@@ -160,38 +160,53 @@ pub enum KnownType {
     LlPtr,
     /// `llmemory.Address` — the RPython `SomeAddress.knowntype`.
     Address,
-    /// Not a type this commit carries; future commits add `List`,
-    /// `Tuple`, `Dict`, `Instance`, `Pbc`, `Iterator`, `Ptr`.
+    /// `list` — the RPython `SomeList.knowntype = list`.
+    List,
+    /// `tuple` — the RPython `SomeTuple.knowntype = tuple`.
+    Tuple,
+    /// `dict` — the RPython `SomeDict.knowntype = dict`.
+    Dict,
+    /// `classdef.classdesc` — the RPython `SomeInstance.knowntype`.
+    /// The `usize` is `ClassDesc.identity`; `None` when `classdef` is
+    /// `None` (`knowntype = None` upstream).
+    Instance(Option<usize>),
+    /// Not a type this port carries as its own tag (`SomePBC` of
+    /// functions, `SomeIterator`, `SomeException`, …).
     Other,
 }
 
 impl fmt::Display for KnownType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            KnownType::Object => "object",
-            KnownType::Type => "type",
-            KnownType::Int => "int",
-            KnownType::Ruint => "r_uint",
-            KnownType::LongLong => "r_longlong",
-            KnownType::LongLongLong => "r_longlonglong",
-            KnownType::ULongLong => "r_ulonglong",
-            KnownType::ULongLongLong => "r_ulonglonglong",
-            KnownType::Bool => "bool",
-            KnownType::Float => "float",
-            KnownType::Singlefloat => "r_singlefloat",
-            KnownType::Longfloat => "r_longfloat",
-            KnownType::Str => "str",
-            KnownType::Unicode => "unicode",
-            KnownType::Bytearray => "bytearray",
-            KnownType::NoneType => "NoneType",
-            KnownType::BuiltinFunctionOrMethod => "builtin_function_or_method",
-            KnownType::PropertyType => "property",
-            KnownType::WeakrefReference => "ReferenceType",
-            KnownType::LlPtr => "_ptr",
-            KnownType::Address => "Address",
-            KnownType::Other => "<other>",
-        };
-        f.write_str(name)
+        match self {
+            KnownType::Object => f.write_str("object"),
+            KnownType::Type => f.write_str("type"),
+            KnownType::Int => f.write_str("int"),
+            KnownType::Ruint => f.write_str("r_uint"),
+            KnownType::LongLong => f.write_str("r_longlong"),
+            KnownType::LongLongLong => f.write_str("r_longlonglong"),
+            KnownType::ULongLong => f.write_str("r_ulonglong"),
+            KnownType::ULongLongLong => f.write_str("r_ulonglonglong"),
+            KnownType::Bool => f.write_str("bool"),
+            KnownType::Float => f.write_str("float"),
+            KnownType::Singlefloat => f.write_str("r_singlefloat"),
+            KnownType::Longfloat => f.write_str("r_longfloat"),
+            KnownType::Str => f.write_str("str"),
+            KnownType::Unicode => f.write_str("unicode"),
+            KnownType::Bytearray => f.write_str("bytearray"),
+            KnownType::NoneType => f.write_str("NoneType"),
+            KnownType::BuiltinFunctionOrMethod => f.write_str("builtin_function_or_method"),
+            KnownType::PropertyType => f.write_str("property"),
+            KnownType::WeakrefReference => f.write_str("ReferenceType"),
+            KnownType::LlPtr => f.write_str("_ptr"),
+            KnownType::Address => f.write_str("Address"),
+            KnownType::List => f.write_str("list"),
+            KnownType::Tuple => f.write_str("tuple"),
+            KnownType::Dict => f.write_str("dict"),
+            // `SomeInstance.knowntype` is the classdesc, or `None`.
+            KnownType::Instance(None) => f.write_str("None"),
+            KnownType::Instance(Some(id)) => write!(f, "classdesc{id}"),
+            KnownType::Other => f.write_str("<other>"),
+        }
     }
 }
 
@@ -204,9 +219,8 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
     match (cls1, cls2) {
         // Python `bool` subclasses `int`.
         (KnownType::Bool, KnownType::Int) | (KnownType::Int, KnownType::Bool) => KnownType::Int,
-        // `Other` means the Rust port has not yet carried the concrete
-        // host type into KnownType. Two equal `Other`s are handled above;
-        // otherwise the nearest known common base is `object`.
+        // Unequal tags, including two `Instance` classdescs, share only
+        // `object`. Class-hierarchy `commonbase` lives on `ClassDesc`.
         _ => KnownType::Object,
     }
 }
@@ -1195,7 +1209,7 @@ pub struct SomeList {
 impl SomeList {
     pub fn new(listdef: ListDef) -> Self {
         SomeList {
-            base: SomeObject::new(KnownType::Other, false),
+            base: SomeObject::new(KnownType::List, false),
             listdef,
         }
     }
@@ -1203,8 +1217,8 @@ impl SomeList {
 
 impl SomeObjectTrait for SomeList {
     fn knowntype(&self) -> KnownType {
-        // upstream `SomeList.knowntype = list`.
-        KnownType::Other
+        // `SomeList.knowntype = list`.
+        KnownType::List
     }
     fn immutable(&self) -> bool {
         false
@@ -1248,7 +1262,7 @@ impl SomeTuple {
             Some(ConstValue::Tuple(out))
         }
 
-        let mut base = SomeObject::new(KnownType::Other, true);
+        let mut base = SomeObject::new(KnownType::Tuple, true);
         if let Some(value) = tuple_const_value(&items) {
             base.const_box = Some(Constant::new(value));
         }
@@ -1258,7 +1272,8 @@ impl SomeTuple {
 
 impl SomeObjectTrait for SomeTuple {
     fn knowntype(&self) -> KnownType {
-        KnownType::Other
+        // `SomeTuple.knowntype = tuple`.
+        KnownType::Tuple
     }
     fn immutable(&self) -> bool {
         true
@@ -1287,7 +1302,7 @@ pub struct SomeDict {
 impl SomeDict {
     pub fn new(dictdef: DictDef) -> Self {
         SomeDict {
-            base: SomeObject::new(KnownType::Other, false),
+            base: SomeObject::new(KnownType::Dict, false),
             dictdef,
         }
     }
@@ -1295,7 +1310,8 @@ impl SomeDict {
 
 impl SomeObjectTrait for SomeDict {
     fn knowntype(&self) -> KnownType {
-        KnownType::Other
+        // `SomeDict.knowntype = dict`.
+        KnownType::Dict
     }
     fn immutable(&self) -> bool {
         false
@@ -1445,8 +1461,13 @@ impl SomeInstance {
         can_be_none: bool,
         flags: std::collections::BTreeMap<String, bool>,
     ) -> Self {
+        let knowntype = KnownType::Instance(
+            classdef
+                .as_ref()
+                .map(|cd| cd.borrow().classdesc.borrow().identity.0),
+        );
         SomeInstance {
-            base: SomeObject::new(KnownType::Other, false),
+            base: SomeObject::new(knowntype, false),
             classdef,
             can_be_none,
             flags,
@@ -1467,10 +1488,12 @@ impl Eq for SomeInstance {}
 
 impl SomeObjectTrait for SomeInstance {
     fn knowntype(&self) -> KnownType {
-        // upstream: `knowntype = classdef.classdesc if classdef else None`
-        // — surfaces as `KnownType::Other` in the Rust port until the
-        // classdef-aware enum extension lands.
-        KnownType::Other
+        // `SomeInstance.knowntype = classdef.classdesc if classdef else None`.
+        KnownType::Instance(
+            self.classdef
+                .as_ref()
+                .map(|cd| cd.borrow().classdesc.borrow().identity.0),
+        )
     }
     fn immutable(&self) -> bool {
         false
@@ -4413,7 +4436,7 @@ mod tests {
         let s = SomeValue::List(SomeList::new(listdef));
         assert!(!s.immutable());
         assert!(s.can_be_none());
-        assert_eq!(s.knowntype(), KnownType::Other);
+        assert_eq!(s.knowntype(), KnownType::List);
     }
 
     #[test]
@@ -4477,6 +4500,7 @@ mod tests {
         let s = SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Impossible]));
         assert!(s.immutable());
         assert!(!s.can_be_none());
+        assert_eq!(s.knowntype(), KnownType::Tuple);
     }
 
     #[test]
@@ -4492,6 +4516,7 @@ mod tests {
         let s = SomeValue::Dict(SomeDict::new(dictdef));
         assert!(!s.immutable());
         assert!(s.can_be_none());
+        assert_eq!(s.knowntype(), KnownType::Dict);
     }
 
     #[test]
@@ -4575,6 +4600,38 @@ mod tests {
             std::collections::BTreeMap::new(),
         ));
         assert!(s.can_be_none());
+    }
+
+    #[test]
+    fn someinstance_knowntype_is_classdesc_identity() {
+        // `SomeInstance.knowntype = classdef.classdesc if classdef else None`.
+        let classdef_less = SomeValue::Instance(SomeInstance::new(
+            None,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        assert_eq!(classdef_less.knowntype(), KnownType::Instance(None));
+
+        let a = ClassDef::new_standalone("pkg.A", None);
+        let b = ClassDef::new_standalone("pkg.B", None);
+        let s_a = SomeValue::Instance(SomeInstance::new(
+            Some(a.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_a2 = SomeValue::Instance(SomeInstance::new(
+            Some(a),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_b = SomeValue::Instance(SomeInstance::new(
+            Some(b),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        assert_eq!(s_a.knowntype(), s_a2.knowntype());
+        assert_ne!(s_a.knowntype(), s_b.knowntype());
+        assert!(matches!(s_a.knowntype(), KnownType::Instance(Some(_))));
     }
 
     #[test]
