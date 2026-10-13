@@ -9662,13 +9662,37 @@ impl CallControl {
         }
 
         // RPython call.py:282-286: random_effects + can_invalidate.
-        let random_effects = match shape {
-            CallShape::Direct(target) => self.cached_random_effects(target, cache),
-            CallShape::Indirect(graphs) => self.cached_random_effects_family(graphs, cache),
+        //
+        // Exception-object materialisers (`pyerror_*_to_exc_object`) are the
+        // fused residual of `PyError::<kind>(msg)` + `to_exc_object`. They
+        // allocate a fresh exception instance the raise consumes. A rewind
+        // discards the allocation, and the raise uses the result so the call
+        // is not dropped — the rewindable-allocation contract
+        // `residual_call_is_effect_free` gives a CanRaise residual with a
+        // known-empty write set. They are not identity-elidable: folding
+        // them to ConstPtr reuses the recording-time instance across
+        // compiled iterations (`history.rs record_result_of_call_pure`).
+        // `RandomEffectsAnalyzer` of the `dont_look_inside` stub, or a top
+        // write set, would otherwise force `EF_RANDOM_EFFECTS` and the
+        // descent scan would treat the fused residual as an effect.
+        let materializer = match shape {
+            CallShape::Direct(target) => self.target_is_exception_object_materializer(target),
+            CallShape::Indirect(_) => false,
+        };
+        let random_effects = if materializer {
+            false
+        } else {
+            match shape {
+                CallShape::Direct(target) => self.cached_random_effects(target, cache),
+                CallShape::Indirect(graphs) => self.cached_random_effects_family(graphs, cache),
+            }
         };
         let mut extraeffect = extraeffect;
         if random_effects {
             extraeffect = Some(ExtraEffect::RandomEffects);
+        }
+        if materializer && extraeffect.is_none() {
+            extraeffect = Some(ExtraEffect::CanRaise);
         }
         let can_invalidate = random_effects
             || match shape {
@@ -9813,9 +9837,15 @@ impl CallControl {
                     .join(",")
             ),
         };
-        let effects = match shape {
-            CallShape::Direct(target) => self.cached_readwrite(target, cache),
-            CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
+        let effects = if materializer {
+            // Empty write set: a top image would force `EF_RANDOM_EFFECTS`
+            // in `effectinfo_from_writeanalyze` and undo the CanRaise mark.
+            ReadWriteEffects::bottom_result()
+        } else {
+            match shape {
+                CallShape::Direct(target) => self.cached_readwrite(target, cache),
+                CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
+            }
         };
         let can_collect = match shape {
             CallShape::Direct(target) => self.cached_can_collect(target, cache),
@@ -15120,6 +15150,47 @@ mod tests {
             descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCanRaise
         );
+    }
+
+    /// Fused `pyerror_*_to_exc_object` residuals are rewindable allocations
+    /// (`residual_call_is_effect_free`): `getcalldescr` must not collapse
+    /// them to `EF_RANDOM_EFFECTS`, and must not mark them identity-elidable
+    /// (`record_result_of_call_pure` would ConstPtr-fold the recording instance).
+    #[test]
+    fn exception_object_materializer_is_can_raise() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments([
+            "pyre_interpreter",
+            "error",
+            "pyerror_value_error_to_exc_object",
+        ]);
+        cc.register_function_graph(path, simple_graph("pyerror_value_error_to_exc_object"));
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path([
+            "pyre_interpreter",
+            "error",
+            "pyerror_value_error_to_exc_object",
+        ]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+        assert!(descriptor.extra_info.can_collect);
+        assert!(!descriptor.extra_info.can_invalidate);
+        let writes = descriptor
+            .extra_info
+            ._write_descrs_fields
+            .as_ref()
+            .expect("materializer write set is known, not the random-effects wildcard");
+        assert!(writes.is_empty());
     }
 
     #[test]

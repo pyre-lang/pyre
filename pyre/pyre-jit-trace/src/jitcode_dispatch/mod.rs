@@ -4361,10 +4361,19 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         ctx.trace_ctx.record_op(OpCode::Keepalive, &[vablebox]);
     }
     if raised != 0 {
+        // `execute_raised(..., constant=False)` then
+        // `handle_possible_exception`: the residual exception has not had
+        // its class proven, so `last_exc_box` is the GUARD_EXCEPTION result,
+        // not ConstPtr of the recording-time instance.
         let exc = ctx.trace_ctx.const_ref(raised);
         let exc_concrete = crate::state::ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
         ctx.set_last_exc_value(exc, exc_concrete);
+        ctx.fbw_mode.class_of_last_exc_is_const = false;
         walker_record_guard_exception(ctx, op.pc)?;
+        let exc = ctx
+            .last_exc_value()
+            .expect("walker_record_guard_exception seeds last_exc_value");
+        let exc_concrete = ctx.last_exc_value_concrete();
         return Ok(Some((
             DispatchOutcome::SubRaise { exc, exc_concrete },
             op.next_pc,
