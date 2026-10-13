@@ -18663,7 +18663,15 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             (ConcreteValue::Ref(list), ConcreteValue::Ref(iterable))
                 if !list.is_null()
                     && !iterable.is_null()
-                    && unsafe { pyre_object::is_list(*list) } =>
+                    && unsafe { pyre_object::is_list(*list) }
+                    // Only the exact list / tuple storage fast paths record
+                    // stores without running them; any other iterable goes
+                    // through `iter()`, whose callbacks the sub-walk already
+                    // ran, so replaying it would run them twice.
+                    && unsafe {
+                        pyre_object::is_exact_list(*iterable)
+                            || pyre_object::is_exact_tuple(*iterable)
+                    } =>
             {
                 Some((
                     pyre_object::gc_roots::pin_roots(&[*list, *iterable]),
