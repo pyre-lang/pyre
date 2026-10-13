@@ -2081,6 +2081,56 @@ impl TraceCtx {
         true
     }
 
+    /// `opimpl_virtual_ref`'s recording half, for a `virtual_ref` over an
+    /// object the trace builds and the tracer never holds: `VIRTUAL_REF(box,
+    /// cindex)` with no tracing-time vref and no pair pushed.
+    ///
+    /// Nothing can force such a vref while the trace is recorded, so it stays
+    /// out of `virtualref_boxes` across the residual-call protocol, whose
+    /// `tracing_before_residual_call` / `tracing_after_residual_call` read a
+    /// concrete vref.  [`Self::track_recorded_virtual_ref`] pushes the pair
+    /// for the guards that resume inside its scope.
+    pub fn record_virtual_ref(&mut self, virtual_obj: OpRef) -> OpRef {
+        let cindex = self.const_int((self.virtualref_boxes.len() / 2) as i64);
+        self.virtual_ref(virtual_obj, cindex)
+    }
+
+    /// `virtualref_boxes += [virtualbox, vrefbox]` for a
+    /// [`Self::record_virtual_ref`] box.
+    pub fn track_recorded_virtual_ref(&mut self, virtual_obj: OpRef, vref: OpRef) {
+        self.virtualref_boxes.push((virtual_obj, 0));
+        self.virtualref_boxes.push((vref, 0));
+    }
+
+    /// `opimpl_virtual_ref_finish` for a [`Self::track_recorded_virtual_ref`]
+    /// pair: pops it and records `VIRTUAL_REF_FINISH(vrefbox, nullbox)`, or
+    /// `VIRTUAL_REF_FINISH(vrefbox, virtualbox)` when the scope's `leave`
+    /// forces the vref.  With `record` false the pair is dropped and nothing
+    /// is recorded, for a trace that is being abandoned.
+    pub fn finish_recorded_virtual_ref(&mut self, forced: bool, record: bool) {
+        let (vrefbox, _) = self
+            .virtualref_boxes
+            .pop()
+            .expect("finish_recorded_virtual_ref: no open virtual_ref scope");
+        let (virtualbox, _) = self
+            .virtualref_boxes
+            .pop()
+            .expect("finish_recorded_virtual_ref: vrefbox without its virtualbox");
+        if !record {
+            return;
+        }
+        let second = if forced {
+            virtualbox
+        } else {
+            self.const_ref(0)
+        };
+        let _ = Self::do_record_op(
+            &mut self.recorder,
+            OpCode::VirtualRefFinish,
+            &[vrefbox, second],
+        );
+    }
+
     /// `pyjitpl.py MetaInterp.vable_and_vrefs_before_residual_call`
     /// — the vrefs half (the virtualizable-info half lives on
     /// `JitCodeMachine::prepare_standard_virtualizable_before_residual_call`).
