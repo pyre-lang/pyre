@@ -2224,6 +2224,16 @@ struct ResidualFrameChainGuard {
 
 impl ResidualFrameChainGuard {
     fn enter(frame: usize, shadow: Option<(super::WalkFrameState, u16)>) -> Option<Self> {
+        Self::enter_published(frame, frame, shadow)
+    }
+
+    /// [`Self::enter`] with the word `topframeref` takes named separately:
+    /// the frame itself, or the `jit.virtual_ref` the trace recorded for it.
+    fn enter_published(
+        frame: usize,
+        published: usize,
+        shadow: Option<(super::WalkFrameState, u16)>,
+    ) -> Option<Self> {
         let frame = frame as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
             return None;
@@ -2255,7 +2265,7 @@ impl ResidualFrameChainGuard {
             );
             unsafe {
                 (*frame).f_backref = saved_topframeref;
-                (*ec).topframeref = frame;
+                (*ec).topframeref = published as *mut pyre_interpreter::PyFrame;
             }
         }
         // Published whether or not this guard wrote the chain: `frame` is the
@@ -5508,12 +5518,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // entered, and here the caller is this residual.  After the guard
         // above, so the frame chains onto the level that calls it.
         let portal_call_frame = ctx.session.borrow().portal_call_frame;
+        let concrete_ref = |ctx: &WalkContext<'_, '_, Sym>, opref: OpRef| match ctx
+            .trace_ctx
+            .concrete_of_opref(opref)
+        {
+            Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => Some(gcref.0),
+            _ => None,
+        };
         let portal_frame_chain = portal_call_frame
-            .and_then(|frame| match ctx.trace_ctx.concrete_of_opref(frame) {
-                Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0),
-                _ => None,
-            })
-            .and_then(|frame| ResidualFrameChainGuard::enter(frame, None));
+            .and_then(|(frame, vref)| Some((concrete_ref(ctx, frame)?, concrete_ref(ctx, vref)?)))
+            .and_then(|(frame, vref)| ResidualFrameChainGuard::enter_published(frame, vref, None));
         let live_py_pc = if ctx.fbw_mode.inline_subwalk {
             ctx.vstack_cur_pypc
         } else {

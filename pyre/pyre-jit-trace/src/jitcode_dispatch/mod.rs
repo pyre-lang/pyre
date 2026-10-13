@@ -740,12 +740,12 @@ pub struct WalkSession {
     /// `aborted_tracing` captured, so a single-frame adopt of the caller
     /// declines into entry replay.
     pub crossed_inline_subwalk: bool,
-    /// The frame box of a portal call being executed for its caller: the
-    /// frame `pyframe.py execute_frame` has entered around that call.
-    /// `record_walker_loop_callee_portal_call` sets it for the one residual
-    /// it executes, and the executor publishes the frame on the chain for
-    /// that call.
-    pub portal_call_frame: Option<OpRef>,
+    /// The frame box of a portal call being executed for its caller, with
+    /// the `jit.virtual_ref` box `pyframe.py execute_frame`'s `ec.enter`
+    /// recorded for it.  `record_walker_loop_callee_portal_call` sets it for
+    /// the one residual it executes, and the executor publishes the vref on
+    /// the chain for that call.
+    pub portal_call_frame: Option<(OpRef, OpRef)>,
     /// `DispatchError::TraceTooLong` was raised. A bridge-carrier drain
     /// drops the `Result` (`P2Drain::MiddleDriveErr`, `p2_drain_abort`)
     /// and would otherwise count `AbortReason::Generic`. The raise already

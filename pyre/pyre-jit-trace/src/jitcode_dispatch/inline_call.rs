@@ -3505,10 +3505,14 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // portal call that runs its loop belongs inside that bracket.  A
     // reconstructed callee (`dst` is None) is still inside its carrier
     // scope, which `carrier_ec_leave` closes when the frame returns.
-    let enters_frame_chain = dst.is_some();
-    if enters_frame_chain {
-        record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, callee_ec);
-    }
+    let portal_vref = dst.is_some().then(|| {
+        record_ec_enter_virtual_ref(
+            ctx.trace_ctx,
+            callee_frame,
+            callee_ec,
+            concrete_callee_frame as usize,
+        )
+    });
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -3603,11 +3607,11 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         .zip(dst)
         .map(|(next_pc, (bank, color))| (next_pc, bank, color));
     // The concrete half of the enter recorded above, scoped to the call.
-    let displaced_portal_call_frame = enters_frame_chain.then(|| {
+    let displaced_portal_call_frame = portal_vref.map(|vref| {
         ctx.session
             .borrow_mut()
             .portal_call_frame
-            .replace(callee_frame)
+            .replace((callee_frame, vref))
     });
     let exec = try_execute_residual_call_via_executor(
         ctx,
@@ -3622,7 +3626,23 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     if let Some(displaced) = displaced_portal_call_frame {
         ctx.session.borrow_mut().portal_call_frame = displaced;
     }
-    let exec = exec?;
+    // `execute_frame` leaves from a `finally`: a walk that stops between the
+    // enter and the recorded leave below still closes the scope.
+    let abandon_portal_scope = |ctx: &mut WalkContext<'_, '_, Sym>| {
+        if portal_vref.is_some()
+            && let Some(majit_ir::Value::Ref(frame)) = ctx.trace_ctx.concrete_of_opref(callee_frame)
+        {
+            ctx.trace_ctx
+                .discard_innermost_virtualref_if_frame(frame.as_usize());
+        }
+    };
+    let exec = match exec {
+        Ok(exec) => exec,
+        Err(err) => {
+            abandon_portal_scope(ctx);
+            return Err(err);
+        }
+    };
     // `pyjitpl.py:2049-2079` records a forced VIRTUAL_REF_FINISH before the
     // selected CALL_ASSEMBLER, followed immediately by GUARD_NOT_FORCED.
     // `direct_assembler_call` records CALL_ASSEMBLER on the portal reds.
@@ -3662,8 +3682,11 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // CALL_MAY_FORCE executed above, not the recorded CALL_ASSEMBLER.
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(OpCode::CallMayForceR, Some(&ei), &allboxes);
-    if let Some((dst_bank, dst)) = dst {
-        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)?;
+    if let Some((dst_bank, dst)) = dst
+        && let Err(err) = write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
+    {
+        abandon_portal_scope(ctx);
+        return Err(err);
     }
     // `opimpl_jit_merge_point` pops the frame holding the merge point
     // (`finishframe(None, leave_portal_frame=False)`) before its caller
@@ -3676,9 +3699,23 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     };
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
-    if enters_frame_chain {
-        record_ec_leave_frame_chain(ctx.trace_ctx, callee_frame, callee_ec);
+    if let Err(err) = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope) {
+        abandon_portal_scope(ctx);
+        return Err(err);
+    }
+    if portal_vref.is_some() {
+        let escaped = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
+            Some(majit_ir::Value::Ref(frame)) if frame.0 != 0 => unsafe {
+                (*(frame.0 as *const pyre_interpreter::PyFrame)).escaped()
+            },
+            _ => false,
+        };
+        record_ec_leave_virtual_ref(
+            ctx.trace_ctx,
+            callee_frame,
+            callee_ec,
+            escaped || exec_raised,
+        );
     }
     // Restore before either exception arm leaves the compiled caller.  Put
     // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
@@ -5611,6 +5648,89 @@ fn record_ec_leave_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_e
         &[callee_ec, f_backref],
         crate::descr::ec_topframeref_descr(),
     );
+}
+
+/// `executioncontext.py ExecutionContext.enter`'s frame-chain half around a
+/// portal call on a frame the walk holds concretely.
+///
+/// ```python
+/// frame.f_backref = self.topframeref
+/// self.topframeref = jit.virtual_ref(frame)
+/// ```
+///
+/// Recorded only.  The concrete half belongs to the one residual that runs
+/// the portal: its executor publishes the vref for that call
+/// (`WalkSession.portal_call_frame`), above the frame chain it enters for the
+/// level that makes the call.  [`walker_ec_enter`] is the form for a callee
+/// whose body the walk itself runs.
+///
+/// Returns the vref box for [`record_ec_leave_virtual_ref`].
+fn record_ec_enter_virtual_ref(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    concrete_frame: usize,
+) -> OpRef {
+    let caller_topframeref = ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[callee_ec],
+        crate::descr::ec_topframeref_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_frame, caller_topframeref],
+        crate::descr::pyframe_f_backref_descr(),
+    );
+    let (vref, concrete_vref) = ctx.opimpl_virtual_ref(callee_frame, concrete_frame);
+    ctx.set_opref_concrete(
+        vref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_vref as usize)),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_ec, vref],
+        crate::descr::ec_topframeref_descr(),
+    );
+    vref
+}
+
+/// `executioncontext.py ExecutionContext.leave`'s frame-chain half behind a
+/// portal call, closing [`record_ec_enter_virtual_ref`].
+///
+/// ```python
+/// frame_vref = self.topframeref
+/// self.topframeref = frame.f_backref
+/// if frame.escaped or got_exception:
+///     f_back = frame.f_backref()
+///     if f_back:
+///         f_back.mark_as_escaped()
+///     frame_vref()
+/// jit.virtual_ref_finish(frame_vref, frame)
+/// ```
+///
+/// `f_back.mark_as_escaped()` runs in the portal runner for this door
+/// (`propagate_portal_frame_escape`), in the trace-time execution and in the
+/// compiled one alike.  `frame_vref()` is recorded the way
+/// [`walker_ec_leave`] records it: `VIRTUAL_REF_FINISH(vrefbox, virtualbox)`
+/// through `stop_tracking_virtualref`, unless the call already forced the
+/// vref and `vrefs_after_residual_call` recorded that.
+fn record_ec_leave_virtual_ref(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    escaped: bool,
+) {
+    record_ec_leave_frame_chain(ctx, callee_frame, callee_ec);
+    if escaped {
+        let live = ctx.virtualref_boxes_len();
+        let vref_is_live = ctx
+            .innermost_virtualref_vref()
+            .is_some_and(|(vrefbox, _)| vrefbox.as_const_ptr().is_none_or(|vref| vref.0 != 0));
+        if live >= 2 && vref_is_live {
+            ctx.stop_tracking_virtualref(live - 2);
+        }
+    }
+    ctx.opimpl_virtual_ref_finish(callee_frame);
 }
 
 #[cfg(test)]
