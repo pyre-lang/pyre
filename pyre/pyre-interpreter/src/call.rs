@@ -7238,13 +7238,21 @@ fn build_class_inner(
                 true,
             )?
         };
-        let w = pyre_object::gc_roots::shadow_stack_get(w_root);
-        let mro = unsafe { crate::baseobjspace::compute_default_mro(w) };
-        unsafe { pyre_object::w_type_set_mro(w, mro) };
-        // typeobject.py ready() — register self on each base's
-        // `weak_subclasses` so cross-subclass invalidation in
-        // `mutated()` and `__subclasses__()` see this class.
-        unsafe { pyre_object::typeobject::w_type_ready(w) };
+        let mro = unsafe {
+            crate::baseobjspace::compute_default_mro(pyre_object::gc_roots::shadow_stack_get(
+                w_root,
+            ))
+        };
+        // `w_type_set_mro` mallocs the young MRO block (`alloc_mro_block_gc_young`).
+        // typeobject.py `ready` is a later livevar use of that same `w_self`;
+        // `gct_fv_gc_malloc` reloads it, so every use after the malloc rereads
+        // the slot rather than the pre-collection word.
+        unsafe {
+            pyre_object::w_type_set_mro(pyre_object::gc_roots::shadow_stack_get(w_root), mro)
+        };
+        unsafe {
+            pyre_object::typeobject::w_type_ready(pyre_object::gc_roots::shadow_stack_get(w_root))
+        };
         // CPython type_new_set_classdict binds __classdict__ before
         // type_new_set_names.  A descriptor's __set_name__ may mutate the
         // completed type dict and immediately materialize lazy annotations;

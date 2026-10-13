@@ -7849,6 +7849,15 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// captures.
     pub carried_resume_jit_pc: Option<usize>,
 
+    /// Liveness window for [`collect_outer_active_boxes`].  When set, this
+    /// jitcode pc is the snapshot's entry coordinate instead of the
+    /// opcode-start floor (`first_floor_boundary_for_py`).  A guard inside
+    /// PUSH_EXC_INFO carries the walk's later `-live-` as resume
+    /// (`carried_resume_jit_pc`); using the opcode floor for boxes would
+    /// encode the landing's liveness, which omits the caught exception
+    /// (`blackhole.py` `bhimpl_last_exc_value` / `bhimpl_raise`).
+    pub liveness_jit_pc: Option<usize>,
+
     /// The branch guard's own jitcode `op.pc` for a kept-stack branch guard
     /// (#124). The snapshot helper is invoked with the *resume* coordinate
     /// (`other_target`, the not-taken arm), so the guard's own coordinate is
@@ -11179,6 +11188,38 @@ fn walker_emit_fold_guard_with_snapshot<Sym: WalkSym>(
 ///
 /// `false` when the walk has no stepped anchor to carry, leaving the caller
 /// to decline its fold.
+fn walker_anchored_fold_guard_available<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> bool {
+    // The anchor answers only when the walk stepped past the block head: the
+    // `-live-` it names must be a LATER one, or it is the block head itself
+    // (or a stale word from a walk that entered mid-opcode) and carrying it
+    // resumes on the landing this exists to skip.  An inline sub-walk's
+    // `op_pc` is a callee coordinate the outer jitcode's tables do not hold,
+    // and its capture resumes at the CALL site instead, so the anchor is not
+    // this guard's to carry there.
+    let anchor = ctx.live_before_jit_pc;
+    if anchor == usize::MAX || ctx.fbw_mode.inline_subwalk {
+        return false;
+    }
+    let block_head = {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if sym.is_null() {
+            return false;
+        }
+        let jitcode = unsafe { (&*sym).jitcode() };
+        if jitcode.is_null() {
+            return false;
+        }
+        unsafe { (&*jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
+    };
+    let Some(block_head) = block_head else {
+        return false;
+    };
+    anchor > block_head
+}
+
 fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -11202,32 +11243,7 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
     {
         return Ok(true);
     }
-    // The anchor answers only when the walk stepped past the block head: the
-    // `-live-` it names must be a LATER one, or it is the block head itself
-    // (or a stale word from a walk that entered mid-opcode) and carrying it
-    // resumes on the landing this exists to skip.  An inline sub-walk's
-    // `op_pc` is a callee coordinate the outer jitcode's tables do not hold,
-    // and its capture resumes at the CALL site instead, so the anchor is not
-    // this guard's to carry there.
-    let anchor = ctx.live_before_jit_pc;
-    if anchor == usize::MAX || ctx.fbw_mode.inline_subwalk {
-        return Ok(false);
-    }
-    let block_head = {
-        let sym = ctx.fbw_mode.snapshot_sym;
-        if sym.is_null() {
-            return Ok(false);
-        }
-        let jitcode = unsafe { (&*sym).jitcode() };
-        if jitcode.is_null() {
-            return Ok(false);
-        }
-        unsafe { (&*jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
-    };
-    let Some(block_head) = block_head else {
-        return Ok(false);
-    };
-    if anchor <= block_head {
+    if !walker_anchored_fold_guard_available(ctx, op_pc) {
         return Ok(false);
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
@@ -11239,7 +11255,8 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
         ctx,
         op_pc,
         GuardCaptureScope {
-            carried_resume_jit_pc: Some(anchor),
+            carried_resume_jit_pc: Some(ctx.live_before_jit_pc),
+            liveness_jit_pc: Some(ctx.live_before_jit_pc),
             ..GuardCaptureScope::default()
         },
     )?;

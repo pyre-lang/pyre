@@ -18329,7 +18329,18 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 ///     saved-prev stack: emit `GETFIELD_GC_R(ec, sys_exc_value)` for the
 ///     restore to reinstate.  The operand `PUSH_EXC_INFO` pushes is `None`
 ///     for an empty slot and the field otherwise; the test becomes the
-///     nullity guard upstream records (see the read arm).
+///     nullity guard upstream records (see the read arm).  That guard
+///     snapshots the walk's later `-live-` liveness, not the landing
+///     floor, so failargs include the caught exception (`pyjitpl.py`
+///     `get_list_of_active_boxes`).  When the guard cannot carry an
+///     anchored `-live-`, the GETFIELD is still the sole prev box
+///     (`Ok(Some)` with dst bound to it): a residual
+///     `current_exception_or_none` Call beside it is a second live prev
+///     and scrambles blackhole resume failargs (`resume.py`
+///     `_prepare_next_section` / `blackhole.py` `bhimpl_raise`).  Do not
+///     convert NULL to `w_None` without the guard (`pyjitpl.py` records a
+///     guard at every branch it specializes); `restore_exc_info` treats a
+///     null slot as empty (`set_sys_exc_info3`).
 ///   * `GetCurrentException` — `get_current_exception()` (`[]→Ref`,
 ///     dst_bank `'r'`): the read a catch-covered bare `raise` uses to obtain
 ///     the exception it re-raises.  Emit `GETFIELD_GC_R(ec, sys_exc_value)`
@@ -18437,6 +18448,13 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
                 ctx.frame_state.borrow().current_exception_seed_concrete,
             )
         } else {
+            // `pyopcode.py PUSH_EXC_INFO` always reads `ec.current_exception()`.
+            // Record that GETFIELD even when the nullity guard below cannot
+            // carry an anchored `-live-`: declining the whole lowering left
+            // the residual `current_exception_or_none` call without a matching
+            // `FBW_EXC_PREV` / `FBW_EXC_PENDING_PUSH_SET` pair, so the
+            // following SETFIELD was treated as a `POP_EXCEPT` restore and
+            // `sys.exc_info()` kept the caught exception after the handler.
             let Some(ec) = walker_ensure_execution_context(ctx) else {
                 return Ok(None);
             };
@@ -18465,26 +18483,37 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         // `prev` operand to the caught exception, not the saved prev; the LIFO
         // stack carries the authoritative value instead.
         if !is_covered_bare_raise_read {
-            FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
-            FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
             // The value `PUSH_EXC_INFO` pushes is `space.w_None` for an empty
             // slot and the field otherwise.  Trace that test as the nullity
             // guard `if prev_operr is not None` records.  It has to carry the
-            // walk's own `-live-` anchor: this opcode is an exception-table
-            // target, so its block head is the handler landing, which reads a
-            // `last_exception` value no guard failure carries.  With no anchor
-            // to carry, leave the test in the helper — decline the fold and
-            // let the call stand, which also keeps the pushed operand a value
-            // the resume image can name.  The field read above balances the
-            // save/store/restore triple either way.
+            // walk's own `-live-` as both resume and liveness: this opcode is
+            // an exception-table target, so its block head is the handler
+            // landing, which reads a `last_exception` value no guard failure
+            // carries (`blackhole.py` `bhimpl_last_exc_value`).  A later
+            // `-live-` whose snapshot still used that landing's liveness
+            // omitted the caught exception, and `GuardIsnull(prev)` failing
+            // resumed `raise/r` with a non-exception (`bhimpl_raise` /
+            // `resume.py _prepare_next_section`).  Skip only that guard when
+            // no later `-live-` exists.  Completing the save still records
+            // the GETFIELD and arms `FBW_EXC_PREV` so `POP_EXCEPT`
+            // (`pyframe.py _restore_exc_info` → `set_sys_exc_info3`)
+            // restores the saved prev.  Fold `w_prev` only when that guard
+            // was actually recorded (`pyjitpl.py` records a guard at every
+            // branch it specializes).  Without one, bind dst to the GETFIELD
+            // so a residual `current_exception_or_none` Call does not also
+            // stand.
             let is_null = prev_obj.is_null();
             let guard = if is_null {
                 OpCode::GuardIsnull
             } else {
                 OpCode::GuardNonnull
             };
-            if !walker_emit_anchored_fold_guard(ctx, op.pc, guard, &[prev])? {
-                return Ok(None);
+            let guarded = walker_emit_anchored_fold_guard(ctx, op.pc, guard, &[prev])?;
+            FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
+            FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
+            if !guarded {
+                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', prev)?;
+                return Ok(Some(()));
             }
             let w_prev = if is_null {
                 ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)

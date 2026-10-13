@@ -10633,7 +10633,16 @@ impl CodeWriter {
                             // reads/writes the same per-thread exception slot as
                             // the interpreter; `POP_EXCEPT` restores the saved
                             // `prev`, where `None` clears the slot.
-                            let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // Peek, do not pop: `pyopcode.py PUSH_EXC_INFO`
+                            // keeps `w_exc` live across `if prev_operr is not
+                            // None`, and the prev-save residual below records
+                            // that guard.  Popping the symbolic stack here
+                            // would drop the slot from that `-live-`.
+                            let exc_value = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             // A bare handler entry (no recorded catch-site
                             // FrameState) fills the
                             // symbolic stack with null sentinels, so the popped
@@ -10672,9 +10681,19 @@ impl CodeWriter {
                             // inside this opcode resumes at the `-live-` that
                             // precedes it: replaying a `last_exc_value` there
                             // reads an exception no guard failure carries
-                            // (`bhimpl_last_exc_value` asserts non-null).  Emitted
-                            // before the pop, which clears the slot.  The slot pin
-                            // below must stay: dropping it perturbs the canonical-
+                            // (`bhimpl_last_exc_value` asserts non-null).
+                            // `pyopcode.py PUSH_EXC_INFO` keeps `w_exc` in a
+                            // local across `if prev_operr is not None`; delay
+                            // the runtime pop until after that prev-save so
+                            // the same slot is still in the guard's live set
+                            // (`pyjitpl.py` `get_list_of_active_boxes`).
+                            // Popping first left only a scratch colour, so
+                            // `GuardIsnull(prev)` failargs omitted the caught
+                            // exception and a nested run resumed `raise/r`
+                            // with a non-exception (`blackhole.py`
+                            // `bhimpl_raise` / `resume.py`
+                            // `_prepare_next_section`).  The slot pin below
+                            // must stay: dropping it perturbs the canonical-
                             // derived gate-off resume liveness.
                             let exc_slot =
                                 stack_base_absolute + current_depth.saturating_sub(1) as usize;
@@ -10690,7 +10709,20 @@ impl CodeWriter {
                                 Some(exc_value.clone()),
                                 py_pc as i64,
                             );
-                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            // `pyopcode.py PUSH_EXC_INFO` binds `w_exc =
+                            // popvalue()` before `if prev_operr is not None`.
+                            // `pyjitpl.py get_list_of_active_boxes` then
+                            // snapshots that local at the guard.  The
+                            // opcode-start `-live-` is this handler's block
+                            // head (`resume_marker_for_jitcode_pc`); a guard
+                            // that carried it would resume into
+                            // `last_exc_value/>r`, which a non-exception
+                            // guard failure does not seed (`blackhole.py`
+                            // `bhimpl_last_exc_value`).  Emit a later
+                            // `-live-` now that `w_exc` is a stack colour so
+                            // the prev-nullity guard can carry it
+                            // (`resume.py` `_prepare_next_section`).
+                            emit_live_placeholder!(py_pc);
                             // pyopcode.py:786 keeps `exc` in a local after
                             // `popvalue()`.  The trailing `push(exc)` targets a
                             // stable scratch register so the intervening
@@ -10727,6 +10759,11 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
+                            // After the prev-save (and its nullity guard).  The
+                            // caught exception stayed in this slot through that
+                            // call so the guard snapshot could name it.
+                            let _ = current_state.stack.pop();
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
@@ -16884,6 +16921,60 @@ mod tests {
                 "the residual must read this callee's frame register"
             );
         }
+    }
+
+    #[test]
+    fn push_exc_info_prev_save_runs_before_the_caught_exc_pop() {
+        // `pyopcode.py PUSH_EXC_INFO` keeps `w_exc` live at
+        // `if prev_operr is not None`.  The runtime pop must follow
+        // `current_exception_or_none` so that guard's `-live-` still
+        // names the vable stack slot (`pyjitpl.py`
+        // `get_list_of_active_boxes` / `blackhole.py` `bhimpl_raise`).
+        let code = first_nested_function_code(
+            "def f():\n    try:\n        {}[0]\n    except KeyError:\n        pass\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
+        let writer = CodeWriter::new();
+        let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
+        assert!(!pyjit.has_abort, "try/except handler must lower");
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let prev_save = ops.iter().find(|op| {
+            op.key == "residual_call_r_r/iRd>r" && pyjit.jitcode.code.get(op.pc + 2) == Some(&0)
+        });
+        let Some(prev_save) = prev_save else {
+            panic!("PUSH_EXC_INFO current_exception_or_none residual is missing");
+        };
+        let getitem_pc = ops
+            .iter()
+            .rev()
+            .find(|op| op.pc < prev_save.pc && op.opname.starts_with("getarrayitem_vable"))
+            .map(|op| op.pc);
+        let Some(getitem_pc) = getitem_pc else {
+            panic!("caught-exc stack read must precede the prev-save residual");
+        };
+        let pop_between = ops.iter().any(|op| {
+            op.pc > getitem_pc
+                && op.pc < prev_save.pc
+                && op.opname.starts_with("setarrayitem_vable")
+        });
+        assert!(
+            !pop_between,
+            "popping the caught exception before current_exception_or_none \
+             drops it from the prev-nullity guard's live set"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| { op.pc > getitem_pc && op.pc < prev_save.pc && op.opname == "live" }),
+            "a -live- after binding w_exc must precede current_exception_or_none \
+             so GuardIsnull failargs include the caught exception"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| { op.pc > prev_save.pc && op.opname.starts_with("setarrayitem_vable") }),
+            "the runtime pop still happens after the prev-save"
+        );
     }
 
     #[test]
