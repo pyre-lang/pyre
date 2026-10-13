@@ -278,13 +278,11 @@ fn local_def_counts(body: &Unstructured, llbc: &Llbc, forward_blocks: &[bool]) -
                         }
                         | Rvalue::RawPtr {
                             place: src, kind, ..
-                        } => {
-                            if ref_kind_mutates(kind) {
-                                bump(
-                                    &mut counts,
-                                    place_local(src).or_else(|| deref_of_local(src)),
-                                );
-                            }
+                        } if ref_kind_mutates(kind) => {
+                            bump(
+                                &mut counts,
+                                place_local(src).or_else(|| deref_of_local(src)),
+                            );
                         }
                         _ => {}
                     }
@@ -525,7 +523,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
     let mut classified: HashMap<usize, (Leaf, bool)> = HashMap::new();
-    let forward_blocks = super::forward_reachable_mask(llbc, &body);
+    let forward_blocks = super::forward_reachable_mask(llbc, body);
     for (bb, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
@@ -1595,7 +1593,7 @@ fn callee_effect_of(llbc: &Llbc, path: &str) -> CalleeEffect {
 }
 
 fn first_non_none_callee(body: &Unstructured, llbc: &Llbc) -> Option<(String, CalleeEffect)> {
-    let forward_blocks = super::forward_reachable_mask(llbc, &body);
+    let forward_blocks = super::forward_reachable_mask(llbc, body);
     for (bb_idx, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;

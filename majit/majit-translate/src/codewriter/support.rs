@@ -217,10 +217,7 @@ pub(crate) fn rewrite_jit_merge_point(
     let mut call_args = greens;
     call_args.extend(reds);
     let return_input = graph.block(graph.returnblock).inputargs.first().cloned();
-    let result_ty = match return_input
-        .as_ref()
-        .map(|var| FunctionGraph::concretetype_of(var))
-    {
+    let result_ty = match return_input.as_ref().map(FunctionGraph::concretetype_of) {
         Some(ConcreteType::Signed) => crate::model::ValueType::Int,
         Some(ConcreteType::GcRef) => crate::model::ValueType::Ref(None),
         Some(ConcreteType::Float) => crate::model::ValueType::Float,
@@ -321,10 +318,10 @@ pub(crate) fn seed_split_portal_input_ops(
         if index == 0 && ty == ValueType::Int {
             ty = ValueType::Unsigned;
         }
-        if class_root.is_none() {
-            if let ValueType::Ref(Some(root)) = &ty {
-                class_root = Some(root.clone());
-            }
+        if class_root.is_none()
+            && let ValueType::Ref(Some(root)) = &ty
+        {
+            class_root = Some(root.clone());
         }
         if class_root.is_none() && index >= red_start {
             class_root = red_types.get(index - red_start).cloned();

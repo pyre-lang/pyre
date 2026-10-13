@@ -877,19 +877,19 @@ fn convert_value_slow(mut value: PyObjectRef, conv: i64) -> Result<PyObjectRef, 
         pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(value);
     if !tagged && !value.is_null() && unsafe { pyre_object::is_instance(value) } {
         let str_conv = conv == 0 || conv == 3;
-        if str_conv {
-            if let Some(result) = pyre_object::with_roots!(value =>
+        if str_conv
+            && let Some(result) = pyre_object::with_roots!(value =>
                 unsafe { crate::display::try_call_dunder_obj_above_object(value, "__str__") }
-            )? {
-                return Ok(result);
-            }
+            )?
+        {
+            return Ok(result);
         }
-        if str_conv || conv == 1 {
-            if let Some(result) = pyre_object::with_roots!(value =>
+        if (str_conv || conv == 1)
+            && let Some(result) = pyre_object::with_roots!(value =>
                 unsafe { crate::display::try_call_dunder_obj(value, "__repr__") }
-            )? {
-                return Ok(result);
-            }
+            )?
+        {
+            return Ok(result);
         }
     }
     if conv == 0 || conv == 3 {

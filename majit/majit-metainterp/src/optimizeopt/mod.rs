@@ -156,12 +156,12 @@ fn alloc_snap_list_slab() -> *mut SnapshotBox {
     if let Some(p) = heap.free.pop() {
         return p;
     }
-    if let Some((base, used)) = heap.chunks.last_mut() {
-        if *used < SNAP_LIST_CHUNK {
-            let p = unsafe { (*base).add(*used * SNAP_LIST_SLAB) };
-            *used += 1;
-            return p;
-        }
+    if let Some((base, used)) = heap.chunks.last_mut()
+        && *used < SNAP_LIST_CHUNK
+    {
+        let p = unsafe { (*base).add(*used * SNAP_LIST_SLAB) };
+        *used += 1;
+        return p;
     }
     let layout = std::alloc::Layout::from_size_align(
         SNAP_LIST_CHUNK * SNAP_LIST_SLAB_BYTES,
@@ -336,25 +336,21 @@ impl Extend<SnapshotBox> for SnapshotBoxList {
             .size_hint()
             .0
             .checked_sub(self.capacity() - self.len as usize)
+            && extra > 0
+            && !self.is_slab()
         {
-            if extra > 0 && !self.is_slab() {
-                let want = self.len as usize + extra;
-                if want > self.capacity() {
-                    let layout = std::alloc::Layout::array::<SnapshotBox>(want)
-                        .expect("snapshot box extend");
-                    let new_ptr = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
-                    assert!(!new_ptr.is_null(), "snapshot box extend failed");
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            self.ptr.as_ptr(),
-                            new_ptr,
-                            self.len as usize,
-                        );
-                    }
-                    self.dealloc_storage(self.len as usize);
-                    self.ptr = unsafe { std::ptr::NonNull::new_unchecked(new_ptr) };
-                    self.cap = want as u32;
+            let want = self.len as usize + extra;
+            if want > self.capacity() {
+                let layout =
+                    std::alloc::Layout::array::<SnapshotBox>(want).expect("snapshot box extend");
+                let new_ptr = unsafe { std::alloc::alloc(layout) as *mut SnapshotBox };
+                assert!(!new_ptr.is_null(), "snapshot box extend failed");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr, self.len as usize);
                 }
+                self.dealloc_storage(self.len as usize);
+                self.ptr = unsafe { std::ptr::NonNull::new_unchecked(new_ptr) };
+                self.cap = want as u32;
             }
         }
         for item in iter {
@@ -3696,10 +3692,10 @@ impl OptContext {
         // `last_guard_idx`; in_final_emission runs use
         // `Optimizer::last_guard_op_idx` instead.
         if op.opcode.is_guard() {
-            if !self.in_final_emission {
-                if let Some(newop) = self.emit_guard_operation(&op) {
-                    op = newop;
-                }
+            if !self.in_final_emission
+                && let Some(newop) = self.emit_guard_operation(&op)
+            {
+                op = newop;
             }
         } else {
             // optimizer.py `_emit_operation` — the test runs for every emitted non-guard
@@ -4553,7 +4549,7 @@ impl OptContext {
                 !matches!(value, Value::Void),
                 "emit_const_guard: ConstVoid not allowed"
             );
-            let c = Operand::const_from_value(value.clone());
+            let c = Operand::const_from_value(*value);
             guards.push(majit_ir::OpRc::new(Op::new(
                 OpCode::GuardValue,
                 &[arg.clone(), c],
@@ -5939,9 +5935,7 @@ impl OptContext {
     /// be a one-node self-cycle. The canonical is a terminal, so no chain
     /// cycle forms once a distinct op is linked.
     pub(crate) fn heal_arg_to_canonical(&self, arg: &Operand) -> Option<Operand> {
-        if arg.bound_op().is_none() {
-            return None;
-        }
+        arg.bound_op()?;
         if !matches!(arg.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
             return None;
         }
@@ -7036,7 +7030,7 @@ impl OptContext {
             if opnum == OpCode::GuardException {
                 self.last_guard_idx = None;
             }
-            return replaced;
+            replaced
         } else {
             // optimizer.py: store_final_boxes_in_guard.  This is
             // the standalone OptContext path (used by tests and the
@@ -7075,7 +7069,7 @@ impl OptContext {
             if opnum == OpCode::GuardException {
                 self.last_guard_idx = None;
             }
-            return replaced;
+            replaced
         }
     }
 
@@ -7504,7 +7498,7 @@ impl OptContext {
             let env = OptBoxEnv { ctx: self };
             let mut memo = self.resumedata_memo.borrow_mut();
             memo.number_from_parts(
-                &snapshot_boxes,
+                snapshot_boxes,
                 frame_sizes,
                 frame_pcs,
                 vable_oprefs,
@@ -7971,7 +7965,6 @@ impl OptContext {
         use majit_ir::OpCode;
 
         let opnum = op.opcode;
-        let arraylength: i64;
 
         let descr = op.getdescr();
         if opnum.is_getfield() {
@@ -8003,7 +7996,7 @@ impl OptContext {
             return;
         }
 
-        if matches!(
+        let arraylength: i64 = if matches!(
             opnum,
             OpCode::GetarrayitemGcPureI
                 | OpCode::GetarrayitemGcPureR
@@ -8032,10 +8025,9 @@ impl OptContext {
             if opnum == OpCode::ArraylenGc {
                 return;
             }
-            arraylength = self
-                .cpu
+            self.cpu
                 .bh_arraylen_gc(array, ad)
-                .expect("bh_arraylen_gc must succeed after protect_speculative_array");
+                .expect("bh_arraylen_gc must succeed after protect_speculative_array")
         } else if matches!(opnum, OpCode::Strgetitem | OpCode::Strlen) {
             // optimizer.py:843-848 string branch.
             let string = match self
@@ -8052,10 +8044,9 @@ impl OptContext {
             if opnum == OpCode::Strlen {
                 return;
             }
-            arraylength = self
-                .cpu
+            self.cpu
                 .bh_strlen(string)
-                .expect("bh_strlen must succeed after protect_speculative_string");
+                .expect("bh_strlen must succeed after protect_speculative_string")
         } else if matches!(opnum, OpCode::Unicodegetitem | OpCode::Unicodelen) {
             // optimizer.py:850-855 unicode branch.
             let unicode = match self
@@ -8075,14 +8066,13 @@ impl OptContext {
             if opnum == OpCode::Unicodelen {
                 return;
             }
-            arraylength = self
-                .cpu
+            self.cpu
                 .bh_unicodelen(unicode)
-                .expect("bh_unicodelen must succeed after protect_speculative_unicode");
+                .expect("bh_unicodelen must succeed after protect_speculative_unicode")
         } else {
             // optimizer.py:857-858 else: return — nothing to validate.
             return;
-        }
+        };
 
         // optimizer.py:860-862 shared bounds check:
         //   index = self.get_constant_box(op.getarg(1)).getint()

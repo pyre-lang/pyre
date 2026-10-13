@@ -367,12 +367,7 @@ pub(crate) fn pointer_newp_with_allocator(
         // Room for the null character `newp` always adds.
         datasize *= 2;
     }
-    let w_cdata = super::allocator::allocate(
-        allocator.as_deref_mut(),
-        datasize,
-        roots.get(ctype_slot),
-        -1,
-    )?;
+    let w_cdata = super::allocator::allocate(allocator, datasize, roots.get(ctype_slot), -1)?;
     let _ = roots.pin_root(w_cdata);
     let w_init = roots.get(init_slot);
     if !unsafe { pyre_object::pyobject::is_none(w_init) } {

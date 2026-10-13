@@ -422,12 +422,12 @@ fn range_feeds_only_forloop(
                 .last_exception
                 .as_ref()
                 .and_then(LinkArg::as_variable)
-                .is_some_and(&in_closure)
+                .is_some_and(in_closure)
                 || link
                     .last_exc_value
                     .as_ref()
                     .and_then(LinkArg::as_variable)
-                    .is_some_and(&in_closure)
+                    .is_some_and(in_closure)
             {
                 return false;
             }

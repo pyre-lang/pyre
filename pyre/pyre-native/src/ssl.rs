@@ -501,7 +501,7 @@ impl Context {
         }
         self.roots
             .add(CertificateDer::from(der.clone()))
-            .map_err(|error| pem_error(error))?;
+            .map_err(pem_error)?;
         self.root_der.push(der);
         Ok(true)
     }
@@ -1183,7 +1183,9 @@ fn canonical_string_value(
         }
         // UniversalString and BMPString.
         28 => input
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter_map(|bytes| {
                 char::from_u32(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             })
@@ -1191,7 +1193,9 @@ fn canonical_string_value(
             .collect(),
         30 => char::decode_utf16(
             input
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]])),
         )
         .map(|value| value.unwrap_or(char::REPLACEMENT_CHARACTER))
@@ -2308,13 +2312,12 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
         // Keep the one TLS 1.2 value directly on this per-connection store,
         // matching ClientSessionStore's documented cardinality.  The inner
         // cache remains responsible for KX hints and TLS 1.3 ticket queues.
-        let session = self
-            .latest_tls12
+
+        self.latest_tls12
             .lock()
             .as_ref()
             .filter(|(known_name, _)| known_name == server_name)
-            .map(|(_, value)| value.clone());
-        session
+            .map(|(_, value)| value.clone())
     }
 
     fn remove_tls12_session(&self, server_name: &rustls::pki_types::ServerName<'static>) {
@@ -2775,10 +2778,10 @@ fn enabled_versions(
     let minimum = context.minimum_version;
     let maximum = context.maximum_version;
     let tls12 = (minimum < 0 || minimum <= 0x303)
-        && (maximum < 0 || maximum >= 0x303)
+        && !(0..0x303).contains(&maximum)
         && context.options & SslOp::NO_TLSV1_2.bits() == 0;
     let tls13 = (minimum < 0 || minimum <= 0x304)
-        && (maximum < 0 || maximum >= 0x304)
+        && !(0..0x304).contains(&maximum)
         && context.options & SslOp::NO_TLSV1_3.bits() == 0;
     if !tls12 && !tls13 {
         return Err((0, "[SSL] no protocols available".to_string()));
@@ -3171,12 +3174,12 @@ fn rustls_protocol_error(error: rustls::Error) -> (i32, String) {
         );
     }
     if let rustls::Error::AlertReceived(alert) = &error {
-        let reason = match alert {
-            &rustls::AlertDescription::AccessDenied => "TLSV1_ALERT_ACCESS_DENIED",
-            &rustls::AlertDescription::HandshakeFailure => "SSLV3_ALERT_HANDSHAKE_FAILURE",
-            &rustls::AlertDescription::InternalError => "TLSV1_ALERT_INTERNAL_ERROR",
-            &rustls::AlertDescription::ProtocolVersion => "TLSV1_ALERT_PROTOCOL_VERSION",
-            &rustls::AlertDescription::UnknownCA => "TLSV1_ALERT_UNKNOWN_CA",
+        let reason = match *alert {
+            rustls::AlertDescription::AccessDenied => "TLSV1_ALERT_ACCESS_DENIED",
+            rustls::AlertDescription::HandshakeFailure => "SSLV3_ALERT_HANDSHAKE_FAILURE",
+            rustls::AlertDescription::InternalError => "TLSV1_ALERT_INTERNAL_ERROR",
+            rustls::AlertDescription::ProtocolVersion => "TLSV1_ALERT_PROTOCOL_VERSION",
+            rustls::AlertDescription::UnknownCA => "TLSV1_ALERT_UNKNOWN_CA",
             _ => "TLSV1_ALERT_UNKNOWN",
         };
         return (

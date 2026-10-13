@@ -2750,7 +2750,7 @@ impl GcCache {
             }
             return simple;
         }
-        return self.mint_field_descr(
+        self.mint_field_descr(
             struct_key,
             parent,
             field_name.to_string(),
@@ -2765,7 +2765,7 @@ impl GcCache {
             virtualizable,
             index_in_parent,
             declared_class_word,
-        );
+        )
     }
 
     /// Cache-miss half of [`Self::get_field_descr_declaring`].
@@ -7157,7 +7157,7 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
         .chain(own_field_descrs.iter())
         .cloned()
         .collect();
-    let mut all_fielddescrs: Vec<Arc<dyn FieldDescr>> = leading.iter().cloned().collect();
+    let mut all_fielddescrs: Vec<Arc<dyn FieldDescr>> = leading.to_vec();
     all_fielddescrs.extend(
         field_descrs
             .iter()

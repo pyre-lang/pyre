@@ -3854,15 +3854,15 @@ fn format_w_slow(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, c
     let spec_is_str = !w_spec.is_null() && unsafe { is_str(w_spec) };
     let spec_is_empty = !spec_is_str || unsafe { pyre_object::w_str_get_wtf8(w_spec) }.is_empty();
 
-    if spec_is_empty {
-        if unsafe {
+    if spec_is_empty
+        && unsafe {
             pyre_object::py_type_check(val, &pyre_object::LONG_TYPE)
                 && pyre_object::is_exact_builtin_instance(val)
-        } {
-            return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
-                crate::py_str_wtf8(val)?
-            }));
         }
+    {
+        return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+            crate::py_str_wtf8(val)?
+        }));
     }
 
     if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") }

@@ -143,7 +143,7 @@ pub fn ffiobj_init(
     }
 
     if !types.is_empty() {
-        if types.len() % 4 != 0 {
+        if !types.len().is_multiple_of(4) {
             return Err(PyError::value_error(
                 "CFFI packed types string is not a multiple of four bytes",
             ));

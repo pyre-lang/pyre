@@ -1095,7 +1095,7 @@ pub fn remove_identical_vars_SSA(graph: &FunctionGraph) {
         }
     }
 
-    for (_, (block, _)) in inputs.iter() {
+    for (block, _) in inputs.values() {
         renamevariables_hl(block, &renaming);
     }
 }

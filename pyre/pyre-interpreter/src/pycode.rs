@@ -3090,14 +3090,8 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     code.locations = Vec::new().into_boxed_slice();
 
     let mut result = box_code_object_with_firstlineno(code, firstlineno_raw);
-    let w_name = match name_slot {
-        Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
-        None => None,
-    };
-    let w_qualname = match qual_slot {
-        Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
-        None => None,
-    };
+    let w_name = name_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let w_qualname = qual_slot.map(pyre_object::gc_roots::shadow_stack_get);
     result = install_code_name_objects(result, w_name, w_qualname);
     unsafe { set_filename_bytes(result, filename_bytes) };
     unsafe { set_co_code_bytes(result, co_code_bytes) };
@@ -3238,12 +3232,12 @@ unsafe fn read_code_units(
 pub(crate) fn decode_code_units(
     bytes: &[u8],
 ) -> Result<(crate::bytecode::CodeUnits, Option<Vec<u8>>), ()> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(());
     }
     let mut units = Vec::with_capacity(bytes.len() / 2);
     let mut preserve_raw = false;
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let (op, arg) = match crate::bytecode::Instruction::try_from(pair[0]) {
             Ok(crate::bytecode::Instruction::Reserved) | Err(_) => {
                 preserve_raw = true;
@@ -4001,7 +3995,7 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
     let key = code as *const crate::CodeObject as usize;
     let mut cache = code_locations_cache().lock();
     let firstlineno_raw = match cache.get(&key) {
-        Some(CodeLocations::Decoded(rows)) => return *rows,
+        Some(CodeLocations::Decoded(rows)) => return rows,
         Some(CodeLocations::Deferred(firstlineno_raw)) => *firstlineno_raw,
         // A copy of a released code object: `w_code_fill_consts_from_tuple`
         // serializes a wrapped constant back into `ConstantData` by copying the

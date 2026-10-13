@@ -902,7 +902,7 @@ fn log_portal_ref_colors(graph: &FunctionGraph, coloring: &VarMap<usize>) {
         .filter(|var| {
             coloring
                 .get(*var)
-                .is_some_and(|color| red_colors.iter().any(|red| *red == Some(*color)))
+                .is_some_and(|color| red_colors.contains(&Some(*color)))
         })
         .count();
     let mut red_occupancy: Vec<(usize, usize)> = Vec::new();
@@ -920,7 +920,7 @@ fn log_portal_ref_colors(graph: &FunctionGraph, coloring: &VarMap<usize>) {
             let Some(color) = coloring.get(result) else {
                 continue;
             };
-            if !red_colors.iter().any(|red| *red == Some(*color)) {
+            if !red_colors.contains(&Some(*color)) {
                 continue;
             }
             let label = match &op.kind {
@@ -960,7 +960,7 @@ fn log_portal_ref_colors(graph: &FunctionGraph, coloring: &VarMap<usize>) {
     kind_hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut name_hits: Vec<(String, usize)> = Vec::new();
     for (var, color) in coloring {
-        if !red_colors.iter().any(|red| *red == Some(*color)) {
+        if !red_colors.contains(&Some(*color)) {
             continue;
         }
         let prefix = var.name_prefix();

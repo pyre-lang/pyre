@@ -4445,11 +4445,11 @@ impl<M: Clone> MetaInterp<M> {
             return Some(jitcode);
         }
         let loader = jd.mainjitcode_loader?;
-        if jd.mainjitcode_loaded.get().is_none() {
-            if let Some(jitcode) = loader() {
-                jitcode.set_jitdriver_sd(index);
-                let _ = jd.mainjitcode_loaded.set(jitcode);
-            }
+        if jd.mainjitcode_loaded.get().is_none()
+            && let Some(jitcode) = loader()
+        {
+            jitcode.set_jitdriver_sd(index);
+            let _ = jd.mainjitcode_loaded.set(jitcode);
         }
         jd.mainjitcode_loaded.get()
     }
@@ -6376,17 +6376,16 @@ impl<M: Clone> MetaInterp<M> {
             None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone()),
         };
         let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
-        let hot = match typed_values.as_ref() {
-            Some(key) => Some(
+        let hot = typed_values
+            .as_ref()
+            .map(|key| {
                 self.warm_state_for_driver(jd_no)
-                    .force_start_tracing_for_key(key),
-            ),
-            None => None,
-        }
-        .unwrap_or_else(|| {
-            self.warm_state_for_driver(jd_no)
-                .force_start_tracing(green_key)
-        });
+                    .force_start_tracing_for_key(key)
+            })
+            .unwrap_or_else(|| {
+                self.warm_state_for_driver(jd_no)
+                    .force_start_tracing(green_key)
+            });
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -8870,7 +8869,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_map_from_byte_recorder(rec, &mut constants)
         } else {
             snapshot_map_from_trace_snapshots(
-                &trace_snapshots,
+                trace_snapshots,
                 &mut constants,
                 preamble_data.base.inputargs(),
             )
@@ -8924,7 +8923,7 @@ impl<M: Clone> MetaInterp<M> {
             Err(crate::optimize::InvalidLoop(reason))
         } else {
             unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
-                &trace_ops,
+                trace_ops,
                 &mut constants,
                 num_trace_inputargs,
                 vable_config.clone(),
@@ -10380,10 +10379,8 @@ impl<M: Clone> MetaInterp<M> {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     crate::mc_diag_bump(30); // compile_trace: origin loop gone
-                    if use_byte_iter {
-                        if let Some(ctx) = self.tracing.as_mut() {
-                            ctx.cut_trace(cut_at);
-                        }
+                    if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
+                        ctx.cut_trace(cut_at);
                     }
                     self.jitlog_trace_aborted();
                     return CompileOutcome::Cancelled;
@@ -10391,10 +10388,8 @@ impl<M: Clone> MetaInterp<M> {
                 let descr_arc = match self.bridge_info() {
                     Some(b) => b.source_descr.clone(),
                     None => {
-                        if use_byte_iter {
-                            if let Some(ctx) = self.tracing.as_mut() {
-                                ctx.cut_trace(cut_at);
-                            }
+                        if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
+                            ctx.cut_trace(cut_at);
                         }
                         self.jitlog_trace_aborted();
                         return CompileOutcome::Cancelled;
@@ -10450,10 +10445,8 @@ impl<M: Clone> MetaInterp<M> {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
                     crate::mc_diag_bump(32); // compile_trace: no entry-bridge data
-                    if use_byte_iter {
-                        if let Some(ctx) = self.tracing.as_mut() {
-                            ctx.cut_trace(cut_at);
-                        }
+                    if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
+                        ctx.cut_trace(cut_at);
                     }
                     self.jitlog_trace_aborted();
                     return CompileOutcome::Cancelled;
@@ -10485,10 +10478,8 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
-        if use_byte_iter {
-            if let Some(ctx) = self.tracing.as_mut() {
-                ctx.cut_trace(cut_at);
-            }
+        if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
+            ctx.cut_trace(cut_at);
         }
         outcome
     }
@@ -12088,7 +12079,7 @@ impl<M: Clone> MetaInterp<M> {
         // `compile_simple_loop` dumps at the same point for the same reason.
         if crate::majit_log_enabled() {
             eprintln!("--- finish trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+            eprint!("{}", majit_ir::format_trace(trace_ops, &constants));
         }
         // InvalidLoop during optimization should abort the trace, not crash
         // the process. Matches compile_loop.
@@ -12530,9 +12521,7 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
         self.compile_tracing = self.tracing.take();
         let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
-        if self.compile_tracing.is_none() {
-            return None;
-        }
+        self.compile_tracing.as_ref()?;
         let green_key = self.compile_tracing.as_ref().unwrap().green_key;
         let driver_descriptor = self
             .compile_tracing
@@ -12579,7 +12568,7 @@ impl<M: Clone> MetaInterp<M> {
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+            eprint!("{}", majit_ir::format_trace(trace_ops, &constants));
         }
 
         let num_ops_before = trace_ops.len();
@@ -13903,7 +13892,7 @@ impl<M: Clone> MetaInterp<M> {
             result.exit_layout = Some(Box::new(self.guard_exit_layout(
                 jd_no,
                 green_key,
-                &descr_arc,
+                descr_arc,
                 result.rd_loop_token,
             )));
         }
@@ -16039,7 +16028,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
-        let mut entry_inputargs: Vec<InputArgRc> = bridge_inputargs.iter().cloned().collect();
+        let mut entry_inputargs: Vec<InputArgRc> = bridge_inputargs.to_vec();
         // compile.py -> send_loop_to_backend(..., orig_inputargs):
         // entry bridges are loops installed as an interpreter front door, so
         // they require the same virtualizable-field reload preamble and
@@ -16531,7 +16520,7 @@ impl<M: Clone> MetaInterp<M> {
             // guard sits in the root loop or in a bridge the frontend never
             // indexed (`send_bridge_to_backend`).  The pool Arcs are the ones
             // the descr holds, so the deserializer shares them.
-            let pending = crate::resume::get_resumestorage(fail_descr_arc).and_then(|storage| {
+            let pending = crate::resume::get_resumestorage(fail_descr_arc).map(|storage| {
                 // Each bridge inputarg carries its `box.type`
                 // (resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float});
                 // mint the typed `OpRef::input_arg_*` variant via
@@ -16588,14 +16577,14 @@ impl<M: Clone> MetaInterp<M> {
                 // `optimize_bridge` as a parameter, not a one-shot stash.
                 let frontend_boxes = self.pending_frontend_boxes.clone().unwrap_or_default();
                 assert_eq!(frontend_boxes.len(), liveboxes.len());
-                Some(PendingBridgeRd {
+                PendingBridgeRd {
                     storage,
                     frontend_boxes,
                     liveboxes,
                     livebox_types,
                     all_descrs: self.staticdata.all_descrs().lock().clone(),
                     cpu: self.cpu.clone(),
-                })
+                }
             });
             let Some(tok) = compiled.live_token() else {
                 self.jitlog_trace_aborted();
@@ -16697,11 +16686,8 @@ impl<M: Clone> MetaInterp<M> {
         // this CompileData-only view remain the original pre-iterator boxes,
         // matching BridgeCompileData.__init__; optimizer consumers below use
         // `prepared_inputargs`, matching `trace.get_iter().inputargs`.
-        let bridge_trace_data = TreeLoop::from_oprc(
-            bridge_inputargs.iter().cloned().collect(),
-            prepared_ops,
-            Vec::new(),
-        );
+        let bridge_trace_data =
+            TreeLoop::from_oprc(bridge_inputargs.to_vec(), prepared_ops, Vec::new());
         // `enable_opts` must be owned before `take_optimizer` / compiled_loops
         // borrows. CompileData.resumestorage is the same payload as
         // `pending_bridge_rd` (compile.py BridgeCompileData.resumestorage);
@@ -19486,7 +19472,7 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .unwrap_or_else(|| self.framestack.frames[i].jitcode.clone());
             let indices =
-                crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, &liveness);
+                crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, liveness);
             // `resume.py` `ResumeDataBoxReader.consume_boxes` always
             // consumes. Pair in bank order up to the available values.
             let mut order = Vec::with_capacity(indices.total_len());
@@ -23325,7 +23311,7 @@ impl MetaInterpStaticData {
             && self.jitdrivers_sd[0].portal_runner_adr == 0
             && self.jitdrivers_sd[0].num_greens() == 0
             && self.jitdrivers_sd[0].reds().is_empty();
-        let idx = preinstalled_index.unwrap_or_else(|| {
+        let idx = preinstalled_index.unwrap_or({
             if replace_default {
                 0
             } else {

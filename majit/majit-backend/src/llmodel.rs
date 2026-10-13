@@ -219,7 +219,7 @@ impl<'a> FailArgSource<'a> {
 
     #[inline]
     pub fn first(&self) -> Option<i64> {
-        (self.len() > 0).then(|| self.get(0))
+        (!self.is_empty()).then(|| self.get(0))
     }
 }
 
@@ -235,12 +235,12 @@ impl Clone for FailArgSource<'_> {
             } => Self::JitFrame {
                 root: OwnerRootGuard::new(root.get()),
                 descr: *descr,
-                rd_locs: *rd_locs,
+                rd_locs,
                 n: *n,
             },
             Self::LibcJitFrame { ptr, rd_locs, n } => Self::LibcJitFrame {
                 ptr: *ptr,
-                rd_locs: *rd_locs,
+                rd_locs,
                 n: *n,
             },
         }
@@ -299,14 +299,10 @@ pub fn fail_arg_source_from_frame<'a>(
 ) -> Option<FailArgSource<'a>> {
     if let Some(ptr) = frame.jitframe_ptr() {
         Some(FailArgSource::from_jitframe(ptr, descr, n))
-    } else if let Some(libc) = frame.as_libc_jitframe() {
-        Some(FailArgSource::from_libc_jitframe(
-            libc.frame_addr() as *const JitFrame,
-            descr,
-            n,
-        ))
     } else {
-        None
+        frame.as_libc_jitframe().map(|libc| {
+            FailArgSource::from_libc_jitframe(libc.frame_addr() as *const JitFrame, descr, n)
+        })
     }
 }
 

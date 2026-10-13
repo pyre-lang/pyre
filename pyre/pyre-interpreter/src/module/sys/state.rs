@@ -59,6 +59,12 @@ impl SysState {
     pub fn walk_roots(&self, _forward: &mut dyn FnMut(&mut pyre_object::PyObjectRef)) {}
 }
 
+impl Default for SysState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// `state.py get(space)` → the prebuilt space's State field.
 fn sys_state() -> &'static SysState {
     crate::baseobjspace::object_space().sys_state()

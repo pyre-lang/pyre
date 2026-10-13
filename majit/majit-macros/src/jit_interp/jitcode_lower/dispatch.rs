@@ -4097,9 +4097,7 @@ pub(crate) fn lower_dispatch_body(
     // that consumer-declared `greens = [<body-local>]` (say
     // `greens = [ok]`) resolve via `lowerer.bindings` when
     // `emit_promote_greens` and `resolve_greens` consult it below.
-    if bind_pre_merge_point_stmts(&mut lowerer, func_block).is_none() {
-        return None;
-    }
+    bind_pre_merge_point_stmts(&mut lowerer, func_block)?;
     if lowerer.dispatch_tainted_reason.is_some() {
         return None;
     }
@@ -4257,14 +4255,9 @@ pub(crate) fn lower_dispatch_body(
     let default_label = if classified_arms.is_empty() {
         let default_label = lowerer.alloc_label();
         lowerer.emit_aux(quote::quote! { let #default_label = __builder.new_label(); });
-        if lowerer
-            .transactional(|inner| {
-                lower_matchless_portal_body(inner, func_block, &loop_start_label)
-            })
-            .is_none()
-        {
-            return None;
-        }
+        lowerer.transactional(|inner| {
+            lower_matchless_portal_body(inner, func_block, &loop_start_label)
+        })?;
         default_label
     } else {
         // Pin pc-writes to i0 for the whole pre-dispatch walk. The branch-op

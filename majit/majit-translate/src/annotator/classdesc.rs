@@ -1692,9 +1692,9 @@ impl ClassDesc {
                 return Some(cdesc);
             }
             let next = cdesc.borrow().basedesc.clone();
-            match next {
-                Some(base) => cdesc = base,
-                None => return None,
+            {
+                let base = next?;
+                cdesc = base
             }
         }
     }

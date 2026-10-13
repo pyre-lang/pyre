@@ -2950,7 +2950,7 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
         // pointer identity.
         SomeValue::List(s) => {
             let listitem_ref = s.listdef.inner.listitem.borrow();
-            crate::annotator::listdef::journal_listitem_mutation(&*listitem_ref);
+            crate::annotator::listdef::journal_listitem_mutation(&listitem_ref);
             listitem_ref.borrow_mut().dont_change_any_more = true;
             ReprKey::List(std::rc::Rc::as_ptr(&*listitem_ref) as usize)
         }
@@ -2961,8 +2961,8 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
         SomeValue::Dict(s) => {
             let key_ref = s.dictdef.inner.dictkey.borrow();
             let value_ref = s.dictdef.inner.dictvalue.borrow();
-            crate::annotator::listdef::journal_listitem_mutation(&*key_ref);
-            crate::annotator::listdef::journal_listitem_mutation(&*value_ref);
+            crate::annotator::listdef::journal_listitem_mutation(&key_ref);
+            crate::annotator::listdef::journal_listitem_mutation(&value_ref);
             key_ref.borrow_mut().dont_change_any_more = true;
             value_ref.borrow_mut().dont_change_any_more = true;
             ReprKey::Dict {

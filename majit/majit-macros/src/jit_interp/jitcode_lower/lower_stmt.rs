@@ -270,11 +270,11 @@ impl<'c> Lowerer<'c> {
                     // declines the whole body, so the arm keeps running in the
                     // interpreter rather than jumping to the wrong head or
                     // falling through with the transfer gone.
-                    if cont.label.is_none() {
-                        if let Some(label) = self.dispatch_loop_label.clone() {
-                            self.emit_jump(&label);
-                            return Some(());
-                        }
+                    if cont.label.is_none()
+                        && let Some(label) = self.dispatch_loop_label.clone()
+                    {
+                        self.emit_jump(&label);
+                        return Some(());
                     }
                     // `stmt_contains_loop_control` fires on a bare `continue`,
                     // so the fallback refuses and records the reason.
@@ -543,7 +543,7 @@ impl<'c> Lowerer<'c> {
         // trace that records, compiles, and returns a wrong answer.
         if let Some(green) = self
             .config
-            .map(|config| green_idents(config))
+            .map(green_idents)
             .and_then(|greens| stmt_writes_green(stmt, &greens))
         {
             if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
@@ -2550,7 +2550,7 @@ fn stmt_writes_green(stmt: &Stmt, greens: &[String]) -> Option<String> {
             }
             let Some(id) = p.path.get_ident() else { return };
             let name = id.to_string();
-            if self.greens.iter().any(|green| *green == name) {
+            if self.greens.contains(&name) {
                 self.hit = Some(name);
             }
         }

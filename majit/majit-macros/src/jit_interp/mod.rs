@@ -2141,15 +2141,15 @@ fn classify_green_kind(
         return value_kind_from_type(&ty);
     }
     if let Some(local) = last_direct_local_before_portal(func, &name) {
-        if let Some((_, _, ty)) = local_pat_ident(&local.pat) {
-            if let Some(ty) = ty {
-                return value_kind_from_type(ty);
-            }
+        if let Some((_, _, ty)) = local_pat_ident(&local.pat)
+            && let Some(ty) = ty
+        {
+            return value_kind_from_type(ty);
         }
-        if let Some(init) = local.init.as_ref() {
-            if let Some(kind) = value_kind_from_expr(&init.expr) {
-                return kind;
-            }
+        if let Some(init) = local.init.as_ref()
+            && let Some(kind) = value_kind_from_expr(&init.expr)
+        {
+            return kind;
         }
     }
     ValueKind::Int
@@ -2286,10 +2286,10 @@ fn binding_value_kind(
         if let Some(ty) = &bind.ty {
             return value_kind_from_type(ty);
         }
-        if let Some(init) = &bind.init {
-            if let Some(kind) = value_kind_from_expr(init) {
-                return kind;
-            }
+        if let Some(init) = &bind.init
+            && let Some(kind) = value_kind_from_expr(init)
+        {
+            return kind;
         }
     }
     ValueKind::Int
@@ -4539,13 +4539,13 @@ fn rewrite_body(
 
                 let mut cloned = block.stmts[i].clone();
                 self.visit_stmt_mut(&mut cloned);
-                if let syn::Stmt::Local(local) = &block.stmts[i] {
-                    if let Some(bind) = scope_bind_from_local(local) {
-                        self.scopes
-                            .last_mut()
-                            .expect("visit_block_mut pushed a scope")
-                            .push(bind);
-                    }
+                if let syn::Stmt::Local(local) = &block.stmts[i]
+                    && let Some(bind) = scope_bind_from_local(local)
+                {
+                    self.scopes
+                        .last_mut()
+                        .expect("visit_block_mut pushed a scope")
+                        .push(bind);
                 }
                 new_stmts.push(cloned);
                 i += 1;

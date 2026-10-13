@@ -1366,7 +1366,7 @@ fn do_setslice(
             } else if pyre_object::bytearrayobject::is_bytearray(w_value) {
                 Some((
                     "bytearray",
-                    &*pyre_object::bytearrayobject::w_bytearray_data(w_value),
+                    pyre_object::bytearrayobject::w_bytearray_data(w_value),
                 ))
             } else {
                 None

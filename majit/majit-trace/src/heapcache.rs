@@ -683,10 +683,10 @@ impl HeapCache {
             && self.test_head_version(opref, boxes)
         {
             let kept_len = deps.first().cloned().flatten();
-            if let Some(length) = kept_len {
-                if let Some(rec) = boxes.heapc_mut(opref) {
-                    rec.deps = Some(vec![Some(length)]);
-                }
+            if let Some(length) = kept_len
+                && let Some(rec) = boxes.heapc_mut(opref)
+            {
+                rec.deps = Some(vec![Some(length)]);
             }
             for dep in deps.into_iter().skip(1).flatten() {
                 self._escape_box(dep, boxes);

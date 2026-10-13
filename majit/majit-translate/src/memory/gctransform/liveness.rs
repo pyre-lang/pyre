@@ -306,10 +306,10 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
             if let Some(t) = fd.signature.inputs.first().and_then(ty_id) {
                 out.insert(t);
             }
-        } else if name.ends_with("gc_roots::shadow_stack_get") {
-            if let Some(t) = ty_id(&fd.signature.output) {
-                out.insert(t);
-            }
+        } else if name.ends_with("gc_roots::shadow_stack_get")
+            && let Some(t) = ty_id(&fd.signature.output)
+        {
+            out.insert(t);
         }
     }
     // `PyError::pin`'s receiver names the handle, the way `pin_root` names
@@ -554,10 +554,9 @@ pub fn frame_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
         if FIRST_INPUT
             .iter()
             .any(|p| name == *p || name.ends_with(&format!("::{p}")))
+            && let Some(t) = fd.signature.inputs.first().and_then(ty_id)
         {
-            if let Some(t) = fd.signature.inputs.first().and_then(ty_id) {
-                out.insert(t);
-            }
+            out.insert(t);
         }
     }
     out
@@ -1393,14 +1392,14 @@ fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAs
                 defs.insert(d, src);
             }
         }
-        if let Some(TermKind::Call { call, .. }) = &terms[b] {
-            if let Some(d) = bare_local(&call.dest) {
-                if !defined.insert(d) {
-                    defs.remove(&d);
-                    call_dests.remove(&d);
-                } else {
-                    call_dests.insert(d);
-                }
+        if let Some(TermKind::Call { call, .. }) = &terms[b]
+            && let Some(d) = bare_local(&call.dest)
+        {
+            if !defined.insert(d) {
+                defs.remove(&d);
+                call_dests.remove(&d);
+            } else {
+                call_dests.insert(d);
             }
         }
     }
@@ -1655,7 +1654,7 @@ fn collects_after_pin(
     let n = body.block_calls.len();
     let mut producer_block = None;
     for (b, indices) in body.block_calls.iter().enumerate() {
-        if indices.iter().any(|&i| i == producer) {
+        if indices.contains(&producer) {
             producer_block = Some(b);
             break;
         }

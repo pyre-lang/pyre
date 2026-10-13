@@ -156,7 +156,7 @@ pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     #[cfg(all(unix, not(target_arch = "wasm32"), feature = "host_env"))]
     {
         let conv = localeconv_from_lconv(unsafe { localeconv() });
-        return (conv.decimal_point, conv.thousands_sep, conv.grouping);
+        (conv.decimal_point, conv.thousands_sep, conv.grouping)
     }
     #[cfg(all(windows, feature = "host_env"))]
     {
@@ -185,7 +185,7 @@ pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u
         if ptr.is_null() {
             return Err(LocaleError::Unsupported);
         }
-        return Ok(unsafe { crate::rffi::charp2str(ptr) });
+        Ok(unsafe { crate::rffi::charp2str(ptr) })
     }
     #[cfg(all(windows, feature = "host_env"))]
     {

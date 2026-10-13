@@ -1055,7 +1055,7 @@ fn angle_wrapper_inner(spelling: &str, leaves: &[&str]) -> Option<String> {
         return None;
     }
     let leaf = head.trim().rsplit("::").next().unwrap_or(head.trim());
-    if !leaves.iter().any(|name| *name == leaf) {
+    if !leaves.contains(&leaf) {
         return None;
     }
     let inner = &rest[..rest.len() - 1];
@@ -3256,10 +3256,11 @@ impl Bookkeeper {
             let guard = self.struct_fields.borrow();
             if let Some(exact) = guard.as_ref().and_then(|r| r.fields.get(n)) {
                 for (fname, fty) in &mut fields {
-                    if let Some((_, exact_ty)) = exact.iter().find(|(en, _)| en == fname) {
-                        if fty.contains("??") && !exact_ty.contains("??") {
-                            *fty = exact_ty.clone();
-                        }
+                    if let Some((_, exact_ty)) = exact.iter().find(|(en, _)| en == fname)
+                        && fty.contains("??")
+                        && !exact_ty.contains("??")
+                    {
+                        *fty = exact_ty.clone();
                     }
                 }
             }
@@ -5321,10 +5322,9 @@ pub(crate) fn func_type_from_fn_spelling(
     let after = after_args.trim();
     let result = if after.is_empty() {
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void
-    } else if let Some(ret) = after.strip_prefix("->") {
-        fn_ptr_result_lltype(ret.trim(), bk)
     } else {
-        return None;
+        let ret = after.strip_prefix("->")?;
+        fn_ptr_result_lltype(ret.trim(), bk)
     };
     Some(FuncType { args, result })
 }

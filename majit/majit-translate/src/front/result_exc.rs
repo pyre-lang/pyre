@@ -1026,10 +1026,10 @@ fn detach_joined_from_residual(
             let Some(var) = link.args[0].as_variable() else {
                 continue;
             };
-            if let Some(slot) = inputarg_slot(graph, var) {
-                if !phis.contains(&slot) {
-                    phis.push(slot);
-                }
+            if let Some(slot) = inputarg_slot(graph, var)
+                && !phis.contains(&slot)
+            {
+                phis.push(slot);
             }
         }
     }
@@ -5005,8 +5005,7 @@ fn catch_and_rewrap(
     // that still inspects the shell itself keeps the rebuild.
     if let (Some(ok_shell), Some(err_shell), Some(ok_payload), Some(err_payload)) =
         (n_shell, e_shell, ok_payload, err_payload)
-    {
-        if let Err(msg) = collapse_rebuilt_shell_match(
+        && let Err(msg) = collapse_rebuilt_shell_match(
             graph,
             n_id.0,
             e_id.0,
@@ -5014,17 +5013,17 @@ fn catch_and_rewrap(
             &err_shell,
             &ok_payload,
             &err_payload,
-        ) {
-            // The rewrap above is the fail-safe. A collapse refusal must
-            // stay visible to the census the same way a drain-fusion
-            // refusal does; dropping the `Err` here used to hide it.
-            crate::decline::record_reason(
-                RESULT_EXC_CALLER_GATE,
-                "rebuilt-shell-collapse-declined",
-                &msg,
-                &graph.name,
-            );
-        }
+        )
+    {
+        // The rewrap above is the fail-safe. A collapse refusal must
+        // stay visible to the census the same way a drain-fusion
+        // refusal does; dropping the `Err` here used to hide it.
+        crate::decline::record_reason(
+            RESULT_EXC_CALLER_GATE,
+            "rebuilt-shell-collapse-declined",
+            &msg,
+            &graph.name,
+        );
     }
     Ok(())
 }
@@ -5110,7 +5109,7 @@ fn rename_block_variables(graph: &mut FunctionGraph, block: usize, from: &Variab
     let body = &mut graph.blocks[block];
     body.inputargs = body.inputargs.iter().map(&remap).collect();
     for op in &mut body.operations {
-        op.result = op.result.as_ref().map(&remap);
+        op.result = op.result.as_ref().map(remap);
         op.kind = crate::inline::remap_op_kind(&op.kind, &remap);
     }
     let (sw, exits) =
@@ -7698,7 +7697,7 @@ fn origin_link_arg(
         // A restore hop's cast / `RootScope::get` result is not an inputarg.
         // Follow that one operand back to the value the link actually carries.
         loop {
-            if graph.blocks[succ].inputargs.iter().any(|v| *v == current) {
+            if graph.blocks[succ].inputargs.contains(&current) {
                 break;
             }
             let Some((src, origin)) = restore_def_source(graph, succ, &current, chain) else {
@@ -8574,16 +8573,16 @@ fn classify_slot_value(
         .position(|op| op.result.as_ref() == Some(var))
     {
         let kind = &graph.blocks[source].operations[op_idx].kind;
-        if let OpKind::Call { target, .. } = kind {
-            if result_ctor_kind(target).is_some() || is_control_flow_ctor(target) {
-                if result_ctor_kind(target).is_some()
-                    && forwards_to_returnblock(graph, source, var).is_ok()
-                {
-                    return Ok(SlotAction::LeaveCtor);
-                }
-                let field = shell_field_write(graph, source, var);
-                return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
+        if let OpKind::Call { target, .. } = kind
+            && (result_ctor_kind(target).is_some() || is_control_flow_ctor(target))
+        {
+            if result_ctor_kind(target).is_some()
+                && forwards_to_returnblock(graph, source, var).is_ok()
+            {
+                return Ok(SlotAction::LeaveCtor);
             }
+            let field = shell_field_write(graph, source, var);
+            return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
         }
         if is_branch_result(graph, var) {
             return Err(format!(
@@ -9171,14 +9170,14 @@ fn rewire_merged_target(
                         }
                         SlotAction::Project(mut projection) => {
                             projection.pos = *pos;
-                            if projection.field.is_none() {
-                                if let Some((field, ty)) = pos0_read_field(
+                            if projection.field.is_none()
+                                && let Some((field, ty)) = pos0_read_field(
                                     graph,
                                     target.0,
                                     &graph.blocks[target.0].inputargs[*pos],
-                                ) {
-                                    projection.field = Some((field, ty));
-                                }
+                                )
+                            {
+                                projection.field = Some((field, ty));
                             }
                             projections.push(projection);
                         }
@@ -9217,14 +9216,13 @@ fn rewire_merged_target(
         reminted.push(plan.call_result.clone());
     }
     for plan in &adjusts {
-        if let Some((call_block, result, payload_ty)) = &plan.remint {
-            if !reminted.contains(result) {
-                let payload =
-                    remint_call_as_payload(graph, *call_block, result, payload_ty.clone());
-                replace_exit_value(graph, *call_block, result, &payload);
-                payloads.push(payload);
-                reminted.push(result.clone());
-            }
+        if let Some((call_block, result, payload_ty)) = &plan.remint
+            && !reminted.contains(result)
+        {
+            let payload = remint_call_as_payload(graph, *call_block, result, payload_ty.clone());
+            replace_exit_value(graph, *call_block, result, &payload);
+            payloads.push(payload);
+            reminted.push(result.clone());
         }
     }
     for plan in &adjusts {
@@ -9920,9 +9918,9 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
             .filter(|(_, op)| !is_frame_exit_cleanup(&op.kind))
             .map(|(i, _)| i)
             .collect();
-        let (op, type_result) = match non_close.as_slice() {
-            &[i] => (&succ.operations[i], None),
-            &[i, j] => {
+        let (op, type_result) = match *non_close.as_slice() {
+            [i] => (&succ.operations[i], None),
+            [i, j] => {
                 let type_op = &succ.operations[j];
                 let OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },

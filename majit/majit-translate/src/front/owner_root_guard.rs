@@ -124,10 +124,9 @@ fn ref_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     let obj = node.as_object()?;
     let inner = if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
         arr.get(1)?
-    } else if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
-        arr.first()?
     } else {
-        return None;
+        let arr = obj.get("RawPtr").and_then(serde_json::Value::as_array)?;
+        arr.first()?
     };
     serde_json::from_value(inner.clone()).ok()
 }

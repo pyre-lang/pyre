@@ -1626,12 +1626,12 @@ fn charmap_decode_impl(
             // output.  Minting a one-character object per byte only to read it
             // back below costs an allocation per input byte, which is more
             // than the table read it wraps.
-            if let Some(cp) = chars.get(b as usize).copied() {
-                if cp.to_u32() != 0xFFFE {
-                    out.push(cp);
-                    i += 1;
-                    continue;
-                }
+            if let Some(cp) = chars.get(b as usize).copied()
+                && cp.to_u32() != 0xFFFE
+            {
+                out.push(cp);
+                i += 1;
+                continue;
             }
             // A byte past the table's end and the `￾` sentinel are both
             // "undefined", and reach the error handler the same way.

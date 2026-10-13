@@ -112,7 +112,7 @@ fn assemble_header() -> Vec<u8> {
     let mut content = Vec::new();
     content.extend_from_slice(&JITLOG_VERSION.to_le_bytes());
     content.push(0); // 64-bit
-    content.extend_from_slice(&encode_str(&std::env::consts::ARCH));
+    content.extend_from_slice(&encode_str(std::env::consts::ARCH));
     content.push(MARK_RESOP_META);
     let opcodes: Vec<OpCode> = OpCode::all().collect();
     content.extend_from_slice(&encode_le_16bit(opcodes.len() as u16));

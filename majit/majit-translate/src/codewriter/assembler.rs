@@ -3798,12 +3798,11 @@ impl AssemblerEncode for Assembler {
         // `initialize_prebuilt_data` `classdesc.read_attribute`).  Recover
         // `(qualname, tag)` from the constant itself so `emit_const_r`
         // does not need a side table of instance identities.
-        if let ConstValue::HostObject(obj) = value {
-            if let Some((qualname, tag)) =
+        if let ConstValue::HostObject(obj) = value
+            && let Some((qualname, tag)) =
                 crate::translator::rtyper::unit_variant_fold::unit_variant_const_from_host(obj)
-            {
-                return self.emit_unit_variant_const_r(qualname, tag, state);
-            }
+        {
+            return self.emit_unit_variant_const_r(qualname, tag, state);
         }
         if let ConstValue::HostObject(obj) = value
             && let Some((class_name, message)) = exception_instance_spec(obj)

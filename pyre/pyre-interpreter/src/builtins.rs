@@ -2974,7 +2974,7 @@ fn memoryview_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// Python 3.14 `memoryview.index(value, start=0, stop=sys.maxsize)`.
 fn memoryview_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let n_args = args.len();
-    if n_args < 2 || n_args > 4 {
+    if !(2..=4).contains(&n_args) {
         return Err(crate::PyError::type_error(format!(
             "index expected at most 3 arguments, got {}",
             n_args.saturating_sub(1)
@@ -8377,7 +8377,7 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             // optional is `_metadata`, which `traceback.py` reads back as
             // `(line, offset, source)`. Five fields parse as well. The
             // `end_offset` check runs after the stores.
-            4 | 5 | 6 | 7 => {
+            4..=7 => {
                 let w_self = pyre_object::gc_roots::shadow_stack_get(base);
                 unsafe {
                     pyre_object::interp_exceptions::w_exception_set_syntax_filename(
@@ -10282,8 +10282,8 @@ unsafe fn exc_args_w_of_five(
         pyre_object::gc_roots::shadow_stack_get(slot5),
     );
     // The cast is its own local so the return is the block reference.
-    let args_w = block as PyObjectRef;
-    args_w
+
+    block as PyObjectRef
 }
 
 /// The fixed `args_w` list of four positionals; see [`exc_args_w_of_five`].
@@ -10320,8 +10320,8 @@ unsafe fn exc_args_w_of_four(
         pyre_object::gc_roots::shadow_stack_get(slot4),
     );
     // The cast is its own local so the return is the block reference.
-    let args_w = block as PyObjectRef;
-    args_w
+
+    block as PyObjectRef
 }
 
 // `descr_new_base_exception(space, w_subtype, __args__)` as the gateway the
@@ -18201,11 +18201,7 @@ fn leading_unexpected_indent_span(source: &str) -> Option<(usize, usize)> {
             // CPython `tok_get_normal_mode` resets both indentation columns
             // at a formfeed. Whitespace before it therefore cannot make the
             // first logical line indented; whitespace after it still can.
-            has_effective_indent = if bytes[indent] == b'\x0c' {
-                false
-            } else {
-                true
-            };
+            has_effective_indent = bytes[indent] != b'\x0c';
             indent += 1;
         }
         let content = line[indent..].trim_end_matches(['\r', '\n']);
@@ -18382,10 +18378,10 @@ fn compound_suite_header_at(source: &str, loc: usize) -> bool {
         }
     }
     let mut rest = source[i..loc].trim_start();
-    if let Some(after) = rest.strip_prefix("async") {
-        if after.starts_with(|c: char| c.is_whitespace()) {
-            rest = after.trim_start();
-        }
+    if let Some(after) = rest.strip_prefix("async")
+        && after.starts_with(|c: char| c.is_whitespace())
+    {
+        rest = after.trim_start();
     }
     const HEADERS: &[&str] = &[
         "try", "if", "elif", "else", "for", "while", "with", "class", "def", "except", "finally",
@@ -20641,7 +20637,7 @@ pub(crate) fn _hash_float(v: f64) -> i64 {
 #[inline(always)]
 fn tuple_hash_mix(acc: u64, lane: u64) -> u64 {
     let mut acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
-    acc = (acc << 31) | (acc >> 33);
+    acc = acc.rotate_left(31);
     acc.wrapping_mul(XXPRIME_1)
 }
 
@@ -23166,10 +23162,10 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // interp_fileio.py descr_init: every successful open resets
         // blksize to DEFAULT_BUFFER_SIZE, then overrides when st_blksize > 1.
         fileio.set_blksize(crate::module::_io::DEFAULT_BUFFER_SIZE);
-        if let Some(blksize) = fileio_stat_field(opened, "__file_stat_blksize__") {
-            if blksize > 1 {
-                fileio.set_blksize(blksize);
-            }
+        if let Some(blksize) = fileio_stat_field(opened, "__file_stat_blksize__")
+            && blksize > 1
+        {
+            fileio.set_blksize(blksize);
         }
     } else {
         let public_mode_slot = pyre_object::gc_roots::shadow_stack_len();

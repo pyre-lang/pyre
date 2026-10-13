@@ -166,7 +166,7 @@ impl RecentPureOps {
                  (stored, resolved): (OpRef, Option<&Operand>)| match (
                     query, resolved,
                 ) {
-                    (Some(query), Some(stored)) => query.same_box(&stored),
+                    (Some(query), Some(stored)) => query.same_box(stored),
                     _ => ctx.same_box(raw, stored),
                 };
             match args.len() {
@@ -424,10 +424,8 @@ impl RecentPureOpTable {
     /// `pure.py OptPure.__init__` builds `_pure_operations` once; `setup`
     /// does not reallocate it.
     fn clear(&mut self) {
-        for bucket in &mut self.buckets {
-            if let Some(ops) = bucket {
-                ops.clear();
-            }
+        for ops in self.buckets.iter_mut().flatten() {
+            ops.clear();
         }
     }
 }

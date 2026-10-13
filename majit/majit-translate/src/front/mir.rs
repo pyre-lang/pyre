@@ -2112,9 +2112,9 @@ impl<'l> CrateLowering<'l> {
             req.leaf,
             module_path,
             &signature,
-            &known_trait_names,
-            &dont_look_inside,
-            &elidable_residual,
+            known_trait_names,
+            dont_look_inside,
+            elidable_residual,
             func_hints,
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
@@ -2196,14 +2196,14 @@ impl<'l> CrateLowering<'l> {
             body,
             static_addrs,
             jitdriver_receiver_roots,
-            &struct_field_attrs,
-            &struct_fields,
-            &dont_look_inside,
-            &tombstoned_leaves,
+            struct_field_attrs,
+            struct_fields,
+            dont_look_inside,
+            tombstoned_leaves,
             gc_struct_ids,
             builder_mode,
             &accum,
-            &root_stack,
+            root_stack,
             Some(spec_queue),
             true,
             Some(spec.segments.join("::")),
@@ -2958,10 +2958,9 @@ pub(crate) fn shaped_array_parts(shape: &str) -> Option<(&str, usize)> {
     let shape = shape.trim();
     let inner = if let Some(rest) = shape.strip_prefix("Array<") {
         rest.strip_suffix('>')?
-    } else if let Some(rest) = shape.strip_prefix('[') {
-        rest.strip_suffix(']')?
     } else {
-        return None;
+        let rest = shape.strip_prefix('[')?;
+        rest.strip_suffix(']')?
     };
     let (item, len) = inner.rsplit_once(';')?;
     let item = item.trim();
@@ -3348,11 +3347,10 @@ fn derive_program_metadata(
                 let unresolved = exact_layouts
                     .get(&sid)
                     .is_none_or(|exact| exact.field_offsets.is_empty());
-                if unresolved {
-                    if let Some(exact) = crate::codeobject_layout::exact_layout_for(&canonical_name)
-                    {
-                        exact_layouts.insert(sid, exact);
-                    }
+                if unresolved
+                    && let Some(exact) = crate::codeobject_layout::exact_layout_for(&canonical_name)
+                {
+                    exact_layouts.insert(sid, exact);
                 }
                 // `bare leaf → crate-relative module`: drop the crate
                 // prefix (first segment) and the leaf (last segment) so
@@ -4769,8 +4767,8 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         jitdriver_receiver_roots,
         struct_field_attrs,
         struct_fields,
-        &dont_look_inside,
-        &tombstoned_leaves,
+        dont_look_inside,
+        tombstoned_leaves,
         gc_struct_ids,
         builder_mode,
         &accum,
@@ -4899,7 +4897,7 @@ pub fn residual_owner_root_guard_escapes(llbc: &Llbc) -> Vec<(String, String)> {
 /// and the proof cannot drift.
 fn local_def_counts(body: &Unstructured, llbc: &Llbc, n: usize) -> Vec<usize> {
     let mut def_count = vec![0usize; n];
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -11106,7 +11104,7 @@ impl<'a> Lowering<'a> {
                 base,
                 index,
                 field: FieldDescriptor::new(field_name, Some(owner_root.to_string()))
-                    .with_owner_id(owner_id.clone())
+                    .with_owner_id(*owner_id)
                     .with_base_is_deref(true)
                     .with_inline_vec(
                         field_ty_is_inline_vec(field_ty, self.llbc)
@@ -11781,15 +11779,12 @@ impl<'a> Lowering<'a> {
                     // first word overwrites the discriminant.
                     if self.struct_field_offset_from_payload(&field_base_ty, field_payload)
                         == Some(0)
+                        && let Some(plan) = self.move_plan(dest_ty)
+                        && !plan.arms.is_empty()
+                        && let LinkArg::Value(src) = &value
                     {
-                        if let Some(plan) = self.move_plan(dest_ty) {
-                            if !plan.arms.is_empty() {
-                                if let LinkArg::Value(src) = &value {
-                                    self.write_aggregate_into(mir_bb, &base, &plan, src)?;
-                                    return Ok(());
-                                }
-                            }
-                        }
+                        self.write_aggregate_into(mir_bb, &base, &plan, src)?;
+                        return Ok(());
                     }
                     // A by-value store of an inlined struct is one setfield
                     // per inner leaf (`heaptracker.py all_fielddescrs`
@@ -12399,14 +12394,11 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             let arg_local = arg_locals.get(index).copied().flatten();
-            match self.classify_gc_mut_ref_arg(arg_local) {
-                Ok(GcMutRefArg::CellParam(local)) => {
-                    let Some(root) = self.gc_mut_ref_param_root(local) else {
-                        continue;
-                    };
-                    plan.push((index, root, local));
-                }
-                _ => {}
+            if let Ok(GcMutRefArg::CellParam(local)) = self.classify_gc_mut_ref_arg(arg_local) {
+                let Some(root) = self.gc_mut_ref_param_root(local) else {
+                    continue;
+                };
+                plan.push((index, root, local));
             }
         }
         let copies = Vec::new();
@@ -14834,7 +14826,7 @@ impl<'a> Lowering<'a> {
                                 res,
                             ));
                         }
-                        return Ok(self.retag_error_carrier(dest_ty, value));
+                        Ok(self.retag_error_carrier(dest_ty, value))
                     }
                     AggregateShape::Ctor(ctor) => {
                         // A pair-slice operand is its pointer here and its
@@ -16314,10 +16306,8 @@ impl<'a> Lowering<'a> {
             .zip(copies.iter())
             .map(|(orig, copy)| (orig.id(), copy.clone()))
             .collect();
-        for slot in &mut self.local_var {
-            if let Some(value) = slot {
-                value.remap_words(&remap);
-            }
+        for value in self.local_var.iter_mut().flatten() {
+            value.remap_words(&remap);
         }
         self.remap_forwarded_provenance(&remap);
         let fail = self.graph.create_block();
@@ -18526,9 +18516,9 @@ fn declared_vable_array_var(graph: &FunctionGraph, var: &Variable) -> Option<Var
         if declared {
             return Some(current);
         }
-        match base {
-            Some(next) => current = next,
-            None => return None,
+        {
+            let next = base?;
+            current = next
         }
     }
     None
@@ -21617,7 +21607,7 @@ impl<'a> Lowering<'a> {
                         let PlaceKind::Local(dst) = place.kind else {
                             return None;
                         };
-                        if aggregate_ctor_name(&kind) != "Array" || array.is_some() {
+                        if aggregate_ctor_name(kind) != "Array" || array.is_some() {
                             return None;
                         }
                         let mut vals = Vec::with_capacity(operands.len());
@@ -21734,7 +21724,7 @@ impl<'a> Lowering<'a> {
                         let PlaceKind::Local(dst) = place.kind else {
                             return None;
                         };
-                        if aggregate_ctor_name(&kind) != "Array" || array.is_some() {
+                        if aggregate_ctor_name(kind) != "Array" || array.is_some() {
                             return None;
                         }
                         let mut vals = Vec::with_capacity(operands.len());
@@ -29593,13 +29583,11 @@ impl<'a> Lowering<'a> {
         if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && crate::front::from_size_align::is_layout_from_size_align_target(target)
-        {
-            if let Some(site) = self
+            && let Some(site) = self
                 .recognize_from_size_align_call_site(dest_class_ty, &result_var)
                 .or_else(|| self.recognize_from_size_align_call_site(&call.dest.ty, &result_var))
-            {
-                self.from_size_align_call_sites.push(site);
-            }
+        {
+            self.from_size_align_call_sites.push(site);
         }
         // Capture `Layout::size` / `Layout::align` on a virtualized
         // `{size, align}` aggregate.  Both are opaque core accessors with
@@ -32197,10 +32185,10 @@ impl<'a> Lowering<'a> {
     /// tag) is that many bytes, so a 16-byte `Union` still moves field by
     /// field when a payload is not an integer.
     fn span_raw_for_ty(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
-        if let Some(node) = tyref_node(ty, self.llbc) {
-            if let Some(descr) = json_ty_raw_store_descr(node, self.llbc) {
-                return Some(descr);
-            }
+        if let Some(node) = tyref_node(ty, self.llbc)
+            && let Some(descr) = json_ty_raw_store_descr(node, self.llbc)
+        {
+            return Some(descr);
         }
         if tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
             return Some((
@@ -33604,7 +33592,7 @@ impl<'a> Lowering<'a> {
                     };
                     if let PlaceKind::Local(i) = &src.kind {
                         followed = Some(*i as usize);
-                    } else if self.place_lowlevel_is_fixed_object_array(&src) {
+                    } else if self.place_lowlevel_is_fixed_object_array(src) {
                         is_fixed = true;
                     }
                 }
@@ -38541,7 +38529,7 @@ impl<'a> Lowering<'a> {
             .flat_map(|block| &block.operations)
             .find_map(|op| {
                 (op.result.as_ref() == Some(count))
-                    .then(|| match &op.kind {
+                    .then_some(match &op.kind {
                         OpKind::ConstInt(n) if *n >= 0 => Some(*n as u64),
                         OpKind::ConstUInt(n) => Some(*n),
                         _ => None,
@@ -40969,7 +40957,7 @@ fn operand_produced_by_get_eval_fn(body: &Unstructured, llbc: &Llbc, operand: &O
     let PlaceKind::Local(local) = place.kind else {
         return false;
     };
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41109,7 +41097,7 @@ fn compute_binop_result_locals(
     body: &Unstructured,
 ) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41141,14 +41129,14 @@ fn compute_multi_assigned_locals(
             *counts.entry(i as usize).or_insert(0) += 1;
         }
     };
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
-                bump(&place);
+                bump(place);
             }
         }
         if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
@@ -41432,7 +41420,7 @@ impl AccumulatorFacts {
             }
         }
         let mut append_piece_accumulator = vec![None; n];
-        let forward_blocks = forward_reachable_mask(llbc, &body);
+        let forward_blocks = forward_reachable_mask(llbc, body);
         for c in owned_dests {
             if c >= n || !builder_mode[c] {
                 continue;
@@ -41487,7 +41475,7 @@ fn ref_temp_is_sole_append_arg(
     }
     let mut selected = 0usize;
     let mut other = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41506,10 +41494,8 @@ fn ref_temp_is_sole_append_arg(
                         other += 1;
                     }
                 }
-                Ok(StmtKind::Assert(a)) => {
-                    if operand_reads_local(&a.cond, rt) {
-                        other += 1;
-                    }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
                 }
                 _ => {}
             }
@@ -41541,10 +41527,8 @@ fn ref_temp_is_sole_append_arg(
                     other += 1;
                 }
             }
-            Ok(TermKind::Assert { assert, .. }) => {
-                if operand_reads_local(&assert.cond, rt) {
-                    other += 1;
-                }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
             }
             _ => {}
         }
@@ -41593,7 +41577,7 @@ fn clean_accumulator_ref_temps_scan(
     c: usize,
 ) -> Option<Vec<usize>> {
     let mut ref_temps: Vec<usize> = Vec::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41684,10 +41668,8 @@ fn clean_accumulator_ref_temps_scan(
                     return None;
                 }
             }
-            Ok(TermKind::Assert { assert, .. }) => {
-                if c_operand_kind(&assert.cond, c).is_some() {
-                    return None;
-                }
+            Ok(TermKind::Assert { assert, .. }) if c_operand_kind(&assert.cond, c).is_some() => {
+                return None;
             }
             _ => {}
         }
@@ -41796,7 +41778,7 @@ fn sole_string_alias_successor_scan(
     }
     let mut successor: Option<usize> = None;
     let mut other = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41908,7 +41890,7 @@ fn append_arg_of_borrow_scan(
     }
     let mut recv: Option<usize> = None;
     let mut other = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41936,10 +41918,8 @@ fn append_arg_of_borrow_scan(
                         other += 1;
                     }
                 }
-                Ok(StmtKind::Assert(a)) => {
-                    if operand_reads_local(&a.cond, rt) {
-                        other += 1;
-                    }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
                 }
                 _ => {}
             }
@@ -41962,10 +41942,8 @@ fn append_arg_of_borrow_scan(
                     other += 1;
                 }
             }
-            Ok(TermKind::Assert { assert, .. }) => {
-                if operand_reads_local(&assert.cond, rt) {
-                    other += 1;
-                }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
             }
             _ => {}
         }
@@ -42044,7 +42022,7 @@ fn append_piece_accumulator_of_arg_temp(
 ) -> Option<usize> {
     let cache = ScanCache::new(body.locals.locals.len());
     cache.precompute_fresh(body, llbc);
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for candidate in owned_builder_dest_locals(body, llbc) {
         if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
             continue;
@@ -42092,7 +42070,7 @@ fn accumulator_materialization_site_count(
     }
     let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
     let mut moves = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42153,7 +42131,7 @@ fn accumulator_materialization_site_count(
 fn single_def_is_str_builder_ctor(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     let mut defs = 0usize;
     let mut ctor = false;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42501,7 +42479,7 @@ fn is_vec_index_mut_call(
 /// the `base` local the slice aliases. See [`str_chars_view_base`].
 fn str_chars_view_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42618,7 +42596,7 @@ fn operand_place(op: &Operand) -> Option<&Place> {
 fn defining_call(llbc: &Llbc, body: &Unstructured, local: usize) -> Option<CallPayload> {
     let mut found = None;
     let mut producers = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42665,7 +42643,7 @@ fn vtable_slot_under_fn_ptr_cast(
 fn defining_assign<'a>(llbc: &Llbc, body: &'a Unstructured, local: usize) -> Option<&'a Rvalue> {
     let mut found = None;
     let mut producers = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42869,7 +42847,7 @@ fn rvalue_copied_local(rvalue: &Rvalue) -> Option<usize> {
 fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local: usize) -> bool {
     let mut alias = vec![dest_local];
     let mut grew = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while grew {
         grew = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -43118,7 +43096,7 @@ fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::Call
 /// `pin_root`, with an optional `<Impl>` segment between them.
 fn gc_root_pin_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.last() == Some(&"pin_root") && segments.iter().any(|s| *s == "gc_roots")
+    segments.last() == Some(&"pin_root") && segments.contains(&"gc_roots")
 }
 
 /// The root-bracket guard type and the call that closes one.
@@ -43133,15 +43111,15 @@ pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
 /// True for the root-bracket guard's own type path.
 fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+    segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&"drop_in_place")
-        && segments.iter().any(|s| *s == "gc_roots")
-        && segments.iter().any(|s| *s == "RootScope")
+        && segments.contains(&"gc_roots")
+        && segments.contains(&"RootScope")
 }
 
 /// `Drop` terminator JSON for `RootScope`, recovered from a `FunDecl`
@@ -43179,8 +43157,7 @@ fn frame_anchor_drop_glue_path(name: &str) -> bool {
     // Charon names the Drop impl `FrameAnchor::drop`; the MIR
     // terminator glue is `drop_in_place`. Either must close the
     // `frame_anchor_new_jit_abi` slot.
-    (last == Some("drop_in_place") || last == Some("drop"))
-        && segments.iter().any(|s| *s == "FrameAnchor")
+    (last == Some("drop_in_place") || last == Some("drop")) && segments.contains(&"FrameAnchor")
 }
 
 fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -43582,7 +43559,7 @@ fn place_ty_is_root_scope(place: &Place, llbc: &Llbc) -> bool {
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -43653,7 +43630,7 @@ fn unit_tyref() -> TyRef {
 /// carries the stamp for the same reason.
 fn gc_root_gcref_result_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.iter().any(|s| *s == "gc_roots")
+    segments.contains(&"gc_roots")
         && matches!(
             segments.last(),
             Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get") | Some(&"reload_top_root")
@@ -43829,7 +43806,7 @@ fn base_traces_to_items_block_accessor_matching(
     matches_accessor: fn(&RegularCall, &Llbc) -> bool,
 ) -> bool {
     let mut cur = base;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for _ in 0..32 {
         let mut producers = 0usize;
         let mut copy_src: Option<usize> = None;
@@ -44035,7 +44012,7 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
         write_derefs: 0,
         other: 0,
     };
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -44043,9 +44020,9 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_dest_ref(&rvalue, dest, &mut census.read_derefs, &mut census.other);
+                    scan_rvalue_dest_ref(rvalue, dest, &mut census.read_derefs, &mut census.other);
                     classify_write_place(
-                        &place,
+                        place,
                         dest,
                         &mut census.defs,
                         &mut census.write_derefs,
@@ -44062,7 +44039,7 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_dest_ref(
-                operand_dest_ref(&discr, dest),
+                operand_dest_ref(discr, dest),
                 &mut census.read_derefs,
                 &mut census.other,
             ),
@@ -44236,7 +44213,7 @@ fn struct_field_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> StructF
         fields: 0,
         other: 0,
     };
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -44244,9 +44221,9 @@ fn struct_field_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> StructF
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_struct_field(&rvalue, dest, &mut census.fields, &mut census.other);
+                    scan_rvalue_struct_field(rvalue, dest, &mut census.fields, &mut census.other);
                     classify_struct_field_write(
-                        &place,
+                        place,
                         dest,
                         &mut census.defs,
                         &mut census.fields,
@@ -44263,7 +44240,7 @@ fn struct_field_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> StructF
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_struct_field_use(
-                operand_struct_field_use(&discr, dest),
+                operand_struct_field_use(discr, dest),
                 &mut census.fields,
                 &mut census.other,
             ),
@@ -44427,7 +44404,7 @@ fn operand_root_local(op: &Operand) -> Option<usize> {
 /// A missing or repeated call declines the interior alias.
 fn ptr_add_def_site(llbc: &Llbc, body: &Unstructured, dest: usize) -> Option<(usize, usize)> {
     let mut found = None;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -44461,8 +44438,8 @@ fn stmt_has_struct_field_value_use(
     let mut other = 0usize;
     match stmt.stmt_kind_ref() {
         Ok(StmtKind::Assign(place, rvalue)) => {
-            scan_rvalue_struct_field(&rvalue, dest, &mut fields, &mut other);
-            if place_is_immediate_struct_field_of(&place, dest) {
+            scan_rvalue_struct_field(rvalue, dest, &mut fields, &mut other);
+            if place_is_immediate_struct_field_of(place, dest) {
                 fields += 1;
             }
         }
@@ -44609,10 +44586,10 @@ fn result_value_is_branched_or_returned(body: &Unstructured, llbc: &Llbc, dest: 
             if !matches!(place.kind, PlaceKind::Local(0)) {
                 continue;
             }
-            if let Rvalue::Use(op, _) = &*rvalue {
-                if operand_root_local(op) == Some(dest) {
-                    return true;
-                }
+            if let Rvalue::Use(op, _) = rvalue
+                && operand_root_local(op) == Some(dest)
+            {
+                return true;
             }
         }
     }
@@ -44655,10 +44632,10 @@ fn mir_successor_ids(llbc: &Llbc, bb: &BasicBlock) -> Vec<usize> {
 
 fn block_assigns_local(llbc: &Llbc, bb: &BasicBlock, local: usize) -> bool {
     for stmt in &bb.statements {
-        if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
-            if matches!(place.kind, PlaceKind::Local(i) if i as usize == local) {
-                return true;
-            }
+        if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+            && matches!(place.kind, PlaceKind::Local(i) if i as usize == local)
+        {
+            return true;
         }
     }
     matches!(
@@ -44705,7 +44682,7 @@ fn locals_assigned_reachable(
 fn header_producer(body: &Unstructured, llbc: &Llbc, cur: usize) -> Option<HeaderStep> {
     let mut producers = 0usize;
     let mut kind = HeaderProd::Stop;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -44853,8 +44830,8 @@ fn block_has_struct_field_value_use(llbc: &Llbc, bb: &BasicBlock, dest: usize) -
     for stmt in &bb.statements {
         match stmt.stmt_kind_ref() {
             Ok(StmtKind::Assign(place, rvalue)) => {
-                scan_rvalue_struct_field(&rvalue, dest, &mut fields, &mut other);
-                if place_is_immediate_struct_field_of(&place, dest) {
+                scan_rvalue_struct_field(rvalue, dest, &mut fields, &mut other);
+                if place_is_immediate_struct_field_of(place, dest) {
                     fields += 1;
                 }
             }
@@ -44870,7 +44847,7 @@ fn block_has_struct_field_value_use(llbc: &Llbc, bb: &BasicBlock, dest: usize) -
     }
     match bb.term_ref(llbc) {
         Ok(TermKind::Switch { discr, .. }) => bump_struct_field_use(
-            operand_struct_field_use(&discr, dest),
+            operand_struct_field_use(discr, dest),
             &mut fields,
             &mut other,
         ),
@@ -45417,7 +45394,7 @@ impl<'a> RootStackAnalyzer<'a> {
             self.call_returns_owned_scope(reg)
         });
         let covered = owned.covered_blocks(self.llbc, body, &name_of);
-        let forward_blocks = forward_reachable_mask(self.llbc, &body);
+        let forward_blocks = forward_reachable_mask(self.llbc, body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -45472,7 +45449,7 @@ impl<'a> RootStackAnalyzer<'a> {
                                     &owned.opener,
                                 )
                         });
-                        !owned_local && self.analyze_regular_call(&fn_ptr, seen)
+                        !owned_local && self.analyze_regular_call(fn_ptr, seen)
                     }
                     Ok(_) => false,
                     Err(_) => true,
@@ -45616,7 +45593,7 @@ fn owned_root_scopes(
     let moved = MovedOutLocals::new(body, llbc);
     let mut opener = std::collections::HashMap::new();
     let mut twice = bit_set::BitSet::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -45681,7 +45658,7 @@ fn body_returns_owned_scope(
     // Follow plain moves of a guard (`_21 = move _3`) to the local that
     // enters the aggregate.
     let mut guards = guards;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     loop {
         let before = guards.count();
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -46017,7 +45994,7 @@ fn root_bracket_region_dominators(
 fn root_pin_value_is_stable(llbc: &Llbc, body: &Unstructured, local: usize) -> bool {
     let mut definitions = usize::from(local > 0 && local <= body.locals.arg_count as usize);
     let watched: bit_set::BitSet = std::iter::once(local).collect();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46071,7 +46048,7 @@ fn root_pin_value_is_stable_in_bracket(
         _ => None,
     };
     let own_dests: bit_set::BitSet = own_gets.iter().filter_map(|&bb| get_dest(bb)).collect();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46162,7 +46139,7 @@ fn root_bracket_stack_effects_are_known(
                 continue;
             }
             Ok(TermKind::Drop { fn_ptr, .. }) => {
-                if touches(&fn_ptr) {
+                if touches(fn_ptr) {
                     return false;
                 }
             }
@@ -46514,7 +46491,8 @@ fn pin_value_incoming_slice_elem(
 ) -> Option<(usize, u64)> {
     let mut local = value;
     for _ in 0..8 {
-        if let Some(rvalue) = unique_assigned_rvalue(body, local, assigned, forward_blocks) {
+        {
+            let rvalue = unique_assigned_rvalue(body, local, assigned, forward_blocks)?;
             match rvalue {
                 Rvalue::Use(operand, _) => {
                     if let Some(place) = operand_place(&operand)
@@ -46546,8 +46524,6 @@ fn pin_value_incoming_slice_elem(
                 }
                 _ => return None,
             }
-        } else {
-            return None;
         }
     }
     None
@@ -46705,7 +46681,7 @@ fn classify_root_slot_getter_body(
     let mut getter_arg: Option<Operand> = None;
     let mut getter_call: Option<(usize, usize)> = None;
     let mut calls = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46813,7 +46789,7 @@ fn getter_returns_follow_call(
         );
     }
     let mut saw_return = false;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
@@ -48310,7 +48286,7 @@ fn analyze_root_brackets_with(
     let mut candidates = bit_set::BitSet::new();
     let mut opener_block: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -48578,7 +48554,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
+                    use_operand_slot_src(body, &assigned, operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -48618,7 +48594,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
+                    use_operand_slot_src(body, &assigned, operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -48670,8 +48646,7 @@ fn analyze_root_brackets_with(
             let PlaceKind::Local(dest) = place.kind else {
                 continue;
             };
-            let (Some(src), Some(k)) =
-                (operand_local(Some(&lhs)), operand_usize_literal(llbc, &rhs))
+            let (Some(src), Some(k)) = (operand_local(Some(lhs)), operand_usize_literal(llbc, rhs))
             else {
                 continue;
             };
@@ -48693,7 +48668,7 @@ fn analyze_root_brackets_with(
                 from_len,
                 from_run,
             };
-            match root_slot_sum_is_checked(&op) {
+            match root_slot_sum_is_checked(op) {
                 Some(true) => {
                     sums.insert(dest as usize, slot);
                 }
@@ -48718,7 +48693,7 @@ fn analyze_root_brackets_with(
             let (Operand::Copy(src) | Operand::Move(src)) = &operand else {
                 continue;
             };
-            let Some(sum) = checked_sum_field_local(&src, 0) else {
+            let Some(sum) = checked_sum_field_local(src, 0) else {
                 continue;
             };
             if let Some(slot) = sums.get(&sum).copied()
@@ -48746,7 +48721,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
+                    use_operand_slot_src(body, &assigned, operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -48832,7 +48807,7 @@ fn analyze_root_brackets_with(
                 }
                 // `_t = copy _slot`, the argument temporary (2.5) recorded,
                 // and a field of a tuple aggregate that names the same slot.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, &operand, &forward_blocks)) =>
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, operand, &forward_blocks)) =>
                 {
                     continue;
                 }
@@ -48864,7 +48839,7 @@ fn analyze_root_brackets_with(
                     place,
                     Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _),
                 )) if matches!(place.kind, PlaceKind::Local(d) if offsets.contains_key(&(d as usize)))
-                    && checked_sum_field_local(&src, 0)
+                    && checked_sum_field_local(src, 0)
                         .is_some_and(|sum| sums.contains_key(&sum)) =>
                 {
                     continue;
@@ -48945,17 +48920,15 @@ fn analyze_root_brackets_with(
                 if call.args.len() == 2
                     && free_leaf.as_deref() == Some("shadow_stack_copy_range")
                     && let Some(index) = operand_local(call.args.first())
-                {
-                    if let Some(scope) = bases
+                    && let Some(scope) = bases
                         .get(&index)
                         .copied()
                         .or_else(|| offsets.get(&index).map(|slot| slot.scope))
-                        && candidates.contains(scope)
-                    {
-                        range_copies.push((bb_idx, scope, index));
-                        free_sites.insert(bb_idx, scope);
-                        continue;
-                    }
+                    && candidates.contains(scope)
+                {
+                    range_copies.push((bb_idx, scope, index));
+                    free_sites.insert(bb_idx, scope);
+                    continue;
                 }
                 if call.args.len() == 1 && !dest_is_guard {
                     match free_leaf.as_deref() {
@@ -49806,7 +49779,7 @@ fn analyze_owner_roots_with(
     // reborrow `_u = &(*_t)` MIR inserts for an auto-deref receiver.
     let mut borrow_of: Vec<Option<usize>> = vec![None; n_locals];
     let mut changed = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -49823,7 +49796,7 @@ fn analyze_owner_roots_with(
                     continue;
                 };
                 let dest = dest as usize;
-                let Some(root) = owner_root_borrow_source(&src, &roots, &borrow_of) else {
+                let Some(root) = owner_root_borrow_source(src, &roots, &borrow_of) else {
                     continue;
                 };
                 match borrow_of.get(dest).copied() {
@@ -49979,7 +49952,7 @@ fn owner_root_borrow_source(
 /// the guard's own constructor.
 fn gc_root_scope_open_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    if !segments.iter().any(|s| *s == "gc_roots") {
+    if !segments.contains(&"gc_roots") {
         return false;
     }
     matches!(segments.last(), Some(&"push_roots"))
@@ -49990,7 +49963,7 @@ fn gc_root_scope_open_path(name: &str) -> bool {
 /// True for the read that answers a bracket's own first slot index.
 fn gc_root_scope_base_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    matches!(segments.last(), Some(&"base")) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+    matches!(segments.last(), Some(&"base")) && segments.contains(&ROOT_SCOPE_MODULE)
 }
 
 /// CFG successors the lowering keeps: `Goto` / `Call` / `Assert` / `Drop`
@@ -50322,7 +50295,7 @@ fn elaborate_explicit_root_closes(
         dest: usize,
     }
     let mut closes: Vec<Close> = Vec::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50641,7 +50614,7 @@ fn local_move_counts(body: &Unstructured, llbc: &Llbc) -> std::collections::Hash
         .collect();
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let mut out = std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50721,7 +50694,7 @@ fn root_scope_drop_sites(
 ) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50774,7 +50747,7 @@ fn compute_index_write_extra_live(
 ) -> Vec<Vec<usize>> {
     let mut index_call: std::collections::HashMap<usize, (Option<usize>, Option<usize>)> =
         std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50853,7 +50826,7 @@ fn compute_index_write_extra_live(
             let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() else {
                 continue;
             };
-            if let Some(p) = deref_write_base_local(&place)
+            if let Some(p) = deref_write_base_local(place)
                 && let Some((base, idx)) = index_call.get(&p)
             {
                 extra[bb_idx].extend(base.iter().copied());
@@ -50879,7 +50852,7 @@ fn compute_interior_field_extra_live(
     tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<Vec<usize>> {
     let mut extra = vec![Vec::new(); body.body.len()];
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50960,11 +50933,11 @@ fn compute_mir_liveness(
             };
             match kind {
                 StmtKind::Assign(place, rvalue) => {
-                    mark_rvalue_uses(&rvalue, &mut uses[bb_idx], &defs[bb_idx], n_locals);
-                    mark_place_write(&place, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
+                    mark_rvalue_uses(rvalue, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                    mark_place_write(place, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
                 }
                 StmtKind::PlaceMention(place) => {
-                    mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx], n_locals)
+                    mark_place_use(place, &mut uses[bb_idx], &defs[bb_idx], n_locals)
                 }
                 StmtKind::Assert(assert) => {
                     mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx], n_locals)
@@ -50984,7 +50957,7 @@ fn compute_mir_liveness(
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks)
             }
             TermKind::Switch { discr, targets } => {
-                mark_operand_use(&discr, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                mark_operand_use(discr, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 match targets {
                     SwitchTargets::If(a, b) => {
                         push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *a, n_blocks);
@@ -50999,7 +50972,7 @@ fn compute_mir_liveness(
                 }
             }
             TermKind::Call { call, target, .. } => {
-                mark_call_uses(&call, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                mark_call_uses(call, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 mark_place_write(&call.dest, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks);
             }
@@ -51010,7 +50983,7 @@ fn compute_mir_liveness(
             TermKind::Drop { place, target, .. } => {
                 // Glue calls read the dropped local; erased drops do not.
                 if glue_call_drops.contains(bb_idx) {
-                    mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                    mark_place_use(place, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 }
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks)
             }
@@ -51690,10 +51663,10 @@ fn pointer_elem_pointee_is_gc(
     else {
         return false;
     };
-    if let Some(def_id) = adt_node_def_id(pointee) {
-        if adt_path_is_gc_container(llbc, def_id) {
-            return true;
-        }
+    if let Some(def_id) = adt_node_def_id(pointee)
+        && adt_path_is_gc_container(llbc, def_id)
+    {
+        return true;
     }
     declared_adt_struct_id(pointee, llbc).is_some_and(|sid| gc_struct_ids.contains(&sid))
 }
@@ -52314,7 +52287,7 @@ fn unstructured_address_escape(
     // summary reads this once the join has settled.
     let mut returned_at = vec![None; n];
     let mut changed = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
         for (index, block) in body.body.iter().enumerate() {
@@ -54132,10 +54105,9 @@ fn pointer_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     let obj = node.as_object()?;
     let pointee = if let Some(parts) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
         parts.first()?
-    } else if let Some(parts) = obj.get("Ref").and_then(serde_json::Value::as_array) {
-        parts.get(1)?
     } else {
-        return None;
+        let parts = obj.get("Ref").and_then(serde_json::Value::as_array)?;
+        parts.get(1)?
     };
     serde_json::from_value(pointee.clone()).ok()
 }
@@ -55260,7 +55232,6 @@ pub(crate) fn collect_foreign_opaque_method_externals(
 /// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
 /// directly from its `<Impl>` NameSeg, the free-function twin of
 /// [`Lowering::resolve_impl_owner_adt_def_id`] over the `<Impl>` segment.
-#[cfg(any(test, feature = "mir-frontend"))]
 fn impl_owner_adt_def_id_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<u64> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
@@ -55297,7 +55268,6 @@ fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
 /// `Ref(Some(root))` so the residual intern's the enum-base ClassDef;
 /// every other shape (`Option`, fieldless enum, tuple, reference,
 /// non-opaque struct) is declined.
-#[cfg(any(test, feature = "mir-frontend"))]
 fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     // A reference return (`&T`) is not the owned residual result the
     // stub models; decline.
@@ -56232,14 +56202,13 @@ fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
             "Isize" | "Usize" => Some(crate::layout::target_word_size() as u64),
             _ => None,
         };
-        if let Some(int) = scalar.get("Integer").and_then(serde_json::Value::as_object) {
-            if let Some(kind) = int
+        if let Some(int) = scalar.get("Integer").and_then(serde_json::Value::as_object)
+            && let Some(kind) = int
                 .get("Signed")
                 .or_else(|| int.get("Unsigned"))
                 .and_then(serde_json::Value::as_str)
-            {
-                return scalar_size(kind);
-            }
+        {
+            return scalar_size(kind);
         }
         if let Some(kind) = scalar.get("Float").and_then(serde_json::Value::as_str) {
             return scalar_size(kind);
@@ -57065,10 +57034,10 @@ fn ty_is_raw_address(
     // `Option<*mut T>` has no niche (`*mut T` may be null), so it stays the
     // tagged Option instance: `flatten.py` `make_return` / `history.getkind`
     // of that CFG return is `ref`, and `FUNC.RESULT` must agree.
-    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
-        if !tyref_is_raw_pointer(&payload, llbc) {
-            return ty_is_raw_address(&payload, llbc, gc_struct_ids);
-        }
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
+        && !tyref_is_raw_pointer(&payload, llbc)
+    {
+        return ty_is_raw_address(&payload, llbc, gc_struct_ids);
     }
     false
 }
@@ -57887,10 +57856,7 @@ fn option_nonzero_word_kind_inner(ty: &TyRef, llbc: &Llbc, peel_shared: bool) ->
             return None;
         };
         if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            option = match llbc.dedup_body(id) {
-                Some(next) => next,
-                None => return None,
-            };
+            option = llbc.dedup_body(id)?;
             continue;
         }
         if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
@@ -57910,10 +57876,7 @@ fn option_nonzero_word_kind_inner(ty: &TyRef, llbc: &Llbc, peel_shared: bool) ->
                 return None;
             }
             peeled_ref = true;
-            option = match arr.get(1) {
-                Some(next) => next,
-                None => return None,
-            };
+            option = arr.get(1)?;
             continue;
         }
         break;
@@ -64786,9 +64749,9 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 | Ok(StmtKind::PlaceMention(_))
                 | Ok(StmtKind::Borrowck(_)) => {}
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    if let Some((arr_local, index_op)) = array_index_place(&place) {
+                    if let Some((arr_local, index_op)) = array_index_place(place) {
                         let index = arr_index(llbc, &locals, &index_op)?;
-                        let value = arr_as_i64(&eval_arr_rvalue(llbc, &locals, &rvalue, depth)?)?;
+                        let value = arr_as_i64(&eval_arr_rvalue(llbc, &locals, rvalue, depth)?)?;
                         let ArrVal::Arr(items) = locals.get_mut(&arr_local)? else {
                             return None;
                         };
@@ -64799,7 +64762,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                     let PlaceKind::Local(dst) = place.kind else {
                         return None;
                     };
-                    let value = eval_arr_rvalue(llbc, &locals, &rvalue, depth)?;
+                    let value = eval_arr_rvalue(llbc, &locals, rvalue, depth)?;
                     locals.insert(dst, value);
                 }
                 _ => return None,
@@ -64825,7 +64788,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 bb = *target as usize;
             }
             TermKind::Switch { discr, targets } => {
-                let ArrVal::Lit(ConstLit::Bool(cond)) = eval_arr_operand(llbc, &locals, &discr)?
+                let ArrVal::Lit(ConstLit::Bool(cond)) = eval_arr_operand(llbc, &locals, discr)?
                 else {
                     return None;
                 };
@@ -64838,7 +64801,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
-                locals.insert(dst, eval_arr_call(llbc, &locals, &call, depth)?);
+                locals.insert(dst, eval_arr_call(llbc, &locals, call, depth)?);
                 bb = *target as usize;
             }
             TermKind::UnwindResume
@@ -65281,7 +65244,7 @@ fn eval_const_struct_init(llbc: &Llbc, u: &Unstructured) -> Option<Vec<u64>> {
                 if dst >= n {
                     return None;
                 }
-                lits[dst] = Some(const_eval_size_align_call(llbc, &call)?);
+                lits[dst] = Some(const_eval_size_align_call(llbc, call)?);
                 structs[dst] = None;
                 bb = *target as usize;
             }
@@ -65426,7 +65389,7 @@ fn const_eval_init_body_with_locals(
                             {
                                 ConstLit::EnumDisc(disc)
                             } else {
-                                let index = const_transparent_aggregate_field(llbc, &kind)?;
+                                let index = const_transparent_aggregate_field(llbc, kind)?;
                                 eval_operand(&locals, operands.get(index)?)?
                             }
                         }
@@ -65465,7 +65428,7 @@ fn const_eval_init_body_with_locals(
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
-                let value = match const_eval_size_align_call(llbc, &call) {
+                let value = match const_eval_size_align_call(llbc, call) {
                     Some(value) => value,
                     None => {
                         let args = call
@@ -65473,7 +65436,7 @@ fn const_eval_init_body_with_locals(
                             .iter()
                             .map(|arg| eval_operand(&locals, arg))
                             .collect::<Option<Vec<_>>>()?;
-                        const_eval_const_fn_call(llbc, &call, &args, depth)?
+                        const_eval_const_fn_call(llbc, call, &args, depth)?
                     }
                 };
                 locals.insert(dst, value);
@@ -65881,10 +65844,9 @@ fn const_cast_int(n: i64, target: &serde_json::Value) -> Option<i64> {
         .and_then(serde_json::Value::as_object)?;
     let (signed, width) = if let Some(w) = int.get("Signed") {
         (true, w.as_str()?)
-    } else if let Some(w) = int.get("Unsigned") {
-        (false, w.as_str()?)
     } else {
-        return None;
+        let w = int.get("Unsigned")?;
+        (false, w.as_str()?)
     };
     let bits: u32 = match width {
         "I8" | "U8" => 8,
@@ -70143,7 +70105,7 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
     // loop.
     let mut referent = vec![None; n];
     let mut changed = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -70242,7 +70204,7 @@ fn item_addr_locals(
     let n = body.locals.locals.len();
     let mut addr = vec![false; n];
     let mut changed = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -71079,7 +71041,7 @@ fn rust_vec_deref_feeds_only_reverse(body: &Unstructured, llbc: &Llbc, local: us
     let mut watched = bit_set::BitSet::new();
     watched.insert(local);
     let mut reverses = 0;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -72724,20 +72686,20 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
             .operations
             .get(site.format_idx)
             .and_then(|op| op.result.clone());
-        if let Some(format_result) = format_result {
-            if !forward_identity(graph, &format_result, &site.fmt_args) {
-                // The format result is a block input. Keep the copy.
-                if let Some(op) = graph
-                    .block_mut(site.format_block)
-                    .operations
-                    .get_mut(site.format_idx)
-                {
-                    op.kind = OpKind::UnaryOp {
-                        op: "same_as".to_string(),
-                        operand: site.fmt_args.clone(),
-                        result_ty: ValueType::Ref(None),
-                    };
-                }
+        if let Some(format_result) = format_result
+            && !forward_identity(graph, &format_result, &site.fmt_args)
+        {
+            // The format result is a block input. Keep the copy.
+            if let Some(op) = graph
+                .block_mut(site.format_block)
+                .operations
+                .get_mut(site.format_idx)
+            {
+                op.kind = OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand: site.fmt_args.clone(),
+                    result_ty: ValueType::Ref(None),
+                };
             }
         }
         // 3. Fold the rendered values with the literal pieces at the args

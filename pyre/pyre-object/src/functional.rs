@@ -1270,8 +1270,8 @@ pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
             field_base + 2,
         )));
         let adj = RBigIntGcRoot::new(len_b.int_sub(1));
-        let product = RBigIntGcRoot::new(adj.mul(&*step_b));
-        let lastitem = start_b.add(&*product);
+        let product = RBigIntGcRoot::new(adj.mul(&step_b));
+        let lastitem = start_b.add(&product);
         let w_lastitem = range_bigint_to_obj(lastitem);
         let lastitem_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(w_lastitem);
@@ -1308,7 +1308,7 @@ pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<P
             len_slot,
         )));
         if idx.int_lt(0) {
-            idx = RBigIntGcRoot::new(idx.add(&*len_b));
+            idx = RBigIntGcRoot::new(idx.add(&len_b));
         }
         if *idx >= *len_b || idx.int_lt(0) {
             return None;
@@ -1319,8 +1319,8 @@ pub unsafe fn w_range_compute_item(obj: PyObjectRef, index: &BigInt) -> Option<P
         let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
             field_base + 1,
         )));
-        let product = RBigIntGcRoot::new(idx.mul(&*step_b));
-        let value = start_b.add(&*product);
+        let product = RBigIntGcRoot::new(idx.mul(&step_b));
+        let value = start_b.add(&product);
         Some(range_bigint_to_obj(value))
     }
 }
@@ -1358,7 +1358,7 @@ pub unsafe fn w_range_contains_bigint(obj: PyObjectRef, item: &BigInt) -> bool {
             }
         }
         // The stride must not invalidate membership.
-        let diff = RBigIntGcRoot::new(item.sub(&*start_b));
+        let diff = RBigIntGcRoot::new(item.sub(&start_b));
         (&*diff % &*step_b).is_zero()
     }
 }
@@ -1382,7 +1382,7 @@ pub unsafe fn w_range_index_of(obj: PyObjectRef, item: &BigInt) -> PyObjectRef {
         let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
             field_base + 1,
         )));
-        let diff = RBigIntGcRoot::new(item.sub(&*start_b));
+        let diff = RBigIntGcRoot::new(item.sub(&start_b));
         let value = &*diff / &*step_b;
         range_bigint_to_obj(value)
     }
@@ -1464,7 +1464,7 @@ pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt 
     let zero = BigInt::zero();
     if *step > zero {
         if *start < *stop {
-            let diff = RBigIntGcRoot::new(stop.sub(&*start));
+            let diff = RBigIntGcRoot::new(stop.sub(&start));
             let adj = RBigIntGcRoot::new(diff.sub(&BigInt::one()));
             let q = RBigIntGcRoot::new(&*adj / &*step);
             q.add(&BigInt::one())
@@ -1472,7 +1472,7 @@ pub fn range_length_big(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt 
             BigInt::zero()
         }
     } else if *start > *stop {
-        let diff = RBigIntGcRoot::new(start.sub(&*stop));
+        let diff = RBigIntGcRoot::new(start.sub(&stop));
         let adj = RBigIntGcRoot::new(diff.sub(&BigInt::one()));
         let neg_step = RBigIntGcRoot::new(step.neg());
         let q = RBigIntGcRoot::new(&*adj / &*neg_step);
@@ -1543,7 +1543,7 @@ pub unsafe fn w_long_range_iter_len(obj: PyObjectRef) -> BigInt {
         let it = obj as *const W_LongRangeIterator;
         let len = RBigIntGcRoot::new(range_obj_to_bigint((*it).len));
         let index = RBigIntGcRoot::new(range_obj_to_bigint((*it).index));
-        let rem = RBigIntGcRoot::new(len.sub(&*index));
+        let rem = RBigIntGcRoot::new(len.sub(&index));
         if rem.int_lt(0) {
             BigInt::from(0)
         } else {
@@ -1615,8 +1615,8 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         // `next_index` is wrapped before `value`; that first allocation may
         // collect while the computed item exists only as an unboxed rbigint.
         // RPython's GC transform roots this local automatically.
-        let product = RBigIntGcRoot::new(index.mul(&*step));
-        let value = RBigIntGcRoot::new(start.add(&*product));
+        let product = RBigIntGcRoot::new(index.mul(&step));
+        let value = RBigIntGcRoot::new(start.add(&product));
         let next_index = range_bigint_to_obj(index.int_add(1));
         let next_index = crate::gc_roots::pin_root(next_index);
         let it = crate::gc_roots::shadow_stack_get(iter_slot) as *mut W_LongRangeIterator;

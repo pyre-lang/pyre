@@ -6725,20 +6725,18 @@ fn set_init_from_iterable_impl(
         pyre_object::is_str(iterable)
             && !pyre_object::is_exact_type(iterable, &pyre_object::STR_TYPE)
             && iterable_uses_base_iter(iterable, &pyre_object::STR_TYPE)
+    } && let Some(chars) = unsafe {
+        pyre_object::w_unicode_listview_ascii(pyre_object::gc_roots::shadow_stack_get(
+            iterable_slot,
+        ))
     } {
-        if let Some(chars) = unsafe {
-            pyre_object::w_unicode_listview_ascii(pyre_object::gc_roots::shadow_stack_get(
-                iterable_slot,
-            ))
-        } {
-            unsafe {
-                pyre_object::w_set_install_ascii_items(
-                    pyre_object::gc_roots::shadow_stack_get(set_slot),
-                    &chars,
-                );
-            }
-            return Ok(());
+        unsafe {
+            pyre_object::w_set_install_ascii_items(
+                pyre_object::gc_roots::shadow_stack_get(set_slot),
+                &chars,
+            );
         }
+        return Ok(());
     }
     // Python 3.14 `set_update_dict_lock_held`: an exact dict is walked
     // through its key table and each cached hash is handed directly to the
@@ -11830,7 +11828,7 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     } else {
         let mut start = RBigIntGcRoot::new(slice_eval_index_big(w_start)?);
         if start.int_lt(0) {
-            start.set(start.add(&*length));
+            start.set(start.add(&length));
             if start.lt(&lower) {
                 start.set(lower.translated_alias());
             }
@@ -11848,7 +11846,7 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     } else {
         let mut stop = RBigIntGcRoot::new(slice_eval_index_big(w_stop)?);
         if stop.int_lt(0) {
-            stop.set(stop.add(&*length));
+            stop.set(stop.add(&length));
             if stop.lt(&lower) {
                 stop.set(lower.translated_alias());
             }
@@ -22639,15 +22637,15 @@ pub(crate) fn complex_repr_string(re: f64, im: f64) -> String {
     if re == 0.0 && re.is_sign_positive() {
         let mut out = String::new();
         out.push_str(&format_complex_component_repr(im));
-        out.push_str("j");
+        out.push('j');
         return out;
     }
 
     let mut out = String::new();
-    out.push_str("(");
+    out.push('(');
     out.push_str(&format_complex_component_repr(re));
     if im.is_sign_positive() || im.is_nan() {
-        out.push_str("+");
+        out.push('+');
     }
     out.push_str(&format_complex_component_repr(im));
     out.push_str("j)");
@@ -23573,7 +23571,7 @@ pub fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef, crate
     // specialization uses.
     const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
     const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
-    if reduced >= SIGNED_MIN_AS_FLOAT && reduced < SIGNED_LIMIT_AS_FLOAT {
+    if (SIGNED_MIN_AS_FLOAT..SIGNED_LIMIT_AS_FLOAT).contains(&reduced) {
         return Ok(pyre_object::w_int_new(reduced as i64));
     }
     use num_traits::FromPrimitive;

@@ -873,10 +873,9 @@ pub fn materialize_bridge_virtual(
             ctx.profiler().count_ops(OpCode::New, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::New, crate::counters::RECORDED_OPS);
-            let allocated = match cache.allocator() {
-                Some(allocator) => Some(allocator.bh_new(&struct_descr)),
-                None => None,
-            };
+            let allocated = cache
+                .allocator()
+                .map(|allocator| allocator.bh_new(&struct_descr));
             let value = allocated
                 .filter(|&ptr| ptr != 0)
                 .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
@@ -951,14 +950,13 @@ pub fn materialize_bridge_virtual(
                 .count_ops(alloc_opcode, crate::counters::RECORDED_OPS);
             // resume.py decoder.allocate_array → execute_new_array[_clear]
             // → `execute_and_record` allocates then records with resvalue.
-            let allocated = match cache.allocator() {
-                Some(allocator) => Some(if clear {
+            let allocated = cache.allocator().map(|allocator| {
+                if clear {
                     allocator.bh_new_array_clear(length, &array_descr)
                 } else {
                     allocator.bh_new_array(length, &array_descr)
-                }),
-                None => None,
-            };
+                }
+            });
             let value = allocated
                 .filter(|&ptr| ptr != 0)
                 .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
@@ -1548,12 +1546,12 @@ pub fn emit_pending_field_op(
             &[target_op, index_op, value_op],
             descr.clone(),
         );
-        if let Some(allocator) = cache.allocator() {
-            if !apply_setarrayitem(
+        if let Some(allocator) = cache.allocator()
+            && !apply_setarrayitem(
                 ctx, cache, allocator, target_op, item_index, value_op, descr,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
         ctx.heapcache_setarrayitem(target_op, index_op, descr.index(), value_op);
     }

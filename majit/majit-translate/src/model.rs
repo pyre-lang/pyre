@@ -5896,7 +5896,7 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
         let cloned: Vec<_> = template
             .iter()
             .map(|op| SpaceOperation {
-                result: op.result.as_ref().map(&remap),
+                result: op.result.as_ref().map(remap),
                 kind: crate::inline::remap_op_kind(&op.kind, &remap),
             })
             .collect();
@@ -7074,7 +7074,7 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
             *inputarg = remap_var(inputarg);
         }
         for op in &mut block.operations {
-            op.result = op.result.as_ref().map(&remap_var);
+            op.result = op.result.as_ref().map(remap_var);
             op.kind = crate::inline::remap_op_kind(&op.kind, &remap_var);
         }
         let (exitswitch, exits) = remap_control_flow_metadata_var(
@@ -7237,8 +7237,8 @@ where
             exitcase: link.exitcase.clone(),
             prevblock: link.prevblock.map(&remap_block),
             llexitcase: link.llexitcase.clone(),
-            last_exception: link.last_exception.as_ref().map(&remap_link_arg),
-            last_exc_value: link.last_exc_value.as_ref().map(&remap_link_arg),
+            last_exception: link.last_exception.as_ref().map(remap_link_arg),
+            last_exc_value: link.last_exc_value.as_ref().map(remap_link_arg),
         })
         .collect();
     (exitswitch, exits)
@@ -7790,9 +7790,9 @@ impl LazyGraph {
     /// first, so the write is seen through this handle only.
     pub fn get_mut(&mut self) -> Option<&mut FunctionGraph> {
         if std::rc::Rc::get_mut(&mut self.0).is_none() {
-            *self = match self.get() {
-                Some(graph) => Self::built(graph.clone()),
-                None => return None,
+            *self = {
+                let graph = self.get()?;
+                Self::built(graph.clone())
             };
         }
         let cell = std::rc::Rc::get_mut(&mut self.0).expect("unshared handle");
@@ -7990,14 +7990,14 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
                 .operations
                 .iter()
                 .map(|op| SpaceOperation {
-                    result: op.result.as_ref().map(&remap_var),
+                    result: op.result.as_ref().map(remap_var),
                     kind: crate::inline::remap_op_kind(&op.kind, &remap_var),
                 })
                 .collect();
             let (exitswitch, exits) = remap_control_flow_metadata_var(
                 &block.exitswitch,
                 &block.exits,
-                &remap_var,
+                remap_var,
                 |block| block,
             );
             Block {

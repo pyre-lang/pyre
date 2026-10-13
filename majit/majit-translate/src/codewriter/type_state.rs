@@ -975,10 +975,10 @@ fn rebucket_args(
         ri += 1;
         place(var, args_i, args_r, &mut new_classes);
     }
-    if let Some(classes) = classes {
-        if !class_src.is_empty() {
-            *classes = new_classes;
-        }
+    if let Some(classes) = classes
+        && !class_src.is_empty()
+    {
+        *classes = new_classes;
     }
 }
 

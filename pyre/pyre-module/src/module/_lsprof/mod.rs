@@ -473,10 +473,8 @@ fn lsprof_call(
                 profiler.enter_builtin_call(w_self, w_arg);
             }
         }
-        "c_return" | "c_exception" => {
-            if profiler.builtins {
-                profiler.enter_builtin_return(w_arg);
-            }
+        "c_return" | "c_exception" if profiler.builtins => {
+            profiler.enter_builtin_return(w_arg);
         }
         _ => {}
     }

@@ -1242,7 +1242,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         let raw_words: Vec<TokenStream> = raw_int_words
             .iter()
             .cloned()
-            .chain(has_vable_identity.then(|| raw_vable_expr))
+            .chain(has_vable_identity.then_some(raw_vable_expr))
             .chain(raw_ref_words.iter().cloned())
             .chain(raw_float_words.iter().cloned())
             .collect();

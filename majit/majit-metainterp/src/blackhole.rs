@@ -14482,30 +14482,30 @@ fn inline_call_native(
         'i' => {
             let result = bh.bhimpl_inline_call_irf_i(fnaddr, &args_i, &args_r, &args_f, calldescr);
             let outcome = check_residual_call_exception_after(bh, p);
-            if outcome.is_ok() {
-                if let Some(dst) = dest {
-                    bh.registers_i[dst] = result;
-                }
+            if outcome.is_ok()
+                && let Some(dst) = dest
+            {
+                bh.registers_i[dst] = result;
             }
             outcome
         }
         'r' => {
             let result = bh.bhimpl_inline_call_irf_r(fnaddr, &args_i, &args_r, &args_f, calldescr);
             let outcome = check_residual_call_exception_after(bh, p);
-            if outcome.is_ok() {
-                if let Some(dst) = dest {
-                    bh.registers_r[dst] = result.0 as i64;
-                }
+            if outcome.is_ok()
+                && let Some(dst) = dest
+            {
+                bh.registers_r[dst] = result.0 as i64;
             }
             outcome
         }
         'f' => {
             let result = bh.bhimpl_inline_call_irf_f(fnaddr, &args_i, &args_r, &args_f, calldescr);
             let outcome = check_residual_call_exception_after(bh, p);
-            if outcome.is_ok() {
-                if let Some(dst) = dest {
-                    bh.registers_f[dst] = result.to_bits() as i64;
-                }
+            if outcome.is_ok()
+                && let Some(dst) = dest
+            {
+                bh.registers_f[dst] = result.to_bits() as i64;
             }
             outcome
         }

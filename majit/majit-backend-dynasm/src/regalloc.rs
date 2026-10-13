@@ -1115,7 +1115,7 @@ impl RegisterManager {
 
     /// regalloc.py:437
     pub fn free_temp_vars(&mut self, longevity: &mut LifetimeManager, fm: &mut FrameManager) {
-        let temps: Vec<OpRef> = self.temp_boxes.drain(..).collect();
+        let temps: Vec<OpRef> = std::mem::take(&mut self.temp_boxes);
         for v in temps {
             // Temp vars are always INT type
             self.possibly_free_var(v, longevity, fm, Type::Int);
@@ -4728,7 +4728,6 @@ impl<'a> RegAlloc<'a> {
             self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
             let res = self.force_allocate_reg(dst, Type::Float, &[], None, false);
             self.perform(i, [loc0, loc1], Some(Loc::Reg(res)), output);
-            return;
         }
         #[cfg(not(target_arch = "aarch64"))]
         {

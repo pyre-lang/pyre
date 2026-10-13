@@ -546,7 +546,7 @@ fn probe_source() -> String {
         } else {
             src.push_str("#ifdef ");
             src.push_str(name);
-            src.push_str("\n");
+            src.push('\n');
             push_const_printf(&mut src, name, name);
             src.push_str("#endif\n");
         }

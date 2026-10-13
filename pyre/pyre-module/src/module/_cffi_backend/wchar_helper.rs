@@ -106,7 +106,7 @@ pub unsafe fn utf8_to_char32(
     for (i, point) in value.code_points().enumerate() {
         unsafe {
             misc::write_raw_unsigned_data(
-                (target.offset((i * 4) as isize)) as usize,
+                (target.add(i * 4)) as usize,
                 u64::from(point.to_u32()),
                 4,
             )?

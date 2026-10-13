@@ -1886,10 +1886,7 @@ impl ExecutionContext {
             let _callback_roots = pyre_object::gc_roots::push_roots();
             // Pin the carrier before the other `pin_root` safepoints.
             // `expand_pop_roots` reloads it before `normalize_exception`.
-            let operr_slot = match operr.as_mut() {
-                Some(operr) => Some(operr.pin(&_callback_roots)),
-                None => None,
-            };
+            let operr_slot = operr.as_mut().map(|operr| operr.pin(&_callback_roots));
             let callback_live_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_callback);
             let w_arg_slot = pyre_object::gc_roots::shadow_stack_len();

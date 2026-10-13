@@ -214,7 +214,7 @@ unsafe fn read_dims(t: PyObjectRef) -> Vec<i64> {
 /// it, so a foreign export whose strides reach below its `buf` must have its
 /// storage lowered to `low` and the shift carried in the view's offset.
 pub fn addressable_window(shape: &[i64], strides: &[i64], itemsize: i64) -> (i64, i64) {
-    if shape.iter().any(|&extent| extent == 0) {
+    if shape.contains(&0) {
         return (0, 0);
     }
     let mut low = 0;

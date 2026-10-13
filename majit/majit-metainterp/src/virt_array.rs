@@ -257,7 +257,7 @@ impl<T: Copy> VirtArray<T> {
     pub fn clear(&mut self) {
         // `resize` needs an item to fill with and a shrink to zero never uses
         // one, so go straight to the empty block rather than invent a value.
-        if self.len() != 0 {
+        if !self.is_empty() {
             *self = Self::with_len(0);
         }
     }
