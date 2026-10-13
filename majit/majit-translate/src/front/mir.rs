@@ -20250,8 +20250,9 @@ impl<'a> Lowering<'a> {
                     // A fat pointer's metadata word (`ClassRepr.getclsfield`'s
                     // vtable pointer, or a slice's length). Dyn metadata is
                     // `FatMeta` (`two_word_fat_struct` item 1); a slice is
-                    // `FatLen` (`ListRepr.rtype_len`).
-                    let is_dyn = tyref_is_dyn_pointer(&inner.ty, self.llbc);
+                    // `FatLen` (`ListRepr.rtype_len`). `tyref_is_fat_dyn`
+                    // covers `Box<dyn T>` as well as one-level `&dyn T`.
+                    let is_dyn = tyref_is_fat_dyn(&inner.ty, self.llbc);
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let part = if is_dyn {
@@ -81513,6 +81514,182 @@ mod tests {
             &shared(serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})),
             &llbc
         ));
+    }
+
+    /// `PtrMetadata` of `Box<dyn T>` is the vtable word (`FatMeta`), not a
+    /// slice length. `tyref_is_dyn_pointer` peels Ref/Value only, so the
+    /// Box ADT would otherwise be classed as `FatLen`.
+    #[test]
+    fn box_dyn_ptr_metadata_is_fat_meta() {
+        use crate::model::{OpKind, VecFieldPart};
+
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let dyn_trait = serde_json::json!({"DynTrait": {}});
+        let empty_generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let boxed = |pointee: serde_json::Value| {
+            super::TyRef::Other(serde_json::json!({
+                "Adt": {
+                    "id": 0, "builtin": "Box",
+                    "generics": {
+                        "regions": [],
+                        "types": [pointee],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }))
+        };
+        let shared = |pointee: serde_json::Value| {
+            super::TyRef::Other(serde_json::json!({"Ref": ["_", pointee, "Shared"]}))
+        };
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let slice = serde_json::json!({"Slice": [u8_ty, null]});
+        assert!(super::tyref_is_fat_dyn(&boxed(dyn_trait.clone()), &llbc));
+        assert!(super::tyref_is_fat_dyn(&shared(dyn_trait.clone()), &llbc));
+        assert!(!super::tyref_is_fat_dyn(&boxed(slice.clone()), &llbc));
+        assert!(!super::tyref_is_fat_dyn(&shared(slice), &llbc));
+        assert!(!super::tyref_is_dyn_pointer(
+            &boxed(dyn_trait.clone()),
+            &llbc
+        ));
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let holder_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+        });
+        let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+        let fat_ty = serde_json::json!({
+            "Adt": {
+                "id": 1, "builtin": "Box",
+                "generics": {
+                    "regions": [],
+                    "types": [dyn_trait],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let meta_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "Holder"]),
+            "kind": {"Struct": [{
+                "name": "slot",
+                "ty": fat_ty,
+                "attr_info": field_attr
+            }]}
+        });
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+        let slot_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fat_ty,
+        );
+        let metadata_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Local": 2}), &fat_ty),
+                "PtrMetadata"
+            ]}),
+            &meta_ty,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "read_box_dyn_meta"]),
+            "signature": {"is_unsafe": false, "inputs": [holder_ref], "output": meta_ty},
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &meta_ty),
+                    local(1, &holder_ref),
+                    local(2, &fat_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 2}), &fat_ty),
+                                {"Use": [{"Copy": slot_place}, "No"]}
+                            ]}},
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 0}), &meta_ty),
+                                {"Use": [{"Copy": metadata_place}, "No"]}
+                            ]}}
+                        ],
+                        "terminator": {"span": span, "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [holder],
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph =
+            super::lower_function(&llbc, "read_box_dyn_meta").expect("lower read_box_dyn_meta");
+        let fat_meta: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "slot" && field.vec_part == Some(VecFieldPart::FatMeta)
+                )
+            })
+            .collect();
+        assert!(
+            !fat_meta.is_empty(),
+            "PtrMetadata of Box<dyn T> must be FatMeta of slot, not FatLen\n{}",
+            graph.dump()
+        );
+        let fat_len = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "slot" && field.vec_part == Some(VecFieldPart::FatLen)
+                )
+            })
+        });
+        assert!(
+            !fat_len,
+            "PtrMetadata of Box<dyn T> must not emit FatLen\n{}",
+            graph.dump()
+        );
     }
 
     #[test]
