@@ -9858,9 +9858,13 @@ impl CallControl {
                 CallShape::Indirect(graphs) => self.cached_readwrite_family(graphs, cache),
             }
         };
-        let can_collect = match shape {
-            CallShape::Direct(target) => self.cached_can_collect(target, cache),
-            CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
+        let can_collect = if materializer {
+            true
+        } else {
+            match shape {
+                CallShape::Direct(target) => self.cached_can_collect(target, cache),
+                CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
+            }
         };
         // `call.py` `getcalldescr`: `tgt_func, tgt_saveerr =
         // func._call_aroundstate_target_` then
