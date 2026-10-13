@@ -120,7 +120,10 @@ fn descr_to_bh_size_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::Bh
     let size = descr.as_size_descr()?;
     Some(majit_jitcode::jitcode::BhDescr::Size {
         size: size.size(),
-        type_id: size.type_id() as u64,
+        // `descr.py` cache identity via `SizeDescr.cache_key()`, matching
+        // `eval.rs` `bh_new`. The collector tid lives on `type_id()` and
+        // is recovered by `resolved_gc_tid_checked`.
+        type_id: size.cache_key(),
         vtable: size.vtable() as u64,
         owner: String::new(),
         all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(size),

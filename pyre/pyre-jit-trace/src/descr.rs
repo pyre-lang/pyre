@@ -9668,6 +9668,117 @@ mod tests {
         assert_eq!(size.all_fielddescrs()[1].field_name(), "Cell.value");
     }
 
+    #[test]
+    fn make_descr_from_bh_size_assigns_fields_onto_get_size_descr_shell() {
+        use majit_ir::descr::{ArrayFlag, LLType, gc_cache};
+        use majit_jitcode::jitcode::{BhDescr, BhFieldSpec};
+
+        // Unique cache key: get_size_descr / register_keyed_size share the
+        // process-global GcCache.
+        let type_id: u64 = 0xf1b1_5000_f0b0_0001;
+        let shell = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(LLType::Struct(type_id), 16, 0, false)
+        };
+        assert!(
+            shell
+                .as_size_descr()
+                .expect("get_size_descr returns a SizeDescr")
+                .all_fielddescrs()
+                .is_empty(),
+            "get_size_descr mints a fieldless shell (descr.py before heaptracker assignment)"
+        );
+
+        let hydrated = make_descr_from_bh(&BhDescr::Size {
+            size: 16,
+            type_id,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 0,
+                field_key: "payload".into(),
+                name: "Shell.payload".into(),
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: None,
+            }],
+            is_gc_managed: true,
+        });
+        let fields = hydrated
+            .as_size_descr()
+            .expect("Size BhDescr -> SizeDescr")
+            .all_fielddescrs();
+        assert_eq!(
+            fields.len(),
+            1,
+            "the BhDescr list must land on cache[STRUCT] so force_box can walk it"
+        );
+        assert_eq!(fields[0].field_key(), "payload");
+        assert!(
+            std::sync::Arc::ptr_eq(&shell, &hydrated),
+            "descr.py mutates the SizeDescr get_size_descr already returned"
+        );
+    }
+
+    #[test]
+    fn make_descr_from_bh_size_does_not_adopt_a_vtable_foreign_cache_hit() {
+        use majit_ir::descr::{ArrayFlag, LLType, gc_cache};
+        use majit_jitcode::jitcode::{BhDescr, BhFieldSpec};
+
+        let type_id: u64 = 0xf1b1_5000_f0b0_00d1;
+        let foreign = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(LLType::Struct(type_id), 72, 0x1000, false)
+        };
+        assert_eq!(
+            foreign.as_size_descr().expect("foreign SizeDescr").size(),
+            72
+        );
+        assert_ne!(
+            foreign.as_size_descr().expect("foreign SizeDescr").vtable(),
+            0
+        );
+
+        let hydrated = make_descr_from_bh(&BhDescr::Size {
+            size: 72,
+            type_id,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 0,
+                field_key: "__discriminant".into(),
+                name: "Result.__discriminant".into(),
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: None,
+            }],
+            is_gc_managed: true,
+        });
+        let sd = hydrated.as_size_descr().expect("Size BhDescr -> SizeDescr");
+        assert_eq!(sd.size(), 72);
+        assert_eq!(sd.vtable(), 0, "plain new must not inherit a class vtable");
+        assert!(
+            !std::sync::Arc::ptr_eq(&foreign, &hydrated),
+            "descr.py get_size_descr is one SizeDescr per STRUCT; a vtable-0 new is not the class"
+        );
+        assert_eq!(
+            sd.cache_key(),
+            majit_ir::descr::distinct_struct_cache_key(type_id, 72, 0)
+        );
+    }
+
     use majit_ir::descr::ArrayFlag;
     use majit_jitcode::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
 
@@ -11548,12 +11659,25 @@ fn force_declared_group(cache_key: u64) {
     std::sync::LazyLock::force(&MODULE_USER_LAYOUT_DESCR_GROUPS);
 }
 
-/// `descr.py` `get_size_descr` reads a cache translation already filled.
-/// `pyjitpl.py` `finish_setup_descrs` does not hash a side table once per row.
-pub(crate) fn force_all_declared_groups() {
+/// Publish every runtime object group into `gc_cache._cache_size` before
+/// synthetic struct tids are allocated.
+///
+/// `descr.py get_size_descr` keeps one SizeDescr per STRUCT, and
+/// `GcLLDescr_framework.init_size_descr` stamps that object's tid from
+/// `TypeLayoutBuilder.get_type_id`. Each group here already carries its
+/// collector id. Forcing it first makes that object the cache entry, so
+/// `register_unresolved_struct_tids` skips it instead of assigning a
+/// synthetic id to a second descr for the same key.
+pub fn force_declared_object_groups() {
     for (_, force) in DECLARED_GROUPS {
         force();
     }
+}
+
+/// `descr.py` `get_size_descr` reads a cache translation already filled.
+/// `pyjitpl.py` `finish_setup_descrs` does not hash a side table once per row.
+pub(crate) fn force_all_declared_groups() {
+    force_declared_object_groups();
     std::sync::LazyLock::force(&MODULE_USER_LAYOUT_DESCR_GROUPS);
 }
 
@@ -12885,14 +13009,33 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // through to the legacy mint path on cache miss (transient
             // empty-field `bh_new` descrs from `pyre-jit/src/eval.rs`,
             // test fixtures, etc.).
+            let mut mint_type_id = *type_id;
             if *type_id != 0 {
-                let key = majit_ir::descr::LLType::Struct(*type_id);
-                let hit = majit_ir::descr::gc_cache()
-                    .lock()
-                    ._cache_size
-                    .get(&key)
-                    .cloned();
-                if let Some(descr) = hit {
+                let lookup = |key: u64| {
+                    majit_ir::descr::gc_cache()
+                        .lock()
+                        ._cache_size
+                        .get(&majit_ir::descr::LLType::Struct(key))
+                        .cloned()
+                };
+                let agrees = |descr: &DescrRef| {
+                    descr.as_size_descr().is_some_and(|sd| {
+                        majit_ir::descr::size_descr_agrees_with_spec(sd, *size, *vtable as usize)
+                    })
+                };
+                let incoming_offsets: Vec<usize> =
+                    all_fielddescrs.iter().map(|field| field.offset).collect();
+                let same_struct = |descr: &DescrRef| {
+                    descr.as_size_descr().is_some_and(|sd| {
+                        majit_ir::descr::size_descr_same_struct_layout(sd, *size, &incoming_offsets)
+                    })
+                };
+                let cached_empty = |descr: &DescrRef| {
+                    descr
+                        .as_size_descr()
+                        .is_some_and(|sd| sd.all_fielddescrs().is_empty())
+                };
+                if let Some(descr) = lookup(*type_id) {
                     // The cache holds one SizeDescr per STRUCT, and the
                     // extra-field exception struct stands for several
                     // interp-level classes, each with its own vtable.
@@ -12900,10 +13043,49 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     {
                         return realbase;
                     }
-                    return descr;
+                    if cached_empty(&descr) && !all_fielddescrs.is_empty() && agrees(&descr) {
+                        // descr.py cache[STRUCT] identity. A fieldless shell
+                        // is the SizeDescr `get_size_descr` minted before
+                        // `heaptracker.all_fielddescrs` assigned the list onto
+                        // it. Returning it here skips that assignment;
+                        // `info.py _force_elements` then walks an empty
+                        // `descr.get_all_fielddescrs()`. Fall through so
+                        // `simple_descr_group_from_bh_size` →
+                        // `register_keyed_size` publishes the BhDescr list
+                        // onto the same Arc. A shell that disagrees on
+                        // size or vtable-presence is a foreign STRUCT
+                        // (`size_descr_agrees_with_spec`); do not assign
+                        // this field list onto it.
+                    } else if agrees(&descr) || (*vtable == 0 && same_struct(&descr)) {
+                        // `descr.py get_size_descr` keys on STRUCT. A
+                        // serialized `vtable == 0` is the same STRUCT as
+                        // the published group (`bh_size_spec_from_callcontrol`
+                        // does not intern a process-local typeptr), so
+                        // NEW and SETFIELD share that one SizeDescr.
+                        return descr;
+                    } else if *vtable == 0 {
+                        // The hash slot names a foreign STRUCT (`descr.py`
+                        // `get_size_descr` is one SizeDescr per lltype
+                        // object). A vtable-0 `new` recovers a distinct
+                        // identity so `init_size_descr` can stamp a collector
+                        // tid instead of the class's. A vtable-bearing
+                        // incoming keeps this key (`effectinfo.py`).
+                        let alt = majit_ir::descr::distinct_struct_cache_key(
+                            *type_id,
+                            *size,
+                            *vtable as usize,
+                        );
+                        if let Some(descr) = lookup(alt)
+                            && agrees(&descr)
+                            && !(cached_empty(&descr) && !all_fielddescrs.is_empty())
+                        {
+                            return descr;
+                        }
+                        mint_type_id = alt;
+                    }
                 }
             }
-            // RPython `descr.py get_size_descr` → `:188 init_size_descr`
+            // RPython `descr.py get_size_descr` → `init_size_descr`
             // populates `SizeDescr.all_fielddescrs` (and the
             // `gc_fielddescrs` subset) from
             // `heaptracker.all_fielddescrs(STRUCT)` so consumers like
@@ -12921,13 +13103,13 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             let headerless = owner == HEADERLESS_SIZE_OWNER_MARKER;
             if all_fielddescrs.is_empty() && !headerless {
                 // TODO: `make_size_descr_with_type_and_vtable`
-                // takes the u32 gc tid; `*type_id` is the u64 cache key.
+                // takes the u32 gc tid; `mint_type_id` is the u64 cache key.
                 // Truncate `as u32` until gc_cache routing.
-                make_size_descr_with_type_and_vtable(*size, *type_id as u32, *vtable as usize)
+                make_size_descr_with_type_and_vtable(*size, mint_type_id as u32, *vtable as usize)
             } else {
                 let spec = majit_jitcode::jitcode::BhSizeSpec {
                     size: *size,
-                    type_id: *type_id,
+                    type_id: mint_type_id,
                     vtable: *vtable,
                     owner: owner.clone(),
                     is_gc_managed: *is_gc_managed,

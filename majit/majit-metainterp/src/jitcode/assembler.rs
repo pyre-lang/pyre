@@ -779,18 +779,22 @@ impl JitCodeBuilder {
             // struct to read it off.  Deciding on offsets alone would keep
             // whichever site happened to arrive first.
             Self::apply_immutable_ranks(&mut existing.all_fielddescrs, &ranks);
-            let existing = &*existing;
             let mut every_offset_known = true;
             for &field in fields {
-                if !Self::record_layout_conflicts(existing, type_id, field) {
+                if !Self::record_layout_conflicts(&*existing, type_id, field) {
                     every_offset_known = false;
                 }
             }
             if every_offset_known {
+                // `descr.py get_size_descr` is one ranking per STRUCT. A
+                // first registration may have ranked by offset before the
+                // parent SizeDescr was cached; re-rank now so
+                // `index_in_parent` follows `all_fielddescrs`.
+                Self::rank_field_specs(type_id, &mut existing.all_fielddescrs);
                 return;
             }
         }
-        let new_fields = Self::field_specs_from_layout(fields, &ranks);
+        let new_fields = Self::field_specs_from_layout(type_id, fields, &ranks);
         // Merge into existing spec if present — each getfield/setfield
         // site registers only the field it accesses, so the complete
         // layout accumulates across multiple register_struct_layout
@@ -808,12 +812,11 @@ impl JitCodeBuilder {
                     existing.all_fielddescrs.push(nf);
                 }
             }
-            // Re-sort by offset and re-index so index_in_parent stays
-            // deterministic (same as field_specs_from_layout).
-            existing.all_fielddescrs.sort_by_key(|f| f.offset);
-            for (idx, f) in existing.all_fielddescrs.iter_mut().enumerate() {
-                f.index_in_parent = idx;
-            }
+            // `descr.py get_size_descr` is one ranking per STRUCT. Reuse
+            // the published SizeDescr's `all_fielddescrs` order when it
+            // is already in `gc_cache`; otherwise rank by offset so a
+            // struct with no published group stays deterministic.
+            Self::rank_field_specs(type_id, &mut existing.all_fielddescrs);
         } else {
             self.struct_size_specs.insert(
                 type_id,
@@ -986,16 +989,14 @@ impl JitCodeBuilder {
     }
 
     fn field_specs_from_layout(
+        type_id: u64,
         fields: &[(usize, bool, &str, usize, bool, bool)],
         ranks: &[(String, ImmutableRank)],
     ) -> Vec<BhFieldSpec> {
-        let mut ordered: Vec<(usize, bool, &str, usize, bool, bool)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _, _, _, _)| offset);
-        ordered
+        let mut specs: Vec<BhFieldSpec> = fields
             .iter()
-            .enumerate()
             .map(
-                |(idx, &(offset, is_ref, name, decl_size, decl_signed, is_float))| {
+                |&(offset, is_ref, name, decl_size, decl_signed, is_float)| {
                     // descr.py `get_field_descr` reads FIELDTYPE once and
                     // `get_type_flag` picks the flag: pointer, FLOAT, signed, or
                     // unsigned. The emit site supplies that kind; nothing retags
@@ -1038,7 +1039,7 @@ impl JitCodeBuilder {
                             .is_some_and(ImmutableRank::is_immutable),
                         is_quasi_immutable: Self::rank_of(ranks, name)
                             .is_some_and(ImmutableRank::is_quasi_immutable),
-                        index_in_parent: idx,
+                        index_in_parent: 0,
                         // The emit-site layout table names fields but declares no
                         // header row, so the rebuilding side falls back to the
                         // name.
@@ -1046,7 +1047,79 @@ impl JitCodeBuilder {
                     }
                 },
             )
-            .collect()
+            .collect();
+        Self::rank_field_specs(type_id, &mut specs);
+        specs
+    }
+
+    /// Position of `spec` in the published SizeDescr list.
+    ///
+    /// `heaptracker.get_fielddescr_index_in(STRUCT, fieldname)` keys on the
+    /// name. An offset is only used when it identifies one cached field: a
+    /// flattened aggregate and its first leaf share an address, so matching
+    /// `key == field_key || offset == spec.offset` would give both the
+    /// aggregate's index.
+    fn rank_of_cached_field(ranks: &[(String, usize)], spec: &BhFieldSpec) -> usize {
+        if let Some(idx) = ranks.iter().position(|(key, _)| key == &spec.field_key) {
+            return idx;
+        }
+        let mut found = None;
+        for (i, (_, offset)) in ranks.iter().enumerate() {
+            if *offset == spec.offset {
+                if found.is_some() {
+                    return ranks.len();
+                }
+                found = Some(i);
+            }
+        }
+        found.unwrap_or(ranks.len())
+    }
+
+    /// Rank `specs` with the published SizeDescr's `all_fielddescrs` order
+    /// (`descr.py get_size_descr` / `heaptracker.all_fielddescrs`) when that
+    /// STRUCT is already in `gc_cache`. Otherwise rank by offset, the
+    /// deterministic merge used when no group has published yet.
+    fn rank_field_specs(type_id: u64, specs: &mut [BhFieldSpec]) {
+        if let Some(ranks) = Self::cached_parent_ranks(type_id) {
+            for spec in specs.iter_mut() {
+                spec.index_in_parent = Self::rank_of_cached_field(&ranks, spec);
+            }
+            specs.sort_by_key(|spec| (spec.index_in_parent, spec.offset));
+            let n_cached = ranks.len();
+            let mut next_extra = n_cached;
+            for spec in specs.iter_mut() {
+                if spec.index_in_parent >= n_cached {
+                    spec.index_in_parent = next_extra;
+                    next_extra += 1;
+                }
+            }
+        } else {
+            specs.sort_by_key(|spec| spec.offset);
+            for (idx, spec) in specs.iter_mut().enumerate() {
+                spec.index_in_parent = idx;
+            }
+        }
+    }
+
+    fn cached_parent_ranks(type_id: u64) -> Option<Vec<(String, usize)>> {
+        if type_id == 0 {
+            return None;
+        }
+        let gc = majit_ir::descr::gc_cache().lock();
+        let descr = gc
+            ._cache_size
+            .get(&majit_ir::descr::LLType::Struct(type_id))?;
+        let size = descr.as_size_descr()?;
+        let fields = size.all_fielddescrs();
+        if fields.is_empty() {
+            return None;
+        }
+        Some(
+            fields
+                .iter()
+                .map(|field| (field.field_key().to_string(), field.offset()))
+                .collect(),
+        )
     }
 
     /// Build a scalar `Field` descr (one machine word) for a plain
@@ -7626,6 +7699,110 @@ mod tests {
         );
     }
 
+    fn publish_parent_layout(type_id: u64, size: usize, fields: &[(&str, usize)]) {
+        let specs: Vec<_> = fields
+            .iter()
+            .enumerate()
+            .map(
+                |(i, (name, offset))| majit_ir::descr::SimpleFieldDescrSpec {
+                    index: i as u32,
+                    field_key: (*name).to_string(),
+                    name: (*name).to_string(),
+                    offset: *offset,
+                    field_size: 8,
+                    field_type: majit_ir::value::Type::Int,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    virtualizable: false,
+                    index_in_parent: i,
+                    is_class_word: Some(false),
+                },
+            )
+            .collect();
+        let _ = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            size,
+            0,
+            type_id,
+            0,
+            true,
+            false,
+            &specs,
+            &[],
+        );
+    }
+
+    #[test]
+    fn rank_field_specs_matches_exact_key_before_shared_offset() {
+        const TID: u64 = 0x4B45_5946_4952_5354;
+        publish_parent_layout(TID, 24, &[("agg", 8), ("leaf", 8)]);
+        let fields = [
+            (8, false, "agg", 8, true, false),
+            (8, true, "leaf", 8, false, false),
+        ];
+        let specs = JitCodeBuilder::field_specs_from_layout(TID, &fields, &[]);
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| (spec.field_key.as_str(), spec.index_in_parent))
+                .collect::<Vec<_>>(),
+            vec![("agg", 0), ("leaf", 1)],
+            "exact field_key must win over a shared offset"
+        );
+    }
+
+    #[test]
+    fn register_struct_layout_reranks_known_offsets_after_cache_publication() {
+        const TID: u64 = 0x5245_5241_4E4B_504F;
+        let mut builder = JitCodeBuilder::new();
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[
+                (8, false, "lo", 8, true, false),
+                (16, false, "hi", 8, true, false),
+            ],
+            "",
+        );
+        let before: Vec<_> = builder
+            .struct_size_specs
+            .get(&TID)
+            .unwrap()
+            .all_fielddescrs
+            .iter()
+            .map(|spec| (spec.field_key.clone(), spec.index_in_parent))
+            .collect();
+        assert_eq!(before, vec![("lo".into(), 0), ("hi".into(), 1)]);
+        publish_parent_layout(TID, 24, &[("hi", 16), ("lo", 8)]);
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[
+                (8, false, "lo", 8, true, false),
+                (16, false, "hi", 8, true, false),
+            ],
+            "",
+        );
+        let after: Vec<_> = builder
+            .struct_size_specs
+            .get(&TID)
+            .unwrap()
+            .all_fielddescrs
+            .iter()
+            .map(|spec| (spec.field_key.clone(), spec.index_in_parent))
+            .collect();
+        assert_eq!(
+            after,
+            vec![("hi".into(), 0), ("lo".into(), 1)],
+            "re-registration after cache publication must adopt all_fielddescrs order"
+        );
+    }
+
     /// …but a name always wins, even when the offset it sits at is ambiguous.
     /// That is `heaptracker.py get_fielddescr_index_in(STRUCT, fieldname)`
     /// — the offset is only a stand-in for the mint sites that carry no name.
@@ -7638,7 +7815,7 @@ mod tests {
         ];
         assert_eq!(
             super::field_slot_in(
-                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                &JitCodeBuilder::field_specs_from_layout(0, &fields, &[]),
                 "leaf",
                 8,
             ),
@@ -7647,7 +7824,7 @@ mod tests {
         );
         assert_eq!(
             super::field_slot_in(
-                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                &JitCodeBuilder::field_specs_from_layout(0, &fields, &[]),
                 "",
                 8
             ),
@@ -7656,7 +7833,7 @@ mod tests {
         );
         assert_eq!(
             super::field_slot_in(
-                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                &JitCodeBuilder::field_specs_from_layout(0, &fields, &[]),
                 "",
                 0
             ),

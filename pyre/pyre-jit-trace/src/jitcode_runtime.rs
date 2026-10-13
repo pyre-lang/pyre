@@ -1575,6 +1575,11 @@ fn decode_kind0_descrs() {
 /// production by running [`materialize_gccache_owned_descrs`] before
 /// `freeze_types`.
 fn register_synthetic_struct_tids() {
+    // Runtime groups carry collector tids (`W_INT_GC_TYPE_ID` and the
+    // rest). They must own `_cache_size` before this walk, including when
+    // no kind-0 slot named the struct. A descr minted afterwards reuses
+    // that entry instead of keeping the truncated cache key.
+    crate::descr::force_declared_object_groups();
     if !majit_gc::gc_sync::is_initialized() {
         return;
     }

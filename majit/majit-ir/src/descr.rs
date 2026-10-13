@@ -439,6 +439,79 @@ pub fn path_hash_for_gc_kind(s: &str, is_gc_managed: bool) -> u64 {
     hasher.finish()
 }
 
+/// STRUCT identity for a SizeDescr whose `path_hash` slot already holds a
+/// different layout.
+///
+/// `descr.py get_size_descr` mints one SizeDescr per lltype STRUCT object;
+/// a second layout under the same hash is not expressible upstream. Mix
+/// size and vtable-presence so `GcLLDescr_framework.init_size_descr` can
+/// stamp a collector tid on the second layout instead of adopting the
+/// first STRUCT's tid (`gc.py`).
+pub fn distinct_struct_cache_key(occupied_key: u64, size: usize, vtable: usize) -> u64 {
+    let vtable_kind = usize::from(vtable != 0);
+    path_hash(&format!(
+        "__majit_struct_identity__:{occupied_key:016x}:{size}:{vtable_kind}"
+    ))
+}
+
+/// Whether `sd` is the SizeDescr for this `(size, vtable-presence)` spec.
+///
+/// Several classes can share one layout and one STRUCT key with different
+/// typeptrs (`W_ExceptionExtended`); those keep the slot. A plain `new`
+/// (vtable 0) and a Python class (nonzero vtable), or two sizes, are
+/// distinct STRUCTs and must not share a tid.
+///
+/// A fieldless vtable-0 shell is `get_size_descr`'s first half of this
+/// STRUCT (`descr.py`); `heaptracker.all_fielddescrs` assigns onto that
+/// same object. It is not a second layout.
+pub fn size_descr_agrees_with_spec(sd: &dyn SizeDescr, size: usize, vtable: usize) -> bool {
+    if sd.size() != size {
+        return false;
+    }
+    if sd.all_fielddescrs().is_empty() && sd.vtable() == 0 {
+        return true;
+    }
+    (sd.vtable() == 0) == (vtable == 0)
+}
+
+/// Whether `sd` and an incoming field list describe the same STRUCT.
+///
+/// Upstream identity is the lltype STRUCT object (`descr.py get_size_descr`
+/// `cache[STRUCT]`; `gc.py init_size_descr` stamps `gctypelayout.py
+/// get_type_id` for that same TYPE). pyre keys the cache on a `path_hash`,
+/// so a collision can put two same-sized layouts in one slot. A serialized
+/// `BhDescr::Size` often carries `vtable == 0` (`bh_size_spec_from_callcontrol`
+/// does not intern a process-local typeptr); that is still the published
+/// STRUCT when the positional lists agree, not a second layout.
+///
+/// Offset *overlap* is not that identity: two unrelated STRUCTs can share
+/// a prefix of field offsets and still have different pointer maps. Equal
+/// size, equal field count, and equal offset bags (duplicates kept, so a
+/// flattened aggregate and its first leaf at one address still match) are
+/// the evidence this hash-key stand-in can offer. An empty list cannot
+/// prove identity (the fieldless-shell path uses [`size_descr_agrees_with_spec`]).
+pub fn size_descr_same_struct_layout(
+    sd: &dyn SizeDescr,
+    size: usize,
+    incoming_offsets: &[usize],
+) -> bool {
+    if sd.size() != size {
+        return false;
+    }
+    let cached = sd.all_fielddescrs();
+    if cached.is_empty() || incoming_offsets.is_empty() {
+        return false;
+    }
+    if cached.len() != incoming_offsets.len() {
+        return false;
+    }
+    let mut cached_offsets: Vec<usize> = cached.iter().map(|field| field.offset()).collect();
+    let mut incoming = incoming_offsets.to_vec();
+    cached_offsets.sort_unstable();
+    incoming.sort_unstable();
+    cached_offsets == incoming
+}
+
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
 /// `module_path` before hashing.  PyPy/RPython has no notion of a crate
 /// boundary — `lltype.Struct` identity is keyed on the Python module
@@ -1407,12 +1480,6 @@ pub struct GcCache {
     /// process that mints the descr. Value `0` means the collector has
     /// not assigned one yet; a later register upgrades only that half.
     pub _cache_gcstruct2vtable: IndexMap<u64, (usize, u32)>,
-
-    /// `gctypelayout.py TypeLayoutBuilder.get_type_id` analog for
-    /// SizeDescr. ArrayDescr tids come from the collector via
-    /// `register_unresolved_array_tids` (`gc.py` `init_array_descr`).
-    /// Tid 0 is reserved (`gctypelayout.py` "don't use typeid 0").
-    next_type_id: u32,
 }
 
 impl Default for GcCache {
@@ -1437,10 +1504,6 @@ impl GcCache {
             _external_interiorfield_order: Vec::new(),
             _size_keepalive: Vec::new(),
             _cache_gcstruct2vtable: IndexMap::new(),
-            // tid 0 is reserved as "no class" / sentinel —
-            // `gctypelayout.py make_type_info_group` adds a
-            // DUMMY member at index 0.
-            next_type_id: 1,
         }
     }
 
@@ -1567,7 +1630,7 @@ impl GcCache {
             if !sd.is_gc_managed()
                 || sd.headerless()
                 || sd.cache_key() == 0
-                || !struct_tid_is_unresolved(sd.cache_key(), sd.type_id())
+                || descr_carries_collector_tid(descr)
             {
                 continue;
             }
@@ -1708,15 +1771,16 @@ impl GcCache {
     }
 
     /// `gc.py GcLLDescr_framework.init_size_descr` analog.
-    /// Allocates a dense GC tid via `next_type_id` (the
-    /// `TypeLayoutBuilder.get_type_id` analog) and stamps
-    /// `SimpleSizeDescr.type_id`.  Called BEFORE Arc wrap so the
-    /// mutation lands on the unwrapped descriptor, matching PyPy's
-    /// mutable-object semantics.
-    pub fn init_size_descr(&mut self, _key: &LLType, sizedescr: &mut SimpleSizeDescr) {
-        let type_id = self.alloc_type_id();
-        sizedescr.set_type_id(type_id);
-    }
+    ///
+    /// Upstream asks `TypeLayoutBuilder.get_type_id` here and stores that
+    /// collector id on the SizeDescr. majit-ir does not own the collector,
+    /// so the id stays the unstamped `0` placeholder until
+    /// `register_unresolved_struct_tids` runs (`gctypelayout.py
+    /// get_type_id`). An analyzer-side `next_type_id` counter would mint
+    /// dense ids that collide with the collector's (`W_BufferedRWPairUser`
+    /// is 209); `gen_initialize_tid` then stamps that foreign layout onto
+    /// a vtable-0 `new`.
+    pub fn init_size_descr(&mut self, _key: &LLType, _sizedescr: &mut SimpleSizeDescr) {}
 
     /// `gc.py GcLLDescr_framework.init_array_descr`.
     ///
@@ -1749,20 +1813,6 @@ impl GcCache {
             }
         }
         arraydescr.set_type_id(UNSET_GC_TYPE_ID);
-    }
-
-    /// `gctypelayout.py:349 type_info_group.add_member` analog — hand
-    /// out the next sequential tid and bump the counter.  u32::MAX
-    /// overflow panics (analyzer trace pool cannot exceed 2^32 distinct
-    /// types in any conceivable program; assertion guards programmer
-    /// error sooner than overflow corruption).
-    fn alloc_type_id(&mut self) -> u32 {
-        let tid = self.next_type_id;
-        self.next_type_id = self
-            .next_type_id
-            .checked_add(1)
-            .expect("GcCache type_id overflow (u32)");
-        tid
     }
 }
 
@@ -1823,15 +1873,14 @@ impl GcCache {
     /// `vtable` is a payload/assertion parameter, not part of the key.
     /// `immutable_flag`: descr.py heaptracker.is_immutable_struct(STRUCT).
     ///
-    /// The numeric `tid` stamped on the returned SizeDescr is allocated
-    /// by `init_size_descr` from the shared `next_type_id` counter
-    /// (analog of `TypeLayoutBuilder.get_type_id` in
-    /// `gctypelayout.py`).  Caller does not supply it.  This
-    /// guarantees dense, collision-free tids per distinct key regardless
-    /// of how the caller derived the `LLType::Struct(u64)` identity.
-    /// A registered collector tid from `_cache_gcstruct2vtable` is the
-    /// exception: that is the value `init_size_descr` would have stamped
-    /// had the collector been in the same process as the mint.
+    /// The numeric `tid` on the returned SizeDescr stays the unstamped
+    /// `0` placeholder until `register_unresolved_struct_tids` asks
+    /// `gctypelayout.py TypeLayoutBuilder.get_type_id` (`gc.py
+    /// init_size_descr`). majit-ir does not own the collector, so
+    /// `init_size_descr` is a no-op here. A registered collector tid
+    /// from `_cache_gcstruct2vtable` is the exception: that is the value
+    /// `init_size_descr` would have stamped had the collector been in
+    /// the same process as the mint.
     pub fn get_size_descr(
         &mut self,
         key: LLType,
@@ -1851,10 +1900,10 @@ impl GcCache {
         // then get_size_descr(gccache, STRUCT, vtable). Analyzer callers pass 0.
         let (vtable, registered_tid) = self.object_shape_for_struct(cache_key, vtable, 0);
         // descr.py: SizeDescr(size, vtable=vtable, immutable_flag=immutable_flag)
-        // `type_id` placeholder 0 — overwritten by `init_size_descr`
-        // (`gc.py` `GcLLDescr_framework.init_size_descr` sets `descr.tid`)
-        // or by the registered collector tid when `_cache_gcstruct2vtable`
-        // already has one.
+        // `type_id` placeholder 0 — stamped later by
+        // `register_unresolved_struct_tids` (`gc.py init_size_descr` sets
+        // `descr.tid`) or by the registered collector tid when
+        // `_cache_gcstruct2vtable` already has one.
         let mut sd = if vtable != 0 {
             SimpleSizeDescr::with_vtable(u32::MAX, size, 0, vtable)
         } else {
@@ -3170,6 +3219,54 @@ impl GcCache {
     /// mint sites that bypass `get_size_descr` (`make_simple_descr_group`,
     /// runtime macro `__majit_register_descrs`).
     pub fn register_keyed_size(&mut self, key: LLType, descr: DescrRef) {
+        // descr.py `get_size_descr` returns the SizeDescr first, then
+        // `heaptracker.all_fielddescrs` assigns the positional list onto
+        // that same object. A fieldless shell is that first half; the
+        // incoming descr is the assignment. Keep the shell Arc (its
+        // collector tid is already stamped) and write the list in place
+        // so every holder — NEW's descr included — sees
+        // `descr.get_all_fielddescrs()` (`info.py _force_elements`).
+        //
+        // A vtable-0 shell must not swallow a runtime group's own tid:
+        // if the incoming descr already carries a collector id and the
+        // shell does not, fall through so the existing collector-tid
+        // preference can install that object as cache[STRUCT].
+        if let Some(existing) = self._cache_size.get(&key).cloned() {
+            let existing_empty = existing
+                .as_size_descr()
+                .is_some_and(|sd| sd.all_fielddescrs().is_empty());
+            let new_fields = descr
+                .as_size_descr()
+                .map(|sd| sd.all_fielddescrs().to_vec())
+                .unwrap_or_default();
+            // `make_descr_from_bh` already gates this path with
+            // `size_descr_agrees_with_spec`; other `register_keyed_size`
+            // callers must not assign a different size or vtable-kind onto
+            // the shell (`gc.py init_size_descr` / `gctypelayout.py
+            // get_type_id` are per STRUCT).
+            let agrees = descr
+                .as_size_descr()
+                .zip(existing.as_size_descr())
+                .is_some_and(|(new, old)| {
+                    size_descr_agrees_with_spec(old, new.size(), new.vtable())
+                });
+            if existing_empty
+                && !new_fields.is_empty()
+                && agrees
+                && !(descr_carries_collector_tid(&descr) && !descr_carries_collector_tid(&existing))
+            {
+                if let Some(sd) = existing
+                    .as_any()
+                    .and_then(|old| old.downcast_ref::<SimpleSizeDescr>())
+                {
+                    sd.assign_all_fielddescrs(new_fields);
+                    FIELD_MINT
+                        .fieldless_size_shell_upgrades
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
         // descr.py caches the SizeDescr. Multiple pyre producers may
         // report partial layouts, so the cached owner is upgraded when the
         // incoming frozen list has more fields.
@@ -5320,8 +5417,8 @@ pub trait SizeDescr: Descr {
     fn type_id(&self) -> u32;
 
     /// `gc_cache._cache_size[LLType::Struct(key)]` cache key — the
-    /// original `path_hash(module_path::Struct)` u64 (not the u32 GC
-    /// `type_id` allocated by `gc_cache.init_size_descr`).  Distinct
+    /// original `path_hash(module_path::Struct)` u64 (not the collector
+    /// `type_id` stamped by `register_unresolved_struct_tids`).  Distinct
     /// concepts: `type_id` is the dense sequential gc tid backends use
     /// for `gc.alloc_*_typed`; `cache_key` is the structural identity
     /// the cache slot is keyed on.  PyPy collapses both into the
@@ -6721,7 +6818,8 @@ pub struct SimpleSizeDescr {
     type_id: AtomicU32,
     /// `gc_cache._cache_size[LLType::Struct(cache_key)]` keyed identity
     /// — the original u64 `path_hash(module_path::Struct)` (not the
-    /// dense u32 `type_id` GC tid allocated post-mint).  Stamped at
+    /// collector `type_id` stamped later by
+    /// `register_unresolved_struct_tids`).  Stamped at
     /// `gc_cache.get_size_descr` cache-miss-mint so the inverse
     /// `bh_size_spec_from_descr` reader can recover the same key the
     /// analyzer-side `bh_size_spec_from_callcontrol` produces (without
@@ -6760,6 +6858,14 @@ pub struct SimpleSizeDescr {
     /// (heaptracker.py `gc_fielddescrs = all_fielddescrs(only_gc=True)`
     /// + heaptracker.py `FIELD._needsgc()` filter).
     gc_fielddescrs: Vec<Arc<dyn FieldDescr>>,
+    /// Post-Arc assignment of the positional list onto a fieldless shell
+    /// (`descr.py` writes `sizedescr.all_fielddescrs` after `get_size_descr`
+    /// has already returned that object). The Vec above is the builder
+    /// path; this cell is the in-place write `register_keyed_size` performs
+    /// so every holder of the shell Arc sees the same list
+    /// (`info.py _force_elements` walks `descr.get_all_fielddescrs()`).
+    assigned_all_fielddescrs: OnceLock<Vec<Arc<dyn FieldDescr>>>,
+    assigned_gc_fielddescrs: OnceLock<Vec<Arc<dyn FieldDescr>>>,
 }
 
 impl Clone for SimpleSizeDescr {
@@ -6778,6 +6884,20 @@ impl Clone for SimpleSizeDescr {
             non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
+            assigned_all_fielddescrs: {
+                let lock = OnceLock::new();
+                if let Some(fields) = self.assigned_all_fielddescrs.get() {
+                    let _ = lock.set(fields.clone());
+                }
+                lock
+            },
+            assigned_gc_fielddescrs: {
+                let lock = OnceLock::new();
+                if let Some(fields) = self.assigned_gc_fielddescrs.get() {
+                    let _ = lock.set(fields.clone());
+                }
+                lock
+            },
         }
     }
 }
@@ -6798,6 +6918,8 @@ impl SimpleSizeDescr {
             non_moving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
+            assigned_all_fielddescrs: OnceLock::new(),
+            assigned_gc_fielddescrs: OnceLock::new(),
         }
     }
 
@@ -6816,18 +6938,41 @@ impl SimpleSizeDescr {
             non_moving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
+            assigned_all_fielddescrs: OnceLock::new(),
+            assigned_gc_fielddescrs: OnceLock::new(),
         }
     }
 
     /// Stamp the `gc_cache._cache_size[LLType::Struct(...)]` identity
     /// onto this descr.  Called by `gc_cache.get_size_descr` cache-miss
-    /// path after `init_size_descr` allocates the dense GC `type_id`.
+    /// path; the collector tid is stamped later by
+    /// `register_unresolved_struct_tids`.
     pub fn set_cache_key(&mut self, key: u64) {
         self.cache_key = key;
     }
 
     fn mark_fieldless_shell_mint(&mut self) {
         self.fieldless_shell_mint = true;
+    }
+
+    /// descr.py writes `sizedescr.all_fielddescrs = all_fielddescrs` onto
+    /// the SizeDescr `get_size_descr` already returned. A fieldless shell
+    /// is that object before the assignment; later producers publish the
+    /// list onto the same Arc so `info.py _force_elements` can walk it.
+    pub fn assign_all_fielddescrs(&self, all_fielddescrs: Vec<Arc<dyn FieldDescr>>) {
+        if all_fielddescrs.is_empty() {
+            return;
+        }
+        if !self.all_fielddescrs.is_empty() || self.assigned_all_fielddescrs.get().is_some() {
+            return;
+        }
+        let gc_fielddescrs: Vec<Arc<dyn FieldDescr>> = all_fielddescrs
+            .iter()
+            .filter(|fd| fd.is_pointer_field() && fd.offset() < self.size)
+            .cloned()
+            .collect();
+        let _ = self.assigned_gc_fielddescrs.set(gc_fielddescrs);
+        let _ = self.assigned_all_fielddescrs.set(all_fielddescrs);
     }
 
     /// Override the GC-header flag (default `true` from the constructors).
@@ -6930,10 +7075,22 @@ impl SizeDescr for SimpleSizeDescr {
         self.is_immutable
     }
     fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
-        &self.all_fielddescrs
+        if !self.all_fielddescrs.is_empty() {
+            &self.all_fielddescrs
+        } else {
+            self.assigned_all_fielddescrs
+                .get()
+                .map_or(&[], Vec::as_slice)
+        }
     }
     fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
-        &self.gc_fielddescrs
+        if !self.gc_fielddescrs.is_empty() {
+            &self.gc_fielddescrs
+        } else {
+            self.assigned_gc_fielddescrs
+                .get()
+                .map_or(&[], Vec::as_slice)
+        }
     }
     fn is_object(&self) -> bool {
         self.vtable != 0
@@ -7193,11 +7350,52 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
     // class has its own typeptr. Handing back the cached owner would stamp
     // the first class's vtable onto every later `new_with_vtable`; the
     // optimizer then proves `guard_class` against the live typeptr always
-    // fails. The allocation keeps the vtable it asked for.
+    // fails (`rewrite.py optimize_GUARD_CLASS`). The allocation keeps the
+    // vtable it asked for, but `all_fielddescrs` is the cached ranking
+    // (`descr.py get_size_descr` is one field list per STRUCT;
+    // `heaptracker.all_fielddescrs` and `get_fielddescr_index_in` are one
+    // walk).
+    //
+    // Compare that full positional list, not `field_specs` alone. The
+    // leading class-word extra_gc leaf is `all_fielddescrs[0]`
+    // (`heaptracker.py` typeptr is skipped and the class word is the
+    // first numbered field); `field_specs` starts at the payload, so an
+    // equal-offset-bag check against cache[STRUCT] fails for every
+    // headered object STRUCT and the arm below would return the first
+    // class's descr.
     let built = size_descr;
+    let incoming_offsets: Vec<usize> = built
+        .all_fielddescrs()
+        .iter()
+        .map(|field| field.offset())
+        .collect();
     let size_descr = match try_downcast_arc::<SimpleSizeDescr>(parent) {
-        Ok(cached) if vtable != 0 && cached.vtable() != vtable => built,
-        Ok(cached) => cached,
+        Ok(cached)
+            if vtable != 0
+                && cached.vtable() != vtable
+                && size_descr_same_struct_layout(&*cached, size, &incoming_offsets) =>
+        {
+            let fields = cached.all_fielddescrs().to_vec();
+            if fields.is_empty() {
+                built
+            } else {
+                Arc::new((*built).clone().with_all_fielddescrs(fields))
+            }
+        }
+        // `size_descr_agrees_with_spec` is true for two different class
+        // typeptrs of the same size (`W_ExceptionExtended` shares one
+        // STRUCT). That is cache[STRUCT] identity, not the SizeDescr
+        // `new_with_vtable` must carry: only a matching typeptr, or a
+        // fieldless `get_size_descr` shell, may reuse the cached Arc.
+        Ok(cached)
+            if (cached.vtable() == vtable
+                || (cached.all_fielddescrs().is_empty() && cached.vtable() == 0))
+                && (size_descr_agrees_with_spec(&*cached, size, vtable)
+                    || size_descr_same_struct_layout(&*cached, size, &incoming_offsets)) =>
+        {
+            cached
+        }
+        Ok(_) => built,
         Err(_) => built,
     };
     SimpleDescrGroup {
@@ -9094,6 +9292,77 @@ mod register_keyed_size_authority_tests {
         assert_eq!(retried.size_descr.all_fielddescrs().len(), 1);
     }
 
+    #[test]
+    fn keyed_group_remaps_when_a_vtable_class_occupies_the_hash() {
+        let cache_key = 0x51a1_e000_00d1_u64;
+        let class = make_simple_descr_group_keyed_with_headerless(
+            7,
+            72,
+            209,
+            cache_key,
+            0x1000,
+            true,
+            false,
+            &[],
+            &[],
+        );
+        assert_eq!(class.size_descr.cache_key(), cache_key);
+        assert_eq!(class.size_descr.vtable(), 0x1000);
+        let plain = make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            72,
+            cache_key as u32,
+            cache_key,
+            0,
+            true,
+            false,
+            &[],
+            &[],
+        );
+        // Field maps stay on this STRUCT key (`effectinfo.py`). The
+        // vtable-0 `new` descr is a distinct Arc so it does not adopt
+        // the class tid; `make_descr_from_bh` remints its cache_key.
+        assert_eq!(plain.size_descr.vtable(), 0);
+        assert!(!Arc::ptr_eq(&class.size_descr, &plain.size_descr));
+        assert_eq!(class.size_descr.cache_key(), cache_key);
+    }
+
+    #[test]
+    fn keyed_group_keeps_the_class_key_when_a_vtable0_shell_occupies() {
+        let cache_key = 0x8fc6_60ad_eff3_a2e_u64;
+        let _shell = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(LLType::struct_key(cache_key), 48, 0, false)
+        };
+        let class = make_simple_descr_group_keyed_with_headerless(
+            7,
+            48,
+            17,
+            cache_key,
+            0x1000,
+            true,
+            false,
+            &[SimpleFieldDescrSpec {
+                index: 0,
+                field_key: "clear_gen".to_string(),
+                name: "W_DictObject.clear_gen".to_string(),
+                offset: 24,
+                field_size: 8,
+                field_type: Type::Int,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Signed,
+                virtualizable: false,
+                index_in_parent: 0,
+                is_class_word: Some(false),
+            }],
+            &[],
+        );
+        assert_eq!(class.size_descr.cache_key(), cache_key);
+        assert_eq!(class.size_descr.vtable(), 0x1000);
+        assert_eq!(class.field_descrs.len(), 1);
+    }
+
     /// Classes that share a layout share the struct key. Each allocation
     /// still has to carry the typeptr it was built with.
     #[test]
@@ -9151,6 +9420,97 @@ mod register_keyed_size_authority_tests {
         );
         assert_eq!(again.size_descr.vtable(), 0x1111);
         assert!(Arc::ptr_eq(&first.size_descr, &again.size_descr));
+    }
+
+    /// `W_ExceptionExtended` is one STRUCT (`descr.py get_size_descr
+    /// cache[STRUCT]`) shared by several class typeptrs. The class word is
+    /// `all_fielddescrs[0]` (`heaptracker.py` numbers it as the first
+    /// field); payload `field_specs` start at offset 16. An equal-offset-bag
+    /// check against `field_specs` alone misses that leading leaf, so the
+    /// second class used to receive the first class's SizeDescr and
+    /// `rewrite.py optimize_GUARD_CLASS` proved the live typeptr always
+    /// failed.
+    #[test]
+    fn keyed_group_keeps_the_requested_vtable_when_a_leading_class_word_is_present() {
+        let cache_key = 0x1_0000_00ae_u64;
+        let spec = SimpleFieldDescrSpec {
+            index: 0,
+            field_key: "kind".to_string(),
+            name: "SharedLayout.kind".to_string(),
+            offset: 16,
+            field_size: 1,
+            field_type: Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Unsigned,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+        };
+        let class_word: Arc<dyn FieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "SharedLayout.w_class",
+                "w_class",
+            )
+            .with_class_word(true),
+        );
+        let extra = [class_word];
+        let first = make_simple_descr_group_keyed_with_headerless(
+            3,
+            32,
+            9,
+            cache_key,
+            0x1111,
+            true,
+            false,
+            &[spec.clone()],
+            &extra,
+        );
+        let second = make_simple_descr_group_keyed_with_headerless(
+            3,
+            32,
+            9,
+            cache_key,
+            0x2222,
+            true,
+            false,
+            &[spec],
+            &extra,
+        );
+        assert_eq!(first.size_descr.vtable(), 0x1111);
+        assert_eq!(
+            second.size_descr.vtable(),
+            0x2222,
+            "new_with_vtable of the second class must keep its own typeptr"
+        );
+        assert!(!Arc::ptr_eq(&first.size_descr, &second.size_descr));
+        let first_offsets: Vec<usize> = first
+            .size_descr
+            .all_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        let second_offsets: Vec<usize> = second
+            .size_descr
+            .all_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        assert_eq!(
+            first_offsets, second_offsets,
+            "heaptracker.all_fielddescrs is one ranking per STRUCT"
+        );
+        assert_eq!(
+            first_offsets.first().copied(),
+            Some(8),
+            "the class word is all_fielddescrs[0]"
+        );
     }
 
     /// A published parent that lists nothing — what a mint installs when it
@@ -9634,6 +9994,119 @@ mod tests {
         let sd = SimpleSizeDescr::new(0, 8, 0).with_all_fielddescrs(vec![inside, array_tail]);
         let offsets: Vec<usize> = sd.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
         assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn register_keyed_size_assigns_fields_onto_get_size_descr_shell() {
+        let key = LLType::Struct(0xf1b1_5000_f0b0_0002);
+        let shell = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(key.clone(), 16, 0, false)
+        };
+        assert!(
+            shell
+                .as_size_descr()
+                .expect("get_size_descr returns a SizeDescr")
+                .all_fielddescrs()
+                .is_empty()
+        );
+
+        let populated: DescrRef = Arc::new(
+            SimpleSizeDescr::new(u32::MAX, 16, 0).with_all_fielddescrs(vec![Arc::new(
+                SimpleFieldDescr::new(0, 0, 8, Type::Int, false),
+            )
+                as Arc<dyn FieldDescr>]),
+        );
+        {
+            let mut gc = gc_cache().lock();
+            gc.register_keyed_size(key, populated);
+        }
+        let fields = shell
+            .as_size_descr()
+            .expect("shell remains a SizeDescr")
+            .all_fielddescrs();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].offset(), 0);
+    }
+
+    #[test]
+    fn register_keyed_size_does_not_assign_a_different_size_onto_a_shell() {
+        let key = LLType::Struct(0xf1b1_5000_f0b0_0004);
+        let shell = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(key.clone(), 16, 0, false)
+        };
+        let foreign: DescrRef = Arc::new(
+            SimpleSizeDescr::new(u32::MAX, 72, 0).with_all_fielddescrs(vec![
+                Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false)) as Arc<dyn FieldDescr>,
+                Arc::new(SimpleFieldDescr::new(1, 64, 8, Type::Ref, false)) as Arc<dyn FieldDescr>,
+            ]),
+        );
+        {
+            let mut gc = gc_cache().lock();
+            gc.register_keyed_size(key, foreign);
+        }
+        let fields = shell
+            .as_size_descr()
+            .expect("shell remains a SizeDescr")
+            .all_fielddescrs();
+        assert!(
+            fields.is_empty(),
+            "a size-72 layout must not freeze onto a size-16 shell"
+        );
+    }
+
+    #[test]
+    fn size_descr_same_struct_layout_requires_equal_offset_bags() {
+        let sd = SimpleSizeDescr::new(0, 32, 0).with_all_fielddescrs(vec![
+            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Int, false)) as Arc<dyn FieldDescr>,
+            Arc::new(SimpleFieldDescr::new(1, 8, 8, Type::Int, false)) as Arc<dyn FieldDescr>,
+        ]);
+        assert!(size_descr_same_struct_layout(&sd, 32, &[0, 8]));
+        assert!(size_descr_same_struct_layout(&sd, 32, &[8, 0]));
+        assert!(
+            !size_descr_same_struct_layout(&sd, 32, &[0]),
+            "a proper subset of offsets is not STRUCT identity"
+        );
+        assert!(!size_descr_same_struct_layout(&sd, 32, &[0, 8, 16]));
+        assert!(!size_descr_same_struct_layout(&sd, 16, &[0, 8]));
+        assert!(!size_descr_same_struct_layout(&sd, 32, &[0, 16]));
+    }
+
+    #[test]
+    fn register_unresolved_stamps_a_get_size_descr_shell() {
+        let key = LLType::Struct(0xaaaabbbbccccdddd);
+        let shell = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(key.clone(), 24, 0, false)
+        };
+        assert_eq!(
+            shell
+                .as_size_descr()
+                .expect("get_size_descr returns a SizeDescr")
+                .type_id(),
+            0,
+            "init_size_descr defers the collector tid"
+        );
+        {
+            let mut gc = gc_cache().lock();
+            let mut next = 1000u32;
+            gc.register_unresolved_struct_tids(|size, _offsets| {
+                assert!(size == 24 || size > 0);
+                let tid = next;
+                next += 1;
+                tid
+            });
+        }
+        let tid = shell
+            .as_size_descr()
+            .expect("shell remains a SizeDescr")
+            .type_id();
+        assert_ne!(tid, 0, "register_unresolved stamps the 0 placeholder");
+        assert_ne!(
+            tid, 209,
+            "the stamp is a collector id, not an analyzer counter that aliases W_BufferedRWPairUser"
+        );
     }
 
     /// A struct-array descr and its interior field descrs point at each

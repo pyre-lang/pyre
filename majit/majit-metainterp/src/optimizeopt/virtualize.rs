@@ -2294,18 +2294,13 @@ impl Optimization for OptVirtualize {
 /// every subclass of it. `info.py` spends exactly that guarantee when
 /// it swaps `self.descr` for "a more precise descr" and keeps the index.
 ///
-/// pyre reaches one such list from two producers that rank fields differently —
-/// the codewriter walks declarations (`codewriter/assembler.rs
-/// bh_all_field_specs_for_struct_into`), `jitcode/assembler.rs
-/// register_struct_layout` sorts by byte offset — so the pairing above is a
-/// postcondition to state rather than a property of the construction. Measured
-/// over 120928 virtual setfields (1172 programs) it holds everywhere, including
-/// the 2286 that did index a descr other than the field's own parent; the
-/// reachable failure needs a reordered list AND that cross-descr step at once,
-/// which nothing in the corpus produces. A census over what ran cannot promise
-/// what the producers can emit, so check it here — the same argument
-/// `jitcode/assembler.rs field_descr_position_disagreement` already makes for
-/// the other end of this pipe.
+/// pyre used to mint a second ranking of the same STRUCT
+/// (`register_struct_layout` offset order vs heaptracker declaration
+/// order). `descr.py get_size_descr` / `get_field_descr` keep one
+/// SizeDescr per STRUCT, and reconstruction reuses that parent so the
+/// pairing above is a property of the construction. Check it here — the
+/// same argument `jitcode/assembler.rs field_descr_position_disagreement`
+/// already makes for the other end of this pipe.
 ///
 /// Returns the disagreement as a message so the caller's panic names both the
 /// slot and the field. Gated on [`jit_strict_mode`], not `cfg!(debug_assertions)`:
@@ -5608,6 +5603,113 @@ mod tests {
         );
         // The last op should be the CALL_N
         assert_eq!(result.last().unwrap().opcode, OpCode::CallN);
+    }
+
+    #[test]
+    fn force_box_emits_setfield_under_allocation_layout_slot() {
+        // `descr.py get_size_descr` / `get_field_descr`: one SizeDescr per
+        // STRUCT, and every FieldDescr's `parent_descr` is that SizeDescr.
+        // `info.py _force_elements` enumerates `descr.get_all_fielddescrs()`
+        // of the allocation; `setfield` indexes `_fields` by
+        // `fielddescr.get_index()`. They agree because both descrs share
+        // that one parent.
+        fn spec(
+            name: &str,
+            offset: usize,
+            field_type: Type,
+            flag: majit_ir::ArrayFlag,
+            index_in_parent: usize,
+        ) -> majit_ir::descr::SimpleFieldDescrSpec {
+            majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: Some(false),
+                index: index_in_parent as u32,
+                field_key: name.to_string(),
+                name: format!("PyFrame.{name}"),
+                offset,
+                field_size: 8,
+                field_type,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag,
+                virtualizable: false,
+                index_in_parent,
+            }
+        }
+        let group = majit_ir::descr::make_simple_descr_group(
+            1,
+            16,
+            1,
+            0,
+            &[
+                spec("last_instr", 0, Type::Int, majit_ir::ArrayFlag::Signed, 0),
+                spec("pycode", 8, Type::Ref, majit_ir::ArrayFlag::Pointer, 1),
+            ],
+        );
+        let last_instr_fd = group.field_descrs[0].clone() as DescrRef;
+        let pycode_fd = group.field_descrs[1].clone() as DescrRef;
+        let pycode = majit_ir::GcRef(0xCAFE);
+        let last_instr = Value::Int(7);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::NewWithVtable,
+                &[],
+                group.size_descr.clone() as DescrRef,
+            ),
+            // Store in reverse of `all_fielddescrs` order. `_force_elements`
+            // must emit in descriptor order (`info.py` enumerate walk).
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    Operand::const_from_value(Value::Ref(pycode)),
+                ],
+                pycode_fd,
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    Operand::const_from_value(last_instr),
+                ],
+                last_instr_fd,
+            ),
+            Op::new(
+                OpCode::CallN,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_pass(&ops);
+        let stores: Vec<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::SetfieldGc)
+            .collect();
+        let keys: Vec<String> = stores
+            .iter()
+            .filter_map(|op| {
+                op.getdescr()
+                    .and_then(|d| d.as_field_descr().map(|f| f.field_key().to_string()))
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["last_instr".to_string(), "pycode".to_string()],
+            "force_box must emit SETFIELD_GC in all_fielddescrs order: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+        let parent = stores[1]
+            .getdescr()
+            .and_then(|d| d.as_field_descr().and_then(|f| f.get_parent_descr()));
+        assert!(
+            parent.is_some_and(|p| std::sync::Arc::ptr_eq(
+                &p,
+                &(group.size_descr.clone() as DescrRef)
+            )),
+            "SETFIELD FieldDescr.parent_descr is the allocation SizeDescr"
+        );
     }
 
     #[test]
