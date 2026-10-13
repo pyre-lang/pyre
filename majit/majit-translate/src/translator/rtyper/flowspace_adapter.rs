@@ -2161,7 +2161,23 @@ pub fn translate_op(
             // `Box<[T]>` length is the metadata word. The result is that
             // count (`ll_length` / `rtype_len`), typed by `len` of the
             // field, not by `getattr` of the slice itself.
+            if field.vec_part == Some(crate::model::VecFieldPart::FatMeta)
+                || (field.vec_part == Some(crate::model::VecFieldPart::FatLen)
+                    && field_spelling_is_dyn_fat(call_registry, field))
+            {
+                // Dyn metadata word: `getitem` of `two_word_fat_struct`
+                // (`rtuple.py` `rtype_getitem`). Slice `FatLen` stays
+                // `len(getattr)` below (`ListRepr.rtype_len`).
+                return Ok(getattr_then_getitem(
+                    base_hl,
+                    &field.name,
+                    fat_dyn_word_index(true),
+                    result,
+                ));
+            }
             if field.vec_part == Some(crate::model::VecFieldPart::FatLen) {
+                // Slice / `Box<[T]>` FatLen is `len(getattr(owner, field))`
+                // (`ListRepr.rtype_len`).
                 let list = Hlvalue::Variable(Variable::new());
                 return Ok(vec![
                     FlowspaceOp::new(
@@ -2174,6 +2190,16 @@ pub fn translate_op(
                     ),
                     FlowspaceOp::new("len", vec![list], result),
                 ]);
+            }
+            if field.vec_part == Some(crate::model::VecFieldPart::FatData)
+                && field_spelling_is_dyn_fat(call_registry, field)
+            {
+                return Ok(getattr_then_getitem(
+                    base_hl,
+                    &field.name,
+                    fat_dyn_word_index(false),
+                    result,
+                ));
             }
             if field.vec_part == Some(crate::model::VecFieldPart::Len) {
                 // Inline: the read's base is the parent struct, so the list
@@ -5131,6 +5157,65 @@ fn input_class_name(kind: &OpKind) -> Option<&str> {
         crate::model::ValueType::Ref(Some(name)) => Some(name.as_str()),
         _ => None,
     }
+}
+
+/// Field type spelling is a fat `&dyn Trait` (`spelling_is_dyn_fat_ptr`),
+/// looked up on the owner through `StructFieldRegistry.field_type` — the
+/// type of the field, not its name.
+fn field_spelling_is_dyn_fat(
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    field: &crate::model::FieldDescriptor,
+) -> bool {
+    let Some(owner) = field.owner_root.as_deref() else {
+        return false;
+    };
+    let bk = call_registry.bookkeeper();
+    let borrowed = bk.struct_fields.borrow();
+    let Some(reg) = borrowed.as_ref() else {
+        return false;
+    };
+    let Some(ty) = reg.field_type(owner, &field.name) else {
+        return false;
+    };
+    crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(ty)
+}
+
+/// Index of the metadata (`true`) or data (`false`) word in
+/// `two_word_fat_struct` / `dyn_fat_field_annotation`.
+fn fat_dyn_word_index(metadata: bool) -> i64 {
+    let layout = crate::fat_ptr_layout::probe();
+    let len_first = layout.len_offset < layout.data_offset;
+    match (metadata, len_first) {
+        (true, true) | (false, false) => 0,
+        (true, false) | (false, true) => 1,
+    }
+}
+
+fn getattr_then_getitem(
+    base_hl: Hlvalue,
+    field_name: &str,
+    index: i64,
+    result: Hlvalue,
+) -> Vec<FlowspaceOp> {
+    let tuple = Hlvalue::Variable(Variable::new());
+    vec![
+        FlowspaceOp::new(
+            "getattr",
+            vec![
+                base_hl,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(field_name))),
+            ],
+            tuple.clone(),
+        ),
+        FlowspaceOp::new(
+            "getitem",
+            vec![
+                tuple,
+                Hlvalue::Constant(Constant::new(ConstValue::Int(index))),
+            ],
+            result,
+        ),
+    ]
 }
 
 fn unique_string_field(
@@ -9641,6 +9726,75 @@ mod tests {
             panic!("mapped data");
         };
         assert_eq!(data_res.id(), mapped.id());
+    }
+
+    #[test]
+    fn translate_op_fat_len_dyn_fat_lowers_to_getattr_getitem() {
+        // DictStrategyRef.imp is `&'static dyn DictStrategy` (`two_word_fat_struct`).
+        // FatLen is getitem of that pair, not len() → getattr("__len__").
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "DictStrategyRef".to_string(),
+            vec![("imp".to_string(), "&'static dyn DictStrategy".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk);
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 5);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let len_op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("imp", Some("DictStrategyRef".into()))
+                    .with_vec_part(crate::model::VecFieldPart::FatLen),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated = translate_op(&len_op, &value_map, &registry).expect("dyn-fat len");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "getitem"]);
+        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+            panic!("getattr name");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"imp"
+        ));
+        let Hlvalue::Constant(ref idx) = translated[1].args[1] else {
+            panic!("getitem index");
+        };
+        let expected = fat_dyn_word_index(true);
+        assert!(matches!(idx.value, ConstValue::Int(n) if n == expected));
+    }
+
+    #[test]
+    fn translate_op_fat_meta_lowers_to_getattr_getitem_without_struct_fields() {
+        // `dyn_fat::emit_fat_len` tags the vtable Int as `FatMeta`. The
+        // adapter keys that tag, not a struct-field spelling lookup.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 5);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let meta_op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("imp", Some("DictStrategyRef".into()))
+                    .with_vec_part(crate::model::VecFieldPart::FatMeta),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&meta_op, &value_map, &empty_call_registry()).expect("dyn-fat meta");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "getitem"]);
     }
 
     #[test]

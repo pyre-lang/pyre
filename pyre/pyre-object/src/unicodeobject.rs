@@ -164,16 +164,14 @@ pub struct W_UnicodeObject {
 }
 
 impl W_UnicodeObject {
-    /// `unicodeobject.py W_UnicodeObject.eq_w` — the typed equality shortcut
-    /// used by `UnicodeDictStrategy` and `argument.contains_w_names`.
-    ///
-    /// Both operands are already proven `W_UnicodeObject`s by those callers,
-    /// so this compares the underlying WTF-8 buffers directly and never
-    /// dispatches an app-level `__eq__`.  WTF-8 preserves PyPy's `_utf8`
-    /// byte equality for lone surrogates as well as ordinary Unicode.
+    /// `unicodeobject.py W_UnicodeObject.eq_w` — `return self._utf8 ==
+    /// w_other._utf8`. Both operands are already proven
+    /// `W_UnicodeObject`s; the rtyped compare is `ll_streq` on the two
+    /// `STR`s (`rstr.py LLHelpers.ll_streq`), the same helper
+    /// `W_UnicodeObject.is_w` uses for unique-ified strings.
     #[inline]
     pub fn eq_w(&self, w_other: &W_UnicodeObject) -> bool {
-        unsafe { utf8_payload_bytes(self.value) == utf8_payload_bytes(w_other.value) }
+        crate::lowlevel_string::jit_ll_streq(self.value, w_other.value) != 0
     }
 }
 

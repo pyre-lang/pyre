@@ -5400,7 +5400,7 @@ fn fielddescrof(
                     )
                 }
             }
-            crate::model::VecFieldPart::FatLen => (
+            crate::model::VecFieldPart::FatLen | crate::model::VecFieldPart::FatMeta => (
                 fat_layout.len_offset,
                 majit_ir::value::Type::Int,
                 majit_ir::descr::ArrayFlag::Unsigned,
@@ -6220,7 +6220,9 @@ mod tests {
                     VecFieldPart::Buf | VecFieldPart::FatData | VecFieldPart::FatVtable => {
                         ValueType::Ref(None)
                     }
-                    VecFieldPart::Len | VecFieldPart::FatLen => ValueType::Int,
+                    VecFieldPart::Len | VecFieldPart::FatLen | VecFieldPart::FatMeta => {
+                        ValueType::Int
+                    }
                 },
                 Some(&cc),
                 true,
@@ -6240,7 +6242,9 @@ mod tests {
                 VecFieldPart::Buf => layout.ptr_offset,
                 VecFieldPart::Len => layout.len_offset,
                 VecFieldPart::FatData => fat.data_offset,
-                VecFieldPart::FatLen | VecFieldPart::FatVtable => fat.len_offset,
+                VecFieldPart::FatLen | VecFieldPart::FatMeta | VecFieldPart::FatVtable => {
+                    fat.len_offset
+                }
             };
             assert_eq!(offset, field_off + add, "{field} {part:?}");
             assert_eq!(size, word);
@@ -6248,12 +6252,14 @@ mod tests {
                 VecFieldPart::Buf | VecFieldPart::FatData | VecFieldPart::FatVtable => {
                     ArrayFlag::Pointer
                 }
-                VecFieldPart::Len | VecFieldPart::FatLen => ArrayFlag::Unsigned,
+                VecFieldPart::Len | VecFieldPart::FatLen | VecFieldPart::FatMeta => {
+                    ArrayFlag::Unsigned
+                }
             };
             assert_eq!(flag, expect_flag);
             assert!(name.ends_with(match part {
                 VecFieldPart::Buf => ".buf",
-                VecFieldPart::Len | VecFieldPart::FatLen => ".len",
+                VecFieldPart::Len | VecFieldPart::FatLen | VecFieldPart::FatMeta => ".len",
                 VecFieldPart::FatData => ".data",
                 VecFieldPart::FatVtable => ".vtable",
             }));

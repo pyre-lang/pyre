@@ -18564,7 +18564,9 @@ fn inline_vec_field_part(
         crate::model::VecFieldPart::Buf => buf_ty,
         crate::model::VecFieldPart::FatData => fat_part_value_type(part, field.owner_declared_gc),
         crate::model::VecFieldPart::FatVtable => ValueType::Ref(None),
-        crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
+        crate::model::VecFieldPart::Len
+        | crate::model::VecFieldPart::FatLen
+        | crate::model::VecFieldPart::FatMeta => ValueType::Int,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -18599,6 +18601,7 @@ fn retarget_vec_operand(
         // word is the `arraylen_gc` fault this path exists to avoid.
         crate::model::VecFieldPart::FatData
         | crate::model::VecFieldPart::FatLen
+        | crate::model::VecFieldPart::FatMeta
         | crate::model::VecFieldPart::FatVtable => {
             return vec_var.clone();
         }
@@ -18607,7 +18610,9 @@ fn retarget_vec_operand(
         crate::model::VecFieldPart::Buf
         | crate::model::VecFieldPart::FatData
         | crate::model::VecFieldPart::FatVtable => ValueType::Ref(None),
-        crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
+        crate::model::VecFieldPart::Len
+        | crate::model::VecFieldPart::FatLen
+        | crate::model::VecFieldPart::FatMeta => ValueType::Int,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -18638,6 +18643,7 @@ fn retarget_fat_operand(
             part,
             crate::model::VecFieldPart::FatData
                 | crate::model::VecFieldPart::FatLen
+                | crate::model::VecFieldPart::FatMeta
                 | crate::model::VecFieldPart::FatVtable
         )
     {
@@ -18648,7 +18654,7 @@ fn retarget_fat_operand(
     field.taken_by_address = false;
     field.inline_vec = false;
     let ty = match part {
-        crate::model::VecFieldPart::FatLen => ValueType::Int,
+        crate::model::VecFieldPart::FatLen | crate::model::VecFieldPart::FatMeta => ValueType::Int,
         crate::model::VecFieldPart::FatData => fat_part_value_type(part, field.owner_declared_gc),
         crate::model::VecFieldPart::FatVtable => ValueType::Ref(None),
         _ => return None,
@@ -18677,7 +18683,9 @@ fn fat_part_value_type(
         crate::model::VecFieldPart::Buf
         | crate::model::VecFieldPart::FatData
         | crate::model::VecFieldPart::FatVtable => ValueType::Ref(None),
-        crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
+        crate::model::VecFieldPart::Len
+        | crate::model::VecFieldPart::FatLen
+        | crate::model::VecFieldPart::FatMeta => ValueType::Int,
     }
 }
 
@@ -20223,15 +20231,18 @@ impl<'a> Lowering<'a> {
                     && name == "PtrMetadata"
                 {
                     // A fat pointer's metadata word (`ClassRepr.getclsfield`'s
-                    // vtable pointer, or a slice's length). The data word is
-                    // at `fat_ptr_layout::probe().data_offset`; this loads
-                    // `len_offset` through the same component read `Box<[T]>`
-                    // uses for `.len()`.
+                    // vtable pointer, or a slice's length). Dyn metadata is
+                    // `FatMeta` (`two_word_fat_struct` item 1); a slice is
+                    // `FatLen` (`ListRepr.rtype_len`).
+                    let is_dyn = tyref_is_dyn_pointer(&inner.ty, self.llbc);
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
-                    if let Some(meta) =
-                        self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatLen)
-                    {
+                    let part = if is_dyn {
+                        crate::model::VecFieldPart::FatMeta
+                    } else {
+                        crate::model::VecFieldPart::FatLen
+                    };
+                    if let Some(meta) = self.fat_component(bb_id, &base, part) {
                         return Ok(meta);
                     }
                     return Ok(base);
@@ -60663,8 +60674,9 @@ fn tyref_is_inline_fat_box(ty: &TyRef, llbc: &Llbc) -> bool {
 }
 
 /// An inline fat pointer: a fat `Box` or a fat shared/mut reference
-/// (`&dyn Trait`, `&[T]`, `&str`). The metadata word is the vtable or
-/// the length; `ptr_metadata` reads it via `VecFieldPart::FatLen`.
+/// (`&dyn Trait`, `&[T]`, `&str`). The metadata word is the vtable
+/// (`FatMeta`) or the length (`FatLen`); `ptr_metadata` picks by
+/// whether the pointee is `dyn`.
 fn tyref_is_inline_fat_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_is_inline_fat_box(ty, llbc) || tyref_is_fat_ref(ty, llbc)
 }
@@ -79252,6 +79264,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dict_strategy_ref_imp_layout_is_dyn_fat() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
+            &llbc,
+            &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        );
+        let spelling = ["dictmultiobject::DictStrategyRef", "DictStrategyRef"]
+            .iter()
+            .find_map(|owner| fields.field_type(owner, "imp"))
+            .expect("DictStrategyRef.imp layout row");
+        assert!(
+            crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(spelling),
+            "DictStrategyRef.imp must be two_word_fat_struct, got {spelling:?}"
+        );
+        let attr_rows = attrs
+            .get("dictmultiobject::DictStrategyRef")
+            .expect("DictStrategyRef FORCE attrs");
+        assert!(
+            attr_rows.iter().any(|(name, _)| name == "imp"),
+            "FORCE attrs include imp: {attr_rows:?}"
+        );
+    }
+
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
     /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
@@ -81471,13 +81514,13 @@ mod tests {
         assert_eq!(field.name, "slot");
         assert_eq!(
             field.vec_part,
-            Some(VecFieldPart::FatLen),
+            Some(VecFieldPart::FatMeta),
             "vtable slot base is the metadata word, not the data word: {meta:?}"
         );
     }
 
     /// `w_dict_getitem_str_hashed` reads `imp` on two strategy arms, merges,
-    /// then reads `method_*` after a passthrough. The FatLen metadata word
+    /// then reads `method_*` after a passthrough. The FatMeta metadata word
     /// must be an inputarg of the method_* block: a dominating use of the
     /// merge phi is not a definition (`lookup_operand`).
     #[test]
@@ -81694,13 +81737,13 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::FieldRead { field, .. }
-                        if field.name == "slot" && field.vec_part == Some(VecFieldPart::FatLen)
+                        if field.name == "slot" && field.vec_part == Some(VecFieldPart::FatMeta)
                 )
             })
             .collect();
         assert!(
             !fat_lens.is_empty(),
-            "the vtable word must be a FatLen of slot\n{}",
+            "the vtable word must be a FatMeta of slot\n{}",
             graph.dump()
         );
     }

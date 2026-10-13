@@ -2968,8 +2968,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // token and this frame's pycode come from the function's code. A
     // `GuardValue` on the function object does not watch that field, so
     // `f.__code__ = ...` would keep entering the old body. The `?` marker
-    // invalidates the trace instead.
-    walker_pin_function_code(ctx, op.pc, callable)?;
+    // invalidates the trace instead. The pin re-reads `function_get_code`
+    // after installing the watcher (`QuasiImmutDescr.__init__`) and aborts
+    // if it no longer matches the `w_code` already used for the token.
+    walker_pin_function_code(ctx, op.pc, callable, w_code)?;
 
     // Build the callee PyFrame inline (Branch A): a single positional
     // local, no cells, constant code / globals.
@@ -8375,7 +8377,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // here: the guard arm below reads the field off the pinned operand,
         // which this arm either cannot do (the operand is not the callee) or
         // must not do (a baked `ConstPtr`).
-        walker_pin_function_code(ctx, op.pc, callable)?;
+        walker_pin_function_code(ctx, op.pc, callable, w_code)?;
     } else {
         // `function.py getcode()` promotes `self.code`, never `self`.
         // The code object below and globals namespace in `InlineCalleeConsts`

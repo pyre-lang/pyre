@@ -805,7 +805,22 @@ impl RPythonTyper {
             }
         }
         // rtyper.py — `return getfunctionptr(graph, getconcretetype)`.
+        // `getconcretetype` is `bindingrepr(v).lowleveltype`. Unbound
+        // return is `lltype.Void` (`callparse.py` `getrresult`); seed
+        // fills getargs only (`rpbc.py` `FunctionReprBase.call`). A
+        // skip-subject / ZST-erased graph leaves the return unbound,
+        // and `bindingrepr` panics `KeyError: no binding for arg`.
+        let return_var = match graph.graph.borrow().getreturnvar() {
+            Hlvalue::Variable(v) => Some(v),
+            _ => None,
+        };
+        let result_ll = super::callparse::getrresult(self, graph)?.lowleveltype();
         getfunctionptr(&graph.graph, |v| {
+            if let (Hlvalue::Variable(var), Some(ret)) = (v, return_var.as_ref())
+                && var == ret
+            {
+                return Ok(result_ll.clone());
+            }
             self.bindingrepr(v).map(|r| r.lowleveltype().clone())
         })
     }
@@ -6755,6 +6770,61 @@ mod tests {
     }
 
     #[test]
+    fn getcallable_unbound_return_is_void_like_getrresult() {
+        // `callparse.getrresult`: no return annotation → `lltype.Void`.
+        // `RDict::new` after ZST-self drop is empty getargs plus that
+        // unbound return; `bindingrepr` on it was `KeyError: no binding
+        // for arg` (`annrpython.py` `binding`).
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let code = HostCode {
+            id: HostCode::fresh_identity(),
+            co_name: "new".into(),
+            co_filename: "<test>".into(),
+            co_firstlineno: 1,
+            co_nlocals: 0,
+            co_argcount: 0,
+            co_stacksize: 0,
+            co_flags: 0,
+            co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
+            co_varnames: Vec::new(),
+            co_freevars: Vec::new(),
+            co_cellvars: Vec::new(),
+            consts: Vec::new(),
+            names: Vec::new(),
+            co_lnotab: Vec::new(),
+            exceptiontable: Vec::new().into_boxed_slice(),
+            signature: Signature::new(Vec::new(), None, None),
+        };
+        let graph = Rc::new(PyGraph::new(
+            GraphFunc::new("new", Constant::new(ConstValue::Dict(Default::default()))),
+            &code,
+        ));
+        {
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+            let graph_borrow = graph.graph.borrow();
+            for arg in graph_borrow.startblock.borrow_mut().inputargs.iter_mut() {
+                if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
+                    v.set_concretetype(Some(LowLevelType::Signed));
+                    v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+                }
+            }
+        }
+
+        let llfn = rtyper
+            .getcallable(&graph)
+            .expect("unbound return is Void, not KeyError");
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+        let PtrTarget::Func(func_t) = &llfn._TYPE.TO else {
+            panic!("expected Func ptr, got {:?}", llfn._TYPE.TO);
+        };
+        assert_eq!(
+            func_t.result,
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void
+        );
+    }
+
+    #[test]
     fn getcallable_sandbox_with_external_name_surfaces_unported_trampoline() {
         // rtyper.py:572-582 — sandbox path requires
         // `make_sandbox_trampoline` (rsandbox.py), which is unported
@@ -7569,6 +7639,32 @@ mod tests {
         let v = Hlvalue::Variable(var);
         let binding = rtyper.binding(&v);
         assert!(matches!(binding, SomeValue::Integer(_)));
+    }
+
+    #[test]
+    fn rtyper_binding_of_constant_int_goes_through_immutablevalue() {
+        // RPythonAnnotator.annotation (annrpython.py):
+        //     elif isinstance(arg, Constant):
+        //         return self.bookkeeper.immutablevalue(arg.value)
+        // RPythonTyper.binding / HighLevelOp.setup (rtyper.py) go through
+        // that, so args_s never sees an unannotated Constant. A Constant
+        // has no stored annotation field; the index 0 used by tuple
+        // getitem is SomeInteger(const=0) solely via this route.
+        use crate::annotator::model::SomeObjectTrait;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let c = Hlvalue::Constant(Constant::new(ConstValue::Int(0)));
+        let s = rtyper.binding(&c);
+        match s {
+            SomeValue::Integer(i) => {
+                assert!(i.is_immutable_constant());
+                assert_eq!(
+                    i.base.const_box.as_ref().map(|k| &k.value),
+                    Some(&ConstValue::Int(0))
+                );
+            }
+            other => panic!("expected SomeInteger from immutablevalue, got {other:?}"),
+        }
     }
 
     #[test]

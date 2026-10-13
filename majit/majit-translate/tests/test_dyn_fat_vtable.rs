@@ -116,7 +116,10 @@ fn reaches_imp_fat_len(
         return match &op.kind {
             OpKind::FieldRead { field, ty, .. }
                 if field.name == "imp"
-                    && field.vec_part == Some(VecFieldPart::FatLen)
+                    && matches!(
+                        field.vec_part,
+                        Some(VecFieldPart::FatLen | VecFieldPart::FatMeta)
+                    )
                     && *ty == ValueType::Int
                     && FunctionGraph::concretetype_of(var) == ConcreteType::Signed =>
             {
@@ -189,6 +192,72 @@ fn w_dict_getitem_str_hashed_assembles_with_vtable_word() {
         &jitcode,
         false,
         0,
+    );
+}
+
+fn has_cast_int_to_ptr_unary(graph: &FunctionGraph) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr"
+            )
+        })
+    })
+}
+
+#[test]
+fn w_dict_store_cast_int_to_ptr_is_unary() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let graph = lower_function(llbc, "w_dict_store").expect("lower w_dict_store");
+    assert_vtable_reads(&graph, "method_setitem");
+    assert!(
+        has_cast_int_to_ptr_unary(&graph),
+        "w_dict_store must emit UnaryOp cast_int_to_ptr of the FatMeta Int load\n{}",
+        graph.dump()
+    );
+}
+
+fn call_leaf_is(target: &CallTarget, leaf: &str) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.last().is_some_and(|name| name == leaf)
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn eq_w_compares_utf8_fields_with_ll_streq() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let graph = lower_function(llbc, "eq_w").expect("lower eq_w");
+    assert!(
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. } if call_leaf_is(target, "jit_ll_streq"))
+            })
+        }),
+        "eq_w must call ll_streq on the two `_utf8` STRs \
+         (unicodeobject.py eq_w: self._utf8 == w_other._utf8)\n{}",
+        graph.dump()
+    );
+    let residual_payload = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            let OpKind::Call { target, .. } = &op.kind else {
+                return false;
+            };
+            call_leaf_is(target, "utf8_payload_bytes")
+        })
+    });
+    assert!(
+        !residual_payload,
+        "eq_w must not go through utf8_payload_bytes; the compare is ll_streq \
+         of the two value fields\n{}",
+        graph.dump()
     );
 }
 
