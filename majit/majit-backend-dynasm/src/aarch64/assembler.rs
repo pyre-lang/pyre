@@ -3447,11 +3447,9 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 let val_reg = match value_loc {
                     Loc::Reg(r) => *r,
-                    Loc::ImmedFloat(i) if size == 4 => {
-                        self.emit_mov_imm64(16, i.value);
-                        dynasm!(self.mc ; .arch aarch64 ; fmov D(14), X(16));
-                        crate::regloc::RegLoc::new(14, true)
-                    }
+                    // An immediate, including a singlefloat bit pattern, is
+                    // an integer store. `get_type_flag` banks SingleFloat as
+                    // FLAG_UNSIGNED; only `lltype.Float` is an 8-byte xmm.
                     Loc::Immed(i) | Loc::ImmedFloat(i) => {
                         self.emit_mov_imm64(16, i.value);
                         crate::regloc::RegLoc::new(16, false)
@@ -6319,7 +6317,6 @@ impl<'a> AssemblerARM64<'a> {
         func_index: usize,
         save_err: i64,
         arg_classes: &str,
-        ref_result: bool,
     ) {
         let arg_count = arglocs.len();
 
@@ -6520,18 +6517,7 @@ impl<'a> AssemblerARM64<'a> {
             self.write_real_errno(save_err, current_sp);
             dynasm!(self.mc ; .arch aarch64 ; blr x8);
         }
-        // `Option<*mut T>` returns the discriminant in x0 and the pointer
-        // in x1. Discriminant 1 is not an aligned pointer; a one-word
-        // pointer return leaves its address in x0.
-        if ref_result {
-            let keep = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch aarch64
-                ; cmp x0, #1
-                ; b.ne =>keep
-                ; mov x0, x1
-                ; =>keep
-            );
-        }
+        // `CallBuilderARM64.load_result` reads the one return word in x0.
         self.read_real_errno(save_err, current_sp);
 
         if stack_bytes != 0 {
@@ -6586,8 +6572,7 @@ impl<'a> AssemblerARM64<'a> {
             .getdescr()
             .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
             .unwrap_or_default();
-        let ref_result = op.opcode.result_type() == Type::Ref;
-        self.emit_call_from_arglocs(arglocs, func_index, save_err, &arg_classes, ref_result);
+        self.emit_call_from_arglocs(arglocs, func_index, save_err, &arg_classes);
         // Result `'S'` returns in s0. `fmov w0, s0` puts those bits in x0.
         if op.opcode.result_type() == Type::Int
             && op.getdescr().is_some_and(|descr| {
@@ -6831,24 +6816,6 @@ impl<'a> AssemblerARM64<'a> {
             let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
             let helper_addr = crate::call_assembler_helper_addr() as i64;
             let green_key = self.header_pc as i64;
-
-            // `MIFrame.get_list_of_active_boxes(in_a_call)` clears the
-            // not-yet-defined result register before a suspended caller is
-            // snapshotted.  GUARD_NOT_FORCED's async path observes this
-            // caller while CALL_ASSEMBLER is still running, before x0/d0
-            // contains the result.  Unlike the ordinary guard-failure stub,
-            // `LLGraphCPU.force`/`AbstractLLCPU.force` only switches
-            // `jf_descr`; it cannot save the caller's hardware registers.
-            // Seed the result's jitframe register slot with the same null
-            // placeholder now.  A normal return puts the real value in the
-            // register, and any later guard stub saves that value as usual.
-            if result_type != Type::Void {
-                let result_loc = result_loc.expect("non-void CALL_ASSEMBLER needs a result loc");
-                let slot = deadframe_slot_for_loc(result_loc)
-                    .expect("CALL_ASSEMBLER result must have a deadframe register slot");
-                let offset = Self::slot_offset(slot as usize) as u32;
-                dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, offset]);
-            }
 
             if !is_resolved {
                 let force_addr = crate::call_assembler_force_fn_addr() as i64;
@@ -7758,7 +7725,7 @@ impl<'a> AssemblerARM64<'a> {
             .getdescr()
             .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
             .unwrap_or_default();
-        self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes, false);
+        self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes);
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         self.pop_all_regs_from_jitframe(&[], true);
 
@@ -7791,8 +7758,8 @@ impl<'a> AssemblerARM64<'a> {
     /// (`_r` is the same). Arglocs are `[argloc, resloc]` from
     /// `_prepare_op_cond_call`; extra args already sit in `argument_regs`.
     /// `CMP argloc, 0` then `B.NE` over the slow path; on miss the helper
-    /// returns a plain word that is moved into `res_loc`. No `ref_result`
-    /// Option rewrite and no `store_rax_to_result`.
+    /// returns a plain word that is moved into `res_loc`. No
+    /// `store_rax_to_result`.
     fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc]) {
         let (argloc, resloc) = match arglocs {
             [argloc, resloc, ..] => (*argloc, *resloc),

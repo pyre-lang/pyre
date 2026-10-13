@@ -6743,22 +6743,19 @@ fn emit_load_from_addr(
     let heap_flags = heap_mem_flags(opcode);
     match value_type {
         Type::Float => {
-            match size {
-                4 => {
-                    let raw = builder.ins().load(cl_types::F32, heap_flags, addr, offset);
-                    Ok(builder.ins().fpromote(cl_types::F64, raw))
-                }
-                8 => {
-                    // Return the natural F64 so a Float-result variable (declared
-                    // F64) receives it without a GPR round-trip; callers feeding a
-                    // boxed I64 slot coerce at their own boundary.
-                    Ok(builder.ins().load(cl_types::F64, heap_flags, addr, offset))
-                }
-                _ => Err(unsupported_semantics(
+            // `get_type_flag`: only `lltype.Float` is FLAG_FLOAT, and it is
+            // 8 bytes. A singlefloat access is int-kind (`FLAG_UNSIGNED`),
+            // not an F32 load promoted to F64.
+            if size != 8 {
+                return Err(unsupported_semantics(
                     opcode,
-                    "float memory operations require 4- or 8-byte values",
-                )),
+                    "float memory operations require 8-byte values",
+                ));
             }
+            // Return the natural F64 so a Float-result variable (declared
+            // F64) receives it without a GPR round-trip; callers feeding a
+            // boxed I64 slot coerce at their own boundary.
+            Ok(builder.ins().load(cl_types::F64, heap_flags, addr, offset))
         }
         Type::Int | Type::Ref => {
             // Adaptation, not parity.  Upstream's reference bank is one word by
@@ -6815,22 +6812,17 @@ fn emit_store_to_addr(
     let heap_flags = heap_mem_flags(opcode);
     match value_type {
         Type::Float => {
-            let fval = coerce_ty(builder, value, cl_types::F64);
-            match size {
-                4 => {
-                    let f32val = builder.ins().fdemote(cl_types::F32, fval);
-                    builder.ins().store(heap_flags, f32val, addr, offset);
-                }
-                8 => {
-                    builder.ins().store(heap_flags, fval, addr, offset);
-                }
-                _ => {
-                    return Err(unsupported_semantics(
-                        opcode,
-                        "float memory operations require 4- or 8-byte values",
-                    ));
-                }
+            // `get_type_flag`: only `lltype.Float` is FLAG_FLOAT, and it is
+            // 8 bytes. A singlefloat access is int-kind (`FLAG_UNSIGNED`),
+            // not an F64 demoted to an F32 store.
+            if size != 8 {
+                return Err(unsupported_semantics(
+                    opcode,
+                    "float memory operations require 8-byte values",
+                ));
             }
+            let fval = coerce_ty(builder, value, cl_types::F64);
+            builder.ins().store(heap_flags, fval, addr, offset);
         }
         Type::Int | Type::Ref => {
             // Same adaptation as the load path above, and for the same reason.
@@ -7670,13 +7662,10 @@ fn push_described_call_results(sig: &mut Signature, result_type: Type) {
     if result_type == Type::Void {
         return;
     }
+    // `CallBuilder64.load_result` reads one return word. A Ref result is
+    // that pointer.
     sig.returns
         .push(AbiParam::new(cranelift_type_for(&result_type)));
-    // Second word is the `Option<*mut T>` payload. A one-word pointer
-    // return leaves its address in the first word.
-    if result_type == Type::Ref {
-        sig.returns.push(AbiParam::new(cl_types::I64));
-    }
 }
 
 fn ref_result_from_call(
@@ -7687,14 +7676,7 @@ fn ref_result_from_call(
     if result_type == Type::Void {
         return None;
     }
-    let first = builder.inst_results(call)[0];
-    if result_type != Type::Ref {
-        return Some(first);
-    }
-    let second = builder.inst_results(call)[1];
-    let one = builder.ins().iconst(cl_types::I64, 1);
-    let is_disc = builder.ins().icmp(IntCC::Equal, first, one);
-    Some(builder.ins().select(is_disc, second, first))
+    Some(builder.inst_results(call)[0])
 }
 
 fn emit_indirect_call_from_parts(

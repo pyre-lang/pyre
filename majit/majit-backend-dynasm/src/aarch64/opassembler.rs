@@ -27,15 +27,10 @@ impl<'a> AssemblerARM64<'a> {
     ) {
         match val_loc {
             Loc::Reg(v) if v.is_xmm => {
-                if field_size == 4 {
-                    let scratch = if v.value == 14 { 15 } else { 14 };
-                    dynasm!(self.mc ; .arch aarch64
-                        ; fcvt S(scratch), D(v.value)
-                        ; str S(scratch), [X(base.value), ofs as u32]
-                    );
-                } else {
-                    dynasm!(self.mc ; .arch aarch64 ; str D(v.value), [X(base.value), ofs as u32]);
-                }
+                // `get_type_flag` banks only `lltype.Float` (8 bytes) as
+                // FLAG_FLOAT. A singlefloat store is int-kind (`str W`).
+                debug_assert_eq!(field_size, 8, "float-kind access is 8 bytes");
+                dynasm!(self.mc ; .arch aarch64 ; str D(v.value), [X(base.value), ofs as u32]);
             }
             Loc::Reg(v) => match field_size {
                 1 => {
@@ -105,14 +100,10 @@ impl<'a> AssemblerARM64<'a> {
         signed: bool,
     ) {
         if dst.is_xmm {
-            if size == 4 {
-                if let Some(r) = ofs_reg {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr S(dst.value), [X(base.value), X(r.value)]);
-                } else {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr S(dst.value), [X(base.value), ofs as u32]);
-                }
-                dynasm!(self.mc ; .arch aarch64 ; fcvt D(dst.value), S(dst.value));
-            } else if let Some(r) = ofs_reg {
+            // `get_type_flag` banks only `lltype.Float` (8 bytes). A
+            // singlefloat load is int-kind, not `ldr S` + `fcvt`.
+            debug_assert_eq!(size, 8, "float-kind access is 8 bytes");
+            if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), X(r.value)]);
             } else {
                 dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
@@ -256,15 +247,10 @@ impl<'a> AssemblerARM64<'a> {
     fn emit_stur_sized(&mut self, base: &RegLoc, ofs: i32, val: &RegLoc, size: usize) {
         debug_assert!((-256..256).contains(&ofs));
         if val.is_xmm {
-            if size == 4 {
-                let scratch = if val.value == 14 { 15 } else { 14 };
-                dynasm!(self.mc ; .arch aarch64
-                    ; fcvt S(scratch), D(val.value)
-                    ; stur S(scratch), [X(base.value), ofs]
-                );
-            } else {
-                dynasm!(self.mc ; .arch aarch64 ; stur D(val.value), [X(base.value), ofs]);
-            }
+            // `get_type_flag` banks only `lltype.Float` (8 bytes). A
+            // singlefloat store is int-kind, not `fcvt` + `stur S`.
+            debug_assert_eq!(size, 8, "float-kind access is 8 bytes");
+            dynasm!(self.mc ; .arch aarch64 ; stur D(val.value), [X(base.value), ofs]);
             return;
         }
         match size {
@@ -284,15 +270,10 @@ impl<'a> AssemblerARM64<'a> {
         size: usize,
     ) {
         if val.is_xmm {
-            if size == 4 {
-                let scratch = if val.value == 14 { 15 } else { 14 };
-                dynasm!(self.mc ; .arch aarch64 ; fcvt S(scratch), D(val.value));
-                if let Some(r) = ofs_reg {
-                    dynasm!(self.mc ; .arch aarch64 ; str S(scratch), [X(base.value), X(r.value)]);
-                } else {
-                    dynasm!(self.mc ; .arch aarch64 ; str S(scratch), [X(base.value), ofs as u32]);
-                }
-            } else if let Some(r) = ofs_reg {
+            // `get_type_flag` banks only `lltype.Float` (8 bytes). A
+            // singlefloat store is int-kind, not `fcvt` + `str S`.
+            debug_assert_eq!(size, 8, "float-kind access is 8 bytes");
+            if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch aarch64 ; str D(val.value), [X(base.value), X(r.value)]);
             } else {
                 dynasm!(self.mc ; .arch aarch64 ; str D(val.value), [X(base.value), ofs as u32]);

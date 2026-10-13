@@ -981,6 +981,7 @@ impl<'c> Lowerer<'c> {
             is_inferred,
             inferred_policy_check,
             None,
+            func_args.len(),
         );
         self.emit_op(
             OpMeta::linear(OpKind::Call, arg_regs, vec![]),
@@ -1132,6 +1133,7 @@ impl<'c> Lowerer<'c> {
             is_inferred,
             inferred_policy_check,
             word_result_addr_for_kind(value_kind, func_path, &cond_call_arg_kinds),
+            cond_call_arg_kinds.len(),
         );
         self.emit_op(
             OpMeta::linear(
@@ -1364,6 +1366,7 @@ impl<'c> Lowerer<'c> {
             is_inferred,
             inferred_policy_check,
             word_result_addr_for_kind(result_binding.kind, func_path, &known_result_arg_kinds),
+            known_result_arg_kinds.len(),
         );
         let result_typed = Register::new(result_binding.kind, result_reg);
         let mut reads = Vec::with_capacity(arg_regs.len() + 1);
@@ -2092,6 +2095,7 @@ impl<'c> Lowerer<'c> {
                     let throwaway_reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let ref_word = assert_ref_result_one_word(func, arg_bindings.len());
                     // The register literals must be spelled inside the
                     // `__builder` call itself: `regalloc`'s rewriter recolors
                     // only the arguments of a non-aux builder method call, so
@@ -2100,6 +2104,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
                         quote! {
+                            #ref_word
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                             __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg);
                         },
@@ -2110,9 +2115,11 @@ impl<'c> Lowerer<'c> {
                     let throwaway_reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let ref_word = assert_ref_result_one_word(func, arg_bindings.len());
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
                         quote! {
+                            #ref_word
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                             __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #throwaway_reg, majit_metainterp::can_raise_effect_info());
                         },
@@ -2123,6 +2130,7 @@ impl<'c> Lowerer<'c> {
                     let throwaway_reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let ref_word = assert_ref_result_one_word(func, arg_bindings.len());
                     // The register literals must be spelled inside the
                     // `__builder` call itself: `regalloc`'s rewriter recolors
                     // only the arguments of a non-aux builder method call, so
@@ -2131,6 +2139,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
                         quote! {
+                            #ref_word
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                             __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #throwaway_reg, majit_metainterp::nursery_alloc_effect_info());
                         },
@@ -2331,6 +2340,10 @@ impl<'c> Lowerer<'c> {
                     quote! {
                         let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                         let __trace_target = if __trace_target.is_null() {
+                            // Statement Infer calls only the void policy bytes
+                            // in the match below, so this raw address is not a
+                            // Ref call target (`llmodel.py bh_call_r`). Any
+                            // other byte panics before the call.
                             #func as *const ()
                         } else {
                             __trace_target

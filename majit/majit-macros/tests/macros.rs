@@ -916,7 +916,7 @@ mod jit_module {
 mod jit_struct {
     //! Smoke tests for `#[jit_struct]` — descr.py get_size_descr / :218-239 auto-discovery.
 
-    use majit_ir::descr::{Descr, GcCache, LLType};
+    use majit_ir::descr::{ArrayFlag, Descr, GcCache, LLType};
     use majit_ir::value::Type;
     use majit_macros::jit_struct;
 
@@ -1007,6 +1007,42 @@ mod jit_struct {
         // descr.py: fielddescr.parent_descr = get_size_descr(...)
         let parent = value_fd.get_parent_descr().expect("parent_descr wired");
         assert!(std::sync::Arc::ptr_eq(&parent, &node_size));
+    }
+
+    #[jit_struct]
+    struct FloatCell {
+        #[expect(
+            dead_code,
+            reason = "field is inspected by jit_struct descriptor generation"
+        )]
+        narrow: f32,
+        #[expect(
+            dead_code,
+            reason = "field is inspected by jit_struct descriptor generation"
+        )]
+        wide: f64,
+    }
+
+    /// `get_type_flag`: `f32` is unsigned int of `size_of::<f32>()`;
+    /// `f64` stays `lltype.Float`.
+    #[test]
+    fn f32_field_is_unsigned_int_f64_stays_float() {
+        let mut gc = GcCache::new();
+        FloatCell::__majit_register_descrs(&mut gc);
+        let key = LLType::struct_key(FloatCell::__majit_type_id());
+        let fields = gc._cache_field.get(&key).expect("field cache entry");
+
+        let narrow = fields.get("narrow").unwrap().as_field_descr().unwrap();
+        assert_eq!(narrow.field_type(), Type::Int);
+        assert_eq!(narrow.field_size(), 4);
+        assert_eq!(narrow.field_flag(), ArrayFlag::Unsigned);
+        assert!(!narrow.is_float_field());
+
+        let wide = fields.get("wide").unwrap().as_field_descr().unwrap();
+        assert_eq!(wide.field_type(), Type::Float);
+        assert_eq!(wide.field_size(), 8);
+        assert_eq!(wide.field_flag(), ArrayFlag::Float);
+        assert!(wide.is_float_field());
     }
 }
 

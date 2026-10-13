@@ -145,7 +145,9 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   - `lltype.Ptr` with `_gckind == 'gc'`         → FLAG_POINTER  (Ref)
 ///   - `lltype.Ptr` otherwise (raw pointer)         → FLAG_UNSIGNED (Int)
 ///   - `lltype.Struct`                              → FLAG_STRUCT
-///   - `lltype.Float` / longlong                    → FLAG_FLOAT
+///   - `lltype.Float`                               → FLAG_FLOAT
+///   - `lltype.SingleFloat` (`f32`)                 → FLAG_UNSIGNED
+///     (not `lltype.Float`; the signed `rffi.cast` test fails)
 ///   - signed `lltype.Number` (cast(-1) == -1)      → FLAG_SIGNED
 ///   - otherwise                                    → FLAG_UNSIGNED
 ///
@@ -188,7 +190,15 @@ fn classify_field_type(ty: &Type) -> (TokenStream, TokenStream) {
                     quote! { ::majit_ir::descr::ArrayFlag::Unsigned },
                 );
             }
-            "f32" | "f64" => {
+            // `get_type_flag(SingleFloat)` is FLAG_UNSIGNED: not `lltype.Float`,
+            // and `rffi.cast(TYPE, -1) == -1` fails. Size stays `size_of::<f32>()`.
+            "f32" => {
+                return (
+                    quote! { ::majit_ir::value::Type::Int },
+                    quote! { ::majit_ir::descr::ArrayFlag::Unsigned },
+                );
+            }
+            "f64" => {
                 return (
                     quote! { ::majit_ir::value::Type::Float },
                     quote! { ::majit_ir::descr::ArrayFlag::Float },

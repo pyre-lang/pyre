@@ -669,7 +669,12 @@ impl VirtualizableInfo {
         match field_type {
             Type::Int => assert!(matches!(field_size, 1 | 2 | 4 | 8)),
             Type::Ref => assert_eq!(field_size, std::mem::size_of::<usize>()),
-            Type::Float => assert!(matches!(field_size, 4 | 8)),
+            // `get_type_flag`: `lltype.Float` is 8 bytes. SingleFloat is
+            // `FLAG_UNSIGNED` (int kind, size 4), not a float-kind field.
+            Type::Float => assert_eq!(
+                field_size, 8,
+                "get_type_flag: lltype.Float is 8 bytes; SingleFloat is FLAG_UNSIGNED"
+            ),
             Type::Void => panic!("virtualizable fields cannot be void"),
         }
         self.static_fields.push(VableFieldInfo {
@@ -1213,17 +1218,13 @@ impl VirtualizableInfo {
         unsafe {
             let field = &self.static_fields[field_index];
             match field.field_type {
-                Type::Float => match field.field_size {
-                    4 => {
-                        let ptr = obj_ptr.add(field.offset) as *const f32;
-                        f64::to_bits(f64::from(*ptr)) as i64
-                    }
-                    8 => {
-                        let ptr = obj_ptr.add(field.offset) as *const f64;
-                        f64::to_bits(*ptr) as i64
-                    }
-                    _ => unreachable!("invalid virtualizable float width"),
-                },
+                // `get_type_flag`: `lltype.Float` is 8 bytes. A singlefloat
+                // is `FLAG_UNSIGNED` and takes the integer arm below.
+                Type::Float => {
+                    debug_assert_eq!(field.field_size, 8);
+                    let ptr = obj_ptr.add(field.offset) as *const f64;
+                    f64::to_bits(*ptr) as i64
+                }
                 // Pointer-width field: 4 bytes on wasm32. Reading 8 bytes
                 // would fold in the next field's bytes.
                 Type::Ref => {
@@ -1257,17 +1258,13 @@ impl VirtualizableInfo {
         unsafe {
             let field = &self.static_fields[field_index];
             match field.field_type {
-                Type::Float => match field.field_size {
-                    4 => {
-                        let ptr = obj_ptr.add(field.offset) as *mut f32;
-                        *ptr = f64::from_bits(value as u64) as f32;
-                    }
-                    8 => {
-                        let ptr = obj_ptr.add(field.offset) as *mut f64;
-                        *ptr = f64::from_bits(value as u64);
-                    }
-                    _ => unreachable!("invalid virtualizable float width"),
-                },
+                // `get_type_flag`: `lltype.Float` is 8 bytes. A singlefloat
+                // is `FLAG_UNSIGNED` and takes the integer arm below.
+                Type::Float => {
+                    debug_assert_eq!(field.field_size, 8);
+                    let ptr = obj_ptr.add(field.offset) as *mut f64;
+                    *ptr = f64::from_bits(value as u64);
+                }
                 // Pointer-width field: 4 bytes on wasm32. Writing 8 bytes
                 // would clobber the adjacent field.
                 Type::Ref => {
@@ -2577,7 +2574,7 @@ mod tests {
     }
 
     #[test]
-    fn single_float_field_roundtrip_preserves_neighbors() {
+    fn unsigned_int_size4_field_roundtrip_preserves_neighbors() {
         #[repr(C)]
         struct Fields {
             value: f32,
@@ -2588,24 +2585,34 @@ mod tests {
             neighbor: 0xa5a5a5a5,
         };
         let mut info = VirtualizableInfo::without_vable_token();
-        info.add_field_sized("value", Type::Float, 0, 4, false);
+        // SingleFloat is FLAG_UNSIGNED (`get_type_flag`), stored as raw bits.
+        info.add_field_sized("value", Type::Int, 0, 4, false);
         let info = info.finalize_arc(majit_ir::descr::make_size_descr(
             std::mem::size_of::<Fields>(),
         ));
         let ptr = (&mut fields as *mut Fields).cast::<u8>();
+        let initial = i64::from(1.25f32.to_bits());
+        let stored = i64::from((-2.5f32).to_bits());
         unsafe {
-            assert_eq!(f64::from_bits(info.read_field(ptr, 0) as u64), 1.25);
-            info.write_field(ptr, 0, (-2.5f64).to_bits() as i64);
+            assert_eq!(info.read_field(ptr, 0), initial);
+            info.write_field(ptr, 0, stored);
+            assert_eq!(info.read_field(ptr, 0), stored);
         }
         assert_eq!(fields.value, -2.5);
         assert_eq!(fields.neighbor, 0xa5a5a5a5);
-        assert_eq!(
-            info.static_field_descr(0)
-                .as_field_descr()
-                .unwrap()
-                .field_size(),
-            4
-        );
+        let descr = info.static_field_descr(0);
+        let field = descr.as_field_descr().unwrap();
+        assert_eq!(field.field_size(), 4);
+        assert_eq!(field.field_type(), Type::Int);
+        assert!(!field.is_float_field());
+        assert!(!field.is_field_signed());
+    }
+
+    #[test]
+    #[should_panic(expected = "lltype.Float is 8 bytes")]
+    fn float_field_refuses_size_other_than_8() {
+        let mut info = VirtualizableInfo::without_vable_token();
+        info.add_field_sized("value", Type::Float, 0, 4, false);
     }
 
     #[test]

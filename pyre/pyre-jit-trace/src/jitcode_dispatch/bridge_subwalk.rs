@@ -1651,7 +1651,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 blackhole: None,
                 resume_coord: ParentResumeCoord::Backxlat(resume_pc),
                 resume_marker_jit_pc: Some(resume_pc),
-                boxes: Vec::new(),
+                // The level's registers as its resume section rebuilt them;
+                // the snapshot carries every box its `-live-` names.
+                boxes: parent_recipe.registers_r.clone(),
                 registers_r: None,
                 registers_i: None,
                 registers_f: None,

@@ -1776,6 +1776,7 @@ impl<'c> Lowerer<'c> {
                     let reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let ref_word = assert_ref_result_one_word(func, arg_bindings.len());
                     // The register literals must be spelled inside the
                     // `__builder` call itself: `regalloc`'s rewriter recolors
                     // only the arguments of a non-aux builder method call, so
@@ -1784,6 +1785,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
                         quote! {
+                            #ref_word
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                             __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #reg);
                         },
@@ -1812,9 +1814,11 @@ impl<'c> Lowerer<'c> {
                     let reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let ref_word = assert_ref_result_one_word(func, arg_bindings.len());
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
                         quote! {
+                            #ref_word
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                             __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #reg, majit_metainterp::can_raise_effect_info());
                         },
@@ -1837,6 +1841,7 @@ impl<'c> Lowerer<'c> {
                     let reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let ref_word = assert_ref_result_one_word(func, arg_bindings.len());
                     // The register literals must be spelled inside the
                     // `__builder` call itself: `regalloc`'s rewriter recolors
                     // only the arguments of a non-aux builder method call, so
@@ -1845,6 +1850,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
                         quote! {
+                            #ref_word
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                             __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #reg, majit_metainterp::nursery_alloc_effect_info());
                         },

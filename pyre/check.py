@@ -6208,7 +6208,7 @@ def main():
         # become 1.60x-2.83x, widest on windows dynasm, and a 3.5 ceiling covers
         # that with a quarter's headroom.
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    3.5,     None,    3.5)
-        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       None,    5,       None,    5,    wasm_float_tol=True)
+        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       None,    3,       None,    4,    wasm_float_tol=True)
         # fannkuch is almost nothing but cross-loop JUMP, which the two
         # backends pay differently: cranelift's closing_jump carries a LABEL's
         # values through jitframe slots (`emit_attached_loop_dispatch`) where

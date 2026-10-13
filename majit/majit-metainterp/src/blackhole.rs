@@ -9422,9 +9422,10 @@ fn read_calldescr(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (CallDe
 /// needs vinfo.static_fields[index].offset resolution.
 ///
 /// Copy `field_size` / `field_type` / signedness from
-/// `vinfo.static_fields`.  A `float(f32)` vable scalar is four bytes;
-/// synthesizing a word-sized `Ref` descr here would make
-/// `bh_getfield_gc_f` consume the next field.
+/// `vinfo.static_fields`.  A float vable field is 8 bytes
+/// (`lltype.Float` / `get_type_flag`); a four-byte singlefloat is
+/// int-kind (`FLAG_UNSIGNED`) and is consumed by `bh_getfield_gc_i`.
+/// Synthesizing a word-sized `Ref` descr here would consume the next field.
 #[inline]
 fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
@@ -9449,6 +9450,12 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
             vinfo.static_fields.len()
         )
     });
+    if field.field_type == majit_ir::value::Type::Float {
+        debug_assert_eq!(
+            field.field_size, 8,
+            "get_type_flag: lltype.Float is 8 bytes; SingleFloat is FLAG_UNSIGNED"
+        );
+    }
     let field_flag = match field.field_type {
         majit_ir::value::Type::Ref => majit_ir::descr::ArrayFlag::Pointer,
         majit_ir::value::Type::Float => majit_ir::descr::ArrayFlag::Float,
