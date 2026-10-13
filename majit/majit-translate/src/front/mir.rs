@@ -47716,10 +47716,12 @@ pub struct PublishedStructField {
     pub ty: serde_json::Value,
 }
 
-/// Struct bodies of this artefact, keyed by the full path and the
-/// crate-stripped path. An importing crate's `Opaque` view of the same
-/// type receives these fields so [`Lowering::resolve_adt_field`]'s struct
-/// arm names them.
+/// Struct bodies of this artefact, keyed by the instantiated type
+/// identity: `name_path` plus `ItemMeta::instantiation` arguments.
+/// `name_path` drops `Instantiated` segments; field types live on the
+/// concrete type (`lltype.Struct.__init__`). An importing crate's
+/// `Opaque` view of the same identity receives these fields so
+/// [`Lowering::resolve_adt_field`]'s struct arm names them.
 pub fn harvest_published_structs(llbc: &Llbc) -> Vec<PublishedStructBody> {
     let mut rows = Vec::new();
     for td in llbc.iter_type_decls() {
@@ -47736,55 +47738,67 @@ pub fn harvest_published_structs(llbc: &Llbc) -> Vec<PublishedStructBody> {
                 ty: expand_portable_tyref(llbc, &field.ty),
             })
             .collect();
-        let path = td.item_meta.name_path();
-        let canonical = strip_crate_prefix(&path);
         rows.push(PublishedStructBody {
-            path: path.clone(),
-            fields: portable.clone(),
+            path: type_decl_identity(llbc, td),
+            fields: portable,
         });
-        if canonical != path {
-            rows.push(PublishedStructBody {
-                path: canonical,
-                fields: portable,
-            });
-        }
     }
     rows
 }
 
-/// Copy `rows` onto every `Opaque` or `Unknown` type decl whose path is
-/// one of them. An existing `Struct` is left alone. A path that does not
+/// Copy `rows` onto every `Opaque` or `Unknown` type decl whose
+/// instantiated identity matches. A crate-stripped identity is used only
+/// when it names exactly one published row; an ambiguous suffix stays
+/// opaque. An existing `Struct` is left alone. A path that does not
 /// resolve to a destination decl stays a `{"Path": ...}` id.
 pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
     if rows.is_empty() {
         return;
     }
-    let mut index: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    for td in llbc.iter_type_decls() {
-        let path = td.item_meta.name_path();
-        let id = td.def_id;
-        index.entry(path.clone()).or_insert(id);
-        let stripped = strip_crate_prefix(&path);
-        if stripped != path {
-            index.entry(stripped).or_insert(id);
+    let dest_identities: Vec<(u64, String)> = llbc
+        .iter_type_decls()
+        .map(|td| (td.def_id, type_decl_identity(llbc, td)))
+        .collect();
+    let mut exact: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut stripped_ids: std::collections::HashMap<String, Vec<u64>> =
+        std::collections::HashMap::new();
+    for (id, key) in &dest_identities {
+        exact.entry(key.clone()).or_insert(*id);
+        let stripped = strip_crate_prefix(key);
+        if stripped != *key {
+            stripped_ids.entry(stripped).or_default().push(*id);
         }
     }
-    // First row for a path wins. The link loop sorts stably and dedups so
-    // that row is the earliest defining crate.
-    let mut by_path: std::collections::HashMap<&str, &PublishedStructBody> =
+    let stripped_unique = unique_stripped_values(stripped_ids);
+    let mut by_identity: std::collections::HashMap<&str, &PublishedStructBody> =
         std::collections::HashMap::new();
     for row in rows {
-        by_path.entry(row.path.as_str()).or_insert(row);
+        by_identity.entry(row.path.as_str()).or_insert(row);
     }
-    for td in llbc.file.translated.type_decls.iter_mut().flatten() {
+    let mut stripped_rows: std::collections::HashMap<String, Vec<&PublishedStructBody>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let stripped = strip_crate_prefix(&row.path);
+        if stripped != row.path {
+            stripped_rows.entry(stripped).or_default().push(row);
+        }
+    }
+    let stripped_unique_rows = unique_stripped_values(stripped_rows);
+    let dest_key_by_id: std::collections::HashMap<u64, String> =
+        dest_identities.into_iter().collect();
+    let mut updates: std::collections::HashMap<u64, Vec<majit_charon_reader::ullbc::FieldDecl>> =
+        std::collections::HashMap::new();
+    for td in llbc.iter_type_decls() {
         if !matches!(td.kind, TypeDeclKind::Opaque | TypeDeclKind::Unknown) {
             continue;
         }
-        let path = td.item_meta.name_path();
-        let stripped = strip_crate_prefix(&path);
-        let row = by_path.get(path.as_str()).copied().or_else(|| {
-            (stripped != path)
-                .then(|| by_path.get(stripped.as_str()).copied())
+        let Some(key) = dest_key_by_id.get(&td.def_id) else {
+            continue;
+        };
+        let row = by_identity.get(key.as_str()).copied().or_else(|| {
+            let stripped = strip_crate_prefix(key);
+            (stripped != *key)
+                .then(|| stripped_unique_rows.get(&stripped).copied())
                 .flatten()
         });
         let Some(row) = row else {
@@ -47795,7 +47809,7 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
             .iter()
             .map(|field| {
                 let mut ty = field.ty.clone();
-                remap_portable_type_ids(&mut ty, &index);
+                remap_portable_type_ids(&mut ty, llbc, &exact, &stripped_unique);
                 majit_charon_reader::ullbc::FieldDecl {
                     name: field.name.clone(),
                     ty: TyRef::Other(ty),
@@ -47803,21 +47817,70 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
                 }
             })
             .collect();
+        updates.insert(td.def_id, fields);
+    }
+    for td in llbc.file.translated.type_decls.iter_mut().flatten() {
+        let Some(fields) = updates.remove(&td.def_id) else {
+            continue;
+        };
         td.published_struct_copy = true;
         td.kind = TypeDeclKind::Struct(fields);
     }
 }
 
-fn lookup_published_type_path(
-    index: &std::collections::HashMap<String, u64>,
+fn unique_stripped_values<T>(
+    grouped: std::collections::HashMap<String, Vec<T>>,
+) -> std::collections::HashMap<String, T> {
+    grouped
+        .into_iter()
+        .filter_map(|(key, mut values)| {
+            if values.len() == 1 {
+                Some((key, values.pop().expect("len == 1")))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn type_decl_identity(llbc: &Llbc, td: &TypeDecl) -> String {
+    type_path_identity(
+        llbc,
+        td.item_meta.name_path_str(),
+        td.item_meta.instantiation(),
+    )
+}
+
+fn type_path_identity(
+    llbc: &Llbc,
     path: &str,
+    instantiation: Option<&serde_json::Value>,
+) -> String {
+    let (types, consts) = identity_instantiation(llbc, instantiation);
+    format_instantiated_identity(path, &types, &consts)
+}
+
+fn format_instantiated_identity(name: &str, types: &str, consts: &str) -> String {
+    if types.is_empty() && consts.is_empty() {
+        name.to_string()
+    } else if consts.is_empty() {
+        format!("{name}<{types}>")
+    } else {
+        format!("{name}<{types}|{consts}>")
+    }
+}
+
+fn lookup_published_type_path(
+    exact: &std::collections::HashMap<String, u64>,
+    stripped_unique: &std::collections::HashMap<String, u64>,
+    key: &str,
 ) -> Option<u64> {
-    if let Some(id) = index.get(path) {
+    if let Some(id) = exact.get(key) {
         return Some(*id);
     }
-    let stripped = strip_crate_prefix(path);
-    if stripped != path {
-        return index.get(&stripped).copied();
+    let stripped = strip_crate_prefix(key);
+    if stripped != key {
+        return stripped_unique.get(&stripped).copied();
     }
     None
 }
@@ -48093,8 +48156,11 @@ fn identity_adt(
     } else {
         "?".to_string()
     };
-    let args = adt
-        .get("generics")
+    // Use-site generics, else the TypeDecl Instantiated segment
+    // (`type_decl_ref_generics`). Const args belong on the concrete type
+    // the same way `types` do (`lltype.Struct.__init__`).
+    let generics = type_decl_ref_generics(adt, llbc);
+    let args = generics
         .and_then(|generics| generics.get("types"))
         .and_then(serde_json::Value::as_array)
         .map(|args| {
@@ -48103,11 +48169,16 @@ fn identity_adt(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if args.is_empty() {
-        name
-    } else {
-        format!("{name}<{}>", args.join(","))
-    }
+    let consts = generics
+        .and_then(|generics| generics.get("const_generics"))
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .map(|value| identity_const(llbc, value))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    format_instantiated_identity(&name, &args.join(","), &consts.join(","))
 }
 
 fn identity_const(llbc: &Llbc, value: &serde_json::Value) -> String {
@@ -48370,29 +48441,36 @@ fn expand_const_body(llbc: &Llbc, body: &serde_json::Value, depth: usize) -> ser
 
 fn remap_portable_type_ids(
     value: &mut serde_json::Value,
-    index: &std::collections::HashMap<String, u64>,
+    llbc: &Llbc,
+    exact: &std::collections::HashMap<String, u64>,
+    stripped_unique: &std::collections::HashMap<String, u64>,
 ) {
     match value {
         serde_json::Value::Array(items) => {
             for item in items {
-                remap_portable_type_ids(item, index);
+                remap_portable_type_ids(item, llbc, exact, stripped_unique);
             }
         }
         serde_json::Value::Object(map) => {
             if let Some(adt) = map
                 .get_mut("Adt")
                 .and_then(serde_json::Value::as_object_mut)
-                && let Some(path) = adt
+            {
+                let path = adt
                     .get("id")
                     .and_then(|id| id.get("Path"))
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-                && let Some(def_id) = lookup_published_type_path(index, &path)
-            {
-                adt.insert("id".into(), serde_json::json!(def_id));
+                    .map(str::to_string);
+                let generics = adt.get("generics").cloned();
+                if let Some(path) = path {
+                    let key = type_path_identity(llbc, &path, generics.as_ref());
+                    if let Some(def_id) = lookup_published_type_path(exact, stripped_unique, &key) {
+                        adt.insert("id".into(), serde_json::json!(def_id));
+                    }
+                }
             }
             for child in map.values_mut() {
-                remap_portable_type_ids(child, index);
+                remap_portable_type_ids(child, llbc, exact, stripped_unique);
             }
         }
         _ => {}
@@ -105408,5 +105486,345 @@ mod tests {
             }
             other => panic!("write base must be FieldRead block, got {other:?}"),
         }
+    }
+
+    fn identity_item_meta(name: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "span": {"data": {
+                "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+            }},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    }
+
+    fn identity_instantiated_name(
+        crate_name: &str,
+        item: &str,
+        types: serde_json::Value,
+        consts: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!([
+            {"Ident": [crate_name, 0]},
+            {"Ident": [item, 0]},
+            {"Instantiated": {"params": {}, "kind": "Other", "skip_binder": {
+                "regions": [],
+                "types": types,
+                "const_generics": consts,
+                "trait_refs": []
+            }}}
+        ])
+    }
+
+    fn identity_plain_name(crate_name: &str, module: &str, item: &str) -> serde_json::Value {
+        serde_json::json!([
+            {"Ident": [crate_name, 0]},
+            {"Ident": [module, 0]},
+            {"Ident": [item, 0]}
+        ])
+    }
+
+    fn identity_signed(kind: &str) -> serde_json::Value {
+        serde_json::json!({"Scalar": {"Integer": {"Signed": kind}}})
+    }
+
+    fn identity_usize_const(value: &str) -> serde_json::Value {
+        serde_json::json!([[
+            {"Integer": {"Unsigned": ["Usize", value]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]])
+    }
+
+    fn identity_struct_decl(
+        def_id: u64,
+        name: serde_json::Value,
+        field_name: &str,
+        field_ty: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": identity_item_meta(name),
+            "kind": {"Struct": [{
+                "name": field_name,
+                "ty": field_ty,
+                "attr_info": null
+            }]}
+        })
+    }
+
+    fn identity_opaque_decl(def_id: u64, name: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": identity_item_meta(name),
+            "kind": "Opaque"
+        })
+    }
+
+    fn identity_fun(def_id: u64, name: &str, output: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": identity_item_meta(serde_json::json!([
+                {"Ident": ["fixture", 0]},
+                {"Ident": [name, 0]}
+            ])),
+            "signature": {"is_unsafe": false, "inputs": [], "output": output},
+            "body": null
+        })
+    }
+
+    fn identity_adt_use(
+        def_id: u64,
+        types: serde_json::Value,
+        consts: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": def_id,
+                "generics": {
+                    "regions": [],
+                    "types": types,
+                    "const_generics": consts,
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn published_field_ty<'a>(
+        llbc: &'a Llbc,
+        id: u64,
+        field: &str,
+    ) -> Option<&'a serde_json::Value> {
+        let td = llbc.type_by_id(id)?;
+        match &td.kind {
+            majit_charon_reader::ullbc::TypeDeclKind::Struct(fields) => fields
+                .iter()
+                .find(|row| row.name.as_deref() == Some(field))
+                .and_then(|row| match &row.ty {
+                    TyRef::Other(value) => Some(value),
+                    _ => None,
+                }),
+            _ => None,
+        }
+    }
+
+    /// Two monomorphizations of one generic struct keep their own field
+    /// types. A crate-stripped suffix is used only when it is unique.
+    #[test]
+    fn published_structs_key_on_instantiated_identity() {
+        let i32_ty = identity_signed("I32");
+        let i64_ty = identity_signed("I64");
+        let defining = llbc_with_types(
+            "crate_a",
+            vec![
+                identity_struct_decl(
+                    0,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Container",
+                        serde_json::json!([i32_ty.clone()]),
+                        serde_json::json!([]),
+                    ),
+                    "payload",
+                    i32_ty.clone(),
+                ),
+                identity_struct_decl(
+                    1,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Container",
+                        serde_json::json!([i64_ty.clone()]),
+                        serde_json::json!([]),
+                    ),
+                    "payload",
+                    i64_ty.clone(),
+                ),
+                identity_struct_decl(
+                    2,
+                    identity_plain_name("crate_a", "mod", "Unique"),
+                    "mark",
+                    i32_ty.clone(),
+                ),
+                identity_struct_decl(
+                    3,
+                    identity_plain_name("crate_a", "mod", "Shared"),
+                    "from_a",
+                    i32_ty.clone(),
+                ),
+            ],
+            vec![],
+        );
+        let other = llbc_with_types(
+            "crate_b",
+            vec![identity_struct_decl(
+                0,
+                identity_plain_name("crate_b", "mod", "Shared"),
+                "from_b",
+                i64_ty.clone(),
+            )],
+            vec![],
+        );
+        let mut rows = super::harvest_published_structs(&defining);
+        rows.extend(super::harvest_published_structs(&other));
+        assert!(
+            rows.iter()
+                .any(|row| row.path.contains("Container") && row.path.contains("i32")),
+            "i32 instantiation must keep its own identity: {:?}",
+            rows.iter().map(|row| &row.path).collect::<Vec<_>>()
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.path.contains("Container") && row.path.contains("i64")),
+            "i64 instantiation must keep its own identity: {:?}",
+            rows.iter().map(|row| &row.path).collect::<Vec<_>>()
+        );
+        assert!(
+            !rows.iter().any(|row| row.path == "Container"
+                || row.path == "mod::Unique"
+                || row.path == "mod::Shared"),
+            "harvest must not emit a crate-stripped alias row: {:?}",
+            rows.iter().map(|row| &row.path).collect::<Vec<_>>()
+        );
+
+        let mut dest = llbc_with_types(
+            "crate_c",
+            vec![
+                identity_opaque_decl(
+                    0,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Container",
+                        serde_json::json!([i32_ty.clone()]),
+                        serde_json::json!([]),
+                    ),
+                ),
+                identity_opaque_decl(
+                    1,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Container",
+                        serde_json::json!([i64_ty.clone()]),
+                        serde_json::json!([]),
+                    ),
+                ),
+                identity_opaque_decl(2, identity_plain_name("crate_c", "mod", "Unique")),
+                identity_opaque_decl(3, identity_plain_name("crate_c", "mod", "Shared")),
+            ],
+            vec![],
+        );
+        super::apply_published_structs(&mut dest, &rows);
+        assert_eq!(
+            published_field_ty(&dest, 0, "payload"),
+            Some(&i32_ty),
+            "the i32 instantiation must receive the i32 payload field"
+        );
+        assert_eq!(
+            published_field_ty(&dest, 1, "payload"),
+            Some(&i64_ty),
+            "the i64 instantiation must receive the i64 payload field"
+        );
+        assert_eq!(
+            published_field_ty(&dest, 2, "mark"),
+            Some(&i32_ty),
+            "a unique crate-stripped suffix may still match"
+        );
+        assert!(
+            matches!(
+                dest.type_by_id(3).map(|td| &td.kind),
+                Some(majit_charon_reader::ullbc::TypeDeclKind::Opaque)
+            ),
+            "an ambiguous crate-stripped suffix must stay opaque"
+        );
+    }
+
+    /// `Container<T,4>` and `Container<T,8>` are distinct types, including
+    /// when nested as a type argument.
+    #[test]
+    fn identity_adt_includes_const_generics() {
+        let i32_ty = identity_signed("I32");
+        let container = identity_struct_decl(
+            0,
+            identity_plain_name("fixture", "types", "Container"),
+            "payload",
+            i32_ty.clone(),
+        );
+        let outer = identity_struct_decl(
+            1,
+            identity_plain_name("fixture", "types", "Outer"),
+            "inner",
+            identity_adt_use(
+                0,
+                serde_json::json!([i32_ty.clone()]),
+                serde_json::json!([]),
+            ),
+        );
+        let four = identity_fun(
+            0,
+            "new",
+            identity_adt_use(
+                0,
+                serde_json::json!([i32_ty.clone()]),
+                identity_usize_const("4"),
+            ),
+        );
+        let eight = identity_fun(
+            1,
+            "new",
+            identity_adt_use(
+                0,
+                serde_json::json!([i32_ty.clone()]),
+                identity_usize_const("8"),
+            ),
+        );
+        let nested_four = identity_fun(
+            2,
+            "wrap",
+            identity_adt_use(
+                1,
+                serde_json::json!([identity_adt_use(
+                    0,
+                    serde_json::json!([i32_ty.clone()]),
+                    identity_usize_const("4"),
+                )]),
+                serde_json::json!([]),
+            ),
+        );
+        let nested_eight = identity_fun(
+            3,
+            "wrap",
+            identity_adt_use(
+                1,
+                serde_json::json!([identity_adt_use(
+                    0,
+                    serde_json::json!([i32_ty.clone()]),
+                    identity_usize_const("8"),
+                )]),
+                serde_json::json!([]),
+            ),
+        );
+        let llbc = llbc_with_types(
+            "fixture",
+            vec![container, outer],
+            vec![four, eight, nested_four, nested_eight],
+        );
+        let id_of = |id| super::scope_owner_identity(&llbc, llbc.fn_by_id(id).expect("fun"));
+        let four_id = id_of(0);
+        let eight_id = id_of(1);
+        assert_ne!(
+            four_id, eight_id,
+            "const generic arguments must distinguish Container<T,4> from Container<T,8>: {four_id} vs {eight_id}"
+        );
+        assert!(
+            four_id.contains("|4") && eight_id.contains("|8"),
+            "the identity must carry the const generic: {four_id} / {eight_id}"
+        );
+        let nested_four_id = id_of(2);
+        let nested_eight_id = id_of(3);
+        assert_ne!(
+            nested_four_id, nested_eight_id,
+            "nested const generics must distinguish Outer<Container<T,4>> from Outer<Container<T,8>>: {nested_four_id} vs {nested_eight_id}"
+        );
     }
 }
