@@ -9000,8 +9000,9 @@ fn pygraph_initial_block(
         // `Ptr`). A byte pointer stays `Ref`: pyre erases a GC
         // reference to `*mut u8`. See [`tyref_scalar_pointee_value_type`].
         //
-        // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref:
-        // rustc still passes the pointer, and RPython method
+        // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
+        // (RPython `DictStrategy` instance / `history.getkind` of a Gc
+        // Ptr): rustc still passes the pointer, and RPython method
         // `indirect_call` always has self. See [`fundecl_keeps_zst_self`].
         let mut ty = input_param_value_type(ty, &local.ty, llbc, keep_zst_self, i == 1);
         // Same membership as [`gc_mut_ref_param_locals`], including the
@@ -9243,8 +9244,9 @@ impl<'a> Lowering<'a> {
             // `&i64` is `int`), and a raw pointer to a wider scalar is
             // `int`. A byte pointer stays `Ref`.
             //
-            // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref.
-            // See [`fundecl_keeps_zst_self`].
+            // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
+            // (the same kind as a GC impl in the family). See
+            // [`fundecl_keeps_zst_self`].
             let mut ty = input_param_value_type(ty, &local.ty, llbc, keep_zst_self, i == 1);
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
@@ -18303,32 +18305,143 @@ impl<'a> Lowering<'a> {
         unit
     }
 
-    /// Keep a dyn-call / ICT-method receiver as a Ref word.
+    /// Keep a dyn-call / ICT-method receiver as a pointer-valued word.
     ///
     /// `resolve_operand` of `&ZST` yields `emit_unit` (Void). rustc still
-    /// passes that pointer; RPython method `indirect_call` always has self.
-    /// Recast only a Void first argument — a fat-pointer data word that is
-    /// already `Ref` is left alone.
+    /// passes that pointer; RPython method `indirect_call` always has self
+    /// (`FunctionReprBase.call`). `same_as` cannot recast Void: the
+    /// flowspace adapter discards `result_ty`, the annotator preserves the
+    /// operand annotation, and `rtype_same_as` emits the operand's original
+    /// Void representation.
+    ///
+    /// Dyn call: the receiver is the fat pointer's DATA word, read from
+    /// the same fat field the vtable word (`FatMeta`) is read from.
+    /// Direct call to a ZST impl: a non-null aligned pointer constant
+    /// (`ConstRefAddr`). Kind is Ref for the whole family: RPython
+    /// `class DictStrategy(object)` and every subclass is a GC instance,
+    /// so `history.getkind` of that Ptr is `'ref'`. rustc mixes ZST
+    /// unit-struct impls with GC `ModuleDictStrategy`; one
+    /// `indirect_call` has one FUNC type, so the family is one kind.
+    /// A GC strategy stays a GC root (`walk_bh_regs` / `drag_out_root`).
+    /// A ZST dummy in `registers_r` is a non-nursery constant
+    /// (`walk_bh_regs` passes those through).
     fn keep_dyn_call_receiver(&mut self, mir_bb: usize, args: &mut [Variable]) {
         let Some(recv) = args.first_mut() else {
             return;
         };
-        if crate::model::FunctionGraph::concretetype_of(recv) != crate::model::ConcreteType::Void {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Some(data) = self.dyn_receiver_data_word(bb_id, recv) {
+            *recv = data;
             return;
         }
-        let recast = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let bb_id = self.block_id[mir_bb];
+        if crate::model::FunctionGraph::concretetype_of(recv) == crate::model::ConcreteType::Void {
+            *recv = self.emit_zst_self_address(bb_id);
+        }
+    }
+
+    /// Fat-pointer DATA word of `recv`, or `None` when `recv` is not a
+    /// fat field (direct ZST `&self` uses [`Self::emit_zst_self_address`]).
+    fn dyn_receiver_data_word(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        recv: &Variable,
+    ) -> Option<Variable> {
+        let (base, mut field, pure) = self.fat_field_producer_of(recv)?;
+        field.vec_part = Some(crate::model::VecFieldPart::FatData);
+        field.taken_by_address = false;
+        field.inline_vec = false;
+        // Same typing as every other FatData read (`fat_part_value_type`):
+        // a GC host's data word is Ref (the strategy instance);
+        // a raw host's data word is Int (`llmemory.Address`).
+        let ty = fat_part_value_type(crate::model::VecFieldPart::FatData, field.owner_declared_gc);
+        let concretetype = fat_part_concretetype(&ty);
+        if !self.graph.variable_defined_in_block(bb_id, &base) {
+            let _ = self.graph.try_ensure_variable_at_block(bb_id, &base);
+        }
+        let res = self.graph.alloc_value_var_with_type(concretetype);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(recast.clone()),
-            kind: OpKind::UnaryOp {
-                op: "same_as".to_string(),
-                operand: recv.clone(),
-                result_ty: ValueType::Ref(None),
+            result: Some(res.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
             },
         });
-        *recv = recast;
+        Some(res)
+    }
+
+    /// `(base, field, pure)` of a fat-pointer FieldRead that produced
+    /// `recv`, walking `same_as` / `cast_int_to_ptr`. The vec_part tag
+    /// (`FatVtable` / `FatData` / `FatMeta` / `FatLen`) identifies the
+    /// field; a name test is not used.
+    fn fat_field_producer_of(
+        &self,
+        recv: &Variable,
+    ) -> Option<(Variable, crate::model::FieldDescriptor, bool)> {
+        let mut current = recv.clone();
+        for _ in 0..8 {
+            let mut next = None;
+            for block in &self.graph.blocks {
+                for op in &block.operations {
+                    if op.result.as_ref() != Some(&current) {
+                        continue;
+                    }
+                    match &op.kind {
+                        OpKind::FieldRead {
+                            base, field, pure, ..
+                        } if matches!(
+                            field.vec_part,
+                            Some(
+                                crate::model::VecFieldPart::FatVtable
+                                    | crate::model::VecFieldPart::FatData
+                                    | crate::model::VecFieldPart::FatMeta
+                                    | crate::model::VecFieldPart::FatLen
+                            )
+                        ) =>
+                        {
+                            return Some((base.clone(), field.clone(), *pure));
+                        }
+                        OpKind::UnaryOp { operand, .. } => {
+                            next = Some(operand.clone());
+                        }
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            args,
+                            ..
+                        } if segments.last().map(|s| s.as_str()) == Some("cast_int_to_ptr")
+                            || segments.last().map(|s| s.as_str()) == Some("same_as") =>
+                        {
+                            next = args
+                                .first()
+                                .and_then(crate::model::LinkArg::as_variable)
+                                .cloned();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            current = next?;
+        }
+        None
+    }
+
+    /// Direct call to a ZST impl method: rustc `&ZST` is any non-null
+    /// address aligned to `align_of::<T>()`. The callee never
+    /// dereferences it. Word alignment is valid for every unit-struct
+    /// strategy (`EmptyDictStrategy` is align-1). Emitted as
+    /// `ConstRefAddr` so the first inputarg kind matches the GC impls
+    /// in the same `indirect_call` family (`history.getkind` of a Gc
+    /// Ptr is `'ref'`).
+    fn emit_zst_self_address(&mut self, bb_id: crate::model::BlockId) -> Variable {
+        let var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind: OpKind::ConstRefAddr(std::mem::size_of::<usize>() as i64),
+        });
+        var
     }
 
     /// Fold a `TraitConst` whose trait ref is one selected impl.
@@ -18602,8 +18715,16 @@ fn inline_vec_field_part(
             }
             match &op.kind {
                 OpKind::FieldRead {
-                    base, field, pure, ..
-                } if field.inline_vec && field.vec_part.is_none() => {
+                    base,
+                    field,
+                    pure,
+                    ty,
+                    ..
+                } if field.vec_part.is_none()
+                    && (field.inline_vec
+                        || (part == crate::model::VecFieldPart::Len
+                            && matches!(ty, ValueType::Int | ValueType::Unsigned))) =>
+                {
                     Some((base.clone(), field.clone(), *pure))
                 }
                 _ => None,
@@ -18612,6 +18733,16 @@ fn inline_vec_field_part(
     })?;
     field.vec_part = Some(part);
     field.taken_by_address = false;
+    // Do not stamp `inline_vec` on a one-word-item Len. getattr of that
+    // field as a list (`flowspace_adapter` getattr+len) unions Integer
+    // with RustVec at `ll_vec_alloc_and_set_*`. `rlist.py` `ll_length`
+    // is `return l.length`, a Signed word of the parent; the assembler
+    // already suffixes `.len`. Keep the original flag so wide-item
+    // fields still take getattr+len and one-word fields take the
+    // Signed `{name}.len` getattr.
+    if !graph.variable_defined_in_block(bb_id, &base) {
+        let _ = graph.try_ensure_variable_at_block(bb_id, &base);
+    }
     let ty = match part {
         crate::model::VecFieldPart::Buf => buf_ty,
         crate::model::VecFieldPart::FatData => fat_part_value_type(part, field.owner_declared_gc),
@@ -18726,7 +18857,7 @@ fn retarget_fat_operand(
 
 /// A raw owner's fat data word is an address (`Int`). A GC owner's
 /// data word stays a reference. Length is always an int.
-fn fat_part_value_type(
+pub(crate) fn fat_part_value_type(
     part: crate::model::VecFieldPart,
     owner_declared_gc: Option<bool>,
 ) -> ValueType {
@@ -18738,6 +18869,13 @@ fn fat_part_value_type(
         crate::model::VecFieldPart::Len
         | crate::model::VecFieldPart::FatLen
         | crate::model::VecFieldPart::FatMeta => ValueType::Int,
+    }
+}
+
+pub(crate) fn fat_part_concretetype(ty: &ValueType) -> crate::model::ConcreteType {
+    match ty {
+        ValueType::Int | ValueType::Unsigned => crate::model::ConcreteType::Signed,
+        _ => crate::model::ConcreteType::GcRef,
     }
 }
 
@@ -19985,11 +20123,18 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let elem_ty = tyref_tuple_element(&inner.ty, idx, self.llbc);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
                             base,
-                            field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner_root)),
+                            field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner_root))
+                                .with_inline_vec(
+                                    elem_ty
+                                        .as_ref()
+                                        .is_some_and(|ty| field_ty_is_inline_vec(ty, self.llbc))
+                                        || field_ty_is_inline_vec(&place_ty, self.llbc),
+                                ),
                             ty,
                             pure: false,
                         },
@@ -20052,6 +20197,10 @@ impl<'a> Lowering<'a> {
                         // `Ref(None)`; the tuple's own generics still name the
                         // concrete element (`(char,)`).
                         let element_ty = tyref_tuple_element(&inner.ty, idx, self.llbc);
+                        let inline_vec = element_ty
+                            .as_ref()
+                            .is_some_and(|ty| field_ty_is_inline_vec(ty, self.llbc))
+                            || field_ty_is_inline_vec(&place_ty, self.llbc);
                         // A tuple reached through a pointer/reference deref
                         // (a residual call returning `&(A, B)`, a
                         // `*mut (A, B)` field) resolves its base to a
@@ -20108,7 +20257,8 @@ impl<'a> Lowering<'a> {
                             result: Some(res.clone()),
                             kind: OpKind::FieldRead {
                                 base,
-                                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner)),
+                                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner))
+                                    .with_inline_vec(inline_vec),
                                 ty,
                                 pure: false,
                             },
@@ -26800,6 +26950,14 @@ impl<'a> Lowering<'a> {
                             crate::model::VecFieldPart::Len,
                             ValueType::Int,
                         ) {
+                            // `rlist.ll_length` is `return l.length`. The
+                            // component is a new op; the whole-field read
+                            // stays the key (`retarget_fat_operand`: one
+                            // field feeds `.len()` and an index). Dropping
+                            // it here is unsound: `count_var_uses` only
+                            // sees already-lowered uses, so a later
+                            // `gcarray_from_pyobject_vec` / link of the
+                            // same field would keep a dead operand.
                             self.local_var[dest_local] = Some(LocalValue::One(len));
                             let target_bb = self.block_id[target];
                             let link_args = self.edge_args(mir_bb, target)?;
@@ -26852,16 +27010,8 @@ impl<'a> Lowering<'a> {
                                 ValueType::Int,
                             )
                         {
-                            let receiver = args[0].clone();
-                            let uses =
-                                crate::front::result_exc::count_var_uses(&self.graph, &receiver);
-                            if uses.op_uses == 0 && uses.link_uses == 0 {
-                                for block in &mut self.graph.blocks {
-                                    block
-                                        .operations
-                                        .retain(|op| op.result.as_ref() != Some(&receiver));
-                                }
-                            }
+                            // Same as the one-word arm: keep the whole-field
+                            // read; the length word is a second getfield.
                             self.local_var[dest_local] = Some(LocalValue::One(len));
                             let target_bb = self.block_id[target];
                             let link_args = self.edge_args(mir_bb, target)?;
@@ -28069,7 +28219,8 @@ impl<'a> Lowering<'a> {
                 // synthetic `__dyn_call`.  The
                 // call args already carry the receiver in `args[0]` (the
                 // fat-pointer data word). RPython method `indirect_call`
-                // always has self: keep that word as Ref even when the
+                // always has self: keep that word as Ref (GC instance;
+                // `history.getkind` of a Gc Ptr) even when the rustc
                 // strategy type is ZST (`keep_dyn_call_receiver`). The
                 // callee ICT jitcode keeps the matching unused `self`
                 // inputarg (`fundecl_keeps_zst_self`).
@@ -28133,7 +28284,9 @@ impl<'a> Lowering<'a> {
                         // it instead of replacing it with a blackhole-only
                         // name-based lookup that has no upstream counterpart.
                         // Keep the fat-pointer data word as the first Ref
-                        // argument so the residual matches rustc `(&self, ...)`.
+                        // argument (the strategy instance) so the residual
+                        // matches rustc `(&self, ...)` and the family's
+                        // FUNC type.
                         self.keep_dyn_call_receiver(mir_bb, &mut args);
                         let funcptr = self.resolve_operand(mir_bb, vtable_slot)?;
                         OpKind::IndirectCall {
@@ -55756,13 +55909,21 @@ fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u64> {
     impl_payload.as_object()?.get("Trait")?.as_u64()
 }
 
-/// A local trait-impl method whose first parameter is `&ZST`.
+/// A local trait-impl method whose first parameter is a ZST `&self`.
 ///
 /// rustc still passes that `&self` in a pointer register (`ResidualSlot`
 /// for `&T`). RPython method `indirect_call` always has self. Keep the
 /// word as `Ref` on graphs reached as `indirectcalltargets` so the
-/// recorded/executed call matches rustc's `(&self, ...)` arity. By-value
-/// ZST (`From::from`) stays `Void`. Core/std impls stay peeled.
+/// recorded/executed call matches rustc's `(&self, ...)` arity and the
+/// family's FUNC type. rustc mixes ZST unit-struct impls
+/// (`KwargsDictStrategy`) with GC `ModuleDictStrategy`; upstream types
+/// every `DictStrategy` `self` as a GC instance
+/// (`class DictStrategy(object)`), so `history.getkind` of that Ptr is
+/// `'ref'`. One `indirect_call` has one FUNC type
+/// (`CallControl.getcalldescr`). A GC strategy stays a GC root
+/// (`walk_bh_regs` / `drag_out_root`). By-value ZST (`From::from`) stays
+/// `Void`. Core/std impls stay peeled
+/// (`trait_impl_trait_path_for_fundecl` is `None` for non-local traits).
 fn fundecl_keeps_zst_self(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -56239,18 +56400,19 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
 
 /// An inline `Vec<T, A>` value, not `Box<Vec<_>>` and not `&Vec<_>`.
 ///
-/// A `Vec` of one-word items is the address of its raw `{ptr, len, cap}`
-/// header (`RustVecRepr`, kind `int`), not a 24-byte inline aggregate.
-/// Marking that field `inline_vec` would pass the header as `Ref` to
-/// `ll_vec_length` / `gcarray_from_pyobject_vec`.
+/// A one-word-item `Vec` local or field stays the address of its raw
+/// `{ptr, len, cap}` header (`RustVecRepr`, kind `int` /
+/// `ll_vec_length` / `gcarray_from_pyobject_vec`). Marking that field
+/// `inline_vec` makes getattr of it a `RustVec` and unions Integer with
+/// that object (`ll_vec_alloc_and_set_*`). `Vec::len` of such a field
+/// still retargets through `inline_vec_field_part` (`VecFieldPart::Len`,
+/// `rlist.py` `ll_length` = parent `{name}.len` Signed word) from the
+/// Int FieldRead producer, without flipping `inline_vec`.
 ///
 /// The ADT is the type decl whose name segments are `alloc::vec::Vec`
 /// (that decl's identity). The use site's type-argument count is the
 /// decl's generic arity: one (`T`) or two (`T` and the allocator).
 fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
-        return false;
-    }
     let body = match tyref_node(ty, llbc) {
         Some(body) => body,
         None => return false,
@@ -56288,7 +56450,10 @@ fn field_ty_is_inline_vec(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|generics| generics.get("types"))
         .and_then(|types| types.as_array())
         .map(|types| types.len());
-    matches!(arity, Some(1 | 2))
+    if !matches!(arity, Some(1 | 2)) {
+        return false;
+    }
+    tyref_rust_vec_item_kind(ty, llbc).is_none()
 }
 
 /// Clone a [`TyRef`] (no `Clone` impl on the schema enum).  Used by

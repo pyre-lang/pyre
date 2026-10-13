@@ -5432,7 +5432,15 @@ fn fielddescrof(
             crate::model::VecFieldPart::FatData => {
                 // A raw owner's data word is an address. `ArrayFlag::Pointer`
                 // asks for `getfield_raw_r`, which a raw base refuses.
-                if is_gc {
+                // A GC host with a Ref-typed load is `getfield_gc_r`
+                // (the strategy instance). An Int-typed load is
+                // `llmemory.Address` (`ArrayFlag::Unsigned`).
+                if is_gc
+                    && !matches!(
+                        ty,
+                        crate::model::ValueType::Int | crate::model::ValueType::Unsigned
+                    )
+                {
                     (
                         fat_layout.data_offset,
                         majit_ir::value::Type::Ref,

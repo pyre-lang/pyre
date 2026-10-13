@@ -7713,31 +7713,46 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // `MIFrame.do_residual_or_indirect_call`: Const funcbox +
+    // `bytecode_for_address` hit => `perform_call`. Remaining
+    // `Ok(None)` arms are capability/structural, not a target filter.
     if !ctx.is_authoritative_executor || !funcptr.is_constant() {
+        // Tracing only: this method lives on `MIFrame`. The blackhole
+        // interpreter (`BlackholeInterpreter`) residualizes.
         return Ok(None);
     }
     let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcptr) else {
+        // `Const.getaddr()` needs an address word (`history.getkind`
+        // of a funcptr is `'int'`).
         return Ok(None);
     };
     if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
+        // Translator-time symbolic addresses have no runtime jitcode.
+        // Same `bytecode_for_address` miss as a null key.
         return Ok(None);
     }
     let Some(jitcode) = crate::state::bytecode_for_address(addr as usize) else {
         return Ok(None);
     };
     if ctx.fbw_mode.transparent_helper_jitcode_index == Some(jitcode.index()) {
+        // Already walking this jitcode. `perform_call` would push
+        // another `MIFrame`; the walker is one walk with a reentry flag.
         return Ok(None);
     }
     let Some(sub_body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
+        // A jitcode with no body cannot `perform_call`.
         return Ok(None);
     };
     if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
+        // `perform_call` needs the assembled body.
         return Ok(None);
     }
     if i_args.len() > sub_body.num_regs_i
         || r_args.len() > sub_body.num_regs_r
         || f_args.len() > sub_body.num_regs_f
     {
+        // `JitCode.num_regs_*` is the frame `perform_call` allocates.
+        // Extra args cannot be stored. Capability bound, not a callee filter.
         return Ok(None);
     }
     if fbw_debug_abort_enabled() {
@@ -7769,6 +7784,8 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     let walk_outcome = match walk {
         Ok(outcome) => outcome,
         Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
+            // Resume has no coordinate for this subwalk, so the call
+            // stays residual (`do_residual_call`).
             cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
         }
@@ -7777,6 +7794,8 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
                 && !unjournaled_before
                 && !fbw_has_unjournaled_effect();
             if nothing_applied {
+                // Subwalk declined before mutating the trace: same as
+                // `do_residual_call` after a failed `perform_call`.
                 cut_declined_subwalk(ctx, pre_fold_pos);
                 return Ok(None);
             }

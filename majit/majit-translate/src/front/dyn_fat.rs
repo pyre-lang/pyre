@@ -24,11 +24,11 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TypeDeclKind;
 
 use crate::flowspace::model::Variable;
-use crate::front::mir::{cast_int_to_ptr_call, tyref_is_fat_dyn};
+use crate::front::mir::{fat_part_concretetype, fat_part_value_type, tyref_is_fat_dyn};
 use crate::inline::splice_direct_call;
 use crate::model::{
-    BlockId, ConcreteType, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation,
-    ValueType, VecFieldPart,
+    BlockId, CallTarget, ConcreteType, FieldDescriptor, FunctionGraph, LinkArg, OpKind,
+    SpaceOperation, ValueType, VecFieldPart,
 };
 
 thread_local! {
@@ -101,11 +101,22 @@ pub(crate) fn splice_fat_dyn_returns(
             spliced += 1;
         }
     }
-    let retargeted = retarget_vtable_method_bases(graph, llbc);
-    if spliced > 0 || retargeted > 0 {
+    let (retargeted, fat_len) = retarget_vtable_method_bases(graph, llbc);
+    if spliced > 0 || retargeted > 0 || !fat_len.is_empty() {
         crate::model::clear_unreachable_blocks(graph);
         crate::model::prune_dead_phis(graph);
     }
+    // `emit_fat_len` keeps the FatVtable GetfieldGcR until method_*
+    // bases are the FatLen Int. A leftover GetfieldGcR of the same slot
+    // as the GetfieldGcI `make_equal_to`s across Box.type: drop it when
+    // unused. A live leftover is the dyn-call receiver
+    // (`FunctionReprBase.call` passes self): rewrite it in place to the
+    // fat DATA word (`fat_part_value_type`; a GC host is Ref). A
+    // `cast_int_to_ptr` of the vtable word would be the receiver by
+    // mistake and `rewrite.py` would `PassOn` a dead CastIntToPtr into
+    // the compiled loop.
+    rewrite_remaining_fat_vtable_reads(graph, &fat_len);
+    drop_unused_fat_len_casts(graph);
 }
 
 fn graph_has_vtable_method(graph: &FunctionGraph) -> bool {
@@ -394,7 +405,10 @@ fn index_producers(
     (fat_fields, copies)
 }
 
-fn retarget_vtable_method_bases(graph: &mut FunctionGraph, llbc: &Llbc) -> usize {
+fn retarget_vtable_method_bases(
+    graph: &mut FunctionGraph,
+    llbc: &Llbc,
+) -> (usize, HashMap<u64, Variable>) {
     let (fat_fields, copies) = index_producers(graph, llbc);
     let sites: Vec<(BlockId, u64, Variable)> = graph
         .blocks
@@ -461,12 +475,14 @@ fn retarget_vtable_method_bases(graph: &mut FunctionGraph, llbc: &Llbc) -> usize
     }
     // A leftover `FatVtable` GetfieldGcR of the same slot as the
     // `FatLen` GetfieldGcI `make_equal_to`s across Box.type
-    // (`imp.len` Int vs `imp.vtable` Ref).
+    // (`imp.len` Int vs `imp.vtable` Ref). Emit the Int load now; the
+    // FatVtable read stays until `rewrite_remaining_fat_vtable_reads`
+    // drops it when unused, or rewrites a live user to the DATA word.
     let fats: Vec<FatField> = env.fat_fields.values().cloned().collect();
     for fat in fats {
         let _ = emit_fat_len(graph, &mut env, &fat);
     }
-    retargeted
+    (retargeted, env.fat_len)
 }
 
 fn ensure_meta(
@@ -644,18 +660,20 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
     });
     match at {
         Some(index) => {
-            let is_fat_vtable = matches!(
-                &block.operations[index].kind,
-                OpKind::FieldRead { field, .. }
-                    if field.vec_part == Some(VecFieldPart::FatVtable)
-            );
-            if is_fat_vtable {
-                // Same metadata word: keep the Ref users on
-                // `lltype.cast_int_to_ptr` of the Int load instead of a
-                // second getfield. `rtype_cast_int_to_ptr` accepts the
-                // host call; UnaryOp `cast_int_to_ptr` has no flowspace
-                // counterpart (`normalize_unary_op_name`).
-                block.operations[index].kind = cast_int_to_ptr_call(meta.clone());
+            let result_ty = match &block.operations[index].kind {
+                OpKind::FieldRead { field, ty, .. }
+                    if field.vec_part == Some(VecFieldPart::FatVtable) =>
+                {
+                    Some(ty.clone())
+                }
+                _ => None,
+            };
+            if result_ty.is_some() {
+                // Same metadata word. Insert the Int load in front and
+                // leave the FatVtable GetfieldGcR; after method_* bases
+                // are retargeted, `rewrite_remaining_fat_vtable_reads`
+                // drops it when unused, or rewrites a live user to the
+                // DATA word (`fat_part_value_type`).
                 block.operations.insert(index, op);
             } else {
                 block.operations.insert(index + 1, op);
@@ -667,10 +685,132 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
     Some(meta)
 }
 
+fn producer_is_fat_len(graph: &FunctionGraph, var: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(var)
+                && matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.vec_part == Some(VecFieldPart::FatLen)
+                )
+        })
+    })
+}
+
+/// `cast_int_to_ptr_call` is `simple_call(lltype.cast_int_to_ptr, …)`,
+/// not a `UnaryOp`. `normalize_unary_op_name` rejects that name.
+fn cast_int_to_ptr_operand(kind: &OpKind) -> Option<&Variable> {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(|s| s.as_str()) == Some("cast_int_to_ptr") => {
+            args.first().and_then(LinkArg::as_variable)
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_remaining_fat_vtable_reads(graph: &mut FunctionGraph, fat_len: &HashMap<u64, Variable>) {
+    let mut drop_ids = Vec::new();
+    let mut rewrite_ids = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            let OpKind::FieldRead { field, .. } = &op.kind else {
+                continue;
+            };
+            if field.vec_part != Some(VecFieldPart::FatVtable) {
+                continue;
+            }
+            if !fat_len.contains_key(&result.id()) {
+                continue;
+            }
+            let uses = crate::front::result_exc::count_var_uses(graph, result);
+            if uses.op_uses == 0 && uses.link_uses == 0 {
+                drop_ids.push(result.clone());
+            } else {
+                rewrite_ids.push(result.id());
+            }
+        }
+    }
+    for result in drop_ids {
+        for block in &mut graph.blocks {
+            block
+                .operations
+                .retain(|op| op.result.as_ref() != Some(&result));
+        }
+    }
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            let Some(result) = op.result.clone() else {
+                continue;
+            };
+            if !rewrite_ids.contains(&result.id()) {
+                continue;
+            }
+            let OpKind::FieldRead { field, ty, .. } = &mut op.kind else {
+                continue;
+            };
+            if field.vec_part != Some(VecFieldPart::FatVtable) {
+                continue;
+            }
+            // Leftover users are the dyn-call receiver
+            // (`FunctionReprBase.call` passes self). Type the DATA word
+            // the same way as every other FatData read
+            // (`fat_part_value_type`): a GC host is Ref (the strategy
+            // instance; `history.getkind` of a Gc Ptr). Forcing Int
+            // here split the `indirect_call` family: ZST impls vs GC
+            // `ModuleDictStrategy`.
+            field.vec_part = Some(VecFieldPart::FatData);
+            field.taken_by_address = false;
+            field.inline_vec = false;
+            *ty = fat_part_value_type(VecFieldPart::FatData, field.owner_declared_gc);
+            FunctionGraph::set_concretetype_of_inline(&result, fat_part_concretetype(ty));
+        }
+    }
+}
+
+fn drop_unused_fat_len_casts(graph: &mut FunctionGraph) {
+    let mut drop_ids = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            let Some(operand) = cast_int_to_ptr_operand(&op.kind) else {
+                continue;
+            };
+            if !producer_is_fat_len(graph, operand) {
+                continue;
+            }
+            let uses = crate::front::result_exc::count_var_uses(graph, result);
+            if uses.op_uses == 0 && uses.link_uses == 0 {
+                drop_ids.push(result.clone());
+            }
+        }
+    }
+    for result in drop_ids {
+        for block in &mut graph.blocks {
+            block
+                .operations
+                .retain(|op| op.result.as_ref() != Some(&result));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType};
+    use crate::front::mir::cast_int_to_ptr_call;
+    use crate::model::{
+        ConcreteType, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType,
+        VecFieldPart,
+    };
     use std::collections::{HashMap, HashSet};
 
     fn hit(id_hit: bool, rank: Option<OwnerPathRank>) -> OwnerHit {
@@ -1049,6 +1189,128 @@ mod tests {
         assert_eq!(
             graph.blocks[header.0].exits[0].args[1].as_variable(),
             Some(&meta)
+        );
+    }
+
+    #[test]
+    fn unused_cast_of_a_fat_len_word_is_dropped() {
+        let mut graph = FunctionGraph::new("unused_vtable_cast");
+        let base = graph.alloc_value_var();
+        let meta = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let cast = graph.alloc_value_var();
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(meta.clone()),
+                kind: OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("imp", Some("DictStrategyRef".into()))
+                        .with_vec_part(VecFieldPart::FatLen),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+            });
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(cast),
+                kind: cast_int_to_ptr_call(meta),
+            });
+        drop_unused_fat_len_casts(&mut graph);
+        assert!(
+            !graph.blocks[graph.startblock.0]
+                .operations
+                .iter()
+                .any(|op| cast_int_to_ptr_operand(&op.kind).is_some()),
+            "unused CastIntToPtr of FatLen must be dropped: {:?}",
+            graph.blocks[graph.startblock.0].operations
+        );
+        assert!(
+            graph.blocks[graph.startblock.0]
+                .operations
+                .iter()
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.vec_part == Some(VecFieldPart::FatLen)
+                )),
+            "FatLen load stays"
+        );
+    }
+
+    #[test]
+    fn used_cast_of_a_fat_len_word_is_kept() {
+        let mut graph = FunctionGraph::new("used_vtable_cast");
+        let base = graph.alloc_value_var();
+        let meta = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let cast = graph.alloc_value_var();
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(meta.clone()),
+                kind: OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("imp", Some("DictStrategyRef".into()))
+                        .with_vec_part(VecFieldPart::FatLen),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+            });
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(cast.clone()),
+                kind: cast_int_to_ptr_call(meta),
+            });
+        graph.set_return(graph.startblock, Some(cast));
+        drop_unused_fat_len_casts(&mut graph);
+        assert!(
+            graph.blocks[graph.startblock.0]
+                .operations
+                .iter()
+                .any(|op| cast_int_to_ptr_operand(&op.kind).is_some()),
+            "a live CastIntToPtr of FatLen stays: {:?}",
+            graph.blocks[graph.startblock.0].operations
+        );
+    }
+
+    #[test]
+    fn leftover_fat_vtable_user_becomes_fat_data() {
+        let mut graph = FunctionGraph::new("leftover_vtable_recv");
+        let base = graph.alloc_value_var();
+        let vtable = graph.alloc_value_var();
+        let meta = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: Some(vtable.clone()),
+                kind: OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("imp", Some("DictStrategyRef".into()))
+                        .with_vec_part(VecFieldPart::FatVtable),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+            });
+        graph.set_return(graph.startblock, Some(vtable.clone()));
+        let mut fat_len = HashMap::new();
+        fat_len.insert(vtable.id(), meta);
+        rewrite_remaining_fat_vtable_reads(&mut graph, &fat_len);
+        let op = &graph.blocks[graph.startblock.0].operations[0];
+        match &op.kind {
+            OpKind::FieldRead { field, ty, .. } => {
+                assert_eq!(field.vec_part, Some(VecFieldPart::FatData));
+                assert_eq!(*ty, ValueType::Ref(None));
+            }
+            other => panic!("expected FatData FieldRead, got {other:?}"),
+        }
+        assert_eq!(FunctionGraph::concretetype_of(&vtable), ConcreteType::GcRef);
+        assert!(
+            !graph.blocks[graph.startblock.0]
+                .operations
+                .iter()
+                .any(|op| cast_int_to_ptr_operand(&op.kind).is_some()),
+            "leftover FatVtable must not become CastIntToPtr: {:?}",
+            graph.blocks[graph.startblock.0].operations
         );
     }
 }

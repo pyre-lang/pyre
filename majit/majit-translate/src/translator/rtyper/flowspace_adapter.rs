@@ -1215,6 +1215,26 @@ fn is_vec_extend_from_slice_segments(segments: &[String]) -> bool {
         && segments[2] == "extend_from_slice"
 }
 
+/// `Vec::set_len(l, n)` (Rust MIR `vec::Vec::set_len` /
+/// `alloc::vec::<Impl>::set_len`) — write the list length.
+///
+/// Routed to `setattr(l, "len", n)`, the same `l.length = n` store
+/// `_ll_list_resize_really` (`rlist.py`) performs on the header. The
+/// raw `RustVec` field is `len`; `RustVecRepr.rtype_setattr` lowers
+/// that setattr to `setfield`. `op_canraise` is false: the store
+/// raises nothing (`setattr` in `operation.py`).
+fn is_vec_set_len_segments(segments: &[String]) -> bool {
+    match segments {
+        [a, b, c, leaf]
+            if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") && leaf == "set_len" =>
+        {
+            true
+        }
+        [a, b, leaf] if a == "vec" && b == "Vec" && leaf == "set_len" => true,
+        _ => false,
+    }
+}
+
 /// Test-only mirror of whether the flowspace op(s) this `OpKind`
 /// lowers to carry a non-empty `canraise` (`operation.py`).
 ///
@@ -1317,6 +1337,13 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         } if is_vec_ctor_segments(segments) || is_vec_from_elem_segments(segments, args.len()) => {
             false
         }
+        // `Vec::set_len` lowers (in `translate_op`) to `setattr`, whose
+        // `canraise` is `[]` (`operation.py`). Matched before the general
+        // `Call` arm.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
+            ..
+        } if is_vec_set_len_segments(segments) => false,
         // `[__iter_next]` (`front::iter_next`) lowers to the raising
         // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
         // = [StopIteration, RuntimeError]`).  Matched before the general
@@ -2205,6 +2232,37 @@ pub fn translate_op(
                 // Inline: the read's base is the parent struct, so the list
                 // is `getattr(parent, field)` and `len` is `ll_length`.
                 // A pointer to the Vec is already the list (`ll_length(l)`).
+                // A tuple item is `getitem(t, N)` (`rtuple.py`
+                // `rtype_getitem`); SomeTuple has no `__pos_N` attribute.
+                //
+                // A one-word-item Vec field stays an Int header
+                // (`field_ty_is_inline_vec` is false). Its Len component
+                // is `rlist.py` `ll_length` = `return l.length`, a Signed
+                // word of the parent (`assembler` suffixes `.len`). getattr
+                // of the Vec field itself would annotate that field as
+                // RustVec and union with Integer at `ll_vec_alloc_and_set_*`.
+                if field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(majit_ir::descr::is_shaped_tuple_name)
+                    && let Some(index) = field
+                        .name
+                        .strip_prefix("__pos_")
+                        .and_then(|n| n.parse::<i64>().ok())
+                {
+                    let list = Hlvalue::Variable(Variable::new());
+                    return Ok(vec![
+                        FlowspaceOp::new(
+                            "getitem",
+                            vec![
+                                base_hl,
+                                Hlvalue::Constant(Constant::new(ConstValue::Int(index))),
+                            ],
+                            list.clone(),
+                        ),
+                        FlowspaceOp::new("len", vec![list], result),
+                    ]);
+                }
                 if field.inline_vec {
                     let list = Hlvalue::Variable(Variable::new());
                     return Ok(vec![
@@ -2218,6 +2276,17 @@ pub fn translate_op(
                         ),
                         FlowspaceOp::new("len", vec![list], result),
                     ]);
+                }
+                if field.owner_root.as_deref() != Some("alloc::vec::Vec") {
+                    let name = format!("{}.len", field.name);
+                    return Ok(vec![FlowspaceOp::new(
+                        "getattr",
+                        vec![
+                            base_hl,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(&name))),
+                        ],
+                        result,
+                    )]);
                 }
                 return Ok(vec![FlowspaceOp::new("len", vec![base_hl], result)]);
             }
@@ -3196,6 +3265,36 @@ pub fn translate_op(
                             ),
                             FlowspaceOp::new("simple_call", vec![bound_method, item], result),
                         ]);
+                    }
+                    // `Vec::set_len(recv, n)` is `l.length = n`
+                    // (`rlist.py` `_ll_list_resize_really`). Emit
+                    // `setattr(recv, "len", n)` so the rtyper writes the
+                    // header length field (`RustVecRepr.rtype_setattr` /
+                    // `PtrRepr.rtype_setattr`) instead of looking the
+                    // foreign method up in CallRegistry.
+                    if is_vec_set_len_segments(segments) {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "Vec::set_len requires exactly two args (receiver, new_len), got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message("Vec::set_len requires a receiver arg".to_string())
+                        })?;
+                        let new_len = iter.next().ok_or_else(|| {
+                            TyperError::message("Vec::set_len requires a new_len arg".to_string())
+                        })?;
+                        return Ok(vec![FlowspaceOp::new(
+                            "setattr",
+                            vec![
+                                receiver,
+                                Hlvalue::Constant(Constant::new(ConstValue::byte_str("len"))),
+                                new_len,
+                            ],
+                            result,
+                        )]);
                     }
                     // `Vec::extend_from_slice(recv, slice)` — same method
                     // shape as the `Vec::push` arm, but the bound method is
@@ -8128,6 +8227,59 @@ mod tests {
         assert!(op_canraise(&op.kind));
     }
 
+    #[test]
+    fn translate_op_vec_set_len_lowers_to_setattr_len() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_vec_set_len_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let receiver = Hlvalue::Variable(Variable::new());
+        let new_len = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), receiver.clone());
+        value_map.insert(vars[1].clone(), new_len.clone());
+        value_map.insert(vars[2].clone(), result.clone());
+        for segments in [
+            vec!["vec".into(), "Vec".into(), "set_len".into()],
+            vec![
+                "alloc".into(),
+                "vec".into(),
+                "<Impl>".into(),
+                "set_len".into(),
+            ],
+        ] {
+            let op = SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
+                    result_ty: ValueType::Void,
+                },
+            };
+            assert!(
+                !op_canraise(&op.kind),
+                "Vec::set_len lowers to setattr, which does not raise"
+            );
+            let translated = translate_op(&op, &value_map, &empty_call_registry())
+                .expect("Vec::set_len must lower to setattr of len");
+            assert_eq!(translated.len(), 1);
+            assert_eq!(translated[0].opname, "setattr");
+            assert_eq!(translated[0].args.len(), 3);
+            assert_eq!(translated[0].args[0], receiver);
+            let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+                panic!("set_len field name must be a Constant");
+            };
+            assert!(matches!(
+                &name_const.value,
+                ConstValue::ByteStr(bytes) if bytes == b"len"
+            ));
+            assert_eq!(translated[0].args[2], new_len);
+            assert_eq!(translated[0].result, result);
+        }
+    }
+
     /// The frontend cannot see the adapter's expansion: `lower_function`
     /// still contains the raw `alloc::vec::from_elem` call, while the
     /// flowspace graph must carry `newlist` + `mul` instead.  This real-LLBC
@@ -9731,6 +9883,69 @@ mod tests {
             translate_op(&word, &value_map, &empty_call_registry()).expect("Vec len word");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "len");
+    }
+
+    #[test]
+    fn translate_op_one_word_vec_field_len_is_signed_length_word() {
+        // One-word-item Vec field: `rlist.py` `ll_length` is `return l.length`.
+        // getattr of the Vec field would annotate it as RustVec.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("items", Some("W_ListObject".into()))
+                    .with_vec_part(crate::model::VecFieldPart::Len),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("one-word Vec len word");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getattr");
+        let Hlvalue::Constant(ref name) = translated[0].args[1] else {
+            panic!("getattr name");
+        };
+        assert!(matches!(&name.value, ConstValue::ByteStr(s) if s == b"items.len"));
+    }
+
+    #[test]
+    fn translate_op_tuple_vec_len_word_lowers_to_getitem_len() {
+        // `t.0.len()` of a shaped tuple is `len(getitem(t, 0))`
+        // (`rtuple.py` `rtype_getitem` + `rlist.py` `rtype_len`). SomeTuple
+        // has no `__pos_0` attribute. One-word item fields do not stamp
+        // `inline_vec`; the tuple arm does not require it.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "__pos_0",
+                    Some("Tuple<Vec<*mut PyObject>,Vec<*mut PyObject>>".into()),
+                )
+                .with_vec_part(crate::model::VecFieldPart::Len),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("tuple Vec len read");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getitem", "len"]);
+        let Hlvalue::Constant(ref idx) = translated[0].args[1] else {
+            panic!("getitem index");
+        };
+        assert!(matches!(idx.value, ConstValue::Int(0)));
     }
 
     #[test]

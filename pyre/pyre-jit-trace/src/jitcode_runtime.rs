@@ -285,15 +285,19 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
             let path = paths.get(index).map(|s| s.as_str()).unwrap_or("");
             let method = path.rsplit_once("::").map(|(_, m)| m).unwrap_or("");
             let fnaddr = crate::runtime_fnaddr_patch::runtime_fnaddr(build_fnaddr) as usize;
-            // Identical-code folding can map several build-time addresses to
-            // one runtime address; retain the first target for that address.
-            //
-            // `pyjitpl.py bytecode_for_address` asserts the address is
-            // absent instead, because RPython's translation never folds two
-            // graphs onto one entry point. Keeping the first target is the
-            // only choice available here, but a wrong pick would otherwise be
-            // invisible, so name every dropped target once at startup.
-            // Two different method names sharing one address are declined.
+            // Identical-code folding can map several graphs onto one runtime
+            // address (`/OPT:ICF`, Mach-O coalescing). `pyjitpl.py
+            // bytecode_for_address` asserts the address is absent, because
+            // RPython never folds two graphs onto one entry point. The map
+            // is only sound when each address names one jitcode; keep-first
+            // would bind the first impl's body at every colliding slot.
+            // Decline an address only when two graphs with different
+            // method names share it. Same-name ICF (`length` on two
+            // impls) keeps the first target: declining both left
+            // `bytecode_for_address` empty and `len(d)` a residual
+            // CallI. The same graph is inserted once per alias
+            // (`runtime_fnaddr`, `runtime_fnaddr_by_path`, the rustc
+            // vtable slot); that is one jitcode, not a collision.
             ict_insert_fnaddr(
                 &mut by_fnaddr,
                 &mut declined,
@@ -377,6 +381,9 @@ fn ict_insert_fnaddr(
         }
         indexmap::map::Entry::Occupied(kept) => {
             let kept_index = *kept.get();
+            if kept_index == index {
+                return;
+            }
             let kept_method = paths
                 .get(kept_index)
                 .and_then(|p| p.rsplit_once("::"))
@@ -385,8 +392,9 @@ fn ict_insert_fnaddr(
                 majit_ir::debug::log_one(
                     "jit-indirectcalltargets",
                     &format!(
-                        "runtime fnaddr {fnaddr:#x} is ICF-shared by {method} \
-                         (index {index}) and {}; declining both",
+                        "runtime fnaddr {fnaddr:#x} is shared by {method} \
+                         (index {index}, build {build_fnaddr:#x}) and {} \
+                         (index {kept_index}); declining both",
                         kept_method.unwrap_or("?")
                     ),
                 );
@@ -4167,6 +4175,115 @@ mod tests {
             fnaddr
         );
         assert!(JITCODE_CELLS[index].get().is_some());
+    }
+
+    #[test]
+    fn ict_insert_fnaddr_declines_every_colliding_address() {
+        let paths = [
+            "crate::IntDictStrategy::length".to_string(),
+            "crate::UnicodeDictStrategy::length".to_string(),
+            "crate::BytesDictStrategy::getitem".to_string(),
+        ];
+        let mut by_fnaddr = indexmap::IndexMap::new();
+        let mut declined = Vec::new();
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x1000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x1000,
+            1,
+            "length",
+            &paths,
+            0x20,
+        );
+        assert_eq!(
+            by_fnaddr.get(&0x1000),
+            Some(&0),
+            "same method name on two impls keeps the first target: {by_fnaddr:?}"
+        );
+        assert!(declined.is_empty());
+
+        let mut by_fnaddr = indexmap::IndexMap::new();
+        let mut declined = Vec::new();
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x2000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x2000,
+            2,
+            "getitem",
+            &paths,
+            0x30,
+        );
+        assert!(by_fnaddr.is_empty(), "distinct names still decline");
+        assert_eq!(declined, vec![0x2000]);
+
+        let mut by_fnaddr = indexmap::IndexMap::new();
+        let mut declined = Vec::new();
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x3000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x4000,
+            1,
+            "length",
+            &paths,
+            0x20,
+        );
+        assert_eq!(by_fnaddr.get(&0x3000), Some(&0));
+        assert_eq!(by_fnaddr.get(&0x4000), Some(&1));
+        assert!(declined.is_empty());
+
+        let mut by_fnaddr = indexmap::IndexMap::new();
+        let mut declined = Vec::new();
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x5000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x5000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        assert_eq!(
+            by_fnaddr.get(&0x5000),
+            Some(&0),
+            "patched fnaddr / path / vtable slot of one graph is one jitcode: {by_fnaddr:?}"
+        );
+        assert!(declined.is_empty());
     }
 
     #[test]

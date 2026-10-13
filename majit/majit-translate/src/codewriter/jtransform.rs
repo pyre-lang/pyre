@@ -6328,42 +6328,29 @@ impl<'a> Transformer<'a> {
             };
             let base = base.clone();
             self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
-            // `jtransform.py handle_getfield_typeptr`: `-live-` then
-            // `guard_class` on the instance, after which the method-slot
-            // getfield is a pure read off a Const. The fat-pointer vtable
-            // word is that instance's class; promote it once here so two
-            // `method_*` reads on the same strategy share the guard.
-            let kind_char = vtable_word_guard_kind(&base);
+            // `jtransform.py handle_getfield_typeptr` emits one `-live-` +
+            // `guard_class` on the instance; the method-slot getfield is
+            // then a pure read. The fat-pointer vtable word is that
+            // instance's class: `promote_dyn_vtable_word` emits the one
+            // guard on the FatLen / FatVtable load, and two `method_*`
+            // reads on the same strategy share it. Do not re-guard here.
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!(
-                    "rewrite: getfield({}.{}) → vtable guard_value + int-kind slot",
+                    "rewrite: getfield({}.{}) → int-kind slot",
                     field.owner_root.as_deref().unwrap_or("<?>"),
                     field.name
                 ),
             });
-            return RewriteResult::Replace(vec![
-                SpaceOperation {
-                    result: None,
-                    kind: OpKind::Live,
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::FieldRead {
+                    base,
+                    field: field.clone(),
+                    ty: ValueType::Int,
+                    pure: true,
                 },
-                SpaceOperation {
-                    result: None,
-                    kind: OpKind::GuardValue {
-                        value: base.clone(),
-                        kind_char,
-                    },
-                },
-                SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::FieldRead {
-                        base,
-                        field: field.clone(),
-                        ty: ValueType::Int,
-                        pure: true,
-                    },
-                },
-            ]);
+            }]);
         }
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
         // A raw address is an int. A later getfield/setfield/raw_load/
@@ -17271,10 +17258,8 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            [
-                "input", "fatlen", "live", "guard_i", "live", "guard_i", "method"
-            ],
-            "vtable word is getfield + live + guard_value; slot read re-guards that word then stays a getfield: {ops:?}"
+            ["input", "fatlen", "live", "guard_i", "method"],
+            "vtable word is getfield + one live + guard_value; slot read stays a getfield: {ops:?}"
         );
 
         let mut slice_graph = FunctionGraph::new("slice_len");
