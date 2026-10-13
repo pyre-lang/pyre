@@ -588,15 +588,16 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
     let x_slot = ffi_slot + 1;
     let x = roots.pin_root(x);
     set_cached_type(ffi_arg(roots.get(ffi_slot))?, type_index, x);
-    if lazy && signed_size(s.size) == -2 {
-        if let Err(error) = do_realize_lazy_struct(x) {
-            set_cached_type(
-                ffi_arg(roots.get(ffi_slot))?,
-                type_index,
-                pyre_object::w_none(),
-            );
-            return Err(error);
-        }
+    if lazy
+        && signed_size(s.size) == -2
+        && let Err(error) = do_realize_lazy_struct(x)
+    {
+        set_cached_type(
+            ffi_arg(roots.get(ffi_slot))?,
+            type_index,
+            pyre_object::w_none(),
+        );
+        return Err(error);
     }
     Ok(roots.get(x_slot))
 }

@@ -1237,9 +1237,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     if pos + buf.len() > len {
                         return Err(pyre_interpreter::PyError::value_error("data out of range"));
                     }
-                    {
-                        std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(pos), buf.len())
-                    };
+                    std::ptr::copy_nonoverlapping(buf.as_ptr(), p.add(pos), buf.len());
                     mmap_set_attr(
                         obj,
                         "_pos",
@@ -1291,9 +1289,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "write_byte out of range",
                         ));
                     }
-                    {
-                        *p.add(pos) = raw as u8
-                    };
+                    *p.add(pos) = raw as u8;
                     mmap_set_attr(obj, "_pos", pyre_object::w_int_new((pos + 1) as i64));
                     Ok(pyre_object::w_none())
                 },
@@ -1511,9 +1507,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             let mut i = start;
                             let mut k = 0usize;
                             while (step > 0 && i < stop) || (step < 0 && i > stop) {
-                                {
-                                    *p.add(i as usize) = buf[k]
-                                };
+                                *p.add(i as usize) = buf[k];
                                 let Some(next) = i.checked_add(step) else {
                                     break;
                                 };
@@ -1545,9 +1539,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                             "mmap item value must be in range(0, 256)",
                         ));
                     }
-                    {
-                        *p.add(idx as usize) = v as u8
-                    };
+                    *p.add(idx as usize) = v as u8;
                     Ok(pyre_object::w_none())
                 },
                 3,

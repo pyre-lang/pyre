@@ -379,7 +379,8 @@ pub fn new_ctype(
     let roots = pyre_object::gc_roots::push_roots();
     let ctitem_slot = roots.base();
     let _ = roots.pin_root(ctitem);
-    let obj = W_CType::allocate_stable(W_CType {
+
+    W_CType::allocate_stable(W_CType {
         size,
         size_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
         name: String::leak(name.to_string()),
@@ -396,8 +397,7 @@ pub fn new_ctype(
         value_smaller_than_long: flags & CTypeFlags::VALUE_SMALLER_THAN_LONG.bits() != 0,
         value_fits_ulong: flags & CTypeFlags::VALUE_FITS_ULONG.bits() != 0,
         ..Default::default()
-    });
-    obj
+    })
 }
 
 impl Default for W_CType {

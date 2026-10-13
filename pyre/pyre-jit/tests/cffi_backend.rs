@@ -19,18 +19,14 @@ use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
-use pyre_jit::eval::{eval_with_jit, init_jit_hooks, reset_gc_fresh_for_test};
-
-/// The programs share the process-global GC singleton and builtin type state,
-/// so they run one at a time regardless of cargo's parallel scheduling.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+use pyre_jit::eval::{eval_with_jit, init_jit_hooks};
 
 fn run_harness(program: &str, name: &str) -> Result<(), String> {
+    // Same startup as `pyrex::real_main`, on this process's own GC.
     pyre_interpreter::stack_check::set_recursion_limit(5000)
         .map_err(|_| "set_recursion_limit failed".to_string())?;
     pyre_module::register();
     init_jit_hooks();
-    reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     importing::init_sys_path(&cwd, cwd.as_os_str());
@@ -60,8 +56,32 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Run one test in its own process, then `run_harness` on a 256 MiB worker.
+///
+/// Unless `PYRE_CFFI_BACKEND_CHILD` is set, re-exec this binary with `--exact`
+/// for the libtest thread name, `--nocapture`, and `--test-threads=1`. The
+/// child has the variable set and runs `run_harness` on the worker thread.
+/// The child builds one GC through the same startup as `pyrex::real_main`.
 fn run_on_worker(program: &'static str, name: &'static str) {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const CHILD: &str = "PYRE_CFFI_BACKEND_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let current = std::thread::current();
+        let test_name = current.name();
+        assert!(test_name.is_some(), "libtest names the test thread");
+        let test_name = test_name.unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-exec cffi_backend test in its own process");
+        assert!(
+            output.status.success(),
+            "{name}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || run_harness(program, name))
@@ -72,12 +92,9 @@ fn run_on_worker(program: &'static str, name: &'static str) {
 /// One program covering every part of `_cffi_backend` the module answers
 /// today, transcribed from `extra_tests/cffi_tests/test_c.py`.
 ///
-/// It is a single `#[test]` on purpose: the module's primitive/singleton
-/// `UniqueCache` entries and weak-value cache carriers are process-global, so
-/// a second program in the same process would meet roots registered with the
-/// heap `reset_gc_fresh_for_test` has already replaced.  Each section runs
-/// through `exec` and reports on its own, so one run names every failure
-/// rather than only the first.
+/// Each section runs through `exec` and reports on its own, so one run names
+/// every failure rather than only the first. `run_on_worker` runs the program
+/// in its own process, on that process's GC.
 #[test]
 fn the_module_answers_every_ctype_family_it_has_ported() {
     const PROGRAM: &str = concat!(

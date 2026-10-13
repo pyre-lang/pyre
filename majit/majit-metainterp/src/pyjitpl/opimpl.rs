@@ -278,7 +278,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        return TraceAction::Abort;
+        TraceAction::Abort
     }
 
     // -- State field access (register/tape machines) --
@@ -4170,11 +4170,10 @@ where
         // Restricted to `inline_depth() == 0`: the position it competes
         // with is the ROOT frame's i0, so an inlined callee's own pc
         // would name a position in the wrong code.
-        if ctx.inline_depth() == 0 {
-            if let Some(u) = mp_green_pc.and_then(|v| usize::try_from(v).ok()) {
+        if ctx.inline_depth() == 0
+            && let Some(u) = mp_green_pc.and_then(|v| usize::try_from(v).ok()) {
                 ctx.last_mp_green_pc = Some(u);
             }
-        }
         if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
             // The loop-vs-bridge split lives inside
             // `create_segmented_trace`, where upstream keeps it
@@ -4533,13 +4532,12 @@ where
                 // pyjitpl.py `same_greenkey` over the greens of the merge
                 // point just reached. A bridge's trace-start header is
                 // the guard, not the parent loop, so the reference is
-                // the compiled loop those greens name
-                // (`compiled_key_for_greens` / `loop_header_greens`).
+                // the cell those greens own (`compiled_key_for_greens`,
+                // `warmstate.py JitCell.get_jitcell`).
                 // It has to be this bridge's source loop: the same pc
                 // in another code object is a different green key.
-                // `None` means that loop was compiled without stored
-                // greens; the pc check above stays the only
-                // discriminator, which is what this arm used to be.
+                // `None` means no compiled targets live at those greens;
+                // the pc check above stays the only discriminator.
                 let greens = (
                     mp_green_ints.to_vec(),
                     mp_green_refs.to_vec(),
@@ -5470,7 +5468,7 @@ where
                 .descr_at(calldescr_idx as usize)
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
-                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
+                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
             let target = frame
                 .jitcode
                 .exec
@@ -5841,7 +5839,7 @@ where
                 .descr_at(calldescr_idx as usize)
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
-                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
+                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
             let target = frame
                 .jitcode
                 .exec
@@ -6216,7 +6214,7 @@ where
                 .descr_at(calldescr_idx as usize)
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
-                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
+                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
             let target = frame
                 .jitcode
                 .exec
@@ -6532,7 +6530,7 @@ where
                 .descr_at(calldescr_idx as usize)
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
-                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
+                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
             let target = frame
                 .jitcode
                 .exec
@@ -8728,7 +8726,7 @@ where
             );
         }
         self.pop_exception_frame(ctx);
-        return self.unwind_to_exception_handler(ctx);
+        self.unwind_to_exception_handler(ctx)
     }
 
     #[inline(never)]
@@ -8746,7 +8744,7 @@ where
         // RaiseWithExplicitTraceback is the bare-reraise path and
         // deliberately skips record_application_traceback.
         self.pop_exception_frame(ctx);
-        return self.unwind_to_exception_handler(ctx);
+        self.unwind_to_exception_handler(ctx)
     }
 
     #[inline(never)]
@@ -8773,7 +8771,7 @@ where
         if crate::is_bridge_walking() || ctx.is_bridge_trace {
             ctx.deterministic_bridge_abort = true;
         }
-        return TraceAction::Abort;
+        TraceAction::Abort
     }
 
     #[inline(never)]
@@ -8786,7 +8784,7 @@ where
         bytecode: u8,
     ) -> TraceAction {
         self.log_bytecode_abort("BC_ABORT_PERMANENT");
-        return TraceAction::AbortPermanent;
+        TraceAction::AbortPermanent
     }
 
     // `jtransform.py` `rewrite_op_malloc_varsize` → `new_array` /

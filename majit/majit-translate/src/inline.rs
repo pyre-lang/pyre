@@ -273,27 +273,36 @@ fn inline_call_site(
     // etype and evalue. The guarded rewire stays unreachable.
     rewire_copied_exceptblock(graph, &block_map, callee.exceptblock);
 
-    // Connect caller's before-block to callee entry
-    // Map call arguments to callee's Input ops.
-    // Callee's Input ops correspond to its entry block's first N ops.
+    // Connect caller's before-block to callee entry.
+    //
+    // `Inliner.do_inline` (`backendopt/inline.py`) binds call arguments
+    // only through the entry Link: `passon_args` is the call args plus
+    // `original_passon_vars`, and `copy_block` starts the copied
+    // startblock from `block.inputargs`. Uses inside the callee keep
+    // the copied parameter Variables; they are never rewritten onto
+    // the caller's argument Variable. Rewriting them (`remap_value_in_graph`)
+    // made a FieldRead name a value defined in the before-block, after
+    // which `prune_dead_phis` dropped the now-unread startblock
+    // inputarg together with that link column (`w_set_items` →
+    // `SetStrategyRef::deref` left `v18.imp` undefined).
+    //
+    // A callee whose parameters live only as `OpKind::Input` ops (empty
+    // `startblock.inputargs`) still has to grow those Input results into
+    // inputargs so the same Link can bind them. `flowspace/model.py`
+    // `checkgraph` requires each use to be a block inputarg or op result.
     let callee_entry_block = &callee.blocks[callee.startblock.0];
-    let input_vars: Vec<crate::flowspace::model::Variable> = callee_entry_block
-        .operations
-        .iter()
-        .filter(|op| matches!(&op.kind, OpKind::Input { .. }))
-        .filter_map(|op| op.result.clone())
-        .collect();
-
-    // Map call args to callee input values
-    for (i, callee_input_var) in input_vars.iter().enumerate() {
-        let remapped_input_var = value_map[callee_input_var].clone();
-        if let Some(crate::model::LinkArg::Value(call_arg_var)) = call_args.get(i) {
-            // Add alias: remapped callee input = call argument
-            // We do this by prepending a "move" in the callee entry block
-            // Actually, we set the entry block's inputargs and jump with call args
-            // But callee entry doesn't have inputargs for Input ops...
-            // Instead, remap all uses of remapped_input to call_arg in the callee blocks
-            remap_value_in_graph(graph, &block_map, &remapped_input_var, call_arg_var);
+    if graph.blocks[callee_entry.0].inputargs.is_empty() {
+        let input_vars: Vec<crate::flowspace::model::Variable> = callee_entry_block
+            .operations
+            .iter()
+            .filter(|op| matches!(&op.kind, OpKind::Input { .. }))
+            .filter_map(|op| op.result.clone())
+            .collect();
+        let n = input_vars.len().min(call_args.len());
+        for var in input_vars.iter().take(n) {
+            graph.blocks[callee_entry.0]
+                .inputargs
+                .push(value_map[var].clone());
         }
     }
 
@@ -303,29 +312,10 @@ fn inline_call_site(
     // original exits (which have already been moved to the merge block
     // above).
     //
-    // RPython parity (`backendopt/inline.py:265-273
-    // inline_function`): the caller-side Link supplies `call_args`
-    // positionally so the callee entry block's `inputargs` Variables
-    // receive the actual argument values.  Pyre's older `Input`-op
-    // remap path (the `remap_value_in_graph(graph, &block_map,
-    // remapped_input, call_arg)` calls above) rewrites every
-    // reference to a callee Input result with the corresponding
-    // call_arg directly — that path is sufficient when the cloned
-    // callee was built via pyre's frontend (which leaves
-    // `Block.inputargs` empty and threads parameters through
-    // `OpKind::Input` ops).  For callees built via the upstream
-    // Variable-keyed shape (where `startblock.inputargs` carries
-    // the parameter Variables), the Link.args path below is the
-    // required binding mechanism — without it the cloned inputarg
-    // Variables arrive unbound and the link arity diverges from
-    // the target's inputarg count.  Both shapes converge here: an
-    // empty inputarg list yields empty `entry_args`, so the prior
-    // behaviour is preserved bit-for-bit when the callee has no
-    // inputargs.
-    let inputarg_count = callee_entry_block.inputargs.len();
     // RPython `get_new_name` keeps Constants on the entry Link
     // (`backendopt/inline.py`).  `call_arg_vars` would drop them and
     // shift later arguments.
+    let inputarg_count = graph.blocks[callee_entry.0].inputargs.len();
     let entry_args: Vec<crate::model::LinkArg> =
         call_args.into_iter().take(inputarg_count).collect();
     graph.set_goto_mixed(block_id, callee_entry, entry_args);
@@ -405,7 +395,7 @@ fn caller_passon_vars(
                     .as_ref()
                     .is_some_and(|exc| exc.as_variable().as_ref() == Some(&var));
             if !carried_exception {
-                push(&var);
+                push(var);
             }
         }
     }
@@ -507,7 +497,7 @@ fn retarget_var_uses(
             op.kind = remap_op_kind(&op.kind, &remap);
         }
         let (exitswitch, exits) =
-            remap_control_flow_metadata_var(&block.exitswitch, &block.exits, &remap, |block_id| {
+            remap_control_flow_metadata_var(&block.exitswitch, &block.exits, remap, |block_id| {
                 block_id
             });
         block.exitswitch = exitswitch;
@@ -611,7 +601,7 @@ fn remap_op(
     let remap_var = |var: &crate::flowspace::model::Variable| {
         value_map.get(var).cloned().unwrap_or_else(|| var.clone())
     };
-    let result = op.result.as_ref().map(&remap_var);
+    let result = op.result.as_ref().map(remap_var);
     let kind = remap_op_kind(&op.kind, &remap_var);
     SpaceOperation { result, kind }
 }
@@ -1291,7 +1281,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         } => vec![clone_var(base), clone_var(index), clone_var(value)],
         OpKind::Call { args, .. } => args
             .iter()
-            .filter_map(|arg| arg.as_variable().map(&clone_var))
+            .filter_map(|arg| arg.as_variable().map(clone_var))
             .collect(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![clone_var(cond)],
         OpKind::GuardValue { value, .. } => vec![clone_var(value)],
@@ -1832,38 +1822,6 @@ fn is_pure_unary_opname(opname: &str) -> bool {
     )
 }
 
-/// Replace all occurrences of `old_var` with `new_var` in ops within the specified blocks.
-fn remap_value_in_graph(
-    graph: &mut FunctionGraph,
-    block_map: &HashMap<BlockId, BlockId>,
-    old_var: &crate::flowspace::model::Variable,
-    new_var: &crate::flowspace::model::Variable,
-) {
-    let target_blocks: Vec<BlockId> = block_map.values().copied().collect();
-    for &bid in &target_blocks {
-        let (exitswitch, exits) = {
-            let block = &graph.blocks[bid.0];
-            remap_control_flow_metadata_var(
-                &block.exitswitch,
-                &block.exits,
-                |var| {
-                    if var == old_var {
-                        new_var.clone()
-                    } else {
-                        var.clone()
-                    }
-                },
-                |b| b,
-            )
-        };
-        let new_ops = remap_value_in_ops(&graph.blocks[bid.0].operations, old_var, new_var);
-        let block = &mut graph.blocks[bid.0];
-        block.operations = new_ops;
-        block.exitswitch = exitswitch;
-        block.exits = exits;
-    }
-}
-
 /// Replace all occurrences of `old_var` with `new_var` in a list of ops.
 fn remap_value_in_ops(
     ops: &[SpaceOperation],
@@ -2049,6 +2007,73 @@ mod tests {
             .flat_map(|b| &b.operations)
             .any(|op| matches!(&op.kind, OpKind::Call { .. }));
         assert!(!has_call, "Call op should be replaced by inlined body");
+    }
+
+    #[test]
+    fn splice_binds_call_arg_through_entry_inputarg() {
+        // `Inliner.do_inline` keeps callee uses on copied startblock
+        // inputargs. Rewriting them onto the caller's argument left
+        // the ArrayRead base undefined once `prune_dead_phis` dropped
+        // the unread parameter column.
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let base_var = caller
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "base".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = caller.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["callee"]),
+                args: crate::model::call_args(vec![base_var.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        );
+        caller.set_return(entry, result);
+
+        assert!(splice_direct_call(
+            &mut caller,
+            entry,
+            1,
+            make_simple_callee()
+        ));
+        crate::model::prune_dead_phis(&mut caller);
+
+        let mut saw_array_read = false;
+        for block in &caller.blocks {
+            let defined: std::collections::HashSet<u64> = block
+                .inputargs
+                .iter()
+                .map(|var| var.id())
+                .chain(
+                    block
+                        .operations
+                        .iter()
+                        .filter_map(|op| op.result.as_ref().map(|var| var.id())),
+                )
+                .collect();
+            for op in &block.operations {
+                let OpKind::ArrayRead { base, .. } = &op.kind else {
+                    continue;
+                };
+                saw_array_read = true;
+                assert!(
+                    defined.contains(&base.id()),
+                    "ArrayRead base must be a block inputarg or op result, not the \
+                     caller's dominating argument\n{}",
+                    caller.dump()
+                );
+            }
+        }
+        assert!(saw_array_read, "spliced graph lost the callee ArrayRead");
     }
 
     #[test]

@@ -110,7 +110,7 @@ pub(super) fn gc_varsize_descr_tokens(config: &LowererConfig, header: &syn::Path
     let pointers = header_items_are_pointers(config, header);
     // A float item is the descr `getarrayitem_gc_f` reads, so the
     // allocation and the reads name one descriptor.
-    if !pointers && header_element_path(config, header).is_some_and(|elem| path_is_f64(elem)) {
+    if !pointers && header_element_path(config, header).is_some_and(path_is_f64) {
         return float_array_descr_tokens(Some(config), &Some(header.clone()));
     }
     // `symbolic.py` `get_array_token`: `itemsize = sizeof(SUBARRAY.OF)`.

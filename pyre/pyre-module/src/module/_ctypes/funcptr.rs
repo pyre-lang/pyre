@@ -1545,7 +1545,7 @@ fn plan_of_call(
     let describable = !past_a_plan
         && kinds.len() <= PLAN_MAX_ARGS
         && matches!(ret, Ret::Void | Ret::Code(_))
-        && !kinds.iter().any(|kind| *kind == ArgKind::Aggregate);
+        && !kinds.contains(&ArgKind::Aggregate);
     if !describable {
         return Settled::Unplannable;
     }
@@ -1639,7 +1639,7 @@ fn call_settled(
     let inargs_base = _roots.pin_roots(inargs);
     // Only a pointer argtype is still wanted as an object; a simple one is
     // fully described by the code the plan carries.
-    let argtypes = if kinds.iter().any(|kind| *kind == ArgKind::Pointer) {
+    let argtypes = if kinds.contains(&ArgKind::Pointer) {
         let argtypes = resolve_argtypes(self_obj);
         if argtypes.as_ref().is_none_or(|at| at.len() < kinds.len()) {
             return Ok(None);

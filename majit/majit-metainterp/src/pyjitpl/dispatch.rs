@@ -1674,7 +1674,7 @@ where
             .frames
             .iter()
             .rev()
-            .any(|frame| frame.ref_regs.iter().any(|slot| *slot == Some(vable_opref)));
+            .any(|frame| frame.ref_regs.contains(&Some(vable_opref)));
         if !has_slot {
             return None;
         }
@@ -2665,7 +2665,7 @@ where
                 false,
                 majit_ir::descr::ArrayFlag::Signed,
                 "len".to_string(),
-                "len".to_string(),
+                "len",
             ));
             d
         });
@@ -5240,14 +5240,10 @@ pub fn publish_walk_abort_handoff(
         if let Some(pc) = stub_resume_pc {
             ctx.walk_final_pc = Some(pc);
         }
-        if stub_resume_pc.is_none() {
-            if let Some(root) = standalone.frames.frames.first() {
-                ctx.snapshot_portal_greens_from_frame(
-                    &root.int_regs,
-                    &root.ref_regs,
-                    &root.float_regs,
-                );
-            }
+        if stub_resume_pc.is_none()
+            && let Some(root) = standalone.frames.frames.first()
+        {
+            ctx.snapshot_portal_greens_from_frame(&root.int_regs, &root.ref_regs, &root.float_regs);
         }
         // `run_to_end` already re-read live greens on Abort. The shared
         // prologue has advanced i0, so that snapshot's first int green is
@@ -5257,15 +5253,15 @@ pub fn publish_walk_abort_handoff(
         // (`last_mp_green_pc`).
         if let Some(pc) = stub_resume_pc {
             let bits = pc as i64;
-            if let Some((ints, _, _)) = ctx.live_portal_greens.as_mut() {
-                if let Some(slot) = ints.first_mut() {
-                    *slot = bits;
-                }
+            if let Some((ints, _, _)) = ctx.live_portal_greens.as_mut()
+                && let Some(slot) = ints.first_mut()
+            {
+                *slot = bits;
             }
-            if let Some((ints, _, _)) = ctx.close_greens.as_mut() {
-                if let Some(slot) = ints.first_mut() {
-                    *slot = bits;
-                }
+            if let Some((ints, _, _)) = ctx.close_greens.as_mut()
+                && let Some(slot) = ints.first_mut()
+            {
+                *slot = bits;
             }
         }
         // Every frame below the top already carries its own resume position:
@@ -8446,7 +8442,6 @@ mod tests {
             _inputargs: &[majit_ir::InputArgRc],
             _ops: &[majit_ir::OpRc],
             _original_token: &majit_backend::JitCellToken,
-            _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
             _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
         ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
             unimplemented!("RecordingGetfieldCpu::compile_bridge")

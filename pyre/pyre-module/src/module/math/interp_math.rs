@@ -370,8 +370,8 @@ use pyre_interpreter::objspace::descroperation::{
 majit_math1_gateway!(sin, _float_sin, |x| x.is_finite());
 majit_math1_gateway!(cos, _float_cos, |x| x.is_finite());
 majit_math1_gateway!(tan, _float_tan, |x| x.is_finite());
-majit_math1_gateway!(asin, _float_asin, |x| x >= -1.0 && x <= 1.0);
-majit_math1_gateway!(acos, _float_acos, |x| x >= -1.0 && x <= 1.0);
+majit_math1_gateway!(asin, _float_asin, |x| (-1.0..=1.0).contains(&x));
+majit_math1_gateway!(acos, _float_acos, |x| (-1.0..=1.0).contains(&x));
 majit_math1_gateway!(atan, _float_atan, |x| x.is_finite());
 majit_math1_gateway!(tanh, _float_tanh, |x| x.is_finite());
 majit_math1_gateway!(asinh, _float_asinh, |x| x.is_finite());
@@ -538,7 +538,7 @@ use pyre_interpreter::objspace::descroperation::{
 // float-to-int cast is exact).
 majit_math2_gateway!(pow, |x, y| {
     let e = _int_frexp_exponent_raw(x);
-    if e >= -1021 && e <= 1024 {
+    if (-1021..=1024).contains(&e) {
         let e_abs = if e < 0 { -e } else { e };
         let y_abs = if y < 0.0 { -y } else { y };
         if y_abs * ((e_abs + 1) as f64) < 1000.0
@@ -673,10 +673,11 @@ pub fn __majit_wrap_math_log(args: &[PyObjectRef]) -> PyResult {
             } else {
                 None
             };
-        if let Some(x) = x {
-            if x.is_finite() && x > 0.0 {
-                return _float_log(x);
-            }
+        if let Some(x) = x
+            && x.is_finite()
+            && x > 0.0
+        {
+            return _float_log(x);
         }
     }
     log_slow(args)
@@ -747,11 +748,10 @@ pub fn __majit_wrap_math_ldexp(args: &[PyObjectRef]) -> PyResult {
             // frexp exponent `e` of `x` has `-1021 <= e + exp <= 1024`.
             if x.is_finite()
                 && (x >= f64::MIN_POSITIVE || x <= -f64::MIN_POSITIVE)
-                && exp >= -1022
-                && exp <= 1023
+                && (-1022..=1023).contains(&exp)
             {
                 let e = _int_frexp_exponent_raw(x) + exp;
-                if e >= -1021 && e <= 1024 {
+                if (-1021..=1024).contains(&e) {
                     return _float_ldexp(x, exp);
                 }
             }
@@ -784,7 +784,7 @@ pub fn __majit_wrap_math_isqrt(args: &[PyObjectRef]) -> PyResult {
         } {
             let n = unsafe { pyre_object::w_int_get_value(w_n) };
             const EXACT_FLOAT_INT: i64 = 1 << 53;
-            if n >= 1 && n < EXACT_FLOAT_INT {
+            if (1..EXACT_FLOAT_INT).contains(&n) {
                 return _int_isqrt(n);
             }
         }
@@ -864,10 +864,11 @@ pub fn __majit_wrap_math_isclose(args: &[PyObjectRef]) -> PyResult {
             } else {
                 None
             };
-        if let (Some(a), Some(b)) = (a, b) {
-            if a.is_finite() && b.is_finite() {
-                return _float_isclose(a, b);
-            }
+        if let (Some(a), Some(b)) = (a, b)
+            && a.is_finite()
+            && b.is_finite()
+        {
+            return _float_isclose(a, b);
         }
     }
     isclose_slow(args)
@@ -1735,7 +1736,7 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
     }
 
     let n_minus_k = &*n_big - &*k_big;
-    let k = RBigIntGcRoot::new(if n_minus_k.lt(&*k_big) {
+    let k = RBigIntGcRoot::new(if n_minus_k.lt(&k_big) {
         n_minus_k
     } else {
         k_big.translated_alias()
@@ -1839,19 +1840,19 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
         let low = live_rbigint(low);
         let high = live_rbigint(high);
         let gap = live_rbigint(gap);
-        if low.add(&*gap).ge(&*high) {
+        if low.add(&gap).ge(&high) {
             let mut result = RBigIntGcRoot::new(BigInt::one());
             let mut i = RBigIntGcRoot::new(low.translated_alias());
-            while i.lt(&*high) {
+            while i.lt(&high) {
                 result = RBigIntGcRoot::new(result.mul(&i));
                 i = RBigIntGcRoot::new(i.int_add(1));
             }
             return Ok((*result).clone());
         }
-        let sum = RBigIntGcRoot::new(low.add(&*high));
+        let sum = RBigIntGcRoot::new(low.add(&high));
         let mid = RBigIntGcRoot::new(sum.rshift(1, false)?);
-        let left = RBigIntGcRoot::new(product_range(&*low, &mid, &*gap)?);
-        let right = RBigIntGcRoot::new(product_range(&mid, &*high, &*gap)?);
+        let left = RBigIntGcRoot::new(product_range(&low, &mid, &gap)?);
+        let right = RBigIntGcRoot::new(product_range(&mid, &high, &gap)?);
         Ok(left.mul(&right))
     }
 

@@ -136,7 +136,7 @@ fn rust_vec_helper_ops(
     let (opname, method) = match op {
         VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
             let kind_letter = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                &kind.kind_char().to_string(),
+                kind.kind_char().to_string(),
             )));
             let mut args = Vec::with_capacity(arg_hls.len() + 1);
             args.push(kind_letter);

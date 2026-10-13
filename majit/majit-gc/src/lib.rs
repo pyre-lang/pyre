@@ -3628,7 +3628,7 @@ pub fn set_active_maybe_collect_for_external_malloc(hook: Option<MaybeCollectFor
 pub fn maybe_collect_for_external_malloc(totalsize: usize) -> bool {
     ACTIVE_MAYBE_COLLECT_FOR_EXTERNAL_MALLOC
         .get()
-        .map_or(false, |hook| hook(totalsize))
+        .is_some_and(|hook| hook(totalsize))
 }
 
 pub fn total_memory_pressure() -> isize {

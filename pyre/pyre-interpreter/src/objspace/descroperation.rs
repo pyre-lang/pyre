@@ -3217,17 +3217,16 @@ fn compare_tuples_general(
 ) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[a, b]);
-    if matches!(op, CompareOp::Eq | CompareOp::Ne) {
-        if let Some(equal) =
+    if matches!(op, CompareOp::Eq | CompareOp::Ne)
+        && let Some(equal) =
             unsafe { specialised_tuple_oo_eq(roots.get(base), roots.get(base + 1))? }
-        {
-            let equal = if matches!(op, CompareOp::Ne) {
-                !equal
-            } else {
-                equal
-            };
-            return Ok(w_bool_from(equal));
-        }
+    {
+        let equal = if matches!(op, CompareOp::Ne) {
+            !equal
+        } else {
+            equal
+        };
+        return Ok(w_bool_from(equal));
     }
     let la = unsafe { w_tuple_len(roots.get(base)) };
     let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
@@ -4796,12 +4795,11 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     // `_make_binop_impl`: `type(w1) is type(w2) and not user_overridden_class`
     // then the `use_special_method_shortcut` body.
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_add(a, b))?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_add(a, b))?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     add_impl(a, b, "+")
@@ -4967,12 +4965,11 @@ pub(crate) fn matmul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 
 pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_sub(a, b))?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_sub(a, b))?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     sub_impl(a, b, "-")
@@ -5027,12 +5024,11 @@ pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 
 pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_mul(a, b))?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_mul(a, b))?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     mul_impl(a, b, "*")
@@ -5171,12 +5167,11 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 
 pub fn floordiv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_floordiv(a, b))?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_floordiv(a, b))?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     floordiv_impl(a, b, "//")
@@ -5241,12 +5236,11 @@ unsafe fn try_subclass_binop_override(
 
 pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_mod(a, b))?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_mod(a, b))?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     mod_impl(a, b, "%")
@@ -5774,10 +5768,7 @@ pub(crate) fn try_dispatch_binary_special(
         let _roots = pyre_object::gc_roots::push_roots();
         let operands = pyre_object::gc_roots::pin_roots(&[lhs, rhs]);
         let w_left = lookup_where_with_method_cache(w_typ1.as_ptr(), dunder);
-        let mut w_left_impl = match w_left {
-            Some((_, imp)) => Some(imp),
-            None => None,
-        };
+        let mut w_left_impl = w_left.map(|(_, imp)| imp);
         // Which slot the forward call's first operand is read from.  Upstream
         // swaps the two values; swapping the *index* keeps the pinned copies
         // authoritative across a collection.
@@ -5787,10 +5778,7 @@ pub(crate) fn try_dispatch_binary_special(
         // never considered.
         if w_typ1 != w_typ2 {
             let w_right = lookup_where_with_method_cache(w_typ2.as_ptr(), rdunder);
-            w_right_impl = match w_right {
-                Some((_, imp)) => Some(imp),
-                None => None,
-            };
+            w_right_impl = w_right.map(|(_, imp)| imp);
             // descroperation.py:662 — both `__op__` and `__rop__` are
             // found, in different MRO classes.
             if let Some((rsrc, _)) = w_right
@@ -6353,10 +6341,10 @@ pub fn pow3(mut base: PyObjectRef, mut exp: PyObjectRef, mut modulus: PyObjectRe
         if iz == 0 {
             return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
         }
-        if iw >= 0 {
-            if let Ok(result) = _pow_mod(iv, iw, iz) {
-                return Ok(pyre_object::with_roots!(base, exp, modulus => w_int_new(result)));
-            }
+        if iw >= 0
+            && let Ok(result) = _pow_mod(iv, iw, iz)
+        {
+            return Ok(pyre_object::with_roots!(base, exp, modulus => w_int_new(result)));
         }
     }
     if let Some(result) = try_dispatch_ternary_pow_special(&mut base, &mut exp, &mut modulus)? {
@@ -6574,12 +6562,11 @@ pub fn float_pow_would_raise(x: f64, y: f64) -> bool {
 
 pub fn lshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_lshift(a, b))?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = pyre_object::with_roots!(a, b => shortcut_lshift(a, b))?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     lshift_impl(a, b, "<<")
@@ -6621,12 +6608,11 @@ pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 
 pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_rshift(a, b)?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = shortcut_rshift(a, b)?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     rshift_impl(a, b, ">>")
@@ -6668,12 +6654,11 @@ pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 
 pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_and(a, b)?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = shortcut_and(a, b)?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     and_impl(a, b, "&")
@@ -6743,12 +6728,11 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
 
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_or(a, b)?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = shortcut_or(a, b)?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     or_impl(a, b, "|")
@@ -6859,12 +6843,11 @@ pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult 
 
 pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b) {
-            if let Some(w_res) = shortcut_xor(a, b)?
-                && !is_not_implemented(w_res)
-            {
-                return Ok(w_res);
-            }
+        if same_unoverridden_rpy_type(a, b)
+            && let Some(w_res) = shortcut_xor(a, b)?
+            && !is_not_implemented(w_res)
+        {
+            return Ok(w_res);
         }
     }
     xor_impl(a, b, "^")

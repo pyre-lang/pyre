@@ -2774,10 +2774,10 @@ fn store_virtual_field_or_emit(
         set_field(fields, field_idx, value);
         return OptimizationResult::Remove;
     }
-    if crate::majit_log_enabled() {
-        if let Some(err) = field_slot_disagreement(descr, field_idx, field) {
-            eprintln!("[jit][setfield-slot-unlisted] {err}; emitting on a forced object");
-        }
+    if crate::majit_log_enabled()
+        && let Some(err) = field_slot_disagreement(descr, field_idx, field)
+    {
+        eprintln!("[jit][setfield-slot-unlisted] {err}; emitting on a forced object");
     }
     OptimizationResult::PassOn
 }

@@ -283,6 +283,9 @@ fn known_type_host(known: KnownType) -> Option<HostObject> {
         KnownType::NoneType => "NoneType",
         KnownType::BuiltinFunctionOrMethod => "builtin_function_or_method",
         KnownType::PropertyType => "property",
+        KnownType::List => "list",
+        KnownType::Tuple => "tuple",
+        KnownType::Dict => "dict",
         _ => return None,
     };
     HOST_ENV.lookup_builtin(name)
@@ -431,6 +434,9 @@ fn known_type_host_from_host(host: &HostObject) -> Option<KnownType> {
         "NoneType" => Some(KnownType::NoneType),
         "builtin_function_or_method" => Some(KnownType::BuiltinFunctionOrMethod),
         "property" => Some(KnownType::PropertyType),
+        "list" => Some(KnownType::List),
+        "tuple" => Some(KnownType::Tuple),
+        "dict" => Some(KnownType::Dict),
         _ => None,
     }
 }

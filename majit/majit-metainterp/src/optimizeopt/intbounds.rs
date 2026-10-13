@@ -419,14 +419,14 @@ impl OptIntBounds {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
         let b = b0.mul_bound(&b1);
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     fn postprocess_int_and(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
         let b = b0.and_bound(&b1);
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     /// intbounds.py postprocess_INT_OR
@@ -494,21 +494,21 @@ impl OptIntBounds {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
         let b = b0.rshift_bound(&b1);
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     fn postprocess_uint_rshift(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
         let b = b0.urshift_bound(&b1);
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     fn postprocess_int_floordiv(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
         let b = b0.trunc_div_bound(&b1);
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     fn postprocess_int_mod(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
@@ -518,19 +518,19 @@ impl OptIntBounds {
         // hold for a negative dividend; that one belongs to the `int_py_mod`
         // call, which `postprocess_call` still attaches it to.
         let b = b0.trunc_mod_bound(&b1);
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     fn postprocess_int_neg(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
         let b = self.getintbound_arg(&op.arg(0), ctx);
         let result = b.neg_bound();
-        self.intersect_bound(&res_box, &result, ctx);
+        self.intersect_bound(res_box, &result, ctx);
     }
 
     fn postprocess_int_invert(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
         let b = self.getintbound_arg(&op.arg(0), ctx);
         let result = b.invert_bound();
-        self.intersect_bound(&res_box, &result, ctx);
+        self.intersect_bound(res_box, &result, ctx);
     }
 
     fn postprocess_int_force_ge_zero(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
@@ -539,7 +539,7 @@ impl OptIntBounds {
         if b_arg.upper >= 0 {
             let _ = result.make_le(&b_arg);
         }
-        self.intersect_bound(&res_box, &result, ctx);
+        self.intersect_bound(res_box, &result, ctx);
     }
 
     fn postprocess_arraylen_gc(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
@@ -555,7 +555,7 @@ impl OptIntBounds {
             // `get_box_replacement` resolves `op.pos` to its bound host
             // (always registered post-emit), matching RPython's
             // unconditional setintbound call.
-            self.intersect_bound(&res_box, &bound, ctx);
+            self.intersect_bound(res_box, &bound, ctx);
         }
     }
 
@@ -578,7 +578,7 @@ impl OptIntBounds {
         // so the operand-held StrPtrInfo is updated in place.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(0)));
         if let Some(bound) = bound {
-            self.intersect_bound(&res_box, &bound, ctx);
+            self.intersect_bound(res_box, &bound, ctx);
         }
     }
 
@@ -593,7 +593,7 @@ impl OptIntBounds {
         // mutation on StrPtrInfo.lenbound needs operand mirror.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(1)));
         if let Some(bound) = bound {
-            self.intersect_bound(&res_box, &bound, ctx);
+            self.intersect_bound(res_box, &bound, ctx);
         }
     }
 
@@ -672,7 +672,7 @@ impl OptIntBounds {
             let b1 = self.getintbound_b(&arg1, ctx);
             b0.add_bound_no_overflow(&b1)
         };
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     /// intbounds.py optimize_INT_SUB_OVF
@@ -707,7 +707,7 @@ impl OptIntBounds {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
         let b = b0.sub_bound_no_overflow(&b1);
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     /// intbounds.py optimize_INT_MUL_OVF
@@ -735,7 +735,7 @@ impl OptIntBounds {
             let b1 = self.getintbound_b(&arg1, ctx);
             b0.mul_bound_no_overflow(&b1)
         };
-        self.intersect_bound(&res_box, &b, ctx);
+        self.intersect_bound(res_box, &b, ctx);
     }
 
     /// intbounds.py optimize_GUARD_NO_OVERFLOW

@@ -64,7 +64,7 @@ fn wtf8_acquisition_prefix(
     let codepoints: Vec<_> = fmt.code_points().collect();
     let spec_start = (0..search_end)
         .filter(|&index| is_format_char(codepoints[index], '%'))
-        .filter(|&index| {
+        .rfind(|&index| {
             let prefix = wtf8_prefix(fmt, index + 1);
             matches!(
                 CFormatWtf8::parse_from_wtf8(&prefix),
@@ -74,7 +74,6 @@ fn wtf8_acquisition_prefix(
                 }) if error_index == index + 1
             )
         })
-        .next_back()
         .expect("a width or precision error belongs to a conversion spec");
 
     let mut recovered = Wtf8Buf::new();
@@ -143,7 +142,7 @@ fn bytes_acquisition_prefix(
 ) -> Vec<u8> {
     let spec_start = (0..search_end)
         .filter(|&index| fmt[index] == b'%')
-        .filter(|&index| {
+        .rfind(|&index| {
             matches!(
                 CFormatBytes::parse_from_bytes(&fmt[..=index]),
                 Err(CFormatError {
@@ -152,7 +151,6 @@ fn bytes_acquisition_prefix(
                 }) if error_index == index + 1
             )
         })
-        .next_back()
         .expect("a width or precision error belongs to a conversion spec");
 
     let mut recovered = fmt[..=spec_start].to_vec();

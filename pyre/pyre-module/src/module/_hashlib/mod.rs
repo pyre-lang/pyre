@@ -661,7 +661,7 @@ fn hmac_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     let has_msg = msg.is_some();
     let mut msg_root = msg.unwrap_or(pyre_object::PY_NULL);
     let key = pyre_object::with_roots!(digestmod, msg_root => read_hash_buffer(key))?;
-    let msg = has_msg.then(|| msg_root);
+    let msg = has_msg.then_some(msg_root);
     let msg = match msg {
         Some(msg) if unsafe { !is_none(msg) } => {
             pyre_object::with_roots!(digestmod => read_hash_buffer(msg))?
@@ -771,7 +771,7 @@ fn pbkdf2_hmac(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
     let password =
         pyre_object::with_roots!(iterations, salt, dklen_root => read_hash_buffer(password))?;
     let salt = pyre_object::with_roots!(iterations, dklen_root => read_hash_buffer(salt))?;
-    let dklen = has_dklen.then(|| dklen_root);
+    let dklen = has_dklen.then_some(dklen_root);
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[dklen.unwrap_or(pyre_object::PY_NULL)]);
     let iterations = pyre_interpreter::baseobjspace::space_index(iterations)
@@ -851,7 +851,7 @@ fn scrypt_kdf(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
     };
     let n = pyre_object::with_roots!(p_obj, r_obj, kwargs_obj => index(n_obj))?;
     let r = pyre_object::with_roots!(p_obj, kwargs_obj => index(r_obj))?;
-    let kwargs = has_kwargs.then(|| kwargs_obj);
+    let kwargs = has_kwargs.then_some(kwargs_obj);
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
     let p = index(p_obj);
@@ -1192,8 +1192,8 @@ fn new_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     let mut data_root = data.unwrap_or(pyre_object::PY_NULL);
     let mut kwargs_root = kwargs.unwrap_or(pyre_object::PY_NULL);
     pyre_object::with_roots!(name, data_root, kwargs_root => check_digest_name(name))?;
-    let data = has_data.then(|| data_root);
-    let kwargs = has_kwargs.then(|| kwargs_root);
+    let data = has_data.then_some(data_root);
+    let kwargs = has_kwargs.then_some(kwargs_root);
     let string = pyre_interpreter::builtins::kwarg_get(kwargs, "string");
     let usedforsecurity = pyre_interpreter::builtins::kwarg_get(kwargs, "usedforsecurity");
     make_hash(name, data, string, usedforsecurity)

@@ -3052,7 +3052,6 @@ impl majit_backend::Backend for AllocTestCpu {
         _inputargs: &[majit_ir::InputArgRc],
         _ops: &[majit_ir::OpRc],
         _original_token: &majit_backend::JitCellToken,
-        _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
         unimplemented!("AllocTestCpu::compile_bridge")
@@ -15550,7 +15549,6 @@ impl majit_backend::Backend for PureArrayTestCpu {
         _inputargs: &[majit_ir::InputArgRc],
         _ops: &[majit_ir::OpRc],
         _original_token: &majit_backend::JitCellToken,
-        _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
         unimplemented!("PureArrayTestCpu::compile_bridge")

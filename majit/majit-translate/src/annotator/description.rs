@@ -1760,51 +1760,6 @@ impl FunctionDesc {
         self.cachedgraph(combined_key, None, builder)
     }
 
-    /// Structural identity of a payload whose `knowntype` is
-    /// [`KnownType::Other`].
-    ///
-    /// `specialize_argtype` keys a scalar by [`KnownType`]. A tuple, a
-    /// list, and an instance are all `Other`, so those would share one
-    /// graph. The key is the annotation shape (`RDict` versus a pair of
-    /// vecs), not a debug rendering of addresses.
-    fn storage_box_payload_key(s: &SomeValue) -> String {
-        match s {
-            SomeValue::Instance(inst) => {
-                let name = inst
-                    .classdef
-                    .as_ref()
-                    .map(|cd| cd.borrow().name.clone())
-                    .unwrap_or_else(|| "_".to_string());
-                format!("inst:{name}")
-            }
-            SomeValue::Tuple(t) => {
-                let parts: Vec<String> =
-                    t.items.iter().map(Self::storage_box_payload_key).collect();
-                format!("tuple({})", parts.join(","))
-            }
-            SomeValue::List(list) => {
-                format!(
-                    "list({})",
-                    Self::storage_box_payload_key(&list.listdef.s_value())
-                )
-            }
-            SomeValue::RustVec(v) => {
-                format!("rustvec({})", Self::storage_box_payload_key(&v.s_item))
-            }
-            SomeValue::Integer(i) => {
-                if i.unsigned {
-                    "uint".to_string()
-                } else {
-                    "int".to_string()
-                }
-            }
-            SomeValue::Float(_) => "float".to_string(),
-            SomeValue::String(_) => "str".to_string(),
-            SomeValue::None_(_) => "none".to_string(),
-            other => format!("{:?}", other.tag()),
-        }
-    }
-
     pub(crate) fn default_specialize(
         &self,
         inputcells: &mut Vec<Option<SomeValue>>,
@@ -1964,16 +1919,8 @@ impl FunctionDesc {
                     "specialize:argtype({idx}): argument is unannotated"
                 ))
             })?;
-            // `specialize.py` `specialize_argtype` keys `args_s[i].knowntype`.
-            // Scalars already split (`int` versus `r_uint`). `Other` is one
-            // bucket for every container and instance, so a storage-box
-            // payload keys the shape instead (`storage_box_payload_key`).
-            let key = if s.knowntype() == super::model::KnownType::Other {
-                GraphCacheKey::String(Self::storage_box_payload_key(s))
-            } else {
-                GraphCacheKey::KnownType(s.knowntype())
-            };
-            key_parts.push(key);
+            // `specialize.py` `specialize_argtype`: `args_s[i].knowntype`.
+            key_parts.push(GraphCacheKey::KnownType(s.knowntype()));
         }
         self.maybe_star_args(GraphCacheKey::Tuple(key_parts), args_s)
     }
@@ -3447,7 +3394,11 @@ impl MethodOfFrozenDesc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+    use crate::annotator::classdesc::ClassDef;
+    use crate::annotator::listdef::ListDef;
+    use crate::annotator::model::{
+        SomeDict, SomeInstance, SomeInteger, SomeList, SomeString, SomeTuple, SomeValue,
+    };
     use crate::flowspace::argument::CallShape;
     use rustpython_compiler::{Mode, compile as rp_compile};
     use rustpython_compiler_core::bytecode::ConstantData;
@@ -3755,6 +3706,164 @@ mod tests {
             .unwrap();
 
         assert_eq!(graph.graph.borrow().name, "f__int_bool");
+    }
+
+    #[test]
+    fn argtype_desc(bk: Rc<Bookkeeper>, name: &str) -> FunctionDesc {
+        let func = compiled_graph_func("def f(x):\n    return x\n", Vec::new());
+        let host = HostObject::new_user_function(func.clone());
+        FunctionDesc::new(
+            bk,
+            Some(host),
+            name,
+            func.code.as_ref().unwrap().signature.clone(),
+            Some(func.defaults.clone()),
+            Some(Specializer::Argtype {
+                parms: vec!["0".to_string()],
+            }),
+        )
+    }
+
+    #[test]
+    fn specialize_argtype_keys_list_tuple_dict_knowntype_not_shape() {
+        // `specialize_argtype` keys `args_s[i].knowntype` (`list` /
+        // `tuple` / `dict`), so two lists of different items share a graph.
+        let (_ann, bk) = ann_bk();
+        let fd = argtype_desc(bk, "g");
+        let list_int = SomeValue::List(SomeList::new(ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+        )));
+        let list_str = SomeValue::List(SomeList::new(ListDef::new(
+            None,
+            SomeValue::String(SomeString::default()),
+            false,
+            false,
+        )));
+        let g_int = fd
+            .specialize(&mut vec![Some(list_int)], None)
+            .expect("list int")
+            .expect_graph()
+            .unwrap();
+        let g_str = fd
+            .specialize(&mut vec![Some(list_str)], None)
+            .expect("list str")
+            .expect_graph()
+            .unwrap();
+        assert!(Rc::ptr_eq(&g_int, &g_str));
+        assert_eq!(g_int.graph.borrow().name, "g__list");
+
+        let tuple_int = SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(
+            SomeInteger::default(),
+        )]));
+        let tuple_pair = SomeValue::Tuple(SomeTuple::new(vec![
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::default()),
+        ]));
+        let t1 = fd
+            .specialize(&mut vec![Some(tuple_int)], None)
+            .expect("tuple int")
+            .expect_graph()
+            .unwrap();
+        let t2 = fd
+            .specialize(&mut vec![Some(tuple_pair)], None)
+            .expect("tuple pair")
+            .expect_graph()
+            .unwrap();
+        assert!(Rc::ptr_eq(&t1, &t2));
+        assert_eq!(t1.graph.borrow().name, "g__tuple");
+
+        let dict_a = SomeValue::Dict(SomeDict::new(crate::annotator::dictdef::DictDef::new(
+            None,
+            SomeValue::String(SomeString::default()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        )));
+        let dict_b = SomeValue::Dict(SomeDict::new(crate::annotator::dictdef::DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::default()),
+            false,
+            false,
+            false,
+        )));
+        let d1 = fd
+            .specialize(&mut vec![Some(dict_a)], None)
+            .expect("dict a")
+            .expect_graph()
+            .unwrap();
+        let d2 = fd
+            .specialize(&mut vec![Some(dict_b)], None)
+            .expect("dict b")
+            .expect_graph()
+            .unwrap();
+        assert!(Rc::ptr_eq(&d1, &d2));
+        assert_eq!(d1.graph.borrow().name, "g__dict");
+    }
+
+    #[test]
+    fn specialize_argtype_instance_keys_classdef() {
+        let (_ann, bk) = ann_bk();
+        let fd = argtype_desc(bk, "h");
+        let class_a = ClassDef::new_standalone("pkg.A", None);
+        let class_b = ClassDef::new_standalone("pkg.B", None);
+        let inst_a = SomeValue::Instance(SomeInstance::new(
+            Some(class_a.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let inst_a2 = SomeValue::Instance(SomeInstance::new(
+            Some(class_a),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let inst_b = SomeValue::Instance(SomeInstance::new(
+            Some(class_b),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let g_a = fd
+            .specialize(&mut vec![Some(inst_a)], None)
+            .expect("inst a")
+            .expect_graph()
+            .unwrap();
+        let g_a2 = fd
+            .specialize(&mut vec![Some(inst_a2)], None)
+            .expect("inst a2")
+            .expect_graph()
+            .unwrap();
+        let g_b = fd
+            .specialize(&mut vec![Some(inst_b)], None)
+            .expect("inst b")
+            .expect_graph()
+            .unwrap();
+        assert!(Rc::ptr_eq(&g_a, &g_a2));
+        assert!(!Rc::ptr_eq(&g_a, &g_b));
+    }
+
+    #[test]
+    fn specialize_argtype_recursive_list_does_not_diverge() {
+        // A self-referential list annotation used to recurse forever in
+        // `storage_box_payload_key`. `specialize_argtype` keys `knowntype`
+        // (`list`) only.
+        let (_ann, bk) = ann_bk();
+        let fd = argtype_desc(bk, "rec");
+        let listdef = ListDef::new(None, SomeValue::Impossible, false, false);
+        {
+            let li = listdef.listitem_rc();
+            li.borrow_mut().s_value = SomeValue::List(SomeList::new(listdef.clone()));
+        }
+        let recursive = SomeValue::List(SomeList::new(listdef));
+        let graph = fd
+            .specialize(&mut vec![Some(recursive)], None)
+            .expect("recursive list")
+            .expect_graph()
+            .unwrap();
+        assert_eq!(graph.graph.borrow().name, "rec__list");
     }
 
     /// Build a memo-specialised FunctionDesc whose `host_call` maps a

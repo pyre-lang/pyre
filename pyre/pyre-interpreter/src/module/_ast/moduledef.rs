@@ -417,7 +417,7 @@ fn call_method_with_raw_kwargs(
         }
     }
 
-    Some((|| -> crate::PyResult {
+    Some({
         let roots = pyre_object::gc_roots::push_roots();
         let receiver_slot = receiver.map(|receiver| {
             let slot = pyre_object::gc_roots::shadow_stack_len();
@@ -446,7 +446,7 @@ fn call_method_with_raw_kwargs(
         }
         args.push(roots.get(carrier_slot));
         ast_replace(&args)
-    })())
+    })
 }
 
 /// The raw-keyword exception is decided once at the CALL_FUNCTION_EX

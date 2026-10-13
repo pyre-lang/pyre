@@ -213,6 +213,15 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
         }
     }
 
+    if let Some(func) = &graph.func {
+        if func._jit_unroll_safe_ {
+            out.func.unroll_safe = true;
+        }
+        if let Some(look) = func._jit_look_inside_ {
+            out.func.jit_look_inside = Some(look);
+        }
+    }
+
     out
 }
 
@@ -731,7 +740,13 @@ fn transduce_op(
         // is bound as a result var.
         "direct_call" => {
             let callee = callee_name_from_funcptr(&op.args[0]);
-            let target = crate::model::CallTarget::function_path([callee]);
+            // `_func._name` is the `::`-joined CallPath
+            // (`functionptr(ft, key.segments().join("::"), …)`). Split so
+            // a call to `majit_rlib::jit::isconstant` hits the marked
+            // oopspec rather than a one-segment residual.
+            let target = crate::model::CallTarget::function_path(
+                callee.split("::").filter(|s| !s.is_empty()),
+            );
             let args: Vec<FVar> = op.args[1..]
                 .iter()
                 .map(|a| materialize(out, block, a))
@@ -998,8 +1013,8 @@ fn is_unichar_array_ptr(var: &FVar) -> bool {
 mod tests {
     use super::lower_graph;
     use crate::flowspace::model::{
-        Block, BlockRefExt, ConstValue, FunctionGraph as FlowGraph, Hlvalue, Link, SpaceOperation,
-        c_last_exception,
+        Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc, Hlvalue,
+        Link, SpaceOperation, c_last_exception,
     };
     use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -2018,5 +2033,72 @@ mod tests {
         );
         assert_eq!(*argc, 2, "size + the materialised 1280");
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    /// A funcptr `_name` is the `::`-joined CallPath. Splitting restores
+    /// the marked `["majit_rlib", "jit", "isconstant"]` oopspec path.
+    #[test]
+    fn lower_graph_splits_funcptr_name_into_callpath_segments() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
+
+        let value = variable_with_lltype("value", LowLevelType::Signed);
+        let startblock = Block::shared(vec![Hlvalue::Variable(value.clone())]);
+        let return_var = variable_with_lltype("out", LowLevelType::Bool);
+        let mut graph = FlowGraph::with_return_var(
+            "_ll_alloc_and_set_isconstant",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let ft = FuncType {
+            args: vec![LowLevelType::Signed],
+            result: LowLevelType::Bool,
+        };
+        let funcptr = functionptr(
+            ft,
+            "majit_rlib::jit::isconstant",
+            None,
+            Some("majit_rlib::jit::isconstant".to_string()),
+        );
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", LowLevelType::Bool);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![callee, Hlvalue::Variable(value)],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let mut func = GraphFunc::new(
+            "_ll_alloc_and_set_isconstant",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func._jit_unroll_safe_ = true;
+        graph.func = Some(func);
+
+        let model = lower_graph(&graph);
+        assert!(model.func.unroll_safe);
+        let calls: Vec<_> = model
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![crate::model::CallTarget::function_path([
+                "majit_rlib",
+                "jit",
+                "isconstant"
+            ])]
+        );
     }
 }

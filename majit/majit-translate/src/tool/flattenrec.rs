@@ -85,7 +85,8 @@ impl<E> FlattenRecursion<E> {
         // appends *during* the drain (via nested `call()`) are visited
         // after the existing head. VecDeque::pop_front matches that
         // FIFO order in O(1).
-        let result = (|| -> Result<(), E> {
+
+        (|| -> Result<(), E> {
             func()?;
             loop {
                 let next = self
@@ -100,8 +101,7 @@ impl<E> FlattenRecursion<E> {
                 }
             }
             Ok(())
-        })();
-        result
+        })()
     }
 }
 

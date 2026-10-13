@@ -1563,7 +1563,7 @@ pub struct VectorizationInfo {
 const FAILARG_SMALL: usize = 8;
 const FAILARG_LARGE: usize = 16;
 const FAILARG_CHUNK: usize = 1024;
-const FAILARG_EMPTY: *mut FailArgHeader = 1 as *mut FailArgHeader;
+const FAILARG_EMPTY: *mut FailArgHeader = std::ptr::dangling_mut::<FailArgHeader>();
 
 #[repr(C)]
 struct FailArgHeader {
@@ -2016,7 +2016,7 @@ const STAMP_WIDE: u32 = 3;
 fn pack_stamp(v: crate::value::Value) -> u32 {
     match v {
         crate::value::Value::Void => STAMP_VOID,
-        crate::value::Value::Int(i) if i >= -(1 << 29) && i < (1 << 29) => {
+        crate::value::Value::Int(i) if (-(1 << 29)..(1 << 29)).contains(&i) => {
             STAMP_INT | ((i as u32) << 2)
         }
         other => {

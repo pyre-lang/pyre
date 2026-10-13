@@ -1062,7 +1062,7 @@ where
 {
     let emptied = {
         let set = unsafe { &*(obj as *const W_SetObject) };
-        set.strategy.kind == strategy.kind() && unsafe { (*strategy.storage_ptr(set)).len() == 0 }
+        set.strategy.kind == strategy.kind() && unsafe { (*strategy.storage_ptr(set)).is_empty() }
     };
     if emptied {
         unsafe { switch_to_empty_strategy(obj) };
@@ -4176,7 +4176,7 @@ impl SetStrategy for ObjectSetStrategy {
         // the element barrier did not run for those stores.
         set_write_barrier(dst);
         let d = &*(dst as *const W_SetObject);
-        if (*object_set_storage_ptr(d)).len() != 0 {
+        if !(*object_set_storage_ptr(d)).is_empty() {
             set_items_write_barrier(object_set_storage_ptr(d));
         }
     }
@@ -4748,20 +4748,21 @@ pub unsafe fn w_list_try_extend_empty_from_set(list: PyObjectRef, set: PyObjectR
     ) {
         return false;
     }
-    if let Some(ints) = w_set_listview_int(set) {
-        if !ints.is_empty() && crate::listobject::w_list_install_int_items(list, &ints) {
-            return true;
-        }
+    if let Some(ints) = w_set_listview_int(set)
+        && !ints.is_empty()
+        && crate::listobject::w_list_install_int_items(list, &ints)
+    {
+        return true;
     }
-    if let Some(blocks) = w_set_listview_bytes(set) {
-        if crate::listobject::w_list_install_bytes_items(list, &blocks) {
-            return true;
-        }
+    if let Some(blocks) = w_set_listview_bytes(set)
+        && crate::listobject::w_list_install_bytes_items(list, &blocks)
+    {
+        return true;
     }
-    if let Some(chars) = w_set_listview_ascii(set) {
-        if crate::listobject::w_list_install_ascii_items(list, &chars) {
-            return true;
-        }
+    if let Some(chars) = w_set_listview_ascii(set)
+        && crate::listobject::w_list_install_ascii_items(list, &chars)
+    {
+        return true;
     }
     false
 }

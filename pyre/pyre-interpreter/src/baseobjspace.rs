@@ -656,6 +656,12 @@ impl SpaceAttr {
     }
 }
 
+impl Default for SpaceAttr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// baseobjspace.py ObjSpace.__init__: own InternalSpaceCache, whose callable
 /// keys construct per-space caches. The process-wide instance is a prebuilt
 /// static (`OBJECT_SPACE`); isolated test spaces keep an `Arc`.
@@ -2191,18 +2197,14 @@ pub(crate) fn base_exception_add_note(exc: PyObjectRef, note: PyObjectRef) -> Re
             pyre_object::gc_roots::shadow_stack_get(notes_slot),
         )?;
     } else {
-        match lookup {
-            Ok(existing) => {
-                let _ = pyre_object::gc_roots::pin_root(existing);
-                if !unsafe {
-                    isinstance_list_w(pyre_object::gc_roots::shadow_stack_get(notes_slot))
-                } {
-                    return Err(PyError::type_error(
-                        "Cannot add note: __notes__ is not a list",
-                    ));
-                }
+        {
+            let existing = lookup?;
+            let _ = pyre_object::gc_roots::pin_root(existing);
+            if !unsafe { isinstance_list_w(pyre_object::gc_roots::shadow_stack_get(notes_slot)) } {
+                return Err(PyError::type_error(
+                    "Cannot add note: __notes__ is not a list",
+                ));
             }
-            Err(err) => return Err(err),
         }
     }
     // Append the list this function holds. A `__setattr__` that stored a
@@ -4232,8 +4234,8 @@ pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let current_b = RBigIntGcRoot::new(BigInt::from(current));
         let remaining_b = RBigIntGcRoot::new(BigInt::from(remaining));
         let step_b = RBigIntGcRoot::new(BigInt::from(step));
-        let product = RBigIntGcRoot::new(remaining_b.mul(&*step_b));
-        let stop = RBigIntGcRoot::new(current_b.add(&*product));
+        let product = RBigIntGcRoot::new(remaining_b.mul(&step_b));
+        let stop = RBigIntGcRoot::new(current_b.add(&product));
         // Python evaluates and keeps all three wrapped arguments before
         // W_Range construction. Mirror the GC transform's root slots between
         // those allocating expressions.
@@ -4399,11 +4401,11 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
             let index = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(
                 pyre_object::gc_roots::shadow_stack_get(field_base + 1),
             ));
-            let remaining = RBigIntGcRoot::new(len.sub(&*index));
+            let remaining = RBigIntGcRoot::new(len.sub(&index));
             if *state > *remaining {
                 state.set((*remaining).clone());
             }
-            let new_index = pyre_object::range_bigint_to_obj(index.add(&*state));
+            let new_index = pyre_object::range_bigint_to_obj(index.add(&state));
             pyre_object::w_long_range_iter_set_index(
                 pyre_object::gc_roots::shadow_stack_get(iter_slot),
                 new_index,
@@ -6827,9 +6829,11 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// `__getattr__` on miss (objspace.py:707 / descroperation.py), while the
 /// `object.__getattribute__` slot (`false`) raises straight away
 /// (descroperation.py) — the `__getattr__` fallback is space.getattr's job.
-/// `suppress` is `_PyObject_LookupAttr`'s flag: the caller swallows the
-/// AttributeError, so a terminal module miss skips the `__spec__` shadowing
-/// diagnosis that exists only to phrase the surfaced message.
+/// `suppress` is `_PyObject_LookupAttr`'s flag: a terminal miss answers
+/// `Ok(null)` without building an AttributeError. A user `__getattr__` /
+/// `__getattribute__` still runs (`space.findattr` = `getattr` + catch
+/// AttributeError). A terminal module miss also skips the `__spec__`
+/// shadowing diagnosis that exists only to phrase the surfaced message.
 /// The caller must have an active `push_roots()` scope. `StdObjSpace.getattr`
 /// keeps `w_obj` in that one bracket
 /// (`ShadowStackFrameworkGCTransformer.push_roots`).
@@ -7147,6 +7151,7 @@ pub fn getattr_str_impl(
                         pyre_object::gc_roots::shadow_stack_get(obj_slot),
                         name,
                         call_getattr,
+                        suppress,
                     );
                 }
                 let _name_roots = pyre_object::gc_roots::push_roots();
@@ -7280,19 +7285,23 @@ pub fn getattr_str_impl(
             // miss, `__getattr__` is the last resort.  Used by every wrapper
             // class that delegates attribute lookup to a backing stream/buffer
             // (unittest._WritelnDecorator, pathlib, etc.).
-            return instance_getattr_hook_or_err(
-                w_type,
+            // `_PyObject_LookupAttr` (`suppress`): the hook still runs; the
+            // absent result is `Ok(null)` so the AttributeError is not built.
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if let Some(result) = unsafe { try_instance_getattr_hook(w_type, obj, name) } {
+                return result;
+            }
+            if suppress {
+                return Ok(pyre_object::PY_NULL);
+            }
+            return Err(PyError::attribute_error_with_context(
+                format!(
+                    "'{}' object has no attribute '{name}'",
+                    w_type_get_name(w_type)
+                ),
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 name,
-                PyError::attribute_error_with_context(
-                    format!(
-                        "'{}' object has no attribute '{name}'",
-                        w_type_get_name(w_type)
-                    ),
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                    name,
-                ),
-            );
+            ));
         } else if call_getattr && is_type(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
             // objspace.py runs the `__getattribute__` gate on
             // `space.type(w_obj)` for every receiver kind.  For a type receiver
@@ -7356,6 +7365,7 @@ pub fn getattr_str_impl(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             name,
             false,
+            false,
         ) {
             Ok(value) => return Ok(value),
             Err(e) => e,
@@ -7377,6 +7387,7 @@ pub fn getattr_str_impl(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
         name,
         call_getattr,
+        suppress,
     ) {
         Ok(value) => return Ok(value),
         Err(e) => e,
@@ -7484,7 +7495,7 @@ fn super_getattribute_str(mut obj: PyObjectRef, name: &str, w_name: PyObjectRef)
             return Ok(value);
         }
     }
-    object_getattr_miss(obj, name, false)
+    object_getattr_miss(obj, name, false, false)
 }
 
 /// Wrapped-name entry point for the builtin `super.__getattribute__`
@@ -7628,7 +7639,7 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     let operands = pyre_object::gc_roots::pin_roots(&[obj, w_name]);
     let w_name = pyre_object::gc_roots::shadow_stack_get(operands + 1);
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+    let result = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
         getattr_str_impl(
             pyre_object::gc_roots::shadow_stack_get(operands),
             unsafe {
@@ -7649,6 +7660,14 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
                 true,
             )
         }
+    };
+    // `getattr_str_impl(..., suppress=true)` is `_PyObject_LookupAttr` and
+    // answers `Ok(null)` on a terminal miss. This PyResult wrapper is
+    // `operation.py hasattr` / `getattr` with a default /
+    // `PyObject_GetOptionalAttr`, which still match AttributeError.
+    match result {
+        Ok(value) if value.is_null() => Err(PyError::attribute_error("attribute not found")),
+        other => other,
     }
 }
 
@@ -7816,6 +7835,12 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, suppress: boo
                     && let Some(getattr_fn) = lookup_in_type_where(w_objtype, "__getattr__")
                 {
                     return get_and_call_function(getattr_fn, obj(), w_objtype, &[w_name()]);
+                }
+                // `_PyObject_LookupAttr` (`suppress`): the hook still ran;
+                // the absent result is `Ok(null)` so the AttributeError is
+                // not returned to a caller that would only swallow it.
+                if suppress {
+                    return Ok(pyre_object::PY_NULL);
                 }
                 Err(e)
             }
@@ -8341,7 +8366,7 @@ pub fn object_getattribute(mut obj: PyObjectRef, name: &str) -> PyResult {
 /// typeobject.py `W_TypeObject.descr_getattribute` — the canonical
 /// metatype-data-descriptor, class-MRO, metatype-non-data-descriptor lookup.
 pub(crate) fn type_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
-    object_getattr_miss(obj, name, false)
+    object_getattr_miss(obj, name, false, false)
 }
 
 /// module.py `Module.descr_getattribute` — run the object-default descriptor
@@ -8581,6 +8606,75 @@ unsafe fn module_getattr_fallback(
     };
     let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
     instance_getattr_hook_or_err(w_type, obj, name, err)
+}
+
+/// Call `__getattr__` when the type defines it. `None` means there is no
+/// hook, so the caller emits the terminal miss — `Ok(null)` when `suppress`,
+/// otherwise AttributeError. Used before constructing that error so
+/// `_PyObject_LookupAttr` does not build one to throw away.
+unsafe fn try_instance_getattr_hook(
+    w_type: PyObjectRef,
+    obj: PyObjectRef,
+    name: &str,
+) -> Option<PyResult> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let live = pyre_object::gc_roots::pin_roots(&[w_type, obj]);
+    let getattr_fn =
+        lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(live), "__getattr__")?;
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(getattr_fn);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+    // objspace.py `space.get_and_call_function(w_descr, w_obj, w_name)` —
+    // bind `__getattr__` through `__get__`.
+    Some(get_and_call_function(
+        pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        pyre_object::gc_roots::shadow_stack_get(live + 1),
+        pyre_object::gc_roots::shadow_stack_get(live),
+        &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
+    ))
+}
+
+/// Metaclass `__getattr__` walk used on a type-receiver terminal miss,
+/// without first building the AttributeError `type_getattr_hook_or_err`
+/// takes as fallback.
+unsafe fn try_type_getattr_hook(
+    obj: PyObjectRef,
+    w_metaclasses: &[Option<PyObjectRef>; 2],
+    name: &str,
+) -> Option<PyResult> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let mut mc_vals: Vec<PyObjectRef> = Vec::new();
+    let mut mc_i = 0usize;
+    while mc_i < w_metaclasses.len() {
+        if let Some(w_metaclass) = w_metaclasses[mc_i] {
+            mc_vals.push(w_metaclass);
+        }
+        mc_i += 1;
+    }
+    let mc_base = pyre_object::gc_roots::pin_roots(&mc_vals);
+    for i in 0..mc_vals.len() {
+        let w_metaclass = pyre_object::gc_roots::shadow_stack_get(mc_base + i);
+        if is_type(w_metaclass)
+            && let Some(getattr_fn) = lookup_in_type_where(w_metaclass, "__getattr__")
+        {
+            let meta_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_metaclass);
+            let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(getattr_fn);
+            let name_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+            return Some(get_and_call_function(
+                pyre_object::gc_roots::shadow_stack_get(hook_slot),
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                pyre_object::gc_roots::shadow_stack_get(meta_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
+            ));
+        }
+    }
+    None
 }
 
 /// `descroperation.py` `_handle_getattribute` tail: on an
@@ -9341,7 +9435,12 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
 /// callback are opaque to the annotator; it returns the blessed `PyResult`
 /// carrier, so the whole cold path is residualised behind one boundary.
 #[majit_macros::dont_look_inside]
-pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
+pub(crate) fn object_getattr_miss(
+    obj: PyObjectRef,
+    name: &str,
+    call_getattr: bool,
+    suppress: bool,
+) -> PyResult {
     // The receiver may be a nursery exception (or another moving object).
     // Several arms below allocate — instance dict, AttributeError name,
     // bound methods — so the word is published here and reloaded after
@@ -9693,20 +9792,22 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             // miss, consult `__getattr__` on the metaclass (gated off for the
             // bare object.__getattribute__ slot by `call_getattr`); otherwise
             // raise. The terminal AttributeError carries the obj/name context.
-            return type_getattr_hook_or_err(
-                obj,
-                &w_metaclasses,
-                name,
-                PyError::attribute_error_with_context(
-                    format!(
-                        "type object '{}' has no attribute '{name}'",
-                        w_type_get_name(obj)
-                    ),
-                    obj,
-                    name,
+            // `_PyObject_LookupAttr` (`suppress`): the hook still runs; the
+            // absent result is `Ok(null)` so the AttributeError is not built.
+            if call_getattr && let Some(result) = try_type_getattr_hook(obj, &w_metaclasses, name) {
+                return result;
+            }
+            if suppress {
+                return Ok(pyre_object::PY_NULL);
+            }
+            return Err(PyError::attribute_error_with_context(
+                format!(
+                    "type object '{}' has no attribute '{name}'",
+                    w_type_get_name(obj)
                 ),
-                call_getattr,
-            );
+                obj,
+                name,
+            ));
         }
     }
 
@@ -10194,24 +10295,31 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
         // Name the object's type via the tag-safe `typedef::r#type`
         // (a tagged immediate has no `ob_type` slot to deref).
         let w_type = crate::typedef::r#type(obj);
-        let tp_name = match w_type {
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-            None => "NULL".to_string(),
-        };
         obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let e = PyError::attribute_error_with_context(
-            format!("'{tp_name}' object has no attribute '{name}'"),
-            obj,
-            name,
-        );
         // descroperation.py `_handle_getattribute`: on the terminal
         // miss, `__getattr__` is the last resort.  Gate on `call_getattr` so
         // `space.getattr` consults the hook while internal lookups propagate
         // the AttributeError unchanged.
-        if call_getattr && let Some(w_type) = w_type {
-            return instance_getattr_hook_or_err(w_type.as_ptr(), obj, name, e);
+        // `_PyObject_LookupAttr` (`suppress`): return the absent result
+        // before `attribute_error_with_context` runs.
+        if call_getattr
+            && let Some(w_type) = w_type
+            && let Some(result) = try_instance_getattr_hook(w_type.as_ptr(), obj, name)
+        {
+            return result;
         }
-        Err(e)
+        if suppress {
+            return Ok(pyre_object::PY_NULL);
+        }
+        let tp_name = match w_type {
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+            None => "NULL".to_string(),
+        };
+        Err(PyError::attribute_error_with_context(
+            format!("'{tp_name}' object has no attribute '{name}'"),
+            obj,
+            name,
+        ))
     }
 }
 
@@ -15765,10 +15873,9 @@ unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyE
     let current = || pyre_object::gc_roots::shadow_stack_get(slot);
     if is_tuple(current())
         && builtin_iter_replacement(current(), &pyre_object::TUPLE_TYPE).is_none()
+        && let Some(block) = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(current()) }
     {
-        if let Some(block) = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(current()) } {
-            return Ok(block as PyObjectRef);
-        }
+        return Ok(block as PyObjectRef);
     }
     let items = fixedview(current(), -1)?;
     Ok(pyre_object::interp_exceptions::w_exception_args_new(items))
@@ -19119,7 +19226,8 @@ pub(crate) unsafe fn tuple_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
     let _ = pyre_object::gc_roots::pin_root(obj);
     // One return so the RootScope Drop is a regular close, not an
     // unwind-only cleanup `body_is_depth_neutral` misses.
-    let result = {
+
+    {
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let seq = pyre_object::w_tuple_iter_seq(obj);
         if seq.is_null() {
@@ -19141,8 +19249,7 @@ pub(crate) unsafe fn tuple_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
                 }
             }
         }
-    };
-    result
+    }
 }
 
 /// `W_TupleObject.wrappeditems[index]` with the unsigned miss
@@ -19180,7 +19287,8 @@ unsafe fn tuple_iter_descr_next_other(obj: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
-    let result = {
+
+    {
         let seq = pyre_object::w_tuple_iter_seq(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         if seq.is_null() {
             PY_NULL
@@ -19203,8 +19311,7 @@ unsafe fn tuple_iter_descr_next_other(obj: PyObjectRef) -> PyObjectRef {
                 PY_NULL
             }
         }
-    };
-    result
+    }
 }
 
 /// Exact object-strategy list of two iterators: `W_Zip.next_w`'s
@@ -19268,7 +19375,8 @@ unsafe fn zip_two_tuple_next(zip_obj: PyObjectRef) -> PyObjectRef {
     let _ = pyre_object::gc_roots::pin_root(zip_obj);
     // One return so the RootScope Drop is a regular close, not an
     // unwind-only cleanup `body_is_depth_neutral` misses.
-    let result = {
+
+    {
         let iterators = pyre_object::functional::w_zip_get_iterators(
             pyre_object::gc_roots::shadow_stack_get(zip_slot),
         );
@@ -19318,8 +19426,7 @@ unsafe fn zip_two_tuple_next(zip_obj: PyObjectRef) -> PyObjectRef {
                 }
             }
         }
-    };
-    result
+    }
 }
 
 /// First `next` stopped before progress advanced (`W_Zip.next_w`, progress
@@ -19331,7 +19438,8 @@ unsafe fn zip_two_tuple_first_stopped(zip_obj: PyObjectRef, it1: PyObjectRef) ->
     let _roots = pyre_object::gc_roots::push_roots();
     let zip_slot = pyre_object::gc_roots::pin_roots(&[zip_obj, it1]);
     let it1_slot = zip_slot + 1;
-    let result = {
+
+    {
         if !pyre_object::functional::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(
             zip_slot,
         )) {
@@ -19346,8 +19454,7 @@ unsafe fn zip_two_tuple_first_stopped(zip_obj: PyObjectRef, it1: PyObjectRef) ->
                 zip_strict_longer()
             }
         }
-    };
-    result
+    }
 }
 
 /// Second `next` stopped after the first yielded (`W_Zip.next_w`, progress
@@ -19386,7 +19493,8 @@ unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
     );
     let _ = pyre_object::gc_roots::pin_root(iterators);
     let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let result = {
+
+    {
         let n = pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(iterators_slot))
             as usize;
         if n != 2 {
@@ -19495,8 +19603,7 @@ unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
                 _ => PY_NULL,
             }
         }
-    };
-    result
+    }
 }
 
 /// Interpreter entry for the same shape the walker admits, except a strict
@@ -21929,8 +22036,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_index_slot = eo::w_enumerate_get_w_index(obj);
             let mut w_iter_or_list = eo::w_enumerate_get_iter_or_list(obj);
             let mut result_item_slot: Option<usize> = None;
-            let w_index: PyObjectRef;
-            if w_index_slot.is_null() {
+
+            let w_index: PyObjectRef = if w_index_slot.is_null() {
                 // i64 fast-path branch.
                 let index = eo::w_enumerate_get_index(obj);
                 if !w_iter_or_list.is_null() && pyre_object::is_list(w_iter_or_list) {
@@ -21980,7 +22087,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         eo::w_enumerate_set_index(obj, -1);
                     }
                 }
-                w_index = pyre_object::w_int_new(index);
+                pyre_object::w_int_new(index)
             } else {
                 // Bigint slot active — bump via `space.add`.
                 let _ = pyre_object::gc_roots::pin_root(w_index_slot);
@@ -21999,8 +22106,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     obj,
                     pyre_object::gc_roots::shadow_stack_get(bumped_slot),
                 );
-                w_index = pyre_object::gc_roots::shadow_stack_get(w_index_slot_root);
-            }
+                pyre_object::gc_roots::shadow_stack_get(w_index_slot_root)
+            };
             let _ = pyre_object::gc_roots::pin_root(w_index);
             let result_index_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let result_item_slot = if let Some(slot) = result_item_slot {
@@ -22539,10 +22646,7 @@ pub unsafe fn generator_invoke_execute_frame(
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
-    let w_inputvalue = match input_slot {
-        Some(slot) => Some(pyre_object::gc_roots::shadow_stack_get(slot)),
-        None => None,
-    };
+    let w_inputvalue = input_slot.map(pyre_object::gc_roots::shadow_stack_get);
     if let Some(slot) = operr_slot
         && let Some(err) = operr.as_mut()
     {
@@ -23517,18 +23621,19 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
     let gen_obj = reload(0);
     let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let thrown_kind = unsafe { PyError::from_exc_object(w_value) }.kind;
-    if thrown_kind == PyErrorKind::GeneratorExit && !generator_get_delegate(gen_obj).is_null() {
-        if let Err(e) = generator_close_iter(gen_obj, true) {
-            // `reload` does not allocate. `e` is consumed by `generator_send_ex`;
-            // the resume pins that carrier across the calls that collect.
-            return generator_send_ex(
-                reload(0),
-                w_none(),
-                Some(e),
-                Some(([reload(1), reload(2), reload(3)], argc)),
-                false,
-            );
-        }
+    if thrown_kind == PyErrorKind::GeneratorExit
+        && !generator_get_delegate(gen_obj).is_null()
+        && let Err(e) = generator_close_iter(gen_obj, true)
+    {
+        // `reload` does not allocate. `e` is consumed by `generator_send_ex`;
+        // the resume pins that carrier across the calls that collect.
+        return generator_send_ex(
+            reload(0),
+            w_none(),
+            Some(e),
+            Some(([reload(1), reload(2), reload(3)], argc)),
+            false,
+        );
     }
     let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let err = unsafe { PyError::from_exc_object(w_value) };
@@ -24632,10 +24737,10 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
             )?;
             return is_true(result);
         }
-        return contains_slot(
+        contains_slot(
             pyre_object::gc_roots::shadow_stack_get(contains_base),
             pyre_object::gc_roots::shadow_stack_get(contains_base + 1),
-        );
+        )
     }
 }
 

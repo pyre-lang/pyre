@@ -689,7 +689,7 @@ impl ArenaCollection {
         debug_assert!(!arena.is_null());
         let base = unsafe { (*arena).base as usize };
         let offset = addr - base;
-        if offset % WORD != 0 {
+        if !offset.is_multiple_of(WORD) {
             return false;
         }
         let bit = offset / WORD;

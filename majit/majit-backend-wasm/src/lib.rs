@@ -1113,8 +1113,8 @@ pub(crate) mod gc_box {
     static NEXT_GC_BOX_GEN: AtomicU64 = AtomicU64::new(1);
 
     /// TLS payload whose destructor forgets the MiniMark.
-    /// Thread teardown must not free the nursery
-    /// (`replace_singleton_leaking_old`).
+    /// Thread teardown must not free the nursery: a dropped nursery's pages
+    /// return to the OS and are reused while still referenced.
     struct LeakingNursery(Option<Box<dyn GcAllocator>>);
 
     impl Drop for LeakingNursery {
@@ -1202,7 +1202,8 @@ pub(crate) mod gc_box {
     /// Returns `(generation, installed)`: the installation id the matching
     /// [`ActiveGcBox`] must present to uninstall, and whether the TLS slot
     /// was empty (a new live box, not a replacement). A previous box is
-    /// forgotten, not dropped (`replace_singleton_leaking_old`).
+    /// forgotten, not dropped: a dropped nursery's pages return to the OS
+    /// and are reused while still referenced.
     pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> (u64, bool) {
         let generation = NEXT_GC_BOX_GEN.fetch_add(1, Ordering::Relaxed);
         let installed = WASM_ACTIVE_GC.with(|cell| {
@@ -1224,9 +1225,9 @@ pub(crate) mod gc_box {
     ///
     /// The raw mirror is cleared first so a reentrant query during
     /// uninstall does not observe a dangling pointer. The MiniMark
-    /// itself is leaked: `gc_sync::replace_singleton_leaking_old`
-    /// — a dropped nursery's pages return to the OS and ExtraHeap /
-    /// InputArg slabs reuse them, smashing their mutex words.
+    /// itself is leaked: a dropped nursery's pages return to the OS and
+    /// are reused while still referenced. ExtraHeap / InputArg slabs
+    /// reuse those pages and smash their mutex words.
     /// Returns `true` when a box was actually removed.
     pub(crate) fn clear() -> bool {
         WASM_ACTIVE_GC_GEN.with(|slot| slot.set(0));
@@ -5943,7 +5944,6 @@ impl majit_backend::Backend for WasmBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
@@ -7699,7 +7699,6 @@ mod tests {
                 &bridge_inputs,
                 &[bridge_advance, bridge_jump],
                 &token,
-                &[],
                 None,
             )
             .expect("bridge compiles");
@@ -7889,7 +7888,6 @@ mod tests {
                 &inputargs,
                 &[bridge_advance, bridge_jump],
                 &token,
-                &[],
                 None,
             )
             .expect("closing JUMP still resolves the earlier label");

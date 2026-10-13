@@ -2384,6 +2384,22 @@ fn call_target_variant_name(target: &CallTarget) -> &'static str {
     }
 }
 
+/// View of the support flags `find_all_graphs` recorded. Late-minted
+/// helpers call `look_inside_graph` on this view so they see those
+/// flags, not a separately constructed policy.
+struct BfsPolicyView<'a> {
+    state: &'a mut crate::policy::JitPolicyState,
+}
+
+impl JitPolicy for BfsPolicyView<'_> {
+    fn state(&self) -> &crate::policy::JitPolicyState {
+        self.state
+    }
+    fn state_mut(&mut self) -> &mut crate::policy::JitPolicyState {
+        self.state
+    }
+}
+
 pub struct CallControl {
     /// Registered graphs, keyed by call path through a funcobj-identity
     /// indirection so alias spellings share one `FunctionGraph` (and thus
@@ -2431,6 +2447,11 @@ pub struct CallControl {
     /// Candidate targets — graphs we will inline.
     /// RPython: `CallControl.candidate_graphs`.
     candidate_graphs: HashSet<CallPath>,
+    /// Support flags of the policy `find_all_graphs` / `find_helper_graphs`
+    /// received. Helpers minted after that walk (`alloc_and_set`) call
+    /// `look_inside_graph` against this state so they see the same flags
+    /// BFS used.
+    bfs_policy_state: crate::policy::JitPolicyState,
     /// `PipelineConfig::helper_graphs` — host-declared BFS seeds beside the
     /// portals (`call.py inline_calls_to`).
     helper_seed_graphs: Vec<CallPath>,
@@ -3263,6 +3284,7 @@ impl CallControl {
             trait_method_impls: HashMap::new(),
             method_to_impl_types: HashMap::new(),
             candidate_graphs: HashSet::new(),
+            bfs_policy_state: crate::policy::JitPolicyState::new(),
             helper_seed_graphs: Vec::new(),
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
@@ -4829,10 +4851,10 @@ impl CallControl {
             if root == "crate" || crate::local_crates::is_local_crate_root(root) {
                 let stripped =
                     CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
-                if let Some(alt) = self.func_effects(&stripped) {
-                    if alt.recorded_oopspec().is_some() || direct.is_none() {
-                        return Some(alt);
-                    }
+                if let Some(alt) = self.func_effects(&stripped)
+                    && (alt.recorded_oopspec().is_some() || direct.is_none())
+                {
+                    return Some(alt);
                 }
             }
         }
@@ -4948,6 +4970,27 @@ impl CallControl {
     /// which the BFS could not have reached.
     pub fn add_candidate_graph(&mut self, path: CallPath) {
         self.candidate_graphs.insert(path);
+    }
+
+    /// Admit `path` when `policy.look_inside_graph` would, using the flags
+    /// `find_all_graphs` recorded (`call.py find_all_graphs`). A helper
+    /// minted after that walk (`alloc_and_set`) goes through this so a
+    /// `_jit_look_inside_ = False` trampoline stays residual the way BFS
+    /// would have left it.
+    pub fn add_candidate_graph_if_look_inside(&mut self, path: CallPath) {
+        let Some(graph) = self.function_graphs.get(&path) else {
+            return;
+        };
+        let graph = std::rc::Rc::clone(&graph);
+        let see = {
+            let mut view = BfsPolicyView {
+                state: &mut self.bfs_policy_state,
+            };
+            JitPolicy::look_inside_graph(&mut view, &graph)
+        };
+        if see {
+            self.candidate_graphs.insert(path);
+        }
     }
 
     /// Register a free function graph together with its hints.
@@ -6406,6 +6449,8 @@ impl CallControl {
     }
 
     fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy, helper_roots: &[CallPath]) {
+        // Late-minted helpers reuse these flags in `look_inside_graph`.
+        self.bfs_policy_state = policy.state().clone();
         // RPython call.py find_all_graphs: BFS from portal targets.
         // For each graph, scan all Call ops. If guess_call_kind would
         // return 'regular' (i.e. graphs_from returns a graph AND it's
@@ -7040,18 +7085,18 @@ fn replace_force_virtualizable_in(graph: &mut FunctionGraph) -> usize {
     for block in &mut graph.blocks {
         let mut newops = Vec::with_capacity(block.operations.len());
         for mut op in block.operations.drain(..) {
-            if let OpKind::Call { target, args, .. } = &op.kind {
-                if is_residual_jit_force_virtualizable(target) {
-                    if args.last().is_some_and(link_arg_access_directly) {
-                        continue;
-                    }
-                    if let OpKind::Call { args, .. } = &mut op.kind {
-                        if args.len() > 1 {
-                            args.truncate(1);
-                        }
-                    }
-                    count += 1;
+            if let OpKind::Call { target, args, .. } = &op.kind
+                && is_residual_jit_force_virtualizable(target)
+            {
+                if args.last().is_some_and(link_arg_access_directly) {
+                    continue;
                 }
+                if let OpKind::Call { args, .. } = &mut op.kind
+                    && args.len() > 1
+                {
+                    args.truncate(1);
+                }
+                count += 1;
             }
             newops.push(op);
         }

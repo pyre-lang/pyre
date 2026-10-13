@@ -266,9 +266,10 @@ impl StructStorageDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CallEffectKind {
     Elidable,
+    #[default]
     Residual,
     MayForce,
     /// A callee whose effects row is stated by the override table rather than
@@ -278,12 +279,6 @@ pub enum CallEffectKind {
     /// The three variants above are shorthands for three particular rows;
     /// this one carries the row.
     Declared(DeclaredCallEffects),
-}
-
-impl Default for CallEffectKind {
-    fn default() -> Self {
-        Self::Residual
-    }
 }
 
 /// `effectinfo.py:17-24` `EF_*`, minus `EF_RANDOM_EFFECTS`.
@@ -800,7 +795,7 @@ fn dict_lookup_rdict_owner(cc: &crate::call::CallControl) -> Option<String> {
                 && cc
                     .struct_fields()
                     .fields
-                    .get(*key)
+                    .get(key)
                     .is_some_and(|rows| rows.iter().any(|(name, _)| name == "entries"))
         })
         .cloned()
@@ -1092,10 +1087,11 @@ fn collect_immutable_array_vars(
             let Some(rank) = cc.field_immutability(field.owner_root.as_deref(), &field.name) else {
                 continue;
             };
-            if rank.is_array() && rank.is_immutable() {
-                if let Some(result) = op.result.clone() {
-                    set.insert(result);
-                }
+            if rank.is_array()
+                && rank.is_immutable()
+                && let Some(result) = op.result.clone()
+            {
+                set.insert(result);
             }
         }
     }
@@ -2587,10 +2583,10 @@ impl<'a> Transformer<'a> {
         owner: Option<&str>,
     ) -> Option<std::sync::Arc<dyn crate::call::VirtualizableInfoHandle>> {
         let cc = self.callcontrol.as_ref()?;
-        if let Some(owner) = owner {
-            if let Some(vinfo) = cc.get_vinfo_by_owner(owner) {
-                return Some(vinfo);
-            }
+        if let Some(owner) = owner
+            && let Some(vinfo) = cc.get_vinfo_by_owner(owner)
+        {
+            return Some(vinfo);
         }
         None
     }
@@ -2602,12 +2598,11 @@ impl<'a> Transformer<'a> {
         var: &crate::flowspace::model::Variable,
         owner: Option<&str>,
     ) -> Option<std::sync::Arc<dyn crate::call::VirtualizableInfoHandle>> {
-        if let Some(ct) = var.concretetype() {
-            if let Some(name) = lltype_vtype_name(&ct) {
-                if let Some(vinfo) = self.get_vinfo(Some(&name)) {
-                    return Some(vinfo);
-                }
-            }
+        if let Some(ct) = var.concretetype()
+            && let Some(name) = lltype_vtype_name(&ct)
+            && let Some(vinfo) = self.get_vinfo(Some(&name))
+        {
+            return Some(vinfo);
         }
         self.get_vinfo(owner)
     }
@@ -2621,10 +2616,10 @@ impl<'a> Transformer<'a> {
     /// return vinfo.static_field_descrs[index]
     /// ```
     fn get_virtualizable_field_descr(&self, field: &FieldDescriptor) -> Option<usize> {
-        if let Some(vinfo) = self.get_vinfo(field.owner_root.as_deref()) {
-            if let Some(index) = vinfo.static_field_index(&field.name) {
-                return Some(index);
-            }
+        if let Some(vinfo) = self.get_vinfo(field.owner_root.as_deref())
+            && let Some(index) = vinfo.static_field_index(&field.name)
+        {
+            return Some(index);
         }
         self.config
             .virtualizable_field(field)
@@ -4300,7 +4295,7 @@ impl<'a> Transformer<'a> {
                 // jtransform.py `rewrite_op_ptr_eq`: `_rewrite_equality`
                 // (NULL → `ptr_iszero`) then the rclass-instance promotion.
                 // `is_` is `rptr.py` `rtype_is_` → `ptr_eq`.
-                if let Some(rewritten) = null_test_rewrite(graph, &op, binop_name != "ne", lhs, rhs)
+                if let Some(rewritten) = null_test_rewrite(graph, op, binop_name != "ne", lhs, rhs)
                 {
                     return rewritten;
                 }
@@ -4658,7 +4653,7 @@ impl<'a> Transformer<'a> {
                         result_ty: ValueType::Int,
                     },
                 };
-                return self.rewrite_operation(&helper_call, graph_name, graph);
+                self.rewrite_operation(&helper_call, graph_name, graph)
             }
             OpKind::UnaryOp {
                 op: unop_name,
@@ -5260,7 +5255,7 @@ impl<'a> Transformer<'a> {
             graph,
             &call,
             &target,
-            &[size_var.clone()],
+            std::slice::from_ref(&size_var),
             &ValueType::Int,
             graph_name,
             OopSpecIndex::None,
@@ -5778,7 +5773,7 @@ impl<'a> Transformer<'a> {
         let ptr_ty = [arg_ty.clone(), result_ty_ll]
             .into_iter()
             .flatten()
-            .find(|ty| Self::direct_ptradd_type_has_item(ty))
+            .find(Self::direct_ptradd_type_has_item)
             .or(arg_ty);
         let is_ccharp = ptr_ty
             .as_ref()
@@ -8599,10 +8594,9 @@ impl<'a> Transformer<'a> {
         }
         let (is_store, width) = if let Some(width) = oopspec_name.strip_prefix("raw_write_") {
             (true, width)
-        } else if let Some(width) = oopspec_name.strip_prefix("raw_read_") {
-            (false, width)
         } else {
-            return None;
+            let width = oopspec_name.strip_prefix("raw_read_")?;
+            (false, width)
         };
         let (item_ty, itemsize, is_item_signed) = match width {
             "i8" => (ValueType::Int, 1, true),

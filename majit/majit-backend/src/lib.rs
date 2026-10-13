@@ -3465,24 +3465,12 @@ pub trait Backend: Send {
     /// owning JCT through `descr_owning_jct(fail_descr)` (Phase E.3+,
     /// `lib.rs:969`) and passes it as `original_token`, so the source descr
     /// is always reachable from `original_token.compiled.fail_descrs`.
-    ///
-    /// **TODO:** the second `previous_tokens` slice is
-    /// pyre-only.  Cranelift recompiles bridges as fresh modules instead of
-    /// patching live machine code, so after a retrace the RUNNING machine
-    /// code still references descrs in retired predecessor tokens — the
-    /// cranelift impl must attach the freshly-compiled bridge to those
-    /// predecessor descrs so the running code can still dispatch to it.
-    /// Dynasm patches in place and ignores the slice.  Convergence requires
-    /// either a cranelift-side registry of running predecessor descrs (so
-    /// the parameter can come off the trait), or moving to RPython-style
-    /// in-place patching.
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError>;
 
@@ -3519,22 +3507,6 @@ pub trait Backend: Send {
     ) {
         // Default no-op — backends that support bridge re-entry override this.
     }
-
-    /// Cranelift workaround — no RPython counterpart.
-    ///
-    /// RPython's x86/ARM backends patch guard failure jump targets in-place,
-    /// so bridges survive retrace automatically. Cranelift cannot patch
-    /// emitted machine code, so when a loop is retraced (producing a new
-    /// token), existing bridges from the old token must be explicitly copied
-    /// to matching guards in the new token.
-    ///
-    /// Called from metainterp after compile_loop, because only the metainterp
-    /// has access to both old_token (from compiled_loops.remove) and new_token
-    /// (from compile_loop). compile_loop itself only receives the new token.
-    ///
-    /// Backends that support in-place patching (e.g. dynasm) leave this as
-    /// no-op — bridges are attached to the guard's machine code directly.
-    fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {}
 
     /// compile.py / resume.py concat_strings plumbing: publish the shared
     /// `CallInfoCollection` so the backend can resolve OS_STR_CONCAT

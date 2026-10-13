@@ -178,9 +178,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     pyre_interpreter::baseobjspace::str_utf8_w(w_name)?.to_string()
                 };
                 let addr = lookup_symbol(h, name.as_bytes()).map_err(|e| {
-                    let msg = match e {
-                        LookupSymbolError::Load(s) => s,
-                    };
+                    let LookupSymbolError::Load(msg) = e;
                     pyre_interpreter::PyError::os_error(format!("dlsym({name}): {msg}"))
                 })?;
                 Ok(pyre_object::w_int_new(addr as i64))

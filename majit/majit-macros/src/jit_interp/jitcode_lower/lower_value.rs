@@ -2845,10 +2845,10 @@ impl<'c> Lowerer<'c> {
     }
 
     fn lower_binary(&mut self, expr: &ExprBinary) -> Option<Binding> {
-        if matches!(expr.op, BinOp::Eq(_) | BinOp::Ne(_)) {
-            if let Some(binding) = self.lower_ptr_equality_against_null(expr) {
-                return Some(binding);
-            }
+        if matches!(expr.op, BinOp::Eq(_) | BinOp::Ne(_))
+            && let Some(binding) = self.lower_ptr_equality_against_null(expr)
+        {
+            return Some(binding);
         }
         if let Some(binding) = self.transactional(|s| s.lower_binary_int_constant(expr)) {
             return Some(binding);

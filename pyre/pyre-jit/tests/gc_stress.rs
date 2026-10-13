@@ -6,15 +6,13 @@
 //! stack in CI.
 //!
 //! Every `#[test]` runs one end-to-end Python program through the shared
-//! `run_harness`, on its own freshly spawned 256 MiB worker thread. The
-//! per-worker thread keeps stack-heavy interpreter / tracer recursion off the
-//! default test stack. These tests also share process-global GC and builtin
-//! type state, so `run_on_worker` serializes them and `run_harness` installs a
-//! fresh GC heap for each worker.
+//! `run_harness`. `run_on_worker` re-execs this binary so each test is its own
+//! process, with that process's own GC. Inside the child, the program runs on
+//! a freshly spawned 256 MiB worker thread, which keeps stack-heavy interpreter
+//! / tracer recursion off the default test stack.
 //!
-//! The harness mirrors the `pyrex` launcher (`pyrex/src/lib.rs` `real_main` +
-//! `run_source`) startup shape, then swaps in a per-worker fresh GC before the
-//! program allocates. Each program's module body and functions use `while`
+//! The harness follows the `pyrex` launcher startup (`pyrex::real_main`, then
+//! `run_source`). Each program's module body and functions use `while`
 //! loops (no `FOR_ITER`), so eval reaches a JIT-eligible frame. `gc.collect()`
 //! then forces deterministic collections through the collect hook
 //! (`interp_gc.py collect`).
@@ -35,9 +33,7 @@ use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
-use pyre_jit::eval::{eval_with_jit, init_jit_hooks, reset_gc_fresh_for_test};
-
-static GC_STRESS_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+use pyre_jit::eval::{eval_with_jit, init_jit_hooks};
 
 /// Nursery-born rbigint digits move; every long op that allocates while
 /// still reading an operand must have that operand on the shadow stack.
@@ -52,6 +48,7 @@ fn long_ops_keep_operands_across_collecting_digit_allocs() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -128,6 +125,7 @@ fn log10_rereads_long_payload_after_tofloat() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -180,6 +178,7 @@ fn pickle_async_forcing_keeps_pending_result_out_of_frame() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
             .expect("run isolated async-forcing regression");
@@ -217,8 +216,8 @@ except BaseException:
 }
 
 /// Shared harness body for every GC-stress program. Compiles and runs `program`
-/// (using `name` as its `sys.argv[0]` / filename) exactly as the `pyrex`
-/// launcher would, after installing a fresh per-worker GC heap. An uncaught
+/// (using `name` as its `sys.argv[0]` / filename) with the same startup as
+/// `pyrex::real_main` and `run_source`, on the process's own GC. An uncaught
 /// `assert` in the program surfaces here as `Err`, so a successful return
 /// means every read-back assertion held. `vacuity_label` names the survival
 /// checks for the post-eval non-vacuity error.
@@ -228,13 +227,6 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
         .map_err(|_| "set_recursion_limit failed".to_string())?;
     pyre_module::register();
     init_jit_hooks();
-    // The previous test's `sys` module and its path list live in the collector
-    // this reset leaks. Drop the registry entry while that collector is still
-    // current, or the next `add_sys_path_0` frees the old list storage.
-    importing::remove_sys_module("sys");
-    // Per-worker fresh GC heap: these tests share the process-global GC
-    // singleton, so hide any prior test's residue before this one allocates.
-    reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     importing::init_sys_path(&cwd, cwd.as_os_str());
@@ -290,23 +282,37 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     Ok(())
 }
 
-/// Run `run_harness` on its own freshly spawned 256 MiB worker thread and
-/// unwrap the result. Mirrors the launcher's worker stack so deep tracer /
-/// interpreter recursion does not overflow the default test stack. The tests
-/// mutate process-global GC and builtin type state, so each worker run is
-/// serialized even when cargo schedules tests in parallel.
+/// Run one test in its own process, then `run_harness` on a 256 MiB worker.
+///
+/// Unless `PYRE_GC_STRESS_CHILD` is set, re-exec this binary with `--exact`
+/// for the libtest thread name, `--nocapture`, and `--test-threads=1`. The
+/// child has the variable set and runs `run_harness` on the worker thread, so
+/// deep tracer / interpreter recursion stays off the default test stack. The
+/// child builds one GC through the same startup as `pyrex::real_main`.
 fn run_on_worker(
     program: &'static str,
     name: &'static str,
     vacuity_label: &'static str,
     fail_msg: &'static str,
 ) {
-    // These tests share the process-global GC singleton and process-global
-    // builtin type state (`object.weak_subclasses`, version tags), which are
-    // not thread-safe, so run them one at a time regardless of cargo's
-    // parallel test scheduling. `parking_lot` does not poison, so one worker
-    // panicking does not wedge the rest.
-    let _serial = GC_STRESS_SERIAL.lock();
+    if std::env::var_os("PYRE_GC_STRESS_CHILD").is_none() {
+        let current = std::thread::current();
+        let test_name = current.name();
+        assert!(test_name.is_some(), "libtest names the test thread");
+        let test_name = test_name.unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env("PYRE_GC_STRESS_CHILD", "1")
+            .output()
+            .expect("re-exec gc_stress test in its own process");
+        assert!(
+            output.status.success(),
+            "{fail_msg}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || run_harness(program, name, vacuity_label))
@@ -1823,6 +1829,7 @@ fn list_richcompare_and_sort_boxes_survive_sibling_getitem() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "65536")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2204,6 +2211,7 @@ fn karatsuba_mul_keeps_operand_digits_across_collecting_allocs() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2249,6 +2257,7 @@ fn compile_keeps_source_across_ast_import() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2298,6 +2307,7 @@ fn range_eq_keeps_operands_across_collecting_fromint() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2345,6 +2355,7 @@ fn classcell_survives_ready_weakref_alloc() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2393,6 +2404,7 @@ fn rbigint_handles_survive_boxing_and_digit_allocs() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2457,6 +2469,7 @@ fn rbigint_pow_isqrt_divmod_survive_tiny_nursery() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2516,6 +2529,7 @@ fn gateway_index_args_survive_collect() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2568,6 +2582,7 @@ fn sre_buffer_subject_survives_bound_conversion() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2618,6 +2633,7 @@ fn range_getitem_slice_survives_fromint() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2666,6 +2682,7 @@ fn unicode_decode_error_fields_survive_wrapper_alloc() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2710,6 +2727,7 @@ fn build_class_metaclass_survives_prepare() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2755,6 +2773,7 @@ fn os_error_args_survive_wrapper_alloc() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2795,6 +2814,7 @@ fn range_keeps_original_long_bound() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "range_keeps_original_long_bound", "--nocapture"])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2838,6 +2858,7 @@ fn marshal_tuple_constants_survive_collecting_int_conversion() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "4096")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .output()
@@ -2868,49 +2889,6 @@ while i < 16:
     );
 }
 
-/// `virtualizable.py` makes `TOKEN_TRACING_RESCALL` the address of a
-/// prebuilt GC object, so the sentinel has to belong to the heap that is
-/// current when a traced slot holds it. `reset_gc_fresh_for_test` builds a
-/// second heap and leaks the first, which leaves any sentinel minted in the
-/// first outside the live heap — `is_managed_heap_object` stops recognising it,
-/// and the traced `virtual_token` / `vable_token` slots would be back to
-/// holding an address the collector does not own.
-///
-/// Mint the sentinel between two resets and require a fresh address, which is
-/// what tells the two heaps apart. This is the ordering the GC-stress harness
-/// itself produces the moment any of its programs reaches a traced residual
-/// call; none does today, so nothing else in this binary covers it.
-#[test]
-fn tracing_sentinel_is_reminted_for_a_rebuilt_heap() {
-    let _serial = GC_STRESS_SERIAL.lock();
-    let handle = std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
-        .spawn(|| {
-            pyre_module::register();
-            init_jit_hooks();
-            reset_gc_fresh_for_test();
-            let first = majit_metainterp::virtualref::token_tracing_rescall();
-            assert!(!first.is_null(), "sentinel must never be TOKEN_NONE");
-
-            reset_gc_fresh_for_test();
-            let second = majit_metainterp::virtualref::token_tracing_rescall();
-            assert!(!second.is_null(), "sentinel must never be TOKEN_NONE");
-            assert_ne!(
-                first, second,
-                "the sentinel stayed in the heap that was replaced",
-            );
-
-            // Stable within one heap: the token protocol compares by address.
-            assert_eq!(
-                second,
-                majit_metainterp::virtualref::token_tracing_rescall(),
-                "the sentinel moved without the heap being rebuilt",
-            );
-        })
-        .expect("spawn worker thread");
-    handle.join().expect("worker thread panicked");
-}
-
 /// `setobject.py` `W_BaseSetObject.clear` installs a fresh storage box and
 /// leaves `d = self.unerase(w_set.sstorage)` iterating the detached one.
 /// Young keys in that box are reachable only through the box's own trace
@@ -2927,6 +2905,7 @@ fn set_update_traces_storage_orphaned_by_eq_clear() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYRE_JIT", "0")
             .env("PYPY_GC_NURSERY", "1048576")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
@@ -2994,6 +2973,7 @@ fn builtin_name_cached_on_a_builtin_held_only_by_a_list() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYRE_JIT", "0")
             .env("PYPY_GC_NURSERY", "1048576")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
@@ -3048,6 +3028,7 @@ fn rbigint_handles_stay_rooted_across_digit_allocations() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYRE_JIT", "0")
             .env("PYPY_GC_NURSERY", "1048576")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
@@ -3110,6 +3091,7 @@ fn generator_backlink_survives_minor_after_external_refs_drop() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .env("MAJIT_GC_NURSERY_POISON", "1")
@@ -3168,6 +3150,7 @@ fn property_init_doc_reloads_after_getter_getattribute() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .env("MAJIT_GC_NURSERY_POISON", "1")
@@ -3220,6 +3203,7 @@ fn property_isabstract_reloads_between_accessors() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .env("MAJIT_GC_NURSERY_POISON", "1")
@@ -3269,6 +3253,7 @@ fn property_no_accessor_reloads_after_qualname() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .env("MAJIT_GC_NURSERY_POISON", "1")
@@ -3329,6 +3314,7 @@ fn memoryview_buffer_wrapper_release_reloads_after_override() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
             .env("PYPY_GC_NURSERY", "1")
             .env("PYPY_GC_NURSERY_DEBUG", "1")
             .env("MAJIT_GC_NURSERY_POISON", "1")

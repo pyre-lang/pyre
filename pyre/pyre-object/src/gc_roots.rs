@@ -874,6 +874,12 @@ impl RootedOnceRef {
     }
 }
 
+impl Default for RootedOnceRef {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Default for RootedItems {
     fn default() -> Self {
         Self::new()

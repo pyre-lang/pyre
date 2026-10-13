@@ -864,7 +864,7 @@ impl Llbc {
                             .and_then(|generics| generics.get("types"))
                             .and_then(serde_json::Value::as_array)
                             .and_then(|types| types.first())
-                            .and_then(|owner| adt_of(owner))?;
+                            .and_then(&adt_of)?;
                         impl_trait
                             .get("id")
                             .and_then(serde_json::Value::as_u64)

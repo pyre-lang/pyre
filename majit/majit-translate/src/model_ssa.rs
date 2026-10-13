@@ -206,7 +206,7 @@ pub(crate) fn renamevariables(graph: &mut FunctionGraph, id: BlockId, v: &Variab
             .operations
             .iter()
             .map(|op| SpaceOperation {
-                result: op.result.as_ref().map(&remap),
+                result: op.result.as_ref().map(remap),
                 kind: crate::inline::remap_op_kind(&op.kind, &remap),
             })
             .collect();

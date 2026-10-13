@@ -77,7 +77,7 @@ thread_local! {
     /// thread-local scope never narrows what production (single-threaded) can
     /// reach.
     static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<u64, DynasmCaTarget, rustc_hash::FxBuildHasher>> =
-        RefCell::new(IndexMap::with_hasher(rustc_hash::FxBuildHasher));
+        const { RefCell::new(IndexMap::with_hasher(rustc_hash::FxBuildHasher)) };
 }
 
 fn unregister_dynasm_ca_target(number: u64) {
@@ -3613,7 +3613,6 @@ impl Backend for DynasmBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
@@ -3725,7 +3724,7 @@ impl Backend for DynasmBackend {
             cond_call_slowpath,
             #[cfg(target_arch = "x86_64")]
             failure_recovery_code,
-            &inputargs,
+            inputargs,
             &prepared_ops,
         );
         // `assembler.py assemble_bridge`: `reserve_gcref_table(allgcrefs)`
@@ -4295,8 +4294,6 @@ impl Backend for DynasmBackend {
         Self::redirect_call_assembler_target(old.number, new_addr as usize);
         Ok(())
     }
-
-    // No migrate_bridges — we patch in place.
 
     fn bridge_was_compiled(
         &self,
@@ -5814,7 +5811,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -5906,7 +5902,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -6008,7 +6003,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();

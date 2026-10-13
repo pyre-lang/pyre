@@ -66,12 +66,14 @@ static GC_FLOAT_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
 /// until that plumbing exists, and moving only these two ids off the static
 /// would buy no second host while the singleton and the allocator hook remain.
 ///
-/// Re-declaring the SAME slot is how a rebuilt heap
-/// (`eval.rs reset_gc_fresh_for_test`) re-announces its registration: the
-/// registry belongs to the collector and the registration order is fixed, so a
-/// fresh collector hands the same ids back. A DIFFERENT slot is a second host
-/// stamping over the first host's registrations, which nothing downstream can
-/// detect — the collector reads the word and indexes its own registry with it.
+/// Re-declaring the SAME slot is how `build_gc` (`pyre-jit::eval`)
+/// re-announces its registration when
+/// `test_gc_rebuild_verifies_published_subclass_ranges` builds a second
+/// collector: the registry belongs to the collector and the registration
+/// order is fixed, so that fresh collector hands the same ids back. A
+/// DIFFERENT slot is a second host stamping over the first host's
+/// registrations, which nothing downstream can detect — the collector reads
+/// the word and indexes its own registry with it.
 /// Refuse it here in debug rather than let it surface as a mis-trace.
 fn declare_array_gc_type_id(slot: &std::sync::atomic::AtomicU32, id: u32, lltype: &str) {
     let previous = slot.swap(id, std::sync::atomic::Ordering::Relaxed);
@@ -451,7 +453,7 @@ impl Digits {
                     .unwrap_or_else(|| {
                         std::alloc::handle_alloc_error(
                             try_typed_items_block_layout(count.max(1))
-                                .unwrap_or_else(|| Layout::new::<TypedItemsBlock>()),
+                                .unwrap_or_else(Layout::new::<TypedItemsBlock>),
                         )
                     });
             // The zeroing stores follow the malloc with no collection point
@@ -541,10 +543,11 @@ mod tests {
         assert_eq!(gc_float_array_gc_type_id(), 42);
     }
 
-    /// A rebuilt heap (`eval.rs reset_gc_fresh_for_test`) re-runs the host's
-    /// registrations against a fresh collector, whose registry hands the same
-    /// slots back in the same order. That re-declaration is the supported
-    /// case, not the overwrite the guard is looking for.
+    /// `build_gc` (`pyre-jit::eval`), called again by
+    /// `test_gc_rebuild_verifies_published_subclass_ranges`, re-runs the
+    /// host's registrations against a fresh collector, whose registry hands
+    /// the same slots back in the same order. That re-declaration is the
+    /// supported case, not the overwrite the guard is looking for.
     #[test]
     fn re_declaring_the_same_slot_is_accepted() {
         let _guard = declaration_lock();

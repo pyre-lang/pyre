@@ -1494,7 +1494,9 @@ fn decode_utf16_bytes(data: &[u8], enc: &str) -> Result<String, pyre_interpreter
         return Err(pyre_interpreter::PyError::value_error("partial character"));
     }
     let words: Vec<u16> = data[start..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             if little {
                 u16::from_le_bytes([chunk[0], chunk[1]])

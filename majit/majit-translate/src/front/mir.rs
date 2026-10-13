@@ -2112,9 +2112,9 @@ impl<'l> CrateLowering<'l> {
             req.leaf,
             module_path,
             &signature,
-            &known_trait_names,
-            &dont_look_inside,
-            &elidable_residual,
+            known_trait_names,
+            dont_look_inside,
+            elidable_residual,
             func_hints,
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
@@ -2196,14 +2196,14 @@ impl<'l> CrateLowering<'l> {
             body,
             static_addrs,
             jitdriver_receiver_roots,
-            &struct_field_attrs,
-            &struct_fields,
-            &dont_look_inside,
-            &tombstoned_leaves,
+            struct_field_attrs,
+            struct_fields,
+            dont_look_inside,
+            tombstoned_leaves,
             gc_struct_ids,
             builder_mode,
             &accum,
-            &root_stack,
+            root_stack,
             Some(spec_queue),
             true,
             Some(spec.segments.join("::")),
@@ -2958,10 +2958,9 @@ pub(crate) fn shaped_array_parts(shape: &str) -> Option<(&str, usize)> {
     let shape = shape.trim();
     let inner = if let Some(rest) = shape.strip_prefix("Array<") {
         rest.strip_suffix('>')?
-    } else if let Some(rest) = shape.strip_prefix('[') {
-        rest.strip_suffix(']')?
     } else {
-        return None;
+        let rest = shape.strip_prefix('[')?;
+        rest.strip_suffix(']')?
     };
     let (item, len) = inner.rsplit_once(';')?;
     let item = item.trim();
@@ -3348,11 +3347,10 @@ fn derive_program_metadata(
                 let unresolved = exact_layouts
                     .get(&sid)
                     .is_none_or(|exact| exact.field_offsets.is_empty());
-                if unresolved {
-                    if let Some(exact) = crate::codeobject_layout::exact_layout_for(&canonical_name)
-                    {
-                        exact_layouts.insert(sid, exact);
-                    }
+                if unresolved
+                    && let Some(exact) = crate::codeobject_layout::exact_layout_for(&canonical_name)
+                {
+                    exact_layouts.insert(sid, exact);
                 }
                 // `bare leaf → crate-relative module`: drop the crate
                 // prefix (first segment) and the leaf (last segment) so
@@ -4769,8 +4767,8 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         jitdriver_receiver_roots,
         struct_field_attrs,
         struct_fields,
-        &dont_look_inside,
-        &tombstoned_leaves,
+        dont_look_inside,
+        tombstoned_leaves,
         gc_struct_ids,
         builder_mode,
         &accum,
@@ -4899,7 +4897,7 @@ pub fn residual_owner_root_guard_escapes(llbc: &Llbc) -> Vec<(String, String)> {
 /// and the proof cannot drift.
 fn local_def_counts(body: &Unstructured, llbc: &Llbc, n: usize) -> Vec<usize> {
     let mut def_count = vec![0usize; n];
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -8353,6 +8351,10 @@ struct IndexElemAlias {
     /// does not read as a list, so `getitem` would stay on the
     /// classdef-less pointer.
     list_root: Option<String>,
+    /// `BytesArray` / `UnicodeArray` when the paired read substituted
+    /// `ll_items` (`block`) for the `{ block, len }` wrapper. The write
+    /// repeats that FieldRead off the remapped wrapper (`ll_setitem_fast`).
+    items_owner: Option<&'static str>,
 }
 
 /// Header of a `(*p.add(i)).field` access.
@@ -8695,6 +8697,11 @@ struct Lowering<'a> {
     /// these locals answers with the recorded length, never with `__len` of
     /// the header, which is the CAPACITY.
     string_array_view_locals: Vec<(usize, Variable)>,
+    /// Twin of [`Self::string_array_view_locals`] for `IntArray` /
+    /// `FloatArray` slice views. Float pair slices are outside
+    /// [`PAIR_SLICE_ITEM_KINDS`], so a length read of the `[f64]` view
+    /// would otherwise be `ll_fixed_length` of the items block.
+    numeric_array_view_locals: Vec<(usize, Variable)>,
     /// Result `Variable`s of calls to callees whose declared result is
     /// `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
@@ -9603,6 +9610,7 @@ impl<'a> Lowering<'a> {
             dyn_return_calls: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
+            numeric_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
             result_map_err_sites: Vec::new(),
@@ -10693,8 +10701,12 @@ impl<'a> Lowering<'a> {
                 // A single-assignment copy of a multi-field integer NamedConst
                 // keeps the field literals. The struct itself is not a flow
                 // value: emitting the const's nullary call leaves that path
-                // unregistered.
+                // unregistered. `fold_op_list` keeps any operation it cannot
+                // prove safe, so a projected store, address-taking, or
+                // whole-value consumer leaves the aggregate.
                 if !self.multi_assigned_locals.contains(&dest_local)
+                    && !self.local_has_projected_store(dest_local)
+                    && const_struct_uses_are_field_reads(self.llbc, self.body, dest_local)
                     && let Some(fields) = self.take_const_struct_fields(&rvalue)
                 {
                     self.const_struct_fields[dest_local] = Some(fields);
@@ -10970,6 +10982,7 @@ impl<'a> Lowering<'a> {
                 array_type_id: None,
                 rust_vec: None,
                 list_root: None,
+                items_owner: None,
             },
         );
         self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -11091,7 +11104,7 @@ impl<'a> Lowering<'a> {
                 base,
                 index,
                 field: FieldDescriptor::new(field_name, Some(owner_root.to_string()))
-                    .with_owner_id(owner_id.clone())
+                    .with_owner_id(*owner_id)
                     .with_base_is_deref(true)
                     .with_inline_vec(
                         field_ty_is_inline_vec(field_ty, self.llbc)
@@ -11515,8 +11528,16 @@ impl<'a> Lowering<'a> {
                     // `local_var` by their source local and fall back
                     // to the recorded Variable for a constant operand.
                     let base_var = alias.base_var.clone();
-                    let arr = self.realias_operand(alias.base_local, alias.base_var);
+                    let mut arr = self.realias_operand(alias.base_local, alias.base_var);
                     let idx = self.realias_operand(alias.index_local, alias.index_var);
+                    // The read already used `ll_items` (`block`). Preferring
+                    // the wrapper local here would cast `BytesArray` to
+                    // `[str]` without that field (`ll_setitem_fast`).
+                    if let Some(owner) = alias.items_owner
+                        && alias.base_local.is_some()
+                    {
+                        arr = self.emit_string_array_items_read(bb_id, arr, owner);
+                    }
                     if let Some(kind) = alias.rust_vec {
                         let op = OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -11758,15 +11779,12 @@ impl<'a> Lowering<'a> {
                     // first word overwrites the discriminant.
                     if self.struct_field_offset_from_payload(&field_base_ty, field_payload)
                         == Some(0)
+                        && let Some(plan) = self.move_plan(dest_ty)
+                        && !plan.arms.is_empty()
+                        && let LinkArg::Value(src) = &value
                     {
-                        if let Some(plan) = self.move_plan(dest_ty) {
-                            if !plan.arms.is_empty() {
-                                if let LinkArg::Value(src) = &value {
-                                    self.write_aggregate_into(mir_bb, &base, &plan, src)?;
-                                    return Ok(());
-                                }
-                            }
-                        }
+                        self.write_aggregate_into(mir_bb, &base, &plan, src)?;
+                        return Ok(());
                     }
                     // A by-value store of an inlined struct is one setfield
                     // per inner leaf (`heaptracker.py all_fielddescrs`
@@ -12376,14 +12394,11 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             let arg_local = arg_locals.get(index).copied().flatten();
-            match self.classify_gc_mut_ref_arg(arg_local) {
-                Ok(GcMutRefArg::CellParam(local)) => {
-                    let Some(root) = self.gc_mut_ref_param_root(local) else {
-                        continue;
-                    };
-                    plan.push((index, root, local));
-                }
-                _ => {}
+            if let Ok(GcMutRefArg::CellParam(local)) = self.classify_gc_mut_ref_arg(arg_local) {
+                let Some(root) = self.gc_mut_ref_param_root(local) else {
+                    continue;
+                };
+                plan.push((index, root, local));
             }
         }
         let copies = Vec::new();
@@ -14690,17 +14705,14 @@ impl<'a> Lowering<'a> {
                 if let Some(seq) = self.item_seq_of_place(&place) {
                     return Ok((None, self.item_seq_len(mir_bb, seq)?));
                 }
-                // A string-list items view is one word — the `GcArray` header
-                // — so `__len` over it is `ll_fixed_length` / `arraylen_gc`,
-                // the CAPACITY.  `ll_length` reads the list's own `l.length`
-                // (`rlist.py:365-366`), which the fold recorded; answer with
-                // that, and keep the two apart exactly as upstream does.
-                if let Some((_, logical_len)) = self
-                    .string_array_view_locals
-                    .iter()
-                    .find(|(local, _)| place_references_local(&place, *local))
-                {
-                    return Ok((None, logical_len.clone()));
+                // A string-list or numeric-list items view is one word — the
+                // `GcArray` header — so `__len` over it is `ll_fixed_length`
+                // / `arraylen_gc`, the CAPACITY.  `ll_length` reads the
+                // list's own `l.length` (`ll_length`), which the fold
+                // recorded; answer with that, and keep the two apart
+                // exactly as upstream does.
+                if let Some(logical_len) = self.array_view_logical_len_for_place(&place) {
+                    return Ok((None, logical_len));
                 }
                 let len_leaf = if self
                     .string_byte_view_locals
@@ -14814,7 +14826,7 @@ impl<'a> Lowering<'a> {
                                 res,
                             ));
                         }
-                        return Ok(self.retag_error_carrier(dest_ty, value));
+                        Ok(self.retag_error_carrier(dest_ty, value))
                     }
                     AggregateShape::Ctor(ctor) => {
                         // A pair-slice operand is its pointer here and its
@@ -16241,6 +16253,11 @@ impl<'a> Lowering<'a> {
                 *var = copy.clone();
             }
         }
+        for (_, var) in &mut self.numeric_array_view_locals {
+            if let Some(copy) = remap.get(&var.id()) {
+                *var = copy.clone();
+            }
+        }
     }
 
     /// Split the current block on `cond`. The true arm is in bounds and
@@ -16289,10 +16306,8 @@ impl<'a> Lowering<'a> {
             .zip(copies.iter())
             .map(|(orig, copy)| (orig.id(), copy.clone()))
             .collect();
-        for slot in &mut self.local_var {
-            if let Some(value) = slot {
-                value.remap_words(&remap);
-            }
+        for value in self.local_var.iter_mut().flatten() {
+            value.remap_words(&remap);
         }
         self.remap_forwarded_provenance(&remap);
         let fail = self.graph.create_block();
@@ -18501,9 +18516,9 @@ fn declared_vable_array_var(graph: &FunctionGraph, var: &Variable) -> Option<Var
         if declared {
             return Some(current);
         }
-        match base {
-            Some(next) => current = next,
-            None => return None,
+        {
+            let next = base?;
+            current = next
         }
     }
     None
@@ -19795,18 +19810,16 @@ impl<'a> Lowering<'a> {
                     } else {
                         base
                     };
-                    // `kwargs_at`'s `items[i]` is `ll_getitem_fast` on a list
+                    // An object-pointer index is `ll_getitem_fast` on a list
                     // of `PyObject`. That slice arrives as a classdef-less
                     // instance, and `getitem_SomeInstance` rewrites the
                     // index to `getattr("__getitem__")`. `[PyObject]` is
                     // the spelling `project_struct_field_type` projects to
-                    // `SomeList`. Other object-pointer indexes keep the
-                    // receiver their signature seeded: casting those makes
-                    // `len_SomeInstance` look up `__len__` on the list
-                    // (`call_function_impl_result`'s `args.len()`).
+                    // `SomeList` (`rtyper_makerepr`). The ARRAY identity
+                    // already names that list; every graph with this type
+                    // takes the same path.
                     let base = if !string_byte_view
                         && array_type_id.as_deref() == Some(OBJECT_REF_GCARRAY_TYPE_ID)
-                        && self.graph.name.contains("kwargsdict::")
                     {
                         self.narrow_value_to_instance_root(
                             bb_id,
@@ -21594,7 +21607,7 @@ impl<'a> Lowering<'a> {
                         let PlaceKind::Local(dst) = place.kind else {
                             return None;
                         };
-                        if aggregate_ctor_name(&kind) != "Array" || array.is_some() {
+                        if aggregate_ctor_name(kind) != "Array" || array.is_some() {
                             return None;
                         }
                         let mut vals = Vec::with_capacity(operands.len());
@@ -21711,7 +21724,7 @@ impl<'a> Lowering<'a> {
                         let PlaceKind::Local(dst) = place.kind else {
                             return None;
                         };
-                        if aggregate_ctor_name(&kind) != "Array" || array.is_some() {
+                        if aggregate_ctor_name(kind) != "Array" || array.is_some() {
                             return None;
                         }
                         let mut vals = Vec::with_capacity(operands.len());
@@ -24197,11 +24210,17 @@ impl<'a> Lowering<'a> {
                     )
                 {
                     // `(s as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` is
-                    // `s.chars` (`rstr.py` `STR`). The operand is already the
-                    // string, so this is not `direct_ptradd` of a `SomePtr`.
-                    if arg_operands.get(1).is_some_and(|op| {
-                        operand_is_lowlevel_string_chars_offset(self.body, self.llbc, op)
-                    }) {
+                    // `s.chars` (`rstr.py` `STR`) only when `s` is the rstr
+                    // header and the add produces a `u8` pointer. Any other
+                    // add/sub of that constant is `rtype_direct_ptradd` with
+                    // its displacement.
+                    if self.is_string_header_chars_byte_ptr_add(
+                        &reg,
+                        &arg_locals,
+                        &arg_operands,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                    ) {
                         self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -24813,6 +24832,7 @@ impl<'a> Lowering<'a> {
                             array_type_id,
                             rust_vec: rust_vec_header,
                             list_root: None,
+                            items_owner: string_index_owner,
                         },
                     );
                     // This intercept returns before the generic call-result
@@ -25040,6 +25060,7 @@ impl<'a> Lowering<'a> {
                             array_type_id: Some(array_type_id),
                             rust_vec: None,
                             list_root: None,
+                            items_owner: None,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -25099,6 +25120,7 @@ impl<'a> Lowering<'a> {
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             rust_vec: None,
                             list_root,
+                            items_owner: None,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -25158,6 +25180,7 @@ impl<'a> Lowering<'a> {
                             array_type_id: Some(array_type_id),
                             rust_vec: None,
                             list_root: None,
+                            items_owner: None,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -25919,14 +25942,27 @@ impl<'a> Lowering<'a> {
                     ));
                     // The dropped second word IS `l.length`; keep it so a
                     // `Rvalue::Len` over the view answers with it.
-                    if !self
-                        .string_array_view_locals
-                        .iter()
-                        .any(|(local, _)| *local == dest_local)
-                    {
-                        self.string_array_view_locals
-                            .push((dest_local, args[1].clone()));
-                    }
+                    self.record_string_array_view_len(dest_local, args[1].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Body-side twin of [`Self::numeric_array_slice_view_owner`]:
+                // `from_raw_parts(self.base(), self.len())` inside
+                // `IntArray` / `FloatArray` `as_slice`. The second word is
+                // `l.length` (`ll_length`).
+                if args.len() == 2
+                    && let Some(root) = self.numeric_array_view_from_raw_parts_root(&reg)
+                {
+                    let view =
+                        self.narrow_value_to_instance_root(bb_id, args[0].clone().into(), root);
+                    self.local_var[dest_local] = Some(LocalValue::One(
+                        view.as_variable()
+                            .expect("a numeric-items view stays a Variable")
+                            .clone(),
+                    ));
+                    self.record_numeric_array_view_len(dest_local, args[1].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -26445,7 +26481,9 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
                     };
-                    let len = if let Some(len_var) = fat_len {
+                    let len = if let Some(len_var) = self.array_view_logical_len_for_var(&args[0]) {
+                        len_var
+                    } else if let Some(len_var) = fat_len {
                         len_var
                     } else {
                         let len = self
@@ -26515,7 +26553,9 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
                     };
-                    let res = if let Some(len_var) = fat_len {
+                    let res = if let Some(len_var) = self.array_view_logical_len_for_var(&args[0]) {
+                        len_var
+                    } else if let Some(len_var) = fat_len {
                         len_var
                     } else {
                         // `.len()` of a declared virtualizable array is
@@ -26807,14 +26847,7 @@ impl<'a> Lowering<'a> {
                     ));
                     // Same pairing as the `from_raw_parts` fold above: the
                     // view is the header, `l.length` is its own field.
-                    if !self
-                        .string_array_view_locals
-                        .iter()
-                        .any(|(local, _)| *local == dest_local)
-                    {
-                        self.string_array_view_locals
-                            .push((dest_local, logical_len));
-                    }
+                    self.record_string_array_view_len(dest_local, logical_len);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -26825,14 +26858,15 @@ impl<'a> Lowering<'a> {
                 // is the `{ block, len }` struct, so aliasing it makes the
                 // following index `getitem_SomeInstance`. Read `block` and
                 // narrow it to `[i64]` / `[f64]`, the GcArray the
-                // unwrapped push sites write. This is not a string-items
-                // view: that local forces `Str` and answers `Rvalue::Len`
-                // with the recorded length. The live length stays the
-                // struct field (`typed_array_len_owner`).
+                // unwrapped push sites write. Record `l.length` so a
+                // length read of the view is `ll_length`, not
+                // `ll_fixed_length` of the items block.
                 if args.len() == 1
                     && let Some((owner, root)) = self.numeric_array_slice_view_owner(&reg)
                 {
                     let block = self.emit_numeric_array_items_read(bb_id, args[0].clone(), owner);
+                    let logical_len =
+                        self.emit_numeric_array_len_read(bb_id, args[0].clone(), owner);
                     let view =
                         self.narrow_value_to_instance_root(bb_id, LinkArg::Value(block), root);
                     self.local_var[dest_local] = Some(LocalValue::One(
@@ -26840,6 +26874,7 @@ impl<'a> Lowering<'a> {
                             .expect("a numeric-items view stays a Variable")
                             .clone(),
                     ));
+                    self.record_numeric_array_view_len(dest_local, logical_len);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -29554,13 +29589,11 @@ impl<'a> Lowering<'a> {
         if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && crate::front::from_size_align::is_layout_from_size_align_target(target)
-        {
-            if let Some(site) = self
+            && let Some(site) = self
                 .recognize_from_size_align_call_site(dest_class_ty, &result_var)
                 .or_else(|| self.recognize_from_size_align_call_site(&call.dest.ty, &result_var))
-            {
-                self.from_size_align_call_sites.push(site);
-            }
+        {
+            self.from_size_align_call_sites.push(site);
         }
         // Capture `Layout::size` / `Layout::align` on a virtualized
         // `{size, align}` aggregate.  Both are opaque core accessors with
@@ -32158,10 +32191,10 @@ impl<'a> Lowering<'a> {
     /// tag) is that many bytes, so a 16-byte `Union` still moves field by
     /// field when a payload is not an integer.
     fn span_raw_for_ty(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
-        if let Some(node) = tyref_node(ty, self.llbc) {
-            if let Some(descr) = json_ty_raw_store_descr(node, self.llbc) {
-                return Some(descr);
-            }
+        if let Some(node) = tyref_node(ty, self.llbc)
+            && let Some(descr) = json_ty_raw_store_descr(node, self.llbc)
+        {
+            return Some(descr);
         }
         if tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
             return Some((
@@ -33167,6 +33200,42 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path().as_str()))
     }
 
+    /// `(header as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` — `s.chars`
+    /// (`rstr.py` `STR`). The add is on a `u8` pointer, the peeled base is
+    /// the low-level string header, and the dest is a `u8` pointer. `sub`
+    /// and any other pointee keep `rtype_direct_ptradd`.
+    fn is_string_header_chars_byte_ptr_add(
+        &self,
+        reg: &RegularCall,
+        arg_locals: &[Option<usize>],
+        arg_operands: &[Operand],
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        if self.ptr_offset_is_sub(reg) {
+            return false;
+        }
+        if !tyref_is_raw_u8_ptr(dest_ty, self.llbc) {
+            return false;
+        }
+        if !first_arg_ty.is_some_and(|ty| tyref_is_raw_u8_ptr(ty, self.llbc)) {
+            return false;
+        }
+        if !arg_operands
+            .get(1)
+            .is_some_and(|op| operand_is_lowlevel_string_chars_offset(self.body, self.llbc, op))
+        {
+            return false;
+        }
+        arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|local| peel_copy_and_cast(self.llbc, self.body, local))
+            .and_then(|base| self.body.locals.locals.get(base))
+            .is_some_and(|decl| tyref_is_lowlevel_string_header_ptr(&decl.ty, self.llbc))
+    }
+
     /// Later intercepts in this same `RegularCall` match already lower
     /// some `.add` calls: items-base accessors alias to the header
     /// (brick 1), string-array remove aliases the interior pointer,
@@ -33565,7 +33634,7 @@ impl<'a> Lowering<'a> {
                     };
                     if let PlaceKind::Local(i) = &src.kind {
                         followed = Some(*i as usize);
-                    } else if self.place_lowlevel_is_fixed_object_array(&src) {
+                    } else if self.place_lowlevel_is_fixed_object_array(src) {
                         is_fixed = true;
                     }
                 }
@@ -33896,6 +33965,71 @@ impl<'a> Lowering<'a> {
         result
     }
 
+    fn record_string_array_view_len(&mut self, dest_local: usize, logical_len: Variable) {
+        if !self
+            .string_array_view_locals
+            .iter()
+            .any(|(local, _)| *local == dest_local)
+        {
+            self.string_array_view_locals
+                .push((dest_local, logical_len));
+        }
+    }
+
+    fn record_numeric_array_view_len(&mut self, dest_local: usize, logical_len: Variable) {
+        if !self
+            .numeric_array_view_locals
+            .iter()
+            .any(|(local, _)| *local == dest_local)
+        {
+            self.numeric_array_view_locals
+                .push((dest_local, logical_len));
+        }
+    }
+
+    fn array_view_logical_len_for_place(&self, place: &Place) -> Option<Variable> {
+        self.string_array_view_locals
+            .iter()
+            .chain(self.numeric_array_view_locals.iter())
+            .find(|(local, _)| place_references_local(place, *local))
+            .map(|(_, len)| len.clone())
+    }
+
+    fn array_view_logical_len_for_var(&self, arg: &Variable) -> Option<Variable> {
+        self.string_array_view_locals
+            .iter()
+            .chain(self.numeric_array_view_locals.iter())
+            .find(|(local, _)| {
+                self.local_var
+                    .get(*local)
+                    .and_then(Option::as_ref)
+                    .and_then(|current| current.one().ok())
+                    .is_some_and(|current| current == *arg)
+            })
+            .map(|(_, len)| len.clone())
+    }
+
+    /// Body-side `from_raw_parts` of [`Self::numeric_array_slice_view_owner`].
+    fn numeric_array_view_from_raw_parts_root(&self, reg: &RegularCall) -> Option<&'static str> {
+        if !self.is_from_raw_parts_call(reg) {
+            return None;
+        }
+        if self.graph.name.ends_with("int_array::<Impl>::as_slice")
+            || self.graph.name.ends_with("int_array::<Impl>::as_mut_slice")
+        {
+            Some("[i64]")
+        } else if self.graph.name.ends_with("float_array::<Impl>::as_slice")
+            || self
+                .graph
+                .name
+                .ends_with("float_array::<Impl>::as_mut_slice")
+        {
+            Some("[f64]")
+        } else {
+            None
+        }
+    }
+
     /// `IntArray` / `FloatArray` items pointer. Same `block` field as
     /// [`Self::emit_string_array_items_read`].
     fn emit_numeric_array_items_read(
@@ -33920,6 +34054,37 @@ impl<'a> Lowering<'a> {
                     majit_ir::descr::StructId::from_canonical(canonical_owner),
                 )),
                 ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        result
+    }
+
+    /// The logical `l.length` of an `IntArray` / `FloatArray` storage
+    /// record. Upstream reads it as the list's own field (`ll_length`),
+    /// strictly apart from `ll_fixed_length` / `arraylen_gc`.
+    fn emit_numeric_array_len_read(
+        &mut self,
+        bb_id: BlockId,
+        base: Variable,
+        owner: &str,
+    ) -> Variable {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let canonical_owner = match owner {
+            "IntArray" => "int_array::IntArray",
+            "FloatArray" => "float_array::FloatArray",
+            _ => unreachable!("numeric array owner is closed"),
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("len", Some(owner.to_string())).with_owner_id(Some(
+                    majit_ir::descr::StructId::from_canonical(canonical_owner),
+                )),
+                ty: ValueType::Int,
                 pure: false,
             },
         });
@@ -38406,7 +38571,7 @@ impl<'a> Lowering<'a> {
             .flat_map(|block| &block.operations)
             .find_map(|op| {
                 (op.result.as_ref() == Some(count))
-                    .then(|| match &op.kind {
+                    .then_some(match &op.kind {
                         OpKind::ConstInt(n) if *n >= 0 => Some(*n as u64),
                         OpKind::ConstUInt(n) => Some(*n),
                         _ => None,
@@ -40834,7 +40999,7 @@ fn operand_produced_by_get_eval_fn(body: &Unstructured, llbc: &Llbc, operand: &O
     let PlaceKind::Local(local) = place.kind else {
         return false;
     };
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -40974,7 +41139,7 @@ fn compute_binop_result_locals(
     body: &Unstructured,
 ) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41006,14 +41171,14 @@ fn compute_multi_assigned_locals(
             *counts.entry(i as usize).or_insert(0) += 1;
         }
     };
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
         }
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
-                bump(&place);
+                bump(place);
             }
         }
         if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
@@ -41297,7 +41462,7 @@ impl AccumulatorFacts {
             }
         }
         let mut append_piece_accumulator = vec![None; n];
-        let forward_blocks = forward_reachable_mask(llbc, &body);
+        let forward_blocks = forward_reachable_mask(llbc, body);
         for c in owned_dests {
             if c >= n || !builder_mode[c] {
                 continue;
@@ -41352,7 +41517,7 @@ fn ref_temp_is_sole_append_arg(
     }
     let mut selected = 0usize;
     let mut other = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41371,10 +41536,8 @@ fn ref_temp_is_sole_append_arg(
                         other += 1;
                     }
                 }
-                Ok(StmtKind::Assert(a)) => {
-                    if operand_reads_local(&a.cond, rt) {
-                        other += 1;
-                    }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
                 }
                 _ => {}
             }
@@ -41406,10 +41569,8 @@ fn ref_temp_is_sole_append_arg(
                     other += 1;
                 }
             }
-            Ok(TermKind::Assert { assert, .. }) => {
-                if operand_reads_local(&assert.cond, rt) {
-                    other += 1;
-                }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
             }
             _ => {}
         }
@@ -41458,7 +41619,7 @@ fn clean_accumulator_ref_temps_scan(
     c: usize,
 ) -> Option<Vec<usize>> {
     let mut ref_temps: Vec<usize> = Vec::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41549,10 +41710,8 @@ fn clean_accumulator_ref_temps_scan(
                     return None;
                 }
             }
-            Ok(TermKind::Assert { assert, .. }) => {
-                if c_operand_kind(&assert.cond, c).is_some() {
-                    return None;
-                }
+            Ok(TermKind::Assert { assert, .. }) if c_operand_kind(&assert.cond, c).is_some() => {
+                return None;
             }
             _ => {}
         }
@@ -41661,7 +41820,7 @@ fn sole_string_alias_successor_scan(
     }
     let mut successor: Option<usize> = None;
     let mut other = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41773,7 +41932,7 @@ fn append_arg_of_borrow_scan(
     }
     let mut recv: Option<usize> = None;
     let mut other = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -41801,10 +41960,8 @@ fn append_arg_of_borrow_scan(
                         other += 1;
                     }
                 }
-                Ok(StmtKind::Assert(a)) => {
-                    if operand_reads_local(&a.cond, rt) {
-                        other += 1;
-                    }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
                 }
                 _ => {}
             }
@@ -41827,10 +41984,8 @@ fn append_arg_of_borrow_scan(
                     other += 1;
                 }
             }
-            Ok(TermKind::Assert { assert, .. }) => {
-                if operand_reads_local(&assert.cond, rt) {
-                    other += 1;
-                }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
             }
             _ => {}
         }
@@ -41909,7 +42064,7 @@ fn append_piece_accumulator_of_arg_temp(
 ) -> Option<usize> {
     let cache = ScanCache::new(body.locals.locals.len());
     cache.precompute_fresh(body, llbc);
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for candidate in owned_builder_dest_locals(body, llbc) {
         if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
             continue;
@@ -41957,7 +42112,7 @@ fn accumulator_materialization_site_count(
     }
     let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
     let mut moves = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42018,7 +42173,7 @@ fn accumulator_materialization_site_count(
 fn single_def_is_str_builder_ctor(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     let mut defs = 0usize;
     let mut ctor = false;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42366,7 +42521,7 @@ fn is_vec_index_mut_call(
 /// the `base` local the slice aliases. See [`str_chars_view_base`].
 fn str_chars_view_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42462,13 +42617,38 @@ fn operand_is_lowlevel_string_chars_offset(body: &Unstructured, llbc: &Llbc, op:
     }
 }
 
+/// `LOWLEVEL_STRING_CHARS_OFFSET` (`lowlevel_string.rs`) — `size_of` the
+/// rstr `STR` header (`rstr.py` `STR`).
+const LOWLEVEL_STRING_CHARS_OFFSET_PATH: &str =
+    "pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET";
+
 fn place_is_chars_offset_global(llbc: &Llbc, place: Option<&Place>) -> bool {
     let Some(PlaceKind::Global { id, .. }) = place.map(|place| &place.kind) else {
         return false;
     };
-    llbc.global_by_id(*id).is_some_and(|global| {
-        global.item_meta.name_path() == "pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET"
-    })
+    llbc.global_by_id(*id)
+        .is_some_and(|global| global.item_meta.name_path() == LOWLEVEL_STRING_CHARS_OFFSET_PATH)
+}
+
+/// rstr `STR` (`rstr.py` `STR`) — `W_UnicodeObject._utf8` and the layout
+/// type next to `LOWLEVEL_STRING_CHARS_OFFSET`.
+fn is_lowlevel_string_header_adt_path(path: &str) -> bool {
+    matches!(
+        path,
+        "pyre_object::unicodeobject::Utf8Str"
+            | "pyre_object::lowlevel_string::LowlevelStringHeader"
+    )
+}
+
+/// `*const Utf8Str` / `*mut Utf8Str` / `*const LowlevelStringHeader` — the
+/// rstr `STR` header (`rstr.py` `STR`).
+fn tyref_is_lowlevel_string_header_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
+        return false;
+    };
+    adt_node_def_id(pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| is_lowlevel_string_header_adt_path(td.item_meta.name_path_str()))
 }
 
 fn operand_place(op: &Operand) -> Option<&Place> {
@@ -42483,7 +42663,7 @@ fn operand_place(op: &Operand) -> Option<&Place> {
 fn defining_call(llbc: &Llbc, body: &Unstructured, local: usize) -> Option<CallPayload> {
     let mut found = None;
     let mut producers = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42530,7 +42710,7 @@ fn vtable_slot_under_fn_ptr_cast(
 fn defining_assign<'a>(llbc: &Llbc, body: &'a Unstructured, local: usize) -> Option<&'a Rvalue> {
     let mut found = None;
     let mut producers = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -42734,7 +42914,7 @@ fn rvalue_copied_local(rvalue: &Rvalue) -> Option<usize> {
 fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local: usize) -> bool {
     let mut alias = vec![dest_local];
     let mut grew = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while grew {
         grew = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -42983,7 +43163,7 @@ fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::Call
 /// `pin_root`, with an optional `<Impl>` segment between them.
 fn gc_root_pin_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.last() == Some(&"pin_root") && segments.iter().any(|s| *s == "gc_roots")
+    segments.last() == Some(&"pin_root") && segments.contains(&"gc_roots")
 }
 
 /// The root-bracket guard type and the call that closes one.
@@ -42998,15 +43178,15 @@ pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
 /// True for the root-bracket guard's own type path.
 fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+    segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&"drop_in_place")
-        && segments.iter().any(|s| *s == "gc_roots")
-        && segments.iter().any(|s| *s == "RootScope")
+        && segments.contains(&"gc_roots")
+        && segments.contains(&"RootScope")
 }
 
 /// `Drop` terminator JSON for `RootScope`, recovered from a `FunDecl`
@@ -43044,8 +43224,7 @@ fn frame_anchor_drop_glue_path(name: &str) -> bool {
     // Charon names the Drop impl `FrameAnchor::drop`; the MIR
     // terminator glue is `drop_in_place`. Either must close the
     // `frame_anchor_new_jit_abi` slot.
-    (last == Some("drop_in_place") || last == Some("drop"))
-        && segments.iter().any(|s| *s == "FrameAnchor")
+    (last == Some("drop_in_place") || last == Some("drop")) && segments.contains(&"FrameAnchor")
 }
 
 fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -43447,7 +43626,7 @@ fn place_ty_is_root_scope(place: &Place, llbc: &Llbc) -> bool {
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -43518,7 +43697,7 @@ fn unit_tyref() -> TyRef {
 /// carries the stamp for the same reason.
 fn gc_root_gcref_result_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.iter().any(|s| *s == "gc_roots")
+    segments.contains(&"gc_roots")
         && matches!(
             segments.last(),
             Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get") | Some(&"reload_top_root")
@@ -43694,7 +43873,7 @@ fn base_traces_to_items_block_accessor_matching(
     matches_accessor: fn(&RegularCall, &Llbc) -> bool,
 ) -> bool {
     let mut cur = base;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for _ in 0..32 {
         let mut producers = 0usize;
         let mut copy_src: Option<usize> = None;
@@ -43900,7 +44079,7 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
         write_derefs: 0,
         other: 0,
     };
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -43908,9 +44087,9 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_dest_ref(&rvalue, dest, &mut census.read_derefs, &mut census.other);
+                    scan_rvalue_dest_ref(rvalue, dest, &mut census.read_derefs, &mut census.other);
                     classify_write_place(
-                        &place,
+                        place,
                         dest,
                         &mut census.defs,
                         &mut census.write_derefs,
@@ -43927,7 +44106,7 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_dest_ref(
-                operand_dest_ref(&discr, dest),
+                operand_dest_ref(discr, dest),
                 &mut census.read_derefs,
                 &mut census.other,
             ),
@@ -44101,7 +44280,7 @@ fn struct_field_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> StructF
         fields: 0,
         other: 0,
     };
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -44109,9 +44288,9 @@ fn struct_field_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> StructF
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_struct_field(&rvalue, dest, &mut census.fields, &mut census.other);
+                    scan_rvalue_struct_field(rvalue, dest, &mut census.fields, &mut census.other);
                     classify_struct_field_write(
-                        &place,
+                        place,
                         dest,
                         &mut census.defs,
                         &mut census.fields,
@@ -44128,7 +44307,7 @@ fn struct_field_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> StructF
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_struct_field_use(
-                operand_struct_field_use(&discr, dest),
+                operand_struct_field_use(discr, dest),
                 &mut census.fields,
                 &mut census.other,
             ),
@@ -44292,7 +44471,7 @@ fn operand_root_local(op: &Operand) -> Option<usize> {
 /// A missing or repeated call declines the interior alias.
 fn ptr_add_def_site(llbc: &Llbc, body: &Unstructured, dest: usize) -> Option<(usize, usize)> {
     let mut found = None;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -44326,8 +44505,8 @@ fn stmt_has_struct_field_value_use(
     let mut other = 0usize;
     match stmt.stmt_kind_ref() {
         Ok(StmtKind::Assign(place, rvalue)) => {
-            scan_rvalue_struct_field(&rvalue, dest, &mut fields, &mut other);
-            if place_is_immediate_struct_field_of(&place, dest) {
+            scan_rvalue_struct_field(rvalue, dest, &mut fields, &mut other);
+            if place_is_immediate_struct_field_of(place, dest) {
                 fields += 1;
             }
         }
@@ -44474,10 +44653,10 @@ fn result_value_is_branched_or_returned(body: &Unstructured, llbc: &Llbc, dest: 
             if !matches!(place.kind, PlaceKind::Local(0)) {
                 continue;
             }
-            if let Rvalue::Use(op, _) = &*rvalue {
-                if operand_root_local(op) == Some(dest) {
-                    return true;
-                }
+            if let Rvalue::Use(op, _) = rvalue
+                && operand_root_local(op) == Some(dest)
+            {
+                return true;
             }
         }
     }
@@ -44520,10 +44699,10 @@ fn mir_successor_ids(llbc: &Llbc, bb: &BasicBlock) -> Vec<usize> {
 
 fn block_assigns_local(llbc: &Llbc, bb: &BasicBlock, local: usize) -> bool {
     for stmt in &bb.statements {
-        if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
-            if matches!(place.kind, PlaceKind::Local(i) if i as usize == local) {
-                return true;
-            }
+        if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+            && matches!(place.kind, PlaceKind::Local(i) if i as usize == local)
+        {
+            return true;
         }
     }
     matches!(
@@ -44570,7 +44749,7 @@ fn locals_assigned_reachable(
 fn header_producer(body: &Unstructured, llbc: &Llbc, cur: usize) -> Option<HeaderStep> {
     let mut producers = 0usize;
     let mut kind = HeaderProd::Stop;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -44718,8 +44897,8 @@ fn block_has_struct_field_value_use(llbc: &Llbc, bb: &BasicBlock, dest: usize) -
     for stmt in &bb.statements {
         match stmt.stmt_kind_ref() {
             Ok(StmtKind::Assign(place, rvalue)) => {
-                scan_rvalue_struct_field(&rvalue, dest, &mut fields, &mut other);
-                if place_is_immediate_struct_field_of(&place, dest) {
+                scan_rvalue_struct_field(rvalue, dest, &mut fields, &mut other);
+                if place_is_immediate_struct_field_of(place, dest) {
                     fields += 1;
                 }
             }
@@ -44735,7 +44914,7 @@ fn block_has_struct_field_value_use(llbc: &Llbc, bb: &BasicBlock, dest: usize) -
     }
     match bb.term_ref(llbc) {
         Ok(TermKind::Switch { discr, .. }) => bump_struct_field_use(
-            operand_struct_field_use(&discr, dest),
+            operand_struct_field_use(discr, dest),
             &mut fields,
             &mut other,
         ),
@@ -45282,7 +45461,7 @@ impl<'a> RootStackAnalyzer<'a> {
             self.call_returns_owned_scope(reg)
         });
         let covered = owned.covered_blocks(self.llbc, body, &name_of);
-        let forward_blocks = forward_reachable_mask(self.llbc, &body);
+        let forward_blocks = forward_reachable_mask(self.llbc, body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -45337,7 +45516,7 @@ impl<'a> RootStackAnalyzer<'a> {
                                     &owned.opener,
                                 )
                         });
-                        !owned_local && self.analyze_regular_call(&fn_ptr, seen)
+                        !owned_local && self.analyze_regular_call(fn_ptr, seen)
                     }
                     Ok(_) => false,
                     Err(_) => true,
@@ -45481,7 +45660,7 @@ fn owned_root_scopes(
     let moved = MovedOutLocals::new(body, llbc);
     let mut opener = std::collections::HashMap::new();
     let mut twice = bit_set::BitSet::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -45546,7 +45725,7 @@ fn body_returns_owned_scope(
     // Follow plain moves of a guard (`_21 = move _3`) to the local that
     // enters the aggregate.
     let mut guards = guards;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     loop {
         let before = guards.count();
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -45882,7 +46061,7 @@ fn root_bracket_region_dominators(
 fn root_pin_value_is_stable(llbc: &Llbc, body: &Unstructured, local: usize) -> bool {
     let mut definitions = usize::from(local > 0 && local <= body.locals.arg_count as usize);
     let watched: bit_set::BitSet = std::iter::once(local).collect();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -45936,7 +46115,7 @@ fn root_pin_value_is_stable_in_bracket(
         _ => None,
     };
     let own_dests: bit_set::BitSet = own_gets.iter().filter_map(|&bb| get_dest(bb)).collect();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46027,7 +46206,7 @@ fn root_bracket_stack_effects_are_known(
                 continue;
             }
             Ok(TermKind::Drop { fn_ptr, .. }) => {
-                if touches(&fn_ptr) {
+                if touches(fn_ptr) {
                     return false;
                 }
             }
@@ -46379,7 +46558,8 @@ fn pin_value_incoming_slice_elem(
 ) -> Option<(usize, u64)> {
     let mut local = value;
     for _ in 0..8 {
-        if let Some(rvalue) = unique_assigned_rvalue(body, local, assigned, forward_blocks) {
+        {
+            let rvalue = unique_assigned_rvalue(body, local, assigned, forward_blocks)?;
             match rvalue {
                 Rvalue::Use(operand, _) => {
                     if let Some(place) = operand_place(&operand)
@@ -46411,8 +46591,6 @@ fn pin_value_incoming_slice_elem(
                 }
                 _ => return None,
             }
-        } else {
-            return None;
         }
     }
     None
@@ -46570,7 +46748,7 @@ fn classify_root_slot_getter_body(
     let mut getter_arg: Option<Operand> = None;
     let mut getter_call: Option<(usize, usize)> = None;
     let mut calls = 0usize;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -46678,7 +46856,7 @@ fn getter_returns_follow_call(
         );
     }
     let mut saw_return = false;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
@@ -48175,7 +48353,7 @@ fn analyze_root_brackets_with(
     let mut candidates = bit_set::BitSet::new();
     let mut opener_block: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -48443,7 +48621,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
+                    use_operand_slot_src(body, &assigned, operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -48483,7 +48661,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
+                    use_operand_slot_src(body, &assigned, operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -48535,8 +48713,7 @@ fn analyze_root_brackets_with(
             let PlaceKind::Local(dest) = place.kind else {
                 continue;
             };
-            let (Some(src), Some(k)) =
-                (operand_local(Some(&lhs)), operand_usize_literal(llbc, &rhs))
+            let (Some(src), Some(k)) = (operand_local(Some(lhs)), operand_usize_literal(llbc, rhs))
             else {
                 continue;
             };
@@ -48558,7 +48735,7 @@ fn analyze_root_brackets_with(
                 from_len,
                 from_run,
             };
-            match root_slot_sum_is_checked(&op) {
+            match root_slot_sum_is_checked(op) {
                 Some(true) => {
                     sums.insert(dest as usize, slot);
                 }
@@ -48583,7 +48760,7 @@ fn analyze_root_brackets_with(
             let (Operand::Copy(src) | Operand::Move(src)) = &operand else {
                 continue;
             };
-            let Some(sum) = checked_sum_field_local(&src, 0) else {
+            let Some(sum) = checked_sum_field_local(src, 0) else {
                 continue;
             };
             if let Some(slot) = sums.get(&sum).copied()
@@ -48611,7 +48788,7 @@ fn analyze_root_brackets_with(
                 };
                 let (PlaceKind::Local(dest), Some(src)) = (
                     &place.kind,
-                    use_operand_slot_src(body, &assigned, &operand, &forward_blocks),
+                    use_operand_slot_src(body, &assigned, operand, &forward_blocks),
                 ) else {
                     continue;
                 };
@@ -48697,7 +48874,7 @@ fn analyze_root_brackets_with(
                 }
                 // `_t = copy _slot`, the argument temporary (2.5) recorded,
                 // and a field of a tuple aggregate that names the same slot.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, &operand, &forward_blocks)) =>
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, operand, &forward_blocks)) =>
                 {
                     continue;
                 }
@@ -48729,7 +48906,7 @@ fn analyze_root_brackets_with(
                     place,
                     Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _),
                 )) if matches!(place.kind, PlaceKind::Local(d) if offsets.contains_key(&(d as usize)))
-                    && checked_sum_field_local(&src, 0)
+                    && checked_sum_field_local(src, 0)
                         .is_some_and(|sum| sums.contains_key(&sum)) =>
                 {
                     continue;
@@ -48810,17 +48987,15 @@ fn analyze_root_brackets_with(
                 if call.args.len() == 2
                     && free_leaf.as_deref() == Some("shadow_stack_copy_range")
                     && let Some(index) = operand_local(call.args.first())
-                {
-                    if let Some(scope) = bases
+                    && let Some(scope) = bases
                         .get(&index)
                         .copied()
                         .or_else(|| offsets.get(&index).map(|slot| slot.scope))
-                        && candidates.contains(scope)
-                    {
-                        range_copies.push((bb_idx, scope, index));
-                        free_sites.insert(bb_idx, scope);
-                        continue;
-                    }
+                    && candidates.contains(scope)
+                {
+                    range_copies.push((bb_idx, scope, index));
+                    free_sites.insert(bb_idx, scope);
+                    continue;
                 }
                 if call.args.len() == 1 && !dest_is_guard {
                     match free_leaf.as_deref() {
@@ -49671,7 +49846,7 @@ fn analyze_owner_roots_with(
     // reborrow `_u = &(*_t)` MIR inserts for an auto-deref receiver.
     let mut borrow_of: Vec<Option<usize>> = vec![None; n_locals];
     let mut changed = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -49688,7 +49863,7 @@ fn analyze_owner_roots_with(
                     continue;
                 };
                 let dest = dest as usize;
-                let Some(root) = owner_root_borrow_source(&src, &roots, &borrow_of) else {
+                let Some(root) = owner_root_borrow_source(src, &roots, &borrow_of) else {
                     continue;
                 };
                 match borrow_of.get(dest).copied() {
@@ -49844,7 +50019,7 @@ fn owner_root_borrow_source(
 /// the guard's own constructor.
 fn gc_root_scope_open_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    if !segments.iter().any(|s| *s == "gc_roots") {
+    if !segments.contains(&"gc_roots") {
         return false;
     }
     matches!(segments.last(), Some(&"push_roots"))
@@ -49855,7 +50030,7 @@ fn gc_root_scope_open_path(name: &str) -> bool {
 /// True for the read that answers a bracket's own first slot index.
 fn gc_root_scope_base_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    matches!(segments.last(), Some(&"base")) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+    matches!(segments.last(), Some(&"base")) && segments.contains(&ROOT_SCOPE_MODULE)
 }
 
 /// CFG successors the lowering keeps: `Goto` / `Call` / `Assert` / `Drop`
@@ -50187,7 +50362,7 @@ fn elaborate_explicit_root_closes(
         dest: usize,
     }
     let mut closes: Vec<Close> = Vec::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50506,7 +50681,7 @@ fn local_move_counts(body: &Unstructured, llbc: &Llbc) -> std::collections::Hash
         .collect();
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let mut out = std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50586,7 +50761,7 @@ fn root_scope_drop_sites(
 ) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
     let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50639,7 +50814,7 @@ fn compute_index_write_extra_live(
 ) -> Vec<Vec<usize>> {
     let mut index_call: std::collections::HashMap<usize, (Option<usize>, Option<usize>)> =
         std::collections::HashMap::new();
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50718,7 +50893,7 @@ fn compute_index_write_extra_live(
             let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() else {
                 continue;
             };
-            if let Some(p) = deref_write_base_local(&place)
+            if let Some(p) = deref_write_base_local(place)
                 && let Some((base, idx)) = index_call.get(&p)
             {
                 extra[bb_idx].extend(base.iter().copied());
@@ -50744,7 +50919,7 @@ fn compute_interior_field_extra_live(
     tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<Vec<usize>> {
     let mut extra = vec![Vec::new(); body.body.len()];
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -50825,11 +51000,11 @@ fn compute_mir_liveness(
             };
             match kind {
                 StmtKind::Assign(place, rvalue) => {
-                    mark_rvalue_uses(&rvalue, &mut uses[bb_idx], &defs[bb_idx], n_locals);
-                    mark_place_write(&place, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
+                    mark_rvalue_uses(rvalue, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                    mark_place_write(place, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
                 }
                 StmtKind::PlaceMention(place) => {
-                    mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx], n_locals)
+                    mark_place_use(place, &mut uses[bb_idx], &defs[bb_idx], n_locals)
                 }
                 StmtKind::Assert(assert) => {
                     mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx], n_locals)
@@ -50849,7 +51024,7 @@ fn compute_mir_liveness(
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks)
             }
             TermKind::Switch { discr, targets } => {
-                mark_operand_use(&discr, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                mark_operand_use(discr, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 match targets {
                     SwitchTargets::If(a, b) => {
                         push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *a, n_blocks);
@@ -50864,7 +51039,7 @@ fn compute_mir_liveness(
                 }
             }
             TermKind::Call { call, target, .. } => {
-                mark_call_uses(&call, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                mark_call_uses(call, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 mark_place_write(&call.dest, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks);
             }
@@ -50875,7 +51050,7 @@ fn compute_mir_liveness(
             TermKind::Drop { place, target, .. } => {
                 // Glue calls read the dropped local; erased drops do not.
                 if glue_call_drops.contains(bb_idx) {
-                    mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                    mark_place_use(place, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 }
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks)
             }
@@ -51555,10 +51730,10 @@ fn pointer_elem_pointee_is_gc(
     else {
         return false;
     };
-    if let Some(def_id) = adt_node_def_id(pointee) {
-        if adt_path_is_gc_container(llbc, def_id) {
-            return true;
-        }
+    if let Some(def_id) = adt_node_def_id(pointee)
+        && adt_path_is_gc_container(llbc, def_id)
+    {
+        return true;
     }
     declared_adt_struct_id(pointee, llbc).is_some_and(|sid| gc_struct_ids.contains(&sid))
 }
@@ -52179,7 +52354,7 @@ fn unstructured_address_escape(
     // summary reads this once the join has settled.
     let mut returned_at = vec![None; n];
     let mut changed = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
         for (index, block) in body.body.iter().enumerate() {
@@ -53997,10 +54172,9 @@ fn pointer_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     let obj = node.as_object()?;
     let pointee = if let Some(parts) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
         parts.first()?
-    } else if let Some(parts) = obj.get("Ref").and_then(serde_json::Value::as_array) {
-        parts.get(1)?
     } else {
-        return None;
+        let parts = obj.get("Ref").and_then(serde_json::Value::as_array)?;
+        parts.get(1)?
     };
     serde_json::from_value(pointee.clone()).ok()
 }
@@ -55125,7 +55299,6 @@ pub(crate) fn collect_foreign_opaque_method_externals(
 /// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
 /// directly from its `<Impl>` NameSeg, the free-function twin of
 /// [`Lowering::resolve_impl_owner_adt_def_id`] over the `<Impl>` segment.
-#[cfg(any(test, feature = "mir-frontend"))]
 fn impl_owner_adt_def_id_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<u64> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
@@ -55162,7 +55335,6 @@ fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
 /// `Ref(Some(root))` so the residual intern's the enum-base ClassDef;
 /// every other shape (`Option`, fieldless enum, tuple, reference,
 /// non-opaque struct) is declined.
-#[cfg(any(test, feature = "mir-frontend"))]
 fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     // A reference return (`&T`) is not the owned residual result the
     // stub models; decline.
@@ -56097,14 +56269,13 @@ fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
             "Isize" | "Usize" => Some(crate::layout::target_word_size() as u64),
             _ => None,
         };
-        if let Some(int) = scalar.get("Integer").and_then(serde_json::Value::as_object) {
-            if let Some(kind) = int
+        if let Some(int) = scalar.get("Integer").and_then(serde_json::Value::as_object)
+            && let Some(kind) = int
                 .get("Signed")
                 .or_else(|| int.get("Unsigned"))
                 .and_then(serde_json::Value::as_str)
-            {
-                return scalar_size(kind);
-            }
+        {
+            return scalar_size(kind);
         }
         if let Some(kind) = scalar.get("Float").and_then(serde_json::Value::as_str) {
             return scalar_size(kind);
@@ -56930,10 +57101,10 @@ fn ty_is_raw_address(
     // `Option<*mut T>` has no niche (`*mut T` may be null), so it stays the
     // tagged Option instance: `flatten.py` `make_return` / `history.getkind`
     // of that CFG return is `ref`, and `FUNC.RESULT` must agree.
-    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
-        if !tyref_is_raw_pointer(&payload, llbc) {
-            return ty_is_raw_address(&payload, llbc, gc_struct_ids);
-        }
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
+        && !tyref_is_raw_pointer(&payload, llbc)
+    {
+        return ty_is_raw_address(&payload, llbc, gc_struct_ids);
     }
     false
 }
@@ -57752,10 +57923,7 @@ fn option_nonzero_word_kind_inner(ty: &TyRef, llbc: &Llbc, peel_shared: bool) ->
             return None;
         };
         if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            option = match llbc.dedup_body(id) {
-                Some(next) => next,
-                None => return None,
-            };
+            option = llbc.dedup_body(id)?;
             continue;
         }
         if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
@@ -57775,10 +57943,7 @@ fn option_nonzero_word_kind_inner(ty: &TyRef, llbc: &Llbc, peel_shared: bool) ->
                 return None;
             }
             peeled_ref = true;
-            option = match arr.get(1) {
-                Some(next) => next,
-                None => return None,
-            };
+            option = arr.get(1)?;
             continue;
         }
         break;
@@ -64651,9 +64816,9 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 | Ok(StmtKind::PlaceMention(_))
                 | Ok(StmtKind::Borrowck(_)) => {}
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    if let Some((arr_local, index_op)) = array_index_place(&place) {
+                    if let Some((arr_local, index_op)) = array_index_place(place) {
                         let index = arr_index(llbc, &locals, &index_op)?;
-                        let value = arr_as_i64(&eval_arr_rvalue(llbc, &locals, &rvalue, depth)?)?;
+                        let value = arr_as_i64(&eval_arr_rvalue(llbc, &locals, rvalue, depth)?)?;
                         let ArrVal::Arr(items) = locals.get_mut(&arr_local)? else {
                             return None;
                         };
@@ -64664,7 +64829,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                     let PlaceKind::Local(dst) = place.kind else {
                         return None;
                     };
-                    let value = eval_arr_rvalue(llbc, &locals, &rvalue, depth)?;
+                    let value = eval_arr_rvalue(llbc, &locals, rvalue, depth)?;
                     locals.insert(dst, value);
                 }
                 _ => return None,
@@ -64690,7 +64855,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 bb = *target as usize;
             }
             TermKind::Switch { discr, targets } => {
-                let ArrVal::Lit(ConstLit::Bool(cond)) = eval_arr_operand(llbc, &locals, &discr)?
+                let ArrVal::Lit(ConstLit::Bool(cond)) = eval_arr_operand(llbc, &locals, discr)?
                 else {
                     return None;
                 };
@@ -64703,7 +64868,7 @@ fn eval_const_int_array(llbc: &Llbc, u: &Unstructured, depth: usize) -> Option<V
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
-                locals.insert(dst, eval_arr_call(llbc, &locals, &call, depth)?);
+                locals.insert(dst, eval_arr_call(llbc, &locals, call, depth)?);
                 bb = *target as usize;
             }
             TermKind::UnwindResume
@@ -64889,6 +65054,162 @@ fn arr_as_i64(val: &ArrVal) -> Option<i64> {
     }
 }
 
+fn projection_is_named_field(elem: &ProjectionElem) -> bool {
+    matches!(
+        elem,
+        ProjectionElem::Tagged(payload)
+            if payload.as_object().is_some_and(|map| map.contains_key("Field"))
+    )
+}
+
+/// `local.field` or a nested field of it, without a deref in the chain.
+fn place_is_field_projection_of_local(place: &Place, dest: usize) -> bool {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return false;
+    };
+    if !projection_is_named_field(elem) {
+        return false;
+    }
+    match &inner.kind {
+        PlaceKind::Local(i) => *i as usize == dest,
+        PlaceKind::Projection(_, _) => place_is_field_projection_of_local(inner, dest),
+        _ => false,
+    }
+}
+
+enum ConstStructUse {
+    None,
+    FieldRead,
+    Other,
+}
+
+fn operand_const_struct_use(op: &Operand, dest: usize) -> ConstStructUse {
+    let (Operand::Copy(place) | Operand::Move(place)) = op else {
+        return ConstStructUse::None;
+    };
+    if place_is_field_projection_of_local(place, dest) {
+        ConstStructUse::FieldRead
+    } else if place_references_local(place, dest) {
+        ConstStructUse::Other
+    } else {
+        ConstStructUse::None
+    }
+}
+
+fn bump_const_struct_use(use_kind: ConstStructUse, fields: &mut usize, other: &mut usize) {
+    match use_kind {
+        ConstStructUse::FieldRead => *fields += 1,
+        ConstStructUse::Other => *other += 1,
+        ConstStructUse::None => {}
+    }
+}
+
+fn scan_rvalue_const_struct(rvalue: &Rvalue, dest: usize, fields: &mut usize, other: &mut usize) {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::ShallowInitBox(op, _) => {
+            bump_const_struct_use(operand_const_struct_use(op, dest), fields, other);
+        }
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            bump_const_struct_use(operand_const_struct_use(lhs, dest), fields, other);
+            bump_const_struct_use(operand_const_struct_use(rhs, dest), fields, other);
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Len(place) | Rvalue::Discriminant(place) => {
+            if place_is_field_projection_of_local(place, dest) {
+                *fields += 1;
+            } else if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                bump_const_struct_use(operand_const_struct_use(op, dest), fields, other);
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+    }
+}
+
+/// `fold_op_list` keeps any operation it cannot prove safe. Fold a
+/// const-struct local only when every use is a field read: a projected
+/// store, address-taking, or whole-value consumer leaves the aggregate.
+fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
+    if dest == 0 {
+        return false;
+    }
+    let mut fields = 0usize;
+    let mut other = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    scan_rvalue_const_struct(&rvalue, dest, &mut fields, &mut other);
+                    if matches!(place.kind, PlaceKind::Local(i) if i as usize == dest) {
+                    } else if place_is_field_projection_of_local(&place, dest)
+                        || place_references_local(&place, dest)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(assert)) => bump_const_struct_use(
+                    operand_const_struct_use(&assert.cond, dest),
+                    &mut fields,
+                    &mut other,
+                ),
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. }) => bump_const_struct_use(
+                operand_const_struct_use(&discr, dest),
+                &mut fields,
+                &mut other,
+            ),
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func {
+                    bump_const_struct_use(
+                        operand_const_struct_use(op, dest),
+                        &mut fields,
+                        &mut other,
+                    );
+                }
+                for arg in &call.args {
+                    bump_const_struct_use(
+                        operand_const_struct_use(arg, dest),
+                        &mut fields,
+                        &mut other,
+                    );
+                }
+                if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
+                } else if place_is_field_projection_of_local(&call.dest, dest)
+                    || place_references_local(&call.dest, dest)
+                {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => bump_const_struct_use(
+                operand_const_struct_use(&assert.cond, dest),
+                &mut fields,
+                &mut other,
+            ),
+            _ => {}
+        }
+    }
+    other == 0
+}
+
 /// Integer fields of a `NamedConst` whose initializer builds one
 /// multi-field aggregate of integer literals (`ArrayToken { base_size,
 /// item_size, len_offset }`). A whole-struct read of that const is an
@@ -64990,7 +65311,7 @@ fn eval_const_struct_init(llbc: &Llbc, u: &Unstructured) -> Option<Vec<u64>> {
                 if dst >= n {
                     return None;
                 }
-                lits[dst] = Some(const_eval_size_align_call(llbc, &call)?);
+                lits[dst] = Some(const_eval_size_align_call(llbc, call)?);
                 structs[dst] = None;
                 bb = *target as usize;
             }
@@ -65135,7 +65456,7 @@ fn const_eval_init_body_with_locals(
                             {
                                 ConstLit::EnumDisc(disc)
                             } else {
-                                let index = const_transparent_aggregate_field(llbc, &kind)?;
+                                let index = const_transparent_aggregate_field(llbc, kind)?;
                                 eval_operand(&locals, operands.get(index)?)?
                             }
                         }
@@ -65174,7 +65495,7 @@ fn const_eval_init_body_with_locals(
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
-                let value = match const_eval_size_align_call(llbc, &call) {
+                let value = match const_eval_size_align_call(llbc, call) {
                     Some(value) => value,
                     None => {
                         let args = call
@@ -65182,7 +65503,7 @@ fn const_eval_init_body_with_locals(
                             .iter()
                             .map(|arg| eval_operand(&locals, arg))
                             .collect::<Option<Vec<_>>>()?;
-                        const_eval_const_fn_call(llbc, &call, &args, depth)?
+                        const_eval_const_fn_call(llbc, call, &args, depth)?
                     }
                 };
                 locals.insert(dst, value);
@@ -65590,10 +65911,9 @@ fn const_cast_int(n: i64, target: &serde_json::Value) -> Option<i64> {
         .and_then(serde_json::Value::as_object)?;
     let (signed, width) = if let Some(w) = int.get("Signed") {
         (true, w.as_str()?)
-    } else if let Some(w) = int.get("Unsigned") {
-        (false, w.as_str()?)
     } else {
-        return None;
+        let w = int.get("Unsigned")?;
+        (false, w.as_str()?)
     };
     let bits: u32 = match width {
         "I8" | "U8" => 8,
@@ -69852,7 +70172,7 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
     // loop.
     let mut referent = vec![None; n];
     let mut changed = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -69951,7 +70271,7 @@ fn item_addr_locals(
     let n = body.locals.locals.len();
     let mut addr = vec![false; n];
     let mut changed = true;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     while changed {
         changed = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -70788,7 +71108,7 @@ fn rust_vec_deref_feeds_only_reverse(body: &Unstructured, llbc: &Llbc, local: us
     let mut watched = bit_set::BitSet::new();
     watched.insert(local);
     let mut reverses = 0;
-    let forward_blocks = forward_reachable_mask(llbc, &body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -72433,20 +72753,20 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
             .operations
             .get(site.format_idx)
             .and_then(|op| op.result.clone());
-        if let Some(format_result) = format_result {
-            if !forward_identity(graph, &format_result, &site.fmt_args) {
-                // The format result is a block input. Keep the copy.
-                if let Some(op) = graph
-                    .block_mut(site.format_block)
-                    .operations
-                    .get_mut(site.format_idx)
-                {
-                    op.kind = OpKind::UnaryOp {
-                        op: "same_as".to_string(),
-                        operand: site.fmt_args.clone(),
-                        result_ty: ValueType::Ref(None),
-                    };
-                }
+        if let Some(format_result) = format_result
+            && !forward_identity(graph, &format_result, &site.fmt_args)
+        {
+            // The format result is a block input. Keep the copy.
+            if let Some(op) = graph
+                .block_mut(site.format_block)
+                .operations
+                .get_mut(site.format_idx)
+            {
+                op.kind = OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand: site.fmt_args.clone(),
+                    result_ty: ValueType::Ref(None),
+                };
             }
         }
         // 3. Fold the rendered values with the literal pieces at the args
@@ -85749,6 +86069,273 @@ mod tests {
         assert!(
             graph_calls_leaf(&graph, "from_raw_parts"),
             "a length from a different base must not drop n"
+        );
+    }
+
+    /// `p.add/sub(LOWLEVEL_STRING_CHARS_OFFSET)` with no string-header peel.
+    fn ptr_offset_chars_const_fun(
+        caller_name: &str,
+        callee_path: &[&str],
+        ptr_ty: serde_json::Value,
+    ) -> Llbc {
+        let usize_t = usize_ty();
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", caller_name], "", true),
+            "signature": {"is_unsafe": true, "inputs": [ptr_ty], "output": ptr_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ptr_ty},
+                    {"index": 1, "name": "p", "span": span_json(), "ty": ptr_ty}
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": {"kind": {"Local": 1}, "ty": ptr_ty}},
+                                {"Copy": {"kind": {"Global": {
+                                    "generics": empty_generics(),
+                                    "id": 1
+                                }}, "ty": usize_t}}
+                            ],
+                            "dest": {"kind": {"Local": 0}, "ty": ptr_ty}
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(callee_path, "", false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [ptr_ty, usize_t],
+                "output": ptr_ty
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, callee],
+                "global_decls": [null, chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET")],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("chars-offset add fixture parses")
+    }
+
+    fn u8_raw_ptr_ty(mutability: &str) -> serde_json::Value {
+        serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, mutability]
+        })
+    }
+
+    fn graph_has_direct_ptradd(graph: &crate::model::FunctionGraph) -> bool {
+        graph_ops(graph)
+            .iter()
+            .any(|op| is_lltype_direct_ptradd(op))
+    }
+
+    #[test]
+    fn u8_add_of_string_chars_offset_stays_direct_ptradd() {
+        let ptr_ty = u8_raw_ptr_ty("Mut");
+        let llbc = ptr_offset_chars_const_fun(
+            "add_u8_chars_offset",
+            &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "add_u8_chars_offset")
+            .expect("lower *mut u8::add of LOWLEVEL_STRING_CHARS_OFFSET");
+        assert!(
+            graph_has_direct_ptradd(&graph),
+            "a u8 pointer add of the chars offset keeps its displacement; graph={graph:#?}"
+        );
+    }
+
+    #[test]
+    fn u8_sub_of_string_chars_offset_stays_direct_ptradd() {
+        let ptr_ty = u8_raw_ptr_ty("Mut");
+        let llbc = ptr_offset_chars_const_fun(
+            "sub_u8_chars_offset",
+            &["core", "ptr", "mut_ptr", "<Impl>", "sub"],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "sub_u8_chars_offset")
+            .expect("lower *mut u8::sub of LOWLEVEL_STRING_CHARS_OFFSET");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+            "a u8 pointer sub of the chars offset keeps its displacement; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg")),
+            "the sub must negate the count; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn i64_add_of_string_chars_offset_stays_direct_ptradd() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Const"]
+        });
+        let llbc = ptr_offset_chars_const_fun(
+            "add_i64_chars_offset",
+            &["core", "ptr", "const_ptr", "<Impl>", "add"],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "add_i64_chars_offset")
+            .expect("lower *const i64::add of LOWLEVEL_STRING_CHARS_OFFSET");
+        assert!(
+            graph_has_direct_ptradd(&graph),
+            "a non-byte pointer add of the chars offset keeps its displacement; graph={graph:#?}"
+        );
+    }
+
+    fn header_as_u8_add_chars_offset_fun(header_path: &[&str]) -> Llbc {
+        let u8_ptr = u8_raw_ptr_ty("Const");
+        let header_ptr = serde_json::json!({
+            "RawPtr": [{
+                "Adt": {
+                    "id": 0,
+                    "generics": empty_generics()
+                }
+            }, "Const"]
+        });
+        let usize_t = usize_ty();
+        let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+        let header_adt = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(header_path, "", true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": isize_t, "attr_info": null},
+                {"name": "length", "ty": usize_t, "attr_info": null}
+            ]},
+            "layout": null
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "header_chars_view"], "", true),
+            "signature": {"is_unsafe": true, "inputs": [header_ptr], "output": u8_ptr},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": u8_ptr},
+                    {"index": 1, "name": "s", "span": span_json(), "ty": header_ptr},
+                    {"index": 2, "name": null, "span": span_json(), "ty": u8_ptr}
+                ]},
+                "body": [
+                    {
+                        "statements": [{
+                            "span": span_json(),
+                            "kind": {"Assign": [
+                                {"kind": {"Local": 2}, "ty": u8_ptr},
+                                {"UnaryOp": [
+                                    {"Cast": {"RawPtr": [header_ptr, u8_ptr]}},
+                                    {"Move": {"kind": {"Local": 1}, "ty": header_ptr}}
+                                ]}
+                            ]}
+                        }],
+                        "terminator": {"span": span_json(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Move": {"kind": {"Local": 2}, "ty": u8_ptr}},
+                                {"Copy": {"kind": {"Global": {
+                                    "generics": empty_generics(),
+                                    "id": 1
+                                }}, "ty": usize_t}}
+                            ],
+                            "dest": {"kind": {"Local": 0}, "ty": u8_ptr}
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(
+                &["core", "ptr", "const_ptr", "<Impl>", "add"],
+                "",
+                false
+            ),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [u8_ptr, usize_t],
+                "output": u8_ptr
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [header_adt],
+                "fun_decls": [caller, callee],
+                "global_decls": [null, chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET")],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes())
+            .expect("header-as-u8 chars-offset add fixture parses")
+    }
+
+    #[test]
+    fn utf8str_as_u8_add_of_chars_offset_aliases_the_header() {
+        let llbc = header_as_u8_add_chars_offset_fun(&["pyre_object", "unicodeobject", "Utf8Str"]);
+        let graph = super::lower_function(&llbc, "header_chars_view")
+            .expect("lower (Utf8Str as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)");
+        assert!(
+            !graph_has_direct_ptradd(&graph),
+            "s.chars is the STR, not a displaced byte pointer; graph={graph:#?}"
+        );
+        assert!(
+            !call_leafs(&graph_ops(&graph))
+                .iter()
+                .any(|leaf| *leaf == "add"),
+            "the header chars add must not residualize; graph={graph:#?}"
+        );
+    }
+
+    #[test]
+    fn other_module_utf8str_as_u8_add_of_chars_offset_stays_direct_ptradd() {
+        let llbc = header_as_u8_add_chars_offset_fun(&["other_crate", "Utf8Str"]);
+        let graph = super::lower_function(&llbc, "header_chars_view")
+            .expect("lower (other Utf8Str as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)");
+        assert!(
+            graph_has_direct_ptradd(&graph),
+            "a same-leaf Utf8Str outside pyre_object::unicodeobject is not rstr STR; graph={graph:#?}"
         );
     }
 
@@ -104358,5 +104945,185 @@ mod tests {
             !link_carries(&graph, field),
             "the ItemsBlock header must not replace the call; ops={ops:?}"
         );
+    }
+
+    /// `float_to_int_or_float` is `source = float_items.as_slice();
+    /// Vec::with_capacity(source.len())`. The as_slice fold used to keep
+    /// only `block` (`ll_items`); `source.len()` then became
+    /// `ll_fixed_length`. Record `l.length` (`ll_length`).
+    #[test]
+    fn float_array_slice_len_reads_logical_len() {
+        let graph = lower_object_fn("pyre_object::listobject::float_to_int_or_float");
+        let ops = graph_ops(&graph);
+        let has_len = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty: ValueType::Int, .. }
+                    if field.name == "len"
+                        && field.owner_root.as_deref() == Some("FloatArray")
+            )
+        });
+        let has_block = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "block"
+                        && field.owner_root.as_deref() == Some("FloatArray")
+            )
+        });
+        let has_arraylen = ops
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. }));
+        assert!(
+            has_len,
+            "as_slice().len() must read FloatArray.len (ll_length); ops={ops:?}"
+        );
+        assert!(
+            has_block,
+            "as_slice must read FloatArray.block (ll_items); ops={ops:?}"
+        );
+        assert!(
+            !has_arraylen,
+            "view length is ll_length, not ll_fixed_length; ops={ops:?}"
+        );
+    }
+
+    /// `[PyObject]` narrowing follows the ARRAY identity
+    /// (`SomeList.rtyper_makerepr`), not a graph-name test. `kwargs_at`
+    /// and `w_tuple_new_from_slice` share `&[PyObjectRef]`.
+    #[test]
+    fn object_array_index_narrows_from_the_array_type() {
+        for name in [
+            "pyre_object::kwargsdict::kwargs_at",
+            "pyre_object::tupleobject::w_tuple_new_from_slice",
+        ] {
+            let graph = lower_object_fn(name);
+            let ops = graph_ops(&graph);
+            assert!(
+                ops.iter()
+                    .any(|op| crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")),
+                "{name} must narrow the object-array index through [PyObject]; ops={ops:?}"
+            );
+        }
+    }
+
+    /// `fold_op_list` keeps any operation it cannot prove safe. Fold a
+    /// const-struct local only when every use is a field read.
+    #[test]
+    fn const_struct_fold_requires_field_reads_only() {
+        use majit_charon_reader::ullbc::Unstructured;
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let field_place = |i: u64, idx: u64| {
+            serde_json::json!({
+                "kind": {"Projection": [place_local(i), {"Field": [null, idx]}]},
+                "ty": ty()
+            })
+        };
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let body_of = |extra: Vec<serde_json::Value>| -> Unstructured {
+            let mut statements = vec![stmt(serde_json::json!({
+                "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
+            }))];
+            statements.extend(extra);
+            let body_json = serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 0, "locals": [local(0), local(1), local(2)]},
+                "body": [{
+                    "statements": statements,
+                    "terminator": {"kind": "Return"}
+                }]
+            });
+            serde_json::from_value(body_json).expect("fixture Unstructured parses")
+        };
+        let llbc = fixture_llbc();
+        let accepts = |body: &Unstructured, dest: usize| {
+            super::const_struct_uses_are_field_reads(&llbc, body, dest)
+        };
+
+        let reads = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(2), {"Use": [{"Copy": field_place(1, 0)}, "No"]}]
+        }))]);
+        assert!(accepts(&reads, 1), "field reads only");
+
+        let store = body_of(vec![stmt(serde_json::json!({
+            "Assign": [field_place(1, 0), {"Use": [{"Copy": place_local(2)}, "No"]}]
+        }))]);
+        assert!(!accepts(&store, 1), "projected store");
+
+        let address = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(2), {
+                "Ref": {"place": place_local(1), "kind": "Shared", "ptr_metadata": null}
+            }]
+        }))]);
+        assert!(!accepts(&address, 1), "address-taking");
+
+        let whole = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+        }))]);
+        assert!(!accepts(&whole, 1), "whole-value consumer");
+
+        assert!(
+            !accepts(&reads, 0),
+            "return place is a whole-value consumer"
+        );
+    }
+
+    /// `ll_list_ascii_setitem_fast` is `l.ascii_items[index] = item`.
+    /// The write must use `ll_items` (`block`), the same base the paired
+    /// read uses (`ll_setitem_fast`).
+    #[test]
+    fn ascii_setitem_writes_items_block() {
+        let graph = lower_object_fn("pyre_object::listobject::ll_list_ascii_setitem_fast");
+        let ops = graph_ops(&graph);
+        let write = ops.iter().find_map(|op| match &op.kind {
+            OpKind::ArrayWrite {
+                base,
+                array_type_id: Some(array_type_id),
+                ..
+            } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID => Some(base),
+            _ => None,
+        });
+        let Some(base) = write else {
+            panic!("ascii_setitem must emit setarrayitem on [str]; ops={ops:?}");
+        };
+        let producer = ops
+            .iter()
+            .find(|op| op.result.as_ref() == Some(base))
+            .unwrap_or_else(|| panic!("ArrayWrite base must be defined; ops={ops:?}"));
+        let items = if crate::model::cast_instance_root(&producer.kind) == Some("[str]") {
+            match &producer.kind {
+                OpKind::Call { args, .. } => args
+                    .first()
+                    .and_then(LinkArg::as_variable)
+                    .unwrap_or_else(|| panic!("[str] cast needs a value arg; ops={ops:?}")),
+                other => panic!("[str] narrow is a call, got {other:?}"),
+            }
+        } else {
+            base
+        };
+        let items_op = ops
+            .iter()
+            .find(|op| op.result.as_ref() == Some(items))
+            .unwrap_or_else(|| panic!("write base must be a FieldRead of block; ops={ops:?}"));
+        match &items_op.kind {
+            OpKind::FieldRead { field, .. } => {
+                assert_eq!(field.name, "block", "write base is ll_items; ops={ops:?}");
+                assert_eq!(
+                    field.owner_root.as_deref(),
+                    Some("UnicodeArray"),
+                    "ascii items live in UnicodeArray; ops={ops:?}"
+                );
+            }
+            other => panic!("write base must be FieldRead block, got {other:?}"),
+        }
     }
 }

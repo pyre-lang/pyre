@@ -4153,21 +4153,16 @@ fn funccall_flat_from_args(
     let env_base = _roots.pin_roots(&[w_globals, closure]);
     let mut func = _roots.get(root_base);
 
-    let mut new_frame = crate::pyframe::FrameBox::new(
-        match pyre_object::with_roots!(func => {
-            crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                _roots.get(root_base + 1) as *const (),
-                &[],
-                _roots.get(env_base),
-                crate::call::getexecutioncontext(),
-                _roots.get(env_base + 1),
-                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            )
-        }) {
-            Ok(f) => f,
-            Err(e) => return Err(e),
-        },
-    );
+    let mut new_frame = crate::pyframe::FrameBox::new(pyre_object::with_roots!(func => {
+        crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            _roots.get(root_base + 1) as *const (),
+            &[],
+            _roots.get(env_base),
+            crate::call::getexecutioncontext(),
+            _roots.get(env_base + 1),
+            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+        )
+    })?);
 
     // funccallunrolling: `for i in unrolling_iterable(range(4)): if i < nargs`
     match nargs {

@@ -26,15 +26,15 @@ pub fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
     let w_int = pyre_object::gc_roots::pin_root(w_int);
     // One return so the RootScope Drop is a regular close, not an
     // unwind-only cleanup `body_is_depth_neutral` misses.
-    let result = match crate::baseobjspace::getindex_w(w_int) {
+
+    match crate::baseobjspace::getindex_w(w_int) {
         Ok(v) => Ok(v),
         Err(e) if e.kind == crate::PyErrorKind::TypeError => Err(crate::PyError::new(
             crate::PyErrorKind::TypeError,
             "slice indices must be integers or None or have an __index__ method".to_string(),
         )),
         Err(e) => Err(e),
-    };
-    result
+    }
 }
 
 /// sliceobject.py `adapt_lower_bound(space, size, w_index)`.

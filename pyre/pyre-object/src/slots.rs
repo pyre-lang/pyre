@@ -61,7 +61,7 @@ macro_rules! slot_set_direct {
                 let new_slots = $crate::listobject::w_list_new(vec![$crate::PY_NULL; index + 1]);
                 let obj = $crate::gc_roots::shadow_stack_get(root_base);
                 unsafe { (*(obj as *mut $ty)).$field = new_slots };
-                $crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
+                $crate::gc_hook::try_gc_write_barrier(obj as $crate::gc_hook::GCREF);
             } else {
                 let mut slots = slots;
                 while unsafe { $crate::listobject::w_list_len(slots) } <= index {

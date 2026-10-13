@@ -643,7 +643,7 @@ pub(crate) fn timestamp_pyc_payload(
     }
     let stored_mtime = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
     let stored_size = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
-    if stored_mtime != source_mtime_sec || stored_size != (source_size & 0xFFFF_FFFF) {
+    if stored_mtime != source_mtime_sec || stored_size != source_size {
         return None;
     }
     Some(&bytes[16..])

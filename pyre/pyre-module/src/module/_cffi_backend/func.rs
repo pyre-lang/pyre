@@ -193,7 +193,7 @@ pub fn alignof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 pub fn getcname(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(args[0])?;
     let replace_with = pyre_interpreter::baseobjspace::text_w(args[1])?;
-    let (name, _) = ct.insert_name(&replace_with, 0);
+    let (name, _) = ct.insert_name(replace_with, 0);
     Ok(pyre_object::w_str_new_managed(&name))
 }
 
@@ -533,7 +533,7 @@ pub fn get_types(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `newtype.py new_primitive_type`.
 pub fn new_primitive_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let name = pyre_interpreter::baseobjspace::text_w(args[0])?;
-    newtype::new_primitive_type(&name)
+    newtype::new_primitive_type(name)
 }
 
 /// `newtype.py new_void_type`.

@@ -208,11 +208,11 @@ struct ThreadDebugState {
 }
 
 thread_local! {
-    static STATE: RefCell<ThreadDebugState> = RefCell::new(ThreadDebugState {
+    static STATE: RefCell<ThreadDebugState> = const { RefCell::new(ThreadDebugState {
         ready: 0,
         inited: false,
         stack: Vec::new(),
-    });
+    }) };
     #[cfg(test)]
     static CONFIG_OVERRIDE: RefCell<Option<DebugLogConfig>> = const { RefCell::new(None) };
 }

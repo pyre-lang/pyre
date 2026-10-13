@@ -190,7 +190,7 @@ impl Op {
                  fail-loud shape (resoperation.py:492)"
             )
         });
-        fa.iter().cloned().collect()
+        fa.to_vec()
     }
 
     /// `resoperation.py GuardResOp.setfailargs` parity — overwrite

@@ -3922,13 +3922,6 @@ impl<S: JitState> JitDriver<S> {
         meta: S::Meta,
     ) -> crate::CompileOutcome {
         let loop_header_pc = self.meta.trace_ctx().map(|c| c.header_pc);
-        // The merge-point greens this loop closed on — the vocabulary a later
-        // bridge closing at the same merge point will present
-        // (pyjitpl.py). Captured before `compile_loop` drains the ctx.
-        let loop_close_greens = self
-            .meta
-            .trace_ctx()
-            .and_then(|c| c.close_greens.clone().or_else(|| c.header_greens.clone()));
         let loop_green_key = self.current_trace_green_key();
         if crate::closedbg_enabled() {
             eprintln!(
@@ -3957,19 +3950,6 @@ impl<S: JitState> JitDriver<S> {
             if let Some(k) = self.meta.last_compiled_key() {
                 if let Some(hp) = loop_header_pc {
                     self.meta.record_loop_header_pc(k, hp);
-                }
-                // Key the loop by the greens it closed on, so a bridge reaching
-                // this merge point resolves THIS loop's procedure token. Only
-                // `last_compiled_key` is registered: on a cross-loop cut that
-                // is the inner loop the close point belongs to, whereas
-                // `loop_green_key` is the outer trace-start key.
-                if let Some(greens) = loop_close_greens {
-                    if crate::closedbg_enabled() {
-                        eprintln!("@@@CLOSE LOOP-GREENS key={} greens={greens:?}", k as i64);
-                    }
-                    self.meta.record_loop_header_greens(k, greens);
-                } else if crate::closedbg_enabled() {
-                    eprintln!("@@@CLOSE LOOP-GREENS key={} greens=NONE", k as i64);
                 }
                 // Stash the just-compiled loop's key so the merge-point hook
                 // can arm the CRN/lazy back-edge label entry with the
@@ -5165,20 +5145,7 @@ impl<S: JitState> JitDriver<S> {
                         .trace_ctx()
                         .and_then(|ctx| ctx.walk_final_pc)
                         .unwrap_or(usize::MAX);
-                    let finish_key = self.current_trace_green_key();
                     self.publish_single_pass_outcome(pc);
-                    if let Some(k) = finish_key {
-                        if let Some((_, _, args)) = self.meta.single_pass_outcome.as_ref() {
-                            self.meta.record_loop_header_greens(
-                                k,
-                                (
-                                    args.green_int.clone(),
-                                    args.green_ref.clone(),
-                                    args.green_float.clone(),
-                                ),
-                            );
-                        }
-                    }
                     self.meta.single_pass_finish = true;
                     // `virtualizable.py write_from_resume_data_partial` writes
                     // every static field before the portal runner continues.
@@ -6536,7 +6503,7 @@ impl<S: JitState> JitDriver<S> {
                         majit_jitcode::codewriter::jitcode::enumerate_vars_by_bank(
                             info,
                             &all_liveness,
-                            |bank, index| consume(bank, index),
+                            consume,
                         );
                     }
                     if let Some(why) = decline {
@@ -7103,7 +7070,7 @@ impl<S: JitState> JitDriver<S> {
                     &mut scratch.types,
                 );
                 if !Self::live_values_match_descriptor(
-                    descriptor.as_deref(),
+                    descriptor,
                     &scratch.live_values,
                     state.state_field_layout().total_live_values(),
                 ) {
@@ -7211,7 +7178,7 @@ impl<S: JitState> JitDriver<S> {
                 }
                 eprintln!(
                     "[callee-rca][entry-live]\n{}",
-                    format_rca_live_values(labels.as_deref(), &live_values)
+                    format_rca_live_values(labels.as_deref(), live_values)
                 );
             }
 
@@ -7231,7 +7198,7 @@ impl<S: JitState> JitDriver<S> {
                 );
                 eprintln!(
                     "[portal-rca][compiled-entry-live]\n{}",
-                    format_rca_live_values(labels.as_deref(), &live_values)
+                    format_rca_live_values(labels.as_deref(), live_values)
                 );
             }
             // Same point the RCA line above reports, but unconditional and
@@ -7565,7 +7532,7 @@ impl<S: JitState> JitDriver<S> {
                 raw_values,
                 fd.fail_arg_types(),
             );
-            if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+            if let Some(dump) = state.debug_state_fields(compiled_meta) {
                 eprintln!("[callee-rca][post-execute-token-state]\n{dump}");
             }
         }
@@ -7968,14 +7935,14 @@ impl<S: JitState> JitDriver<S> {
                                 "[callee-rca][crn-pre] ref_slice={:?}",
                                 &bh.registers_r[ref_base..],
                             );
-                            if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+                            if let Some(dump) = state.debug_state_fields(compiled_meta) {
                                 eprintln!("[callee-rca][crn-state-before]\n{dump}");
                             }
                         }
                         if layout.num_vable_identity_slots == 0 {
                             let float_base = layout.float_scalar_base.min(bh.registers_f.len());
                             state.restore_banked3(
-                                &compiled_meta,
+                                compiled_meta,
                                 &bh.registers_i[int_base..],
                                 &bh.registers_r[ref_base..],
                                 &bh.registers_f[float_base..],
@@ -8000,7 +7967,7 @@ impl<S: JitState> JitDriver<S> {
                         // guard with zero forward progress.
                         state.recover_after_compiled_run();
                         if crate::callee_rca_enabled()
-                            && let Some(dump) = state.debug_state_fields(&compiled_meta)
+                            && let Some(dump) = state.debug_state_fields(compiled_meta)
                         {
                             eprintln!("[callee-rca][crn-state-after]\n{dump}");
                         }
@@ -8034,7 +8001,7 @@ impl<S: JitState> JitDriver<S> {
                         let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
                         let float_base = layout.float_scalar_base.min(bh.registers_f.len());
                         state.restore_banked3(
-                            &compiled_meta,
+                            compiled_meta,
                             &bh.registers_i[int_base..],
                             &bh.registers_r[ref_base..],
                             &bh.registers_f[float_base..],
@@ -8089,7 +8056,7 @@ impl<S: JitState> JitDriver<S> {
                         let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
                         let float_base = layout.float_scalar_base.min(bh.registers_f.len());
                         state.restore_banked3(
-                            &compiled_meta,
+                            compiled_meta,
                             &bh.registers_i[int_base..],
                             &bh.registers_r[ref_base..],
                             &bh.registers_f[float_base..],
@@ -8100,10 +8067,9 @@ impl<S: JitState> JitDriver<S> {
                     }
                     crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
                         let args = Some(banks_from_bh(self, &bh));
-                        match state.deliver_blackhole_exception(exc_ref) {
-                            Some(pc) => Some(PortalResume::ExitFrameWithException { pc, args }),
-                            None => None,
-                        }
+                        state
+                            .deliver_blackhole_exception(exc_ref)
+                            .map(|pc| PortalResume::ExitFrameWithException { pc, args })
                     }
                 };
                 bh_builder.release_interp(bh);
@@ -8607,7 +8573,7 @@ impl<S: JitState> JitDriver<S> {
         }
         self.descriptor_cache
             .as_ref()
-            .and_then(|cached| cached.as_ref().map(|descr| std::sync::Arc::as_ptr(descr)))
+            .and_then(|cached| cached.as_ref().map(std::sync::Arc::as_ptr))
     }
 
     fn driver_descriptor_for(
@@ -8840,10 +8806,10 @@ impl<S: JitState> JitDriver<S> {
     /// decline and finish exits call this directly, because a walk that resumes
     /// recording must flush into its own frame whether or not the entry ran.
     fn restore_trace_vable_ptr(&mut self, saved: Option<*const u8>) {
-        if let Some(ptr) = saved {
-            if let Some(ctx) = self.meta.tracing.as_mut() {
-                ctx.set_virtualizable_heap_ptr(ptr);
-            }
+        if let Some(ptr) = saved
+            && let Some(ctx) = self.meta.tracing.as_mut()
+        {
+            ctx.set_virtualizable_heap_ptr(ptr);
         }
     }
 
@@ -11193,7 +11159,7 @@ impl<S: JitState> JitDriver<S> {
         // arms the flag as well. `compile_trace`'s sibling read is the one
         // that stays unresolved (compile.py:1040 tests `resumekey` itself).
         ctx.bridge_resume_at_position =
-            crate::compile::get_resumestorage(&descr_arc).is_resume_at_position();
+            crate::compile::get_resumestorage(descr_arc).is_resume_at_position();
         if let Some((_, ptr)) = &live_vable {
             ctx.set_virtualizable_heap_ptr(*ptr);
         }
@@ -15483,7 +15449,6 @@ mod cross_loop_cut_close_tests {
         }
         driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(driver.has_compiled_loop(key), "inner loop must compile");
-        driver.meta.record_loop_header_greens(key, inner_greens());
         assert_eq!(
             driver.meta.is_cross_loop_cut_key(key),
             cut,

@@ -543,11 +543,11 @@ mod imp {
             d.errpipe_read,
         )?;
 
-        if let Some(cwd) = d.cwd {
-            if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
-                *ctx = ExecErrorContext::ChDir;
-                return Err(last_err());
-            }
+        if let Some(cwd) = d.cwd
+            && unsafe { libc::chdir(cwd.as_ptr()) } < 0
+        {
+            *ctx = ExecErrorContext::ChDir;
+            return Err(last_err());
         }
 
         if d.child_umask >= 0 {

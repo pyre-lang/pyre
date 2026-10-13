@@ -1977,7 +1977,7 @@ impl Repr for ClassRepr {
         // rclass.py — `allmethods.update(self.rbase.allmethods)`.
         // Merge whichever parent methods upstream already recorded.
         if let ClassReprArc::Inst(parent_inst) = &rbase {
-            for (method_name, _) in parent_inst.allmethods.borrow().iter() {
+            for method_name in parent_inst.allmethods.borrow().keys() {
                 allmethods.insert(method_name.clone(), true);
             }
         }

@@ -2626,10 +2626,10 @@ impl RBigInt {
             let shifted_a = RBigIntGcRoot::new(a.lshift(d - e - 1)?);
             let shifted_self = RBigIntGcRoot::new(this.rshift(2 * c - e - d + 1, false)?);
             let quot = RBigIntGcRoot::new(shifted_self.floordiv(&a)?);
-            a = RBigIntGcRoot::new(shifted_a.add(&*quot));
+            a = RBigIntGcRoot::new(shifted_a.add(&quot));
         }
         let square = RBigIntGcRoot::new(a.mul(&a));
-        Ok(a.int_sub(square.gt(&*this) as i64))
+        Ok(a.int_sub(square.gt(&this) as i64))
     }
 }
 
@@ -3708,7 +3708,7 @@ fn _divrem1(a: &RBigInt, n: Digit) -> (RBigInt, Digit) {
     let a = live_rbigint(a);
     let size = a.numdigits();
     let mut z = RBigInt::with_size(size, 1);
-    let rem = _inplace_divrem1(&mut z, &*a, n);
+    let rem = _inplace_divrem1(&mut z, &a, n);
     z._normalize();
     (z, rem)
 }
@@ -3837,9 +3837,9 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
     let mut w = live_rbigint(&RBigInt::with_size(size_w, 1));
 
     let d = SHIFT - bits_in_digit(w1.digit(size_w - 1));
-    let carry = _v_lshift(&mut w, &*w1, size_w, d);
+    let carry = _v_lshift(&mut w, &w1, size_w, d);
     debug_assert_eq!(carry, 0);
-    let carry = _v_lshift(&mut v, &*v1, size_v, d);
+    let carry = _v_lshift(&mut v, &v1, size_v, d);
     if carry != 0 || v.digit(size_v - 1) >= w.digit(size_w - 1) {
         v.setdigit_uwidedigit(size_v, carry);
         size_v += 1;
@@ -5855,10 +5855,10 @@ fn gcd_lehmer(a: RBigInt, b: RBigInt) -> Result<RBigInt, RBigIntError> {
         );
         let a_s = RBigIntGcRoot::new(a.int_mul(s_new as i64));
         let b_t = RBigIntGcRoot::new(b.int_mul(t_new as i64));
-        let n_a = RBigIntGcRoot::new(RBigIntGcRoot::new(a_s.add(&*b_t)).abs());
+        let n_a = RBigIntGcRoot::new(RBigIntGcRoot::new(a_s.add(&b_t)).abs());
         let a_s = RBigIntGcRoot::new(a.int_mul(s_old as i64));
         let b_t = RBigIntGcRoot::new(b.int_mul(t_old as i64));
-        b = RBigIntGcRoot::new(RBigIntGcRoot::new(a_s.add(&*b_t)).abs());
+        b = RBigIntGcRoot::new(RBigIntGcRoot::new(a_s.add(&b_t)).abs());
         a = n_a;
         if a.lt(&b) {
             std::mem::swap(&mut a, &mut b);

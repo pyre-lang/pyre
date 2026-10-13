@@ -662,7 +662,6 @@ fn compile_bridge_terminal_decline_invalidates_ca_callers() {
             &[InputArg::from_type_rc(Type::Int, 40)],
             &host_bridge_ops(&label_descr),
             &token,
-            &[],
             None,
         )
         .expect_err("arity mismatch is a terminal decline");
@@ -7273,7 +7272,6 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
         &host_bridge_inputargs(),
         &bridge_ops,
         &token,
-        &[],
         None,
     );
     majit_backend_wasm::set_inline_trip_helper_slot(0);
@@ -7356,7 +7354,6 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
             &host_bridge_inputargs(),
             &host_gni_bridge_ops(&label_descr),
             &token,
-            &[],
             None,
         )
         .expect("the GNI bridge still compiles out of line");
@@ -7419,7 +7416,6 @@ fn a_bridge_compiled_after_the_owner_was_invalidated_starts_valid() {
             &host_bridge_inputargs(),
             &host_bridge_ops(&label_descr),
             &token,
-            &[],
             None,
         )
         .expect("the loop-closing bridge compiles out of line");

@@ -2773,7 +2773,8 @@ pub(crate) fn eval_frame_plain_with_resume(
             let roots = pyre_object::gc_roots::push_roots();
             let exit_slot = roots.base();
             let exit = roots.pin_root(w_exitvalue);
-            let result = match inner_result {
+
+            match inner_result {
                 Err(err) => {
                     let mut err = err;
                     let err_slot = err.pin(&roots);
@@ -2790,8 +2791,7 @@ pub(crate) fn eval_frame_plain_with_resume(
                     inner_result = Ok(v);
                     result
                 }
-            };
-            result
+            }
         };
         // Python finally: a finally-block exception replaces any
         // pending exception from the try-body. Only the all-OK path
@@ -2810,7 +2810,8 @@ pub(crate) fn eval_frame_plain_with_resume(
     })();
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
-        let result = match outer_result {
+
+        match outer_result {
             Err(err) => {
                 let mut err = err;
                 let err_slot = err.pin(&roots);
@@ -2827,8 +2828,7 @@ pub(crate) fn eval_frame_plain_with_resume(
                 outer_result = Ok(v);
                 result
             }
-        };
-        result
+        }
     };
     match leave_result {
         Err(leave_err) => Err(leave_err),
@@ -3097,7 +3097,7 @@ impl SharedOpcodeHandler for PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
         let obj = roots.pin_root(obj);
-        getattr_str(obj, name).map_err(|error| {
+        getattr_str(obj, name).inspect_err(|error| {
             if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
                 // Keep this write on the live virtualizable red frame.  The
                 // opaque helper only answers the semantic type question;
@@ -3105,7 +3105,6 @@ impl SharedOpcodeHandler for PyFrame {
                 // register-resident copy of the same field.
                 self.defer_failed_attr_until_pop_except();
             }
-            error
         })
     }
 
@@ -4529,9 +4528,9 @@ pub fn load_super_attr_value_w(
     class_slot: isize,
 ) -> Result<PyObjectRef, PyError> {
     if !unsafe { pyre_object::is_str(w_name) } {
-        return Err(PyError::runtime_error(format!(
-            "LOAD_SUPER_ATTR requires a string name"
-        )));
+        return Err(PyError::runtime_error(
+            "LOAD_SUPER_ATTR requires a string name".to_string(),
+        ));
     }
     let exact_builtin_zero_arg =
         !is_two_arg && crate::builtins::is_builtin_super_type(global_super);
@@ -6238,11 +6237,10 @@ impl OpcodeStepExecutor for PyFrame {
         let w_value = unsafe {
             crate::objspace::std::mapdict::load_attr_caching(pycode, obj, nameindex, name)
         }
-        .map_err(|error| {
+        .inspect_err(|error| {
             if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
                 unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
             }
-            error
         })?;
         Self::push_anchored(&anchor, w_value)
     }

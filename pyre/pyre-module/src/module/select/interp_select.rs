@@ -250,13 +250,12 @@ impl Poll {
 #[cfg(all(unix, feature = "host_env"))]
 fn selectable_fd(fd: i32, _index: usize) -> Result<i32, pyre_interpreter::PyError> {
     // `_build_fd_set`: `MAX_FD_SIZE is not None and fd >= MAX_FD_SIZE`.
-    if let Some(max) = majit_rlib::_rsocket_rffi::MAX_FD_SIZE {
-        if fd >= max {
+    if let Some(max) = majit_rlib::_rsocket_rffi::MAX_FD_SIZE
+        && fd >= max {
             return Err(pyre_interpreter::PyError::value_error(
                 "file descriptor out of range in select()",
             ));
         }
-    }
     Ok(fd)
 }
 
@@ -515,8 +514,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // pending signal. `_call_select` then updates `timeout`
                     // only when it was positive.
                     select_failure(std::io::Error::from_raw_os_error(errno))?;
-                    if let (Some(t), Some(dl)) = (timeout_left, end_time) {
-                        if t > 0.0 {
+                    if let (Some(t), Some(dl)) = (timeout_left, end_time)
+                        && t > 0.0 {
                             let now = std::time::Instant::now();
                             let remaining = if now >= dl {
                                 0.0
@@ -525,7 +524,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             };
                             timeout_left = Some(remaining);
                         }
-                    }
                 };
 
                 fn build_ready(

@@ -740,7 +740,7 @@ fn unpack_slow(this: &W_Struct, mut w_str: PyObjectRef) -> Result<PyObjectRef, c
 /// that call is an effect, so `pack_slow`'s `dont_look_inside` would sit
 /// after an effect.  The walk is spelled here instead.
 pub fn __majit_wrap_struct_pack(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let Some(this) = W_Struct::from_obj(args.get(0).copied().unwrap_or(PY_NULL)) else {
+    let Some(this) = W_Struct::from_obj(args.first().copied().unwrap_or(PY_NULL)) else {
         return Err(crate::PyError::type_error(
             "descriptor 'pack' for 'Struct' objects doesn't apply to a 'object' object",
         ));
@@ -754,7 +754,7 @@ pub fn __majit_wrap_struct_pack(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             let fmt = unsafe { w_str_get_wtf8(format) };
             if let Some((4, true, false)) = simple_int_format!(fmt) {
                 let v = unsafe { w_int_get_value(value) };
-                if v >= -2147483648 && v <= 2147483647 {
+                if (-2147483648..=2147483647).contains(&v) {
                     let b0 = v as u8;
                     let b1 = (v >> 8) as u8;
                     let b2 = (v >> 16) as u8;
@@ -784,15 +784,16 @@ pub fn __majit_wrap_struct_unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     if this.size >= 0 {
         let format = majit_metainterp::jit::promote_string(this.format);
         let fmt = unsafe { w_str_get_wtf8(format) };
-        if let Some((4, true, false)) = simple_int_format!(fmt) {
-            if unsafe { bytesobject::is_bytes(w_str) } && unsafe { w_bytes_len(w_str) } == 4 {
-                let b0 = unsafe { jit_w_bytes_getitem(w_str, 0) } as i64;
-                let b1 = unsafe { jit_w_bytes_getitem(w_str, 1) } as i64;
-                let b2 = unsafe { jit_w_bytes_getitem(w_str, 2) } as i64;
-                let b3 = unsafe { jit_w_bytes_getitem(w_str, 3) } as i64;
-                let v = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-                return Ok(jit_w_tuple1(w_int_new(v as i32 as i64)));
-            }
+        if let Some((4, true, false)) = simple_int_format!(fmt)
+            && unsafe { bytesobject::is_bytes(w_str) }
+            && unsafe { w_bytes_len(w_str) } == 4
+        {
+            let b0 = unsafe { jit_w_bytes_getitem(w_str, 0) } as i64;
+            let b1 = unsafe { jit_w_bytes_getitem(w_str, 1) } as i64;
+            let b2 = unsafe { jit_w_bytes_getitem(w_str, 2) } as i64;
+            let b3 = unsafe { jit_w_bytes_getitem(w_str, 3) } as i64;
+            let v = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            return Ok(jit_w_tuple1(w_int_new(v as i32 as i64)));
         }
     }
     unpack_slow(this, w_str)
@@ -1485,14 +1486,14 @@ impl W_Struct {
         if self.size >= 0 {
             let format = majit_metainterp::jit::promote_string(self.format);
             let fmt = unsafe { w_str_get_wtf8(format) };
-            if let Some((size, signed, bigendian)) = simple_int_format!(fmt) {
-                if unsafe { bytesobject::is_bytes_like(w_str) } {
-                    let buf = unsafe { bytesobject::bytes_like_data(w_str) };
-                    if buf.len() == size {
-                        if let Some(v) = unpack_simple_int(buf, size, signed, bigendian) {
-                            return Ok(w_tuple_new(vec![w_int_new(v)]));
-                        }
-                    }
+            if let Some((size, signed, bigendian)) = simple_int_format!(fmt)
+                && unsafe { bytesobject::is_bytes_like(w_str) }
+            {
+                let buf = unsafe { bytesobject::bytes_like_data(w_str) };
+                if buf.len() == size
+                    && let Some(v) = unpack_simple_int(buf, size, signed, bigendian)
+                {
+                    return Ok(w_tuple_new(vec![w_int_new(v)]));
                 }
             }
         }

@@ -49,7 +49,7 @@ pub struct Cache<K, V> {
     state: Mutex<Option<CacheState<K, V>>>,
 }
 
-fn occupied<'a, K, V>(state: &'a mut Option<CacheState<K, V>>) -> &'a mut CacheState<K, V> {
+fn occupied<K, V>(state: &mut Option<CacheState<K, V>>) -> &mut CacheState<K, V> {
     state.get_or_insert_with(|| CacheState {
         content: IndexMap::new(),
         _building: IndexMap::new(),

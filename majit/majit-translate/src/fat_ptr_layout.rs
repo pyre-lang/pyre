@@ -69,7 +69,7 @@ fn wrapper_inner<'a>(s: &'a str, leaves: &[&str]) -> Option<&'a str> {
         return None;
     }
     let leaf = head.trim().rsplit("::").next().unwrap_or(head.trim());
-    if !leaves.iter().any(|name| *name == leaf) {
+    if !leaves.contains(&leaf) {
         return None;
     }
     let inner = &rest[..rest.len() - 1];

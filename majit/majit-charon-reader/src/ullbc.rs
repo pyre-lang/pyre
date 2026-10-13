@@ -377,13 +377,11 @@ impl TypeDecl {
             .variant_layouts
             .iter()
             .any(|variant| variant.field_offsets.contains(&UNRESOLVED_OFFSET))
+            && let Some(rows) = resolved_field_offset_rows(llbc, raw.get(), target)
+            && rows.len() == layout.variant_layouts.len()
         {
-            if let Some(rows) = resolved_field_offset_rows(llbc, raw.get(), target) {
-                if rows.len() == layout.variant_layouts.len() {
-                    for (variant, row) in layout.variant_layouts.iter_mut().zip(rows) {
-                        variant.field_offsets = row;
-                    }
-                }
+            for (variant, row) in layout.variant_layouts.iter_mut().zip(rows) {
+                variant.field_offsets = row;
             }
         }
         if layout

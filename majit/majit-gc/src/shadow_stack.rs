@@ -333,7 +333,7 @@ thread_local! {
     /// are GC objects: `registers_r`, `tmpreg_r`, `exception_last_value` and
     /// `virtualizable_ptr` are traced fields for the object's whole life, not
     /// only while `run()` is on the stack.
-    static BH_INTERP_ROOTS: RefCell<Vec<BhInterpEntry>> = RefCell::new(Vec::new());
+    static BH_INTERP_ROOTS: RefCell<Vec<BhInterpEntry>> = const { RefCell::new(Vec::new()) };
 
     /// Thread-local stack of ref slices live only during blackhole resume
     /// construction (`resume.py blackhole_from_resumedata`).  The
