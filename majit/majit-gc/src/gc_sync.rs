@@ -128,36 +128,6 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
     GC_INITIALIZED.store(true, Ordering::Release);
 }
 
-/// Test-support: install a fresh GC singleton, LEAKING the previous one.
-///
-/// The prior GC's objects must NOT be freed; process-global immortal builtins
-/// (a builtin type's `weak_subclasses`, etc.) may still reference them, so
-/// dropping the old `OldGen` would leave those references dangling. Forgetting
-/// the old singleton keeps them valid. Used by the `gc_stress` harness to give
-/// each per-worker test a pristine heap and empty root set, so a prior test's
-/// oldgen residue or stale registered roots cannot corrupt this test's
-/// collections.
-pub fn replace_singleton_leaking_old(gc: Box<MiniMarkGC>) {
-    let _guard = GC_SYNC.install_mutex.lock().unwrap();
-    // Same debug gate as `store_singleton`: a live pre-collector host jitframe
-    // is invisible to both `LIBC_JF_REGISTRY` and `LIVE_DEADFRAMES`.
-    #[cfg(debug_assertions)]
-    if !GC_INITIALIZED.load(Ordering::Acquire) {
-        crate::shadow_stack::assert_no_unregistered_host_jitframes();
-    }
-    // SAFETY: install_mutex held; the gc_stress harness runs tests serially, so
-    // no concurrent gc_op is in flight during the swap.
-    unsafe {
-        if let Some(old) = (*GC_STORE.0.get()).take() {
-            std::mem::forget(old);
-        }
-        *GC_STORE.0.get() = Some(gc);
-        let installed = (*GC_STORE.0.get()).as_ref().unwrap();
-        crate::publish_singleton_nursery(&**installed);
-    }
-    GC_INITIALIZED.store(true, Ordering::Release);
-}
-
 /// Check if the GC singleton has been initialized.
 #[inline]
 pub fn is_initialized() -> bool {

@@ -5824,19 +5824,6 @@ fn build_gc_global() {
     });
 }
 
-/// Test-support: give the calling `gc_stress` worker a pristine GC heap by
-/// installing a fresh GC and leaking the shared singleton. The per-test worker
-/// threads share the process-global GC singleton; without this, a
-/// class-defining test leaves oldgen residue or stale roots that a later
-/// test's collection, run on a different worker thread with a different
-/// thread-local root set, can mishandle and corrupt immortal state.
-pub fn reset_gc_fresh_for_test() {
-    let gc = build_gc();
-    majit_gc::gc_sync::replace_singleton_leaking_old(gc);
-    pyre_interpreter::baseobjspace::publish_method_cache_container();
-    pyre_object::unicodeobject::init_interned_strings();
-}
-
 /// Initialize the GC subsystem independently of the JIT driver.
 ///
 /// Phase 1 (process-global, once): build MiniMarkGC, type registry,
@@ -17880,8 +17867,8 @@ mod tests {
         pyre_interpreter::typedef::init_subclass_ranges();
         assert_matches_gc();
 
-        // Exercise the same reconstruction used by reset_gc_fresh_for_test,
-        // without replacing the installed collector or rewriting vtables.
+        // Build another collector and check its subclass ranges. Leave the
+        // installed collector in place, and do not rewrite vtables.
         let rebuilt = build_gc();
         assert_subclass_ranges(aliases.iter().map(|alias| alias.pytype), |classptr| {
             rebuilt.subclass_range(classptr)
