@@ -2,8 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=44d455d3f2ebbb0e platform=darwin
-direct-skip (never reaches unported_category)	pyre_interpreter::argument::<Impl>::new::<Impl>::call_once
+# corpus=0e48d6b24a0c93cf platform=darwin
 direct-skip (never reaches unported_category)	rordereddict::RDict::clone_index_block__spec_BytesKey_PyObject_Fnv1aHasher__2a836105d282e843
 direct-skip (never reaches unported_category)	rordereddict::RDict::clone_index_block__spec_IdentityKey_PyObject_RandomState_76e8545b5b3723f1
 direct-skip (never reaches unported_category)	rordereddict::RDict::clone_index_block__spec_ObjectKey_PyObject_ObjectKeyHasher__2d65836373e73eba
@@ -2045,8 +2044,6 @@ two-phase-annotate-skipped	pyre_object::quasiimmut::<Impl>::invalidate_then_stor
 two-phase-annotate-skipped	pyre_object::quasiimmut::<Impl>::take
 two-phase-annotate-skipped	pyre_object::rordereddict::<Impl>::entry_valid
 two-phase-annotate-skipped	pyre_object::rordereddict::<Impl>::get_slot
-two-phase-annotate-skipped	pyre_object::setobject::w_set_add_hashed_checked
-two-phase-annotate-skipped	pyre_object::setobject::w_set_insert_key_checked
 two-phase-annotate-skipped	pyre_object::tupleobject::wraptuple
 two-phase-annotate-skipped	pyre_object::typeobject::w_type_set_name
 two-phase-annotate-skipped	pyre_object::unicode_array::<Impl>::pop
