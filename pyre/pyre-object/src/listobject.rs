@@ -1874,6 +1874,33 @@ pub fn current_gc_ref(obj: *mut PyObject) -> *mut PyObject {
     crate::gc_hook::try_gc_current_object_address(obj as crate::gc_hook::GCREF) as *mut PyObject
 }
 
+/// `listobject.py make_empty_list`: `EmptyListStrategy` plus `erase(None)`,
+/// then `W_ListObject.from_storage_and_strategy`.
+///
+/// `#[inline(never)]` is load-bearing: rustc otherwise folds this body into
+/// `w_list_new` and the codewriter never mints the graph a BUILD_LIST
+/// descent looks up (`specialize.rs try_walker_orthodox_empty_newlist`).
+/// Same split as `w_range_iter`.
+#[inline(never)]
+pub fn w_list_make_empty() -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let full = W_ListObject {
+        ob_header: PyObject {
+            ob_type: &LIST_TYPE as *const PyType,
+            w_class: get_instantiate(&LIST_TYPE),
+        },
+        allocated: 0,
+        length: AtomicUsize::new(0),
+        items: std::ptr::null_mut(),
+        strategy: ListStrategy::Empty,
+        int_items: IntArray::empty(),
+        float_items: FloatArray::empty(),
+        bytes_items: BytesArray::empty(),
+        ascii_items: UnicodeArray::empty(),
+    };
+    crate::lltype::malloc_typed_managed(full) as PyObjectRef
+}
+
 /// Allocate a new W_ListObject from a Vec of items.
 ///
 /// Residualized: the storage construction below
@@ -1882,9 +1909,12 @@ pub fn current_gc_ref(obj: *mut PyObject) -> *mut PyObject {
 /// the collecting header allocator — shadow-stack and `box_assume_init` plumbing
 /// the tracer cannot model. The JIT leaves the call as a residual
 /// returning the fresh object pointer rather than tracing into the GC
-/// allocator.
+/// allocator. An empty item set is `make_empty_list` and has its own graph.
 #[majit_macros::dont_look_inside]
 pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    if items.is_empty() {
+        return w_list_make_empty();
+    }
     let strategy = list_strategy_for(&items);
     w_list_new_with_strategy(items, strategy)
 }

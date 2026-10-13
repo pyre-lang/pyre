@@ -8626,6 +8626,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    // `make_empty_list`. The hand fold above declines length 0; this walks
+    // the interpreter body instead. Not a spec-fold row.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewlistFromArray {
+        if let Some(outcome) =
+            try_walker_orthodox_empty_newlist(ctx, op.pc, &r_args, dst, dst_bank)?
+        {
+            return Ok((outcome, op.next_pc));
+        }
+    }
 
     // #171: specialize `lst.append(x)` so its array ops reach the trace,
     // replacing the opaque `bh_call_fn` residual (orthodox descent of the

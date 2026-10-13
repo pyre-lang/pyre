@@ -1197,6 +1197,15 @@ fn real_main() {
                     "listobject",
                     "w_list_getitem_inner",
                 ]),
+                // BUILD_LIST residual `newlist_from_array`. The portal never
+                // calls `make_empty_list`, so the descent looks the body up
+                // by this graph key (`specialize.rs
+                // try_walker_orthodox_empty_newlist`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "listobject",
+                    "w_list_make_empty",
+                ]),
                 // BUILD_MAP's `inline_call` target (`flatten.rs
                 // inline_call_targets`). `build_map_from_refs` stores through
                 // `w_dict_store_checked`, so the portal closure never names
