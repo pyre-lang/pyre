@@ -14303,6 +14303,15 @@ impl<M: Clone> MetaInterp<M> {
                 descr_arc,
                 result.rd_loop_token,
             )));
+            // `execute_assembler_at_dispatch_key` decodes no values on a guard
+            // exit; this runner's callers hand a dense list to
+            // `resume_in_blackhole`, so read the fail-arg slots off the
+            // deadframe here.
+            if let (Some(frame), Some(fd)) = (result.deadframe.as_ref(), descr_arc.as_fail_descr())
+            {
+                result.typed_values =
+                    Self::decode_exit_slots(&self.backend, frame, fd.fail_arg_types());
+            }
         }
         Some(result)
     }
