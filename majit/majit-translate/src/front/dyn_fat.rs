@@ -440,13 +440,14 @@ fn retarget_vtable_method_bases(
         };
         // `lookup_operand` requires a block inputarg or op result. The
         // metadata word is often a FatLen FieldRead in a predecessor, or
-        // a merge phi of two such reads, and `ensure_meta` may reuse that
-        // identity across a passthrough. Thread it the way
-        // `ensure_variable_at_block` threads every other block-crossing
-        // value (`flowspace/model.py` `checkgraph`).
-        if !graph.ensure_variable_at_block(block, &meta) {
+        // a merge phi of two such reads. `ensure_meta` mints a
+        // `Variable.copy()` per block (`checkgraph` `definevar`).
+        // Bind the FieldRead to that local: `SSA_to_SSI` renames uses of
+        // `meta` to the copy, so writing the producer back would leave a
+        // Ref/Signed operand with no definition in this block.
+        let Some(local) = graph.ensure_variable_at_block_local(block, &meta) else {
             continue;
-        }
+        };
         let Some(op) = graph.blocks[block.0].operations.iter_mut().find(|op| {
             op.result
                 .as_ref()
@@ -458,7 +459,7 @@ fn retarget_vtable_method_bases(
             let OpKind::FieldRead { base, pure, ty, .. } = &mut op.kind else {
                 continue;
             };
-            *base = meta;
+            *base = local;
             // The slot of a vtable does not change. The base is the metadata
             // word, an int (`raw` pointer). The slot itself is a function
             // address (`getfield_raw_i`), not a GC pointer: a Ref-typed
@@ -597,17 +598,15 @@ fn ensure_meta_inner(
         // All predecessors produced the same metadata word, so a new
         // phi would be an identity copy. The word still has to appear
         // as an inputarg of this block: `lookup_operand` does not
-        // accept a dominating use.
-        let meta = metas[0].2.clone();
+        // accept a dominating use. `checkgraph` `definevar` rejects
+        // reusing the producer's Variable; `SSA_to_SSI` mints
+        // `Variable.copy()` and binds it through `Link.args`.
+        let producer = metas[0].2.clone();
+        let Some(meta) = graph.ensure_variable_at_block_local(block, &producer) else {
+            env.memo.remove(&key);
+            return None;
+        };
         env.memo.insert(key, meta.clone());
-        if !graph.variable_defined_in_block(block, &meta) {
-            graph.push_inputarg_var(block, meta.clone());
-            for (pred, link_index, incoming) in metas {
-                graph.blocks[pred.0].exits[link_index]
-                    .args
-                    .push(LinkArg::Value(incoming));
-            }
-        }
         return Some(meta);
     }
     graph.push_inputarg_var(block, phi.clone());
@@ -628,16 +627,22 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
     // (`ensure_variable_at_block`) before emitting the length word. A base
     // with no reaching definition stays the operand it already was: the
     // length word is still this field's metadata.
-    if !graph.variable_defined_in_block(fat.block, &fat.base) {
-        let _ = graph.try_ensure_variable_at_block(fat.block, &fat.base);
-    }
+    // `try_ensure` mints a `Variable.copy()` and renames existing uses;
+    // the new FatLen read has to name that local (`SSA_to_SSI`). Binding
+    // the producer identity would leave a Ref operand with no definition
+    // in this block (`switch_to_object_strategy` `strategy_`).
+    let mut base = graph
+        .try_ensure_variable_at_block_local(fat.block, &fat.base)
+        .unwrap_or_else(|| fat.base.clone());
     // `lookup_operand` requires the FieldRead base in this block
     // (`w_set_insert_key_checked` reads `strategy.imp` FatMeta after a
     // passthrough of the set pointer). A dominating definition is not a
     // definition (`ensure_meta` already threads the metadata word the
     // same way).
-    if !graph.variable_defined_in_block(fat.block, &fat.base) {
-        graph.ensure_variable_at_block(fat.block, &fat.base);
+    if !graph.variable_defined_in_block(fat.block, &base) {
+        if let Some(local) = graph.ensure_variable_at_block_local(fat.block, &fat.base) {
+            base = local;
+        }
     }
     let meta = graph.alloc_value_var_with_type(ConcreteType::Signed);
     // `FatMeta` is the vtable word as Int (`GetfieldGcI`). Slice `FatLen`
@@ -646,7 +651,7 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
     let op = SpaceOperation {
         result: Some(meta.clone()),
         kind: OpKind::FieldRead {
-            base: fat.base.clone(),
+            base,
             field,
             ty: ValueType::Int,
             pure: fat.pure,
@@ -855,8 +860,20 @@ mod tests {
             visiting: HashSet::new(),
         };
         let _meta = emit_fat_len(&mut graph, &mut env, &fat);
+        let fieldread_base = graph.blocks[merge.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if field.vec_part == Some(VecFieldPart::FatMeta) =>
+                {
+                    Some(base.clone())
+                }
+                _ => None,
+            })
+            .expect("FatMeta FieldRead");
         assert!(
-            graph.variable_defined_in_block(merge, &base),
+            graph.variable_defined_in_block(merge, &fieldread_base),
             "FatMeta FieldRead base must be an inputarg of the consuming block"
         );
     }
@@ -1030,10 +1047,11 @@ mod tests {
             std::slice::from_ref(&meta)
         );
         assert_eq!(graph.blocks[merge.0].inputargs.len(), 2);
-        assert_eq!(graph.blocks[merge.0].inputargs[1], meta);
+        let merge_meta = graph.blocks[merge.0].inputargs[1].clone();
+        assert_ne!(merge_meta.id(), meta.id());
         assert_eq!(
             graph.blocks[merge.0].exits[0].args.as_slice(),
-            std::slice::from_ref(&LinkArg::Value(meta.clone()))
+            std::slice::from_ref(&LinkArg::Value(merge_meta.clone()))
         );
         assert!(graph.variable_defined_in_block(later, &meta));
         assert_eq!(graph.blocks[entry.0].exits[0].args.len(), 2);
@@ -1044,6 +1062,8 @@ mod tests {
             FunctionGraph::concretetype_of(entry_meta),
             ConcreteType::Signed
         );
+        assert_ne!(entry_meta.id(), meta.id());
+        assert_ne!(entry_meta.id(), merge_meta.id());
     }
 
     #[test]
@@ -1110,26 +1130,37 @@ mod tests {
             "the method_* block must define the vtable word as an inputarg"
         );
         assert!(
-            graph.variable_defined_in_block(pass, &meta),
+            graph.blocks[pass.0]
+                .inputargs
+                .last()
+                .is_some_and(|var| FunctionGraph::concretetype_of(var) == ConcreteType::Signed),
             "the passthrough must carry the vtable word"
         );
         assert!(
-            graph.variable_defined_in_block(merge, &meta),
+            graph.blocks[merge.0]
+                .inputargs
+                .last()
+                .is_some_and(|var| FunctionGraph::concretetype_of(var) == ConcreteType::Signed),
             "the diamond merge must phi the two FatLen words"
         );
+        let pass_meta = graph.blocks[pass.0].inputargs.last().unwrap().clone();
+        let merge_meta = graph.blocks[merge.0].inputargs.last().unwrap().clone();
+        assert_ne!(pass_meta.id(), meta.id());
+        assert_ne!(merge_meta.id(), meta.id());
+        assert_ne!(pass_meta.id(), merge_meta.id());
         assert_eq!(
             graph.blocks[pass.0].exits[0]
                 .args
                 .last()
                 .and_then(LinkArg::as_variable),
-            Some(&meta)
+            Some(&pass_meta)
         );
         assert_eq!(
             graph.blocks[merge.0].exits[0]
                 .args
                 .last()
                 .and_then(LinkArg::as_variable),
-            Some(&meta)
+            Some(&merge_meta)
         );
     }
 
@@ -1172,7 +1203,72 @@ mod tests {
             FunctionGraph::concretetype_of(entry_meta),
             ConcreteType::Signed
         );
-        assert_eq!(entry_meta, &meta);
+        assert_ne!(
+            entry_meta.id(),
+            meta.id(),
+            "later inputarg is Variable.copy(), link carries the producer"
+        );
+    }
+
+    #[test]
+    fn fat_len_base_is_the_block_local_copy() {
+        let mut graph = FunctionGraph::new("fat_len_strategy_base");
+        let strategy = Variable::named("strategy_");
+        FunctionGraph::set_concretetype_of_inline(&strategy, ConcreteType::GcRef);
+        let data = graph.alloc_value_var();
+        let entry = graph.startblock;
+        let later = graph.create_block();
+        let field = FieldDescriptor::new("imp", Some("DictStrategyRef".into()));
+        graph.blocks[entry.0].operations.push(SpaceOperation {
+            result: Some(strategy.clone()),
+            kind: OpKind::Input {
+                name: "strategy_".into(),
+                ty: ValueType::Ref(Some("object".into())),
+                class_root: None,
+            },
+        });
+        graph.set_goto(entry, later, vec![]);
+        graph.blocks[later.0].operations.push(SpaceOperation {
+            result: Some(data.clone()),
+            kind: OpKind::FieldRead {
+                base: strategy.clone(),
+                field: field.clone(),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let fat = FatField {
+            block: later,
+            var_id: data.id(),
+            base: strategy.clone(),
+            field,
+            pure: false,
+        };
+        let mut env = empty_env(data.id(), Some(fat.clone()));
+        let meta = emit_fat_len(&mut graph, &mut env, &fat).expect("FatLen");
+        let fat_len = graph.blocks[later.0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&meta))
+            .expect("FatLen op");
+        match &fat_len.kind {
+            OpKind::FieldRead { base, .. } => {
+                assert!(
+                    graph.variable_defined_in_block(later, base),
+                    "FatLen base must be defined in the emitting block"
+                );
+                assert_ne!(
+                    base.id(),
+                    strategy.id(),
+                    "FatLen names the SSI copy, not the producer"
+                );
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+        assert_eq!(
+            graph.blocks[entry.0].exits[0].args.len(),
+            graph.blocks[later.0].inputargs.len()
+        );
     }
 
     #[test]

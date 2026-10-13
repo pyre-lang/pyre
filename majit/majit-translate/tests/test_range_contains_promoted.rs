@@ -113,15 +113,40 @@ fn is_primitive_promoted_range_folds_to_int_between() {
     );
 
     let const_int_of = |var: &majit_translate::flowspace::model::Variable| -> Option<i64> {
-        graph.blocks.iter().find_map(|block| {
-            block
-                .operations
-                .iter()
-                .find_map(|op| match (&op.result, &op.kind) {
-                    (Some(result), OpKind::ConstInt(value)) if result == var => Some(*value),
-                    _ => None,
-                })
-        })
+        // The ConstInt may live in a predecessor; `SSA_to_SSI` binds a
+        // fresh `Variable.copy()` through `Link.args` at each hop.
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![var.clone()];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur.id()) {
+                continue;
+            }
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    if let (Some(result), OpKind::ConstInt(value)) = (&op.result, &op.kind)
+                        && result == &cur
+                    {
+                        return Some(*value);
+                    }
+                }
+                for (i, input) in block.inputargs.iter().enumerate() {
+                    if input != &cur {
+                        continue;
+                    }
+                    for pred in &graph.blocks {
+                        for link in &pred.exits {
+                            if link.target != block.id {
+                                continue;
+                            }
+                            if let Some(incoming) = link.args.get(i).and_then(|a| a.as_variable()) {
+                                stack.push(incoming.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     };
     let args = int_between[0];
     assert_eq!(args.len(), 3);

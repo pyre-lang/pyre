@@ -6426,6 +6426,69 @@ mod tests {
         );
     }
 
+    fn bool_const(value: bool) -> Hlvalue {
+        Hlvalue::Constant(Constant::new(ConstValue::Bool(value)))
+    }
+
+    fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default()
+    }
+
+    /// `flowspace/model.py` `checkgraph`: `usevar(block.exitswitch)`
+    /// (`assert block.exitswitch in vars`) rejects a switch whose
+    /// discriminant is not defined in the block.
+    #[test]
+    fn checkgraph_rejects_undefined_exitswitch() {
+        let x = Variable::named("x");
+        let sw = Variable::named("func_1");
+        let start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let g = FunctionGraph::new("f", start.clone());
+        start.borrow_mut().exitswitch = Some(Hlvalue::Variable(sw));
+        let false_link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x.clone())],
+            Some(g.returnblock.clone()),
+            Some(bool_const(false)),
+        )));
+        let true_link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x)],
+            Some(g.returnblock.clone()),
+            Some(bool_const(true)),
+        )));
+        start.closeblock(vec![false_link, true_link]);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            checkgraph(&g);
+        }))
+        .expect_err("undefined exitswitch must fail checkgraph");
+        let msg = panic_message(err);
+        assert!(
+            msg.contains("used before definition") && msg.contains("exitswitch"),
+            "expected usevar(block.exitswitch), got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn checkgraph_accepts_defined_exitswitch() {
+        let x = Variable::named("x");
+        let start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let g = FunctionGraph::new("f", start.clone());
+        start.borrow_mut().exitswitch = Some(Hlvalue::Variable(x.clone()));
+        let false_link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x.clone())],
+            Some(g.returnblock.clone()),
+            Some(bool_const(false)),
+        )));
+        let true_link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x)],
+            Some(g.returnblock.clone()),
+            Some(bool_const(true)),
+        )));
+        start.closeblock(vec![false_link, true_link]);
+        checkgraph(&g);
+    }
+
     #[test]
     fn link_settarget_checks_arity() {
         let a = Hlvalue::Variable(Variable::named("a"));
