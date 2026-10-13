@@ -50,16 +50,24 @@ const _: () = {
 pub type UnicodeValueStorage = Utf8Str;
 
 /// Allocate an rstr `STR` from WTF-8 bytes (`W_UnicodeObject._utf8`).
+///
+/// `rstr.mallocstr` does not clear `chars` (`malloc_zero_filled` is false).
+/// The copy below fills every byte the caller asked for.
+///
+/// A failed allocation is `MemoryError` upstream (`rtype_malloc`,
+/// `IncrementalMiniMarkGC.external_malloc`). The raw helper answers null;
+/// this aborts with `handle_alloc_error` rather than handing a null STR to a
+/// caller that would store it as an empty name. `Layout::new` is the abort
+/// path's reported request (`items_block_alloc_failed` uses the same stand-in
+/// when the real layout cannot be named).
 pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStorage {
-    // `rstr.mallocstr` does not clear `chars` (`malloc_zero_filled` is false).
-    // The copy below fills every byte the caller asked for.
     let p = if managed && lowlevel_str_gc_type_id() != 0 {
         bh_alloc_str_nofill(bytes.len())
     } else {
         alloc_raw_utf8_payload(bytes.len())
     };
     if p == 0 {
-        return std::ptr::null_mut();
+        std::alloc::handle_alloc_error(std::alloc::Layout::new::<Utf8Str>());
     }
     unsafe {
         let dst = (p as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);

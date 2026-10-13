@@ -9,8 +9,8 @@
 use pyre_object::pyobject::*;
 use pyre_object::quasiimmut::QuasiImmutField;
 use pyre_object::unicodeobject::{
-    UnicodeValueStorage, alloc_utf8_payload, as_str_unchecked, utf8_payload_wtf8, w_str_is_utf8,
-    w_str_storage,
+    UnicodeValueStorage, alloc_utf8_payload, as_str_unchecked, utf8_payload_bytes,
+    utf8_payload_wtf8, w_str_is_utf8, w_str_storage,
 };
 use rustpython_wtf8::Wtf8Buf;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -650,9 +650,10 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     let w_code = roots.get(root_base);
     let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
     // `Function.name` is an rstr `STR` and `function_get_name` hands it out as
-    // `&str`, so the payload must be valid UTF-8 (`function_set_func_name`
-    // keeps the same invariant through `name_utf8_mirror`). A `co_name` that
-    // carries a lone surrogate stays on `w_name` as the exact wrapper.
+    // `&str`, so the payload must be valid UTF-8. `function_set_func_name`
+    // shares a valid-UTF-8 wrapper's `_utf8` (`text_w`) and only the
+    // lone-surrogate case builds the lossy mirror. A `co_name` that carries a
+    // lone surrogate stays on `w_name` as the exact wrapper.
     let name = if w_name.is_null() {
         FunctionName::Owned(String::new())
     } else if unsafe { w_str_is_utf8(w_name) } {
@@ -2600,32 +2601,43 @@ pub unsafe fn function_get_func_name(obj: PyObjectRef) -> &'static str {
     unsafe { function_get_name(obj) }
 }
 
-/// The UTF-8 mirror a `Function`'s raw `name` `STR` holds (`function.py self.name`).
+/// UTF-8 mirror of a lone-surrogate name (`function.py self.name`).
 ///
-/// A name carrying a lone surrogate — which `surrogateescape` puts there for
-/// any byte an operating-system name failed to decode — has no exact form in
-/// a UTF-8 `STR`. The `w_name` slot keeps the object the caller supplied and
-/// is what `__name__` reads, so the stored value survives; this is the `&str`
-/// view `repr` and the `__qualname__` default consume. `Wtf8::to_string_lossy`
-/// writes U+FFFD for the surrogate, then `.as_ref().to_string()` copies the
-/// `&str`. `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
-/// the lossy copy is encoding, the same class of body `w_str_new` residualises.
-#[majit_macros::dont_look_inside]
-#[inline(never)]
+/// `W_UnicodeObject.text_w` returns `self._utf8` including surrogates.
+/// `function_get_name` hands the stored STR out as `&str`, so a name that
+/// carries a lone surrogate — `surrogateescape` for a byte an OS name failed
+/// to decode — is rewritten with U+FFFD. The `w_name` slot keeps the object
+/// the caller supplied. `codepoint_at_pos` / `next_codepoint_pos` walk the
+/// existing `_utf8`; non-surrogate runs are `&str` views of that payload
+/// (`from_utf8_unchecked` / `utf8_payload_bytes`). The UTF-8 setter path
+/// never reaches here.
 unsafe fn name_utf8_mirror(w_name: PyObjectRef) -> String {
-    unsafe { pyre_object::w_str_get_wtf8(w_name) }
-        .to_string_lossy()
-        .as_ref()
-        .to_string()
+    let storage = unsafe { w_str_storage(w_name) };
+    let wtf8 = unsafe { utf8_payload_wtf8(storage) };
+    let bytes = unsafe { utf8_payload_bytes(storage) };
+    let mut out = String::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let next = pyre_object::rutf8::next_codepoint_pos(wtf8, pos);
+        let cp = pyre_object::rutf8::codepoint_at_pos(wtf8, pos);
+        if cp >= 0xD800 && cp <= 0xDFFF {
+            out.push_str("\u{FFFD}");
+        } else {
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[pos..next]) });
+        }
+        pos = next;
+    }
+    out
 }
 
 /// PyPy-compatible `__name__` setter.
 ///
 /// `function.py fset_func_name` stores `space.text_w(w_name)` — an rstr `STR`.
-/// A GC-managed function allocates a managed `STR`; an immortal function
-/// keeps an immortal `STR` leaf. The old payload is not freed here: a GC
-/// `STR` is reclaimed on sweep once unreachable, and an immortal leaf was
-/// never collector-freed.
+/// `W_UnicodeObject.text_w` returns `self._utf8` directly, so a valid-UTF-8
+/// wrapper shares that payload (`FunctionName::Borrowed`). A lone surrogate
+/// has no UTF-8 form and allocates the lossy mirror instead. The old payload
+/// is not freed here: a GC `STR` is reclaimed on sweep once unreachable, and
+/// an immortal leaf was never collector-freed.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -2635,27 +2647,36 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
         if !crate::baseobjspace::isinstance_str_w(name) {
             return;
         }
-        // Host `String` first (`name_utf8_mirror`), then root live refs across
-        // `alloc_utf8_payload` (`FrameworkGCTransformer.gct_fv_gc_malloc`).
-        // `function_notify_quasi_immut` can collect (`QuasiImmutField.invalidate`);
-        // run it before the barrier. `transform_generic_set` puts the barrier
-        // at the pointer store, with no collecting call between barrier and stores.
-        let raw_name = name_utf8_mirror(name);
-        let managed = pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF);
+        // Root `obj` and `name` across any collecting call
+        // (`alloc_utf8_payload` / `FrameworkGCTransformer.gct_fv_gc_malloc`,
+        // `QuasiImmutField.invalidate`). `function_notify_quasi_immut` runs
+        // before the barrier. `transform_generic_set` puts the barrier at the
+        // pointer store, with no collecting call between barrier and stores.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(name);
-        let payload = alloc_utf8_payload(raw_name.as_bytes(), managed);
-        let payload_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(payload as PyObjectRef);
+        let payload_slot = if w_str_is_utf8(name) {
+            usize::MAX
+        } else {
+            let raw_name = name_utf8_mirror(name);
+            let managed =
+                pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF);
+            let payload = alloc_utf8_payload(raw_name.as_bytes(), managed);
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(payload as PyObjectRef);
+            slot
+        };
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_notify_quasi_immut(obj, QuasiImmutSlot::Name);
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let name = pyre_object::gc_roots::shadow_stack_get(name_slot);
-        let payload =
-            pyre_object::gc_roots::shadow_stack_get(payload_slot) as *mut UnicodeValueStorage;
+        let payload = if payload_slot == usize::MAX {
+            w_str_storage(name)
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(payload_slot) as *mut UnicodeValueStorage
+        };
         function_write_barrier(obj);
         (*(obj as *mut Function)).w_name = name;
         (*(obj as *mut Function)).name = payload;
@@ -4769,6 +4790,10 @@ mod tests {
             assert_eq!(function_get_name_obj(obj), w_name);
             assert_eq!(function_get_name_obj(obj), w_name);
             assert_eq!(function_get_name(obj), "renamed");
+            assert_eq!(
+                (*(obj as *const Function)).name,
+                pyre_object::unicodeobject::w_str_storage(w_name)
+            );
         }
     }
 

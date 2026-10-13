@@ -37,4 +37,14 @@ f = types.FunctionType(code, {})
 assert f.__name__ == "\ud800x"
 repr(f)
 
+abc = "abc"
+f.__name__ = abc
+assert f.__name__ == "abc"
+assert repr(f).startswith("<function ")
+
+lone = "\ud800"
+f.__name__ = lone
+assert f.__name__ == lone
+repr(f)
+
 print("OK")
