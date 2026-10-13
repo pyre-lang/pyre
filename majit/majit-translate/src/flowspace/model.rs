@@ -2751,12 +2751,68 @@ pub enum ConstValue {
     /// Identity is the `Arc` pointer, matching Python `is`.
     Opaque(OpaqueConst),
     /// RPython `s_repr.const` when that constant is an `rmodel.Repr`
-    /// (`hlinvoke`'s first argument). The `usize` is
-    /// `Box::into_raw(Box<Arc<dyn Repr>>)` leaked for the process.
-    /// A fat `Arc<dyn Repr>` cannot sit in this enum: `Repr` is not
-    /// `Send`, and `HostEnv` requires `ConstValue: Send`. This is the
-    /// object itself, not a side table.
-    Repr(usize),
+    /// (`rbuiltin.py` `rtype_hlinvoke`: `r_callable = s_repr.const`).
+    Repr(ReprConst),
+}
+
+/// Address of a leaked `Box<Arc<dyn Repr>>`, not the live object.
+/// Statics (`HOST_ENV`, `SPECIAL_CASES`, lltype tables) require
+/// `ConstValue: Send + Sync`; upstream stores the live repr on
+/// `Constant.value` (`rbuiltin.py` `rtype_hlinvoke`: `r_callable = s_repr.const`).
+#[derive(Clone)]
+pub struct ReprConst {
+    /// `Box::into_raw(Box::new(Arc<dyn Repr>))` as an integer. Always
+    /// nonzero: only [`ReprConst::new`] constructs this type.
+    leaked: usize,
+    /// Data pointer of the inner `Arc`, captured at construction so
+    /// `PartialEq` / `Hash` / `Debug` never dereference.
+    data_ptr: usize,
+    thread: std::thread::ThreadId,
+}
+
+impl ReprConst {
+    pub fn new(repr: Arc<dyn crate::translator::rtyper::rmodel::Repr>) -> Self {
+        let data_ptr = Arc::as_ptr(&repr) as *const () as usize;
+        let leaked = Box::into_raw(Box::new(repr)) as usize;
+        ReprConst {
+            leaked,
+            data_ptr,
+            thread: std::thread::current().id(),
+        }
+    }
+
+    pub fn as_repr(&self) -> Arc<dyn crate::translator::rtyper::rmodel::Repr> {
+        assert!(
+            std::thread::current().id() == self.thread,
+            "ReprConst::as_repr called off the creating thread"
+        );
+        // SAFETY: `leaked` is the `Box::into_raw` address from
+        // `ReprConst::new` and is never freed. The thread check above
+        // confines the `!Send` Repr to the creating thread.
+        unsafe {
+            Arc::clone(&*(self.leaked as *const Arc<dyn crate::translator::rtyper::rmodel::Repr>))
+        }
+    }
+}
+
+impl std::fmt::Debug for ReprConst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReprConst({:#x})", self.data_ptr)
+    }
+}
+
+impl PartialEq for ReprConst {
+    fn eq(&self, other: &Self) -> bool {
+        self.data_ptr == other.data_ptr
+    }
+}
+
+impl Eq for ReprConst {}
+
+impl Hash for ReprConst {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.data_ptr.hash(state);
+    }
 }
 
 /// Identity-bearing rtyper object stored on `Constant.value`.
@@ -2801,33 +2857,6 @@ impl Hash for OpaqueConst {
     }
 }
 
-/// `ConstValue::Repr` carries a leaked `Box<Arc<dyn Repr>>`. Equality is
-/// the inner `Arc` allocation, the same identity `OpaqueConst` uses.
-/// A null carrier is not a live box.
-fn repr_carriers_eq(a: usize, b: usize) -> bool {
-    if a == 0 || b == 0 {
-        return a == b;
-    }
-    // SAFETY: both addresses are leaked boxes from `repr_const`, which
-    // stores `Box<Arc<dyn Repr>>` and never frees it.
-    let arc_a =
-        unsafe { &*(a as *const std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>) };
-    let arc_b =
-        unsafe { &*(b as *const std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>) };
-    std::sync::Arc::ptr_eq(arc_a, arc_b)
-}
-
-fn hash_repr_carrier<H: Hasher>(ptr: usize, state: &mut H) {
-    if ptr == 0 {
-        0usize.hash(state);
-        return;
-    }
-    // SAFETY: `ptr` is a leaked box from `repr_const` and is never freed.
-    let arc =
-        unsafe { &*(ptr as *const std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>) };
-    std::sync::Arc::as_ptr(arc).hash(state);
-}
-
 impl PartialEq for ConstValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -2858,7 +2887,7 @@ impl PartialEq for ConstValue {
             (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => a == b,
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::Opaque(a), ConstValue::Opaque(b)) => a == b,
-            (ConstValue::Repr(a), ConstValue::Repr(b)) => repr_carriers_eq(*a, *b),
+            (ConstValue::Repr(a), ConstValue::Repr(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             (ConstValue::AddressOffset(a), ConstValue::AddressOffset(b)) => a == b,
             (
@@ -2899,7 +2928,7 @@ impl std::fmt::Display for ConstValue {
             ConstValue::SpecTag(id) => write!(f, "<spec-tag {id}>"),
             ConstValue::HostObject(obj) => write!(f, "{}", obj.qualname()),
             ConstValue::Opaque(_) => f.write_str("<opaque>"),
-            ConstValue::Repr(ptr) => write!(f, "<repr {ptr:#x}>"),
+            ConstValue::Repr(repr) => write!(f, "<repr {:#x}>", repr.data_ptr),
             ConstValue::Dict(_)
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
@@ -2967,7 +2996,7 @@ impl Hash for ConstValue {
             },
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::Opaque(opaque) => opaque.hash(state),
-            ConstValue::Repr(ptr) => hash_repr_carrier(*ptr, state),
+            ConstValue::Repr(repr) => repr.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
             ConstValue::AddressOffset(offset) => offset.hash(state),
             ConstValue::InheritanceId {
@@ -5696,6 +5725,49 @@ mod tests {
         a.hash(&mut ha);
         b.hash(&mut hb);
         assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn repr_const_pointer_identity_eq_hash_and_round_trip() {
+        use crate::translator::rtyper::rbuiltin::repr_from_const;
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle_a: Arc<dyn crate::translator::rtyper::rmodel::Repr> = Arc::new(VoidRepr::new());
+        let handle_b: Arc<dyn crate::translator::rtyper::rmodel::Repr> = Arc::new(VoidRepr::new());
+
+        let same_left = ReprConst::new(Arc::clone(&handle_a));
+        let same_right = ReprConst::new(Arc::clone(&handle_a));
+        let different = ReprConst::new(Arc::clone(&handle_b));
+
+        assert_eq!(same_left, same_right);
+        assert_ne!(same_left, different);
+
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        same_left.hash(&mut ha);
+        same_right.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+
+        let mut hd = DefaultHasher::new();
+        different.hash(&mut hd);
+        assert_ne!(ha.finish(), hd.finish());
+
+        let value = ConstValue::Repr(ReprConst::new(Arc::clone(&handle_a)));
+        let round_tripped = repr_from_const(&value).expect("round-trip");
+        assert!(Arc::ptr_eq(&round_tripped, &handle_a));
+    }
+
+    #[test]
+    fn repr_const_as_repr_panics_on_other_thread() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: Arc<dyn crate::translator::rtyper::rmodel::Repr> = Arc::new(VoidRepr::new());
+        let carrier = ReprConst::new(handle);
+        let result = std::thread::spawn(move || {
+            let _ = carrier.as_repr();
+        })
+        .join();
+        assert!(result.is_err());
     }
 
     /// `ConstValue::as_pystr` mirrors RPython `isinstance(value, str)`

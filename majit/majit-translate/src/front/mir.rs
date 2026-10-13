@@ -25640,7 +25640,7 @@ impl<'a> Lowering<'a> {
                     ) && let Some(kind) = self.instance_narrow_for_type(&call.dest.ty, &args[0])
                     {
                         let res = if let Some((base, offset)) =
-                            self.taken_array_field_address(bb_id, &args[0])
+                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))
                             && let Some(root) = tyref_class_root_with(
                                 &call.dest.ty,
                                 self.llbc,
@@ -31058,7 +31058,15 @@ impl<'a> Lowering<'a> {
     /// `direct_arrayitems` (`lltype.py`) is that field's address. The
     /// header is the field-read base; the byte offset is the field's
     /// layout offset (`array_items_base` for a length-prefixed array).
-    fn taken_array_field_address(&self, bb_id: BlockId, var: &Variable) -> Option<(Variable, u64)> {
+    /// `dest_ty` is the `.cast()` dest (`*mut Entry<i64, PyObjectRef>`):
+    /// the instantiated element type at this use, which the generic
+    /// `GcEntries` declaration does not carry.
+    fn taken_array_field_address(
+        &self,
+        bb_id: BlockId,
+        var: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
         let found = {
             let block = self.graph.block(bb_id);
             let mut found = None;
@@ -31077,15 +31085,99 @@ impl<'a> Lowering<'a> {
             }
             found
         }?;
-        let offset = self.array_field_tail_offset(&found.1, &found.2)?;
+        let instantiated_align = dest_ty
+            .and_then(|ty| self.instantiated_elem_align_from_tyref(ty, &found.2))
+            .or_else(|| self.instantiated_elem_align_of_var(var, &found.2))
+            .or_else(|| self.instantiated_elem_align_of_var(&found.0, &found.2));
+        let offset = self.array_field_tail_offset(&found.1, &found.2, instantiated_align)?;
         Some((found.0, offset))
+    }
+
+    /// Alignment of the array element named by MIR local `var`.
+    fn instantiated_elem_align_of_var(&self, var: &Variable, field_name: &str) -> Option<usize> {
+        for (i, slot) in self.local_var.iter().enumerate() {
+            let Some(value) = slot else {
+                continue;
+            };
+            let bound = match value {
+                LocalValue::One(v) | LocalValue::ItemAddr(v) => v,
+                LocalValue::Pair(v, _) => v,
+                LocalValue::SliceIter { items, .. } => items,
+            };
+            if bound == var {
+                return self.instantiated_elem_align_from_tyref(
+                    &self.body.locals.locals.get(i)?.ty,
+                    field_name,
+                );
+            }
+        }
+        None
+    }
+
+    /// Element alignment of an instantiated array-tail field, or of the
+    /// `.cast()` dest / array element at a use site. Type variables (the
+    /// generic declaration) are `None`.
+    fn instantiated_elem_align_from_tyref(&self, ty: &TyRef, field_name: &str) -> Option<usize> {
+        self.instantiated_elem_align_from_json(&tyref_json(ty), field_name)
+    }
+
+    fn instantiated_elem_align_from_json(
+        &self,
+        ty: &serde_json::Value,
+        field_name: &str,
+    ) -> Option<usize> {
+        let body = tyexpr_body(self.llbc, ty)?;
+        if let Some(raw) = body.get("RawPtr").and_then(serde_json::Value::as_array) {
+            return self.instantiated_elem_align_from_json(raw.first()?, field_name);
+        }
+        if let Some(reference) = body.get("Ref").and_then(serde_json::Value::as_array) {
+            return self.instantiated_elem_align_from_json(reference.get(1)?, field_name);
+        }
+        if let Some(arr) = body.get("Array").and_then(serde_json::Value::as_array) {
+            return self.instantiated_elem_align_from_json(arr.first()?, field_name);
+        }
+        let adt = body.get("Adt")?.as_object()?;
+        let td = self.llbc.type_by_id(type_decl_ref_adt_id(adt)?)?;
+        if let TypeDeclKind::Struct(fields) = &td.kind
+            && let Some(field) = fields
+                .iter()
+                .find(|field| field.name.as_deref() == Some(field_name))
+            && let Some(node) = tyref_node(&field.ty, self.llbc)
+            && let Some(stripped) = strip_ty_wrappers(node, self.llbc)
+            && stripped
+                .get("Array")
+                .and_then(serde_json::Value::as_array)
+                .is_some()
+        {
+            let subst = type_decl_ref_generics(adt, self.llbc)
+                .and_then(|g| g.get("types"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let (_, align) = mem_size_align(self.llbc, &tyref_json(&field.ty), &subst, 0)?;
+            return usize::try_from(align).ok().filter(|&a| a > 0);
+        }
+        // `size_align_const_from_tyexpr` only resolves `Value` /
+        // `Deduplicated` wrappers. A spec copy replaces those with a
+        // plain `Adt` that already carries the instantiation.
+        mem_size_align(self.llbc, body, &[], 0)
+            .and_then(|(_, align)| usize::try_from(align).ok())
+            .filter(|&a| a > 0)
     }
 
     /// Byte offset of the `[T; N]` field `field_name` on struct leaf
     /// `owner`. Every matching declaration must agree. A missing layout
     /// with the array at field 1 (the `usize` length word of
-    /// `GcEntries`) is one target word.
-    fn array_field_tail_offset(&self, owner: &str, field_name: &str) -> Option<u64> {
+    /// `GcEntries`) is that word rounded up to `T`'s alignment
+    /// (`array_items_base`). The declaration of a generic struct has no
+    /// layout and unresolved type variables, so `instantiated_elem_align`
+    /// is the use-site `T`. Unknown element alignment is `None`.
+    fn array_field_tail_offset(
+        &self,
+        owner: &str,
+        field_name: &str,
+        instantiated_elem_align: Option<usize>,
+    ) -> Option<u64> {
         let leaf = owner
             .rsplit("::")
             .next()
@@ -31096,6 +31188,7 @@ impl<'a> Lowering<'a> {
         let target = std::env::var("TARGET").unwrap_or_default();
         let mut offset: Option<u64> = None;
         let mut index: Option<usize> = None;
+        let mut elem_align: Option<u64> = None;
         let mut saw = false;
         for td in self.llbc.iter_type_decls() {
             let name = td.item_meta.name_path();
@@ -31118,17 +31211,26 @@ impl<'a> Lowering<'a> {
             let Some(stripped) = strip_ty_wrappers(node, self.llbc) else {
                 continue;
             };
-            if !stripped
-                .as_object()
-                .is_some_and(|obj| obj.contains_key("Array"))
-            {
+            let Some(array) = stripped.get("Array").and_then(serde_json::Value::as_array) else {
                 continue;
-            }
+            };
             saw = true;
             match index {
                 None => index = Some(idx),
                 Some(prev) if prev != idx => return None,
                 Some(_) => {}
+            }
+            if let Some(elem) = array.first()
+                && let Some(align) = self
+                    .size_align_const_from_tyexpr(true, elem)
+                    .and_then(|a| u64::try_from(a).ok())
+                    .filter(|&a| a > 0)
+            {
+                match elem_align {
+                    None => elem_align = Some(align),
+                    Some(prev) if prev != align => return None,
+                    Some(_) => {}
+                }
             }
             if let Some(layout) = td.layout_for_target(self.llbc, &target) {
                 let off = layout.struct_field_offset(idx)?;
@@ -31143,9 +31245,24 @@ impl<'a> Lowering<'a> {
             return Some(off);
         }
         if saw && index == Some(1) {
-            return Some(crate::layout::target_word_size() as u64);
+            let align = elem_align
+                .and_then(|a| usize::try_from(a).ok())
+                .or(instantiated_elem_align);
+            return Self::array_field_tail_offset_fallback(
+                crate::layout::target_word_size(),
+                align,
+            );
         }
         None
+    }
+
+    /// Items offset of a length-prefixed `[T; 0]` sitting at field 1 when
+    /// Charon recorded no layout. Items start at the length word rounded
+    /// up to `T`'s alignment (`array_items_base` / `symbolic.get_array_token`).
+    /// Unknown element alignment is `None`.
+    fn array_field_tail_offset_fallback(word: usize, elem_align: Option<usize>) -> Option<u64> {
+        let align = elem_align.filter(|&a| a > 0)?;
+        Some(crate::codewriter::call::array_items_base(word, align) as u64)
     }
 
     /// `direct_arrayitems` (`lltype.py`) as `cast_ptr_to_int` + add +
@@ -73432,6 +73549,136 @@ mod tests {
             Some(super::IntCastAction::RUint)
         );
         assert_eq!(super::int_cast_action(128, false, 64, false), None);
+    }
+
+    /// A missing Charon layout on `GcEntries { length: usize, items: [T; 0] }`
+    /// still has to place items at the length word rounded up to `T`'s
+    /// alignment (`array_items_base`). A 4-byte wasm32 word and an 8-aligned
+    /// `Entry<i64, PyObjectRef>` therefore sit at 8, not 4; a 64-bit word
+    /// already satisfies that alignment.
+    #[test]
+    fn array_field_tail_offset_rounds_length_word_to_element_align() {
+        assert_eq!(
+            super::Lowering::array_field_tail_offset_fallback(4, Some(8)),
+            Some(8)
+        );
+        assert_eq!(
+            super::Lowering::array_field_tail_offset_fallback(8, Some(8)),
+            Some(8)
+        );
+        assert_eq!(
+            super::Lowering::array_field_tail_offset_fallback(4, None),
+            None
+        );
+    }
+
+    /// `entries_item_ptr` of `GcEntries<i64, PyObjectRef>` is
+    /// `addr_of_mut!((*header).items).cast()`. The generic `GcEntries`
+    /// declaration has no Charon layout and unresolved type variables,
+    /// so the items offset is the length word rounded up to the
+    /// instantiated `Entry` alignment (`array_items_base`). `Entry`
+    /// always contains `f_hash: u64`, so that offset is 8.
+    #[test]
+    fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
+        use crate::model::{CallTarget, OpKind};
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let name_path = "pyre_object::rordereddict_entries::entries_item_ptr";
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path() == name_path)
+            .unwrap_or_else(|| panic!("{name_path} in pyre-object LLBC"));
+        let gcref_id = llbc
+            .iter_type_decls()
+            .find(|td| td.item_meta.name_path() == "pyre_object::pyobject::PyObject")
+            .unwrap_or_else(|| panic!("PyObject in pyre-object LLBC"))
+            .def_id;
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let gcref_ty = serde_json::json!({
+            "RawPtr": [
+                {
+                    "Adt": {
+                        "id": gcref_id,
+                        "generics": {
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": []
+                        },
+                        "builtin": null
+                    }
+                },
+                "Mut"
+            ]
+        });
+        let body = crate::front::clause_spec::substituted_unstructured(
+            fd,
+            &llbc,
+            &[],
+            &[i64_ty, gcref_ty],
+            &[],
+        )
+        .expect("substituted entries_item_ptr body");
+        let context = super::LowerContext::new(&llbc);
+        let struct_fields = super::struct_field_registry_from_rows(&context.struct_fields);
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let jitdriver_receiver_roots =
+            crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+        let graph = super::lower_unstructured_with_static_addrs_and_attrs(
+            &llbc,
+            fd,
+            &body,
+            crate::HostStaticAddrs::default(),
+            &jitdriver_receiver_roots,
+            &context.struct_field_attrs,
+            &struct_fields,
+            &context.dont_look_inside,
+            &context.tombstoned_leaves,
+            &context.gc_struct_ids,
+            accum.has_builder,
+            &accum,
+            &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+            None,
+            true,
+            None,
+        )
+        .unwrap_or_else(|err| panic!("lower substituted {name_path}: {err:?}"));
+
+        // `emit_array_tail_item_ptr` is `cast_ptr_to_int` + ConstInt(offset)
+        // + add + `cast_int_to_ptr`. The address-taken `items` FieldRead is
+        // unused after that rewrite and may be dropped.
+        let mut offset = None;
+        let mut saw_cast_int_to_ptr = false;
+        for block in &graph.blocks {
+            for (i, op) in block.operations.iter().enumerate() {
+                if let OpKind::ConstInt(n) = op.kind {
+                    let add = block.operations.get(i + 1).map(|next| &next.kind);
+                    if matches!(
+                        add,
+                        Some(OpKind::BinOp { op, .. }) if op == "add"
+                    ) {
+                        offset = Some(n);
+                    }
+                }
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } = &op.kind
+                    && segments.last().is_some_and(|s| s == "cast_int_to_ptr")
+                {
+                    saw_cast_int_to_ptr = true;
+                }
+            }
+        }
+        assert!(
+            saw_cast_int_to_ptr,
+            "substituted entries_item_ptr must emit direct_arrayitems (cast_int_to_ptr)"
+        );
+        assert_eq!(
+            offset,
+            Some(8),
+            "GcEntries items sit at the length word rounded up to Entry alignment"
+        );
     }
 
     /// A one-word-item Vec header pointer is int-banked, matching

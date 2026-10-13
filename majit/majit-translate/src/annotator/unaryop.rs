@@ -1848,6 +1848,33 @@ fn dict_method_get(
 }
 
 #[allow(dead_code)]
+fn dict_method_insert(
+    ann: &RPythonAnnotator,
+    s_self: &super::model::SomeDict,
+    s_key: &SomeValue,
+    s_value: &SomeValue,
+) -> SomeValue {
+    // Annotation of the old get(key) + setitem(key, value) pair:
+    // get(key) defaults dfl to s_None (unaryop.py method_get), so the
+    // result admits None (`ll_dict_insert` returns NULL on a miss);
+    // setitem generalizes the stored value (binaryop.py setitem SomeDict).
+    let position = ann.bookkeeper.current_position_key();
+    s_self
+        .dictdef
+        .generalize_key(s_key)
+        .expect("generalize_key");
+    s_self
+        .dictdef
+        .generalize_value(&s_none())
+        .expect("generalize_value");
+    s_self
+        .dictdef
+        .generalize_value(s_value)
+        .expect("generalize_value");
+    s_self.dictdef.read_value(position)
+}
+
+#[allow(dead_code)]
 fn dict_method_copy(_ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
     // unaryop.py method_copy — SomeDict(self.dictdef).
     SomeValue::Dict(super::model::SomeDict::new(s_self.dictdef.clone()))
@@ -2765,6 +2792,7 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
         },
         SomeValue::Dict(_) => match name {
             "get" | "setdefault" => "dict_method_get",
+            "insert" => "dict_method_insert",
             "copy" => "dict_method_copy",
             "update" => "dict_method_update",
             "__prepare_dict_update" => "dict_method_prepare_dict_update",
@@ -3116,6 +3144,22 @@ pub(crate) fn call_builtin_method(
                 unreachable!();
             };
             dict_method_get(ann, s_self, s_key, s_dfl)
+        }
+        "dict_method_insert" => {
+            let SomeValue::Dict(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(
+                args_s,
+                kwds,
+                &["s_key", "s_value"],
+                None,
+                &method.analyser_name,
+            )?;
+            let [s_key, s_value] = scope.as_slice() else {
+                unreachable!();
+            };
+            dict_method_insert(ann, s_self, s_key, s_value)
         }
         "dict_method_copy" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -6762,6 +6806,84 @@ mod tests {
             &SomeValue::Integer(SomeInteger::default()),
         );
         assert!(matches!(result, SomeValue::String(_)));
+    }
+
+    #[test]
+    fn dict_method_insert_on_instance_values_admits_none_and_generalizes_value() {
+        // Old lowering annotated get(key) (dfl = s_None) then
+        // setitem(key, value). insert(key, value) must keep that pair:
+        // the result admits None (miss returns NULL) and the dict
+        // value cell is generalized with the inserted instance.
+        use super::super::classdesc::ClassDef;
+        use super::super::model::SomeInstance;
+
+        let ann = mk_ann();
+        let pk = super::super::bookkeeper::PositionKey::new(9, 0, 0);
+        ann.bookkeeper.set_position_key(Some(pk));
+        let classdef = ClassDef::new_standalone("pkg.X", None);
+        let s_inst = SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let dictdef = super::super::dictdef::DictDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::default()),
+            s_inst.clone(),
+            false,
+            false,
+            false,
+        );
+        let s_dict = SomeValue::Dict(super::super::model::SomeDict::new(dictdef));
+
+        let SomeValue::BuiltinMethod(insert) = s_dict.find_method("insert").unwrap() else {
+            panic!("dict.insert must be recognized");
+        };
+        assert_eq!(insert.analyser_name, "dict_method_insert");
+        let SomeValue::BuiltinMethod(get) = s_dict.find_method("get").unwrap() else {
+            panic!("dict.get must be recognized");
+        };
+        assert_eq!(get.analyser_name, "dict_method_get");
+        let SomeValue::BuiltinMethod(setdefault) = s_dict.find_method("setdefault").unwrap() else {
+            panic!("dict.setdefault must be recognized");
+        };
+        assert_eq!(setdefault.analyser_name, "dict_method_get");
+
+        let args = super::super::argument::ArgumentsForTranslation::new(
+            vec![
+                Some(SomeValue::Integer(SomeInteger::default())),
+                Some(s_inst),
+            ],
+            None,
+            None,
+        );
+        let result = call_builtin_method(&ann, &insert, &args).expect("insert call must bind");
+        let Some(SomeValue::Instance(result_inst)) = result else {
+            panic!("insert must return an instance annotation, got {result:?}");
+        };
+        assert!(
+            result_inst.can_be_none,
+            "insert result must admit None (miss returns NULL)"
+        );
+
+        let SomeValue::Dict(s_self) = &s_dict else {
+            panic!("receiver stays a dict");
+        };
+        let stored = s_self.dictdef.read_value(None);
+        let SomeValue::Instance(stored_inst) = &stored else {
+            panic!("dict value must stay an instance, got {stored:?}");
+        };
+        assert!(
+            stored_inst.can_be_none,
+            "dict value must be generalized with None from the miss path"
+        );
+        assert!(
+            stored_inst
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &classdef)),
+            "dict value must stay generalized with the inserted instance class"
+        );
     }
 
     #[test]

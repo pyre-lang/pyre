@@ -3275,6 +3275,24 @@ impl DescrIndexRegistry {
     }
 }
 
+/// Byte offset of the first item of a length-prefixed array whose length
+/// word ends at `header_end` and whose elements align to `elem_align`.
+///
+/// The blocks these descrs address are `#[repr(C)] { length: usize, items:
+/// [T; 0] }`, so the items begin at the length word rounded UP to `T`'s
+/// alignment — not at the word itself. The two coincide whenever the word
+/// is at least as wide as every element, which is why a 64-bit target sees
+/// `header_end` unchanged; on a 32-bit target an 8-byte element (`i64` /
+/// `f64` unboxed list storage, `Entry.f_hash`) is aligned past the 4-byte
+/// length word, and addressing it at the word would stride the array 4
+/// bytes early.
+///
+/// Shared by [`CallControl::array_items_base`] (`symbolic.get_array_token`)
+/// and the MIR fallback for a missing Charon layout.
+pub(crate) fn array_items_base(header_end: usize, elem_align: usize) -> usize {
+    header_end.next_multiple_of(elem_align)
+}
+
 impl CallControl {
     /// RPython: `CallControl.__init__`.
     pub fn new() -> Self {
@@ -3609,8 +3627,7 @@ impl CallControl {
     /// `f64` unboxed list storage) is aligned past the 4-byte length word, and
     /// addressing it at the word would stride the array 4 bytes early.
     fn array_items_base(&self, header_end: usize, elem: Option<&str>, item_size: usize) -> usize {
-        let align = self.element_align(elem, item_size);
-        header_end.next_multiple_of(align)
+        self::array_items_base(header_end, self.element_align(elem, item_size))
     }
 
     /// Alignment of an array element. A scalar or pointer aligns to its own

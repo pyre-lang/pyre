@@ -1189,10 +1189,10 @@ fn is_vec_push_segments(segments: &[String]) -> bool {
     segments.len() == 3 && segments[0] == "vec" && segments[1] == "Vec" && segments[2] == "push"
 }
 
-/// `RDict::insert` / `RDict::get` (`rordereddict.py` `ll_dict_setitem` /
-/// `ll_dict_lookup`). The owner segment is the type; `unspecialized_leaf`
-/// sees through the monomorphized copy. The hash in the leaf is not part
-/// of the match.
+/// `RDict::insert` / `RDict::get` (`rordereddict.py`
+/// `ll_dict_setitem_with_hash` / `ll_dict_get`). The owner segment is the
+/// type; `unspecialized_leaf` sees through the monomorphized copy. The
+/// hash in the leaf is not part of the match.
 fn rdict_insert_or_get_leaf(segments: &[String]) -> Option<&str> {
     if segments.len() < 3 || segments[segments.len() - 2] != "RDict" {
         return None;
@@ -3239,12 +3239,11 @@ pub fn translate_op(
                     // (`OrderedDictRepr.rtype_method_get` → `ll_dict_get`
                     // → `ll_dict_lookup`). Two arguments: the missing key
                     // answers the `None` default that method pushes.
-                    // `RDict::insert(recv, key, value)` returns the previous
-                    // value (`Option`), while `ll_dict_setitem` is void
-                    // (`rtype_setitem`). Read with `get` into the call's
-                    // result, then `setitem` (`ll_dict_setitem`). `get`
-                    // runs first so the displaced value is the one insert
-                    // returned.
+                    // `RDict::insert(recv, key, value)` is one FLAG_STORE
+                    // probe: `ll_dict_lookup(FLAG_STORE)` then
+                    // `_ll_dict_setitem_lookup_done`
+                    // (`ll_dict_setitem_with_hash`), returning the
+                    // displaced value. One method call (`insert`).
                     if let Some(leaf) = rdict_insert_or_get_leaf(segments) {
                         if leaf == "get" {
                             if arg_hls.len() != 2 {
@@ -3295,22 +3294,18 @@ pub fn translate_op(
                             TyperError::message("RDict::insert requires a value arg".to_string())
                         })?;
                         let bound_method = Hlvalue::Variable(Variable::new());
-                        let stored = Hlvalue::Variable(Variable::new());
                         return Ok(vec![
                             FlowspaceOp::new(
                                 "getattr",
                                 vec![
-                                    receiver.clone(),
-                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("get"))),
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        "insert",
+                                    ))),
                                 ],
                                 bound_method.clone(),
                             ),
-                            FlowspaceOp::new(
-                                "simple_call",
-                                vec![bound_method, key.clone()],
-                                result,
-                            ),
-                            FlowspaceOp::new("setitem", vec![receiver, key, value], stored),
+                            FlowspaceOp::new("simple_call", vec![bound_method, key, value], result),
                         ]);
                     }
                     // Fail-closed on an UNFUSED
@@ -9168,6 +9163,89 @@ mod tests {
         assert_eq!(translated[1].args.len(), 2);
         assert_eq!(&translated[1].args[0], bound);
         assert_eq!(translated[1].args[1], piece);
+    }
+
+    #[test]
+    fn translate_op_rdict_insert_lowers_to_one_insert_method_call() {
+        // `RDict::insert(recv, key, value)` → `getattr(recv, "insert") +
+        // simple_call(bound, key, value)`. One method call: no `get`
+        // probe and no `setitem` (`ll_dict_lookup(FLAG_STORE)` +
+        // `_ll_dict_setitem_lookup_done`).
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        let recv = Hlvalue::Variable(Variable::new());
+        let key = Hlvalue::Variable(Variable::new());
+        let value = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), recv.clone());
+        value_map.insert(vars[2].clone(), key.clone());
+        value_map.insert(vars[3].clone(), value.clone());
+        value_map.insert(vars[4].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[4].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".into(),
+                        "rordereddict".into(),
+                        "RDict".into(),
+                        "insert".into(),
+                    ],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![
+                    vars[1].clone(),
+                    vars[2].clone(),
+                    vars[3].clone(),
+                ]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("RDict::insert must lower");
+        assert_eq!(translated.len(), 2, "getattr + simple_call");
+        assert!(
+            translated.iter().all(|op| op.opname != "setitem"),
+            "insert must not emit setitem"
+        );
+        assert_eq!(translated[0].opname, "getattr");
+        assert_eq!(translated[0].args[0], recv);
+        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+            panic!("insert getattr name must be a Constant");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"insert"
+        ));
+        assert!(
+            !matches!(
+                name_const.value,
+                ConstValue::ByteStr(ref bytes) if bytes == b"get"
+            ),
+            "insert must not getattr get"
+        );
+        let bound = &translated[0].result;
+        assert_eq!(translated[1].opname, "simple_call");
+        assert_eq!(translated[1].args.len(), 3);
+        assert_eq!(&translated[1].args[0], bound);
+        assert_eq!(translated[1].args[1], key);
+        assert_eq!(translated[1].args[2], value);
+        assert_eq!(translated[1].result, result_var);
+        assert!(
+            translated.iter().all(|op| {
+                !op.args.iter().any(|arg| {
+                    matches!(
+                        arg,
+                        Hlvalue::Constant(c) if matches!(
+                            &c.value,
+                            ConstValue::ByteStr(bytes) if bytes == b"get"
+                        )
+                    )
+                })
+            }),
+            "insert lowering must not mention get"
+        );
     }
 
     #[test]

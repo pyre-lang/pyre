@@ -227,15 +227,16 @@ pub struct Bookkeeper {
     pub(crate) dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
     /// RPython `self.descs = {}` (bookkeeper.py). Maps
     /// `Constant(pyobj)` to a FunctionDesc / ClassDesc / FrozenDesc /
-    /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py getdesc. The
-    /// Rust port keys directly on [`HostObject`] (which already has
-    /// `Arc::ptr_eq` identity) via [`DescEntry`].
+    /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py getdesc.
+    /// Keys are [`ConstValue`] (`Constant(pyobj)`): HostObject entries
+    /// use `ConstValue::HostObject` (Arc identity), and a frozen Repr
+    /// uses `ConstValue::Repr` (the repr `Arc` data pointer).
     /// `IndexMap`, not `HashMap`: `normalize_class_pbcs` iterates
     /// `descs.values()` to resolve DescKeys back to `ClassDesc`s and folds
     /// them into a `commonbase`, feeding classdef numbering.  The key is a
     /// pointer identity, so only insertion order (IndexMap) is
     /// reproducible — a `HashMap` would number classdefs run-varyingly.
-    pub(crate) descs: RefCell<IndexMap<HostObject, DescEntry>>,
+    pub(crate) descs: RefCell<DescMap>,
     /// RPython `self.classdefs = []` (bookkeeper.py). Populated by
     /// `ClassDesc._init_classdef` (classdesc.py). ClassDef
     /// identity is Rc pointer equality — matches upstream's Python
@@ -434,6 +435,47 @@ impl std::fmt::Debug for Bookkeeper {
             .field("classdefs_len", &self.classdefs.borrow().len())
             .field("methoddescs_len", &self.methoddescs.borrow().len())
             .finish()
+    }
+}
+
+/// `Bookkeeper.descs` keyed like upstream `Constant(pyobj)`
+/// (`bookkeeper.py` `getdesc`). HostObject insert/get keep the
+/// existing call-site API; a Repr constant (`Repr._freeze_`) is
+/// stored under `ConstValue::Repr`.
+#[derive(Default)]
+pub(crate) struct DescMap {
+    inner: IndexMap<ConstValue, DescEntry>,
+}
+
+impl DescMap {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: IndexMap::new(),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, pyobj: HostObject, entry: DescEntry) -> Option<DescEntry> {
+        self.insert_const(ConstValue::HostObject(pyobj), entry)
+    }
+
+    pub(crate) fn get(&self, pyobj: &HostObject) -> Option<&DescEntry> {
+        self.get_const(&ConstValue::HostObject(pyobj.clone()))
+    }
+
+    pub(crate) fn insert_const(&mut self, key: ConstValue, entry: DescEntry) -> Option<DescEntry> {
+        self.inner.insert(key, entry)
+    }
+
+    pub(crate) fn get_const(&self, key: &ConstValue) -> Option<&DescEntry> {
+        self.inner.get(key)
+    }
+
+    pub(crate) fn values(&self) -> indexmap::map::Values<'_, ConstValue, DescEntry> {
+        self.inner.values()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
     }
 }
 
@@ -1138,7 +1180,7 @@ impl Bookkeeper {
             listdefs: RefCell::new(HashMap::new()),
             projected_roots: RefCell::new(HashMap::new()),
             dictdefs: RefCell::new(HashMap::new()),
-            descs: RefCell::new(IndexMap::new()),
+            descs: RefCell::new(DescMap::new()),
             classdefs: RefCell::new(Vec::new()),
             methoddescs: RefCell::new(HashMap::new()),
             frozenpbc_attr_families: RefCell::new(UnionFind::new(|desc: &DescKey| {
@@ -2266,8 +2308,9 @@ impl Bookkeeper {
     /// RPython `Bookkeeper.getdesc(pyobj)` (bookkeeper.py).
     ///
     /// Returns the cached [`DescEntry`] for `pyobj`, or constructs a
-    /// fresh one per upstream's `isinstance` dispatch. The Rust port
-    /// branches on [`HostObject`] kind:
+    /// fresh one per upstream's `isinstance` dispatch. Cached under
+    /// `ConstValue::HostObject` in [`Self::descs`] (`obj_key =
+    /// Constant(pyobj)`). The Rust port branches on [`HostObject`] kind:
     ///   * `UserFunction` → [`Self::newfuncdesc`]
     ///   * `Class` → `ClassDesc` (c1 shell — c2c replaces this with the
     ///     full `ClassDesc::__init__` body; the shell still satisfies
@@ -2368,6 +2411,35 @@ impl Bookkeeper {
         };
         self.descs.borrow_mut().insert(pyobj.clone(), entry.clone());
         Ok(entry)
+    }
+
+    /// `Bookkeeper.getdesc` for a [`ConstValue`] key (`bookkeeper.py`
+    /// `obj_key = Constant(pyobj)`). HostObject constants reuse
+    /// [`Self::getdesc`]; a `Repr` constant (`Repr._freeze_`) is the
+    /// frozen-PBC fallback, cached under `ConstValue::Repr`.
+    pub(crate) fn getdesc_for_const(
+        self: &Rc<Self>,
+        x: &ConstValue,
+    ) -> Result<DescEntry, AnnotatorError> {
+        match x {
+            ConstValue::HostObject(obj) => self.getdesc(obj),
+            ConstValue::Repr(_) => {
+                if let Some(existing) = self.descs.borrow().get_const(x) {
+                    return Ok(existing.clone());
+                }
+                let entry = DescEntry::Frozen(Rc::new(RefCell::new(FrozenDesc::prebuilt(
+                    self.clone(),
+                    x.clone(),
+                ))));
+                self.descs
+                    .borrow_mut()
+                    .insert_const(x.clone(), entry.clone());
+                Ok(entry)
+            }
+            other => Err(AnnotatorError::new(format!(
+                "Bookkeeper.getdesc({other:?}): unexpected prebuilt constant"
+            ))),
+        }
     }
 
     /// RPython `Bookkeeper.newfuncdesc(pyfunc)` (bookkeeper.py).
@@ -4893,14 +4965,11 @@ impl Bookkeeper {
             }
             ConstValue::Repr(_) => {
                 // `Repr._freeze_` returns true, so this is the `_freeze_`
-                // arm: `SomePBC([getdesc(x)])`. A Repr is not a HostObject,
-                // so the frozen description is built for this bookkeeper
-                // without a host key.
-                let entry =
-                    DescEntry::Frozen(Rc::new(RefCell::new(FrozenDesc::prebuilt(self.clone()))));
-                let mut pbc = SomePBC::new(vec![entry], false);
-                pbc.base.const_box = Some(Constant::new(x.clone()));
-                Ok(SomeValue::PBC(pbc))
+                // arm: `SomePBC([getdesc(x)])` (bookkeeper.py
+                // immutablevalue). getdesc caches one FrozenDesc per
+                // object; Repr identity is the carrier's Arc data pointer.
+                let entry = self.getdesc_for_const(x)?;
+                Ok(SomeValue::PBC(SomePBC::new(vec![entry], false)))
             }
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
@@ -9171,6 +9240,79 @@ mod tests {
             }
             other => panic!("expected SomePBC, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn immutablevalue_repr_reuses_frozen_desc_and_union_stays_constant() {
+        // bookkeeper.py immutablevalue `_freeze_` arm:
+        // `SomePBC([self.getdesc(x)])`. getdesc caches one descriptor
+        // per object (`obj_key = Constant(pyobj)`). Repr identity is
+        // the carrier's Arc data pointer (`ReprConst`).
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::translator::rtyper::rmodel::VoidRepr;
+        use std::sync::Arc;
+
+        let bk = bk();
+        let handle_a: Arc<dyn crate::translator::rtyper::rmodel::Repr> = Arc::new(VoidRepr::new());
+        let handle_b: Arc<dyn crate::translator::rtyper::rmodel::Repr> = Arc::new(VoidRepr::new());
+        let c1 = ConstValue::Repr(crate::flowspace::model::ReprConst::new(Arc::clone(
+            &handle_a,
+        )));
+        let c1_again = ConstValue::Repr(crate::flowspace::model::ReprConst::new(Arc::clone(
+            &handle_a,
+        )));
+        let c2 = ConstValue::Repr(crate::flowspace::model::ReprConst::new(Arc::clone(
+            &handle_b,
+        )));
+
+        let s1 = bk.immutablevalue(&c1).expect("repr annotates");
+        let s1b = bk.immutablevalue(&c1_again).expect("same repr annotates");
+        let s2 = bk.immutablevalue(&c2).expect("other repr annotates");
+
+        let SomeValue::PBC(p1) = &s1 else {
+            panic!("expected SomePBC, got {s1:?}");
+        };
+        let SomeValue::PBC(p1b) = &s1b else {
+            panic!("expected SomePBC, got {s1b:?}");
+        };
+        let SomeValue::PBC(p2) = &s2 else {
+            panic!("expected SomePBC, got {s2:?}");
+        };
+        assert_eq!(p1.descriptions.len(), 1);
+        assert_eq!(
+            p1.descriptions.keys().next(),
+            p1b.descriptions.keys().next(),
+            "same repr must reuse one FrozenDesc"
+        );
+        assert!(p1.is_constant());
+        assert_eq!(p1.base.const_box.as_ref().map(|c| &c.value), Some(&c1));
+
+        let merged = union(&s1, &s1b).expect("same-repr PBC union");
+        let SomeValue::PBC(merged_pbc) = &merged else {
+            panic!("expected SomePBC, got {merged:?}");
+        };
+        assert_eq!(merged_pbc.descriptions.len(), 1);
+        assert!(merged_pbc.is_constant());
+        assert_eq!(
+            merged_pbc.base.const_box.as_ref().map(|c| &c.value),
+            Some(&c1)
+        );
+        assert_eq!(
+            merged_pbc.descriptions.keys().next(),
+            p1.descriptions.keys().next()
+        );
+
+        assert_ne!(
+            p1.descriptions.keys().next(),
+            p2.descriptions.keys().next(),
+            "different reprs must mint two FrozenDescs"
+        );
+        let mixed = union(&s1, &s2).expect("distinct-repr PBC union");
+        let SomeValue::PBC(mixed_pbc) = mixed else {
+            panic!("expected SomePBC, got {mixed:?}");
+        };
+        assert_eq!(mixed_pbc.descriptions.len(), 2);
+        assert!(!mixed_pbc.is_constant());
     }
 
     #[test]

@@ -1665,10 +1665,8 @@ impl SomePBC {
         //             self.const = desc.pyobj
         if pbc.descriptions.len() == 1 && !pbc.can_be_none {
             let entry = pbc.descriptions.values().next().unwrap();
-            if let Some(pyobj) = entry.pyobj() {
-                pbc.base.const_box = Some(Constant::new(
-                    super::super::flowspace::model::ConstValue::HostObject(pyobj),
-                ));
+            if let Some(pyobj) = entry.pyobj_const() {
+                pbc.base.const_box = Some(Constant::new(pyobj));
             }
         }
         // upstream model.py:538-553 — multi-desc kind enforcement.
@@ -1876,8 +1874,8 @@ impl SomeObjectTrait for SomePBC {
     fn is_constant(&self) -> bool {
         // upstream: `SomePBC.__init__` sets `self.const` when
         // `len(descriptions) == 1 and not can_be_None and desc.pyobj
-        // is not None` (model.py:534-537). The constructor already
-        // pins `const_box` via [`DescEntry::pyobj`], so this check
+        // is not None` (model.py). The constructor already
+        // pins `const_box` via [`DescEntry::pyobj_const`], so this check
         // reduces to inspecting `const_box`.
         self.base.const_box.is_some()
     }

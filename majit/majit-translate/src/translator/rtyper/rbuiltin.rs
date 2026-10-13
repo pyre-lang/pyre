@@ -2131,27 +2131,22 @@ pub fn rtype_WindowsError__init__(
     Ok(None)
 }
 
-/// Pack a live `Repr` into `ConstValue::Repr`. The box is leaked so the
-/// pointer stays valid for the process and `ConstValue` stays `Send`.
+/// Pack a live `Repr` into `ConstValue::Repr`.
 #[cfg(test)]
 pub(crate) fn repr_const(
     repr: Arc<dyn crate::translator::rtyper::rmodel::Repr>,
 ) -> crate::flowspace::model::ConstValue {
-    crate::flowspace::model::ConstValue::Repr(Box::into_raw(Box::new(repr)) as usize)
+    crate::flowspace::model::ConstValue::Repr(crate::flowspace::model::ReprConst::new(repr))
 }
 
-/// Inverse of [`repr_const`]. Clones the `Arc`; the leaked box stays.
+/// Inverse of [`repr_const`]. Clones the live `Arc`.
 pub(crate) fn repr_from_const(
     value: &crate::flowspace::model::ConstValue,
 ) -> Option<Arc<dyn crate::translator::rtyper::rmodel::Repr>> {
-    let crate::flowspace::model::ConstValue::Repr(ptr) = value else {
+    let crate::flowspace::model::ConstValue::Repr(repr) = value else {
         return None;
     };
-    if *ptr == 0 {
-        return None;
-    }
-    // SAFETY: `ptr` was produced by `repr_const` and never freed.
-    Some(unsafe { Arc::clone(&*(*ptr as *const Arc<dyn crate::translator::rtyper::rmodel::Repr>)) })
+    Some(repr.as_repr())
 }
 
 /// RPython `def rtype_hlinvoke(hop)` (rbuiltin.py).
