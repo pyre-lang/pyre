@@ -3613,7 +3613,6 @@ impl Backend for DynasmBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
@@ -4295,8 +4294,6 @@ impl Backend for DynasmBackend {
         Self::redirect_call_assembler_target(old.number, new_addr as usize);
         Ok(())
     }
-
-    // No migrate_bridges — we patch in place.
 
     fn bridge_was_compiled(
         &self,
@@ -5814,7 +5811,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -5906,7 +5902,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();
@@ -6008,7 +6003,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                &[],
                 None,
             )
             .unwrap();

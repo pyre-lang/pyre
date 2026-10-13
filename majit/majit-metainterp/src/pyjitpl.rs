@@ -2321,9 +2321,8 @@ impl<M> CompiledEntry<M> {
 /// These two are carried at **all five** replace paths. They are deliberately
 /// the *only* members: the label list is `JitCellToken.target_tokens`
 /// (`history.py`), and a token minted by `make_jitcell_token` starts with
-/// none, so no replace path inherits the displaced loop's labels. Likewise
-/// `migrate_bridges` is called at three of the five and must stay at the call
-/// sites. Adding a field here that is not universal re-introduces exactly the
+/// none, so no replace path inherits the displaced loop's labels. Adding a
+/// field here that is not universal re-introduces exactly the
 /// bug this type exists to prevent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CarriedFields {
@@ -2546,14 +2545,6 @@ pub struct MetaInterp<M: Clone> {
     /// it before it can publish or mutate one of those fields, and the next
     /// minor root walk consumes it. Major marking still scans everything.
     compiled_graph_minor_scan_pending: bool,
-    /// warmstate.py `JitCell.get_jit_cell_at_key` analog for the
-    /// merge-point green vocabulary: the header greens (`(ints, refs,
-    /// floats)`) each compiled loop was traced under, keyed by
-    /// `(jitdriver_sd.index, cell green_key)` like `compiled_loops`.
-    /// Lets a bridge that closes on a merge point resolve the procedure token
-    /// of the loop living AT that merge point (pyjitpl.py:3005), which the
-    /// cell key alone cannot be inverted to.
-    pub(crate) loop_header_greens: crate::FxIndexMap<(usize, u64), (Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// Recycled `ContinueRunningNormally` banks for compiled-entry FINISH
     /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
     /// six Vec capacities on the pooled interpreter; exits that never enter
@@ -4184,7 +4175,6 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: crate::FxIndexMap::default(),
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
-            loop_header_greens: crate::FxIndexMap::default(),
             portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
             cut_compiled_keys: crate::FxIndexSet::default(),
             speculative_cut_owned_key: None,
@@ -9728,12 +9718,6 @@ impl<M: Clone> MetaInterp<M> {
                 // that aims its closing JUMP at it.
                 let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
-                    // Cranelift workaround (no RPython counterpart): copy
-                    // bridges from old token to new, since Cranelift cannot
-                    // patch machine code in-place. No-op for dynasm.
-                    if let Some(old_tok) = old_entry.live_token() {
-                        self.backend.migrate_bridges(&old_tok, token.as_ref());
-                    }
                     // Box Identity Phase E.2b parity: preserve old entry's
                     // high-water so previously stored bridges' OpRefs stay
                     // disjoint from any future bridge.
@@ -10028,11 +10012,11 @@ impl<M: Clone> MetaInterp<M> {
     /// compiler and to the suite alike.
     ///
     /// This does **not** mean the replace paths are tested. It removes one
-    /// class of omission; everything else those paths do (bridge migration,
-    /// label minting, retirement, snapshot handling) remains uncovered, because
-    /// nothing in this crate can drive a production compile path.
-    /// The caller still performs `retire_compiled_entry`, `migrate_bridges` and
-    /// any label carry itself, deliberately: those vary per site and flattening
+    /// class of omission; everything else those paths do (label minting,
+    /// retirement, snapshot handling) remains uncovered, because nothing in
+    /// this crate can drive a production compile path.
+    /// The caller still performs `retire_compiled_entry` and any label carry
+    /// itself, deliberately: those vary per site and flattening
     /// them into here would change behaviour at the sites that omit them.
     pub(crate) fn take_entry_for_replace(
         &mut self,
@@ -11288,12 +11272,6 @@ impl<M: Clone> MetaInterp<M> {
                 // Carried forward for the same reason as the compile_loop site.
                 let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
-                    // Cranelift workaround (no RPython counterpart): copy
-                    // bridges from old token to new, since Cranelift cannot
-                    // patch machine code in-place. No-op for dynasm.
-                    if let Some(old_tok) = old_entry.live_token() {
-                        self.backend.migrate_bridges(&old_tok, token.as_ref());
-                    }
                     // Box Identity Phase E.2b parity: see compile_loop site.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
                     carried_loop_header_pc = carried.loop_header_pc;
@@ -11487,18 +11465,8 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
         self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
 
-        // Read both backend inputs out of `compiled_loops` before the
-        // `&mut self.backend` borrow; see `compile_bridge` for what each is.
-        let previous_tokens_strong: Vec<Arc<JitCellToken>> = self
-            .compiled_entry(green_key)
-            .map(|compiled| {
-                compiled
-                    .previous_tokens
-                    .iter()
-                    .filter_map(|weak| weak.upgrade())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Read the backend input out of `compiled_loops` before the
+        // `&mut self.backend` borrow; see `compile_bridge` for what it is.
         let caller_recovery_layout = self
             .compiled_entry(green_key)
             .and_then(|compiled| compiled.traces.get(&source_trace_id))
@@ -11525,7 +11493,6 @@ impl<M: Clone> MetaInterp<M> {
                     &inputargs,
                     &combined_ops,
                     &source_jct,
-                    &previous_tokens_strong,
                     caller_recovery_layout.as_deref(),
                 )
             }))
@@ -12383,12 +12350,6 @@ impl<M: Clone> MetaInterp<M> {
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 {
                     let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
-                    let ft = self
-                        .compiled_entry(green_key)
-                        .and_then(|c| c.live_token())
-                        .map(|live| crate::history::target_tokens_of(&live))
-                        .unwrap_or_default();
-                    let _had_old = self.has_compiled_loop_entry(green_key);
                     // Carried forward for the same reason as the compile_loop site.
                     let mut carried_loop_header_pc = None;
                     if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
@@ -12427,10 +12388,6 @@ impl<M: Clone> MetaInterp<M> {
                     // real `ll_loop_code`; synthesising a code-less one here let
                     // a later guard-failure bridge close with a JUMP whose
                     // backend target is `ll_loop_code == 0` (`br 0` → PC=0).
-                    for target_token in &ft {
-                        token.record_target_token(target_token.as_jump_target_descr());
-                    }
-                    let front_entry_index = Self::front_entry_index_for(&ft);
                     self.note_compiled_loops_changed();
                     self.insert_compiled_loop_on_driver(
                         compiling_jd,
@@ -12438,7 +12395,7 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledEntry {
                             token: Arc::downgrade(&token),
                             meta: Arc::new(meta),
-                            front_entry_index,
+                            front_entry_index: None,
                             front_target_source_positions: None,
                             root_trace_id: trace_id,
                             loop_header_pc: carried_loop_header_pc,
@@ -12963,30 +12920,6 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&(jd_no, green_key))
     }
 
-    /// Merge-point greens recorded for `green_key` on the compiling driver.
-    /// `warmstate.py JitCell` is per `jitdriver_sd.warmstate`; two drivers
-    /// may share a numeric cell key.
-    #[cfg(test)]
-    pub(crate) fn loop_header_greens_for(
-        &self,
-        green_key: u64,
-    ) -> Option<&(Vec<i64>, Vec<i64>, Vec<i64>)> {
-        self.loop_header_greens
-            .get(&self.compiled_loop_key(green_key))
-    }
-
-    /// Runtime FINISH / `ContinueRunningNormally` banks for that driver's
-    /// cell. `warmspot.py handle_jitexception` reads the entering
-    /// `jitdriver_sd.warmstate`, not leftover `active_jitdriver_sd`.
-    #[cfg(test)]
-    pub(crate) fn loop_header_greens_for_driver(
-        &self,
-        jd_no: usize,
-        green_key: u64,
-    ) -> Option<&(Vec<i64>, Vec<i64>, Vec<i64>)> {
-        self.loop_header_greens.get(&(jd_no, green_key))
-    }
-
     pub(crate) fn compiled_entry_mut(&mut self, green_key: u64) -> Option<&mut CompiledEntry<M>> {
         let key = self.compiled_loop_key(green_key);
         self.compiled_loops.get_mut(&key)
@@ -13236,17 +13169,6 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|entry| entry.loop_header_pc)
     }
 
-    /// Record the merge-point green constants a compiled loop was traced
-    /// under, so `compiled_key_for_greens` can invert them back to its key.
-    pub fn record_loop_header_greens(
-        &mut self,
-        green_key: u64,
-        greens: (Vec<i64>, Vec<i64>, Vec<i64>),
-    ) {
-        let key = self.compiled_loop_key(green_key);
-        self.loop_header_greens.insert(key, greens);
-    }
-
     /// Take the recycled `ContinueRunningNormally` buffer. Capacity stays
     /// on the returned value; the field is left empty until
     /// [`Self::recycle_portal_resume_args`] puts it back.
@@ -13273,18 +13195,33 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// pyjitpl.py `ptoken = self.get_procedure_token(greenboxes)` /
-    /// `has_compiled_targets(ptoken)`: the green key of the compiled loop
-    /// whose header greens equal `greens`, or `None` when no loop lives at
-    /// those greens.  Compared element-wise like pyjitpl.py
-    /// `same_greenkey`, over every green rather than the pc alone.
+    /// `has_compiled_targets(ptoken)`: the key of the cell those greens own
+    /// on the compiling driver (`warmstate.py JitCell.get_jitcell`, matched
+    /// by `comparekey`), or `None` when its procedure token has no compiled
+    /// targets.
     pub fn compiled_key_for_greens(&self, greens: &(Vec<i64>, Vec<i64>, Vec<i64>)) -> Option<u64> {
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
-        self.loop_header_greens
-            .iter()
-            .find(|(key, header)| {
-                key.0 == jd_no && *header == greens && self.has_compiled_targets(key.1)
-            })
-            .map(|(key, _)| key.1)
+        let spec = self.staticdata.jitdrivers_sd.get(jd_no)?.green_args_spec();
+        let (mut ints, mut refs, mut floats) = (greens.0.iter(), greens.1.iter(), greens.2.iter());
+        let mut values = Vec::with_capacity(spec.len());
+        for kind in spec.iter() {
+            let value = match majit_ir::green_type_to_ir(*kind) {
+                Type::Int => ints.next(),
+                Type::Ref => refs.next(),
+                Type::Float => floats.next(),
+                Type::Void => None,
+            };
+            values.push(*value?);
+        }
+        if ints.next().is_some() || refs.next().is_some() || floats.next().is_some() {
+            return None;
+        }
+        let key = majit_ir::GreenKey::with_types(values, spec);
+        let cell_key = self
+            .warm_state_ref_for_driver(jd_no)
+            .and_then(|warm| warm.get_cell_for_key(&key))
+            .and_then(|cell| cell.cell_key.get())?;
+        self.has_compiled_targets(cell_key).then_some(cell_key)
     }
 
     /// compile.py:269-270 parity: whether the loop at `green_key` was stored
@@ -14467,21 +14404,12 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Drop the per-loop side tables (`loop_header_greens`,
-    /// `cut_compiled_keys`) when a loop is retired,
-    /// so they cannot outlive `compiled_loops`. `compiled_key_for_greens`
-    /// already skips keys without compiled targets, so a leftover entry could
-    /// not mis-target a bridge — but keeping them would grow the maps without
-    /// bound over a long run. The driver index is part of the key: two
-    /// `WarmEnterState`s may share a numeric cell key
+    /// Drop the `cut_compiled_keys` marker when a loop is retired, so it
+    /// cannot outlive `compiled_loops`. The driver index is part of the key:
+    /// two `WarmEnterState`s may share a numeric cell key
     /// (`warmstate.py JitCell`).
-    ///
-    /// The loop-header pc used to be retired here too; it now lives on
-    /// `CompiledEntry::loop_header_pc` and is dropped with the entry, so no
-    /// caller can forget it.
     fn forget_loop_side_tables(&mut self, jd_no: usize, green_key: u64) {
         let key = (jd_no, green_key);
-        self.loop_header_greens.swap_remove(&key);
         self.cut_compiled_keys.swap_remove(&key);
     }
 
@@ -15343,7 +15271,6 @@ impl<M: Clone> MetaInterp<M> {
     pub fn clear_compiled_loops(&mut self) {
         self.note_compiled_loops_changed();
         self.compiled_loops.clear();
-        self.loop_header_greens.clear();
         self.cut_compiled_keys.clear();
     }
 
@@ -16234,9 +16161,6 @@ impl<M: Clone> MetaInterp<M> {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
                     carried_loop_header_pc = carried.loop_header_pc;
-                    if let Some(old_tok) = old_entry.live_token() {
-                        self.backend.migrate_bridges(&old_tok, token.as_ref());
-                    }
                     previous_tokens =
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
@@ -16961,19 +16885,6 @@ impl<M: Clone> MetaInterp<M> {
             // current running loop's token.  Pass `source_jct` so backend
             // stamping (`runner.rs`, `compiler.rs`) reaches the
             // correct CLT for newly compiled bridge-internal guards.
-            // `previous_tokens` lets cranelift attach the bridge to retired
-            // predecessor descrs whose machine code is still running (it
-            // cannot patch in place); see `compile_bridge` trait doc.
-            // Upgrade Weak refs to strong Arcs for the backend
-            // call; dead entries are filtered out.  The backend signature
-            // continues to take `&[Arc<JitCellToken>]` until a follow-up
-            // converts it to Weak.
-            let previous_tokens_strong: Vec<std::sync::Arc<JitCellToken>> = compiled
-                .previous_tokens
-                .iter()
-                .filter_map(|weak| weak.upgrade())
-                .collect();
-            let previous_tokens: &[std::sync::Arc<JitCellToken>] = &previous_tokens_strong;
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] calling backend.compile_bridge: key={} guard={} ops={}",
@@ -17019,7 +16930,6 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_inputargs,
                         &optimized_ops,
                         &source_jct,
-                        previous_tokens,
                         caller_recovery_layout.as_deref(),
                     )
                 }))
@@ -34514,11 +34424,10 @@ mod loop_side_table_tests {
         ));
     }
 
-    /// Register a loop at `green_key` with both side tables populated.
+    /// Register a loop at `green_key` with its header pc recorded.
     fn record_loop(meta: &mut MetaInterp<()>, green_key: u64, root_trace_id: u64) {
         meta.insert_compiled_loop(green_key, compiled_entry(root_trace_id));
         meta.record_loop_header_pc(green_key, green_key as usize);
-        meta.record_loop_header_greens(green_key, (vec![green_key as i64], vec![], vec![]));
     }
 
     #[test]
@@ -34574,19 +34483,9 @@ mod loop_side_table_tests {
         let jd1 = meta.register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![]));
         let green_key = 17;
         meta.active_jitdriver_sd = Some(jd1);
-        meta.record_loop_header_greens(green_key, (vec![11], vec![], vec![]));
         meta.cut_compiled_keys
             .insert(meta.compiled_loop_key(green_key));
         meta.active_jitdriver_sd = Some(jd0);
-        assert!(
-            meta.loop_header_greens_for(green_key).is_none(),
-            "ambient compiled_loop_key still names leftover active_jitdriver_sd"
-        );
-        assert_eq!(
-            meta.loop_header_greens_for_driver(jd1, green_key)
-                .map(|(ints, _, _)| ints.as_slice()),
-            Some([11i64].as_slice()),
-        );
         assert!(
             !meta.is_cross_loop_cut_key(green_key),
             "ambient cut gate follows leftover active_jitdriver_sd"
@@ -34880,12 +34779,10 @@ mod loop_side_table_tests {
         meta.insert_compiled_loop_on_driver(jd1, green_key, jd1_entry);
 
         meta.active_jitdriver_sd = Some(jd0);
-        meta.record_loop_header_greens(green_key, (vec![10], vec![], vec![]));
         let jd0_key = meta.compiled_loop_key(green_key);
         meta.cut_compiled_keys.insert(jd0_key);
 
         meta.active_jitdriver_sd = Some(jd1);
-        meta.record_loop_header_greens(green_key, (vec![11], vec![], vec![]));
         let jd1_key = meta.compiled_loop_key(green_key);
         meta.cut_compiled_keys.insert(jd1_key);
 
@@ -34897,8 +34794,6 @@ mod loop_side_table_tests {
             .set_max_age(1, 1);
 
         meta.active_jitdriver_sd = Some(jd0);
-        assert!(meta.loop_header_greens.contains_key(&(jd0, green_key)));
-        assert!(meta.loop_header_greens.contains_key(&(jd1, green_key)));
         assert!(meta.cut_compiled_keys.contains(&(jd0, green_key)));
         assert!(meta.cut_compiled_keys.contains(&(jd1, green_key)));
 
@@ -34915,16 +34810,8 @@ mod loop_side_table_tests {
             "evicting the jd1 token must drop the jd1 compiled_loops row while leftover active_jitdriver_sd is 0"
         );
         assert!(
-            !meta.loop_header_greens.contains_key(&(jd1, green_key)),
-            "jd1 header greens must go with the evicted row"
-        );
-        assert!(
             !meta.cut_compiled_keys.contains(&(jd1, green_key)),
             "jd1 cut marker must go with the evicted row"
-        );
-        assert!(
-            meta.loop_header_greens.contains_key(&(jd0, green_key)),
-            "same-key jd0 header greens must stay"
         );
         assert!(
             meta.cut_compiled_keys.contains(&(jd0, green_key)),
@@ -34935,9 +34822,6 @@ mod loop_side_table_tests {
 
     fn has_side_tables(meta: &MetaInterp<()>, green_key: u64) -> bool {
         meta.loop_header_pc_for(green_key).is_some()
-            || meta
-                .loop_header_greens
-                .contains_key(&meta.compiled_loop_key(green_key))
     }
 
     #[test]
@@ -35005,7 +34889,6 @@ mod loop_side_table_tests {
         assert!(meta.compiled_loops.is_empty());
         assert!(meta.loop_header_pc_for(7).is_none());
         assert!(meta.loop_header_pc_for(8).is_none());
-        assert!(meta.loop_header_greens.is_empty());
     }
 
     #[test]

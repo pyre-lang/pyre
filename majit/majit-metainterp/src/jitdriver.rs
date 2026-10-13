@@ -3922,13 +3922,6 @@ impl<S: JitState> JitDriver<S> {
         meta: S::Meta,
     ) -> crate::CompileOutcome {
         let loop_header_pc = self.meta.trace_ctx().map(|c| c.header_pc);
-        // The merge-point greens this loop closed on — the vocabulary a later
-        // bridge closing at the same merge point will present
-        // (pyjitpl.py). Captured before `compile_loop` drains the ctx.
-        let loop_close_greens = self
-            .meta
-            .trace_ctx()
-            .and_then(|c| c.close_greens.clone().or_else(|| c.header_greens.clone()));
         let loop_green_key = self.current_trace_green_key();
         if crate::closedbg_enabled() {
             eprintln!(
@@ -3957,19 +3950,6 @@ impl<S: JitState> JitDriver<S> {
             if let Some(k) = self.meta.last_compiled_key() {
                 if let Some(hp) = loop_header_pc {
                     self.meta.record_loop_header_pc(k, hp);
-                }
-                // Key the loop by the greens it closed on, so a bridge reaching
-                // this merge point resolves THIS loop's procedure token. Only
-                // `last_compiled_key` is registered: on a cross-loop cut that
-                // is the inner loop the close point belongs to, whereas
-                // `loop_green_key` is the outer trace-start key.
-                if let Some(greens) = loop_close_greens {
-                    if crate::closedbg_enabled() {
-                        eprintln!("@@@CLOSE LOOP-GREENS key={} greens={greens:?}", k as i64);
-                    }
-                    self.meta.record_loop_header_greens(k, greens);
-                } else if crate::closedbg_enabled() {
-                    eprintln!("@@@CLOSE LOOP-GREENS key={} greens=NONE", k as i64);
                 }
                 // Stash the just-compiled loop's key so the merge-point hook
                 // can arm the CRN/lazy back-edge label entry with the
@@ -5165,20 +5145,7 @@ impl<S: JitState> JitDriver<S> {
                         .trace_ctx()
                         .and_then(|ctx| ctx.walk_final_pc)
                         .unwrap_or(usize::MAX);
-                    let finish_key = self.current_trace_green_key();
                     self.publish_single_pass_outcome(pc);
-                    if let Some(k) = finish_key
-                        && let Some((_, _, args)) = self.meta.single_pass_outcome.as_ref()
-                    {
-                        self.meta.record_loop_header_greens(
-                            k,
-                            (
-                                args.green_int.clone(),
-                                args.green_ref.clone(),
-                                args.green_float.clone(),
-                            ),
-                        );
-                    }
                     self.meta.single_pass_finish = true;
                     // `virtualizable.py write_from_resume_data_partial` writes
                     // every static field before the portal runner continues.
@@ -15482,7 +15449,6 @@ mod cross_loop_cut_close_tests {
         }
         driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(driver.has_compiled_loop(key), "inner loop must compile");
-        driver.meta.record_loop_header_greens(key, inner_greens());
         assert_eq!(
             driver.meta.is_cross_loop_cut_key(key),
             cut,

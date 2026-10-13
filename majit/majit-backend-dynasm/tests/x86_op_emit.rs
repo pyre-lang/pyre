@@ -2896,7 +2896,6 @@ fn attach_bridge(
             inputargs,
             &bridge_ops,
             token,
-            &[],
             None,
         )
         .unwrap_or_else(|err| panic!("compile bridge: {err:?}"));

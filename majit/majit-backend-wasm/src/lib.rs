@@ -5944,7 +5944,6 @@ impl majit_backend::Backend for WasmBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
@@ -7700,7 +7699,6 @@ mod tests {
                 &bridge_inputs,
                 &[bridge_advance, bridge_jump],
                 &token,
-                &[],
                 None,
             )
             .expect("bridge compiles");
@@ -7890,7 +7888,6 @@ mod tests {
                 &inputargs,
                 &[bridge_advance, bridge_jump],
                 &token,
-                &[],
                 None,
             )
             .expect("closing JUMP still resolves the earlier label");
