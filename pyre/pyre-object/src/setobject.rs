@@ -702,10 +702,11 @@ impl crate::rordereddict::GcRefOffsets for IdentitySetKey {
 
 /// `setobject.py IdentitySetStrategy.get_empty_dict` — `{}` keyed by
 /// object identity. The key is [`IdentitySetKey`]. The table hash is
-/// `RandomState` over `gc_identity_hash`, the hasher `IdentityDictStorage`
-/// uses. `(IdentityKey, PyObjectRef)` is the identity-dict entries id;
-/// this table's value is `()`.
-pub type IdentitySetStorage = crate::rordereddict::RDict<IdentitySetKey, ()>;
+/// `gc_identity_hash` as is, the hasher `IdentityDictStorage` uses.
+/// `(IdentityKey, PyObjectRef)` is the identity-dict entries id; this
+/// table's value is `()`.
+pub type IdentitySetStorage =
+    crate::rordereddict::RDict<IdentitySetKey, (), crate::dictmultiobject::ObjectKeyBuildHasher>;
 
 /// Runtime-assigned GC type id for the [`IdentitySetStorage`] entries array.
 /// The registration traces the object pointer on [`IdentitySetKey`]
@@ -1927,7 +1928,7 @@ impl AbstractUnwrappedSetStrategy for AsciiSetStrategy {
 
 impl AbstractUnwrappedSetStrategy for IdentitySetStrategy {
     type Key = IdentitySetKey;
-    type Hasher = std::collections::hash_map::RandomState;
+    type Hasher = crate::dictmultiobject::ObjectKeyBuildHasher;
 
     fn kind(&self) -> SetStrategyKind {
         SetStrategyKind::Identity
