@@ -1,9 +1,8 @@
-# pyre-check: max-pypy-ratio=0.6
+# pyre-check: max-pypy-ratio=1
 # pyre-check: requires-modules=math
-# Ubuntu run 33279264115: 0.2-0.3x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
-# The ceiling sits between the two measured states: folded this runs 0.1x
-# pypy, and with the `isqrt` gateway's fast arm suppressed it runs about 2.1x.
+# The ceiling is pypy's own speed.  With both descents recording this runs
+# 0.3x on Windows dynasm; with the `isqrt` fast arm lost it ran 0.8-1.0x on
+# the CI runners, inside the ceiling, so this gate does not catch that loss.
 # pyre-check: skip-cpython
 # cpython 3.46s vs pyre 0.29s (11.9x on the ubuntu runner), and it is not
 # gated on — only pypy is.
@@ -18,10 +17,10 @@
 # non-finite argument takes the `dont_look_inside` slow path.
 #
 # `math.isqrt(i)`: `__majit_wrap_math_isqrt` walks `_int_isqrt` for an exact
-# positive machine int below `2**53`.  Suppressing that fast arm measures 20.2x here
-# (0.097s -> 1.961s), so a regression that loses it walks straight through the
-# ceiling below.  Loosen the ceiling if the machine gets slower; do not drop
-# the loop.
+# positive machine int below `2**53`.  The arm's range test is two
+# comparisons: written as `(1..EXACT_FLOAT_INT).contains(&n)` it is a
+# `Range::contains` call the walker does not descend, so the gateway walk
+# rolls back to the opaque residual call.  Do not drop the loop.
 import math
 
 # Sized so pypy's own execution clears the measurement floor: below it the
