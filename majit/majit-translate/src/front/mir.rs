@@ -16400,11 +16400,17 @@ impl<'a> Lowering<'a> {
                 *var = copy.clone();
             }
         }
+        for (orig, copy) in remap {
+            self.input_copied_from.insert(copy.id(), *orig);
+            if self.object_vec_headers.contains(orig) {
+                self.object_vec_headers.insert(copy.id());
+            }
+        }
     }
 
     /// Split the current block on `cond`. The true arm is in bounds and
-    /// becomes the emit cursor for `mir_bb`; the false arm raises
-    /// `IndexError`. Incoming edges still target [`Self::block_id`].
+    /// becomes the emit cursor for `mir_bb`; the false arm calls
+    /// `ll_slice_bounds_panic`. Incoming edges still target [`Self::block_id`].
     /// Locals defined in the head, and every `carry` word, are forwarded
     /// onto the true arm. Returns `carry` as those forwarded copies.
     fn fork_in_bounds(
@@ -16453,6 +16459,23 @@ impl<'a> Lowering<'a> {
         }
         self.remap_forwarded_provenance(&remap);
         let fail = self.graph.create_block();
+        let panic = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(fail).operations.push(SpaceOperation {
+            result: Some(panic),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: majit_ir::rvec::SLICE_BOUNDS_PANIC
+                        .split("::")
+                        .map(str::to_string)
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Void,
+            },
+        });
         self.graph.set_raise_implicit(fail, "IndexError");
         self.graph
             .set_branch(head, cond, tail, forwarded, fail, Vec::new());
@@ -22770,11 +22793,11 @@ impl<'a> Lowering<'a> {
                     }
                     VecInit::Uninit => return Ok(true),
                     VecInit::Init => {
-                        return Ok(self.lower_rust_vec_drop(self.block_id[mir_bb], place));
+                        return Ok(self.lower_rust_vec_drop(self.emit_bb(mir_bb), place));
                     }
                 }
             }
-            return Ok(self.lower_rust_vec_drop(self.block_id[mir_bb], place));
+            return Ok(self.lower_rust_vec_drop(self.emit_bb(mir_bb), place));
         }
         if tyref_rust_vec_item_kind(&place.ty, self.llbc).is_some() {
             return Ok(self.lower_rust_vec_drop(self.emit_bb(mir_bb), place));
@@ -99577,6 +99600,19 @@ mod tests {
                 "{name}: {calls:?}"
             );
         }
+    }
+
+    /// A pair-slice index fail arm calls `ll_slice_bounds_panic`, a DLI
+    /// residual `remove_assertion_errors` cannot fold away.
+    #[test]
+    fn pair_slice_index_keeps_the_bounds_panic() {
+        let calls = corpus_call_leaves("first_ref");
+        assert!(
+            calls
+                .iter()
+                .any(|(leaf, n)| leaf == "ll_slice_bounds_panic" && *n == 0),
+            "{calls:?}"
+        );
     }
 
     /// `dst.copy_from_slice(src)` over two pair slices is
