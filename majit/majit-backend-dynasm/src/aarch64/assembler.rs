@@ -653,10 +653,9 @@ const MAX_BYTES_PER_OP: usize = 1024;
 
 /// Ceiling assumed for one guard's failure-recovery stub, which
 /// [`AssemblerARM64::write_pending_failure_recoveries`] emits after the body a
-/// guard's `b.cond` has to reach across.  The fixed part is a `bl`, the
-/// optional exception block, the descriptor `mov`+`str`, the gcmap push and
-/// the call footer — under 128 bytes; the rest is `const_stores`, which costs
-/// a `mov` plus a `str` per entry and is not bounded by the operation count.
+/// guard's `b.cond` has to reach across.  The stub is bounded by its fixed
+/// part: a `bl`, the optional exception block, the descriptor `mov`+`str`,
+/// the gcmap push and the call footer.
 /// The exact span is still checked in [`AssemblerARM64::check_guard_reach`]
 /// once every stub is written, so this only has to be right often enough to
 /// keep large traces off the two-instruction form.
@@ -892,9 +891,6 @@ struct GuardToken {
     /// [`FailDescrCell::thin_ptr`] baked into `jf_descr`. The cell lives
     /// on `Asm::fail_descrs` so the address stays valid.
     fail_cell_ptr: usize,
-    /// Constants to store in frame during recovery.
-    /// Each entry: (frame_slot_index, constant_value).
-    const_stores: Vec<(usize, i64)>,
     /// opassembler.py:515 GuardToken.gcmap.
     gcmap: *mut usize,
     /// `opassembler.py _emit_guard`'s `token.offset = pos` — the instruction
@@ -1119,11 +1115,6 @@ impl<'a> AssemblerARM64<'a> {
         park_float_const(&mut self.datablockwrapper, bits).unwrap_or_else(|err| {
             panic!("MachineDataBlockWrapper.malloc_aligned failed parking float constant: {err}")
         })
-    }
-
-    /// Bit pattern stored by `VFPRegisterManager.convert_to_imm`.
-    fn const_float_bits(from: crate::regloc::ConstFloatLoc) -> i64 {
-        unsafe { (from.value as *const i64).read_unaligned() }
     }
 
     /// `compile.py:665` parity: heap-pinned address of `self.cpu`'s
@@ -2360,9 +2351,8 @@ impl<'a> AssemblerARM64<'a> {
         self.unrelocated_jump_target = None;
         // A guard's `b.cond` has to reach a stub that is written after the
         // whole body, so the budget is the body plus every stub — not the body
-        // alone.  `const_stores` makes a stub grow independently of the
-        // operation count, so charge it separately instead of leaving it to
-        // `MAX_BYTES_PER_OP`.
+        // alone.  Each stub is bounded by its fixed part, so charge
+        // `MAX_BYTES_PER_GUARD_STUB` separately from `MAX_BYTES_PER_OP`.
         let guard_count = ops.iter().filter(|op| op.opcode.is_guard()).count();
         self.long_guard_branch = ops
             .len()
@@ -5070,29 +5060,23 @@ impl<'a> AssemblerARM64<'a> {
             );
         }
 
-        // `llsupport/assembler.py store_info_on_descr` parity.
-        // PyPy encodes each fail-arg location as a USHORT in `rd_locs`;
-        // pyre allocates a const-store slot for `Loc::Immed` and writes
-        // the slot into rd_locs so the deopt path reads it via PyPy's
-        // stack-position decode (`llmodel.py _decode_pos`).
-        let mut const_stores: Vec<(usize, i64)> = Vec::new();
+        // `llsupport/assembler.py store_info_on_descr`:
+        // encode each fail-arg location as a USHORT —
+        //   None           → 0xFFFF
+        //   GPR register   → `gen_regs.index(loc)`
+        //   float register → len(gen_regs) + loc.value * coeff
+        //   stack          → (loc.value - base_ofs) // WORD
+        //                      (here: `f.get_position() + JITFRAME_FIXED_SIZE`)
         let rd_locs: majit_ir::RdLocs = faillocs
             .iter()
             .map(|fl| match fl {
                 None => 0xFFFF,
-                Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, i.value));
-                    slot as u16
-                }
-                Some(Loc::ConstFloat(c)) => {
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, Self::const_float_bits(*c)));
-                    slot as u16
-                }
-                Some(loc) => deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
+                Some(loc) => match deadframe_slot_for_loc(loc) {
+                    Some(encoded) => encoded,
+                    None => panic!(
+                        "store_info_on_descr: cannot encode fail-arg loc {loc:?} (gen_regs.index)"
+                    ),
+                },
             })
             .collect();
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
@@ -5154,7 +5138,6 @@ impl<'a> AssemblerARM64<'a> {
             fail_label,
             fail_descr: descr.clone(),
             fail_cell_ptr,
-            const_stores,
             gcmap,
             pos_jump_offset: None,
             must_save_exception: matches!(
@@ -5190,11 +5173,6 @@ impl<'a> AssemblerARM64<'a> {
             .pending_guard_tokens
             .pop()
             .expect("GUARD_NOT_FORCED_2 descriptor token");
-        for &(slot, value) in &token.const_stores {
-            let ofs = Self::slot_offset(slot);
-            self.emit_mov_imm64(16, value);
-            dynasm!(self.mc ; .arch aarch64 ; str X(16), [x29, ofs as u32]);
-        }
         let descr_ptr = token.fail_cell_ptr as i64;
         self.emit_mov_imm64(16, descr_ptr);
         dynasm!(self.mc ; .arch aarch64
@@ -5297,12 +5275,6 @@ impl<'a> AssemblerARM64<'a> {
             ; str x0, [x29, JF_DESCR_OFS as u32]
         );
         self.push_gcmap(guard_token.gcmap);
-
-        for &(slot, val) in &guard_token.const_stores {
-            let ofs = Self::slot_offset(slot);
-            self.emit_mov_imm64(16, val);
-            self.emit_str_fp(16, ofs);
-        }
 
         self._call_footer();
         RecoveryStub {
