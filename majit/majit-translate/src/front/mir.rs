@@ -29717,7 +29717,17 @@ impl<'a> Lowering<'a> {
             // assumed unconditionally before this was carried, so an
             // unreadable type keeps today's behaviour instead of inventing a
             // new one.
-            let enumerate_next = crate::front::iter_adapter::is_enumerate_next_target(target);
+            let enumerate_next = crate::front::iter_adapter::is_enumerate_next_target(target)
+                || first_arg_ty.as_ref().is_some_and(|receiver| {
+                    self.tyref_ref_adt_path(receiver)
+                        .or_else(|| {
+                            self.tyref_peel_ref_to_pointee(receiver)
+                                .and_then(|ty| adt_path_of_tyref(&ty, self.llbc))
+                        })
+                        .is_some_and(|path| {
+                            crate::front::iter_adapter::is_enumerate_adapter_path(&path)
+                        })
+                });
             let iterator_added_a_reference = if enumerate_next {
                 // `Enumerate<I>::next` yields `(usize, I::Item)`; the native
                 // `next` runs on `I`, so the reference-peel follows I, not

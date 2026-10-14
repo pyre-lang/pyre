@@ -88,6 +88,7 @@ pub(crate) fn is_iterator_next_target(target: &CallTarget) -> bool {
     match target {
         CallTarget::Method { name, .. } => name == "next",
         CallTarget::FunctionPath { segments, .. } => segments.last().is_some_and(|s| s == "next"),
+        CallTarget::Indirect { method_name, .. } => method_name == "next",
         _ => false,
     }
 }
@@ -103,11 +104,19 @@ pub(crate) fn is_iterator_next_target(target: &CallTarget) -> bool {
 /// `slice` family + `iter` leaf, so mirror that family/leaf match here
 /// rather than the exact-length form (which missed the method spelling and
 /// declined every `boxed_slice.iter()` for-loop).
-fn is_iter_op_segments(segments: &[String]) -> bool {
-    segments.len() >= 3
-        && segments[0] == "core"
-        && segments[1] == "slice"
-        && segments.last().is_some_and(|s| s == "iter")
+pub(crate) fn is_iter_op_segments(segments: &[String]) -> bool {
+    if !segments.last().is_some_and(|s| s == "iter") {
+        return false;
+    }
+    // `is_concrete_iter_constructor` emits `["core", "slice", "iter"]`;
+    // a direct `<[T]>::iter` keeps `["core", "slice", "<Impl>", "iter"]`.
+    // `impl_method_owner_for_fundecl` / `trait_default_call_segments`
+    // strip the crate, so the same family also arrives as `slice::…::iter`.
+    match segments {
+        [a, b, ..] if a == "core" && b == "slice" => true,
+        [a, ..] if a == "slice" && segments.len() >= 2 => true,
+        _ => false,
+    }
 }
 
 /// `true` iff `var` originates — directly or through loop-carried block
@@ -705,19 +714,116 @@ pub(crate) fn peel_recast_chain(
     Ok(cur)
 }
 
-/// Several `__pos_0` reads of one Option payload are one value. Keep the
-/// first read and retarget every later result onto it.
-fn unify_duplicate_pos0_reads(graph: &mut FunctionGraph, block_idx: usize, at: &[usize]) {
-    let keep = graph.blocks[block_idx].operations[at[0]]
-        .result
-        .clone()
-        .expect("caller checked __pos_0 results");
-    let extras: Vec<Variable> = at
-        .iter()
-        .skip(1)
-        .filter_map(|&i| graph.blocks[block_idx].operations[i].result.clone())
-        .collect();
-    for &i in at.iter().skip(1).rev() {
+/// `cast(opt, Option<T>::Some)` — production MIR for an aggregate Option
+/// match (`collapse_pos0_read` `cast_then_payload`).
+fn is_option_some_recast(kind: &OpKind, of: &Variable) -> bool {
+    crate::model::cast_instance_root(kind)
+        .is_some_and(|root| matches!(root.rsplit("::").next(), Some("Some" | "Continue")))
+        && op_operand_vars(kind).contains(of)
+}
+
+/// One Some-arm projection of the Option payload: `carrier.__pos_0`, or
+/// `cast(carrier, Option::Some).__pos_0`.  `for (i, x) in it.enumerate()`
+/// emits the latter twice (once per field).
+struct PayloadProjection {
+    recast_idx: Option<usize>,
+    pos0_idx: usize,
+    payload: Variable,
+}
+
+fn collect_option_payload_projections(
+    ops: &[SpaceOperation],
+    carrier: &Variable,
+) -> Result<Vec<PayloadProjection>, String> {
+    let mut projections = Vec::new();
+    let mut recasts: Vec<(usize, Variable)> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if !op_operand_vars(&op.kind).contains(carrier) {
+            continue;
+        }
+        match &op.kind {
+            OpKind::FieldRead { base, field, .. } if base == carrier && field.name == "__pos_0" => {
+                let payload = op
+                    .result
+                    .clone()
+                    .ok_or_else(|| "__pos_0 read without result".to_string())?;
+                projections.push(PayloadProjection {
+                    recast_idx: None,
+                    pos0_idx: i,
+                    payload,
+                });
+            }
+            _ if is_option_some_recast(&op.kind, carrier) => {
+                let narrowed = op
+                    .result
+                    .clone()
+                    .ok_or_else(|| "variant cast without result".to_string())?;
+                recasts.push((i, narrowed));
+            }
+            _ => {
+                return Err("uses the payload outside a __pos_0 read".into());
+            }
+        }
+    }
+    for (recast_idx, narrowed) in recasts {
+        let mut n_pos0 = 0;
+        for (i, op) in ops.iter().enumerate() {
+            if !op_operand_vars(&op.kind).contains(&narrowed) {
+                continue;
+            }
+            match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if *base == narrowed && field.name == "__pos_0" =>
+                {
+                    let payload = op
+                        .result
+                        .clone()
+                        .ok_or_else(|| "__pos_0 read without result".to_string())?;
+                    projections.push(PayloadProjection {
+                        recast_idx: Some(recast_idx),
+                        pos0_idx: i,
+                        payload,
+                    });
+                    n_pos0 += 1;
+                }
+                _ => {
+                    return Err("uses the payload outside a __pos_0 read".into());
+                }
+            }
+        }
+        if n_pos0 == 0 {
+            return Err("uses the payload outside a __pos_0 read".into());
+        }
+    }
+    Ok(projections)
+}
+
+/// Several payload projections of one Option are one value. Keep the
+/// first and retarget every later result onto it, dropping extra recasts.
+fn unify_payload_projections(
+    graph: &mut FunctionGraph,
+    block_idx: usize,
+    projections: &[PayloadProjection],
+) {
+    if projections.len() <= 1 {
+        return;
+    }
+    let keep = projections[0].payload.clone();
+    let keep_recast = projections[0].recast_idx;
+    let extras: Vec<Variable> = projections[1..].iter().map(|p| p.payload.clone()).collect();
+    let mut drop: Vec<usize> = Vec::new();
+    for p in &projections[1..] {
+        drop.push(p.pos0_idx);
+        if let Some(r) = p.recast_idx
+            && Some(r) != keep_recast
+            && !drop.contains(&r)
+        {
+            drop.push(r);
+        }
+    }
+    drop.sort_unstable();
+    drop.dedup();
+    for i in drop.into_iter().rev() {
         graph.blocks[block_idx].operations.remove(i);
     }
     let rename = |v: &Variable| -> Variable {
@@ -1091,80 +1197,36 @@ fn rewire_one_next_site(
             .get(pos)
             .cloned()
             .ok_or_else(|| format!("{name}: enumerate Some arm lacks payload slot {pos}"))?;
-        let pos0_at: Vec<usize> = {
-            let block = &graph.blocks[some_target.0];
-            block
-                .operations
+        let block = &graph.blocks[some_target.0];
+        let projections = collect_option_payload_projections(&block.operations, &carrier)
+            .map_err(|reason| format!("{name}: enumerate Some arm {reason}"))?;
+        let forwarded = block.exits.iter().any(|link| {
+            link.args
                 .iter()
-                .enumerate()
-                .filter(|(_, op)| {
-                    matches!(
-                        &op.kind,
-                        OpKind::FieldRead { base, field, .. }
-                            if base == &carrier && field.name == "__pos_0"
-                    )
-                })
-                .map(|(i, _)| i)
-                .collect()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == &carrier))
+        });
+        let switched = match &block.exitswitch {
+            Some(ExitSwitch::Value(v)) if v == &carrier => true,
+            Some(ExitSwitch::Fused { args, .. }) if args.contains(&carrier) => true,
+            _ => false,
         };
-        if pos0_at.is_empty() {
-            let block = &graph.blocks[some_target.0];
-            let uses = block
-                .operations
-                .iter()
-                .filter(|op| op_operand_vars(&op.kind).contains(&carrier))
-                .count();
-            let forwarded = block.exits.iter().any(|link| {
-                link.args
-                    .iter()
-                    .any(|arg| matches!(arg, LinkArg::Value(v) if v == &carrier))
-            });
-            if uses != 0 {
-                return Err(format!(
-                    "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
-                ));
-            }
+        if switched {
+            return Err(format!(
+                "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
+            ));
+        }
+        if projections.is_empty() {
             if forwarded {
                 some_dead =
                     forwarded_dead_slots(graph, some_target.0, &carrier).map_err(|reason| {
                         format!("{name}: enumerate Some arm forwards a live payload — {reason}")
                     })?;
             }
-        } else if pos0_at
-            .iter()
-            .any(|&i| graph.blocks[some_target.0].operations[i].result.is_none())
-        {
-            return Err(format!("{name}: __pos_0 read without result"));
         } else {
-            // Duplicate `__pos_0` reads are the same Some payload (`for (i, x)`
-            // projects it once per field). They are merged after validation.
-            // A forward is accepted only into a dead chain.
-            let block = &graph.blocks[some_target.0];
-            let other_operand = block.operations.iter().enumerate().any(|(i, op)| {
-                !pos0_at.contains(&i) && op_operand_vars(&op.kind).contains(&carrier)
-            });
-            let forwarded = block.exits.iter().any(|link| {
-                link.args
-                    .iter()
-                    .any(|arg| matches!(arg, LinkArg::Value(v) if v == &carrier))
-            });
-            let switched = match &block.exitswitch {
-                Some(ExitSwitch::Value(v)) if v == &carrier => true,
-                Some(ExitSwitch::Fused { args, .. }) if args.contains(&carrier) => true,
-                _ => false,
-            };
-            if other_operand || switched {
-                return Err(format!(
-                    "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
-                ));
-            }
-            // The tuple itself may only be read here: its item reads are
-            // repainted to the tuple `next` yields, and a successor's reads
-            // would keep the old shape.
-            let tuples: Vec<Variable> = pos0_at
-                .iter()
-                .filter_map(|&i| block.operations[i].result.clone())
-                .collect();
+            // Duplicate payload projections are the same Some tuple
+            // (`for (i, x)` recasts once per field). They are merged after
+            // validation. A forward is accepted only into a dead chain.
+            let tuples: Vec<Variable> = projections.iter().map(|p| p.payload.clone()).collect();
             let tuple_escapes = block.operations.iter().any(|op| {
                 !matches!(
                     &op.kind,
@@ -1298,23 +1360,13 @@ fn rewire_one_next_site(
 
     if enumerate_site.is_some() {
         let pos = payload_positions[0];
-        if let Some(carrier) = graph.blocks[some_target.0].inputargs.get(pos).cloned() {
-            let at: Vec<usize> = graph.blocks[some_target.0]
-                .operations
-                .iter()
-                .enumerate()
-                .filter(|(_, op)| {
-                    matches!(
-                        &op.kind,
-                        OpKind::FieldRead { base, field, .. }
-                            if base == &carrier && field.name == "__pos_0"
-                    )
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if at.len() > 1 {
-                unify_duplicate_pos0_reads(graph, some_target.0, &at);
-            }
+        if let Some(carrier) = graph.blocks[some_target.0].inputargs.get(pos).cloned()
+            && let Ok(projections) = collect_option_payload_projections(
+                &graph.blocks[some_target.0].operations,
+                &carrier,
+            )
+        {
+            unify_payload_projections(graph, some_target.0, &projections);
         }
     }
 
