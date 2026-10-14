@@ -8918,18 +8918,15 @@ fn forwards_to_returnblock_inner(
     Err("forwarding chain is longer than the block count".to_string())
 }
 
-/// True for the root bracket's close, the one operation an `Err` shell's
-/// forwarding chain may carry.
+/// Follow `__cast_instance_intrinsic` results and object-in/object-out
+/// GC-erasure identities back to the value the block received. A tail
+/// close often names the recast of the guard, which is the same word as
+/// the inputarg the hop carries.
 ///
-/// The close is a leaf: one argument, no result anything reads, and no
-/// dependence on where in the chain it sits. That is what lets the `Err`
-/// rewrite re-emit it at the raise site instead of declining the callee.
-/// `RootScope::get` / `shadow_stack_get` / `reload_top_root`. A tail that
-/// returns `Err` reloads the bracket's pointers before the close. The raise
-/// substitutes the already-built payload, so the reload is not re-emitted.
-/// Follow `__cast_instance_intrinsic` results back to the value the block
-/// received. A tail close often names the recast of the guard, which is the
-/// same word as the inputarg the hop carries.
+/// `gctransform/shadowstack.py pop_roots` restores the live variable;
+/// `shadowcolor.py _gc_restore_root` writes that variable from its slot.
+/// `RootScope::get` / `shadow_stack_get` stay out — their first argument
+/// is the scope or index, not the object.
 fn peel_recast_to_source(graph: &FunctionGraph, block: usize, mut arg: LinkArg) -> LinkArg {
     let ops = &graph.blocks[block].operations;
     loop {
@@ -8937,7 +8934,7 @@ fn peel_recast_to_source(graph: &FunctionGraph, block: usize, mut arg: LinkArg) 
             return arg;
         };
         let Some(source) = ops.iter().find_map(|op| {
-            let image = is_recast_narrow(&op.kind) || is_gc_root_reload(&op.kind);
+            let image = is_recast_narrow(&op.kind) || is_gc_erasure_root_identity(&op.kind);
             if !image || op.result.as_ref() != Some(var) {
                 return None;
             }
@@ -8964,21 +8961,58 @@ pub(crate) fn is_gc_root_reload(kind: &OpKind) -> bool {
     // `reload_top_root`: the gctransformer inserts these reloads after
     // the codewriter (`rpython/memory/gctransform/shadowstack.py`,
     // `framework.py push_roots/pop_roots`). pyre writes them in source.
-    segments.iter().any(|segment| segment == "gc_roots")
+    if segments.iter().any(|segment| segment == "gc_roots")
         && matches!(
             segments.last().map(String::as_str),
             Some("get" | "shadow_stack_get" | "reload_top_root" | "reload_top_root_at")
         )
+    {
+        return true;
+    }
+    // `PyFrame::live_mut` spells `self as GCREF` →
+    // `gc_hook::try_gc_current_object_address` → `as *mut Self`. That
+    // round trip is the forwarding-address lookup of the same object;
+    // a moving GC's references are already current after gctransform,
+    // so the annotated graph must see the original `self`.
+    is_try_gc_current_object_address_path(segments)
 }
 
-/// `start` plus every `__cast_instance_intrinsic` image of it in `ops`.
+/// Owner path of `pyre_object::gc_hook::try_gc_current_object_address`
+/// (`gc_hook.rs try_gc_current_object_address`), including the crate-stripped
+/// FunDecl prefix, and the crate-root re-export `["pyre_object",
+/// "try_gc_current_object_address"]` (`pub use gc_hook::*`). A user function
+/// of that name is an ordinary call (`is_current_gc_ref_path`).
+pub(crate) fn is_try_gc_current_object_address_path(segments: &[String]) -> bool {
+    path_segments_end_with(
+        segments,
+        &["pyre_object", "gc_hook", "try_gc_current_object_address"],
+    ) || path_segments_eq(segments, &["gc_hook", "try_gc_current_object_address"])
+        || path_segments_eq(segments, &["pyre_object", "try_gc_current_object_address"])
+}
+
+fn path_segments_end_with(segments: &[String], tail: &[&str]) -> bool {
+    segments.len() >= tail.len()
+        && segments[segments.len() - tail.len()..]
+            .iter()
+            .zip(tail)
+            .all(|(s, t)| s.as_str() == *t)
+}
+
+fn path_segments_eq(segments: &[String], expected: &[&str]) -> bool {
+    segments.len() == expected.len() && segments.iter().zip(expected).all(|(s, e)| s.as_str() == *e)
+}
+
+/// `start` plus every `__cast_instance_intrinsic` image of it in `ops`,
+/// and every GC-erasure identity (`reload_top_root`,
+/// `try_gc_current_object_address`) of those images. `peel_recast_to_source`
+/// walks the same ops the other way.
 fn recast_images_of(ops: &[crate::model::SpaceOperation], start: &Variable) -> Vec<Variable> {
     let mut images = vec![start.clone()];
     let mut progressed = true;
     while progressed {
         progressed = false;
         for op in ops {
-            if !is_recast_narrow(&op.kind) {
+            if !is_recast_narrow(&op.kind) && !is_gc_erasure_root_identity(&op.kind) {
                 continue;
             }
             let (Some(result), Some(arg)) = (
@@ -9001,6 +9035,90 @@ fn recast_images_of(ops: &[crate::model::SpaceOperation], start: &Variable) -> V
         }
     }
     images
+}
+
+/// True when `kind` is a GC-erasure identity whose first argument is the
+/// object being reloaded: `reload_top_root[_at]` and
+/// `try_gc_current_object_address`. `get` / `shadow_stack_get` stay out —
+/// their first argument is the scope, not the root.
+fn is_gc_erasure_root_identity(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    is_gc_root_reload(kind)
+        && (matches!(
+            segments.last().map(String::as_str),
+            Some("reload_top_root" | "reload_top_root_at")
+        ) || is_try_gc_current_object_address_path(segments))
+}
+
+/// Peel only `__cast_instance_intrinsic` wrappers of `arg`.
+///
+/// [`peel_recast_to_source`] also walks object-in/object-out GC-erasure
+/// identities. Retargeting an identity's first argument must stop at the
+/// object the recast pair hid.
+fn peel_recast_narrow_to_source(graph: &FunctionGraph, block: usize, mut arg: LinkArg) -> LinkArg {
+    let ops = &graph.blocks[block].operations;
+    loop {
+        let LinkArg::Value(var) = &arg else {
+            return arg;
+        };
+        let Some(source) = ops.iter().find_map(|op| {
+            if !is_recast_narrow(&op.kind) || op.result.as_ref() != Some(var) {
+                return None;
+            }
+            match &op.kind {
+                OpKind::Call { args, .. } => args.first().cloned(),
+                _ => None,
+            }
+        }) else {
+            return arg;
+        };
+        arg = source;
+    }
+}
+
+/// Point each GC-erasure identity at the value the GCREF (or other)
+/// recast pair hid, so a `cast(x, GCREF)` that only exists to feed
+/// `try_gc_current_object_address` / `reload_top_root` is dead and the
+/// annotator sees `x` (flags included) rather than the GCREF projection.
+/// Same walk as [`peel_recast_to_source`], restricted to recasts.
+pub(crate) fn retarget_gc_erasure_identity_args(graph: &mut FunctionGraph) {
+    for block in 0..graph.blocks.len() {
+        let rewrites: Vec<(usize, crate::flowspace::model::Variable)> = graph.blocks[block]
+            .operations
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| {
+                if !is_gc_erasure_root_identity(&op.kind) {
+                    return None;
+                }
+                let OpKind::Call { args, .. } = &op.kind else {
+                    return None;
+                };
+                let arg = args.first()?.clone();
+                let LinkArg::Value(src) = &arg else {
+                    return None;
+                };
+                let peeled = peel_recast_narrow_to_source(graph, block, arg.clone());
+                let LinkArg::Value(peeled_v) = peeled else {
+                    return None;
+                };
+                (peeled_v != *src).then_some((i, peeled_v))
+            })
+            .collect();
+        for (i, peeled) in rewrites {
+            if let OpKind::Call { args, .. } = &mut graph.blocks[block].operations[i].kind
+                && let Some(LinkArg::Value(v)) = args.first_mut()
+            {
+                *v = peeled;
+            }
+        }
+    }
 }
 
 fn is_root_bracket_close(kind: &OpKind) -> bool {
@@ -18308,5 +18426,218 @@ mod merged_continue_tests {
             }),
             "replayed close reaches exceptblock"
         );
+    }
+}
+
+#[cfg(test)]
+mod live_mut_gc_erasure_tests {
+    use super::*;
+    use crate::model::{CallTarget, ValueType};
+
+    /// `self as GCREF` → `try_gc_current_object_address` → `as *mut Self`.
+    fn live_mut_roundtrip() -> (FunctionGraph, Variable, Variable, Variable, Variable) {
+        let mut graph = FunctionGraph::new("live_mut_roundtrip");
+        let entry = graph.startblock;
+        let frame = graph.alloc_value_var();
+        graph.blocks[entry.0].inputargs = vec![frame.clone()];
+        let gcref = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("GCREF", frame.clone()),
+                true,
+            )
+            .expect("GCREF recast");
+        let current = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_object",
+                        "gc_hook",
+                        "try_gc_current_object_address",
+                    ]),
+                    args: crate::model::call_args(vec![gcref.clone()]),
+                    result_ty: ValueType::Ref(Some("GCREF".into())),
+                },
+                true,
+            )
+            .expect("try_gc_current_object_address");
+        let live = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("PyFrame", current.clone()),
+                true,
+            )
+            .expect("back-cast");
+        graph.set_return(entry, Some(live.clone()));
+        (graph, frame, gcref, current, live)
+    }
+
+    fn try_gc_kind() -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path([
+                "pyre_object",
+                "gc_hook",
+                "try_gc_current_object_address",
+            ]),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some("GCREF".into())),
+        }
+    }
+
+    fn path_kind(segments: &[&str]) -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path(segments.iter().copied()),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some("GCREF".into())),
+        }
+    }
+
+    #[test]
+    fn try_gc_current_object_address_is_a_gc_root_reload() {
+        assert!(is_gc_root_reload(&try_gc_kind()));
+        assert!(is_gc_erasure_root_identity(&try_gc_kind()));
+        assert!(is_gc_root_reload(&path_kind(&[
+            "gc_hook",
+            "try_gc_current_object_address"
+        ])));
+        assert!(is_gc_root_reload(&path_kind(&[
+            "pyre_object",
+            "try_gc_current_object_address"
+        ])));
+        let pin = OpKind::Call {
+            target: CallTarget::function_path(["pyre_object", "gc_roots", "pin_root"]),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(None),
+        };
+        assert!(!is_gc_root_reload(&pin));
+    }
+
+    #[test]
+    fn user_gc_hook_try_gc_current_object_address_is_an_ordinary_call() {
+        let user = path_kind(&["user", "gc_hook", "try_gc_current_object_address"]);
+        assert!(
+            !is_gc_root_reload(&user),
+            "user::gc_hook::try_gc_current_object_address must not be the GC identity"
+        );
+        assert!(!is_gc_erasure_root_identity(&user));
+        assert!(!is_gc_root_reload(&path_kind(&[
+            "user",
+            "try_gc_current_object_address"
+        ])));
+
+        let mut graph = FunctionGraph::new("user_try_gc");
+        let entry = graph.startblock;
+        let arg = graph.alloc_value_var();
+        graph.blocks[entry.0].inputargs = vec![arg.clone()];
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "user",
+                        "gc_hook",
+                        "try_gc_current_object_address",
+                    ]),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: ValueType::Ref(Some("GCREF".into())),
+                },
+                true,
+            )
+            .expect("user try_gc call");
+        let peeled = peel_recast_to_source(&graph, entry.0, LinkArg::Value(result.clone()));
+        assert_eq!(
+            peeled.as_variable(),
+            Some(&result),
+            "ordinary user call must not peel to its argument"
+        );
+        assert_ne!(peeled.as_variable(), Some(&arg));
+    }
+
+    #[test]
+    fn shadow_stack_get_result_is_not_an_image_of_its_index() {
+        let mut graph = FunctionGraph::new("shadow_stack_get_idx");
+        let entry = graph.startblock;
+        let idx = graph.alloc_value_var();
+        graph.blocks[entry.0].inputargs = vec![idx.clone()];
+        let loaded = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_object",
+                        "gc_roots",
+                        "shadow_stack_get",
+                    ]),
+                    args: crate::model::call_args(vec![idx.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("shadow_stack_get");
+        let kind = &graph.blocks[entry.0].operations[0].kind;
+        assert!(
+            is_gc_root_reload(kind),
+            "shadow_stack_get is a root-slot read"
+        );
+        assert!(
+            !is_gc_erasure_root_identity(kind),
+            "shadow_stack_get first argument is the index, not the object"
+        );
+        let images = recast_images_of(&graph.blocks[entry.0].operations, &idx);
+        assert!(
+            !images.iter().any(|v| v == &loaded),
+            "shadow_stack_get(idx) must not be an image of idx"
+        );
+        let peeled = peel_recast_to_source(&graph, entry.0, LinkArg::Value(loaded.clone()));
+        assert_eq!(
+            peeled.as_variable(),
+            Some(&loaded),
+            "peel must not equate the restored object with its slot index"
+        );
+        assert_ne!(peeled.as_variable(), Some(&idx));
+    }
+
+    #[test]
+    fn live_mut_peel_names_the_original_self() {
+        let (graph, frame, _gcref, _current, live) = live_mut_roundtrip();
+        let peeled = peel_recast_to_source(&graph, graph.startblock.0, LinkArg::Value(live));
+        assert_eq!(peeled.as_variable(), Some(&frame));
+    }
+
+    #[test]
+    fn live_mut_retarget_feeds_try_gc_the_original_self() {
+        let (mut graph, frame, gcref, _current, _live) = live_mut_roundtrip();
+        retarget_gc_erasure_identity_args(&mut graph);
+        let try_gc = graph.blocks[graph.startblock.0]
+            .operations
+            .iter()
+            .find(|op| is_gc_erasure_root_identity(&op.kind))
+            .expect("try_gc_current_object_address");
+        let OpKind::Call { args, .. } = &try_gc.kind else {
+            panic!("try_gc must remain a call");
+        };
+        assert_eq!(
+            args.first().and_then(LinkArg::as_variable),
+            Some(&frame),
+            "GCREF recast around try_gc must collapse to self"
+        );
+        assert_ne!(
+            args.first().and_then(LinkArg::as_variable),
+            Some(&gcref),
+            "try_gc must not keep the GCREF projection as its argument"
+        );
+    }
+
+    #[test]
+    fn live_mut_recast_images_include_the_sandwich() {
+        let (graph, frame, gcref, current, live) = live_mut_roundtrip();
+        let images = recast_images_of(&graph.blocks[graph.startblock.0].operations, &frame);
+        for image in [&frame, &gcref, &current, &live] {
+            assert!(
+                images.iter().any(|v| v == image),
+                "sandwich image missing from recast_images_of"
+            );
+        }
     }
 }

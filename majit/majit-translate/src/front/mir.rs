@@ -6529,6 +6529,10 @@ fn simplify_lowered_graph_expanding(
     // eagerly so the direct-scan passes see the same surface
     // `iterblocks()` exposes upstream.
     crate::model::clear_unreachable_blocks(graph);
+    // `reload_top_root` / `try_gc_current_object_address` are gctransform
+    // identities pyre spells in source. Peel a `cast(x, GCREF)` that only
+    // feeds them so the annotator sees `x` (`peel_recast_to_source`).
+    crate::front::result_exc::retarget_gc_erasure_identity_args(graph);
     // Rust's `ptr::write(raw as *mut T, T { .. })` is the source spelling of
     // RPython's already-allocated object followed by one setfield per member.
     // Lower that aggregate copy before allocation fusion so generic
