@@ -5384,12 +5384,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     p1(
         &mut entries,
-        "pyre_object::rordereddict::ll_dict_len_trampoline",
-        pyre_object::rordereddict::ll_dict_len_trampoline
-            as fn(&pyre_object::dictmultiobject::IntDictStorage) -> usize,
-    );
-    p1(
-        &mut entries,
         "pyre_object::rordereddict::ll_dict_grow_trampoline",
         pyre_object::rordereddict::ll_dict_grow_trampoline
             as fn(&mut pyre_object::dictmultiobject::IntDictStorage) -> bool,
