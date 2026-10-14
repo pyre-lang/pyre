@@ -22845,18 +22845,18 @@ pub fn genentry_raise_just_started(gen_obj: PyObjectRef) -> PyResult {
 #[majit_macros::dont_look_inside]
 pub fn genentry_raise_returned(
     gen_obj: PyObjectRef,
-    frame: *mut crate::pyframe::PyFrame,
     w_result: PyObjectRef,
     throw: usize,
 ) -> PyResult {
     use pyre_object::generator::*;
     // `frame_is_finished` clears the frame and can collect; the return value
-    // lives only in this argument until the StopIteration constructor.
+    // lives only in this argument until the StopIteration constructor. Both
+    // words are published as one run, and `self.frame` is read off the
+    // generator after it.
     let roots = pyre_object::gc_roots::push_roots();
-    let gen_slot = roots.base();
-    let _ = roots.pin_root(gen_obj);
-    let _ = roots.pin_root(w_result);
+    let gen_slot = roots.pin_roots(&[gen_obj, w_result]);
     unsafe {
+        let frame = w_generator_get_frame(roots.get(gen_slot)) as *mut crate::pyframe::PyFrame;
         generator_frame_is_finished(
             roots.get(gen_slot),
             &mut *frame,
@@ -23099,7 +23099,6 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg: PyObjectRef, throw: u
                 if (*frame_now).frame_finished_execution() {
                     genentry_raise_returned(
                         pyre_object::gc_roots::shadow_stack_get(gen_slot),
-                        frame_now,
                         value,
                         throw,
                     )

@@ -8502,9 +8502,7 @@ fn finish_generatorentry_after_walk_abort(
             let frame = unsafe { pyre_object::generator::w_generator_get_frame(live_gen) }
                 as *mut pyre_interpreter::pyframe::PyFrame;
             if !frame.is_null() && unsafe { (*frame).frame_finished_execution() } {
-                return pyre_interpreter::baseobjspace::genentry_raise_returned(
-                    live_gen, frame, value, 0,
-                );
+                return pyre_interpreter::baseobjspace::genentry_raise_returned(live_gen, value, 0);
             }
         }
         return done;
