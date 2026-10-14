@@ -299,8 +299,8 @@ fn rewire_one_range_iter_site(
             iter_var.clone()
         } else if graph.variable_defined_in_block(src, &iter_phi) {
             iter_phi.clone()
-        } else if graph.ensure_variable_at_block(src, &iter_phi) {
-            iter_phi.clone()
+        } else if let Some(local) = graph.ensure_variable_at_block_local(src, &iter_phi) {
+            local
         } else {
             continue;
         };
@@ -730,6 +730,77 @@ mod tests {
             count_calls_ending(&g, &["core", "slice", "iter"]),
             1,
             "one iter op emitted"
+        );
+        assert_link_args_defined_in_source(&g);
+    }
+
+    /// A predecessor that still names a non-iterator dummy must receive
+    /// the header iterator as an SSI local (`ssa.py` `SSA_to_SSI`), not
+    /// the header inputarg identity.
+    #[test]
+    fn rewrite_threads_iterator_ssi_local_onto_non_alias_predecessor() {
+        let mut g = FunctionGraph::new("test_range_iter_ssi_pred");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: range_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "start", &a),
+        });
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "end", &b),
+        });
+
+        let mid = g.create_block();
+        let dummy = g.push_op_var(mid, OpKind::ConstInt(0), true).unwrap();
+        let header = g.create_block();
+        g.block_mut(header).inputargs.push(range.clone());
+        let opt = g
+            .push_op_var(
+                header,
+                OpKind::Call {
+                    target: CallTarget::method("next", Some("Range".to_string())),
+                    args: crate::model::call_args(vec![range.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(header, Some(opt.clone()));
+        g.set_goto(n, mid, vec![]);
+        g.set_goto(mid, header, vec![dummy]);
+
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range.clone(),
+            }],
+            &[opt],
+        );
+        assert_eq!(rewritten, 1, "the range for-loop must be diverted");
+        assert_link_args_defined_in_source(&g);
+        let passed = g.block(mid).exits[0].args[0]
+            .as_variable()
+            .expect("iterator slot is a value");
+        assert!(
+            g.variable_defined_in_block(mid, passed),
+            "predecessor link names the mid SSI local"
+        );
+        assert_ne!(
+            passed, &range,
+            "predecessor must not plant the header inputarg identity"
         );
     }
 

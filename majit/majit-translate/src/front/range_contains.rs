@@ -98,7 +98,9 @@
 //! Every mismatch declines (leaves BOTH residual calls / the ctor chain,
 //! census Skip) — no regression.
 
-use crate::flowspace::model::Variable;
+use std::collections::HashSet;
+
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
     BlockId, CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
 };
@@ -281,15 +283,16 @@ fn rewire_one_range_contains_site(
             "{name}: range construction bounds cannot thread to the contains block"
         ));
     }
-    let lo_in_c = lo.clone();
-    let hi_in_c = hi.clone();
-    let ok = graph.ensure_variable_at_block(c_block, &lo_in_c)
-        && graph.ensure_variable_at_block(c_block, &hi_in_c);
-    if !ok {
+    let Some(lo_in_c) = graph.ensure_variable_at_block_local(c_block, &lo) else {
         return Err(format!(
             "{name}: range construction bounds threading failed at the contains block"
         ));
-    }
+    };
+    let Some(hi_in_c) = graph.ensure_variable_at_block_local(c_block, &hi) else {
+        return Err(format!(
+            "{name}: range construction bounds threading failed at the contains block"
+        ));
+    };
 
     // 6. Splice the bounds check into block C, replacing the `contains`
     //    op in place and reusing its result Variable.
@@ -634,18 +637,67 @@ fn remove_op_by_result(graph: &mut FunctionGraph, result_var: &Variable) {
     }
 }
 
-/// The signed constant `var` is produced by, if its single producer is
-/// `ConstInt`.
+/// The signed constant `var` is produced by. Follows `Variable.copy()`
+/// inputargs (`ssa.py` `SSA_to_SSI`) only when every incoming path
+/// agrees (`DataFlowFamilyBuilder` unifies a single family).
 fn const_int_of(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
-    graph.blocks.iter().find_map(|block| {
-        block
-            .operations
-            .iter()
-            .find_map(|op| match (&op.result, &op.kind) {
-                (Some(result), OpKind::ConstInt(value)) if result == var => Some(*value),
-                _ => None,
-            })
-    })
+    const_int_of_inner(graph, var, &mut HashSet::new())
+}
+
+fn const_int_of_inner(
+    graph: &FunctionGraph,
+    var: &Variable,
+    seen: &mut HashSet<u64>,
+) -> Option<i64> {
+    if !seen.insert(var.id()) {
+        return None;
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let (Some(result), OpKind::ConstInt(value)) = (&op.result, &op.kind)
+                && result == var
+            {
+                return Some(*value);
+            }
+        }
+    }
+    let mut agreed: Option<i64> = None;
+    let mut saw_incoming = false;
+    for block in graph.iterblocks() {
+        if block.dead {
+            continue;
+        }
+        let Some(slot) = block.inputargs.iter().position(|arg| arg == var) else {
+            continue;
+        };
+        for pred in graph.iterblocks() {
+            if pred.dead {
+                continue;
+            }
+            for link in &pred.exits {
+                if link.target != block.id {
+                    continue;
+                }
+                let value = match link.args.get(slot) {
+                    Some(LinkArg::Value(incoming)) => const_int_of_inner(graph, incoming, seen)?,
+                    Some(LinkArg::Const(constant)) => match constant.value {
+                        ConstValue::Int(value) => value,
+                        _ => return None,
+                    },
+                    None => return None,
+                };
+                if let Some(prev) = agreed {
+                    if prev != value {
+                        return None;
+                    }
+                } else {
+                    agreed = Some(value);
+                }
+                saw_incoming = true;
+            }
+        }
+    }
+    if saw_incoming { agreed } else { None }
 }
 
 /// `int_between(lo, x, upper)` bound to `result_var`.  The result is a
@@ -964,7 +1016,8 @@ mod tests {
     }
 
     /// `int_between(lo, x, exclusive)` bound to `result`, and no leftover
-    /// compare pair.
+    /// compare pair. Bound operands are defined in the contains block
+    /// (`ssa.py` `SSA_to_SSI` / `Block.renamevariables`).
     fn assert_int_between(
         g: &FunctionGraph,
         result: &Variable,
@@ -972,12 +1025,34 @@ mod tests {
         x: &Variable,
         exclusive: i64,
     ) {
-        let sites = int_between_ops(g);
-        assert_eq!(sites.len(), 1, "one int_between, got {sites:?}");
-        let (bound, args) = &sites[0];
-        assert_eq!(bound, result, "int_between reuses the contains result");
+        let mut found = None;
+        for block in &g.blocks {
+            for op in &block.operations {
+                if let OpKind::LoweredBlackholeOp { opname, args } = &op.kind
+                    && opname == "int_between"
+                {
+                    found = Some((
+                        block.id,
+                        op.result.clone().expect("int_between result"),
+                        args.clone(),
+                    ));
+                }
+            }
+        }
+        let (block, bound, args) = found.expect("one int_between");
+        assert_eq!(&bound, result, "int_between reuses the contains result");
         assert_eq!(args.len(), 3);
-        assert_eq!(&args[0], lo, "lower bound is lo");
+        for (i, arg) in args.iter().enumerate() {
+            assert!(
+                g.variable_defined_in_block(block, arg),
+                "int_between arg {i} must be defined in the contains block"
+            );
+        }
+        assert_eq!(
+            const_int_of(g, &args[0]),
+            const_int_of(g, lo),
+            "lower bound is lo"
+        );
         assert_eq!(&args[1], x, "middle value is x");
         assert_eq!(
             const_int_of(g, &args[2]),
@@ -987,6 +1062,34 @@ mod tests {
         assert!(binop_results(g, "le").is_empty(), "no leftover le");
         assert!(binop_results(g, "ge").is_empty(), "no leftover ge");
         assert!(binop_results(g, "bitand").is_empty(), "no leftover bitand");
+    }
+
+    /// A phi that merges two different constants is not a ConstInt family
+    /// (`DataFlowFamilyBuilder.complete`).
+    #[test]
+    fn const_int_of_rejects_phi_of_distinct_constants() {
+        let mut g = FunctionGraph::new("const_int_mixed_phi");
+        let entry = g.startblock;
+        let left = g.create_block();
+        let right = g.create_block();
+        let (join, join_args) = g.create_block_with_arg_vars(1);
+        let one = g.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nine = g.push_op_var(entry, OpKind::ConstInt(9), true).unwrap();
+        let cond = g
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_branch(entry, cond, left, vec![], right, vec![]);
+        g.set_goto(left, join, vec![one]);
+        g.set_goto(right, join, vec![nine]);
+        assert_eq!(const_int_of(&g, &join_args[0]), None);
     }
 
     /// Result Variables of every `BinOp` with the given opname.
