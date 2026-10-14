@@ -6083,10 +6083,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::PyError::not_implemented(format!("{funcname}: {arg} unavailable on this platform"))
     }
 
-    /// `os.link` takes its two names positionally and everything else by
-    /// keyword, so a third positional argument is a `src_dir_fd` that would
-    /// otherwise be dropped on the floor.
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     /// `do_stat` (`interp_posix.py`) resolves a name against an open
     /// directory descriptor with `fstatat`, where `AT_SYMLINK_NOFOLLOW`
     /// carries `follow_symlinks=False`. An absolute name ignores `dir_fd`,
