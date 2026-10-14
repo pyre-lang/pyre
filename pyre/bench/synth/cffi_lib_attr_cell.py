@@ -2,6 +2,7 @@
 # pyre-check: skip-backends=wasm
 # pyre-check: requires-modules=_cffi_backend
 # pyre-check: skip-platforms=win32
+# pyre-check: trace-shape=hot_lib_call:max=CallMayForceR:2
 # `optind` is a libc `int` on unix. Windows has no such export, so pypy
 # exits 1 during dlopen and the oracle never starts.
 # `_cffi_backend` is built into pypy but is not a CPython builtin, and this

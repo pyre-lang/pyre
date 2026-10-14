@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=2.9
+# pyre-check: trace-shape=run_abs_float:absent=CallMayForceR,run_min_max:absent=CallMayForceR
 # A ceiling under 3 derives no floor.
 # pyre-check: skip-cpython
 # The ceiling was fitted when the `builtin_fold1` / `builtin_fold2` hand

@@ -1,4 +1,5 @@
 # pyre-check: spec-folds=load_method_attr
+# pyre-check: trace-shape=entry-bridge:helper:max=GetfieldGcR:2
 # LOAD_METHOD's fast-method path decides the descriptor and the receiver
 # together (`callmethod.py LOAD_METHOD` pushes `w_descr` then `w_obj`).  pyre
 # reaches the two halves through separate jitcode residuals -- `load_attr_fn`

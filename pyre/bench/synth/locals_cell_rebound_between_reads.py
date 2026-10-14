@@ -1,4 +1,5 @@
 # pyre-check: spec-folds=builtin_locals
+# pyre-check: trace-shape=rebound_between_reads:present=Jump
 # Three `locals()` calls in ONE loop body, separated by two rebinds of the same
 # cell.
 #

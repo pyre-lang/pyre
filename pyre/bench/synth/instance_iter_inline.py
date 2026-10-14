@@ -1,6 +1,7 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=self_iter,nested_call,in_callee
 # pyre-check: spec-folds=instance_iter
+# pyre-check: trace-shape=nested_call:absent=CallMayForceR
 # `iter`'s instance arm dispatches a user class's `__iter__` and then runs
 # `iter_check_is_iterator` on what came back.  Left residual the method is one
 # opaque `CallMayForce` per `for` statement -- a real interpreter frame, plus

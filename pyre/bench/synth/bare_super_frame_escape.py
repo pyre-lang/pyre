@@ -1,6 +1,7 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main
 # pyre-check: spec-folds=bare_super_call,bare_super_virtual
+# pyre-check: trace-shape=entry-bridge:tag:absent=CallMayForceR,entry-bridge:val:absent=CallMayForceR
 # Self-checking guard for zero-argument `super()` bound to a name, which is the
 # spelling that reaches the frame-escape path.
 #

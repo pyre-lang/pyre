@@ -1,6 +1,7 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # pyre-check: spec-folds=two_arg_super_call,load_attr_on_super,super_attr_unwrap
+# pyre-check: trace-shape=run:absent=CallMayForceR,absent=CallR
 # `super(C, self).m(x)` in a callee the FOR_ITER-driven trace inlines.
 # `load_super_attr.py` keeps its loop inside the super-bearing method, so the
 # callee replay scan never sees the LOAD_SUPER_ATTR residuals; this shape does.

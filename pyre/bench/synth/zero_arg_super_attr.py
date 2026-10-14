@@ -1,6 +1,7 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # pyre-check: spec-folds=load_deref,load_super_attr,super_attr_unwrap
+# pyre-check: trace-shape=run:absent=CallMayForceR,absent=CallR
 # Zero-argument super inside a FOR_ITER body.  N keeps the pypy reference above
 # check.py's timing floor; CPython is skipped because that N is impractical.
 #

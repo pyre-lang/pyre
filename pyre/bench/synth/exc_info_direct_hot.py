@@ -1,6 +1,7 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # pyre-check: spec-folds=sys_exc_info,subscr_tuple_slice2
+# pyre-check: trace-shape=type_hot:absent=CallMayForceR,slice_hot:absent=CallMayForceR
 # PyPy's `vm.py exc_info_direct` lets `function.py funccall_valuestack`
 # omit the traceback when bytecode look-ahead proves that only slots 0/1 can
 # escape.  A residual `sys.exc_info()` call used to allocate its three-tuple

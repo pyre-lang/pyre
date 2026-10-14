@@ -1,5 +1,6 @@
 # pyre-check: max-pypy-ratio=18
 # pyre-check: spec-folds=for_iter_next
+# pyre-check: trace-shape=three_levels:absent=CallMayForceR
 # The iteration fold, 487 firings across the corpus and undeclared. 22 here.
 def variable_inner(n):
     total = 0

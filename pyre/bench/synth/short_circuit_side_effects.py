@@ -1,5 +1,6 @@
 # pyre-check: max-pypy-ratio=30
 # pyre-check: spec-folds=subscr
+# pyre-check: trace-shape=main:absent=CallMayForceI,absent=CallMayForceR
 # The and/or chains below present a non-bool truthiness to the walker.
 # Short-circuit and/or chains whose operands call side-effecting helpers,
 # inside a hot loop whose first operand flips truthiness after warm-up. The

@@ -1,4 +1,5 @@
 # pyre-check: spec-folds=builtin_len_descent
+# pyre-check: trace-shape=hot:absent=CallMayForceR
 # PyPy installs the builtin implementations reached by
 # descroperation.py `_len` through typedef.py
 # `use_special_method_shortcut('__len__')`.  Keep every layout formerly emitted

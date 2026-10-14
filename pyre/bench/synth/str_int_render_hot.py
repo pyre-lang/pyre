@@ -1,3 +1,4 @@
+# pyre-check: trace-shape=hot_render:absent=CallMayForceR
 # Hot-loop `str(int)`. The Python-level call walks `intobject.py descr_str`:
 # `ll_int2dec` plus a `newutf8` wrap. The residual it replaces is a
 # `CallMayForce`, so it clears the heap cache and forces virtualizables
