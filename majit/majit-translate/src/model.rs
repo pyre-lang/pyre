@@ -5957,12 +5957,26 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
     use crate::flowspace::model::Variable;
     use std::collections::{HashMap, HashSet};
 
-    // target block id → source block ids feeding it.
+    // target block id → source block ids feeding it. Dead stubs keep a
+    // raise exit (`stub_dead_block`); skip them so they cannot poison
+    // `available_on_every_predecessor_path` the way `SSA_to_SSI` only
+    // walks `graph.iterblocks()`.
     let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for b in &graph.blocks {
+        if b.dead {
+            continue;
+        }
         for e in &b.exits {
             preds.entry(e.target).or_default().push(b.id);
         }
+    }
+
+    // Predecessor walks stay on exact identity (`variable_defined_in_block`).
+    // `ssa.py` `SSA_to_SSI` `find_rep` reuse is a per-use lookup below,
+    // not a gate predicate: folding `ssi_variable_at_block` into every
+    // ancestor step re-walks the CFG at each node.
+    fn block_has_value(graph: &FunctionGraph, block: BlockId, var: &Variable) -> bool {
+        graph.variable_defined_in_block(block, var)
     }
 
     fn ancestor_has_definition(
@@ -5975,7 +5989,7 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
         if !seen.insert(block) {
             return false;
         }
-        graph.variable_defined_in_block(block, var)
+        block_has_value(graph, block, var)
             || preds.get(&block).is_some_and(|ps| {
                 ps.iter()
                     .any(|&pred| ancestor_has_definition(graph, preds, pred, var, seen))
@@ -5990,7 +6004,7 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
         visiting: &mut HashSet<BlockId>,
         memo: &mut HashMap<BlockId, bool>,
     ) -> bool {
-        if graph.variable_defined_in_block(block, var) {
+        if block_has_value(graph, block, var) {
             return true;
         }
         if let Some(&known) = memo.get(&block) {
@@ -6019,33 +6033,79 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
         if block.dead {
             continue;
         }
+        // `ssa.py` `SSA_to_SSI` `record_used_var`: ops, `exitswitch`, and
+        // every `link.args` entry. A copy minted for an op use also
+        // rewrites this block's exits (`Block.renamevariables`); a
+        // pass-through that only names the value on a jump still needs
+        // its own inputarg so the jump operand is defined here.
+        let mut used: Vec<Variable> = Vec::new();
+        let mut seen_use = HashSet::new();
+        let mut record = |var: Variable| {
+            if seen_use.insert(var.id()) {
+                used.push(var);
+            }
+        };
         for op in &block.operations {
             for var in crate::inline::op_variable_refs(&op.kind) {
-                if graph.variable_defined_in_block(block.id, &var) {
-                    continue;
+                record(var);
+            }
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => record(var.clone()),
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    record(arg.clone());
                 }
-                let has_definition =
-                    ancestor_has_definition(graph, &preds, block.id, &var, &mut HashSet::new());
-                let available = available_on_every_predecessor_path(
-                    graph,
-                    &preds,
-                    block.id,
-                    &var,
-                    &mut HashSet::new(),
-                    &mut HashMap::new(),
-                );
-                if has_definition && available {
-                    work.push((block.id, var));
+            }
+            Some(ExitSwitch::LastException) | None => {}
+        }
+        for link in &block.exits {
+            for arg in &link.args {
+                if let LinkArg::Value(var) = arg {
+                    record(var.clone());
                 }
             }
         }
+        for var in used {
+            if graph.variable_defined_in_block(block.id, &var) {
+                continue;
+            }
+            let has_definition =
+                ancestor_has_definition(graph, &preds, block.id, &var, &mut HashSet::new());
+            let available = available_on_every_predecessor_path(
+                graph,
+                &preds,
+                block.id,
+                &var,
+                &mut HashSet::new(),
+                &mut HashMap::new(),
+            );
+            if has_definition && available {
+                work.push((block.id, var));
+                continue;
+            }
+            // `ssa.py` `SSA_to_SSI`: `find_rep(w) is find_rep(v)` reuses
+            // a created family member even when an extra predecessor
+            // does not define the producer identity. One lookup at this
+            // use site (`record_used_var(block.exitswitch)`); the
+            // predecessor walk above stays exact-identity.
+            if graph.ssi_variable_at_block(block.id, &var).is_some() {
+                work.push((block.id, var));
+            }
+        }
     }
-    // `ensure_variable_at_block` is idempotent, so a duplicate (block, var)
-    // pair from two operands referencing the same Variable is a harmless no-op
-    // on the second call.
+    // One (block, var) is enough: the first call mints the SSI copy and
+    // renames every use in the block (`Variable.copy` / `Block.renamevariables`).
+    let mut seen = HashSet::new();
+    work.retain(|(block_id, var)| seen.insert((block_id.0, var.id())));
     for (block_id, var) in work {
         graph.ensure_variable_at_block(block_id, &var);
     }
+    // A predecessor `recloseblock` can drop the extra SSI slot on one
+    // incoming link while a sibling still carries it. Pad from that
+    // sibling so `join_blocks` zip cannot drop the copy then clear its
+    // only definition (`ssa.py` `SSA_to_SSI` incoming `link.args`).
+    graph.repair_short_incoming_links();
 }
 
 /// Sweep the construct-on-stack header remnants that [`fuse_boxing_alloc`]
@@ -8769,7 +8829,7 @@ impl FunctionGraph {
         pred_state: &FrameState,
         target_state: &FrameState,
     ) {
-        let outputargs = pred_state.getoutputargs(target_state, self);
+        let mut outputargs = pred_state.getoutputargs(target_state, self);
         // Backfill ancestor-defined Variable args into `block`'s
         // inputargs + predecessor link args via the eager-threading
         // helper.  When `target_state.mergeable` carries a carry-through
@@ -8778,13 +8838,16 @@ impl FunctionGraph {
         // returns it as `LinkArg::Value(cond)` — but `block` may not
         // define `cond` locally, so the Link.args would reference an
         // undefined operand (`flowspace_adapter.rs`).  Walking
-        // back through the predecessor chain to add `cond` as a
-        // `block.inputargs` entry restores the
-        // `flowspace/flowcontext.py setstate(block.framestate)`
-        // shape that the AST walker doesn't produce eagerly.
-        for arg in &outputargs {
-            if let LinkArg::Value(var) = arg {
-                self.ensure_variable_at_block(block, var);
+        // back through the predecessor chain mints a `Variable.copy()`
+        // inputarg per block (`ssa.py` `SSA_to_SSI`) and the link
+        // carries that local, matching
+        // `flowspace/flowcontext.py setstate(block.framestate)`.
+        let mut memo = std::collections::HashMap::new();
+        for arg in &mut outputargs {
+            if let LinkArg::Value(var) = arg
+                && let Some(local) = self.ensure_variable_at_block_with_memo(block, var, &mut memo)
+            {
+                *arg = LinkArg::Value(local);
             }
         }
         // `flowspace/model.py Link.__init__` asserts
@@ -8870,19 +8933,22 @@ impl FunctionGraph {
 
     /// Backfill `var` as a definition reachable at `block`.
     ///
-    /// Cycle-safe top-down: adds `var` to `block.inputargs` BEFORE
-    /// recursing into predecessors so a back-edge that reaches `block`
-    /// again finds the in-progress slot via
-    /// [`Self::variable_defined_in_block`] and short-circuits.  For
-    /// each predecessor edge `(pred_block, exit_idx)`, recursively
-    /// ensures `pred_block` defines `var`, then appends
-    /// `LinkArg::Value(var)` to `pred_block.exits[exit_idx].args` so
-    /// the arity invariant `len(link.args) == len(target.inputargs)`
-    /// is preserved.
+    /// Each target block gets a fresh `Variable.copy()` bound through
+    /// `Link.args`, and uses of `var` inside that block are renamed
+    /// (`ssa.py` `SSA_to_SSI`, `flowspace/model.py` `Variable.copy` /
+    /// `Block.renamevariables`).  `checkgraph` `definevar` rejects the
+    /// same Variable as an inputarg of more than one block.
     ///
-    /// Returns `true` when `var` is now reachable at `block` (was
-    /// already defined, or newly threaded).  Returns `false` only when
-    /// `block` has no predecessors AND `var` is not defined locally
+    /// Cycle-safe: the copy is recorded before walking predecessors so
+    /// a back-edge observes the in-progress inputarg.  For each
+    /// predecessor edge, recursively ensures the predecessor defines
+    /// the value, then appends that predecessor's local to
+    /// `pred_block.exits[exit_idx].args` so
+    /// `len(link.args) == len(target.inputargs)`.
+    ///
+    /// Returns `true` when the value is reachable at `block` (already
+    /// defined, or newly threaded).  Returns `false` only when `block`
+    /// has no predecessors AND `var` is not defined locally
     /// — a malformed graph state callers should treat as a bug.
     ///
     /// `flowspace/flowcontext.py setstate(block.framestate)`
@@ -8897,37 +8963,143 @@ impl FunctionGraph {
         block: BlockId,
         var: &crate::flowspace::model::Variable,
     ) -> bool {
-        if self.variable_defined_in_block(block, var) {
-            return true;
-        }
-        let pred_edges: Vec<(BlockId, usize)> = self
-            .blocks
+        self.ensure_variable_at_block_local(block, var).is_some()
+    }
+
+    /// Like [`Self::ensure_variable_at_block`], returning the Variable
+    /// defined at `block` for this value (`var` itself, or the SSI copy).
+    pub(crate) fn ensure_variable_at_block_local(
+        &mut self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<crate::flowspace::model::Variable> {
+        let mut memo = std::collections::HashMap::new();
+        self.ensure_variable_at_block_with_memo(block, var, &mut memo)
+    }
+
+    fn incoming_edges(&self, block: BlockId) -> Vec<(BlockId, usize)> {
+        self.blocks
             .iter()
             .flat_map(|b| {
                 let bid = b.id;
-                b.exits.iter().enumerate().filter_map(move |(i, exit)| {
-                    if exit.target == block {
-                        Some((bid, i))
-                    } else {
-                        None
-                    }
-                })
+                b.exits
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(i, exit)| (exit.target == block).then_some((bid, i)))
             })
-            .collect();
-        if pred_edges.is_empty() {
-            return false;
+            .collect()
+    }
+
+    /// The Variable this block defines for `var`'s value: `var` itself
+    /// when created here, otherwise the inputarg whose incoming
+    /// `Link.args` carry `var` or an SSI copy (`ssa.py` `SSA_to_SSI`).
+    pub(crate) fn ssi_variable_at_block(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<crate::flowspace::model::Variable> {
+        self.ssi_variable_at_block_inner(
+            block,
+            var,
+            &mut HashSet::new(),
+            &mut std::collections::HashMap::new(),
+        )
+    }
+
+    fn ssi_variable_at_block_inner(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        visiting: &mut HashSet<usize>,
+        memo: &mut std::collections::HashMap<usize, Option<crate::flowspace::model::Variable>>,
+    ) -> Option<crate::flowspace::model::Variable> {
+        if let Some(cached) = memo.get(&block.0) {
+            return cached.clone();
         }
-        // If `block` is a phi-block (has any `OpKind::Input` op), every
-        // inputarg must be paired with an `OpKind::Input { name, .. }` op.
-        // When this helper adds a fresh inputarg via the recursive backfill
-        // we must also emit the paired op so the invariant holds; otherwise
-        // `closeblock_link` / `getoutputargs` panics on arity mismatch.
+        if self.variable_defined_in_block(block, var) {
+            let found = Some(var.clone());
+            memo.insert(block.0, found.clone());
+            return found;
+        }
+        if !visiting.insert(block.0) {
+            return None;
+        }
+        let pred_edges = self.incoming_edges(block);
+        let inputargs = self.block(block).inputargs.clone();
+        let mut found = None;
+        'slots: for (i, local) in inputargs.iter().enumerate() {
+            for &(pred, idx) in &pred_edges {
+                let Some(LinkArg::Value(incoming)) = self
+                    .block(pred)
+                    .exits
+                    .get(idx)
+                    .and_then(|link| link.args.get(i))
+                else {
+                    continue;
+                };
+                if incoming == var
+                    || self
+                        .ssi_variable_at_block_inner(pred, var, visiting, memo)
+                        .as_ref()
+                        == Some(incoming)
+                {
+                    found = Some(local.clone());
+                    break 'slots;
+                }
+            }
+        }
+        visiting.remove(&block.0);
+        memo.insert(block.0, found.clone());
+        found
+    }
+
+    fn ensure_variable_at_block_with_memo(
+        &mut self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        memo: &mut std::collections::HashMap<(usize, u64), crate::flowspace::model::Variable>,
+    ) -> Option<crate::flowspace::model::Variable> {
+        if let Some(local) = self.ssi_variable_at_block(block, var) {
+            // `ssa.py` `SSA_to_SSI`: a created `w` in the same family as
+            // `v` is reused with `block.renamevariables({v: w})`. Finding
+            // the family member in `inputargs` does not rewrite remaining
+            // uses; `record_used_var` treats `block.exitswitch` as a use
+            // (`flowspace/model.py` `checkgraph` `usevar(block.exitswitch)`).
+            if local != *var {
+                crate::model_ssa::renamevariables(self, block, var, &local);
+            }
+            // A later `recloseblock` can drop the extra SSI slot. Pad
+            // with the predecessor local for `var`, not for `local`:
+            // `carried_from_pred` of the copy panics because only this
+            // block defines it (`ssa.py` `SSA_to_SSI` appends original
+            // `v`). A memo hit here is a self-loop already being padded.
+            let key = (block.0, var.id());
+            if memo.contains_key(&key) {
+                return Some(local);
+            }
+            memo.insert(key, local.clone());
+            self.pad_incoming_slot_for_var(block, var, &local, memo);
+            return Some(local);
+        }
+        let key = (block.0, var.id());
+        if let Some(local) = memo.get(&key) {
+            return Some(local.clone());
+        }
+        let pred_edges = self.incoming_edges(block);
+        if pred_edges.is_empty() {
+            return None;
+        }
+        // `SSA_to_SSI`: `w = v.copy(); block.renamevariables({v: w});
+        // block.inputargs.append(w)`.
+        let local = var.copy();
+        memo.insert(key, local.clone());
         let is_phi_block = self
             .block(block)
             .operations
             .iter()
             .any(|op| matches!(op.kind, OpKind::Input { .. }));
-        self.block_mut(block).inputargs.push(var.clone());
+        crate::model_ssa::renamevariables(self, block, var, &local);
+        self.block_mut(block).inputargs.push(local.clone());
         if is_phi_block {
             let name = self.value_name_for(var).unwrap_or_default();
             self.push_op_with_result_var(
@@ -8937,85 +9109,233 @@ impl FunctionGraph {
                     ty: ValueType::Unknown,
                     class_root: None,
                 },
-                var.clone(),
+                local.clone(),
             );
         }
+        // `ssa.py` `SSA_to_SSI`: append a value for `w` on every incoming
+        // link, then give the predecessor its own copy. Recursing first
+        // yields that predecessor local; a later `set_goto` /
+        // `recloseblock` can replace an exit and drop the extra slot, so
+        // re-walk incoming edges and pad any link still short of
+        // `inputargs` (`flowspace/model.py` `Link.__init__`
+        // `len(args) == len(target.inputargs)`).
         for (pred_block, exit_idx) in pred_edges {
-            let ok = self.ensure_variable_at_block(pred_block, var);
-            if !ok {
-                // The Variable's source name is read identity-first off
-                // its `OpKind::Input` op via `value_name_for`; the panic
-                // identifies the variable by `id` + source name.
-                let name = self.value_name_for(var);
-                // Dump the blocks whose framestate references `var` and the
-                // blocks that actually define it.  Surfaces stale carry-
-                // through bindings (e.g. a sibling control-flow path's
-                // local leaking into a slot whose backing Variable is no
-                // longer reachable via the predecessor chain) without
-                // forcing the engineer to rebuild a custom dump.
-                let mut framestate_blocks: Vec<BlockId> = Vec::new();
-                for b in &self.blocks {
-                    let Some(fs) = b.framestate.as_ref() else {
-                        continue;
-                    };
-                    let in_locals = fs.entries.iter().any(|e| e.as_ref() == Some(var));
-                    let in_stack = crate::flowspace::framestate::recursively_flatten(&fs.stack)
-                        .iter()
-                        .any(|h| {
-                            matches!(h, crate::flowspace::model::Hlvalue::Variable(v) if v == var)
-                        });
-                    if in_locals || in_stack {
-                        framestate_blocks.push(b.id);
-                    }
-                }
-                let mut def_blocks: Vec<BlockId> = Vec::new();
-                for b in &self.blocks {
-                    if b.inputargs.contains(var)
-                        || b.operations
-                            .iter()
-                            .any(|op| op.result.as_ref() == Some(var))
-                    {
-                        def_blocks.push(b.id);
-                    }
-                }
-                panic!(
-                    "ensure_variable_at_block: predecessor {:?} cannot define \
-                     Variable id={} (name={:?}) when threading to block {:?} on graph {:?} \
-                     — graph corruption: no transitive predecessor chain leads \
-                     to a definition site. \
-                     Variable appears in framestate of blocks {:?} and in inputargs/operations of blocks {:?}.",
-                    pred_block,
-                    var.id(),
-                    name,
-                    block,
-                    self.name,
-                    framestate_blocks,
-                    def_blocks,
-                );
-            }
+            let carried = self.carried_from_pred(pred_block, var, memo, block);
             self.block_mut(pred_block).exits[exit_idx]
                 .args
-                .push(LinkArg::Value(var.clone()));
+                .push(LinkArg::Value(carried));
         }
-        true
+        self.pad_incoming_slot_for_var(block, var, &local, memo);
+        Some(local)
+    }
+
+    /// When `local` is the last inputarg and an incoming link is short
+    /// by one, append the predecessor's local for `var`. Extra SSI
+    /// copies are appended (`SSA_to_SSI`), so a one-slot gap at the end
+    /// is this value. Filling every missing slot with `var` would alias
+    /// a later copy's slot.
+    fn pad_incoming_slot_for_var(
+        &mut self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        local: &crate::flowspace::model::Variable,
+        memo: &mut std::collections::HashMap<(usize, u64), crate::flowspace::model::Variable>,
+    ) {
+        let want = self.block(block).inputargs.len();
+        if self.block(block).inputargs.last() != Some(local) {
+            return;
+        }
+        for (pred_block, exit_idx) in self.incoming_edges(block) {
+            let have = self.block(pred_block).exits[exit_idx].args.len();
+            if have + 1 != want {
+                continue;
+            }
+            let carried = self.carried_from_pred(pred_block, var, memo, block);
+            let have = self.block(pred_block).exits[exit_idx].args.len();
+            if have + 1 == want {
+                self.block_mut(pred_block).exits[exit_idx]
+                    .args
+                    .push(LinkArg::Value(carried));
+            }
+        }
+    }
+
+    /// Walk an SSI copy back to the op result or startblock inputarg it
+    /// was minted from, following the incoming arg at the copy's slot.
+    fn chase_ssi_producer(
+        &self,
+        var: &crate::flowspace::model::Variable,
+        visiting: &mut HashSet<u64>,
+    ) -> crate::flowspace::model::Variable {
+        if !visiting.insert(var.id()) {
+            return var.clone();
+        }
+        for b in &self.blocks {
+            if b.operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(var))
+            {
+                return var.clone();
+            }
+            if b.id == self.startblock && b.inputargs.contains(var) {
+                return var.clone();
+            }
+        }
+        for b in &self.blocks {
+            let Some(slot) = b.inputargs.iter().position(|arg| arg == var) else {
+                continue;
+            };
+            for (pred, idx) in self.incoming_edges(b.id) {
+                let Some(LinkArg::Value(incoming)) = self
+                    .block(pred)
+                    .exits
+                    .get(idx)
+                    .and_then(|link| link.args.get(slot))
+                else {
+                    continue;
+                };
+                if incoming != var {
+                    return self.chase_ssi_producer(incoming, visiting);
+                }
+            }
+        }
+        var.clone()
+    }
+
+    /// Incoming links that lost extra SSI slots (one predecessor
+    /// `recloseblock`'d) are padded from a still-full sibling, chasing
+    /// each slot back to the producer `SSA_to_SSI` would append.
+    fn repair_short_incoming_links(&mut self) {
+        let targets: Vec<BlockId> = self
+            .blocks
+            .iter()
+            .filter(|b| !b.dead)
+            .map(|b| b.id)
+            .collect();
+        for target in targets {
+            let want = self.block(target).inputargs.len();
+            if want == 0 {
+                continue;
+            }
+            let incoming = self.incoming_edges(target);
+            let template: Option<Vec<crate::flowspace::model::Variable>> =
+                incoming.iter().find_map(|&(pred, idx)| {
+                    let args = &self.block(pred).exits[idx].args;
+                    if args.len() != want {
+                        return None;
+                    }
+                    args.iter()
+                        .map(|arg| arg.as_variable().cloned())
+                        .collect::<Option<Vec<_>>>()
+                });
+            let Some(template) = template else {
+                continue;
+            };
+            let short: Vec<(BlockId, usize)> = incoming
+                .into_iter()
+                .filter(|&(pred, idx)| self.block(pred).exits[idx].args.len() < want)
+                .collect();
+            if short.is_empty() {
+                continue;
+            }
+            let producers: Vec<crate::flowspace::model::Variable> = template
+                .iter()
+                .map(|var| self.chase_ssi_producer(var, &mut HashSet::new()))
+                .collect();
+            let mut memo = std::collections::HashMap::new();
+            for (pred, idx) in short {
+                let have = self.block(pred).exits[idx].args.len();
+                for slot in have..want {
+                    let producer = &producers[slot];
+                    let carried = self
+                        .ensure_variable_at_block_with_memo(pred, producer, &mut memo)
+                        .unwrap_or_else(|| producer.clone());
+                    self.block_mut(pred).exits[idx]
+                        .args
+                        .push(LinkArg::Value(carried));
+                }
+            }
+        }
+    }
+
+    fn carried_from_pred(
+        &mut self,
+        pred_block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        memo: &mut std::collections::HashMap<(usize, u64), crate::flowspace::model::Variable>,
+        target: BlockId,
+    ) -> crate::flowspace::model::Variable {
+        if let Some(carried) = self.ensure_variable_at_block_with_memo(pred_block, var, memo) {
+            return carried;
+        }
+        let name = self.value_name_for(var);
+        let mut framestate_blocks: Vec<BlockId> = Vec::new();
+        for b in &self.blocks {
+            let Some(fs) = b.framestate.as_ref() else {
+                continue;
+            };
+            let in_locals = fs.entries.iter().any(|e| e.as_ref() == Some(var));
+            let in_stack = crate::flowspace::framestate::recursively_flatten(&fs.stack)
+                .iter()
+                .any(|h| matches!(h, crate::flowspace::model::Hlvalue::Variable(v) if v == var));
+            if in_locals || in_stack {
+                framestate_blocks.push(b.id);
+            }
+        }
+        let mut def_blocks: Vec<BlockId> = Vec::new();
+        for b in &self.blocks {
+            if b.inputargs.contains(var)
+                || b.operations
+                    .iter()
+                    .any(|op| op.result.as_ref() == Some(var))
+            {
+                def_blocks.push(b.id);
+            }
+        }
+        panic!(
+            "ensure_variable_at_block: predecessor {:?} cannot define \
+             Variable id={} (name={:?}) when threading to block {:?} on graph {:?} \
+             — graph corruption: no transitive predecessor chain leads \
+             to a definition site. \
+             Variable appears in framestate of blocks {:?} and in inputargs/operations of blocks {:?}.",
+            pred_block,
+            var.id(),
+            name,
+            target,
+            self.name,
+            framestate_blocks,
+            def_blocks,
+        );
     }
 
     /// Fallible twin of [`Self::ensure_variable_at_block`].
     ///
     /// Returns false when no predecessor chain reaches a real definition,
     /// including a cycle that only mentions itself. A block already on the
-    /// stack is a back edge, not a definition: the commit pushes the
-    /// inputarg before recursing, matching `ensure_variable_at_block`.
+    /// stack is a back edge, not a definition: the commit records the
+    /// `Variable.copy()` inputarg before recursing, matching
+    /// `ensure_variable_at_block`.
     pub fn try_ensure_variable_at_block(
         &mut self,
         block: BlockId,
         var: &crate::flowspace::model::Variable,
     ) -> bool {
+        self.try_ensure_variable_at_block_local(block, var)
+            .is_some()
+    }
+
+    /// Like [`Self::try_ensure_variable_at_block`], returning the Variable
+    /// defined at `block` for this value (`var` itself, or the SSI copy).
+    pub(crate) fn try_ensure_variable_at_block_local(
+        &mut self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<crate::flowspace::model::Variable> {
         let mut saw_def = false;
         if !self.can_thread_variable(block, var, &mut HashSet::new(), &mut saw_def) || !saw_def {
-            return false;
+            return None;
         }
-        self.ensure_variable_at_block(block, var)
+        self.ensure_variable_at_block_local(block, var)
     }
 
     /// Carry `var` into every block whose `FieldRead` names it before that
@@ -9050,9 +9370,10 @@ impl FunctionGraph {
             *saw_def = true;
             return true;
         }
-        // A block already on the stack will receive `var` as an inputarg
-        // if this walk commits (`ensure_variable_at_block` pushes before
-        // recursing). That back edge is not itself a definition.
+        // A block already on the stack will receive a `Variable.copy()`
+        // inputarg if this walk commits (`ensure_variable_at_block`
+        // records the copy before recursing). That back edge is not
+        // itself a definition.
         if !visiting.insert(block.0) {
             return true;
         }
@@ -15590,6 +15911,39 @@ mod tests {
         graph.set_goto_from_framestate(pred, target, &pred_state, &target_state);
     }
 
+    fn defined_variables(
+        graph: &FunctionGraph,
+        block: BlockId,
+    ) -> Vec<crate::flowspace::model::Variable> {
+        let b = graph.block(block);
+        let mut vars = b.inputargs.clone();
+        for op in &b.operations {
+            if let Some(result) = &op.result {
+                vars.push(result.clone());
+            }
+        }
+        vars
+    }
+
+    /// `checkgraph` `definevar` — a Variable is created in at most one block.
+    fn assert_unique_variable_definitions(graph: &FunctionGraph) {
+        use std::collections::HashMap;
+        let mut seen: HashMap<u64, BlockId> = HashMap::new();
+        for block in &graph.blocks {
+            for var in defined_variables(graph, block.id) {
+                if let Some(prev) = seen.insert(var.id(), block.id) {
+                    panic!(
+                        "variable id={} defined in {:?} and {:?} on graph {:?}",
+                        var.id(),
+                        prev,
+                        block.id,
+                        graph.name
+                    );
+                }
+            }
+        }
+    }
+
     /// `ensure_variable_at_block` short-circuits when the Variable is
     /// already in `block.inputargs` — no graph mutation, returns true.
     #[test]
@@ -15659,10 +16013,9 @@ mod tests {
     }
 
     /// `ensure_variable_at_block` threads a Variable defined in a
-    /// predecessor through one intermediate block: appends to the
-    /// predecessor's exit args + adds to the block's inputargs.
-    /// Mirrors the carry-through case in `flowspace/flowcontext.py
-    /// setstate(block.framestate)` at block entry.
+    /// predecessor through one intermediate block: mints a
+    /// `Variable.copy()` inputarg, binds it via `Link.args`, and
+    /// renames uses inside the target (`ssa.py` `SSA_to_SSI`).
     #[test]
     fn ensure_variable_at_block_threads_one_level_through_predecessor() {
         use crate::flowspace::model::Variable;
@@ -15684,15 +16037,28 @@ mod tests {
         // predicate matches.
         graph.block_mut(pred).operations[0].result = Some(v.clone());
         graph.set_goto(pred, target, vec![]);
+        graph.block_mut(target).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: v.clone(),
+                result_ty: ValueType::Unknown,
+            },
+        });
 
         let ok = graph.ensure_variable_at_block(target, &v);
         assert!(ok, "predecessor defines v => threading succeeds");
         assert_eq!(
             graph.block(target).inputargs.len(),
             1,
-            "target gains v as inputarg",
+            "target gains a copy as inputarg",
         );
-        assert!(graph.block(target).inputargs.contains(&v));
+        let local = graph.block(target).inputargs[0].clone();
+        assert_ne!(local.id(), v.id(), "target inputarg is Variable.copy()");
+        assert!(
+            !graph.block(target).inputargs.contains(&v),
+            "producer identity is not a second definition",
+        );
         assert_eq!(
             graph.block(pred).exits[0].args.len(),
             1,
@@ -15700,7 +16066,24 @@ mod tests {
         );
         assert!(
             matches!(&graph.block(pred).exits[0].args[0], LinkArg::Value(var) if var.id() == v.id()),
-            "pred exit args carry the same Variable identity",
+            "pred exit args carry the producer",
+        );
+        match &graph.block(target).operations[0].kind {
+            OpKind::UnaryOp { operand, .. } => {
+                assert_eq!(
+                    operand.id(),
+                    local.id(),
+                    "uses inside the target are renamed"
+                );
+            }
+            other => panic!("expected UnaryOp, got {other:?}"),
+        }
+        assert_unique_variable_definitions(&graph);
+        assert!(graph.ensure_variable_at_block(target, &v), "idempotent");
+        assert_eq!(
+            graph.block(target).inputargs.len(),
+            1,
+            "second call mints no extra copy"
         );
     }
 
@@ -15730,24 +16113,22 @@ mod tests {
 
         let ok = graph.ensure_variable_at_block(leaf, &v);
         assert!(ok, "two-level chain threading succeeds");
+        assert_eq!(graph.block(leaf).inputargs.len(), 1);
+        assert_eq!(graph.block(mid).inputargs.len(), 1);
+        let leaf_local = graph.block(leaf).inputargs[0].clone();
+        let mid_local = graph.block(mid).inputargs[0].clone();
+        assert_ne!(leaf_local.id(), v.id());
+        assert_ne!(mid_local.id(), v.id());
+        assert_ne!(leaf_local.id(), mid_local.id());
         assert!(
-            graph.block(leaf).inputargs.contains(&v),
-            "leaf gains v inputarg",
+            matches!(&graph.block(root).exits[0].args[0], LinkArg::Value(var) if var.id() == v.id()),
+            "root → mid carries the producer",
         );
         assert!(
-            graph.block(mid).inputargs.contains(&v),
-            "mid gains v inputarg",
+            matches!(&graph.block(mid).exits[0].args[0], LinkArg::Value(var) if var.id() == mid_local.id()),
+            "mid → leaf carries mid's copy",
         );
-        assert_eq!(
-            graph.block(root).exits[0].args.len(),
-            1,
-            "root exit args grow",
-        );
-        assert_eq!(
-            graph.block(mid).exits[0].args.len(),
-            1,
-            "mid exit args grow",
-        );
+        assert_unique_variable_definitions(&graph);
     }
 
     /// Cycle-safe: a back-edge predecessor finds the in-progress
@@ -15777,29 +16158,414 @@ mod tests {
 
         let ok = graph.ensure_variable_at_block(header, &v);
         assert!(ok, "back-edge cycle is handled");
-        assert!(
-            graph.block(header).inputargs.contains(&v),
-            "header inputarg seeded",
+        assert_eq!(
+            graph.block(header).inputargs.len(),
+            1,
+            "header inputarg seeded"
         );
-        assert!(
-            graph.block(body_tail).inputargs.contains(&v),
+        assert_eq!(
+            graph.block(body_tail).inputargs.len(),
+            1,
             "body_tail inputarg also seeded — back-edge predecessor demanded v",
         );
+        let header_local = graph.block(header).inputargs[0].clone();
+        let tail_local = graph.block(body_tail).inputargs[0].clone();
+        assert_ne!(header_local.id(), v.id());
+        assert_ne!(tail_local.id(), v.id());
+        assert_ne!(header_local.id(), tail_local.id());
         assert_eq!(
             graph.block(entry).exits[0].args.len(),
             1,
             "entry → header link args extended",
+        );
+        assert!(
+            matches!(&graph.block(entry).exits[0].args[0], LinkArg::Value(var) if var.id() == v.id()),
+            "entry → header carries the producer",
         );
         assert_eq!(
             graph.block(body_tail).exits[0].args.len(),
             1,
             "body_tail → header link args extended",
         );
+        assert!(
+            matches!(&graph.block(body_tail).exits[0].args[0], LinkArg::Value(var) if var.id() == tail_local.id()),
+            "back-edge carries body_tail's copy",
+        );
         assert_eq!(
             graph.block(header).exits[0].args.len(),
             1,
             "header → body_tail link args extended (body_tail demands v)",
         );
+        assert_unique_variable_definitions(&graph);
+    }
+
+    /// `ssa.py` `SSA_to_SSI` `record_used_var(block.exitswitch)`: a
+    /// switch that names a dominating Variable is a use. Threading
+    /// mints a `Variable.copy()` and `Block.renamevariables` rewrites
+    /// the exitswitch to that local.
+    #[test]
+    fn thread_undefined_op_operand_renames_exitswitch_use() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("thread_exitswitch");
+        let root = graph.create_block();
+        let switch_block = graph.create_block();
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        let v = Variable::named("func_1");
+        graph.block_mut(root).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::Input {
+                name: "func_1".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        graph.set_goto(root, switch_block, vec![]);
+        graph.block_mut(switch_block).exitswitch = Some(ExitSwitch::Value(v.clone()));
+        graph.recloseblock(
+            switch_block,
+            vec![
+                Link::from_variables(&graph, vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::from_variables(&graph, vec![], if_true, Some(ExitCase::Bool(true))),
+            ],
+        );
+
+        thread_undefined_op_operands(&mut graph);
+
+        let local = graph.block(switch_block).inputargs[0].clone();
+        assert_ne!(local.id(), v.id(), "switch inputarg is Variable.copy()");
+        match &graph.block(switch_block).exitswitch {
+            Some(ExitSwitch::Value(sw)) => {
+                assert_eq!(
+                    sw.id(),
+                    local.id(),
+                    "exitswitch use is renamed to the switch copy"
+                );
+                assert!(
+                    graph.variable_defined_in_block(switch_block, sw),
+                    "exitswitch is a definition of this block"
+                );
+            }
+            other => panic!("expected Value exitswitch, got {other:?}"),
+        }
+        assert!(
+            matches!(&graph.block(root).exits[0].args[0], LinkArg::Value(var) if var.id() == v.id()),
+            "root → switch carries the producer"
+        );
+        assert_unique_variable_definitions(&graph);
+    }
+
+    /// `ssa.py` `SSA_to_SSI`: a created family member `w` is reused
+    /// with `block.renamevariables({v: w})`. An inputarg already
+    /// receiving `v` does not leave `exitswitch` naming `v`.
+    #[test]
+    fn thread_undefined_renames_exitswitch_to_existing_family_member() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("thread_exitswitch_family");
+        let root = graph.create_block();
+        let (switch_block, switch_args) = graph.create_block_with_arg_vars(1);
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        let v = Variable::named("func_1");
+        let w = switch_args[0].clone();
+        graph.block_mut(root).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::Input {
+                name: "func_1".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        graph.set_goto(root, switch_block, vec![v.clone()]);
+        graph.block_mut(switch_block).exitswitch = Some(ExitSwitch::Value(v.clone()));
+        graph.recloseblock(
+            switch_block,
+            vec![
+                Link::from_variables(&graph, vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::from_variables(&graph, vec![], if_true, Some(ExitCase::Bool(true))),
+            ],
+        );
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert_eq!(
+            graph.block(switch_block).inputargs.as_slice(),
+            std::slice::from_ref(&w),
+            "family member is reused, no second copy"
+        );
+        match &graph.block(switch_block).exitswitch {
+            Some(ExitSwitch::Value(sw)) => {
+                assert_eq!(
+                    sw.id(),
+                    w.id(),
+                    "exitswitch is renamed to the existing family member"
+                );
+            }
+            other => panic!("expected Value exitswitch, got {other:?}"),
+        }
+        assert_unique_variable_definitions(&graph);
+    }
+
+    /// `ssa.py` `SSA_to_SSI` reuses a family member even when a second
+    /// predecessor does not define the producer identity. Exact-identity
+    /// `available_on_every_predecessor_path` would skip the rename and
+    /// leave `exitswitch` naming `v`.
+    #[test]
+    fn thread_undefined_renames_exitswitch_with_extra_predecessor() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("thread_exitswitch_extra_pred");
+        let root = graph.create_block();
+        let orphan = graph.create_block();
+        let (switch_block, switch_args) = graph.create_block_with_arg_vars(1);
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        let v = Variable::named("func_1");
+        let dummy = Variable::named("dummy");
+        let w = switch_args[0].clone();
+        graph.block_mut(root).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::Input {
+                name: "func_1".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        graph.block_mut(orphan).operations.push(SpaceOperation {
+            result: Some(dummy.clone()),
+            kind: OpKind::Input {
+                name: "dummy".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        graph.set_goto(root, switch_block, vec![v.clone()]);
+        graph.set_goto(orphan, switch_block, vec![dummy]);
+        graph.block_mut(switch_block).exitswitch = Some(ExitSwitch::Value(v.clone()));
+        graph.recloseblock(
+            switch_block,
+            vec![
+                Link::from_variables(&graph, vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::from_variables(&graph, vec![], if_true, Some(ExitCase::Bool(true))),
+            ],
+        );
+
+        thread_undefined_op_operands(&mut graph);
+
+        match &graph.block(switch_block).exitswitch {
+            Some(ExitSwitch::Value(sw)) => {
+                assert_eq!(
+                    sw.id(),
+                    w.id(),
+                    "exitswitch is renamed to the family member despite an extra predecessor"
+                );
+            }
+            other => panic!("expected Value exitswitch, got {other:?}"),
+        }
+        assert!(
+            graph.variable_defined_in_block(switch_block, &w),
+            "family member remains the switch block's definition"
+        );
+        prune_dead_phis(&mut graph);
+        match &graph.block(switch_block).exitswitch {
+            Some(ExitSwitch::Value(sw)) => {
+                assert_eq!(
+                    sw.id(),
+                    w.id(),
+                    "prune keeps the renamed exitswitch inputarg"
+                );
+                assert!(
+                    graph.block(switch_block).inputargs.contains(sw),
+                    "exitswitch use pins the family member through prune"
+                );
+            }
+            other => panic!("expected Value exitswitch after prune, got {other:?}"),
+        }
+    }
+
+    /// `SSA_to_SSI` records `link.args` uses. A pass-through that only
+    /// names the value on the jump still gets a `Variable.copy()`
+    /// inputarg so the jump operand is defined in that block.
+    /// Leaf already takes `v` as an inputarg (`len(link.args) ==
+    /// len(target.inputargs)`); ops there do not force a second mint.
+    #[test]
+    fn thread_undefined_op_operand_threads_a_jump_only_use() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("thread_jump_only");
+        let root = graph.create_block();
+        let mid = graph.create_block();
+        let leaf = graph.create_block();
+        let v = Variable::named("strategy_");
+        graph.block_mut(root).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::Input {
+                name: "strategy_".to_string(),
+                ty: ValueType::Ref(Some("object".into())),
+                class_root: None,
+            },
+        });
+        graph.set_goto(root, mid, vec![]);
+        graph.block_mut(leaf).inputargs.push(v.clone());
+        graph.set_goto(mid, leaf, vec![v.clone()]);
+        graph.block_mut(leaf).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: v.clone(),
+                result_ty: ValueType::Ref(Some("object".into())),
+            },
+        });
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert_eq!(graph.block(mid).inputargs.len(), 1);
+        let mid_local = graph.block(mid).inputargs[0].clone();
+        assert_ne!(mid_local.id(), v.id());
+        assert!(
+            matches!(&graph.block(mid).exits[0].args[0], LinkArg::Value(var) if var.id() == mid_local.id()),
+            "pass-through jump carries the mid copy"
+        );
+        assert_eq!(
+            graph.block(leaf).inputargs.as_slice(),
+            std::slice::from_ref(&v)
+        );
+        match &graph.block(leaf).operations[0].kind {
+            OpKind::UnaryOp { operand, .. } => {
+                assert_eq!(operand.id(), v.id());
+            }
+            other => panic!("expected UnaryOp, got {other:?}"),
+        }
+        assert_eq!(
+            graph.block(root).exits[0].args.len(),
+            graph.block(mid).inputargs.len()
+        );
+        assert_eq!(
+            graph.block(mid).exits[0].args.len(),
+            graph.block(leaf).inputargs.len()
+        );
+        assert!(graph.variable_defined_in_block(mid, &mid_local));
+    }
+
+    /// Incoming links that lost the extra SSI slot (a `recloseblock`
+    /// replacing the exit) are padded on the next ensure so
+    /// `len(link.args) == len(target.inputargs)`.
+    #[test]
+    fn ensure_variable_at_block_pads_short_incoming_link() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ensure_pad_short_link");
+        let pred = graph.create_block();
+        let target = graph.create_block();
+        let v = Variable::named("strategy_");
+        graph.block_mut(pred).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::Input {
+                name: "strategy_".into(),
+                ty: ValueType::Ref(Some("object".into())),
+                class_root: None,
+            },
+        });
+        graph.set_goto(pred, target, vec![]);
+        graph.block_mut(target).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: v.clone(),
+                result_ty: ValueType::Ref(Some("object".into())),
+            },
+        });
+
+        assert!(graph.ensure_variable_at_block(target, &v));
+        assert_eq!(graph.block(pred).exits[0].args.len(), 1);
+        graph.block_mut(pred).exits[0].args.clear();
+        assert!(graph.ensure_variable_at_block(target, &v));
+        assert_eq!(
+            graph.block(pred).exits[0].args.len(),
+            graph.block(target).inputargs.len(),
+            "short incoming link is padded to the target inputarg count"
+        );
+        match &graph.block(target).operations[0].kind {
+            OpKind::UnaryOp { operand, .. } => {
+                assert!(
+                    graph.variable_defined_in_block(target, operand),
+                    "renamed use stays a definition of this block"
+                );
+            }
+            other => panic!("expected UnaryOp, got {other:?}"),
+        }
+        assert_unique_variable_definitions(&graph);
+    }
+
+    /// One predecessor `recloseblock` drops the extra SSI slot; a sibling
+    /// still carries it. `thread_undefined_op_operands` pads from that
+    /// sibling so `join_blocks` zip cannot drop the copy.
+    #[test]
+    fn thread_undefined_repairs_a_short_sibling_incoming_link() {
+        let mut graph = FunctionGraph::new("repair_short_sibling");
+        let entry = graph.startblock;
+        let left = graph.create_block();
+        let right = graph.create_block();
+        let target = graph.create_block();
+        let v = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "func_1".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, left, vec![], right, vec![]);
+        graph.set_goto(left, target, vec![]);
+        graph.set_goto(right, target, vec![]);
+        graph.block_mut(target).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: v.clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+
+        assert!(graph.ensure_variable_at_block(target, &v));
+        let want = graph.block(target).inputargs.len();
+        assert_eq!(graph.block(left).exits[0].args.len(), want);
+        assert_eq!(graph.block(right).exits[0].args.len(), want);
+        graph.block_mut(right).exits[0].args.pop();
+        assert!(graph.block(right).exits[0].args.len() < want);
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert_eq!(
+            graph.block(right).exits[0].args.len(),
+            graph.block(target).inputargs.len(),
+            "short sibling is padded from the full incoming link"
+        );
+        assert_eq!(
+            graph.block(left).exits[0].args.len(),
+            graph.block(target).inputargs.len()
+        );
+        match &graph.block(target).operations[0].kind {
+            OpKind::UnaryOp { operand, .. } => {
+                assert!(
+                    graph.variable_defined_in_block(target, operand),
+                    "target use stays a definition of this block"
+                );
+            }
+            other => panic!("expected UnaryOp, got {other:?}"),
+        }
+        assert_unique_variable_definitions(&graph);
     }
 
     #[test]
@@ -15869,16 +16635,40 @@ mod tests {
         thread_undefined_op_operands(&mut graph);
 
         for block in [left, right, join] {
-            assert!(
-                graph.block(block).inputargs.contains(&value),
+            assert_eq!(
+                graph.block(block).inputargs.len(),
+                1,
                 "dominating value is threaded through {block:?}",
             );
+            assert_ne!(
+                graph.block(block).inputargs[0].id(),
+                value.id(),
+                "threaded inputarg is Variable.copy() at {block:?}",
+            );
         }
+        assert_ne!(
+            graph.block(left).inputargs[0].id(),
+            graph.block(right).inputargs[0].id(),
+        );
         assert!(graph.block(entry).exits.iter().all(|link| {
             link.args
                 .iter()
                 .any(|arg| matches!(arg, LinkArg::Value(v) if v == &value))
         }));
+        match &graph.block(join).operations.last().unwrap().kind {
+            OpKind::FieldWrite {
+                value: LinkArg::Value(operand),
+                ..
+            } => {
+                assert_eq!(
+                    operand.id(),
+                    graph.block(join).inputargs[0].id(),
+                    "join use is renamed to the join copy"
+                );
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_unique_variable_definitions(&graph);
     }
 
     #[test]

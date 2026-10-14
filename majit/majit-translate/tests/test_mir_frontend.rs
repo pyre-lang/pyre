@@ -1977,8 +1977,9 @@ fn a_borrowed_primitive_banks_by_its_container() {
     );
 }
 
-/// `stored` is `new_arg`, or a block input that a link feeds with `new_arg`
-/// (one hop is what the slice replace splits into).
+/// `stored` is `new_arg`, or an SSI copy a later block binds through
+/// `Link.args` (`ssa.py` `SSA_to_SSI`, `Variable.copy`). Slice replace
+/// splits across several blocks; each target mints its own copy.
 fn operand_is_new_argument(
     graph: &majit_translate::model::FunctionGraph,
     new_arg: &majit_translate::flowspace::model::Variable,
@@ -1987,15 +1988,27 @@ fn operand_is_new_argument(
     if stored == new_arg {
         return true;
     }
-    graph.blocks.iter().any(|block| {
-        block.exits.iter().any(|link| {
-            let target = graph.block(link.target);
-            link.args
-                .iter()
-                .zip(target.inputargs.iter())
-                .any(|(arg, input)| arg.as_variable() == Some(new_arg) && input == stored)
-        })
-    })
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![new_arg.clone()];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur.id()) {
+            continue;
+        }
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let target = graph.block(link.target);
+                for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    if arg.as_variable() == Some(&cur) {
+                        if input == stored {
+                            return true;
+                        }
+                        stack.push(input.clone());
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// `mem::replace(&mut place, new)` is a read of `place` then a store of `new`.

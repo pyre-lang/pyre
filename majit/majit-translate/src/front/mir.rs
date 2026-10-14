@@ -5840,6 +5840,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // reject the graph on an undefined `Link.args` operand — the same
         // post-collapse cleanup the panic-message phase below performs.
         if fmt_collapsed > 0 {
+            // `rewrite_debug_enum_fmt_site` installs a new exitswitch use.
+            // Thread it onto the block local before prune drops an unused
+            // family member (`ssa.py` `SSA_to_SSI` `record_used_var`).
+            crate::model::thread_undefined_op_operands(&mut lo.graph);
             crate::model::clear_unreachable_blocks(&mut lo.graph);
             crate::model::prune_dead_phis(&mut lo.graph);
         }
@@ -6250,6 +6254,13 @@ fn simplify_lowered_graph_expanding(
     // into a successor that never reads it, and nothing else in this
     // sequence reports a removal for that graph.
     if sweep_dead_vars || dirty {
+        // `ssa.py` `SSA_to_SSI` `record_used_var(block.exitswitch)` /
+        // `block.renamevariables({v: w})` rewrites the use onto the
+        // family member before `transform_dead_op_vars` runs. An
+        // exitswitch that still names the producer while a copy sits
+        // in `inputargs` looks unused to prune and is dropped; the
+        // later thread then sees no family member.
+        crate::model::thread_undefined_op_operands(graph);
         crate::model::prune_dead_phis(graph);
     }
     // Collapse again, now that every dead-code sweep above has run.
@@ -73719,9 +73730,12 @@ fn rewrite_debug_enum_fmt_site(graph: &mut FunctionGraph, site: &DebugEnumFmtCol
     {
         return false;
     }
-    if !graph.ensure_variable_at_block(bf, &site.enum_value) {
+    // `ssa.py` `SSA_to_SSI` `record_used_var(block.exitswitch)`: the
+    // switch is a use in `bf`, so it must name this block's local
+    // (`Variable.copy` / `Block.renamevariables`), not the producer.
+    let Some(disc) = graph.ensure_variable_at_block_local(bf, &site.enum_value) else {
         return false;
-    }
+    };
 
     // `carried` = the distinct live Values the saved exit forwards other
     // than the format result; each threads through every arm to reach the
@@ -73743,7 +73757,6 @@ fn rewrite_debug_enum_fmt_site(graph: &mut FunctionGraph, site: &DebugEnumFmtCol
     // IS the discriminant — switch on it directly, no `__discriminant`
     // field read (a getfield off an integer base has no blackhole handler).
     graph.blocks[bf_idx].operations.remove(fi);
-    let disc = site.enum_value.clone();
 
     // One arm per variant: emit the constant message and forward it to the
     // continuation through the format-result slot, threading `carried`.
@@ -79189,6 +79202,87 @@ mod tests {
         for l in arm_exits {
             assert_eq!(l.args.len(), 2, "continuation arity preserved");
             assert!(matches!(l.args[0], LinkArg::Value(_)));
+        }
+    }
+
+    /// `ssa.py` `SSA_to_SSI` `record_used_var(block.exitswitch)`: when the
+    /// enum value is defined in a predecessor, the switch block's
+    /// exitswitch names that block's `Variable.copy()` local, not the
+    /// producer identity (`Block.renamevariables`).
+    #[test]
+    fn rewrite_debug_enum_fmt_site_renames_exitswitch_to_block_local() {
+        use super::{DebugEnumFmtCollapse, rewrite_debug_enum_fmt_site};
+        use crate::model::{CallTarget, ExitSwitch, FunctionGraph, Link, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("debug_enum_fmt_exitswitch_local");
+        let root = graph.startblock;
+        let func = graph.push_op_var(root, OpKind::ConstInt(0), true).unwrap();
+        let bf = graph.create_block();
+        graph.set_goto(root, bf, vec![]);
+
+        let fmt_args = graph
+            .push_op_var(
+                bf,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Arguments"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let formatted = graph
+            .push_op_var(
+                bf,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["alloc", "fmt", "format"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![fmt_args]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let carried = graph.push_op_var(bf, OpKind::ConstInt(7), true).unwrap();
+        let (bcont, cont_args) = graph.create_block_with_arg_vars(2);
+        graph.set_return(bcont, Some(cont_args[0].clone()));
+        graph.block_mut(bf).exits = vec![
+            Link::from_variables(&graph, vec![formatted.clone(), carried], bcont, None)
+                .with_prevblock(bf),
+        ];
+
+        let site = DebugEnumFmtCollapse {
+            format_result: formatted,
+            enum_value: func.clone(),
+            pieces: vec![
+                "intrinsic function ".to_string(),
+                " not implemented".to_string(),
+            ],
+            by_discr: vec![(0, "Invalid".to_string()), (1, "Print".to_string())],
+            link_rewrites: Vec::new(),
+            dead_results: Vec::new(),
+            dead_bases: Vec::new(),
+        };
+        assert!(rewrite_debug_enum_fmt_site(&mut graph, &site));
+
+        match &graph.block(bf).exitswitch {
+            Some(ExitSwitch::Value(sw)) => {
+                assert_ne!(
+                    sw.id(),
+                    func.id(),
+                    "exitswitch must not keep the producer identity"
+                );
+                assert!(
+                    graph.variable_defined_in_block(bf, sw),
+                    "exitswitch use must be defined in the switch block"
+                );
+            }
+            other => panic!("expected Value exitswitch, got {other:?}"),
         }
     }
 
