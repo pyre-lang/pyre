@@ -754,7 +754,7 @@ pub fn __majit_wrap_struct_pack(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             let fmt = unsafe { w_str_get_wtf8(format) };
             if let Some((4, true, false)) = simple_int_format!(fmt) {
                 let v = unsafe { w_int_get_value(value) };
-                if (-2147483648..=2147483647).contains(&v) {
+                if v >= -2147483648 && v <= 2147483647 {
                     let b0 = v as u8;
                     let b1 = (v >> 8) as u8;
                     let b2 = (v >> 16) as u8;

@@ -54,7 +54,7 @@ fn legacy_feature_version_error(
 ) -> Option<(&'static str, ruff_text_size::TextRange)> {
     use ast::visitor::Visitor;
 
-    if !(0..6).contains(&feature_version) {
+    if feature_version < 0 || feature_version >= 6 {
         return None;
     }
 

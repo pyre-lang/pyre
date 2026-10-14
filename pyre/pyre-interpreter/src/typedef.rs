@@ -24325,7 +24325,7 @@ pub fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef, crate
     // specialization uses.
     const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
     const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
-    if (SIGNED_MIN_AS_FLOAT..SIGNED_LIMIT_AS_FLOAT).contains(&reduced) {
+    if reduced >= SIGNED_MIN_AS_FLOAT && reduced < SIGNED_LIMIT_AS_FLOAT {
         return Ok(pyre_object::w_int_new(reduced as i64));
     }
     use num_traits::FromPrimitive;
