@@ -54,9 +54,6 @@ rustpython-wtf8 = { workspace = true }
 [target.'cfg(any(unix, windows))'.dependencies]
 rustpython-host_env = { workspace = true, optional = true, features = ["ctypes"] }
 
-[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"), not(any(target_env = "musl", target_env = "sgx"))))'.dependencies]
-libffi = { version = "5", features = ["system"] }
-
 [target.'cfg(windows)'.dependencies]
 # `faulthandler`'s vectored exception handler returns
 # `EXCEPTION_CONTINUE_SEARCH`. Same 0.61 line as pyre-interpreter so

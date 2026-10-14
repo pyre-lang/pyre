@@ -87,14 +87,6 @@ getrandom = { workspace = true }
 indexmap = { workspace = true }
 paste = { workspace = true }
 parking_lot = { workspace = true }
-# `_cffi_backend` owns the `ffi_cif` for a function type and reuses it across
-# every call to that function (`pypy/module/_cffi_backend/ctypefunc.py`'s
-# `cif_descr`), which the host_env ctypes door cannot express -- it builds a
-# `Cif` per call.  Same target predicate and same feature as host_env's own
-# declaration, so both resolve to one package instance.
-[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"), not(any(target_env = "musl", target_env = "sgx"))))'.dependencies]
-libffi = { version = "5", features = ["system"] }
-
 [target.'cfg(windows)'.dependencies]
 # Remaining Windows FFI host_env does not wrap 1:1 (WinSock types).
 # `not(host_env)` SEH still reads Foundation exception codes.

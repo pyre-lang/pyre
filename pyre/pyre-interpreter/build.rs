@@ -11,27 +11,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let target = std::env::var("TARGET").unwrap_or_default();
 
-    // `ctypefunc` names `ffi_type_longdouble`, which libffi defines only where
-    // its configure saw `sizeof(long double) != sizeof(double)`.  A build with
-    // that off -- Apple's system libffi on aarch64, for one -- neither defines
-    // the symbol nor needs it, because `long double` *is* `double` there.  Ask
-    // the target's own compiler the same question libffi's configure asked.
-    println!("cargo:rustc-check-cfg=cfg(pyre_ffi_type_longdouble)");
-    if matches!(
-        std::env::var("CARGO_CFG_TARGET_OS")
-            .unwrap_or_default()
-            .as_str(),
-        "linux" | "macos" | "windows" | "android"
-    ) && !matches!(
-        std::env::var("CARGO_CFG_TARGET_ENV")
-            .unwrap_or_default()
-            .as_str(),
-        "musl" | "sgx"
-    ) && long_double_is_its_own_type()
-    {
-        println!("cargo:rustc-cfg=pyre_ffi_type_longdouble");
-    }
-
     // The variadic C-API entry points cannot have Rust bodies -- no Rust
     // compiler walks a `va_list` -- so they are C translation units compiled
     // into the interpreter, which is what `pypy/module/cpyext/src/` is.  The
@@ -135,28 +114,4 @@ fn crt_assembly_version() -> Option<String> {
         .collect();
     (fields.len() == 4 && fields.iter().all(|field| field.parse::<u32>().is_ok()))
         .then(|| fields.join("."))
-}
-
-/// Whether the target's `long double` is wider than its `double`, which is
-/// what libffi's `HAVE_LONG_DOUBLE` records.  The probe only has to compile:
-/// a static assertion answers without running anything, so it holds when
-/// cross-compiling too.
-fn long_double_is_its_own_type() -> bool {
-    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("longdouble-probe");
-    if std::fs::create_dir_all(&out).is_err() {
-        return false;
-    }
-    let source = out.join("probe.c");
-    let assertion = "_Static_assert(sizeof(long double) != sizeof(double), \"same width\");\n";
-    if std::fs::write(&source, assertion).is_err() {
-        return false;
-    }
-    cc::Build::new()
-        .file(&source)
-        .out_dir(&out)
-        .warnings(false)
-        .cargo_metadata(false)
-        .cargo_warnings(false)
-        .try_compile("pyre_longdouble_probe")
-        .is_ok()
 }

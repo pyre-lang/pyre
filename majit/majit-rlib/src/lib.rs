@@ -18,6 +18,16 @@ extern crate self as majit_rlib;
 pub mod _rsocket_rffi;
 
 pub mod cache;
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ),
+    not(any(target_env = "musl", target_env = "sgx"))
+))]
+pub mod clibffi;
 pub mod debug;
 pub mod jit;
 pub mod lltypesystem;

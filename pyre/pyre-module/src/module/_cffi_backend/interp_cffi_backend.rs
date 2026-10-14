@@ -234,7 +234,7 @@ const MODULE: &str = "_cffi_backend";
     not(any(target_env = "musl", target_env = "sgx"))
 ))]
 pub fn default_abi() -> u32 {
-    libffi::raw::ffi_abi_FFI_DEFAULT_ABI
+    majit_rlib::clibffi::FFI_DEFAULT_ABI
 }
 
 #[cfg(not(all(

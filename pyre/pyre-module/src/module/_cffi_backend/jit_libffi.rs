@@ -45,7 +45,7 @@
 ))]
 mod imp {
     use super::super::misc;
-    use libffi::low::{CodePtr, ffi_abi, ffi_cif, ffi_type};
+    use majit_rlib::clibffi::{self, FFI_ABI, FFI_TYPE_P, FFI_TYPE_PP, ffi_arg, ffi_cif};
 
     /// `jit_libffi.py CIF_DESCRIPTION`.  An array of `nargs` exchange offsets
     /// follows the record; `atypes` and any struct `ffi_type` follow that, all
@@ -53,16 +53,16 @@ mod imp {
     #[repr(C)]
     pub struct CifDescription {
         pub cif: ffi_cif,
-        pub abi: ffi_abi,
+        pub abi: FFI_ABI,
         pub nargs: usize,
-        pub rtype: *mut ffi_type,
-        pub atypes: *mut *mut ffi_type,
+        pub rtype: FFI_TYPE_P,
+        pub atypes: FFI_TYPE_PP,
         pub exchange_size: usize,
         pub exchange_result: usize,
     }
 
     /// `jit_libffi.py SIZE_OF_FFI_ARG`.
-    pub const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<libffi::low::ffi_arg>();
+    pub const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<ffi_arg>();
 
     /// # Safety
     /// `cif` must be a block [`super::super::ctypefunc::build_cif_descr`] built.
@@ -170,42 +170,28 @@ mod imp {
     /// to a less strict kind letter.
     pub mod types {
         use super::kind;
-        use libffi::low::{type_tag, types as ffi_types};
+        use majit_rlib::clibffi::{self, FFI_TYPE_STRUCT};
 
         /// `types.slong` — `cast_type_to_ffitype(rffi.LONG)`.
         fn slong() -> usize {
-            match std::mem::size_of::<std::ffi::c_long>() {
-                8 => &raw mut ffi_types::sint64 as usize,
-                4 => &raw mut ffi_types::sint32 as usize,
-                _ => &raw mut ffi_types::sint16 as usize,
-            }
+            clibffi::_signed_type_for(std::mem::size_of::<std::ffi::c_long>()) as usize
         }
 
         /// `types.ulong` — `cast_type_to_ffitype(rffi.ULONG)`.
         fn ulong() -> usize {
-            match std::mem::size_of::<std::ffi::c_ulong>() {
-                8 => &raw mut ffi_types::uint64 as usize,
-                4 => &raw mut ffi_types::uint32 as usize,
-                _ => &raw mut ffi_types::uint16 as usize,
-            }
+            clibffi::_unsigned_type_for(std::mem::size_of::<std::ffi::c_ulong>()) as usize
         }
 
         /// `types.signed` — `cast_type_to_ffitype(rffi.SIGNED)`.  Win64 is
         /// where this differs from [`slong`]: a machine word is eight bytes
         /// there while a `long` is four.
         fn signed() -> usize {
-            match std::mem::size_of::<isize>() {
-                8 => &raw mut ffi_types::sint64 as usize,
-                _ => &raw mut ffi_types::sint32 as usize,
-            }
+            clibffi::_signed_type_for(std::mem::size_of::<isize>()) as usize
         }
 
         /// `types.unsigned` — `cast_type_to_ffitype(rffi.UNSIGNED)`.
         fn unsigned() -> usize {
-            match std::mem::size_of::<usize>() {
-                8 => &raw mut ffi_types::uint64 as usize,
-                _ => &raw mut ffi_types::uint32 as usize,
-            }
+            clibffi::_unsigned_type_for(std::mem::size_of::<usize>()) as usize
         }
 
         /// `types.getkind(ffi_type)`.
@@ -223,16 +209,34 @@ mod imp {
             if ffi_type == 0 {
                 return kind::OTHER;
             }
-            if ffi_type == &raw mut ffi_types::void as usize {
+            if ffi_type == clibffi::ffi_type_void() as usize {
                 return kind::VOID;
             }
-            if ffi_type == &raw mut ffi_types::double as usize {
+            if ffi_type == clibffi::ffi_type_double() as usize {
                 return kind::FLOAT;
             }
-            if ffi_type == &raw mut ffi_types::float as usize {
+            if ffi_type == clibffi::ffi_type_float() as usize {
                 return kind::SINGLEFLOAT;
             }
-            if ffi_type == &raw mut ffi_types::pointer as usize {
+            if ffi_type == clibffi::ffi_type_pointer() as usize {
+                return kind::UNSIGNED;
+            }
+            if ffi_type == clibffi::ffi_type_schar() as usize {
+                return kind::SIGNED;
+            }
+            if ffi_type == clibffi::ffi_type_uchar() as usize {
+                return kind::UNSIGNED;
+            }
+            if ffi_type == clibffi::ffi_type_sshort() as usize {
+                return kind::SIGNED;
+            }
+            if ffi_type == clibffi::ffi_type_ushort() as usize {
+                return kind::UNSIGNED;
+            }
+            if ffi_type == clibffi::ffi_type_sint() as usize {
+                return kind::SIGNED;
+            }
+            if ffi_type == clibffi::ffi_type_uint() as usize {
                 return kind::UNSIGNED;
             }
             if ffi_type == slong() || ffi_type == signed() {
@@ -241,20 +245,20 @@ mod imp {
             if ffi_type == ulong() || ffi_type == unsigned() {
                 return kind::UNSIGNED;
             }
-            if ffi_type == &raw mut ffi_types::sint8 as usize
-                || ffi_type == &raw mut ffi_types::sint16 as usize
-                || ffi_type == &raw mut ffi_types::sint32 as usize
+            if ffi_type == clibffi::ffi_type_sint8() as usize
+                || ffi_type == clibffi::ffi_type_sint16() as usize
+                || ffi_type == clibffi::ffi_type_sint32() as usize
             {
                 return kind::SIGNED;
             }
-            if ffi_type == &raw mut ffi_types::uint8 as usize
-                || ffi_type == &raw mut ffi_types::uint16 as usize
-                || ffi_type == &raw mut ffi_types::uint32 as usize
+            if ffi_type == clibffi::ffi_type_uint8() as usize
+                || ffi_type == clibffi::ffi_type_uint16() as usize
+                || ffi_type == clibffi::ffi_type_uint32() as usize
             {
                 return kind::UNSIGNED;
             }
-            if ffi_type == &raw mut ffi_types::sint64 as usize
-                || ffi_type == &raw mut ffi_types::uint64 as usize
+            if ffi_type == clibffi::ffi_type_sint64() as usize
+                || ffi_type == clibffi::ffi_type_uint64() as usize
             {
                 return kind::LONGLONG;
             }
@@ -270,7 +274,7 @@ mod imp {
         /// `ffi_type` must be an `ffi_type` record.
         #[majit_macros::elidable_cannot_raise]
         pub unsafe fn getsize(ffi_type: usize) -> usize {
-            unsafe { (*(ffi_type as *const libffi::low::ffi_type)).size }
+            unsafe { (*(ffi_type as clibffi::FFI_TYPE_P)).size }
         }
 
         /// `types.is_struct(ffi_type)`.
@@ -279,7 +283,7 @@ mod imp {
         /// `ffi_type` must be an `ffi_type` record.
         #[majit_macros::elidable_cannot_raise]
         pub unsafe fn is_struct(ffi_type: usize) -> bool {
-            unsafe { (*(ffi_type as *const libffi::low::ffi_type)).type_ == type_tag::STRUCT }
+            unsafe { (*(ffi_type as clibffi::FFI_TYPE_P)).type_ == FFI_TYPE_STRUCT }
         }
     }
 
@@ -457,23 +461,17 @@ mod imp {
         let resultdata = (exchange_buffer + unsafe { exchange_result(cif_description) })
             as *mut std::ffi::c_void;
         let descr = unsafe { header(cif_description) };
-        // `clibffi.py c_ffi_call` is an external declared
-        // `save_err=RFFI_ERR_ALL | RFFI_ALT_ERRNO`; its wrapper runs
-        // `_errno_before` / `_errno_after` around the raw call. A trace
-        // records `CALL_RELEASE_GIL` with the same flags instead
+        // `clibffi.py c_ffi_call` (`save_err=RFFI_ERR_ALL | RFFI_ALT_ERRNO`).
+        // A trace records `CALL_RELEASE_GIL` with the same flags
         // (`pyjitpl.py direct_libffi_call`) and the backend does the swap.
-        const SAVE_ERR: i64 =
-            majit_jitcode::rffi::RFFI_ERR_ALL | majit_jitcode::rffi::RFFI_ALT_ERRNO;
-        majit_rlib::rposix::_errno_before(SAVE_ERR);
         unsafe {
-            libffi::low::call_return_into(
+            clibffi::c_ffi_call(
                 &raw mut descr.cif,
-                CodePtr::from_ptr(func_addr as *mut std::ffi::c_void),
-                buffer_array,
+                func_addr as majit_rlib::rffi::VOIDP,
                 resultdata,
+                buffer_array,
             );
         }
-        majit_rlib::rposix::_errno_after(SAVE_ERR);
     }
 }
 
