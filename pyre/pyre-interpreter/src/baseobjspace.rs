@@ -6264,10 +6264,15 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
         {
             return get_and_call_function(method, obj, w_type.as_ptr(), &[]);
         }
-        Err(PyError::type_error(format!(
-            "object of type '{}' has no len()",
-            object_functionstr_type_name(obj),
-        )))
+        // `descroperation._len`: `oefmt(space.w_TypeError,
+        // "object of type '%T' has no len()", w_obj)`.
+        Err(crate::error::oefmt(
+            cached_type_error()
+                .or_else(|| crate::builtins::lookup_exc_class("TypeError"))
+                .unwrap_or(pyre_object::PY_NULL),
+            "object of type '%T' has no len()",
+            &[crate::error::FmtArg::Obj(obj)],
+        ))
     }
 }
 

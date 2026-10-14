@@ -11326,6 +11326,7 @@ static PYERROR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 "w_obj_context",
                 pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
             ),
+            field("w_fmt_x0", pyre_interpreter::error::PYERROR_W_FMT_X0_OFFSET),
             field(
                 "w_class",
                 std::mem::offset_of!(PyErrorObject, ob_header.w_class),

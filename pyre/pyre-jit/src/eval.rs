@@ -4877,6 +4877,7 @@ fn build_gc() -> Box<MiniMarkGC> {
                 pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
                 pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
                 pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
+                pyre_interpreter::error::PYERROR_W_FMT_X0_OFFSET,
             ],
         ));
         debug_assert_eq!(pyerror_tid, pyre_interpreter::error::pyerror_gc_type_id());
