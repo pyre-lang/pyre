@@ -16689,6 +16689,98 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     }
 }
 
+/// `reached_loop_header` drops the prepared SAVE_EXCEPTION box with the
+/// heap cache. A gated arrival (no `loop_header` stamp) is not that
+/// call, so the box stays; a stamped crossing consumes it so a later
+/// `cut_trace_from` cannot name the pre-cut producer.
+#[test]
+fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte, 0x00, // c: jdindex
+        0x01, 0x00, // gi: len=1, [i0 = next_instr]
+        0x01, 0x00, // gr: len=1, [r0 = pycode]
+        0x00, // gf: len=0
+        0x00, // ri: len=0
+        0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
+        0x00, // rf: len=0
+    ];
+    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    tc.seed_compile_and_run_once_merge_point();
+    let saved = tc.save_exception();
+    tc.seed_bridge_exception_resume(saved);
+    let next_instr = tc.const_int(42);
+    let pycode = tc.const_ref(0x1_0000);
+    let red0 = tc.const_ref(0x2_0000);
+    let red1 = tc.const_ref(0x3_0000);
+    let regs_i = vec![next_instr];
+    let regs_r = vec![pycode, red0, red1];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let (gated, _) = step(&code, 0, &mut wc).expect("gated jit_merge_point must dispatch");
+    assert_eq!(gated, DispatchOutcome::Continue);
+    assert!(
+        wc.trace_ctx.bridge_exception_resume_prepared(),
+        "a gated arrival is not reached_loop_header"
+    );
+    assert_eq!(wc.trace_ctx.bridge_saved_exc_op(), Some(saved));
+
+    wc.trace_ctx.seen_loop_header_for_jdindex = 0;
+    let (first, _) = step(&code, 0, &mut wc).expect("stamped jit_merge_point must dispatch");
+    assert!(
+        matches!(first, DispatchOutcome::CloseLoop { .. }),
+        "stamped visit closes, got {first:?}"
+    );
+    assert!(
+        !wc.trace_ctx.bridge_exception_resume_prepared(),
+        "reached_loop_header consumes the prepared resume"
+    );
+    assert_eq!(wc.trace_ctx.bridge_saved_exc_op(), None);
+}
+
 /// The walker JUMP used to skip a missing `virtualizable_box_at` slot, so
 /// `live_arg_boxes` was one shorter than the LABEL registered from
 /// `inputarg_types`. Every declared slot is now a box.
