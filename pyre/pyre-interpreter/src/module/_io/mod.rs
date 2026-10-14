@@ -1225,7 +1225,7 @@ fn init_iobase_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            crate::typedef::make_new_descr(iobase_new)
+            crate::typedef::make_new_descr_passthrough1(iobase_new, iobase_new_args)
         )
     };
 }
@@ -1253,8 +1253,7 @@ fn allocate_iobase_instance(
     owner_name: &str,
     args: &[PyObjectRef],
 ) -> crate::PyResult {
-    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
-    let Some(&cls) = positional.first() else {
+    let Some(&cls) = args.first() else {
         return Err(crate::PyError::type_error(format!(
             "{owner_name}.__new__(): not enough arguments"
         )));
@@ -1267,16 +1266,40 @@ fn iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
     allocate_iobase_instance(io_base_type(), "_IOBase", args)
 }
 
+/// `generic_new_descr(W_IOBase)`: extras belong to `__init__`.
+fn iobase_new_args(w_type: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
+    let _ = args;
+    iobase_new(&[w_type])
+}
+
 fn raw_iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
     allocate_iobase_instance(raw_iobase_type(), "_RawIOBase", args)
+}
+
+fn raw_iobase_new_args(w_type: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
+    let _ = args;
+    raw_iobase_new(&[w_type])
 }
 
 fn buffered_iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
     allocate_iobase_instance(buffered_iobase_type(), "_BufferedIOBase", args)
 }
 
+fn buffered_iobase_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let _ = args;
+    buffered_iobase_new(&[w_type])
+}
+
 fn text_iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
     allocate_iobase_instance(text_iobase_type(), "_TextIOBase", args)
+}
+
+fn text_iobase_new_args(w_type: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
+    let _ = args;
+    text_iobase_new(&[w_type])
 }
 
 /// `interp_iobase.py:rawiobase_read_w` — the default raw `read` is a
@@ -1389,7 +1412,7 @@ fn init_rawiobase_type(ns: PyObjectRef) {
     crate::__pyre_store!(
         ns,
         "__new__",
-        crate::typedef::make_new_descr(raw_iobase_new)
+        crate::typedef::make_new_descr_passthrough1(raw_iobase_new, raw_iobase_new_args)
     );
     crate::__pyre_store!(
         ns,
@@ -1475,7 +1498,7 @@ fn init_buffered_iobase_type(ns: PyObjectRef) {
     crate::__pyre_store!(
         ns,
         "__new__",
-        crate::typedef::make_new_descr(buffered_iobase_new)
+        crate::typedef::make_new_descr_passthrough1(buffered_iobase_new, buffered_iobase_new_args)
     );
     for (name, function) in [
         (
@@ -1540,7 +1563,7 @@ fn init_text_iobase_type(ns: PyObjectRef) {
     crate::__pyre_store!(
         ns,
         "__new__",
-        crate::typedef::make_new_descr(text_iobase_new)
+        crate::typedef::make_new_descr_passthrough1(text_iobase_new, text_iobase_new_args)
     );
     for (name, function) in [
         ("read", text_iobase_read as crate::gateway::BuiltinCodeFn),
@@ -1635,7 +1658,17 @@ pub(crate) fn fileio_type() -> PyObjectRef {
         let ns_slot = tp_base + 1;
         crate::builtins::init_file_wrapper_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
         crate::builtins::init_fileio_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
-        let init_fn = crate::make_builtin_function("__init__", crate::builtins::fileio_init);
+        let init_fn = crate::make_builtin_function_with_signature(
+            "__init__",
+            crate::builtins::fileio_init,
+            crate::gateway::Signature::new(
+                vec!["self", "file", "mode", "closefd", "opener"],
+                None,
+                None,
+                0,
+                1,
+            ),
+        );
         let init_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(init_fn);
         type_method(
@@ -1747,7 +1780,13 @@ crate::py_module! {
         "DEFAULT_BUFFER_SIZE" => w_int_new(DEFAULT_BUFFER_SIZE),
     },
     functions: {
-        "open"            / * = crate::builtins::builtin_open,
+        "open"            / * = crate::builtins::builtin_open; crate::gateway::Signature::new(
+            vec!["file", "mode", "buffering", "encoding", "errors", "newline", "closefd", "opener"],
+            None,
+            None,
+            0,
+            0,
+        ),
         // `io.open_code(path)` — `_PyIO_open_code` opens the path in binary
         // read mode ("rb"); pyre has no audit hooks so it is just `open`.
         "open_code"       / * = |args| {

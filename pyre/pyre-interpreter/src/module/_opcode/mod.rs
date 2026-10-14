@@ -54,48 +54,37 @@ fn has_exc(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErro
 }
 
 fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let (positional, mut kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["jump"], "stack_effect")?;
-    if positional.len() > 2 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
-            "stack_effect() takes at most 2 positional arguments ({} given)",
-            positional.len(),
-        )));
+    // Bound scope: `opcode`, `oparg`, kw-only `jump` (`PY_NULL` omitted).
+    if args.first().copied().filter(|o| !o.is_null()).is_none() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "stack_effect() missing opcode",
+        ));
     }
-    let raw = positional
-        .first()
-        .copied()
-        .ok_or_else(|| pyre_interpreter::PyError::type_error("stack_effect() missing opcode"))?;
-    let npos = positional.len();
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let pos_base = roots.pin_roots(positional);
-    let raw = pyre_interpreter::baseobjspace::int_w(raw);
-    let w = roots.get(base);
-    kwargs = if w.is_null() { None } else { Some(w) };
-    let positional_1 = (npos > 1).then(|| roots.get(pos_base + 1));
-    drop(roots);
-    let raw = raw?;
+    let n = args.len();
+    let base = roots.pin_roots(args);
+    let raw = pyre_interpreter::baseobjspace::int_w(roots.get(base))?;
     let opcode = try_opcode(raw)
         .filter(|op| op.real().is_none_or(|real| real.deopt().is_none()))
         .ok_or_else(|| pyre_interpreter::PyError::value_error("invalid opcode or oparg"))?;
-
-    let oparg = match positional_1 {
-        Some(value) if unsafe { !is_none(value) } => {
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-            let oparg = pyre_interpreter::baseobjspace::int_w(value);
-            let w = roots.get(base);
-            kwargs = if w.is_null() { None } else { Some(w) };
-            drop(roots);
-            oparg?
-        }
+    let oparg_obj = if n > 1 {
+        let w = roots.get(base + 1);
+        if w.is_null() { None } else { Some(w) }
+    } else {
+        None
+    };
+    let oparg = match oparg_obj {
+        Some(value) if unsafe { !is_none(value) } => pyre_interpreter::baseobjspace::int_w(value)?,
         _ => 0,
     };
     let oparg = u32::try_from(oparg)
         .map_err(|_| pyre_interpreter::PyError::value_error("invalid opcode or oparg"))?;
-
-    let jump = pyre_interpreter::builtins::kwarg_get(kwargs, "jump");
+    let jump = if n > 2 {
+        let w = roots.get(base + 2);
+        if w.is_null() { None } else { Some(w) }
+    } else {
+        None
+    };
     let effect = match jump {
         Some(value) if unsafe { !is_none(value) } => {
             if pyre_interpreter::baseobjspace::is_true(value)? {
@@ -179,7 +168,7 @@ pyre_interpreter::py_module! {
         // `stack_effect(opcode, oparg=None, *, jump=None)` — the optional
         // tail and the keyword-only `jump` leave no single natural arity, so
         // the body enforces the count itself.
-        "stack_effect"             / * = stack_effect,
+        "stack_effect"             / * = stack_effect; crate::Signature::new(vec!["opcode", "oparg", "jump"], None, None, 1, 0),
         "get_executor"             / 2 = |_| Ok(w_none()),
         "get_specialization_stats" / 0 = |_| Ok(w_none()),
         "get_intrinsic1_descs"     / 0 = get_intrinsic1_descs,

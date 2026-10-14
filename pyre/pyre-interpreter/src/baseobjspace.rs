@@ -22352,26 +22352,16 @@ unsafe fn property_no_accessor(
 pub(crate) fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     // descriptor.py `set_name(self, w_type, w_name)` — the bound
     // method receives `[property, owner, name]`.  CPython 3.14 exposes this
-    // method through a positional-only clinic wrapper.  Keep the PyPy body
-    // shape, but parse pyre's temporary keyword marker here so the 3.14
-    // public error surface excludes the bound receiver from its count.
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "property.__set_name__() takes no keyword arguments",
-        ));
-    }
-    if positional.len() != 3 {
+    // method through a positional-only clinic wrapper. Keywords are refused
+    // by remaining HOPELESS CALL_KW before wrap runs.
+    if args.len() != 3 {
         return Err(crate::PyError::type_error(format!(
             "__set_name__() takes 2 positional arguments but {} were given",
-            crate::type_methods::args_given(positional),
+            crate::type_methods::args_given(args),
         )));
     }
-    let prop = property_require_obj(
-        positional.first().copied().unwrap_or(PY_NULL),
-        "__set_name__",
-    )?;
-    let w_name = positional[2];
+    let prop = property_require_obj(args.first().copied().unwrap_or(PY_NULL), "__set_name__")?;
+    let w_name = args[2];
     unsafe { pyre_object::descriptor::w_property_set_name(prop, w_name) };
     Ok(pyre_object::w_none())
 }

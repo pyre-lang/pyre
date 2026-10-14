@@ -664,6 +664,19 @@ pub const BUILTIN_CODE_GC_TYPE_ID: u32 = 13;
 /// pyre equivalent: returns Result so errors propagate through the call stack.
 pub type BuiltinCodeFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
+/// `gateway.py BuiltinCodePassThroughArguments0.func__args__(space, args)`.
+///
+/// Kind-(c) builtins receive `Arguments` out of band (`keyword_names_w` /
+/// `keywords_w` parallel lists). Invoked only from residual
+/// `call_with_kwargs` / `funcrun`; the traced wrapper ABI stays
+/// `BuiltinCodeFn`.
+pub type BuiltinCodePassThroughFn0 =
+    fn(&crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError>;
+
+/// `gateway.py BuiltinCodePassThroughArguments1.func__args__(space, w_obj, args)`.
+pub type BuiltinCodePassThroughFn1 =
+    fn(PyObjectRef, &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError>;
+
 /// Cold interp2app arity-error formatter.
 ///
 /// RPython's gateway constructs this exception only on the rejected-call
@@ -692,17 +705,11 @@ pub fn method_noarg_failure(
     name: &str,
     receiver_slots: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if crate::builtins::has_builtin_kwargs(args) {
-        Err(crate::PyError::type_error(format!(
-            "{name}() takes no keyword arguments"
-        )))
-    } else {
-        method_arity_failure(
-            name,
-            "no arguments",
-            (args.len() as i64 - receiver_slots).max(0),
-        )
-    }
+    method_arity_failure(
+        name,
+        "no arguments",
+        (args.len() as i64 - receiver_slots).max(0),
+    )
 }
 
 /// Cold `_PyArg_CheckPositional` exact-count failure.
@@ -863,9 +870,19 @@ pub struct MethodOwner {
 /// it is later reached, so a call that named a base reaches the base's
 /// implementation rather than being redirected to whatever the receiver's own
 /// type carries.
+/// `W_PyCWrapperObject.descr_call(self, space, w_self, __args__)`.
+pub type WrapperCallArgsFn = fn(
+    *const std::ffi::c_void,
+    PyObjectRef,
+    &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError>;
+
 pub struct WrapperCall {
     pub slot: *const std::ffi::c_void,
     pub call: fn(*const std::ffi::c_void, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    /// Keyword path: `descr_call(..., w_self, __args__)`. None for a
+    /// wrapper whose call shape takes no keywords (`__repr__`, `__hash__`).
+    pub call_args: Option<WrapperCallArgsFn>,
 }
 
 /// A built-in function object.
@@ -879,6 +896,14 @@ pub struct BuiltinCode {
     pub ob: PyObject,
     pub name: &'static str,
     pub func: BuiltinCodeFn,
+    /// `BuiltinCodePassThroughArguments0.func__args__`.  Null for every
+    /// builtin that is not a no-receiver passthrough (`__build_class__`,
+    /// `min`/`max`).  A function pointer is not a GC pointer.
+    pub func_args0: Option<BuiltinCodePassThroughFn0>,
+    /// `BuiltinCodePassThroughArguments1.func__args__`.  Null for every
+    /// builtin that is not a receiver passthrough (`dict.__init__`,
+    /// `str.format`, `type.__new__`).
+    pub func_args1: Option<BuiltinCodePassThroughFn1>,
     pub docstring: Option<&'static str>,
     /// eval.py:16-23 — `fast_natural_arity`. For builtins with fixed
     /// positional arity 0-4, this equals the arity directly. Builtins
@@ -887,10 +912,11 @@ pub struct BuiltinCode {
     /// gateway.py `BuiltinCode.sig` — the argument `Signature`
     /// (named params, `*args`/`**kwargs`, kw-only tail) used to bind
     /// keyword arguments into positional order before the function runs.
-    /// `null` means "no declared signature" (positional-only), which is
-    /// every builtin today.  The pointee is leaked to `'static` so the
-    /// raw pointer carries no Drop obligation and is not a GC pointer,
-    /// matching the `func` function-pointer convention.
+    /// `null` means no declared signature: keywords are rejected
+    /// (arity 0..=4 and remaining HOPELESS alike).  The pointee is leaked
+    /// to `'static` so the raw pointer
+    /// carries no Drop obligation and is not a GC pointer, matching the
+    /// `func` function-pointer convention.
     pub sig: *const Signature,
     /// The type this code object is a descriptor of, or null for a builtin
     /// with no receiver to check (a module-level function, a `__new__`
@@ -1002,6 +1028,38 @@ pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeF
     )
 }
 
+/// `BuiltinCodePassThroughArguments0`: keyword calls invoke `func_args`
+/// with an `Arguments` object (`gateway.py` `funcrun` → `func__args__`).
+/// Positional calls keep `func` so a no-keyword `dict()` / `min(a, b)`
+/// stays on today's traced slice ABI.
+pub fn builtin_code_new_passthrough0(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+) -> PyObjectRef {
+    let code = builtin_code_new(name, func);
+    unsafe {
+        (*(code as *mut BuiltinCode)).func_args0 = Some(func_args);
+    }
+    code
+}
+
+/// `BuiltinCodePassThroughArguments1`: keyword calls invoke `func_args`
+/// as `func__args__(space, w_obj, args)`.  `fast_natural_arity` stays
+/// `PASSTHROUGHARGS1` so `funccall` still peels the receiver for a
+/// positional call and hands `func` the flat slice.
+pub fn builtin_code_new_passthrough1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough_args1(name, func);
+    unsafe {
+        (*(code as *mut BuiltinCode)).func_args1 = Some(func_args);
+    }
+    code
+}
+
 /// Full constructor for `BuiltinCode`.  `sig` is a `*const Signature`
 /// (null for positional-only builtins); the pointee must outlive the
 /// object — callers leak it to `'static`.
@@ -1031,6 +1089,8 @@ fn builtin_code_new_full(
         },
         name,
         func,
+        func_args0: None,
+        func_args1: None,
         docstring,
         fast_natural_arity,
         sig,
@@ -1072,7 +1132,9 @@ pub fn with_module(module: &'static str, func: PyObjectRef) -> PyObjectRef {
 /// object has no Drop obligation, matching the `func`/`name` convention.
 /// `fast_natural_arity` is `HOPELESS`: a builtin with a declared
 /// signature takes the keyword-binding slow path, not the fixed-arity
-/// fast path.
+/// fast path.  Callers that need both (a matching positional slice on
+/// `fastcall_N`, keywords through `parse_obj`) pass an explicit arity
+/// through [`builtin_code_new_full`].
 pub fn builtin_code_new_with_signature(
     name: &'static str,
     func: BuiltinCodeFn,
@@ -1206,7 +1268,7 @@ pub(crate) unsafe fn builtin_code_check_receiver(
     if owner.is_null() {
         return Ok(());
     }
-    // `bind_kwargs_to_signature` lays out every declared slot and leaves the
+    // `parse_builtin_signature` lays out every declared slot and leaves the
     // ones the call did not fill as `PY_NULL`, so a descriptor invoked with no
     // receiver at all arrives with its `self` slot present but empty.  Reading
     // that slot as an argument reported a missing receiver as a foreign one,
@@ -1249,45 +1311,37 @@ pub unsafe fn builtin_code_call(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let code = obj as *const BuiltinCode;
-    // The trailing marker dict is not an argument, so every check below reads
-    // the positional slice: counting it as the receiver would report the
-    // keyword dict as the object the descriptor was called on.
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // Wrap is positional. Keywords stay on `Arguments` for passthrough /
+    // Signature entries; remaining HOPELESS CALL_KW already rejects them.
+    let positional = args;
     unsafe { builtin_code_check_receiver(code, positional) }?;
-    // The receiver the two argument refusals below name, read the same way
-    // the check above reads it: an unfilled `self` slot is `PY_NULL`, not an
-    // argument the call supplied.
     let receiver = positional.first().copied().filter(|r| !r.is_null());
     // eval.py:16-23 — a `fast_natural_arity` of 0..=4 is the exact positional
     // count the implementation was registered for; `HOPELESS`,
     // `PASSTHROUGHARGS1` and the `FLATPYCALL` bit all exceed 4.  A body with a
     // fixed arity indexes its slice directly, so a call that supplies a
-    // different number of arguments is rejected before the body runs.  The
-    // trailing marker dict occupies a slot of its own, so the keyword one
-    // argument short of the arity leaves the slice at exactly the declared
-    // length — the split has to happen before the count is read, not only once
-    // a length already mismatched.
+    // different number of arguments is rejected before the body runs.
     let arity = unsafe { (*code).fast_natural_arity } as usize;
-    // A builtin registered by arity alone declares no parameter names (`sig`
-    // is null), so it is positional-only and a keyword cannot name anything it
-    // accepts.  Checked ahead of the count, which is the order the messages
-    // come in (`','.join('a', 'b', x=1)` reports the keyword).  A declared
-    // count above the fast-path ceiling is rejected here too; only the
-    // `FLATPYCALL` / `PASSTHROUGHARGS1` / `HOPELESS` markers, whose bodies read
-    // the raw slice themselves, are left to do their own checking.
-    if arity < BuiltinCodeFlags::FLATPYCALL.bits() as usize
-        && unsafe { (*code).sig.is_null() }
-        && crate::builtins::has_real_kwargs(kwargs)
-    {
-        return Err(no_keyword_arguments(unsafe { &*code }, receiver));
-    }
     if arity <= 4 && positional.len() != arity {
-        return Err(arity_mismatch(
-            unsafe { &*code },
-            receiver,
-            arity,
-            positional.len(),
-        ));
+        // A keyword call binds through `parse_obj` first and then hands this
+        // function the filled scope (`scope_length` slots, omitted kw-only as
+        // `PY_NULL`).  `fast_natural_arity` is the no-keyword `fastcall_N`
+        // count, so it does not match that bound slice; the binder already
+        // rejected a surplus positional.
+        let already_bound = unsafe {
+            (*code)
+                .sig
+                .as_ref()
+                .is_some_and(|sig| positional.len() == sig.scope_length())
+        };
+        if !already_bound {
+            return Err(arity_mismatch(
+                unsafe { &*code },
+                receiver,
+                arity,
+                positional.len(),
+            ));
+        }
     }
     // `get_func_to_call`: a wrapper answers with the slot it was published
     // with, and every other builtin with the body it was registered with.
@@ -1476,7 +1530,7 @@ fn arity_mismatch(
 /// (`list.sort($self, /, *, key=None, reverse=False)`).  Such a method is an
 /// argument-clinic `_PyArg_UnpackKeywords` parse under its bare name, so its
 /// errors take that wording; every other shape keeps the `Arguments` wording
-/// `call::bind_kwargs_to_signature` produced.  `pos_args` leads with the
+/// `call::parse_builtin_signature` produced.  `pos_args` leads with the
 /// receiver.
 ///
 /// # Safety
@@ -1683,6 +1737,41 @@ pub unsafe fn builtin_code_get_signature(obj: PyObjectRef) -> Option<&'static Si
     unsafe { (*(obj as *const BuiltinCode)).sig.as_ref() }
 }
 
+/// `BuiltinCodePassThroughArguments0.func__args__`, if this code is one.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_passthrough0(obj: PyObjectRef) -> Option<BuiltinCodePassThroughFn0> {
+    unsafe { (*(obj as *const BuiltinCode)).func_args0 }
+}
+
+/// `BuiltinCodePassThroughArguments1.func__args__`, if this code is one.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_passthrough1(obj: PyObjectRef) -> Option<BuiltinCodePassThroughFn1> {
+    unsafe { (*(obj as *const BuiltinCode)).func_args1 }
+}
+
+/// `W_PyCWrapperObject.func` plus `descr_call(..., __args__)`, when this
+/// code is a keyword-accepting slot wrapper.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_wrapper_call_args(
+    obj: PyObjectRef,
+) -> Option<(*const std::ffi::c_void, WrapperCallArgsFn)> {
+    let wrapper = unsafe { (*(obj as *const BuiltinCode)).wrapper };
+    if wrapper.is_null() {
+        return None;
+    }
+    let wrapper = unsafe { &*wrapper };
+    wrapper.call_args.map(|call_args| (wrapper.slot, call_args))
+}
+
 /// Get the name of a built-in function.
 ///
 /// # Safety
@@ -1710,6 +1799,9 @@ pub unsafe fn builtin_code_call_name(obj: PyObjectRef, receiver: Option<PyObject
     if let Some(name) = starargs_constructor_type_name(code, receiver) {
         return name;
     }
+    if let Some(name) = new_constructor_type_name(code, receiver) {
+        return name;
+    }
     builtin_names(code, receiver).1
 }
 
@@ -1735,6 +1827,24 @@ fn starargs_constructor_type_name(
         return None;
     };
     if arg0 != "self" && arg0 != "cls" {
+        return None;
+    }
+    let receiver = receiver.filter(|receiver| !receiver.is_null())?;
+    if unsafe { pyre_object::typeobject::is_type(receiver) } {
+        return Some(unsafe { pyre_object::w_type_get_qualname(receiver) }.to_string());
+    }
+    crate::typedef::r#type(receiver)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string())
+}
+
+/// Clinic `tp_new` wrapper names the type (`int()`, not `int.__new__()`).
+/// [3.14-spec] vs PyPy `descr_new` reporting `int.__new__()`.
+fn new_constructor_type_name(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> Option<String> {
+    if code.name != "__new__" {
+        return None;
+    }
+    let sig = unsafe { code.sig.as_ref() }?;
+    if sig.argnames.first().copied() != Some("cls") {
         return None;
     }
     let receiver = receiver.filter(|receiver| !receiver.is_null())?;
@@ -1869,6 +1979,92 @@ pub fn make_builtin_function_as_builtin_with_doc(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `interp2app._getdefaults` / `GatewayCache.build`: copy keyword-only
+/// defaults onto `Function.w_kw_defs` at registration.  Names without a
+/// recorded default map to `None`.  A non-None default is installed later
+/// through [`function_set_kwonly_default_pairs`].
+pub(crate) fn with_registered_kwonly_defaults(function: PyObjectRef) -> PyObjectRef {
+    let code = unsafe { crate::function::getcode(function) };
+    let Some(sig) = (unsafe { builtin_code_get_signature(code) }) else {
+        return function;
+    };
+    if sig.num_kwonlyargnames() == 0 {
+        return function;
+    }
+    let n_pos = sig.num_argnames();
+    let n_kwonly = sig.num_kwonlyargnames();
+    let roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = roots.publish(&[function]);
+    let dict_slot = roots.publish(&[pyre_object::w_dict_new()]);
+    for i in 0..n_kwonly {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(dict_slot),
+                sig.argnames[n_pos + i],
+                pyre_object::w_none(),
+            );
+        }
+    }
+    unsafe {
+        crate::function::function_set_kwdefaults_from_definition(
+            roots.get(fn_slot),
+            roots.get(dict_slot),
+        );
+    }
+    roots.get(fn_slot)
+}
+
+/// Store `n` PY_NULL positional defaults on `function`.
+///
+/// `unicodeobject.py` `descr_new` / `bytesobject.py` `descr_new` default
+/// `w_object`/`w_source`, `w_encoding`, and `w_errors` to `None`. The binder
+/// fills omitted slots from `Function.defs_w` (`interp2app` `_getdefaults`);
+/// PY_NULL keeps those slots distinct from an explicit `None`.
+pub fn function_set_null_positional_defaults(function: PyObjectRef, n: usize) -> PyObjectRef {
+    if n == 0 {
+        return function;
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = roots.publish(&[function]);
+    let defs_slot = roots.publish(&[pyre_object::w_tuple_new(vec![pyre_object::PY_NULL; n])]);
+    unsafe {
+        crate::function::function_set_defaults(roots.get(fn_slot), roots.get(defs_slot));
+    }
+    roots.get(fn_slot)
+}
+
+/// Replace `Function.w_kw_defs` with `pairs` (`init_kwdefaults_dict`).
+/// Used when a kw-only default is not `None` (`isclose` `rel_tol=1e-09`).
+pub fn function_set_kwonly_default_pairs(
+    function: PyObjectRef,
+    pairs: &[(&'static str, PyObjectRef)],
+) -> PyObjectRef {
+    if pairs.is_empty() {
+        return function;
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = roots.publish(&[function]);
+    let values: Vec<PyObjectRef> = pairs.iter().map(|(_, value)| *value).collect();
+    let val_base = roots.publish(&values);
+    let dict_slot = roots.publish(&[pyre_object::w_dict_new()]);
+    for (i, (name, _)) in pairs.iter().enumerate() {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(dict_slot),
+                name,
+                roots.get(val_base + i),
+            );
+        }
+    }
+    unsafe {
+        crate::function::function_set_kwdefaults_from_definition(
+            roots.get(fn_slot),
+            roots.get(dict_slot),
+        );
+    }
+    roots.get(fn_slot)
+}
+
 /// Signature-aware [`make_builtin_function_as_builtin`].  Builtin `__new__`
 /// descriptors need the builtin-function carrier for `copyreg` parity while
 /// still routing keyword-only arguments through the gateway binder.
@@ -1877,20 +2073,77 @@ pub fn make_builtin_function_as_builtin_with_signature(
     func: BuiltinCodeFn,
     signature: Signature,
 ) -> PyObjectRef {
-    let code = builtin_code_new_with_signature(name, func, None, signature);
-    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    make_builtin_function_as_builtin_with_signature_and_opt_doc(name, func, signature, None)
+}
+
+/// [`make_builtin_function_as_builtin_with_signature`] carrying
+/// `BuiltinCode.docstring`.  `interp2app` keeps the app-visible `__doc__`
+/// on the gateway code; a `Signature` constructor that also needs the
+/// `tp_new` wrapper text (`tp_new_doc`) uses this path.
+pub fn make_builtin_function_as_builtin_with_signature_and_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Signature,
+    docstring: &'static str,
+) -> PyObjectRef {
+    make_builtin_function_as_builtin_with_signature_and_opt_doc(
+        name,
+        func,
+        signature,
+        Some(docstring),
+    )
+}
+
+fn make_builtin_function_as_builtin_with_signature_and_opt_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Signature,
+    docstring: Option<&'static str>,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_signature(name, func, docstring, signature);
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
+}
+
+/// Like [`make_builtin_function_as_builtin_with_signature`], but keep
+/// `arity` as `fast_natural_arity`.  A no-keyword call of exactly that
+/// many positionals stays on `fastcall_N` (`function.py`
+/// `nargs == fast_natural_arity`); other counts and keywords still bind
+/// through `parse_obj`.  `int.__new__(cls, x, /, base=None)` is that
+/// shape: two positionals, optional `base`, and `int(x)` must not enter
+/// `parse_obj`.
+pub fn make_builtin_function_as_builtin_with_fast_arity_and_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    signature: Signature,
+) -> PyObjectRef {
+    let sig: *const Signature = Box::into_raw(Box::new(signature));
+    let code = builtin_code_new_full(name, func, None, arity, sig);
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// `make_builtin_function` for a builtin with a declared argument
 /// `Signature`, so the call path binds keyword arguments into positional
-/// order before the function runs (see `call::bind_kwargs_to_signature`).
+/// order before the function runs (see `call::parse_builtin_signature`).
 pub fn make_builtin_function_with_signature(
     name: &'static str,
     func: BuiltinCodeFn,
     signature: Signature,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_signature(name, func, None, signature);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_with_fixed_code(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// `make_builtin_function`, optionally carrying a `Signature`.  `Some`
@@ -1936,7 +2189,11 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
         None => std::ptr::null(),
     };
     let code = builtin_code_new_full(name, func, None, arity, sig);
-    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_with_fixed_code(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// `gateway.py BuiltinCode.funcrun` reaches the unwrapped body through
@@ -1956,21 +2213,14 @@ pub fn check_declared_arity(name: &str, arity: usize, given: usize) -> Result<()
     Err(crate::PyError::type_error(message))
 }
 
-/// Check the declared arity as positional-only. Keyword calls carry a trailing
-/// marker dict in the raw builtin slice; the callee still receives that raw
-/// slice after the arity guard.
+/// Check the declared arity as positional-only. Wrap is positional;
+/// keywords stay on `Arguments` for the `*_args` path.
 pub fn check_declared_positional_arity(
     name: &str,
     arity: usize,
     args: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(format!(
-            "{name}() takes no keyword arguments"
-        )));
-    }
-    check_declared_arity(name, arity, positional.len())
+    check_declared_arity(name, arity, args.len())
 }
 
 /// `make_builtin_function` with known fixed arity for fast-path dispatch.
@@ -2087,6 +2337,20 @@ pub fn make_method_descriptor_with_doc(
     crate::function_new_method_descriptor(code as *const (), name.to_string())
 }
 
+/// Method-descriptor `PassThroughArguments1` carrying a docstring.
+pub fn make_method_descriptor_passthrough1_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    unsafe {
+        (*(code as *mut BuiltinCode)).docstring = Some(docstring);
+    }
+    crate::function_new_method_descriptor(code as *const (), name.to_string())
+}
+
 /// `make_builtin_function` with `fast_natural_arity = PASSTHROUGHARGS1` —
 /// PyPy `BuiltinCodePassThroughArguments1` registration shape.
 pub fn make_builtin_function_passthrough_args1(
@@ -2094,6 +2358,105 @@ pub fn make_builtin_function_passthrough_args1(
     func: BuiltinCodeFn,
 ) -> PyObjectRef {
     let code = builtin_code_new_passthrough_args1(name, func);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// Module-level `BuiltinCodePassThroughArguments0` (`funcrun` → `func__args__`).
+pub fn make_module_builtin_function_passthrough0(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough0(name, func, func_args);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// `make_builtin_function` carrying `BuiltinCodePassThroughArguments0`.
+///
+/// Used for module-namespace functions that were already registered as
+/// `Function` (not `BuiltinFunction`) and must keep that carrier while
+/// keyword calls go through `func_args`.
+pub fn make_builtin_function_passthrough0(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough0(name, func, func_args);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// Module-level passthrough0 carrying `BuiltinCode.docstring`.
+pub fn make_module_builtin_function_passthrough0_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn0,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
+    unsafe {
+        (*(code as *mut BuiltinCode)).func_args0 = Some(func_args);
+    }
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// `make_builtin_function_as_builtin` carrying `PassThroughArguments1`.
+///
+/// Builtin `__new__` stays a `BuiltinFunction` (`copyreg` identity) while
+/// keyword calls take `Arguments` out of band.
+pub fn make_builtin_function_as_builtin_passthrough1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// [`make_builtin_function_as_builtin_passthrough1`] carrying `BuiltinCode.docstring`.
+pub fn make_builtin_function_as_builtin_passthrough1_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    unsafe {
+        (*(code as *mut BuiltinCode)).docstring = Some(docstring);
+    }
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// Slot-wrapper `PassThroughArguments1`.
+pub fn make_slot_wrapper_passthrough1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    crate::function_new_slot_wrapper(code as *const (), name.to_string())
+}
+
+/// Method-descriptor `BuiltinCodePassThroughArguments1`.
+pub fn make_builtin_function_passthrough1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// [`make_builtin_function_passthrough1`] carrying `BuiltinCode.docstring`.
+pub fn make_builtin_function_passthrough1_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    func_args: BuiltinCodePassThroughFn1,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough1(name, func, func_args);
+    unsafe {
+        (*(code as *mut BuiltinCode)).docstring = Some(docstring);
+    }
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
@@ -2132,9 +2495,9 @@ pub fn make_module_builtin_function_with_arity(
 
 /// `make_module_builtin_function_with_arity` additionally carrying an argument
 /// `Signature` so the keyword-call path binds arguments by name at the call
-/// site — the builtin then receives only positional slots and never the
-/// `__pyre_kw__` marker dict. A `*args`/`**kwargs`/kw-only signature is demoted
-/// to `HOPELESS` (as in `make_builtin_function_with_arity_and_maybe_sig`).
+/// site — the builtin then receives only positional slots. A
+/// `*args`/`**kwargs`/kw-only signature is demoted to `HOPELESS` (as in
+/// `make_builtin_function_with_arity_and_maybe_sig`).
 pub fn make_module_builtin_function_with_arity_and_sig(
     name: &'static str,
     func: BuiltinCodeFn,
@@ -2149,7 +2512,33 @@ pub fn make_module_builtin_function_with_arity_and_sig(
         };
     let sig: *const Signature = Box::into_raw(Box::new(signature));
     let code = builtin_code_new_full(name, func, None, arity, sig);
-    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
+}
+
+/// Like [`make_module_builtin_function_with_arity_and_sig`], but keep
+/// `arity` as `fast_natural_arity` even when the signature has kw-only
+/// names.  A no-keyword call of exactly that many positionals stays on
+/// `fastcall_N` (`function.py` `nargs == fast_natural_arity`); keywords
+/// still bind through `parse_obj`.  `isclose(a, b, *, rel_tol, abs_tol)`
+/// is that shape: two positionals, kw-only tolerances, and the JIT wrapper
+/// folds the two-arg call.
+pub fn make_module_builtin_function_with_fast_arity_and_sig(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    signature: Signature,
+) -> PyObjectRef {
+    let sig: *const Signature = Box::into_raw(Box::new(signature));
+    let code = builtin_code_new_full(name, func, None, arity, sig);
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 /// Non-binding (`BuiltinFunction`) twin of
@@ -2177,7 +2566,11 @@ pub fn make_module_builtin_function_with_arity_and_maybe_sig(
         None => std::ptr::null(),
     };
     let code = builtin_code_new_full(name, func, None, arity, sig);
-    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+    with_registered_kwonly_defaults(crate::function_new_builtin(
+        code as *const (),
+        name.to_string(),
+        pyre_object::PY_NULL,
+    ))
 }
 
 // ── fsencode_bytes_w ─────────────────────────────────────────────────

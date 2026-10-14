@@ -2,7 +2,10 @@
 # the errors a bad mapping raises, but every key it passes is an exact `str`, so
 # nothing there notices an implementation that rebuilds the key.  `test_unicode`
 # and `test_userstring` exercise `str` subclasses as values and as dict keys,
-# never as the name half of a `**` mapping.
+# never as the name half of a `**` mapping.  `test_extcall` and `test_builtin`
+# pass `**` mappings whose keys are ordinary parameter names (`x`, `sep`,
+# `start`); they do not pin an unknown name through builtins that reject
+# keywords, constructors that name the subclass, or applevel `sorted`/`sort`.
 #
 # parity-tests reason: `Arguments._collect_keyword_args` forwards the key the
 # mapping supplied -- `space.setitem(w_kwds, w_key, keywords_w[i])` with the
@@ -12,8 +15,9 @@
 # and re-wraps them loses that identity, and the loss is invisible to a timing
 # run and to every arm that only reads the name.  The error message an unknown
 # keyword produces reads the same object, so it is pinned here too.
-#
-# CPython 3.14 and PyPy agree on every arm below.
+# `keyword_names_w` / `keywords_w` keep the name out of band (`argument.py`).
+# Each unknown-name row pins CPython 3.14.6.
+# pyre-check: pypy-diverges: pypy3 words round/pow/int/str as "takes no keyword arguments" (and names `int.__new__`/`str.__new__`); type.__init_subclass__ names `object` rather than `C`; sum with two extras is "unexpected keyword" rather than "takes at most 2 arguments"; applevel sorted reports `sorted()` rather than `sort()`.
 class S(str):
     def __repr__(self):
         return "S(%s)" % str.__repr__(self)
@@ -138,6 +142,135 @@ def every_dispatch_arm_keeps_the_key():
         assert types_of(call()) == [S], (name, types_of(call()))
 
 
+K = "no_such_keyword"
+
+
+def _catch(thunk):
+    try:
+        return ("ok", thunk())
+    except Exception as err:
+        return (type(err).__name__, str(err))
+
+
+def _check(label, thunk, expected):
+    got = _catch(thunk)
+    if got == expected:
+        return
+    raise AssertionError("%s: got %r, expected %r" % (label, got, expected))
+
+
+def sum_rejects_an_unknown_keyword():
+    _check(
+        "sum([1,2], **{K:0})",
+        lambda: sum([1, 2], **{K: 0}),
+        (
+            "TypeError",
+            "sum() got an unexpected keyword argument '%s'" % K,
+        ),
+    )
+
+
+def round_rejects_an_unknown_keyword():
+    _check(
+        "round(1.5, **{K:0})",
+        lambda: round(1.5, **{K: 0}),
+        (
+            "TypeError",
+            "round() got an unexpected keyword argument '%s'" % K,
+        ),
+    )
+
+
+def pow_rejects_an_unknown_keyword():
+    _check(
+        "pow(2,3,**{K:5})",
+        lambda: pow(2, 3, **{K: 5}),
+        (
+            "TypeError",
+            "pow() got an unexpected keyword argument '%s'" % K,
+        ),
+    )
+
+
+def int_rejects_an_unknown_keyword():
+    _check(
+        'int("5", **{K:1})',
+        lambda: int("5", **{K: 1}),
+        (
+            "TypeError",
+            "int() got an unexpected keyword argument '%s'" % K,
+        ),
+    )
+
+
+def str_rejects_an_unknown_keyword():
+    _check(
+        'str(b"x", **{K:1})',
+        lambda: str(b"x", **{K: 1}),
+        (
+            "TypeError",
+            "str() got an unexpected keyword argument '%s'" % K,
+        ),
+    )
+
+
+def type_init_subclass_names_the_class():
+    _check(
+        'type("C", (), {}, **{K:1})',
+        lambda: type("C", (), {}, **{K: 1}).__name__,
+        (
+            "TypeError",
+            "C.__init_subclass__() takes no keyword arguments",
+        ),
+    )
+
+
+def sum_two_extras_are_too_many_arguments():
+    _check(
+        'sum([1], **{K:0, "start":3})',
+        lambda: sum([1], **{K: 0, "start": 3}),
+        ("TypeError", "sum() takes at most 2 arguments (3 given)"),
+    )
+
+
+def dict_get_takes_no_keyword_arguments():
+    _check(
+        "{}.get(**{K:1})",
+        lambda: {}.get(**{K: 1}),
+        ("TypeError", "dict.get() takes no keyword arguments"),
+    )
+
+
+def list_append_takes_no_keyword_arguments():
+    _check(
+        "[].append(**{K:1})",
+        lambda: [].append(**{K: 1}),
+        ("TypeError", "list.append() takes no keyword arguments"),
+    )
+
+
+def sorted_reports_sort_for_an_unknown_keyword():
+    _check(
+        "sorted([], **{K:1})",
+        lambda: sorted([], **{K: 1}),
+        (
+            "TypeError",
+            "sort() got an unexpected keyword argument '%s'" % K,
+        ),
+    )
+
+
+def print_rejects_an_unknown_keyword():
+    _check(
+        "print(**{K:7})",
+        lambda: print(**{K: 7}),
+        (
+            "TypeError",
+            "print() got an unexpected keyword argument '%s'" % K,
+        ),
+    )
+
+
 a_star_star_key_reaches_kwargs_unchanged()
 a_matched_name_is_bound_and_the_rest_keep_their_keys()
 the_keys_survive_a_sort()
@@ -145,4 +278,15 @@ a_literal_keyword_is_an_exact_str()
 an_unknown_keyword_names_the_key_it_was_given()
 a_duplicate_keyword_is_still_a_type_error()
 every_dispatch_arm_keeps_the_key()
+sum_rejects_an_unknown_keyword()
+round_rejects_an_unknown_keyword()
+pow_rejects_an_unknown_keyword()
+int_rejects_an_unknown_keyword()
+str_rejects_an_unknown_keyword()
+type_init_subclass_names_the_class()
+sum_two_extras_are_too_many_arguments()
+dict_get_takes_no_keyword_arguments()
+list_append_takes_no_keyword_arguments()
+sorted_reports_sort_for_an_unknown_keyword()
+print_rejects_an_unknown_keyword()
 print('OK')

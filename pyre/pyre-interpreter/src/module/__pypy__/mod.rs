@@ -220,21 +220,18 @@ fn reversed_dict(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// default) or front of the insertion order.  `@unwrap_spec(last=bool)`: `last`
 /// may be supplied positionally or by keyword and is coerced by truthiness.
 fn move_to_end(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(kwargs, &["last"], "move_to_end")?;
-    let (mut d, mut key) = match positional {
-        [d, key] | [d, key, _] => (*d, *key),
-        _ => {
-            return Err(crate::PyError::type_error(
-                "move_to_end() takes 2 or 3 positional arguments",
-            ));
-        }
+    // Bound scope: `d`, `key`, `last` (`PY_NULL` omitted).
+    let d = args.first().copied().filter(|o| !o.is_null());
+    let key = args.get(1).copied().filter(|o| !o.is_null());
+    let (Some(mut d), Some(mut key)) = (d, key) else {
+        return Err(crate::PyError::type_error(
+            "move_to_end() takes 2 or 3 positional arguments",
+        ));
     };
-    let last =
-        match crate::builtins::bind_pos_or_kw(positional, kwargs, 2, "last", "move_to_end", 3)? {
-            Some(w) => pyre_object::with_roots!(d, key => crate::baseobjspace::is_true(w))?,
-            None => true,
-        };
+    let last = match args.get(2).copied().filter(|o| !o.is_null()) {
+        Some(w) => pyre_object::with_roots!(d, key => crate::baseobjspace::is_true(w))?,
+        None => true,
+    };
     let _roots = pyre_object::gc_roots::push_roots();
     // Both words already exist. Sequential `pin_root` would normalize after
     // `d` and leave `key` unpublished (`RootScope::pin_roots`).
@@ -338,12 +335,12 @@ crate::py_module! {
         "resizelist_hint" / 2 = resizelist_hint,
         "list_get_physical_size" / 1 = list_get_physical_size,
         "reversed_dict" / 1 = reversed_dict,
-        "move_to_end" / * = move_to_end,
+        "move_to_end" / * = move_to_end; crate::Signature::new(vec!["d", "key", "last"], None, None, 0, 0),
         "objects_in_repr" / 0 = objects_in_repr,
         "write_unraisable" / 3 = write_unraisable,
         "hidden_applevel" / 1 = hidden_applevel,
         "strategy" / 1 = strategy,
-        "newmemoryview" / * = interp_buffer::newmemoryview,
+        "newmemoryview" / * = interp_buffer::newmemoryview; crate::Signature::new(vec!["buf", "itemsize", "format", "shape", "strides"], None, None, 0, 0),
     },
     extra_init: |ns| {
         // Mark as a package so `from __pypy__.builders import ...`

@@ -146,6 +146,16 @@ fn ffi_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     make_plain_ffi_object(w_subtype)
 }
 
+/// `W_FFIObject___new__(space, w_subtype, __args__)`. Extras belong to
+/// `descr_init`; keywords stay on `Arguments`.
+fn ffi_new_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    let _ = args;
+    ffi_new(&[w_type])
+}
+
 /// `W_FFIObject.descr_init`.
 fn ffi_init(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let a = bind_method(
@@ -256,45 +266,35 @@ pub(crate) fn allocate_free_mem(w_ffi: PyObjectRef, nbytes: usize) -> Result<*mu
 
 /// Bind the positional-or-keyword part of an FFI method.  `names` excludes
 /// the receiver and `required` counts required entries in that list.
+/// The gateway `Signature` has already bound keywords into positional order;
+/// omitted optional slots arrive as `PY_NULL`.
 fn bind_method(
     args: &[PyObjectRef],
     method: &str,
     names: &[&str],
     required: usize,
 ) -> Result<Vec<PyObjectRef>, PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if positional.is_empty() {
+    let slot = |i: usize| {
+        args.get(i)
+            .copied()
+            .filter(|value| !value.is_null())
+            .unwrap_or(pyre_object::PY_NULL)
+    };
+    let receiver = slot(0);
+    if receiver.is_null() {
         return Err(PyError::type_error(format!(
             "{method}() missing FFI receiver"
         )));
     }
-    if positional.len() > names.len() + 1 {
-        return Err(PyError::type_error(format!(
-            "{method}() takes at most {} arguments ({} given)",
-            names.len(),
-            positional.len() - 1
-        )));
-    }
-    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, names, method)?;
     let mut bound = Vec::with_capacity(names.len() + 1);
-    bound.push(positional[0]);
+    bound.push(receiver);
     for (i, name) in names.iter().enumerate() {
-        let positional_value = positional.get(i + 1).copied();
-        let keyword_value = pyre_interpreter::builtins::kwarg_get(kwargs, name);
-        let value = match (positional_value, keyword_value) {
-            (Some(_), Some(_)) => {
-                return Err(PyError::type_error(format!(
-                    "{method}() got multiple values for argument '{name}'"
-                )));
-            }
-            (Some(value), None) | (None, Some(value)) => value,
-            (None, None) if i < required => {
-                return Err(PyError::type_error(format!(
-                    "{method}() missing required argument '{name}'"
-                )));
-            }
-            (None, None) => pyre_object::PY_NULL,
-        };
+        let value = slot(i + 1);
+        if value.is_null() && i < required {
+            return Err(PyError::type_error(format!(
+                "{method}() missing required argument '{name}'"
+            )));
+        }
         bound.push(value);
     }
     Ok(bound)
@@ -302,15 +302,9 @@ fn bind_method(
 
 fn no_keyword_varargs<'a>(
     args: &'a [PyObjectRef],
-    method: &str,
+    _method: &str,
 ) -> Result<&'a [PyObjectRef], PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::real_kwarg_count(kwargs) != 0 {
-        return Err(PyError::type_error(format!(
-            "{method}() takes no keyword arguments"
-        )));
-    }
-    Ok(positional)
+    Ok(args)
 }
 
 fn dict_string_type(ffi: &W_FFIObject, string: &str) -> Option<PyObjectRef> {
@@ -1310,57 +1304,120 @@ fn init_ffi_type(ns: PyObjectRef) {
         |name: &str, value: PyObjectRef| pyre_interpreter::__pyre_put_new!(ns_slot, name, value);
     store(
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(ffi_new),
+        pyre_interpreter::typedef::make_new_descr_passthrough1(ffi_new, ffi_new_args),
     );
     store(
         "__init__",
-        pyre_interpreter::make_builtin_function("__init__", ffi_init),
+        pyre_interpreter::make_builtin_function_with_signature(
+            "__init__",
+            ffi_init,
+            pyre_interpreter::Signature::new(
+                vec![
+                    "self",
+                    "module_name",
+                    "_version",
+                    "_types",
+                    "_globals",
+                    "_struct_unions",
+                    "_enums",
+                    "_typenames",
+                    "_includes",
+                ],
+                None,
+                None,
+                0,
+                1,
+            ),
+        ),
     );
+    // `addressof` / `offsetof` take a variable field-name tail and reject
+    // keywords themselves (`no_keyword_varargs`).
     for (name, function) in [
         (
             "addressof",
             ffi_addressof as pyre_interpreter::gateway::BuiltinCodeFn,
         ),
-        ("alignof", ffi_alignof),
-        ("cast", ffi_cast),
-        ("callback", ffi_callback),
-        ("dlclose", ffi_dlclose),
-        ("dlopen", ffi_dlopen),
-        ("from_buffer", ffi_from_buffer),
-        ("from_handle", ffi_from_handle),
-        ("gc", ffi_gc),
-        ("getctype", ffi_getctype),
-        ("init_once", ffi_init_once),
-        ("integer_const", ffi_integer_const),
-        ("list_types", ffi_list_types),
-        ("memmove", ffi_memmove),
-        ("new", ffi_new_value),
-        ("new_allocator", ffi_new_allocator),
-        ("new_handle", ffi_new_handle),
         ("offsetof", ffi_offsetof),
-        ("release", ffi_release),
-        ("sizeof", ffi_sizeof),
-        ("string", ffi_string),
-        ("typeof", ffi_typeof),
-        ("unpack", ffi_unpack),
     ] {
         store(
             name,
             pyre_interpreter::make_builtin_function_with_doc(name, function, ffi_method_doc(name)),
         );
     }
+    for (name, function, argnames) in [
+        (
+            "alignof",
+            ffi_alignof as pyre_interpreter::gateway::BuiltinCodeFn,
+            &["self", "cdecl"] as &[&'static str],
+        ),
+        ("cast", ffi_cast, &["self", "cdecl", "source"]),
+        (
+            "callback",
+            ffi_callback,
+            &["self", "cdecl", "python_callable", "error", "onerror"],
+        ),
+        ("dlclose", ffi_dlclose, &["self", "lib"]),
+        ("dlopen", ffi_dlopen, &["self", "name", "flags"]),
+        (
+            "from_buffer",
+            ffi_from_buffer,
+            &["self", "cdecl", "python_buffer", "require_writable"],
+        ),
+        ("from_handle", ffi_from_handle, &["self", "x"]),
+        ("gc", ffi_gc, &["self", "cdata", "destructor", "size"]),
+        ("getctype", ffi_getctype, &["self", "cdecl", "replace_with"]),
+        ("init_once", ffi_init_once, &["self", "function", "tag"]),
+        ("integer_const", ffi_integer_const, &["self", "name"]),
+        ("list_types", ffi_list_types, &["self"]),
+        ("memmove", ffi_memmove, &["self", "dest", "src", "n"]),
+        ("new", ffi_new_value, &["self", "cdecl", "init"]),
+        (
+            "new_allocator",
+            ffi_new_allocator,
+            &["self", "alloc", "free", "should_clear_after_alloc"],
+        ),
+        ("new_handle", ffi_new_handle, &["self", "x"]),
+        ("release", ffi_release, &["self", "cdata"]),
+        ("sizeof", ffi_sizeof, &["self", "cdecl"]),
+        ("string", ffi_string, &["self", "cdata", "maxlen"]),
+        ("typeof", ffi_typeof, &["self", "cdecl"]),
+        ("unpack", ffi_unpack, &["self", "cdata", "length"]),
+    ] {
+        let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
+            name,
+            function,
+            Some(ffi_method_doc(name)),
+            pyre_interpreter::Signature::new(argnames.to_vec(), None, None, 0, 1),
+        );
+        store(
+            name,
+            pyre_interpreter::function_new_with_fixed_code(
+                code as *const (),
+                name.to_string(),
+                pyre_object::PY_NULL,
+            ),
+        );
+    }
     // `ffi_obj.py` registers this one through `_extras` because it exists on
     // win32 alone; its docstring is the same table entry every other method
     // takes.
     #[cfg(windows)]
-    store(
-        "getwinerror",
-        pyre_interpreter::make_builtin_function_with_doc(
+    {
+        let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
             "getwinerror",
             ffi_getwinerror,
-            ffi_method_doc("getwinerror"),
-        ),
-    );
+            Some(ffi_method_doc("getwinerror")),
+            pyre_interpreter::Signature::new(vec!["self", "code"], None, None, 0, 1),
+        );
+        store(
+            "getwinerror",
+            pyre_interpreter::function_new_with_fixed_code(
+                code as *const (),
+                "getwinerror".to_string(),
+                pyre_object::PY_NULL,
+            ),
+        );
+    }
     let getter = pyre_interpreter::make_builtin_function_with_arity("errno", errno_get, 2);
     let getter_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(getter);

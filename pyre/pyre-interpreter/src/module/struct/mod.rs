@@ -1629,7 +1629,7 @@ impl W_Struct {
 /// `marker_posonly()` gives `posonlyargcount == N`, and `varargname`
 /// records the tail.  With no keyword-only slot and `posonly ==
 /// n_pos_params`, a stray keyword is rejected as "() takes no keyword
-/// arguments" before the tail is packed (`bind_kwargs_to_signature`).
+/// arguments" before the tail is packed (`parse_builtin_signature`).
 fn sig_posonly_then_varargs(
     name: &'static str,
     names: &[&'static str],

@@ -134,14 +134,17 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `__majit_wrap_descr_typecheck_fget_f_back` and `..._fget_f_builtins` read
 /// `f_backref` and `w_builtin`, so they carry none.
 ///
-/// A hand-placed marker owes one question upstream's injection never has to
-/// ask, because it fires at every access in every graph rather than once per
-/// gateway: can the trace's shadow and the live frame disagree about the field
-/// this body reads?  For `pycode` they cannot — it is written only at frame
-/// construction — so `__majit_wrap_descr_typecheck_fget_f_code` carries no
-/// marker either.
-/// Each of the three says so at its own definition, with what the marker
-/// measured.
+/// Residual `typeobject.py ensure_module_attr` (inside
+/// `type_create_new_type`) calls [`force_virtualizable_if_necessary`]
+/// before `get_w_globals`: during tracing that is the
+/// `TOKEN_TRACING_RESCALL` → `TOKEN_NONE` escape marker, not a
+/// question of whether the heap slot can disagree with the shadow.
+/// `get_w_globals` / `getdebug` / `getcode` omit it: pyre residualizes
+/// LOAD_GLOBAL / STORE_NAME / MAKE_FUNCTION through those reads while
+/// `pyopcode.py` looks those opcodes inside, so a native force on the
+/// accessor would abort loops pypy compiles. The `f_code` gateway
+/// still omits the escape-flush marker; that placement is at its own
+/// definition.
 ///
 /// Upstream reaches the rewrite because `hook_access_field` puts the marker
 /// at every redirected FIELD access, which lands it inside graphs the
@@ -181,6 +184,12 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// the codewriter never looks inside, so a direct call and a deleted marker
 /// come to the same thing.
 ///
+/// Residual redirected-field reads that pypy also residualizes use
+/// [`force_virtualizable_if_necessary`] instead: that helper *does* open
+/// with the token test, matching the function
+/// `replace_force_virtualizable_with_call` installs, and is the one
+/// `type_create_new_type`'s `ensure_module_attr` arm calls.
+///
 /// # No `vable_token` test here
 ///
 /// `virtualizable.py force_virtualizable_if_necessary` opens with
@@ -201,6 +210,49 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// because the uncommitted walk kept the node it had already attached.
 #[inline(never)]
 pub fn jit_force_virtualizable(frame: *mut PyFrame) {
+    force_frame_before_locals_read(frame);
+}
+
+/// `virtualizable.py force_virtualizable_if_necessary`:
+///
+/// ```text
+/// def force_virtualizable_if_necessary(virtualizable):
+///     if virtualizable.vable_token:
+///         force_now(virtualizable)
+/// ```
+///
+/// `rvirtualizable.py hook_access_field` genops `jit_force_virtualizable` on
+/// every redirected field access; `replace_force_virtualizable_with_call`
+/// rewrites the residual copies into this helper; `jtransform.py
+/// rewrite_op_jit_force_virtualizable` deletes the Call in graphs the
+/// codewriter looks inside. Native residual execution has no rewritten
+/// graph, so `type_create_new_type`'s `ensure_module_attr` arm — the
+/// residual graph that keeps the Call — calls this directly.
+///
+/// `force_now` on `TOKEN_TRACING_RESCALL` only stores `TOKEN_NONE` — the
+/// values are already correct during tracing, and that store is the escape
+/// marker `tracing_after_residual_call` reads. An Active token materializes
+/// through [`force_frame_before_locals_read`]. TOKEN_NONE is a no-op, so
+/// interpreted code that is not in a residual-from-trace does not enter
+/// the backend hook.
+///
+/// `#[inline(never)]` keeps the callee name on the Call so
+/// `rewrite_op_jit_force_virtualizable` can delete it from looked-inside
+/// graphs. Distinct from [`jit_force_virtualizable`]: that stand-in is the
+/// gateway/escape-flush path and must not test the token first.
+#[inline(never)]
+pub fn force_virtualizable_if_necessary(frame: *mut PyFrame) {
+    if frame.is_null() {
+        return;
+    }
+    let token = unsafe { (*frame).vable_token };
+    if token == 0 {
+        return;
+    }
+    if token == majit_metainterp::virtualref::token_tracing_rescall() as usize {
+        unsafe { (*frame).vable_token = 0 };
+        return;
+    }
     force_frame_before_locals_read(frame);
 }
 

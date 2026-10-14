@@ -423,31 +423,21 @@ mod imp {
         ))
     }
 
-    /// The wording a boundary with no keyword table gives one anyway. It
-    /// qualifies itself with the module, which the clinic's keyword binder
-    /// does not.
-    fn no_keywords(name: &str) -> pyre_interpreter::PyError {
-        pyre_interpreter::PyError::type_error(format!("winreg.{name}() takes no keyword arguments"))
-    }
-
     /// A positional-only call of fixed arity — `_PyArg_CheckPositional`
     /// reports the count it wanted against the count it got.
+    /// Bound scope: omitted slots are `PY_NULL`.
     fn exact_args<'a>(
         args: &'a [PyObjectRef],
         name: &str,
         count: usize,
     ) -> Result<&'a [PyObjectRef], pyre_interpreter::PyError> {
-        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-            return Err(no_keywords(name));
-        }
-        if pos.len() != count {
+        let given = args.iter().filter(|value| !value.is_null()).count();
+        if given != count {
             return Err(pyre_interpreter::PyError::type_error(format!(
-                "{name} expected {count} arguments, got {}",
-                pos.len()
+                "{name} expected {count} arguments, got {given}"
             )));
         }
-        Ok(pos)
+        Ok(args)
     }
 
     /// `METH_O` — the single key the seven one-argument calls take, whose
@@ -456,17 +446,13 @@ mod imp {
         args: &[PyObjectRef],
         name: &str,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-            return Err(no_keywords(name));
-        }
-        if pos.len() != 1 {
+        let given = args.iter().filter(|value| !value.is_null()).count();
+        if given != 1 {
             return Err(pyre_interpreter::PyError::type_error(format!(
-                "winreg.{name}() takes exactly one argument ({} given)",
-                pos.len()
+                "winreg.{name}() takes exactly one argument ({given} given)"
             )));
         }
-        Ok(pos[0])
+        Ok(args[0])
     }
 
     /// The four `key, sub_key, …` boundaries the clinic exposes by keyword.
@@ -482,24 +468,18 @@ mod imp {
         name: &str,
         params: [&str; 4],
     ) -> Result<[Option<PyObjectRef>; 4], pyre_interpreter::PyError> {
-        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        if pos.len() > params.len() {
+        // Bound scope: four named slots (`PY_NULL` omitted). The first two
+        // are required; the last two default per boundary.
+        let given = args.iter().filter(|o| !o.is_null()).count();
+        if given > params.len() {
             return Err(pyre_interpreter::PyError::type_error(format!(
-                "{name}() takes at most {} arguments ({} given)",
-                params.len(),
-                pos.len()
+                "{name}() takes at most {} arguments ({given} given)",
+                params.len()
             )));
         }
         let mut bound = [None; 4];
         for (index, key) in params.iter().enumerate() {
-            let value = pyre_interpreter::builtins::bind_pos_or_kw(
-                pos,
-                kwargs,
-                index,
-                key,
-                name,
-                index + 1,
-            )?;
+            let value = args.get(index).copied().filter(|o| !o.is_null());
             if value.is_none() && index < 2 {
                 return Err(pyre_interpreter::PyError::type_error(format!(
                     "{name}() missing required argument '{key}' (pos {})",
@@ -508,7 +488,6 @@ mod imp {
             }
             bound[index] = value;
         }
-        pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &params, name)?;
         Ok(bound)
     }
 
@@ -1543,7 +1522,85 @@ mod imp {
                 "Returns the reflection state for the specified key as a bool.\n\n  key\n    An already open key, or any one of the predefined HKEY_* constants.\n\nWill generally raise NotImplementedError if executed on a 32bit OS.",
             ),
         ] {
-            let function = pyre_interpreter::make_builtin_function_with_doc(name, func, doc);
+            let function = match name {
+                "OpenKey" | "OpenKeyEx" | "CreateKeyEx" => {
+                    let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
+                        name,
+                        func,
+                        Some(doc),
+                        pyre_interpreter::Signature::new(
+                            vec!["key", "sub_key", "reserved", "access"],
+                            None,
+                            None,
+                            0,
+                            0,
+                        ),
+                    );
+                    pyre_interpreter::function_new_with_fixed_code(
+                        code as *const (),
+                        name.to_string(),
+                        pyre_object::PY_NULL,
+                    )
+                }
+                "DeleteKeyEx" => {
+                    let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
+                        name,
+                        func,
+                        Some(doc),
+                        pyre_interpreter::Signature::new(
+                            vec!["key", "sub_key", "access", "reserved"],
+                            None,
+                            None,
+                            0,
+                            0,
+                        ),
+                    );
+                    pyre_interpreter::function_new_with_fixed_code(
+                        code as *const (),
+                        name.to_string(),
+                        pyre_object::PY_NULL,
+                    )
+                }
+                "CloseKey"
+                | "QueryInfoKey"
+                | "FlushKey"
+                | "ExpandEnvironmentStrings"
+                | "DisableReflectionKey"
+                | "EnableReflectionKey"
+                | "QueryReflectionKey" => {
+                    pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 1, doc)
+                }
+                "SaveKey" | "QueryValue" | "QueryValueEx" | "EnumKey" | "EnumValue"
+                | "CreateKey" | "DeleteKey" | "DeleteValue" | "ConnectRegistry" => {
+                    pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 2, doc)
+                }
+                "LoadKey" => {
+                    pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 3, doc)
+                }
+                "SetValue" => {
+                    pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 4, doc)
+                }
+                "SetValueEx" => {
+                    let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
+                        name,
+                        func,
+                        Some(doc),
+                        pyre_interpreter::Signature::new(
+                            vec!["key", "value_name", "reserved", "type", "value"],
+                            None,
+                            None,
+                            0,
+                            5,
+                        ),
+                    );
+                    pyre_interpreter::function_new_with_fixed_code(
+                        code as *const (),
+                        name.to_string(),
+                        pyre_object::PY_NULL,
+                    )
+                }
+                _ => pyre_interpreter::make_builtin_function_with_doc(name, func, doc),
+            };
             let function_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(function);
             let signature_slot = pyre_object::gc_roots::shadow_stack_len();

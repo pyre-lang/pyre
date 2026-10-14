@@ -12,55 +12,29 @@ use crate::PyError;
 /// existing memoryview.  This is an internal PyPy helper, not the public
 /// `memoryview.cast`: structured format strings are accepted verbatim.
 pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() > 5 {
+    // Bound scope: required `buf`/`itemsize`/`format`, optional `shape`/`strides`
+    // (`PY_NULL` omitted). Extra positionals are refused by the Signature
+    // overlay; a direct test slice still names the count here.
+    let given = args.iter().filter(|o| !o.is_null()).count();
+    if given > 5 {
         return Err(PyError::type_error(format!(
-            "newmemoryview() takes at most 5 arguments ({} given)",
-            positional.len()
+            "newmemoryview() takes at most 5 arguments ({given} given)"
         )));
     }
-    let kw = |name: &str| -> Option<PyObjectRef> {
-        kwargs.and_then(|dict| unsafe { pyre_object::w_dict_getitem_str(dict, name) })
-    };
-    let arg = |index: usize, name: &str| -> Result<Option<PyObjectRef>, PyError> {
-        if let Some(&value) = positional.get(index) {
-            if kw(name).is_some() {
-                return Err(PyError::type_error(format!(
-                    "newmemoryview() got multiple values for argument '{name}'"
-                )));
-            }
-            return Ok(Some(value));
-        }
-        Ok(kw(name))
-    };
-    if let Some(dict) = kwargs {
-        for (key, _) in unsafe { pyre_object::w_dict_items(dict) } {
-            let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(key) }) else {
-                continue;
-            };
-            if name == "__pyre_kw__" {
-                continue;
-            }
-            if !matches!(name, "buf" | "itemsize" | "format" | "shape" | "strides") {
-                return Err(PyError::type_error(format!(
-                    "newmemoryview() got an unexpected keyword argument '{name}'"
-                )));
-            }
-        }
-    }
-    let w_obj = arg(0, "buf")?
+    let arg = |index: usize| args.get(index).copied().filter(|o| !o.is_null());
+    let w_obj = arg(0)
         .ok_or_else(|| PyError::type_error("newmemoryview() missing required argument 'buf'"))?;
-    let itemsize_obj = arg(1, "itemsize")?.ok_or_else(|| {
+    let itemsize_obj = arg(1).ok_or_else(|| {
         PyError::type_error("newmemoryview() missing required argument 'itemsize'")
     })?;
-    let fmt_obj = arg(2, "format")?
+    let fmt_obj = arg(2)
         .ok_or_else(|| PyError::type_error("newmemoryview() missing required argument 'format'"))?;
     // `if w_shape` / `if w_strides` are RPython reference tests, not truth
     // tests: only an omitted argument selects the derive-it path.  An empty
     // sequence still counts as supplied, and so does an explicit `None`, which
     // then fails in `dimensions` with "'NoneType' object is not iterable".
-    let shape_arg = arg(3, "shape")?;
-    let strides_arg = arg(4, "strides")?;
+    let shape_arg = arg(3);
+    let strides_arg = arg(4);
     let has_shape = shape_arg.is_some();
     let has_strides = strides_arg.is_some();
     let shape_obj = shape_arg.unwrap_or_else(pyre_object::w_none);

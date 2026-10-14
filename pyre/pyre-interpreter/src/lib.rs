@@ -383,8 +383,8 @@ macro_rules! py_module {
                 fn $ifn_name:ident ( $($ifn_args:tt)* ) $(-> $ifn_ret:ty)? $ifn_body:block
             )*
         })?
-        $(, functions: { $($fn_key:literal / $fn_arity:tt = $fn_path:expr),* $(,)? })?
-        $(, module_functions: { $($mfn_key:literal / $mfn_arity:tt = $mfn_path:expr),* $(,)? })?
+        $(, functions: { $($fn_key:literal / $fn_arity:tt = $fn_path:expr $(; $fn_sig:expr)?),* $(,)? })?
+        $(, module_functions: { $($mfn_key:literal / $mfn_arity:tt = $mfn_path:expr $(; $mfn_sig:expr)?),* $(,)? })?
         $(, extra_init: |$ns:ident| $body:block)?
         $(,)?
     ) => {
@@ -490,7 +490,7 @@ macro_rules! py_module {
                     $fn_key,
                     $crate::gateway::with_module(
                         $name,
-                        $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                        $crate::py_module_fn!($fn_key, $fn_arity, $fn_path $(, $fn_sig)?),
                     )
                 );
             )*)?
@@ -500,7 +500,7 @@ macro_rules! py_module {
                     $mfn_key,
                     $crate::gateway::with_module(
                         $name,
-                        $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                        $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path $(, $mfn_sig)?),
                     )
                 );
             )*)?
@@ -757,11 +757,22 @@ macro_rules! py_module_fn {
     ($key:literal, *, $path:expr) => {
         $crate::make_module_builtin_function($key, $path)
     };
+    ($key:literal, *, $path:expr, $sig:expr) => {
+        $crate::make_module_builtin_function_with_arity_and_sig($key, $path, $crate::HOPELESS, $sig)
+    };
     ($key:literal, $arity:literal, $path:expr) => {
         $crate::make_module_builtin_function_with_arity(
             $key,
             $crate::py_checked_arity_fn!($key, $arity, $path),
             $arity,
+        )
+    };
+    ($key:literal, $arity:literal, $path:expr, $sig:expr) => {
+        $crate::make_module_builtin_function_with_arity_and_sig(
+            $key,
+            $crate::py_checked_arity_fn!($key, $arity, $path),
+            $arity,
+            $sig,
         )
     };
 }
@@ -792,11 +803,22 @@ macro_rules! py_module_module_fn {
     ($key:literal, *, $path:expr) => {
         $crate::make_module_builtin_function($key, $path)
     };
+    ($key:literal, *, $path:expr, $sig:expr) => {
+        $crate::make_module_builtin_function_with_arity_and_sig($key, $path, $crate::HOPELESS, $sig)
+    };
     ($key:literal, $arity:literal, $path:expr) => {
         $crate::make_module_builtin_function_with_arity(
             $key,
             $crate::py_checked_arity_fn!($key, $arity, $path),
             $arity,
+        )
+    };
+    ($key:literal, $arity:literal, $path:expr, $sig:expr) => {
+        $crate::make_module_builtin_function_with_arity_and_sig(
+            $key,
+            $crate::py_checked_arity_fn!($key, $arity, $path),
+            $arity,
+            $sig,
         )
     };
 }
@@ -1018,19 +1040,27 @@ pub use function::*;
 /// `bits()` call is an Opaque Charon body and does not fold.
 pub use gateway::HOPELESS;
 pub use gateway::{
-    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFlags, BuiltinCodeFn, MethodOwner, Signature,
-    SignatureBuilder, builtin_code_call, builtin_code_get, builtin_code_get_fast_natural_arity,
-    builtin_code_get_signature, builtin_code_name, builtin_code_new,
-    builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
-    builtin_code_new_with_signature, builtin_code_no_keyword_arguments, is_builtin_code,
-    make_builtin_function, make_builtin_function_as_builtin_with_signature,
-    make_builtin_function_maybe_sig, make_builtin_function_passthrough_args1,
-    make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,
-    make_builtin_function_with_doc, make_builtin_function_with_opt_doc,
-    make_builtin_function_with_signature, make_method_descriptor_with_arity,
-    make_module_builtin_function, make_module_builtin_function_with_arity,
-    make_module_builtin_function_with_arity_and_maybe_sig, make_module_builtin_function_with_doc,
-    make_slot_wrapper, make_slot_wrapper_with_arity,
+    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFlags, BuiltinCodeFn, BuiltinCodePassThroughFn0,
+    BuiltinCodePassThroughFn1, MethodOwner, Signature, SignatureBuilder, builtin_code_call,
+    builtin_code_get, builtin_code_get_fast_natural_arity, builtin_code_get_signature,
+    builtin_code_name, builtin_code_new, builtin_code_new_passthrough_args1,
+    builtin_code_new_passthrough0, builtin_code_new_passthrough1, builtin_code_new_with_arity,
+    builtin_code_new_with_signature, builtin_code_no_keyword_arguments, builtin_code_passthrough0,
+    builtin_code_passthrough1, function_set_kwonly_default_pairs, is_builtin_code,
+    make_builtin_function, make_builtin_function_as_builtin_passthrough1,
+    make_builtin_function_as_builtin_with_fast_arity_and_signature,
+    make_builtin_function_as_builtin_with_signature, make_builtin_function_maybe_sig,
+    make_builtin_function_passthrough_args1, make_builtin_function_passthrough0,
+    make_builtin_function_passthrough1, make_builtin_function_passthrough1_with_doc,
+    make_builtin_function_with_arity, make_builtin_function_with_arity_and_doc,
+    make_builtin_function_with_arity_and_maybe_sig, make_builtin_function_with_doc,
+    make_builtin_function_with_opt_doc, make_builtin_function_with_signature,
+    make_method_descriptor_with_arity, make_module_builtin_function,
+    make_module_builtin_function_passthrough0, make_module_builtin_function_passthrough0_with_doc,
+    make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_maybe_sig,
+    make_module_builtin_function_with_arity_and_sig, make_module_builtin_function_with_doc,
+    make_module_builtin_function_with_fast_arity_and_sig, make_slot_wrapper,
+    make_slot_wrapper_passthrough1, make_slot_wrapper_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use loop_headers::*;

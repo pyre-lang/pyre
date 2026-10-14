@@ -602,9 +602,11 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
             value_slot,
             &mut needs_write_barrier,
         )
-    }
-    .filter(|raw| !raw.is_null())
-    .unwrap_or(std::ptr::null_mut());
+    };
+    let raw = match raw {
+        Some(p) if !p.is_null() => p,
+        _ => std::ptr::null_mut(),
+    };
     if raw.is_null() {
         let recovered = unsafe { utf8_payload_wtf8(unicode.value).to_owned() };
         return w_str_from_wtf8_immortal(recovered);

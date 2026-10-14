@@ -126,45 +126,17 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
     reject_duplicate_param_names(&param_names, user_name.span())?;
 
-    // Keyword-binding preamble: when the call carried a `__pyre_kw__`
-    // dict, rebind positional+keyword args into a resolved scope keyed by
-    // parameter name; otherwise the positional fast path runs unchanged.
-    // Skipped for varargs fns — `&[PyObjectRef]` consumes the whole slice
-    // (including any trailing kwargs dict), which the resolved-scope shape
-    // cannot express.
+    // Keyword calls bind through the registered `Signature` before this
+    // wrapper runs (`call::parse_builtin_signature` / `parse_obj`).  PY_NULL
+    // is never a real argument, so the leading non-null run is the true
+    // positional count on both the keyword-bound and the raw positional path.
+    // Skipped for varargs fns — `&[PyObjectRef]` consumes the whole slice.
     let kwargs_preamble = if has_varargs {
         quote! {}
     } else {
-        let name_lits = param_names.iter().map(|n| quote! { #n });
-        let req_lits = param_required.iter().map(|b| quote! { #b });
-        let fn_name_str = user_name.to_string();
         quote! {
-            let __pyre_has_kwargs = ::pyre_interpreter::builtins::has_builtin_kwargs(args);
-            // `bind_kwargs_to_signature` pads `args` out to the full
-            // parameter count with PY_NULL, so keyword-only slots and absent
-            // optionals would otherwise be counted as positional.  PY_NULL is
-            // never a real argument, so the leading non-null run is the true
-            // positional count on both the bound and the raw path.  The
-            // marker, when present, is the last slot and is not part of that
-            // run; capping there is `split_builtin_kwargs`'s prefix without
-            // building the sub-slice.
             let __pyre_positional_count =
-                ::pyre_interpreter::builtins::builtin_positional_count(args, __pyre_has_kwargs);
-            const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
-            const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
-            let __pyre_bound_args;
-            let args: &[::pyre_object::PyObjectRef] =
-                if __pyre_has_kwargs {
-                    __pyre_bound_args = ::pyre_interpreter::builtins::bind_builtin_kwargs(
-                        args,
-                        __PYRE_PARAM_NAMES,
-                        __PYRE_PARAM_REQUIRED,
-                        #fn_name_str,
-                    )?;
-                    &__pyre_bound_args
-                } else {
-                    args
-                };
+                ::pyre_interpreter::builtins::leading_non_null_count(args);
         }
     };
 
@@ -195,26 +167,9 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let fn_name = user_name.to_string();
         let too_few = arity_message(&fn_name, required, total, false);
         let too_many = arity_message(&fn_name, required, total, true);
-        let too_many_guard = if has_kw_markers {
-            // `gateway.py:BuiltinCode.funcrun` first resolves a Signature
-            // into one slot per positional / keyword-only parameter (plus
-            // the **kwargs tail).  Such a bound scope has
-            // `__PYRE_PARAM_NAMES.len()` entries even though only `total`
-            // of them are positional.  Do not count those trailing slots as
-            // supplied positionals; the Signature binder has already
-            // rejected genuine positional overflow before entering here.
-            quote! {
-                if __pyre_positional_count > #total as i64
-                    && args.len() != __PYRE_PARAM_NAMES.len()
-                {
-                    return ::std::result::Result::Err(::pyre_interpreter::PyError::type_error(#too_many));
-                }
-            }
-        } else {
-            quote! {
-                if __pyre_positional_count > #total as i64 {
-                    return ::std::result::Result::Err(::pyre_interpreter::PyError::type_error(#too_many));
-                }
+        let too_many_guard = quote! {
+            if __pyre_positional_count > #total as i64 {
+                return ::std::result::Result::Err(::pyre_interpreter::PyError::type_error(#too_many));
             }
         };
         quote! {
@@ -564,7 +519,7 @@ fn unwrap_arg(
     // gets no missing-argument guard.
     let is_optional = option_inner(ty).is_some();
     let expr = match default {
-        // `bind_kwargs_to_signature` pads `args` to the parameter count
+        // `parse_builtin_signature` pads `args` to the parameter count
         // with PY_NULL, so the default only applies when the slot is both
         // present and non-null.
         Some(default) => quote! {
@@ -925,8 +880,8 @@ fn unwrap_expr(
             return Ok(quote! { #slot });
         }
         // `Option<T>` — present when the slot is in range and not the
-        // `PY_NULL` "argument omitted" marker `bind_builtin_kwargs` writes
-        // for an absent optional after keyword resolution.  Mirrors PyPy
+        // `PY_NULL` "argument omitted" slot `parse_obj` writes for an absent
+        // optional after keyword resolution.  Mirrors PyPy
         // `@unwrap_spec(s=W_Root)` with `def f(self, space, s=None)`.
         if let Some(inner) = option_inner(ty) {
             let inner_unwrap = unwrap_expr(inner, slot, idx)?;
@@ -2702,11 +2657,9 @@ fn expand_pyre_methods(
 
         reject_duplicate_param_names(&param_names, m.sig.span())?;
 
-        // Keyword-binding preamble (mirrors `#[pyre_function]`): when the
-        // call carried a trailing `__pyre_kw__` dict, rebind positional +
-        // keyword args into a resolved scope keyed by parameter name before
-        // the receiver/arg unwraps run; otherwise the positional fast path
-        // is untouched. Instance methods prepend a `self` slot — filled
+        // Keyword-binding preamble (mirrors `#[pyre_function]`): keyword
+        // calls bind through the registered `Signature` before this wrapper
+        // runs. Instance methods prepend a `self` slot — filled
         // positionally — so the receiver index lines up with the bound
         // scope; static/class methods already carry every slot (including
         // `cls`) as a typed parameter. Property getters/setters/deleters use
@@ -2731,9 +2684,7 @@ fn expand_pyre_methods(
                 quote! {
                     // A method with no user-visible parameters has no keyword
                     // slots to bind.  Its valid-call fast path is the exact
-                    // total arity; only a mismatch enters the cold classifier
-                    // that distinguishes CALL_KW's marker from surplus
-                    // positional arguments.
+                    // total arity; a mismatch is surplus positionals.
                     if args.len() != #expected_total {
                         return ::pyre_interpreter::gateway::method_noarg_failure(
                             args,
@@ -2751,10 +2702,9 @@ fn expand_pyre_methods(
                 quote! {
                     // Every `#[pyre_methods]` shim registers with a
                     // `Signature` (see `method_sig` below), so the call path
-                    // (`call::bind_kwargs_to_signature`) has already resolved
+                    // (`call::parse_builtin_signature`) has already resolved
                     // keywords into positional PY_NULL-padded slots before the
-                    // wrapper runs — there is no trailing `__pyre_kw__` marker
-                    // dict to peel.  PY_NULL is never a real argument, so the
+                    // wrapper runs.  PY_NULL is never a real argument, so the
                     // leading non-null run is the true positional count on both
                     // the keyword-bound and the raw positional path.
                     let __pyre_positional_count = ::pyre_interpreter::builtins::leading_non_null_count(args);
@@ -2776,7 +2726,7 @@ fn expand_pyre_methods(
             if has_varargs || is_property || has_keyword_slots {
                 // See `expand_pyre_function`: once a slot can be filled by
                 // keyword, the resolved scope no longer distinguishes it from
-                // a positional one, and `bind_kwargs_to_signature` has already
+                // a positional one, and `parse_builtin_signature` has already
                 // applied the bound.
                 quote! {}
             } else {
@@ -3054,18 +3004,53 @@ fn expand_pyre_methods(
             // entry: `add_tp_new_wrapper` stores the carrier itself, so the
             // namespace holds a `builtin_function_or_method` bound to the
             // owning type rather than a `staticmethod` around one.
+            // A raw whole-args `__new__` (`generic_new_descr`) is
+            // `PassThroughArguments1`: keywords stay on `Arguments` and the
+            // wrap sees only the positional slice, matching
+            // `typedef.py generic_new_descr` / `object.__new__` when `__init__`
+            // is overridden.
             MethodKind::Static if py_name == "__new__" => {
+                let descr = if has_varargs {
+                    let args_name = format_ident!("__pyre_passthrough1_{}", mname);
+                    wrappers.push(quote! {
+                        pub fn #args_name(
+                            w_type: ::pyre_object::PyObjectRef,
+                            args: &::pyre_interpreter::argument::Arguments,
+                        ) -> ::std::result::Result<
+                            ::pyre_object::PyObjectRef,
+                            ::pyre_interpreter::PyError,
+                        > {
+                            let flat = ::pyre_interpreter::builtins::passthrough1_positional_slice(
+                                w_type, args,
+                            );
+                            #wrapper_name(&flat)
+                        }
+                    });
+                    quote! {
+                        ::pyre_interpreter::typedef::make_new_descr_passthrough1(
+                            #wrapper_name,
+                            #args_name,
+                        )
+                    }
+                } else {
+                    quote! {
+                        ::pyre_interpreter::typedef::make_new_descr_maybe_sig(
+                            #wrapper_name,
+                            #method_sig,
+                        )
+                    }
+                };
                 registrations.push(quote! {{
-                    let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
-                    let __pyre_built = ::pyre_interpreter::typedef::make_new_descr_maybe_sig(#wrapper_name, #method_sig);
-                    let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
-                    let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
-                    unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                #py_name,
-                ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
-            ) };
-                }});
+                        let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
+                        let __pyre_built = #descr;
+                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    #py_name,
+                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                ) };
+                    }});
             }
             MethodKind::Static => {
                 registrations.push(quote! {{

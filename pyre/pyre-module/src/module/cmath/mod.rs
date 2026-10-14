@@ -34,7 +34,7 @@ pyre_interpreter::py_module! {
         "asinh" / 1 = m::asinh,
         "acosh" / 1 = m::acosh,
         "atanh" / 1 = m::atanh,
-        "log"   / * = m::log,
+        "log"   / * = m::log; pyre_interpreter::Signature::new(vec!["z", "base"], None, None, 0, 2),
 
         "phase" / 1 = m::phase,
         "polar" / 1 = m::polar,
@@ -43,6 +43,6 @@ pyre_interpreter::py_module! {
         "isfinite" / 1 = m::isfinite,
         "isinf"    / 1 = m::isinf,
         "isnan"    / 1 = m::isnan,
-        "isclose"  / * = m::isclose,
+        "isclose"  / * = m::isclose; pyre_interpreter::Signature::new(vec!["a", "b", "rel_tol", "abs_tol"], None, None, 2, 2),
     },
 }

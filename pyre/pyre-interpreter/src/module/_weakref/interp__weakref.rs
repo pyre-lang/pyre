@@ -9,7 +9,10 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
-use crate::{PyError, make_builtin_function, make_builtin_function_with_arity};
+use crate::{
+    PyError, make_builtin_function, make_builtin_function_passthrough1,
+    make_builtin_function_with_arity,
+};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 
@@ -272,7 +275,10 @@ fn init_weakref_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            crate::typedef::make_new_descr(descr__new__weakref_typecall)
+            crate::typedef::make_new_descr_passthrough1(
+                descr__new__weakref_typecall,
+                descr__new__weakref_typecall_args,
+            )
         )
     };
     unsafe {
@@ -467,7 +473,11 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__call__",
-            make_builtin_function("__call__", callable_proxy_descr__call__)
+            make_builtin_function_passthrough1(
+                "__call__",
+                callable_proxy_descr__call__,
+                callable_proxy_descr__call_args,
+            )
         )
     };
     // **callable_proxy_typedef_dict — interp__weakref.py, plus the
@@ -964,15 +974,9 @@ fn referent_name_suffix(w_obj: PyObjectRef) -> Result<Wtf8Buf, PyError> {
 /// ```
 pub fn descr__init__weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // args[0] = self, args[1] = w_obj, args[2] = w_callable (optional)
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() > 3 {
+    if args.len() > 3 {
         return Err(PyError::type_error(
             "__init__ expected at most 2 arguments".to_string(),
-        ));
-    }
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(PyError::type_error(
-            "ref() does not take keyword arguments".to_string(),
         ));
     }
     Ok(pyre_object::w_none())
@@ -1384,12 +1388,18 @@ fn descr__new__weakref_typecall(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
             "ref() takes at least 1 argument".to_string(),
         ));
     }
-    // PyPy's trailing `__args__` captures keywords separately: __new__ uses
-    // only its positional `w_obj` / `w_callable` slots, while __init__ below
-    // is responsible for rejecting keywords on the exact builtin type. Do
-    // not mistake pyre's flat keyword-marker dict for the callback object.
-    let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    descr__new__weakref(args[0], positional)
+    // `__new__` uses only its positional `w_obj` / `w_callable` slots.
+    // Keywords stay on `Arguments` for the `*_args` entry.
+    descr__new__weakref(args[0], &args[1..])
+}
+
+fn descr__new__weakref_typecall_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    descr__new__weakref_typecall(&crate::builtins::passthrough1_positional_slice(
+        w_type, args,
+    ))
 }
 
 /// pypy/module/_weakref/interp__weakref.py getweakrefcount
@@ -1461,13 +1471,37 @@ pub fn callable_proxy_descr__call__(args: &[PyObjectRef]) -> Result<PyObjectRef,
     let base = _roots.pin_roots(args);
     let w_obj = force(_roots.get(base))?;
     // `space.call_args(w_obj, __args__)` preserves both positional and keyword
-    // arguments. Re-split pyre's flat builtin kwargs marker before forwarding
-    // so the marker dict cannot leak into the referent as a positional value.
+    // arguments. Wrap is positional, so the rest slice is the referent call's
+    // positionals.
     let mut forwarded = Vec::with_capacity(args.len() - 1);
     for i in 1..args.len() {
         forwarded.push(_roots.get(base + i));
     }
     crate::builtins::call_forwarding_args(w_obj, &forwarded)
+}
+
+/// Keyword path: `space.call_args(force(self), __args__)`.
+fn callable_proxy_descr__call_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_base = _roots.pin_roots(&[self_]);
+    let pos = &args.arguments_w;
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let pos_base = _roots.pin_roots(pos);
+    let names_base = _roots.pin_roots(names);
+    let values_base = _roots.pin_roots(values);
+    let npos = pos.len();
+    let nnames = names.len();
+    let w_obj = force(_roots.get(self_base))?;
+    let obj_slot = _roots.pin_roots(&[w_obj]);
+    let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| _roots.get(pos_base + i)).collect();
+    let names_now: Vec<PyObjectRef> = (0..nnames).map(|i| _roots.get(names_base + i)).collect();
+    let values_now: Vec<PyObjectRef> = (0..nnames).map(|i| _roots.get(values_base + i)).collect();
+    let forwarded = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    crate::call::call_args(_roots.get(obj_slot), &forwarded)
 }
 
 /// pypy/module/_weakref/interp__weakref.py proxy

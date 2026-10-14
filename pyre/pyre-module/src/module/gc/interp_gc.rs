@@ -306,12 +306,7 @@ pub(super) fn disable_finalizers() {
 pub(super) fn set_threshold(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(pyre_interpreter::PyError::type_error(
-            "set_threshold() takes no keyword arguments",
-        ));
-    }
+    let positional = args;
     // CPython 3.14 `gc.set_threshold(threshold0[, threshold1[,
     // threshold2]])` writes only the positions it was given, and
     // parses every argument before writing any of them.

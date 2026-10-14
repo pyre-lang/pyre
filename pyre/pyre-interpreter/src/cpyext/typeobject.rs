@@ -2746,7 +2746,11 @@ pub(super) fn method_descriptor_type() -> PyObjectRef {
         crate::__pyre_put_new!(
             ns_slot,
             "__call__",
-            crate::make_builtin_function("__call__", method_descr_call)
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                method_descr_call,
+                method_descr_call_args,
+            )
         );
         crate::__pyre_put_new!(
             ns_slot,
@@ -2777,7 +2781,11 @@ pub(super) fn classmethod_descriptor_type() -> PyObjectRef {
             crate::__pyre_put_new!(
                 ns_slot,
                 "__call__",
-                crate::make_builtin_function("__call__", classmethod_descr_call)
+                crate::gateway::make_builtin_function_passthrough1(
+                    "__call__",
+                    classmethod_descr_call,
+                    classmethod_descr_call_args,
+                )
             );
             crate::__pyre_put_new!(
                 ns_slot,
@@ -3046,7 +3054,29 @@ fn descr_classmethod_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `descr.__call__(cls, *args)`, the unbound spelling.
 fn classmethod_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    classmethod_descr_call_body(carrier, &args[1..], None)
+}
+
+fn classmethod_descr_call_args(
+    carrier: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(carrier);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    classmethod_descr_call_body(
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+fn classmethod_descr_call_body(
+    carrier: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     let Some(&named) = positional.first() else {
         return Err(crate::PyError::type_error(format!(
             "descriptor '{}' of '{}' object needs an argument",
@@ -3068,7 +3098,29 @@ fn classmethod_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// `descr.__call__(instance, *args)`, the unbound spelling.
 fn method_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    method_descr_call_body(carrier, &args[1..], None)
+}
+
+fn method_descr_call_args(
+    carrier: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(carrier);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    method_descr_call_body(
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+fn method_descr_call_body(
+    carrier: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     let Some(&instance) = positional.first() else {
         return Err(crate::PyError::type_error(format!(
             "unbound method {}() needs an argument",
@@ -3531,23 +3583,77 @@ fn ternary_args(positional: &[PyObjectRef], keywords: &[(String, PyObjectRef)]) 
 }
 
 fn split_call(args: &[PyObjectRef]) -> (Vec<PyObjectRef>, Vec<(String, PyObjectRef)>) {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let keywords: Vec<(String, PyObjectRef)> = match kwargs {
-        Some(dict) if crate::builtins::has_real_kwargs(kwargs) => unsafe {
-            pyre_object::w_dict_str_entries(dict)
-                .into_iter()
-                .filter(|(key, _)| key != "__pyre_kw__")
-                .collect()
-        },
-        _ => Vec::new(),
+    (args.to_vec(), Vec::new())
+}
+
+/// Keywords stay on `Arguments`; names are interned strings for the C slot.
+fn keyword_pairs_from_arguments(
+    args: &crate::argument::Arguments,
+) -> Result<Vec<(String, PyObjectRef)>, crate::PyError> {
+    let Some(names) = args.keyword_names_w.as_ref() else {
+        return Ok(Vec::new());
     };
-    (positional.to_vec(), keywords)
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    let roots = pyre_object::gc_roots::push_roots();
+    let names_base = roots.pin_roots(names);
+    let values_base = if values.is_empty() {
+        0
+    } else {
+        roots.pin_roots(values)
+    };
+    let mut keywords = Vec::with_capacity(names.len());
+    for i in 0..names.len() {
+        let name = pyre_object::gc_roots::shadow_stack_get(names_base + i);
+        let key = crate::baseobjspace::text_w(name)?.to_string();
+        let value = if values.is_empty() {
+            pyre_object::PY_NULL
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(values_base + i)
+        };
+        keywords.push((key, value));
+    }
+    Ok(keywords)
+}
+
+fn pinned_positionals(args: &crate::argument::Arguments) -> Vec<PyObjectRef> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&args.arguments_w);
+    (0..args.arguments_w.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+        .collect()
 }
 
 /// `slot_tp_new` — `cls.__new__(cls, *args, **kwds)`.
 fn slot_new(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args[0];
     let (positional, keywords) = split_call(&args[1..]);
+    slot_new_kw(slot, cls, &positional, &keywords)
+}
+
+/// `slot_tp_new` / `W_PyCWrapperObject.descr_call(..., w_self, __args__)`.
+fn slot_new_args(
+    slot: *const c_void,
+    cls: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.pin_roots(&[cls]);
+    let positional = pinned_positionals(args);
+    let keywords = keyword_pairs_from_arguments(args)?;
+    slot_new_kw(
+        slot,
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        &positional,
+        &keywords,
+    )
+}
+
+fn slot_new_kw(
+    slot: *const c_void,
+    cls: PyObjectRef,
+    positional: &[PyObjectRef],
+    keywords: &[(String, PyObjectRef)],
+) -> Result<PyObjectRef, crate::PyError> {
     if slot.is_null() {
         return Err(crate::PyError::type_error(
             "cannot create instances of this cpyext type",
@@ -3558,8 +3664,8 @@ fn slot_new(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         super::methodobject::MethFlags::METH_VARARGS
             | super::methodobject::MethFlags::METH_KEYWORDS,
         cls,
-        &positional,
-        &keywords,
+        positional,
+        keywords,
     )
 }
 
@@ -3567,10 +3673,36 @@ fn slot_new(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 fn slot_init(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = args[0];
     let (positional, keywords) = split_call(&args[1..]);
+    slot_init_kw(slot, w_self, &positional, &keywords)
+}
+
+fn slot_init_args(
+    slot: *const c_void,
+    w_self: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = roots.pin_roots(&[w_self]);
+    let positional = pinned_positionals(args);
+    let keywords = keyword_pairs_from_arguments(args)?;
+    slot_init_kw(
+        slot,
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &positional,
+        &keywords,
+    )
+}
+
+fn slot_init_kw(
+    slot: *const c_void,
+    w_self: PyObjectRef,
+    positional: &[PyObjectRef],
+    keywords: &[(String, PyObjectRef)],
+) -> Result<PyObjectRef, crate::PyError> {
     if slot.is_null() {
         return Ok(pyre_object::w_none());
     }
-    let built = ternary_args(&positional, &keywords);
+    let built = ternary_args(positional, keywords);
     let receiver = pyobject::make_ref(w_self);
     let result = unsafe {
         let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyObject, *mut CPyObject) -> c_int =
@@ -3592,6 +3724,32 @@ fn slot_init(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, c
 fn slot_call(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = args[0];
     let (positional, keywords) = split_call(&args[1..]);
+    slot_call_kw(slot, w_self, &positional, &keywords)
+}
+
+fn slot_call_args(
+    slot: *const c_void,
+    w_self: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = roots.pin_roots(&[w_self]);
+    let positional = pinned_positionals(args);
+    let keywords = keyword_pairs_from_arguments(args)?;
+    slot_call_kw(
+        slot,
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &positional,
+        &keywords,
+    )
+}
+
+fn slot_call_kw(
+    slot: *const c_void,
+    w_self: PyObjectRef,
+    positional: &[PyObjectRef],
+    keywords: &[(String, PyObjectRef)],
+) -> Result<PyObjectRef, crate::PyError> {
     if slot.is_null() {
         return Err(crate::PyError::type_error("cpyext object is not callable"));
     }
@@ -4643,7 +4801,22 @@ fn publish(
     slot: *const c_void,
     call: WrapperFn,
 ) {
-    let wrapper = Box::leak(Box::new(crate::gateway::WrapperCall { slot, call }));
+    publish_with_args(ns, dunder, arity, slot, call, None);
+}
+
+fn publish_with_args(
+    ns: PyObjectRef,
+    dunder: &'static str,
+    arity: u16,
+    slot: *const c_void,
+    call: WrapperFn,
+    call_args: Option<crate::gateway::WrapperCallArgsFn>,
+) {
+    let wrapper = Box::leak(Box::new(crate::gateway::WrapperCall {
+        slot,
+        call,
+        call_args,
+    }));
     store(
         ns,
         dunder,
@@ -4851,36 +5024,56 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     // and the body that runs it.  A slot filled with an interpreter
     // trampoline earns no wrapper: the trampoline answers by resolving the
     // very name this would publish.
-    let scalars: [(&'static str, u16, *const c_void, WrapperFn); 13] = unsafe {
+    let scalars: [(
+        &'static str,
+        u16,
+        *const c_void,
+        WrapperFn,
+        Option<crate::gateway::WrapperCallArgsFn>,
+    ); 13] = unsafe {
         [
-            ("__new__", crate::gateway::HOPELESS, (*tp).tp_new, slot_new),
+            (
+                "__new__",
+                crate::gateway::HOPELESS,
+                (*tp).tp_new,
+                slot_new,
+                Some(slot_new_args),
+            ),
             (
                 "__init__",
                 crate::gateway::HOPELESS,
                 (*tp).tp_init,
                 slot_init,
+                Some(slot_init_args),
             ),
-            ("__repr__", 1, (*tp).tp_repr, slot_repr),
-            ("__str__", 1, (*tp).tp_str, slot_str),
-            ("__iter__", 1, (*tp).tp_iter, slot_iter),
-            ("__next__", 1, (*tp).tp_iternext, slot_iternext),
-            ("__hash__", 1, (*tp).tp_hash, slot_hash),
+            ("__repr__", 1, (*tp).tp_repr, slot_repr, None),
+            ("__str__", 1, (*tp).tp_str, slot_str, None),
+            ("__iter__", 1, (*tp).tp_iter, slot_iter, None),
+            ("__next__", 1, (*tp).tp_iternext, slot_iternext, None),
+            ("__hash__", 1, (*tp).tp_hash, slot_hash, None),
             (
                 "__call__",
                 crate::gateway::HOPELESS,
                 (*tp).tp_call,
                 slot_call,
+                Some(slot_call_args),
             ),
-            ("__getattribute__", 2, (*tp).tp_getattro, slot_getattro),
-            ("__setattr__", 3, (*tp).tp_setattro, slot_setattro),
-            ("__delattr__", 2, (*tp).tp_setattro, slot_delattro),
-            ("__get__", 3, (*tp).tp_descr_get, slot_descr_get),
-            ("__set__", 3, (*tp).tp_descr_set, slot_descr_set),
+            (
+                "__getattribute__",
+                2,
+                (*tp).tp_getattro,
+                slot_getattro,
+                None,
+            ),
+            ("__setattr__", 3, (*tp).tp_setattro, slot_setattro, None),
+            ("__delattr__", 2, (*tp).tp_setattro, slot_delattro, None),
+            ("__get__", 3, (*tp).tp_descr_get, slot_descr_get, None),
+            ("__set__", 3, (*tp).tp_descr_set, slot_descr_set, None),
         ]
     };
-    for (dunder, arity, slot, wrapper) in scalars {
+    for (dunder, arity, slot, wrapper, call_args) in scalars {
         if !slot.is_null() && !is_interpreter_slot(slot) {
-            publish(ns, dunder, arity, slot, wrapper);
+            publish_with_args(ns, dunder, arity, slot, wrapper, call_args);
         }
     }
     // `slotdefs` carries `TPSLOT(__setattr__, tp_setattr, NULL, NULL, "")` and

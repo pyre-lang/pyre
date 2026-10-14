@@ -46,40 +46,21 @@ fn offset_in_bytes_type() -> PyObjectRef {
 /// declare a fixed arity at registration.  `argnames` is the whole parameter
 /// list and `required` how many of them have no default; a parameter that was
 /// not supplied comes back as `PY_NULL`, which [`optional`] reads as absent.
+/// The gateway `Signature` has already bound keywords into positional order.
 pub(super) fn bind_entry_point(
     args: &[PyObjectRef],
     name: &'static str,
     argnames: &[&'static str],
     required: usize,
 ) -> Result<Vec<PyObjectRef>, PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if positional.len() > argnames.len() {
-        let takes = if required == argnames.len() {
-            format!("takes {} positional arguments", argnames.len())
-        } else {
-            format!(
-                "takes from {required} to {} positional arguments",
-                argnames.len()
-            )
-        };
-        let given = positional.len();
-        let were = if given == 1 { "was" } else { "were" };
-        return Err(PyError::type_error(format!(
-            "{name}() {takes} but {given} {were} given"
-        )));
-    }
-    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, argnames, name)?;
     let mut bound = Vec::with_capacity(argnames.len());
-    for (index, argname) in argnames.iter().enumerate() {
-        let value = pyre_interpreter::builtins::bind_pos_or_kw(
-            positional,
-            kwargs,
-            index,
-            argname,
-            name,
-            index + 1,
-        )?;
-        bound.push(value.unwrap_or(pyre_object::PY_NULL));
+    for i in 0..argnames.len() {
+        let value = args
+            .get(i)
+            .copied()
+            .filter(|value| !value.is_null())
+            .unwrap_or(pyre_object::PY_NULL);
+        bound.push(value);
     }
     let missing: Vec<&str> = argnames[..required]
         .iter()
@@ -130,30 +111,15 @@ pub fn cast(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py callback`.
 pub fn callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if positional.len() > 4 {
-        return Err(PyError::type_error(format!(
-            "callback() takes at most 4 arguments ({} given)",
-            positional.len()
-        )));
-    }
-    pyre_interpreter::builtins::kwarg_reject_unknown(
-        kwargs,
-        &["ctype", "callable", "error", "onerror"],
+    let a = bind_entry_point(
+        args,
         "callback",
+        &["ctype", "callable", "error", "onerror"],
+        2,
     )?;
-    let bind = |slot, name, position| {
-        pyre_interpreter::builtins::bind_pos_or_kw(
-            positional, kwargs, slot, name, "callback", position,
-        )
-    };
-    let w_ctype = bind(0, "ctype", 1)?
-        .ok_or_else(|| PyError::type_error("callback() missing required argument 'ctype'"))?;
-    let w_callable = bind(1, "callable", 2)?
-        .ok_or_else(|| PyError::type_error("callback() missing required argument 'callable'"))?;
-    let w_error = bind(2, "error", 3)?.unwrap_or_else(pyre_object::w_none);
-    let w_onerror = bind(3, "onerror", 4)?.unwrap_or_else(pyre_object::w_none);
-    super::ccallback::make_callback(w_ctype, w_callable, w_error, w_onerror)
+    let w_error = optional(&a, 2).unwrap_or_else(pyre_object::w_none);
+    let w_onerror = optional(&a, 3).unwrap_or_else(pyre_object::w_none);
+    super::ccallback::make_callback(a[0], a[1], w_error, w_onerror)
 }
 
 /// `func.py typeof`.

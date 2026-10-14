@@ -691,12 +691,7 @@ mod context_methods {
             mut cls: PyObjectRef,
             args: &[PyObjectRef],
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "_SSLContext.__new__() takes no keyword arguments",
-                ));
-            }
+            let positional = args;
             let protocol_obj = positional.get(1).copied().ok_or_else(|| {
                 pyre_interpreter::PyError::type_error(
                     "_SSLContext.__new__() missing required argument 'protocol'",
@@ -984,55 +979,20 @@ mod context_methods {
 
         fn load_cert_chain(
             &mut self,
-            args: &[PyObjectRef],
+            certfile: PyObjectRef,
+            keyfile: Option<PyObjectRef>,
+            password: Option<PyObjectRef>,
         ) -> Result<(), pyre_interpreter::PyError> {
-            const KEYWORDS: &[&str] = &["certfile", "keyfile", "password"];
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            let user = positional.get(1..).unwrap_or(&[]);
-            if user.len() > 3 {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "load_cert_chain() takes at most 3 arguments",
-                ));
-            }
-            let cert = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                0,
-                "certfile",
-                "load_cert_chain",
-                1,
-            )?
-            .ok_or_else(|| {
-                pyre_interpreter::PyError::type_error(
-                    "load_cert_chain() missing required argument 'certfile'",
-                )
-            })?;
-            let key = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                1,
-                "keyfile",
-                "load_cert_chain",
-                2,
-            )?;
-            let password = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                2,
-                "password",
-                "load_cert_chain",
-                3,
-            )?;
-            pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "load_cert_chain")?;
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.pin_roots(&[
-                key.unwrap_or(pyre_object::PY_NULL),
+                certfile,
+                keyfile.unwrap_or(pyre_object::PY_NULL),
                 password.unwrap_or(pyre_object::PY_NULL),
             ]);
-            let cert_path = fs_path(cert);
-            let w = roots.get(base);
-            let key = if w.is_null() { None } else { Some(w) };
+            let cert_path = fs_path(roots.get(base));
             let w = roots.get(base + 1);
+            let key = if w.is_null() { None } else { Some(w) };
+            let w = roots.get(base + 2);
             let mut password = if w.is_null() { None } else { Some(w) };
             drop(roots);
             let cert_path = cert_path?;
@@ -1075,45 +1035,10 @@ mod context_methods {
 
         fn load_verify_locations(
             &mut self,
-            args: &[PyObjectRef],
+            cafile: Option<PyObjectRef>,
+            capath: Option<PyObjectRef>,
+            cadata: Option<PyObjectRef>,
         ) -> Result<(), pyre_interpreter::PyError> {
-            const KEYWORDS: &[&str] = &["cafile", "capath", "cadata"];
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            let user = positional.get(1..).unwrap_or(&[]);
-            if user.len() > 3 {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "load_verify_locations() takes at most 3 arguments",
-                ));
-            }
-            let cafile = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                0,
-                "cafile",
-                "load_verify_locations",
-                1,
-            )?;
-            let capath = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                1,
-                "capath",
-                "load_verify_locations",
-                2,
-            )?;
-            let cadata = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                2,
-                "cadata",
-                "load_verify_locations",
-                3,
-            )?;
-            pyre_interpreter::builtins::kwarg_reject_unknown(
-                kwargs,
-                KEYWORDS,
-                "load_verify_locations",
-            )?;
             let cafile = cafile.filter(|value| !unsafe { is_none(*value) });
             let mut capath = capath.filter(|value| !unsafe { is_none(*value) });
             let mut cadata = cadata.filter(|value| !unsafe { is_none(*value) });
@@ -1413,86 +1338,19 @@ mod context_methods {
 
         fn _wrap_bio(
             &self,
-            args: &[PyObjectRef],
+            mut incoming: PyObjectRef,
+            mut outgoing: PyObjectRef,
+            server_side: Option<PyObjectRef>,
+            server_hostname: Option<PyObjectRef>,
+            owner: Option<PyObjectRef>,
+            session: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            const KEYWORDS: &[&str] = &[
-                "incoming",
-                "outgoing",
-                "server_side",
-                "server_hostname",
-                "owner",
-                "session",
-            ];
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            let user = positional.get(1..).unwrap_or(&[]);
-            if user.len() > KEYWORDS.len() {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "_wrap_bio() takes at most 6 arguments",
-                ));
-            }
-            let mut incoming = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                0,
-                "incoming",
-                "_wrap_bio",
-                1,
-            )?
-            .ok_or_else(|| {
-                pyre_interpreter::PyError::type_error(
-                    "_wrap_bio() missing required argument 'incoming'",
-                )
-            })?;
-            let mut outgoing = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                1,
-                "outgoing",
-                "_wrap_bio",
-                2,
-            )?
-            .ok_or_else(|| {
-                pyre_interpreter::PyError::type_error(
-                    "_wrap_bio() missing required argument 'outgoing'",
-                )
-            })?;
-            let server_side = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                2,
-                "server_side",
-                "_wrap_bio",
-                3,
-            )?
-            .map(pyre_interpreter::baseobjspace::is_true)
-            .transpose()?
-            .unwrap_or(false);
-            let hostname = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                3,
-                "server_hostname",
-                "_wrap_bio",
-                4,
-            )?;
-            let mut owner = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                4,
-                "owner",
-                "_wrap_bio",
-                5,
-            )?
-            .unwrap_or_else(w_none);
-            let session = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                5,
-                "session",
-                "_wrap_bio",
-                6,
-            )?;
-            pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "_wrap_bio")?;
+            let server_side = server_side
+                .map(pyre_interpreter::baseobjspace::is_true)
+                .transpose()?
+                .unwrap_or(false);
+            let mut owner = owner.unwrap_or_else(w_none);
+            let hostname = server_hostname;
             if W_MemoryBIO::from_obj(incoming).is_none()
                 || W_MemoryBIO::from_obj(outgoing).is_none()
             {
@@ -1547,67 +1405,19 @@ mod context_methods {
 
         fn _wrap_socket(
             &self,
-            args: &[PyObjectRef],
+            sock: PyObjectRef,
+            server_side: Option<PyObjectRef>,
+            server_hostname: Option<PyObjectRef>,
+            owner: Option<PyObjectRef>,
+            session: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            const KEYWORDS: &[&str] =
-                &["sock", "server_side", "server_hostname", "owner", "session"];
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            let user = positional.get(1..).unwrap_or(&[]);
-            if user.len() > KEYWORDS.len() {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "_wrap_socket() takes at most 5 arguments",
-                ));
-            }
-            let mut socket = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                0,
-                "sock",
-                "_wrap_socket",
-                1,
-            )?
-            .ok_or_else(|| {
-                pyre_interpreter::PyError::type_error(
-                    "_wrap_socket() missing required argument 'sock'",
-                )
-            })?;
-            let server_side = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                1,
-                "server_side",
-                "_wrap_socket",
-                2,
-            )?
-            .map(pyre_interpreter::baseobjspace::is_true)
-            .transpose()?
-            .unwrap_or(false);
-            let hostname = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                2,
-                "server_hostname",
-                "_wrap_socket",
-                3,
-            )?;
-            let mut owner = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                3,
-                "owner",
-                "_wrap_socket",
-                4,
-            )?
-            .unwrap_or_else(w_none);
-            let session = pyre_interpreter::builtins::bind_pos_or_kw(
-                user,
-                kwargs,
-                4,
-                "session",
-                "_wrap_socket",
-                5,
-            )?;
-            pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "_wrap_socket")?;
+            let server_side = server_side
+                .map(pyre_interpreter::baseobjspace::is_true)
+                .transpose()?
+                .unwrap_or(false);
+            let mut owner = owner.unwrap_or_else(w_none);
+            let mut socket = sock;
+            let hostname = server_hostname;
             if let Some(session) = session.filter(|value| !unsafe { is_none(*value) })
                 && W_SSLSession::from_obj(session).is_none()
             {
@@ -1702,8 +1512,8 @@ mod memory_bio_methods {
             cls: PyObjectRef,
             args: &[PyObjectRef],
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            if positional.len() != 1 || pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+            let positional = args;
+            if positional.len() != 1 {
                 return Err(pyre_interpreter::PyError::type_error(
                     "MemoryBIO() takes no arguments",
                 ));
@@ -2627,13 +2437,11 @@ mod ssl_socket_methods {
         fn read(&mut self, args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             // `args` is the gateway's native copy; a collection in
             // `ensure_connection` or `int_w` does not forward it.
-            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-            let mut w_kwargs = kwargs.unwrap_or(PY_NULL);
+            let positional = args;
             let mut w_size = positional.get(1).copied().unwrap_or(PY_NULL);
             let mut w_buffer = positional.get(2).copied().unwrap_or(PY_NULL);
-            pyre_object::with_roots!(w_kwargs, w_size, w_buffer => ensure_connection(self))?;
-            let kwargs = (!w_kwargs.is_null()).then_some(w_kwargs);
-            if pyre_interpreter::builtins::has_real_kwargs(kwargs) || positional.len() > 3 {
+            pyre_object::with_roots!(w_size, w_buffer => ensure_connection(self))?;
+            if positional.len() > 3 {
                 return Err(pyre_interpreter::PyError::type_error(
                     "read() takes at most 2 arguments",
                 ));
@@ -3227,27 +3035,24 @@ fn oid_tuple(entry: pyre_native::ssl::OidInfo) -> PyObjectRef {
 }
 
 fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if positional.is_empty() || positional.len() > 2 {
+    // Bound scope: `txt`, optional `name` (`PY_NULL` omitted).
+    if args.first().copied().filter(|o| !o.is_null()).is_none() {
         return Err(pyre_interpreter::PyError::type_error(
             "txt2obj() takes 1 or 2 arguments",
         ));
     }
-    let npos = positional.len();
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.publish(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let pos_base = roots.publish(positional);
-    roots.normalize(base, 1 + npos);
-    let value = pyre_interpreter::baseobjspace::str_utf8_w(roots.get(pos_base));
-    let w = roots.get(base);
-    let kwargs = if w.is_null() { None } else { Some(w) };
-    let mut pos_buf = vec![pyre_object::PY_NULL; npos];
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
+    let n = args.len();
+    let base = roots.pin_roots(args);
+    let value = pyre_interpreter::baseobjspace::str_utf8_w(roots.get(base));
+    let name_arg = if n > 1 {
+        let w = roots.get(base + 1);
+        if w.is_null() { None } else { Some(w) }
+    } else {
+        None
+    };
     drop(roots);
     let value = value?;
-    let name_arg =
-        pyre_interpreter::builtins::bind_pos_or_kw(&pos_buf, kwargs, 1, "name", "txt2obj", 2)?;
-    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["name"], "txt2obj")?;
     let allow_names = name_arg
         .map(pyre_interpreter::baseobjspace::is_true)
         .transpose()?
@@ -3521,7 +3326,7 @@ pyre_interpreter::py_module! {
         "RAND_status" / 0 = rand_status,
         "RAND_add" / * = rand_add,
         "RAND_bytes" / 1 = rand_bytes,
-        "txt2obj" / * = txt2obj,
+        "txt2obj" / * = txt2obj; pyre_interpreter::Signature::new(vec!["txt", "name"], None, None, 0, 0),
         "nid2obj" / 1 = nid2obj,
         "get_default_verify_paths" / 0 = get_default_verify_paths,
         "_test_decode_cert" / 1 = test_decode_cert

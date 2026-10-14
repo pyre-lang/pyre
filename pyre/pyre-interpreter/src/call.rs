@@ -1412,58 +1412,67 @@ pub(crate) fn set_orig_class(
 /// here, and the JIT residual-call path in `pyre-jit`) must route through this
 /// to give a `*args`/optional-positional body the slot shape it reads.
 pub fn builtin_code_call_positional(
-    current_code: PyObjectRef,
+    current_callable: PyObjectRef,
     current_args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
+    let current_code = unsafe { crate::getcode(current_callable) } as PyObjectRef;
     if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code) } {
-        // Every HOPELESS signature needs `_match_signature`, not only
-        // *args/**kwargs/kw-only shapes.  A plain optional positional
-        // parameter also has HOPELESS fast arity; bypassing the binder let
+        // `function.py` `nargs == fast_natural_arity` then `fastcall_N`.
+        // A matching positional slice is already the bound scope.  Any other
+        // count (optional trailing slots, `*args`/`**kwargs`/kw-only
+        // `HOPELESS`) goes through `_match_signature`; bypassing it let
         // excess positionals reach the typed wrapper, which consumes its
         // declared prefix and silently ignores the rest.
-        if unsafe { crate::builtin_code_get_fast_natural_arity(current_code) } == crate::HOPELESS {
+        let arity = unsafe { crate::builtin_code_get_fast_natural_arity(current_code) };
+        let needs_bind = arity == crate::HOPELESS || current_args.len() != arity as usize;
+        if needs_bind {
             // `descr_check` before the binder: binding reports a surplus
             // positional or an unknown keyword, and upstream reaches neither
-            // until the receiver has answered for itself.
-            let (positional, _) = crate::builtins::split_builtin_kwargs(current_args);
-            unsafe {
-                crate::gateway::builtin_code_check_receiver(
-                    current_code as *const crate::gateway::BuiltinCode,
-                    positional,
-                )
-            }?;
-            let fname = unsafe {
-                crate::gateway::builtin_code_call_name(current_code, current_args.first().copied())
-            };
-            // `bind_kwargs_to_signature` reaches `store_collected_keyword`,
-            // and that `__hash__` can collect. `current_code` is read again
-            // for the binding error and for `builtin_code_call`, so publish
-            // it with the positional slice and read both back from the slots.
+            // until the receiver has answered for itself.  Pin the Function
+            // first so `funcrun_obj`'s `func.defs_w` / `func.w_kw_defs` stay
+            // live across that check and `_parse`.
             let n_args = current_args.len();
             let roots = pyre_object::gc_roots::push_roots();
-            let code_slot = roots.publish(&[current_code]);
+            let fn_slot = roots.publish(&[current_callable]);
             let args_base = roots.publish(current_args);
-            roots.normalize(code_slot, 1 + n_args);
+            roots.normalize(fn_slot, 1 + n_args);
+            let callable_now = roots.get(fn_slot);
+            let code_now = unsafe { crate::getcode(callable_now) } as PyObjectRef;
+            let args_for_check: Vec<PyObjectRef> =
+                (0..n_args).map(|i| roots.get(args_base + i)).collect();
+            unsafe {
+                crate::gateway::builtin_code_check_receiver(
+                    code_now as *const crate::gateway::BuiltinCode,
+                    &args_for_check,
+                )
+            }?;
+            let callable_now = roots.get(fn_slot);
+            let code_now = unsafe { crate::getcode(callable_now) } as PyObjectRef;
             let args_for_bind: Vec<PyObjectRef> =
                 (0..n_args).map(|i| roots.get(args_base + i)).collect();
-            let bound = match bind_kwargs_to_signature(sig, &fname, &args_for_bind, &[], &[]) {
-                Ok(bound) => bound,
-                Err(err) => {
-                    let code_now = roots.get(code_slot);
-                    let args_now: Vec<PyObjectRef> =
-                        (0..n_args).map(|i| roots.get(args_base + i)).collect();
-                    return Err(unsafe {
-                        crate::gateway::builtin_code_binding_error(
-                            code_now,
-                            sig,
-                            &args_now,
-                            &[],
-                            err,
-                        )
-                    });
-                }
+            let fname = unsafe {
+                crate::gateway::builtin_code_call_name(code_now, args_for_bind.first().copied())
             };
-            return unsafe { crate::builtin_code_call(roots.get(code_slot), &bound) };
+            let bound =
+                match bind_from_callable(callable_now, sig, &fname, &args_for_bind, &[], &[]) {
+                    Ok(bound) => bound,
+                    Err(err) => {
+                        let code_now = unsafe { crate::getcode(roots.get(fn_slot)) } as PyObjectRef;
+                        let args_now: Vec<PyObjectRef> =
+                            (0..n_args).map(|i| roots.get(args_base + i)).collect();
+                        return Err(unsafe {
+                            crate::gateway::builtin_code_binding_error(
+                                code_now,
+                                sig,
+                                &args_now,
+                                &[],
+                                err,
+                            )
+                        });
+                    }
+                };
+            let code_now = unsafe { crate::getcode(roots.get(fn_slot)) } as PyObjectRef;
+            return unsafe { crate::builtin_code_call(code_now, &bound) };
         }
     }
     unsafe { crate::builtin_code_call(current_code, current_args) }
@@ -1476,7 +1485,7 @@ fn call_builtin_code_many_from_roots(root_base: usize, nargs: usize) -> PyResult
     builtin_code_call_positional(rooted[0], &rooted[1..])
 }
 
-fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
+fn call_builtin_code_positional(callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     // `gateway.py BuiltinCode.funcrun` is translated with both its code
     // object and `Arguments.arguments_w` live across gateway dispatch.  A
     // collection between the outer `space.call_function` reload and this
@@ -1491,7 +1500,7 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     // whose return type reads Void, which panics the codewriter.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
-    let _ = _roots.pin_root(code);
+    let _ = _roots.pin_root(callable);
     for &arg in args {
         let _ = _roots.pin_root(arg);
     }
@@ -1499,30 +1508,30 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     // common fixed-arity cases the same way so source translation sees no Rust
     // array slicing/indexing helpers between the live roots and the gateway
     // indirect call.  The uncommon variadic case stays a residual helper.
-    let current_code = _roots.get(root_base);
+    let current_callable = _roots.get(root_base);
     match args.len() {
-        0 => builtin_code_call_positional(current_code, &[]),
+        0 => builtin_code_call_positional(current_callable, &[]),
         1 => {
             let a0 = _roots.get(root_base + 1);
-            builtin_code_call_positional(current_code, &[a0])
+            builtin_code_call_positional(current_callable, &[a0])
         }
         2 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
-            builtin_code_call_positional(current_code, &[a0, a1])
+            builtin_code_call_positional(current_callable, &[a0, a1])
         }
         3 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
             let a2 = _roots.get(root_base + 3);
-            builtin_code_call_positional(current_code, &[a0, a1, a2])
+            builtin_code_call_positional(current_callable, &[a0, a1, a2])
         }
         4 => {
             let a0 = _roots.get(root_base + 1);
             let a1 = _roots.get(root_base + 2);
             let a2 = _roots.get(root_base + 3);
             let a3 = _roots.get(root_base + 4);
-            builtin_code_call_positional(current_code, &[a0, a1, a2, a3])
+            builtin_code_call_positional(current_callable, &[a0, a1, a2, a3])
         }
         nargs => call_builtin_code_many_from_roots(root_base, nargs),
     }
@@ -1672,8 +1681,7 @@ fn call_function_carrier_with_mode(
                 }
                 return Ok(w_res);
             }
-            let code = unsafe { crate::getcode(callable) };
-            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
+            call_builtin_code_positional(callable, args)
         }
         CallableKind::User => match mode {
             CallMode::Jit => call_user_function_with_ctx(execution_context, callable, args),
@@ -2692,7 +2700,7 @@ pub fn call_callable_inline_residual(
 /// diagnostics, `*args` / `**kwargs` packing, error message text) matches
 /// CPython bit-for-bit.  Reifying an `Arguments` object with the same
 /// method surface is a separate, much larger refactor that would also
-/// re-thread `call_with_kwargs` / `bind_kwargs_to_signature`; it is out of
+/// re-thread `call_with_kwargs` / `parse_builtin_signature`; it is out of
 /// scope here and tracked as a follow-up.
 pub(crate) fn resolve_kwargs(
     callable: PyObjectRef,
@@ -3132,232 +3140,439 @@ unsafe fn store_collected_keyword(
     })
 }
 
-/// Bind keyword arguments to a builtin's declared `Signature`, producing
-/// the flat positional slice the `#[pyre_function]` wrapper reads.
-///
-/// Mirrors `resolve_kwargs` / `_match_keywords`, but sources parameter names
-/// from the `Signature` rather than a `CodeObject`, and leaves missing slots
-/// as `PY_NULL` (the wrapper applies its own `#[default]` values).  Excess
-/// positionals pack into the `*args` tuple when `varargname` is set;
-/// unmatched keywords pack into the `**kwargs` dict when `kwargname` is set,
-/// otherwise raise TypeError.
-///
-/// `keyword_names_w` and `keywords_w` are the wrapped lists
-/// `Arguments.keyword_names_w` keeps parallel. Callers that only have host
-/// buffers mint one exact `str` per name before calling.
-pub fn bind_kwargs_to_signature(
+fn function_defaults_vec(func: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+    let defaults = unsafe { crate::function_get_defaults(func) };
+    if defaults.is_null() || !unsafe { pyre_object::is_tuple(defaults) } {
+        return None;
+    }
+    let n = unsafe { pyre_object::w_tuple_len(defaults) };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(
+            unsafe { pyre_object::w_tuple_getitem(defaults, i as i64) }
+                .unwrap_or(pyre_object::PY_NULL),
+        );
+    }
+    Some(out)
+}
+
+fn bind_from_callable(
+    callable: PyObjectRef,
     sig: &crate::Signature,
     fname: &str,
     pos_args: &[PyObjectRef],
     keyword_names_w: &[PyObjectRef],
     keywords_w: &[PyObjectRef],
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    let nparams = sig.argnames.len();
-    let n_pos_params = sig.num_argnames(); // positional params (excludes kwonly tail)
-    let posonly = sig.posonlyargcount;
-    let has_varargs = sig.varargname.is_some();
-    let has_varkw = sig.kwargname.is_some();
-    let n_pos = pos_args.len();
-    let nkw = keyword_names_w.len();
-    debug_assert_eq!(nkw, keywords_w.len());
-
-    // A METH_O-style builtin accepts no keyword arguments — every parameter
-    // positional-only, no `**kwargs`, no keyword-only — so any keyword is
-    // rejected with the "takes no keyword arguments" form (e.g. `len`, `abs`).
-    if nkw > 0 && !has_varkw && sig.num_kwonlyargnames() == 0 && posonly == n_pos_params {
-        return builtin_keyword_failure(fname, &[], true);
-    }
-
-    // `_match_signature` flags too many positionals with no `*args` to
-    // absorb, but raises it only after keyword matching, so a
-    // duplicate/positional-only/unknown-keyword error on the same call wins
-    // first.
-    let too_many_args = n_pos > n_pos_params && !has_varargs;
-
-    // `_match_keywords` reads `keyword_names_w[i]` and `keywords_w[i]`. Both
-    // lists are wrapped, so publish them with the positionals before the
-    // first allocating call and read each name from its slot.
-    let roots = pyre_object::gc_roots::push_roots();
-    let pos_args_slot = roots.base();
-    let _ = roots.publish(pos_args);
-    let keyword_values_slot = pos_args_slot + n_pos;
-    let _ = roots.publish(keywords_w);
-    let keyword_names_slot = keyword_values_slot + nkw;
-    let _ = roots.publish(keyword_names_w);
-    roots.normalize(pos_args_slot, n_pos + nkw + nkw);
-    let result_slot = keyword_names_slot + nkw;
-    for _ in 0..nparams {
-        let _ = roots.pin_root(pyre_object::PY_NULL);
-    }
-    for i in 0..n_pos.min(n_pos_params) {
-        roots.set(result_slot + i, roots.get(pos_args_slot + i));
-    }
-
-    // `_match_keywords` — match each keyword to a param name by index.
-    // `_collect_keyword_args` keeps keyword names and values in parallel
-    // lists (`keyword_names_w`, `keywords_w`) and uses `kwds_mapping` only
-    // to select unmatched positions. Record the unmatched indices into those
-    // two rooted lists.
-    let mut extra_kw_indices: Vec<usize> = Vec::new();
-    let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
-    // `ArgErrPosonlyAsKwds` is collected across the whole loop and reported
-    // together, after the scan.
-    let mut posonly_kwds: Vec<String> = Vec::new();
-    for kw_index in 0..nkw {
-        let w_name = roots.get(keyword_names_slot + kw_index);
-        // `_match_keywords` delegates this lookup to `Signature.find_w_argname`.
-        // A non-str or a lone surrogate returns -1 and falls through to
-        // `**kwargs` or the unexpected-keyword error below.
-        let pi = sig.find_w_argname(w_name);
-        let mut matched = false;
-        if pi >= 0 {
-            let pi = pi as usize;
-            // Positional-only param passed by keyword: absorb into **kwargs
-            // when that slot exists, otherwise record `ArgErrPosonlyAsKwds`.
-            if pi < posonly {
-                if !has_varkw {
-                    posonly_kwds.push(keyword_name_text(w_name).to_string());
-                    matched = true;
-                }
-            } else if !roots.get(result_slot + pi).is_null() {
-                return builtin_multiple_values_failure(fname, &keyword_name_text(w_name));
-            } else {
-                roots.set(result_slot + pi, roots.get(keyword_values_slot + kw_index));
-                matched = true;
-            }
-        }
-        if !matched {
-            if has_varkw {
-                extra_kw_indices.push(kw_index);
-            } else {
-                unmatched_kw_names.push(keyword_name_text(w_name));
-            }
-        }
-    }
-
-    // argument.py — ArgErrPosonlyAsKwds, raised after the full
-    // keyword scan and before ArgErrUnknownKwds.
-    raise_if_posonly_kwds(&posonly_kwds, Wtf8::new(fname))?;
-
-    if !unmatched_kw_names.is_empty() {
-        // parse_obj (argument.py) rewrites the unknown-keyword message
-        // to "takes no keyword arguments" when the signature accepts no keywords
-        // at all (no **kwargs and no keyword-only params). Every BuiltinCode
-        // call routes through parse_obj (gateway.py funcrun / funcrun_obj), so
-        // the rewrite applies at any arity, not just the single-argument form.
-        return builtin_keyword_failure(
-            fname,
-            &unmatched_kw_names,
-            !has_varkw && sig.num_kwonlyargnames() == 0,
-        );
-    }
-
-    // argument.py:289 — too-many-positionals is raised last, after the
-    // keyword-matching errors above.
-    if too_many_args {
-        return builtin_too_many_positional_failure(fname, n_pos_params as i64, n_pos as i64);
-    }
-
-    // Pack `*args` / `**kwargs` tails — `_match_signature`.
-    // The bound parameters, keyword names, and keyword values are reloaded
-    // from their rooted parallel lists across the packing allocations.
-    // `_match_keywords` reads `keyword_names_w` and `keywords_w`, so both
-    // lists are published with the positionals before matching.
-    if !has_varargs && !has_varkw {
-        let mut result = Vec::with_capacity(nparams);
-        for i in 0..nparams {
-            result.push(roots.get(result_slot + i));
-        }
-        return Ok(result);
-    }
-    let varargs_slot = result_slot + nparams;
-    if has_varargs {
-        let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
-            // argument.py `_match_signature` slices `args_w[input_argcount:]`.
-            // Reload the rooted list first so the Rust slice contains the
-            // post-collection addresses, then preserve that upstream slice.
-            let mut rooted_pos_args = Vec::with_capacity(n_pos);
-            for i in 0..n_pos {
-                rooted_pos_args.push(roots.get(pos_args_slot + i));
-            }
-            let mut extra_pos = Vec::with_capacity(n_pos - n_pos_params);
-            let mut i = n_pos_params;
-            while i < n_pos {
-                extra_pos.push(rooted_pos_args[i]);
-                i += 1;
-            }
-            extra_pos
-        } else {
-            vec![]
-        };
-        let _ = roots.pin_root(pyre_object::w_tuple_new(extra_pos));
-    }
-    let varkw_slot = varargs_slot + usize::from(has_varargs);
-    if has_varkw {
-        let _ = roots.pin_root(pyre_object::w_dict_new_kwargs());
-        // The index loop lowers to direct one-word element loads; iterator
-        // adapters are residual calls.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..extra_kw_indices.len() {
-            let kw_index = extra_kw_indices[i];
-            unsafe {
-                store_collected_keyword(
-                    roots.get(varkw_slot),
-                    roots.get(keyword_names_slot + kw_index),
-                    roots.get(keyword_values_slot + kw_index),
-                )?;
-            }
-        }
-    }
-    let mut result: Vec<PyObjectRef> =
-        Vec::with_capacity(nparams + usize::from(has_varargs) + usize::from(has_varkw));
-    for i in 0..nparams {
-        result.push(roots.get(result_slot + i));
-    }
-    if has_varargs {
-        result.push(roots.get(varargs_slot));
-    }
-    if has_varkw {
-        result.push(roots.get(varkw_slot));
-    }
-
-    Ok(result)
-}
-
-/// Cold `ArgErrMultipleValues.getmsg` materialisation.
-///
-/// PyPy's `_match_signature` returns `ArgErrMultipleValues(argname)` and
-/// `Arguments.parse_obj` formats it only on the rejected-call path.  Pyre's
-/// `PyError` carries the eager message, so centralize that materialisation in
-/// the corresponding rejected-call helper instead of duplicating it in every
-/// generated gateway graph that calls the matcher.
-#[cold]
-fn builtin_multiple_values_failure(
-    fname: &str,
-    key: &Wtf8Buf,
-) -> Result<Vec<PyObjectRef>, PyError> {
-    Err(PyError::type_error(format!(
-        "{}() got multiple values for argument '{}'",
-        fname, key
-    )))
-}
-
-/// Cold `ArgErrTooMany.getmsg` materialisation; see
-/// [`builtin_multiple_values_failure`].
-#[cold]
-fn builtin_too_many_positional_failure(
-    fname: &str,
-    expected: i64,
-    given: i64,
-) -> Result<Vec<PyObjectRef>, PyError> {
-    Err(PyError::type_error(format!(
-        "{}() takes {} positional argument{} but {} {} given",
+    let defaults = function_defaults_vec(callable);
+    let w_kw_defs = unsafe { crate::function_get_kwdefaults(callable) };
+    parse_builtin_signature(
+        sig,
         fname,
-        expected,
-        if expected != 1 { "s" } else { "" },
-        given,
-        if given != 1 { "were" } else { "was" },
-    )))
+        pos_args,
+        keyword_names_w,
+        keywords_w,
+        defaults.as_deref(),
+        w_kw_defs,
+    )
+}
+
+/// `Arguments.parse_obj` for a builtin, with `Function.defs_w` / `w_kw_defs`
+/// when registration has filled them (`interp2app` `_getdefaults`).
+pub fn parse_builtin_signature(
+    sig: &crate::Signature,
+    fname: &str,
+    pos_args: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    keywords_w: &[PyObjectRef],
+    defaults_w: Option<&[PyObjectRef]>,
+    w_kw_defs: PyObjectRef,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    // `Arguments::with_kw` allocates. Pin the binder inputs first and
+    // reload them afterwards so `_parse` never sees pre-collection
+    // pointers (`argument.py` stores the same lists on `Arguments`,
+    // which is traced).  `w_kw_defs` is already on the Function
+    // (`interp2app` `_getdefaults`).
+    let npos = pos_args.len();
+    let nkw = keyword_names_w.len();
+    let ndef = defaults_w.map(|d| d.len()).unwrap_or(0);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pos_base = pyre_object::gc_roots::pin_roots(pos_args);
+    let names_base = pyre_object::gc_roots::pin_roots(keyword_names_w);
+    let values_base = pyre_object::gc_roots::pin_roots(keywords_w);
+    let defaults_base = defaults_w.map(|d| pyre_object::gc_roots::pin_roots(d));
+    let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_kw_defs);
+    // `Function.w_kw_defs` is filled at registration
+    // (`with_registered_kwonly_defaults` / `interp2app` `_getdefaults`).
+    let w_kw_defs = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot);
+    let pos_now: Vec<PyObjectRef> = (0..npos)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
+        .collect();
+    let names_now: Vec<PyObjectRef> = (0..nkw)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+        .collect();
+    let values_now: Vec<PyObjectRef> = (0..nkw)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
+        .collect();
+    let defaults_now: Option<Vec<PyObjectRef>> = defaults_base.map(|base| {
+        (0..ndef)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect()
+    });
+    let arguments = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+    let pad;
+    let defaults = match defaults_now.as_deref() {
+        Some(d) => Some(d),
+        None => {
+            pad = vec![pyre_object::PY_NULL; sig.num_argnames()];
+            Some(pad.as_slice())
+        }
+    };
+    // Clinic `_PyArg_UnpackKeywords` names a method by its function, not
+    // `Type.function`.  All-posonly descriptors keep the qualified
+    // parse_obj spelling (`dict.get() takes no keyword arguments`).
+    let fname = clinic_method_bind_name(sig, fname);
+    // [3.14-spec] clinic counts nargs+nkwargs against the declared
+    // parameter total when the signature accepts keywords.  parse_obj
+    // reports UnknownKwds / TooMany instead (`argument.py`).  Measured
+    // against 3.14.6: `sum([1], **{K:0, "start":3})` is
+    // `takes at most 2 arguments (3 given)`; `int("5", 10, 1)` is
+    // `int expected at most 2 arguments, got 3` (`_PyArg_CheckPositional`
+    // on `descr_new`, cls excluded).  A `**kwargs` slot packs unmatched
+    // names (`argument.py` `_collect_keyword_args`), so this overlay
+    // stays off when `has_kwarg`.
+    if signature_accepts_keywords(sig)
+        && !sig.has_vararg()
+        && !sig.has_kwarg()
+        && npos + nkw > sig.argnames.len()
+    {
+        let skip = usize::from(signature_cls_constructor(sig) || signature_method_self(sig));
+        let n = sig.argnames.len() - skip;
+        let m = npos + nkw - skip;
+        // `_PyArg_CheckPositional` (`int("5", 10, 1)` → `int expected at most
+        // 2 arguments, got 3`) applies when user-facing parameters after
+        // `cls` are still positional-only. Clinic METH_KEYWORDS constructors
+        // (`traceback`) use `{fname}() takes at most {n} arguments ({m}
+        // given)` for an all-positional overflow as well.
+        // [3.14-spec] `unicode_new` uses `PyArg_UnpackTuple(..., "str", 0, 3)`
+        // so `str("a","b","c","d")` is `str expected at most 3 arguments, got 4`
+        // even though encoding/errors are positional-or-keyword. `bytes` stays
+        // on the clinic form. Measured 3.14.6; `test_str.StrTest.test_str_invalid_call`.
+        if signature_cls_constructor(sig)
+            && nkw == 0
+            && (sig.posonlyargcount > skip || fname == "str")
+        {
+            let argword = if n == 1 { "argument" } else { "arguments" };
+            return Err(crate::PyError::type_error(format!(
+                "{fname} expected at most {n} {argword}, got {m}"
+            )));
+        }
+        // Receiver excluded, same count `_PyArg_UnpackKeywords` reports:
+        // `expandtabs(2, 3)` is "takes at most 1 argument (2 given)";
+        // `expandtabs(one=1, two=2)` is "takes at most 1 keyword argument
+        // (2 given)" because no positional was supplied after `self`.
+        let npos_user = npos.saturating_sub(skip);
+        crate::builtins::clinic_arity(fname, npos_user, nkw, 0, n, 0)?;
+    }
+    let mut scope_w = match arguments._parse(pyre_object::PY_NULL, sig, defaults, w_kw_defs, 0) {
+        Ok(scope) => scope,
+        Err(crate::argument::MatchSignatureError::Shape(err)) => {
+            let names_now: Vec<PyObjectRef> = (0..nkw)
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+                .collect();
+            // Clinic `_PyArg_UnpackKeywords` reports the first empty required
+            // slot even when the call also passed an unknown or duplicate
+            // keyword (`traceback(None, frame, 0, spam=1)`).
+            if matches!(
+                err,
+                crate::argument::ArgErr::UnknownKwds { .. }
+                    | crate::argument::ArgErr::MultipleValues { .. }
+            ) && let Some(msg) =
+                clinic_first_unfilled_required(sig, fname, npos, ndef, &names_now)
+            {
+                return Err(crate::PyError::type_error(msg));
+            }
+            return Err(rewrite_builtin_keyword_error(sig, fname, &names_now, err));
+        }
+        Err(crate::argument::MatchSignatureError::Py(err)) => return Err(err),
+    };
+    let names_now: Vec<PyObjectRef> = (0..nkw)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+        .collect();
+    rewrite_omitted_kwonly_none_to_null(sig, &mut scope_w, &names_now);
+    Ok(scope_w)
+}
+
+/// True when a caller may pass a keyword that names a parameter
+/// (`start=` on `sum`, kw-only tails, `**kwargs`).  All-posonly
+/// signatures stay on parse_obj's `takes no keyword arguments`.
+fn signature_accepts_keywords(sig: &crate::Signature) -> bool {
+    sig.has_kwarg() || sig.num_kwonlyargnames() > 0 || sig.num_argnames() > sig.posonlyargcount
+}
+
+fn signature_cls_constructor(sig: &crate::Signature) -> bool {
+    sig.argnames.first().copied() == Some("cls")
+}
+
+fn signature_method_self(sig: &crate::Signature) -> bool {
+    sig.argnames.first().copied() == Some("self") && sig.posonlyargcount >= 1
+}
+
+/// Clinic METH_KEYWORDS method wrappers report the function name
+/// (`expandtabs()`, `tobytes()`).  `Arguments.parse_obj` otherwise
+/// prefixes `Function.name`, which for a descriptor is `Type.function`.
+fn clinic_method_bind_name<'a>(sig: &crate::Signature, fname: &'a str) -> &'a str {
+    if signature_accepts_keywords(sig) && sig.argnames.first().copied() == Some("self") {
+        fname
+            .rsplit_once('.')
+            .map(|(_, name)| name)
+            .unwrap_or(fname)
+    } else {
+        fname
+    }
+}
+
+/// Clinic wording for the first required positional-or-keyword slot left
+/// empty. `ndef` is `Function.defs_w` length, not the PY_NULL pad.
+fn clinic_first_unfilled_required(
+    sig: &crate::Signature,
+    fname: &str,
+    npos: usize,
+    ndef: usize,
+    keyword_names_w: &[PyObjectRef],
+) -> Option<String> {
+    if !signature_accepts_keywords(sig) || sig.has_kwarg() || sig.has_vararg() {
+        return None;
+    }
+    let skip = usize::from(signature_cls_constructor(sig));
+    // `sum` / `round` are not constructors; an unknown keyword is
+    // `got an unexpected keyword argument` even when a later optional
+    // slot is empty. Restrict to `cls` constructors (`traceback`).
+    if skip == 0 {
+        return None;
+    }
+    let n_pos_params = sig.num_argnames();
+    let optional_start = n_pos_params.saturating_sub(ndef);
+    // `int.base` is the trailing pos-or-kw of a descr_new that still has
+    // user-facing positional-only parameters. `Function.defs_w` is often
+    // empty, so treat that last slot as optional rather than required.
+    let user_posonly = sig.posonlyargcount.saturating_sub(skip);
+    for i in skip..n_pos_params {
+        if npos > i {
+            continue;
+        }
+        let name = sig.argnames[i];
+        let filled_by_kw = keyword_names_w
+            .iter()
+            .any(|&w_name| keyword_name_utf8(&keyword_name_text(w_name)) == Some(name));
+        if filled_by_kw {
+            continue;
+        }
+        if i >= optional_start {
+            continue;
+        }
+        if user_posonly > 0 && i + 1 == n_pos_params {
+            continue;
+        }
+        let pos = i - skip + 1;
+        return Some(format!(
+            "{fname}() missing required argument '{name}' (pos {pos})"
+        ));
+    }
+    None
+}
+
+/// [3.14-spec] overlay on `ArgErr` variants while they are still known.
+/// `parse_obj` (`argument.py`) reports `ArgErrUnknownKwds` as
+/// `takes no keyword arguments` when there is no `**` and no kw-only, and
+/// `ArgErrPosonlyAsKwds` as `got some positional-only arguments passed as
+/// keyword arguments`.  3.14.6 names the extra key once the signature
+/// already accepts some keywords (`round(1.5, **{K:0})`, `int(x=5)`,
+/// `sum([1,2], **{K:0})`).  `ArgErrMultipleValues` is clinic's
+/// `argument for fname() given by name ('x') and position (n)`
+/// (`str(b"x", "utf-8", encoding="ascii")`, hashlib `data=` + positional).
+fn rewrite_builtin_keyword_error(
+    sig: &crate::Signature,
+    fname: &str,
+    keyword_names_w: &[PyObjectRef],
+    err: crate::argument::ArgErr,
+) -> crate::PyError {
+    match &err {
+        crate::argument::ArgErr::MultipleValues { argname } if signature_accepts_keywords(sig) => {
+            let skip = usize::from(signature_cls_constructor(sig));
+            let idx = sig.find_argname(argname);
+            let pos = if idx >= 0 {
+                (idx as usize + 1).saturating_sub(skip)
+            } else {
+                1
+            };
+            crate::PyError::type_error(format!(
+                "argument for {fname}() given by name ('{argname}') and position ({pos})"
+            ))
+        }
+        crate::argument::ArgErr::UnknownKwds { .. }
+        | crate::argument::ArgErr::PosonlyAsKwds { .. }
+            if signature_accepts_keywords(sig) =>
+        {
+            match first_unexpected_keyword_name(sig, keyword_names_w) {
+                Some(name) => crate::PyError::type_error(crate::display::wtf8_format!(
+                    format!("{fname}() got an unexpected keyword argument '"),
+                    name,
+                    "'",
+                )),
+                None => format_parse_obj_argerr(fname, sig, err),
+            }
+        }
+        _ => format_parse_obj_argerr(fname, sig, err),
+    }
+}
+
+/// `Arguments.parse_obj` TypeError text for an `ArgErr`.
+fn format_parse_obj_argerr(
+    fname: &str,
+    sig: &crate::Signature,
+    err: crate::argument::ArgErr,
+) -> crate::PyError {
+    if let crate::argument::ArgErr::UnknownKwds { .. } = &err
+        && !sig.has_kwarg()
+        && sig.num_kwonlyargnames() == 0
+    {
+        return crate::PyError::type_error(format!("{fname}() takes no keyword arguments"));
+    }
+    crate::PyError::type_error(crate::display::wtf8_format!(
+        format!("{fname}() "),
+        err.getmsg_wtf8()
+    ))
+}
+
+fn first_unexpected_keyword_name(
+    sig: &crate::Signature,
+    keyword_names_w: &[PyObjectRef],
+) -> Option<Wtf8Buf> {
+    for &w_name in keyword_names_w {
+        let text = keyword_name_text(w_name);
+        match keyword_name_utf8(&text) {
+            Some(name) => {
+                let idx = sig.find_argname(name);
+                if idx >= 0 && (idx as usize) >= sig.posonlyargcount {
+                    continue;
+                }
+                return Some(text);
+            }
+            None => return Some(text),
+        }
+    }
+    None
+}
+
+/// Residual `BuiltinCodePassThroughArguments0.funcrun`.
+#[majit_macros::dont_look_inside]
+fn call_passthrough0(
+    func_args: crate::gateway::BuiltinCodePassThroughFn0,
+    arguments: &crate::argument::Arguments,
+) -> PyResult {
+    func_args(arguments)
+}
+
+/// Residual `BuiltinCodePassThroughArguments1.funcrun_obj`.
+#[majit_macros::dont_look_inside]
+fn call_passthrough1(
+    func_args: crate::gateway::BuiltinCodePassThroughFn1,
+    w_obj: PyObjectRef,
+    arguments: &crate::argument::Arguments,
+) -> PyResult {
+    func_args(w_obj, arguments)
+}
+
+/// Residual `W_PyCWrapperObject.descr_call(..., w_self, __args__)`.
+#[majit_macros::dont_look_inside]
+fn call_passthrough_wrapper(
+    call_args: crate::gateway::WrapperCallArgsFn,
+    slot: *const std::ffi::c_void,
+    w_obj: PyObjectRef,
+    arguments: &crate::argument::Arguments,
+) -> PyResult {
+    call_args(slot, w_obj, arguments)
+}
+
+/// `baseobjspace.py call_args_and_c_profile` around a passthrough body.
+/// Keyword passthrough used to return from `funcrun` without the `c_call`
+/// the positional slice ABI still emits, so `profile.Profile` never saw
+/// `max([0], key=int)` as `:0(max)`.
+fn call_passthrough_maybe_profile(
+    profile_frame: *mut PyFrame,
+    current_callable: impl Fn() -> PyObjectRef,
+    make_args: impl Fn() -> crate::argument::Arguments,
+    body: impl FnOnce(&crate::argument::Arguments) -> PyResult,
+) -> PyResult {
+    let frame_ptr = c_profile_frame(profile_frame);
+    if frame_ptr.is_null() {
+        let arguments = make_args();
+        return body(&arguments);
+    }
+    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
+    let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
+    let arguments = make_args();
+    if !ec.is_null() {
+        unsafe {
+            (*ec).c_call_trace(frame_anchor.live(), current_callable(), Some(&arguments))?;
+        }
+    }
+    let arguments = make_args();
+    match body(&arguments) {
+        Ok(w_res) => {
+            let result_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_res);
+            if !ec.is_null() {
+                let arguments = make_args();
+                unsafe {
+                    (*ec).c_return_trace(
+                        frame_anchor.live(),
+                        current_callable(),
+                        Some(&arguments),
+                    )?;
+                }
+            }
+            Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
+        }
+        Err(err) => {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut err = err;
+            let err_slot = err.pin(&_roots);
+            if !ec.is_null() {
+                unsafe {
+                    (*ec).c_exception_trace(frame_anchor.live(), current_callable())?;
+                }
+            }
+            err.reload(&_roots, err_slot);
+            Err(err)
+        }
+    }
+}
+
+/// Wrappers that still test `is_null()` for an omitted kw-only slot get
+/// `PY_NULL` when `_match_signature` filled the registered `None` default.
+/// A non-None `w_kw_defs` entry (`isclose` `rel_tol=1e-09`) is left alone.
+fn rewrite_omitted_kwonly_none_to_null(
+    sig: &crate::Signature,
+    scope_w: &mut [PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+) {
+    let n_pos = sig.num_argnames();
+    for i in 0..sig.num_kwonlyargnames() {
+        let name = sig.argnames[n_pos + i];
+        let provided = keyword_names_w
+            .iter()
+            .any(|&w_name| keyword_name_utf8(&keyword_name_text(w_name)) == Some(name));
+        if provided {
+            continue;
+        }
+        let slot = n_pos + i;
+        if slot < scope_w.len() && unsafe { pyre_object::is_none(scope_w[slot]) } {
+            scope_w[slot] = pyre_object::PY_NULL;
+        }
+    }
 }
 
 /// [`call_with_kwargs_in_ctx`] reached from a frame.  The caller frame is
@@ -3375,6 +3590,26 @@ pub fn call_with_kwargs(
 ) -> PyResult {
     let _ = frame;
     call_with_kwargs_in_ctx(getexecutioncontext(), callable, pos_args, kwargs)
+}
+
+/// `space.call_args(w_func, args)` — keywords stay on `Arguments`
+/// (`keyword_names_w` / `keywords_w`).
+pub fn call_args(callable: PyObjectRef, args: &crate::argument::Arguments) -> PyResult {
+    let pos = args.arguments_w.as_slice();
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    if names.is_empty() {
+        return call_function_impl_result(callable, pos);
+    }
+    call_with_kwargs_in_ctx_impl(
+        getexecutioncontext(),
+        callable,
+        pos,
+        names,
+        values,
+        true,
+        std::ptr::null_mut(),
+    )
 }
 
 /// Call a user function with positional args + keyword args from a dict.
@@ -3591,30 +3826,81 @@ fn call_with_kwargs_in_ctx_impl(
             crate::typedef::slot_wrapper_check_instance(current_callable(), receiver)?;
         }
         let code = unsafe { crate::getcode(current_callable()) };
-        // For builtins: pack kwargs into a dict as last arg.
-        //
-        // PRE-EXISTING-ADAPTATION (builtin kwargs ABI). PyPy gives every
-        // builtin a real Signature (`gateway.py BuiltinCode`, `:804
-        // self.sig = app_sig.signature()`) and `funcrun_obj` (`gateway.py`)
-        // resolves keywords by name through `args.parse_obj` →
-        // `_match_signature` (`argument.py:173`), exactly like a user function;
-        // there is no marker dict. Pyre's builtin ABI is a flat
-        // `&[PyObjectRef]` slice (`BuiltinCodeFn`), so kwargs are smuggled as a
-        // trailing dict tagged with the `__pyre_kw__` sentinel and each
-        // kwarg-aware builtin reads it manually (`builtins::split_builtin_kwargs`).
-        // CONVERGENCE PATH: port the gateway Signature/unwrap_spec surface for
-        // builtins, then route builtin kwargs through `Arguments::_match_signature`
-        // into named parameter slots and delete `__pyre_kw__`. Deferred: that is
-        // a standalone multi-slice epic (no builtin-Signature machinery exists
-        // yet) and the JIT inline-call path consumes the same flat tail
-        // (`pyre-jit/src/eval.rs`), so it cannot land in one ≤12-file slice.
-        // Keep the marker here, in the one builtin kwargs packing site, so
-        // CALL_KW and CALL_FUNCTION_EX have the same shape.
+        // `gateway.py BuiltinCode.funcrun_obj` / `PassThroughArguments0/1.funcrun`.
+        // Keywords stay on `Arguments.keyword_names_w` / `keywords_w`. A
+        // `Signature` binds through `parse_obj`; a passthrough body receives
+        // the `Arguments` object. Remaining null-sig HOPELESS builtins take
+        // no keywords (`arity <= 4` and `HOPELESS` alike).
         if unsafe { crate::is_builtin_code(code as pyre_object::PyObjectRef) } {
+            // `BuiltinCodePassThroughArguments0/1.funcrun`: keywords stay
+            // out of band on `Arguments`.  A no-keyword call never reaches
+            // here, so the positional slice ABI (`func`) is unchanged.
+            let code_obj = code as pyre_object::PyObjectRef;
+            // `W_PyCWrapperObject.descr_call(..., w_self, __args__)`.
+            // `__init__`/`__call__` are retagged `SLOT_WRAPPER_TYPE`;
+            // `__new__` stays a Function with `new_self` (`function_set_new_self`)
+            // but still carries `WrapperCall.call_args`. Dispatch on that
+            // field, not on `is_slot_wrapper`.
+            if let Some((slot, call_args)) =
+                unsafe { crate::gateway::builtin_code_wrapper_call_args(code_obj) }
+            {
+                if npos == 0 {
+                    return Err(PyError::type_error(format!(
+                        "{}() missing 1 required positional argument",
+                        unsafe { crate::gateway::builtin_code_name(code_obj) }
+                    )));
+                }
+                return call_passthrough_maybe_profile(
+                    profile_anchor.live(),
+                    current_callable,
+                    || {
+                        let rest: Vec<PyObjectRef> = (1..npos).map(current_pos_arg).collect();
+                        let names_now = rooted_names();
+                        let values_now = rooted_values();
+                        crate::argument::Arguments::with_kw(&rest, &names_now, &values_now)
+                    },
+                    |arguments| {
+                        call_passthrough_wrapper(call_args, slot, current_pos_arg(0), arguments)
+                    },
+                );
+            }
+            if let Some(func_args) = unsafe { crate::gateway::builtin_code_passthrough0(code_obj) }
+            {
+                return call_passthrough_maybe_profile(
+                    profile_anchor.live(),
+                    current_callable,
+                    || {
+                        let pos_now = rooted_pos();
+                        let names_now = rooted_names();
+                        let values_now = rooted_values();
+                        crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now)
+                    },
+                    |arguments| call_passthrough0(func_args, arguments),
+                );
+            }
+            if let Some(func_args) = unsafe { crate::gateway::builtin_code_passthrough1(code_obj) }
+            {
+                if npos == 0 {
+                    return Err(PyError::type_error(format!(
+                        "{}() missing 1 required positional argument",
+                        unsafe { crate::gateway::builtin_code_name(code_obj) }
+                    )));
+                }
+                return call_passthrough_maybe_profile(
+                    profile_anchor.live(),
+                    current_callable,
+                    || {
+                        let rest: Vec<PyObjectRef> = (1..npos).map(current_pos_arg).collect();
+                        let names_now = rooted_names();
+                        let values_now = rooted_values();
+                        crate::argument::Arguments::with_kw(&rest, &names_now, &values_now)
+                    },
+                    |arguments| call_passthrough1(func_args, current_pos_arg(0), arguments),
+                );
+            }
             // Signature-bearing builtins bind keywords into positional
-            // order via their declared Signature instead of receiving a
-            // trailing `__pyre_kw__` dict.  A null sig (every builtin
-            // today) falls through to the dict-packing path below.
+            // order via their declared Signature.  A null sig refuses
+            // keywords the way a fixed-arity builtin does.
             if let Some(sig) =
                 unsafe { crate::builtin_code_get_signature(code as pyre_object::PyObjectRef) }
             {
@@ -3668,7 +3954,8 @@ fn call_with_kwargs_in_ctx_impl(
                     let pos_now = rooted_pos();
                     let names_now = rooted_names();
                     let values_now = rooted_values();
-                    let bound = match bind_kwargs_to_signature(
+                    let bound = match bind_from_callable(
+                        current_callable(),
                         sig,
                         &fname,
                         &pos_now,
@@ -3748,7 +4035,8 @@ fn call_with_kwargs_in_ctx_impl(
                 let pos_now = rooted_pos();
                 let names_now = rooted_names();
                 let values_now = rooted_values();
-                let bound = match bind_kwargs_to_signature(
+                let bound = match bind_from_callable(
+                    current_callable(),
                     sig,
                     &fname,
                     &pos_now,
@@ -3782,10 +4070,7 @@ fn call_with_kwargs_in_ctx_impl(
                     )
                 };
             }
-            let arity = unsafe {
-                crate::builtin_code_get_fast_natural_arity(code as pyre_object::PyObjectRef)
-            };
-            if arity <= 4 && nkw > 0 {
+            if nkw > 0 {
                 let receiver = if npos == 0 {
                     None
                 } else {
@@ -3798,90 +4083,8 @@ fn call_with_kwargs_in_ctx_impl(
                     )
                 });
             }
-            // `gct_fv_gc_malloc` bracket (`framework.py`) for the kwargs
-            // dict below.  `w_dict_new` allocates in the nursery, so the fresh
-            // dict is a young object no root names, and every step that follows
-            // allocates: `w_dict_store`'s strategy promotion and the call this
-            // frame ends in.  An allocation leaves RUNNING before taking
-            // `gc_mutex` (`gc_sync.rs`), so a collector on another thread runs
-            // there and relocates or reclaims anything the shadow stack does
-            // not name.  The scope reaches every `return` below, which is
-            // where the dict stops being a livevar.
-            //
-            // The positionals, the keyword values and the wrapped names are
-            // already pinned by this function's entry bracket, so they are
-            // read back through `current_pos_arg` / `current_kwarg` /
-            // `current_kw_name`. `_collect_keyword_args` setitems that name
-            // object.
-            let kw_roots = pyre_object::gc_roots::push_roots();
-            let kw_slot = kw_roots.base();
-            if nkw > 0 {
-                let _ = kw_roots.pin_root(pyre_object::w_dict_new());
-                for index in 0..nkw {
-                    unsafe {
-                        pyre_object::w_dict_store(
-                            kw_roots.get(kw_slot),
-                            current_kw_name(index),
-                            current_kwarg(index),
-                        );
-                    }
-                }
-                // Store the marker last so a user keyword literally named
-                // `__pyre_kw__` cannot overwrite the sentinel: the reserved
-                // key always resolves to the sentinel value that detection
-                // compares by identity.
-                unsafe {
-                    let marker_key = pyre_object::kw_marker::w_kw_marker_key();
-                    let marker_value = pyre_object::kw_marker::w_kw_marker_sentinel();
-                    pyre_object::w_dict_store(kw_roots.get(kw_slot), marker_key, marker_value);
-                }
-            }
-            let mut full_args: Vec<PyObjectRef> = (0..npos).map(current_pos_arg).collect();
-            if nkw > 0 {
-                full_args.push(kw_roots.get(kw_slot));
-                // Step 2 of the Arguments port: when this is a profiled
-                // builtin call AND kwargs are present, route through
-                // `call_args_and_c_profile_args` with a structured
-                // `Arguments::with_kw(pos_args, keyword_names_w,
-                // keywords_w)`.  Otherwise `call_args_and_c_profile`
-                // (reached via `call_callable`'s on_builtin closure)
-                // would build `Arguments::positional_only(full_args)`
-                // and surface the trailing kwargs dict at index 0,
-                // breaking the FunctionWithFixedCode rebinding's
-                // firstarg() (`argument.py` returns `None`
-                // when positional count is zero, not the kwargs dict).
-                let frame_ptr = c_profile_frame(profile_anchor.live());
-                if !frame_ptr.is_null() {
-                    // The argument marshalling below allocates before the frame
-                    // is handed to the profiling call, so the profiled frame is
-                    // read back out of the anchor rather than from this local.
-                    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
-                    // The dict stores above can move the positionals, the
-                    // names and the dict. Read each back from its slot.
-                    let pos_now = rooted_pos();
-                    let names_now = rooted_names();
-                    let values_now = rooted_values();
-                    let mut arguments =
-                        crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
-                    full_args = pos_now
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(kw_roots.get(kw_slot)))
-                        .collect();
-                    let w_res = crate::baseobjspace::call_args_and_c_profile_args(
-                        unsafe { &mut *frame_anchor.live() },
-                        current_callable(),
-                        &mut arguments,
-                        &full_args,
-                    );
-                    if w_res == pyre_object::PY_NULL {
-                        return Err(take_call_error()
-                            .unwrap_or_else(|| crate::PyError::value_error("call failed")));
-                    }
-                    return Ok(w_res);
-                }
-            }
-            return call_callable_in_ctx(execution_context, current_callable(), &full_args);
+            let pos = rooted_pos();
+            return call_callable_in_ctx(execution_context, current_callable(), &pos);
         }
 
         // For user functions: resolve kwargs to parameter slots
@@ -4255,8 +4458,7 @@ fn call_with_kwargs_in_ctx_impl(
         // (`cdata=` on `_cffi_backend.buffer`, `format=` on `_lzma`, `ident=`
         // on `select.kevent`) are non-acceptable-as-base too. Route those
         // through `__new__` / `__init__`.  `traceback` and `memoryview` bind
-        // the keywords in the body instead of through a `Signature`, so the
-        // marker dict has to reach `__new__` rather than be refused here.
+        // the keywords in the body instead of through a `Signature`.
         let accepts_keywords_despite_nonbase = std::ptr::eq(
             current_type(),
             crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
@@ -4313,7 +4515,9 @@ fn call_with_kwargs_in_ctx_impl(
             // pre-lookup addresses.
             new_args.push(current_metaclass());
             extend_current_args(&mut new_args);
-            if unsafe { crate::is_function(new_fn) } && nkw > 0 {
+            // typeobject.py descr_call: `space.call_obj_args(w_newfunc, self, __args__)`.
+            // The same Arguments object reaches both `__new__` and `__init__`.
+            if nkw > 0 {
                 forward_kw(new_fn, &new_args, true, std::ptr::null_mut())?
             } else {
                 call_callable_in_ctx(execution_context, new_fn, &new_args)?
@@ -4607,7 +4811,7 @@ pub fn call_function_impl_result(
                 // signature-aware positional path so variadic builtins
                 // (*args / **kwargs) get their tail packed; non-variadic
                 // builtins fall through to the raw fast path.
-                return call_builtin_code_positional(code as pyre_object::PyObjectRef, args);
+                return call_builtin_code_positional(callable, args);
             }
             // User function: create frame + eval. The bare-PyObjectRef
             // helper stashes any error in `PENDING_CALL_ERROR` and returns
@@ -5380,15 +5584,29 @@ fn call_metaclass_with_kwargs(
                 }
             }
         } else {
-            // Builtin type.__new__ (the metaclass defines no __new__): pass
-            // the class-definition keywords through the `__pyre_kw__`
-            // trailing-dict ABI so type.__new__ fires __init_subclass__
-            // with them, matching the default-metaclass path.
+            // Builtin type.__new__: the same Arguments shape as
+            // `space.call_obj_args(w_newfunc, self, __args__)`.
             let mut new_args = vec![w_metaclass(), name(), bases(), w_namespace_dict()];
-            if !kw_items.is_empty() {
-                new_args.push(pack_pyre_kwargs(&kw_items));
-            }
-            match call_function_impl_result(new_fn, &new_args) {
+            let result = if kw_items.is_empty() {
+                call_function_impl_result(new_fn, &new_args)
+            } else {
+                let mut names = Vec::with_capacity(kw_items.len());
+                let mut values = Vec::with_capacity(kw_items.len());
+                for &(k, v) in &kw_items {
+                    names.push(k);
+                    values.push(v);
+                }
+                call_with_kwargs_in_ctx_impl(
+                    take_last_exec_ctx(),
+                    new_fn,
+                    &new_args,
+                    &names,
+                    &values,
+                    true,
+                    std::ptr::null_mut(),
+                )
+            };
+            match result {
                 Ok(obj) => obj,
                 Err(e) => {
                     set_call_error(e);
@@ -6019,9 +6237,28 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             "__build_class__: not enough arguments",
         ));
     }
-    let mut body_fn = args[0];
-    let mut name_obj = args[1];
+    real_build_class_from(args[0], args[1], &args[2..], None)
+}
 
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+pub(crate) fn real_build_class_args(
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.arguments_w.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "__build_class__: not enough arguments",
+        ));
+    }
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    real_build_class_from(pos[0], pos[1], &pos[2..], kwargs)
+}
+
+fn real_build_class_from(
+    mut body_fn: PyObjectRef,
+    mut name_obj: PyObjectRef,
+    base_args: &[PyObjectRef],
+    kwds_dict: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     // compiling.py:163-167 — the body must be a Python function carrying a
     // `PyCode`.  Its code object is read directly below, so anything else is
     // rejected here rather than reaching that read.
@@ -6033,7 +6270,6 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         ));
     }
 
-    // Check if last arg is a kwargs dict (from CALL_KW)
     // PyPy: __build_class__(func, name, *bases, metaclass=None, **kwds)
     //
     // The class-definition keywords are collected into a fresh dict that only
@@ -6044,17 +6280,6 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // without keywords opens no scope at all — `pin_root` is
     // `dont_look_inside`, so an unconditional one would residualise in every
     // traced class body.
-    let kwds_dict = if args.len() > 2 {
-        let last = args[args.len() - 1];
-        let is_kwds = unsafe { pyre_object::is_dict(last) }
-            && unsafe {
-                pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-            };
-        is_kwds.then_some(last)
-    } else {
-        None
-    };
     // Open the keyword-dict bracket in this function, not in a `map`
     // closure: `compiling.py build_class` roots `kwds_w` on `build_class`
     // itself, and a generated `FnOnce` would own a `push_roots` that cannot
@@ -6064,12 +6289,12 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     } else {
         None
     };
-    let (base_args, metaclass, extra_kwargs) = if let Some(last) = kwds_dict {
+    let (metaclass, extra_kwargs) = if let Some(last) = kwds_dict {
         {
             let extra_roots = extra_roots.as_ref().expect("opened for a kwargs dict");
             let extra_slot = extra_roots.base();
             let w_metaclass = unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") };
-            // Collect extra kwargs (not metaclass, not __pyre_kw__).
+            // Collect extra kwargs (not metaclass).
             // `w_dict_items` already dispatches `is_module_dict` so a
             // class statement with `**module_dict` (rare but valid)
             // walks the strategy.
@@ -6080,20 +6305,16 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
                 for (k, v) in pyre_object::w_dict_items(last) {
                     if pyre_object::is_str(k) {
                         let key = pyre_object::w_str_get_wtf8(k).as_str();
-                        if key != Ok("metaclass") && key != Ok("__pyre_kw__") {
+                        if key != Ok("metaclass") {
                             pyre_object::w_dict_store(extra_roots.get(extra_slot), k, v);
                         }
                     }
                 }
             }
-            (
-                &args[2..args.len() - 1],
-                w_metaclass,
-                Some(extra_roots.get(extra_slot)),
-            )
+            (w_metaclass, Some(extra_roots.get(extra_slot)))
         }
     } else {
-        (&args[2..], None, None)
+        (None, None)
     };
 
     // `type(name, bases, namespace)` rejects a lone surrogate. `str_utf8_w`
@@ -6189,27 +6410,7 @@ pub fn build_class_body_namespace_is_module_dict(args: &[PyObjectRef]) -> bool {
     if args.len() < 2 {
         return false;
     }
-    let mut base_args = &args[2..];
-    if let Some(&last) = base_args.last() {
-        let is_kwds = unsafe { pyre_object::is_dict(last) }
-            && unsafe {
-                pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-            };
-        if is_kwds {
-            // An explicit `metaclass=type` still reaches `descr___prepare__`,
-            // which answers `newdict(module=True)`, so the body runs in a
-            // module dict exactly as the implicit winner does.  Any other
-            // metaclass may define its own `__prepare__` and is undecidable
-            // from here.  The base test below keeps the winner `type`.
-            if let Some(metaclass) = unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") }
-                && !std::ptr::eq(metaclass, crate::typedef::w_type())
-            {
-                return false;
-            }
-            base_args = &base_args[..base_args.len() - 1];
-        }
-    }
+    let base_args = &args[2..];
     let w_type_type = crate::typedef::w_type();
     base_args.iter().all(|&base| unsafe {
         // A non-type base reaches `__mro_entries__`, which runs Python and can
@@ -6997,10 +7198,24 @@ fn build_class_inner(
             pyre_object::gc_roots::shadow_stack_get(bases_root),
             dict_obj as pyre_object::gc_hook::GCREF,
         );
-        let w = pyre_object::gc_roots::pin_root(w);
-        crate::builtins::type_new_take_qualname(w, dict_obj)?;
+        let _ = pyre_object::gc_roots::pin_root(w);
+        // `w_type_new` allocates the name-storage box
+        // (`gc_alloc_young_storage_box`) and may spill the header to old-gen
+        // when the nursery is full. Either collect. The namespace is a
+        // nursery dict; the pre-alloc local is then recycled poison.
+        // `_create_new_type` reloads both words from their slots
+        // (`type_new_take_qualname(w_type(), shadow_stack_get(dict_root))`).
+        crate::builtins::type_new_take_qualname(
+            pyre_object::gc_roots::shadow_stack_get(w_root),
+            pyre_object::gc_roots::shadow_stack_get(dict_root),
+        )?;
         // typeobject.py create_all_slots parity.
-        unsafe { create_all_slots(w, pyre_object::gc_roots::shadow_stack_get(bases_root))? };
+        unsafe {
+            create_all_slots(
+                pyre_object::gc_roots::shadow_stack_get(w_root),
+                pyre_object::gc_roots::shadow_stack_get(bases_root),
+            )?
+        };
         // `type_ready_fill_dict` defaults the doc entry once the slot and
         // instance descriptors own their names.
         crate::builtins::type_dict_set_doc(pyre_object::gc_roots::shadow_stack_get(w_root));
@@ -7177,39 +7392,6 @@ fn build_class_inner(
     Ok(w_type())
 }
 
-/// Pack `(name, value)` keyword pairs into the `__pyre_kw__`-tagged
-/// trailing dict that the builtin kwargs ABI (`split_builtin_kwargs`)
-/// consumes.  Mirrors the producer in `call_with_kwargs`.
-pub(crate) fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
-    // The dict is born young, and `w_dict_store` allocates when it promotes the
-    // strategy — see the bracket in `call_with_kwargs`. `kw_items` is the
-    // caller's array of raw references, so the pairs still to be installed are
-    // pinned as well: the first promotion relocates every one of them.
-    let kw_roots = pyre_object::gc_roots::push_roots();
-    let item_slot = kw_roots.base();
-    for &(k, v) in kw_items {
-        let _ = kw_roots.pin_root(k);
-        let _ = kw_roots.pin_root(v);
-    }
-    let kw_slot = item_slot + kw_items.len() * 2;
-    let _ = kw_roots.pin_root(pyre_object::w_dict_new());
-    unsafe {
-        for i in 0..kw_items.len() {
-            pyre_object::w_dict_store(
-                kw_roots.get(kw_slot),
-                kw_roots.get(item_slot + i * 2),
-                kw_roots.get(item_slot + i * 2 + 1),
-            );
-        }
-        // Marker stored last so a user keyword named `__pyre_kw__` cannot
-        // overwrite the sentinel detection compares by identity.
-        let marker_key = pyre_object::kw_marker::w_kw_marker_key();
-        let marker_value = pyre_object::kw_marker::w_kw_marker_sentinel();
-        pyre_object::w_dict_store(kw_roots.get(kw_slot), marker_key, marker_value);
-    }
-    kw_roots.get(kw_slot)
-}
-
 /// typeobject.py `_init_subclass` — after a class is created,
 /// call `super(w_type, w_type).__init_subclass__(**kwds)` exactly once.
 ///
@@ -7225,8 +7407,7 @@ pub(crate) fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObj
 /// The super-proxy getattr performs descriptor binding (a classmethod
 /// binds `w_type` as cls; a plain function binds `w_type` as the super
 /// obj), and the call forwards only the class-definition keywords.
-/// `init_subclass_kwargs` must already exclude the `__pyre_kw__` marker
-/// and the `metaclass` key.
+/// `init_subclass_kwargs` must already exclude the `metaclass` key.
 ///
 /// `w_effective_bases` is unused now that resolution follows the MRO, but
 /// is kept in the signature so the call sites need not change.

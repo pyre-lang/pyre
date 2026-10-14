@@ -12,7 +12,11 @@ pub mod interp_jit;
 
 pyre_interpreter::py_module! {
     "pypyjit",
-    functions: {
-        "set_param" / * = interp_jit::set_param,
-    }
+    interpleveldefs: {
+        "set_param" => pyre_interpreter::gateway::make_module_builtin_function_passthrough0(
+            "set_param",
+            interp_jit::set_param,
+            interp_jit::set_param_args,
+        ),
+    },
 }

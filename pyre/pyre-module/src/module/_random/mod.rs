@@ -167,8 +167,7 @@ impl W_Random {
         cls: PyObjectRef,
         args: &[PyObjectRef],
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        let (positional, _kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-        let user_args = positional.get(1..).unwrap_or(&[]);
+        let user_args = args.get(1..).unwrap_or(&[]);
         let w_anything = user_args.first().copied().unwrap_or_else(w_none);
         // `objspace.py` `allocate_instance` validates the requested subtype.
         // The builtin is the base layout; a subclass is `typedef.py`

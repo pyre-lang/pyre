@@ -33523,8 +33523,7 @@ impl<'a> Lowering<'a> {
     /// `CallTarget::Method` (`as_ref`/`copied`/`cloned`) getattr the rtyper
     /// cannot route on the classdef-less `Option` receiver (the `getattr
     /// (opt, "copied")` census wall — e.g. `_codecs::lookup_codec`'s
-    /// `args.first().copied()`, `split_builtin_kwargs`'s
-    /// `positional.first().copied()`).  Bind the destination to the receiver
+    /// `args.first().copied()`).  Bind the destination to the receiver
     /// instead, the same alias shape as `to_string` / `NonNull::as_ptr`.
     ///
     /// Gated on BOTH the receiver and the destination: a slice/iterator
@@ -100777,8 +100776,8 @@ mod tests {
                 .is_some_and(|values| values.iter().any(|hint| hint == "elidable")),
             "Signature.find_argname must retain PyPy's @jit.elidable marker"
         );
-        let graph = super::lower_function(&llbc, "bind_kwargs_to_signature")
-            .expect("lower bind_kwargs_to_signature");
+        let graph = super::lower_function(&llbc, "parse_builtin_signature")
+            .expect("lower parse_builtin_signature");
 
         let residual_scalar_indexes: Vec<_> = graph
             .blocks
@@ -101436,50 +101435,6 @@ mod tests {
                 )
             }),
             "w_int_new must not retain residual malloc_typed: {graph:#?}"
-        );
-    }
-
-    /// `split_builtin_kwargs` returns `&args[..args.len() - 1]` after proving
-    /// the slice non-empty. MIR carries both the stop and receiver through
-    /// block-link aliases, so the RangeTo proof must resolve those aliases
-    /// before recognizing the orthodox `getslice_minusone` shape.
-    #[test]
-    #[ignore]
-    fn split_builtin_kwargs_rangeto_aliases_lower_to_getslice() {
-        use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
-        let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "split_builtin_kwargs")
-            .expect("lower split_builtin_kwargs");
-        let calls_path = |want: &[&str]| -> usize {
-            let want: Vec<String> = want.iter().map(|part| part.to_string()).collect();
-            graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .filter(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        } if segments == &want
-                    )
-                })
-                .count()
-        };
-        assert_eq!(
-            calls_path(&["core", "slice", "index", "<Impl>", "index"]),
-            0,
-            "the proven RangeTo index must not remain a core residual"
-        );
-        assert_eq!(
-            calls_path(&["__getslice_minusone"]),
-            1,
-            "the marker strip must use the len-minus-one slice helper"
         );
     }
 

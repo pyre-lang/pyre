@@ -43,21 +43,8 @@ fn pin(value: PyObjectRef) -> usize {
     slot
 }
 
-fn argument(
-    positional: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
-    index: usize,
-    name: &str,
-    function: &str,
-) -> Result<Option<PyObjectRef>, pyre_interpreter::PyError> {
-    let positional_value = positional.get(index).copied();
-    let keyword_value = pyre_interpreter::builtins::kwarg_get(kwargs, name);
-    if positional_value.is_some() && keyword_value.is_some() {
-        return Err(pyre_interpreter::PyError::type_error(format!(
-            "{function}() got multiple values for argument '{name}'"
-        )));
-    }
-    Ok(positional_value.or(keyword_value))
+fn bound_slot(args: &[PyObjectRef], i: usize) -> Option<PyObjectRef> {
+    args.get(i).copied().filter(|o| !o.is_null())
 }
 
 fn index_value(value: PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
@@ -69,34 +56,20 @@ fn parse_args(
     args: &[PyObjectRef],
     function: &str,
 ) -> Result<BisectArgs, pyre_interpreter::PyError> {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    pyre_interpreter::builtins::kwarg_reject_unknown(
-        kwargs,
-        &["a", "x", "lo", "hi", "key"],
-        function,
-    )?;
-    if positional.len() > 4 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
-            "{function}() takes at most 4 positional arguments ({} given)",
-            positional.len()
-        )));
-    }
-
-    let a = argument(positional, kwargs, 0, "a", function)?.ok_or_else(|| {
+    // Bound scope: `a`, `x`, `lo`, `hi`, kw-only `key` (`PY_NULL` omitted).
+    let a = bound_slot(args, 0).ok_or_else(|| {
         pyre_interpreter::PyError::type_error(format!(
             "{function}() missing required argument 'a' (pos 1)"
         ))
     })?;
-    let x = argument(positional, kwargs, 1, "x", function)?.ok_or_else(|| {
+    let x = bound_slot(args, 1).ok_or_else(|| {
         pyre_interpreter::PyError::type_error(format!(
             "{function}() missing required argument 'x' (pos 2)"
         ))
     })?;
-    let lo_arg = argument(positional, kwargs, 2, "lo", function)?;
-    let hi_arg = argument(positional, kwargs, 3, "hi", function)?
-        .filter(|value| !unsafe { is_none(*value) });
-    let key_arg = pyre_interpreter::builtins::kwarg_get(kwargs, "key")
-        .filter(|value| !unsafe { is_none(*value) });
+    let lo_arg = bound_slot(args, 2);
+    let hi_arg = bound_slot(args, 3).filter(|value| !unsafe { is_none(*value) });
+    let key_arg = bound_slot(args, 4).filter(|value| !unsafe { is_none(*value) });
 
     // Every operand is rooted before the first callback runs: `__index__` and
     // `__len__` below already execute Python, and `args` is a plain slice a
@@ -221,9 +194,16 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ns);
+    let bisect_sig =
+        || pyre_interpreter::Signature::new(vec!["a", "x", "lo", "hi", "key"], None, None, 1, 0);
     let left = pyre_interpreter::gateway::with_module(
         "_bisect",
-        pyre_interpreter::make_module_builtin_function("bisect_left", bisect_left),
+        pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+            "bisect_left",
+            bisect_left,
+            0,
+            bisect_sig(),
+        ),
     );
     // Each function is pinned before the next allocation. The stores below
     // reload those original slots: a second `pin_root` of the Rust local
@@ -232,19 +212,34 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _ = pyre_object::gc_roots::pin_root(left);
     let right = pyre_interpreter::gateway::with_module(
         "_bisect",
-        pyre_interpreter::make_module_builtin_function("bisect_right", bisect_right),
+        pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+            "bisect_right",
+            bisect_right,
+            0,
+            bisect_sig(),
+        ),
     );
     let right_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(right);
     let insert_left = pyre_interpreter::gateway::with_module(
         "_bisect",
-        pyre_interpreter::make_module_builtin_function("insort_left", insort_left),
+        pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+            "insort_left",
+            insort_left,
+            0,
+            bisect_sig(),
+        ),
     );
     let insert_left_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(insert_left);
     let insert_right = pyre_interpreter::gateway::with_module(
         "_bisect",
-        pyre_interpreter::make_module_builtin_function("insort_right", insort_right),
+        pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+            "insort_right",
+            insort_right,
+            0,
+            bisect_sig(),
+        ),
     );
     let insert_right_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(insert_right);

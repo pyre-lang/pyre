@@ -102,12 +102,7 @@ fn declaring_builtin_type_name(receiver: PyObjectRef) -> String {
 /// TypeError for a keyword handed to a builtin method that takes a fixed
 /// number of positional arguments.
 ///
-/// Every arity helper here counts the raw slice length, so the body it guards
-/// has no parameter a keyword could name — a keyword-aware builtin reads the
-/// trailing marker dict itself (`split_builtin_kwargs`) and never validates by
-/// slice length.  Without this the marker would be counted as a positional
-/// value and reach the implementation as one.  A slot wrapper reports itself
-/// as `wrapper NAME()`, everything else under its qualified name.
+/// Remaining HOPELESS CALL_KW already rejects keywords before wrap runs.
 pub(crate) fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
     reject_kwargs_of(None, args, name)
 }
@@ -115,25 +110,12 @@ pub(crate) fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crat
 /// [`reject_kwargs`] for a method whose declaring class is fixed rather than
 /// read off the receiver — see [`arity_no_args_of`].
 pub fn reject_kwargs_of(
-    owner: Option<&str>,
-    args: &[PyObjectRef],
-    name: &str,
+    _owner: Option<&str>,
+    _args: &[PyObjectRef],
+    _name: &str,
 ) -> Result<(), crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if !crate::builtins::has_real_kwargs(kwargs) {
-        return Ok(());
-    }
-    let slot = positional.first().is_some_and(|&receiver| {
-        crate::gateway::is_slot_wrapper(&declaring_builtin_type_name(receiver), name)
-    });
-    let subject = match (slot, owner) {
-        (true, _) => format!("wrapper {name}"),
-        (false, Some(owner)) => format!("{owner}.{name}"),
-        (false, None) => method_qualname(positional, name),
-    };
-    Err(crate::PyError::type_error(format!(
-        "{subject}() takes no keyword arguments"
-    )))
+    // Remaining HOPELESS CALL_KW already rejects keywords before wrap.
+    Ok(())
 }
 
 /// TypeError for a method requiring exactly `n` positional arguments after
@@ -1169,34 +1151,22 @@ fn str_join_many_items(
 }
 
 /// `str.split` / `str.rsplit` take `sep` and `maxsplit` positionally or by
-/// keyword.  Builtin kwargs arrive as a trailing `__pyre_kw__` dict, so
-/// resolve each argument from its positional slot (after the receiver),
-/// falling back to the matching keyword.
+/// keyword. Resolve each argument from its positional slot (after the
+/// receiver); keywords stay on `Arguments` for the `*_args` path.
 fn resolve_split_args(
     args: &[PyObjectRef],
-    fn_name: &str,
+    _fn_name: &str,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::clinic_arity(
-        fn_name,
-        pos.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        2,
-        0,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
-    let sep = pos
+    // Bound scope: `self`, `sep`, `maxsplit` (`PY_NULL` omitted).
+    let sep = args
         .get(1)
         .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"))
+        .filter(|o| !o.is_null())
         .unwrap_or(pyre_object::PY_NULL);
-    let maxsplit = pos
+    let maxsplit = args
         .get(2)
         .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "maxsplit"))
+        .filter(|o| !o.is_null())
         .unwrap_or(pyre_object::PY_NULL);
     Ok((sep, maxsplit))
 }
@@ -1783,9 +1753,8 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// (miss residual `_compute_index_storage`) then the elidable
 /// `codepoint_position_at_index`.
 fn str_idx_params_unrooted(args: &[PyObjectRef]) -> Option<(PyObjectRef, PyObjectRef, i64, i64)> {
-    // `startswith(prefix[, start[, end]])` behind the receiver.  A keyword
-    // argument rides the same slice as a trailing marker dict, which is
-    // neither `int` nor `None`, so the bound tests below decline it.
+    // `startswith(prefix[, start[, end]])` behind the receiver. Wrap is
+    // positional.
     if args.len() < 2 || args.len() > 4 {
         return None;
     }
@@ -1891,48 +1860,39 @@ fn str_descr_endswith_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 }
 
 pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `old` / `new` are positional-only; `count` is positional-or-keyword.
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() < 3 {
+    // Bound scope: `self`, `old`, `new` (pos-only), `count` (`PY_NULL` omitted).
+    let pos0 = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let pos1 = args.get(1).copied().filter(|o| !o.is_null());
+    let pos2 = args.get(2).copied().filter(|o| !o.is_null());
+    let given = usize::from(pos1.is_some()) + usize::from(pos2.is_some());
+    let (Some(pos1), Some(pos2)) = (pos1, pos2) else {
         return Err(crate::PyError::type_error(format!(
-            "replace() takes at least 2 positional arguments ({} given)",
-            args_given(pos)
+            "replace() takes at least 2 positional arguments ({given} given)",
         )));
-    }
-    if pos.len() > 4 {
-        return Err(crate::PyError::type_error(format!(
-            "replace() takes at most 3 arguments ({} given)",
-            args_given(pos)
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["count"], "replace")?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "replace", "count", pos.get(3).is_some())?;
+    };
     // pypy/objspace/std/unicodeobject.py descr_replace —
     // both `old` and `new` must be str / W_UnicodeObject; otherwise
     // TypeError("replace() argument N must be str, not ...").
-    if !unsafe { pyre_object::is_str(pos[1]) } {
+    if !unsafe { pyre_object::is_str(pos1) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 1 must be str, not {}",
-            clinic_arg_type_name(pos[1])
+            clinic_arg_type_name(pos1)
         )));
     }
-    if !unsafe { pyre_object::is_str(pos[2]) } {
+    if !unsafe { pyre_object::is_str(pos2) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 2 must be str, not {}",
-            clinic_arg_type_name(pos[2])
+            clinic_arg_type_name(pos2)
         )));
     }
     // `__index__` on `count` can collect, so pin the three strings and the
     // optional count together and copy their payloads off the objects first.
-    let w_count = pos
-        .get(3)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "count"));
+    let w_count = args.get(3).copied().filter(|o| !o.is_null());
     let _roots = pyre_object::gc_roots::push_roots();
     let base = if let Some(c) = w_count {
-        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2], c])
+        pyre_object::gc_roots::pin_roots(&[pos0, pos1, pos2, c])
     } else {
-        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2]])
+        pyre_object::gc_roots::pin_roots(&[pos0, pos1, pos2])
     };
     let recv = || pyre_object::gc_roots::shadow_stack_get(base);
     let s = unsafe { pyre_object::w_str_get_wtf8(recv()) }.to_wtf8_buf();
@@ -2164,9 +2124,25 @@ pub fn descr_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     require_receiver(args, "format")?;
     // `pypy/objspace/std/newformat.py Formatter.format` —
     // positional args are slots 1.. of the receiver; keyword args
-    // (`{name}` lookups) live in the trailing CALL_KW dict.
-    let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    str_method_format_core(args[0], positional, kwargs_dict, None)
+    // (`{name}` lookups) stay on `Arguments` for `descr_format_args`.
+    str_method_format_core(args[0], &args[1..], None, None)
+}
+
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+pub fn descr_format_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    str_method_format_core(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
+        None,
+    )
 }
 
 /// Shared core for `str.format` (`{name}` looks up the trailing
@@ -4569,9 +4545,7 @@ pub(crate) fn encode_utf8_with_errors(
 /// of the string. Other codecs fall through to a best-effort UTF-8 encoding.
 pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "encode")?;
-    // `encoding` and `errors` arrive positionally or by keyword; builtin
-    // kwargs are packed in a trailing `__pyre_kw__` dict.
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    // Bound scope: `self`, `encoding`, `errors` (`PY_NULL` omitted).
     // Clinic's `encode` converter is `_PyArg_BadArgument`: a rejected
     // value is `None` or its type name.  PyPy's `get_encoding_and_errors`
     // goes through `space.text_w` / `_typed_unwrap_error` and says
@@ -4590,42 +4564,26 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 ))),
             }
         };
-    // `encode(encoding=None, errors=None)` — both positional-or-keyword;
-    // the gateway rejects unknown keywords and a value given both ways.
-    crate::builtins::clinic_arity(
-        "encode",
-        pos.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        2,
-        0,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "encode")?;
-    // Only the counts are read off the native slices once they are pinned.
-    let nargs = args.len();
-    let npos = pos.len();
     let _roots = pyre_object::gc_roots::push_roots();
+    let n = args.len();
     let arg_base = pyre_object::gc_roots::pin_roots(args);
-    let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(arg_base + i);
-    let kwargs = kwargs.map(|_| reload(nargs - 1));
-    let dual =
-        |name: &str, p: Option<PyObjectRef>| -> Result<Option<PyObjectRef>, crate::PyError> {
-            let kw = crate::builtins::kwarg_get(kwargs, name);
-            if p.is_some() && kw.is_some() {
-                return Err(crate::PyError::type_error(format!(
-                    "got multiple values for argument '{name}'"
-                )));
-            }
-            Ok(p.or(kw))
-        };
-    let w_encoding = if npos > 1 { Some(reload(1)) } else { None };
-    let w_errors = if npos > 2 { Some(reload(2)) } else { None };
-    let has_w_errors = w_errors.is_some();
-    let w_errors_slot = _roots.pin_roots(&[w_errors.unwrap_or(pyre_object::PY_NULL)]);
-    let encoding_arg = dual("encoding", w_encoding)?;
+    let reload = |i: usize| {
+        if i < n {
+            pyre_object::gc_roots::shadow_stack_get(arg_base + i)
+        } else {
+            pyre_object::PY_NULL
+        }
+    };
+    let encoding_arg = {
+        let w = reload(1);
+        if w.is_null() { None } else { Some(w) }
+    };
     let encoding = str_arg("encoding", encoding_arg, "utf-8")?;
-    let w_errors = has_w_errors.then(|| _roots.get(w_errors_slot));
-    let errors = str_arg("errors", dual("errors", w_errors)?, "strict")?;
+    let errors_arg = {
+        let w = reload(2);
+        if w.is_null() { None } else { Some(w) }
+    };
+    let errors = str_arg("errors", errors_arg, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(
         reload(0),
         &encoding,
@@ -6038,29 +5996,15 @@ fn cp_is_linebreak(cp: CodePoint) -> bool {
 
 pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "splitlines")?;
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "splitlines() takes at most 1 argument ({} given)",
-            args_given(pos)
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
-    crate::builtins::kwarg_reject_duplicate(
-        kwargs,
-        "splitlines",
-        "keepends",
-        pos.get(1).is_some(),
-    )?;
-    let keepends_obj =
-        crate::builtins::kwarg_get(kwargs, "keepends").or_else(|| pos.get(1).copied());
+    // Bound scope: `self`, `keepends` (`PY_NULL` omitted).
+    let keepends_obj = args.get(1).copied().filter(|o| !o.is_null());
     let recv_roots = pyre_object::gc_roots::push_roots();
     let recv_slot = if let Some(keepends_obj) = keepends_obj {
-        let recv_slot = recv_roots.publish(&[pos[0], keepends_obj]);
+        let recv_slot = recv_roots.publish(&[args[0], keepends_obj]);
         recv_roots.normalize(recv_slot, 2);
         recv_slot
     } else {
-        let recv_slot = recv_roots.publish(&[pos[0]]);
+        let recv_slot = recv_roots.publish(&[args[0]]);
         recv_roots.normalize(recv_slot, 1);
         recv_slot
     };
@@ -6103,7 +6047,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// PyPy: unicodeobject.py descr_removeprefix (Python 3.9+)
 pub fn descr_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    let pos = args;
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "str.removeprefix() takes exactly one argument ({} given)",
@@ -6131,7 +6075,7 @@ pub fn descr_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_removesuffix (Python 3.9+)
 pub fn descr_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, _) = crate::builtins::split_builtin_kwargs(args);
+    let pos = args;
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "str.removesuffix() takes exactly one argument ({} given)",
@@ -6167,30 +6111,18 @@ pub fn descr_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// PyPy: unicodeobject.py descr_expandtabs
 pub fn descr_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `tabsize` is positional-or-keyword (default 8).
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "expandtabs() takes at most 1 argument ({} given)",
-            args_given(pos)
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
-    crate::builtins::kwarg_reject_duplicate(kwargs, "expandtabs", "tabsize", pos.get(1).is_some())?;
+    // Bound scope: `self`, `tabsize` (`PY_NULL` omitted; default 8).
     // [3.14-spec] PyPy `W_UnicodeObject.descr_expandtabs` unwraps a machine
     // `int`; CPython `unicode_expandtabs` declares an Argument Clinic `int`
     // and therefore calls `PyLong_AsInt` before inspecting even an empty
     // receiver.  Keep PyPy's method body below, but narrow this observable
     // argument boundary to a C int.
-    let w_tabsize = pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"));
+    let w_tabsize = args.get(1).copied().filter(|o| !o.is_null());
     let _roots = pyre_object::gc_roots::push_roots();
     let recv_slot = if let Some(t) = w_tabsize {
-        pyre_object::gc_roots::pin_roots(&[pos[0], t])
+        pyre_object::gc_roots::pin_roots(&[args[0], t])
     } else {
-        pyre_object::gc_roots::pin_roots(&[pos[0]])
+        pyre_object::gc_roots::pin_roots(&[args[0]])
     };
     let tabsize = i64::from(match w_tabsize {
         Some(_) => crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
@@ -6554,8 +6486,8 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     // Those two residuals stay out of this graph; the slow arm is one real
     // fnaddr.
     if (args.len() == 2 || args.len() == 3) && !args[0].is_null() {
-        // A three-word call can be `d.get(k, **kw)`: the third word is then
-        // the marker dict, not a default.
+        // A three-word call is `d.get(k, default)`. Keywords are refused
+        // before wrap.
         let tail = if args.len() == 3 {
             args[2]
         } else {
@@ -6586,24 +6518,21 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     dict_get_slow(dict, key, default, args.len() as i64)
 }
 
-/// Exact `dict`, an exact `str` key, and a third word that is not the
-/// trailing keyword dict.
+/// Exact `dict`, an exact `str` key, and a third word that is the default.
 ///
 /// Exactness is the requirement, not layout: `py_type_check` passes a `str`
 /// subclass, whose `__hash__` can raise, and the unchecked probe reports that
 /// raise as a miss.  `tail` is `PY_NULL` for a two-word call; anything else is
-/// the caller's third word, and a keyword marker there means the call is
-/// `d.get(k, **kw)`, which `dict_method_get` rejects.
+/// the caller's third word. Keywords are refused before wrap.
 ///
 /// The dict's strategy is deliberately not tested here.  Reading it in this
 /// call and probing in the next is a time-of-check window, so
 /// [`dict_get_plain`] decides it under the lock that probes.
 #[majit_macros::dont_look_inside_cannot_raise]
-fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, tail: PyObjectRef) -> bool {
+fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, _tail: PyObjectRef) -> bool {
     unsafe {
         pyre_object::is_exact_type(dict, &pyre_object::DICT_TYPE)
             && pyre_object::is_exact_type(key, &pyre_object::STR_TYPE)
-            && (tail.is_null() || !crate::builtins::builtin_kwargs_marker_tail(tail))
     }
 }
 
@@ -7104,8 +7033,8 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
 /// subclass instance is updated through its backing dict rather than its own
 /// (uninitialised) strategy slot.
 ///
-/// `__pyre_kw__`-marked dict is the kwargs vehicle pyre's CALL_KW
-/// emits for builtin callees (`call.rs`'s `pack_pyre_kwargs`).
+/// Keyword arguments arrive out of band on `Arguments` (`keyword_names_w`
+/// / `keywords_w`); the wrap path is positional only.
 pub fn dict_init_or_update(
     args: &[PyObjectRef],
     name: &str,
@@ -7121,22 +7050,53 @@ pub fn dict_init_or_update(
         .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + i))
         .collect::<Vec<_>>();
     require_receiver(&rooted_args, "update")?;
-    let (positional, kwargs_dict) = crate::builtins::split_builtin_kwargs(&rooted_args);
+    dict_init_or_update_from(
+        rooted_args[0],
+        rooted_args.get(1..).unwrap_or(&[]),
+        None,
+        name,
+    )
+}
+
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+pub fn dict_init_or_update_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    dict_init_or_update_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
+        name,
+    )
+}
+
+fn dict_init_or_update_from(
+    self_: PyObjectRef,
+    rest: &[PyObjectRef],
+    kwargs_dict: Option<PyObjectRef>,
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = _roots.pin_roots(&[self_]);
+    let rest_slot = _roots.pin_roots(rest);
     let has_kwargs = kwargs_dict.is_some();
     let kwargs_slot = _roots.pin_roots(&[kwargs_dict.unwrap_or(pyre_object::PY_NULL)]);
-    if positional.len() > 2 {
+    if rest.len() > 1 {
         return Err(crate::PyError::type_error(format!(
             "{name} expected at most 1 argument, got {}",
-            positional.len() - 1
+            rest.len()
         )));
     }
-    if positional.len() > 1 {
-        dict_update1(
-            pyre_object::gc_roots::shadow_stack_get(root_base),
-            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
-        )?;
+    if rest.len() == 1 {
+        dict_update1(_roots.get(self_slot), _roots.get(rest_slot))?;
     }
-    let backing = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(root_base));
+    let backing = resolve_dict_backing(_roots.get(self_slot));
     if backing.is_null() {
         // A dict subclass declared with `__slots__` has no attribute storage
         // for its item backing (pyre keeps a dict subclass's items in an
@@ -7156,11 +7116,6 @@ pub fn dict_init_or_update(
             let items_base = pyre_object::gc_roots::pin_roots(&flat);
             for i in 0..items.len() {
                 let k = pyre_object::gc_roots::shadow_stack_get(items_base + 2 * i);
-                if pyre_object::is_str(k)
-                    && pyre_object::w_str_get_wtf8(k).as_str() == Ok("__pyre_kw__")
-                {
-                    continue;
-                }
                 dict_store_checked(
                     pyre_object::gc_roots::shadow_stack_get(backing_slot),
                     k,
@@ -7177,6 +7132,25 @@ pub fn dict_init_or_update(
 pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "update")?;
     dict_init_or_update(args, "update")
+}
+
+pub fn dict_method_update_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    require_receiver(&[self_], "update")?;
+    dict_init_or_update_args(self_, args, "update")
+}
+
+pub fn dict_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_init_or_update(args, "dict")
+}
+
+pub fn dict_descr_init_args(
+    self_: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    dict_init_or_update_args(self_, args, "dict")
 }
 
 /// `dictmultiobject.py update1` —

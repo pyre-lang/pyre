@@ -73,12 +73,6 @@ fn extract_char(func: &str, argno: Option<u32>, obj: PyObjectRef) -> Result<Code
 
 /// Single required character argument (`category`, `bidirectional`, …).
 fn one_char(func: &str, args: &[PyObjectRef]) -> Result<CodePoint, PyError> {
-    let (args, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(PyError::type_error(format!(
-            "unicodedata.{func}() takes no keyword arguments"
-        )));
-    }
     if args.len() != 1 {
         return Err(PyError::type_error(format!(
             "unicodedata.{func}() takes exactly one argument ({} given)",
@@ -94,19 +88,21 @@ fn char_and_default(
     func: &str,
     args: &[PyObjectRef],
 ) -> Result<(CodePoint, Option<PyObjectRef>), PyError> {
-    if args.is_empty() {
+    // Module-level Signature path has already bound and filled omitted
+    // slots with PY_NULL. Wrap is positional.
+    let given = args.iter().filter(|a| !a.is_null()).count();
+    if given == 0 {
         return Err(PyError::type_error(format!(
             "{func} expected at least 1 argument, got 0"
         )));
     }
-    if args.len() > 2 {
+    if given > 2 {
         return Err(PyError::type_error(format!(
-            "{func} expected at most 2 arguments, got {}",
-            args.len()
+            "{func} expected at most 2 arguments, got {given}"
         )));
     }
     let cp = extract_char(func, Some(1), args[0])?;
-    Ok((cp, args.get(1).copied()))
+    Ok((cp, args.get(1).copied().filter(|value| !value.is_null())))
 }
 
 // Version-sensitive queries take a `Ucd` built from `W_UCD.legacy`

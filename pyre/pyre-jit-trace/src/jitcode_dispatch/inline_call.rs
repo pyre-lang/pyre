@@ -3924,7 +3924,7 @@ fn builtin_call_kw_bind_signature(
         return None;
     }
     let nparams = sig.argnames.len();
-    // `bind_kwargs_to_signature` appends packed `*args` / `**kwargs` slots
+    // `parse_builtin_signature` appends packed `*args` / `**kwargs` slots
     // after the named ones; this permutation builds only the named slots.
     if nparams == 0 || sig.varargname.is_some() || sig.kwargname.is_some() {
         return None;
@@ -5681,8 +5681,7 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     if !ctx.is_authoritative_executor
         // `CallKw` is admitted when the builtin has a Signature: keyword
         // VALUES stay the traced boxes and are permuted into parameter
-        // slots (`Arguments` + gateway unwrap).  Building a marker dict
-        // from recording-time concretes as ConstPtr is forbidden.
+        // slots (`Arguments` + gateway unwrap).
         || (runtime_helper != majit_ir::RuntimeHelperKind::CallFn && !is_call_kw)
         || r_args.len() < 2
         || dst_bank != 'r'

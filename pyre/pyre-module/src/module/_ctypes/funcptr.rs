@@ -94,7 +94,11 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "__call__",
-        pyre_interpreter::make_builtin_function("__call__", cfuncptr_call)
+        pyre_interpreter::make_builtin_function_passthrough1(
+            "__call__",
+            cfuncptr_call,
+            cfuncptr_call_args,
+        )
     );
     // `restype` / `argtypes` — settable data descriptors with class-attr
     // fallback to `_restype_` / `_argtypes_`.
@@ -231,8 +235,7 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     let rest: Vec<_> = (1..args.len())
         .map(|i| pyre_object::gc_roots::shadow_stack_get(cls_slot + i))
         .collect();
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&rest);
-    reject_kwargs(kwargs)?;
+    let pos = rest.as_slice();
     let mut callback = pyre_object::PY_NULL;
     let mut paramflags = pyre_object::PY_NULL;
     #[cfg(windows)]
@@ -836,24 +839,6 @@ fn instance_del(obj: PyObjectRef, key: &str) {
     }
 }
 
-/// Reject keyword arguments: ctypes foreign calls and `_CFuncPtr(...)` take
-/// only positional arguments, so a stray `fn(x, foo=1)` is an error rather
-/// than a silently dropped `foo`.
-fn reject_kwargs(kwargs: Option<PyObjectRef>) -> Result<(), pyre_interpreter::PyError> {
-    let Some(kw) = kwargs else { return Ok(()) };
-    for (key_obj, _) in unsafe { pyre_object::w_dict_items(kw) } {
-        if unsafe { pyre_object::is_str(key_obj) }
-            && unsafe { pyre_object::w_str_get_wtf8(key_obj) } == "__pyre_kw__"
-        {
-            continue;
-        }
-        return Err(pyre_interpreter::PyError::type_error(
-            "call takes no keyword arguments",
-        ));
-    }
-    Ok(())
-}
-
 // ── call ──────────────────────────────────────────────────────────────
 
 /// Resolved return-type selector.
@@ -1303,9 +1288,32 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
             "__call__ requires self",
         ));
     }
+    cfuncptr_call_from(args[0], &args[1..], None)
+}
+
+/// Keyword path: names stay on `Arguments` (`func__args__`).
+fn cfuncptr_call_args(
+    self_: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    cfuncptr_call_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+fn cfuncptr_call_from(
+    self_: PyObjectRef,
+    inargs: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // A keyword argument only ever names a paramflag, and one that names
     // nothing is not an error — it simply goes unread.
-    let (inargs, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
     // self, the positional arguments, and the keyword dict are published
     // before the first allocating call.  Later steps read those slots; the
     // originals are not.
@@ -1313,7 +1321,7 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
     let has_kwargs = kwargs.is_some();
     let kwargs_word = kwargs.unwrap_or(pyre_object::PY_NULL);
     let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::publish_roots(&[args[0]]);
+    let self_slot = pyre_object::gc_roots::publish_roots(&[self_]);
     let inargs_base = pyre_object::gc_roots::publish_roots(inargs);
     let kwargs_slot = pyre_object::gc_roots::publish_roots(&[kwargs_word]);
     pyre_object::gc_roots::normalize_roots(self_slot, 1 + n_inargs + 1);

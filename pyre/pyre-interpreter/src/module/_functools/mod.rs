@@ -115,40 +115,22 @@ impl W_KeyWrapper {
 /// reduction callback may both collect, so a Rust local would not track a
 /// relocated object between iterations.
 fn reduce(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
-    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    let keyword_initial =
-        kwargs.and_then(|dict| unsafe { pyre_object::w_dict_getitem_str(dict, "initial") });
-    let keyword_count = pyre_interpreter::builtins::real_kwarg_count(kwargs);
-    if keyword_count != usize::from(keyword_initial.is_some()) {
-        return Err(pyre_interpreter::PyError::type_error(
-            "reduce() got an unexpected keyword argument",
-        ));
-    }
-    // CPython 3.14 `_functoolsmodule.c:reduce` keeps `function` and
-    // `iterable` positional-only even though `initial` may be named.  A named
-    // initial cannot fill either required position.
-    if positional.len() < 2 {
+    // Bound scope: pos-only `function`, `iterable`, optional `initial`
+    // (`PY_NULL` omitted).
+    let function = args.first().copied().filter(|o| !o.is_null());
+    let iterable = args.get(1).copied().filter(|o| !o.is_null());
+    let given = usize::from(function.is_some()) + usize::from(iterable.is_some());
+    let (Some(_function), Some(_iterable)) = (function, iterable) else {
         return Err(pyre_interpreter::PyError::type_error(format!(
-            "reduce() takes at least 2 positional arguments ({} given)",
-            positional.len()
+            "reduce() takes at least 2 positional arguments ({given} given)",
         )));
-    }
-    let mut effective = positional.to_vec();
-    if let Some(initial) = keyword_initial {
-        effective.push(initial);
-    }
-    if effective.len() > 3 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
-            "reduce() takes at most 3 arguments ({} given)",
-            effective.len()
-        )));
-    }
+    };
+    let _ = (_function, _iterable);
 
     let _roots = pyre_object::gc_roots::push_roots();
-    // Publish every operand in one pass and read each back from its slot: a
-    // slot is what a promotion rewrites, the copies left in `effective` are
-    // not.
-    let base = pyre_object::gc_roots::pin_roots(&effective);
+    // Publish every bound slot in one pass and read each back from its slot:
+    // a slot is what a promotion rewrites.
+    let base = pyre_object::gc_roots::pin_roots(args);
     let function_slot = base;
     let sequence_slot = base + 1;
     // `_functoolsmodule.c:reduce` reports the failed second argument itself
@@ -167,8 +149,14 @@ fn reduce(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let _ = pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    let initial = if effective.len() == 3 {
-        pyre_object::gc_roots::shadow_stack_get(base + 2)
+    let initial = if args.len() > 2 {
+        let w = pyre_object::gc_roots::shadow_stack_get(base + 2);
+        if w.is_null() { None } else { Some(w) }
+    } else {
+        None
+    };
+    let initial = if let Some(initial) = initial {
+        initial
     } else {
         match pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(
             iter_slot,
@@ -498,7 +486,7 @@ cmp_to_key = staticmethod(cmp_to_key)
 "# => ["cmp_to_key", "partial", "Placeholder", "_PlaceholderType"],
     },
     functions: {
-        "reduce" / * = reduce,
+        "reduce" / * = reduce; pyre_interpreter::Signature::new(vec!["function", "iterable", "initial"], None, None, 0, 2),
     },
 }
 

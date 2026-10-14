@@ -161,7 +161,10 @@ cached_type!(CFIELD, cfield_type, || {
         pyre_interpreter::__pyre_store!(
             ns,
             "__new__",
-            pyre_interpreter::typedef::make_new_descr(cfield_new_internal)
+            pyre_interpreter::typedef::make_new_descr_passthrough1(
+                cfield_new_internal,
+                cfield_new_internal_args,
+            )
         );
         pyre_interpreter::__pyre_store!(
             ns,
@@ -376,12 +379,16 @@ fn init_aggregate_base(ns: PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(structure_new)
+        pyre_interpreter::typedef::make_new_descr_passthrough1(structure_new, structure_new_args,)
     );
     pyre_interpreter::__pyre_store!(
         ns,
         "__init__",
-        pyre_interpreter::make_builtin_function("__init__", structure_init)
+        pyre_interpreter::make_builtin_function_passthrough1(
+            "__init__",
+            structure_init,
+            structure_init_args,
+        )
     );
     pyre_interpreter::__pyre_store!(
         ns,
@@ -1825,15 +1832,42 @@ fn cfield_repr(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    cfield_new_internal_from(args, None)
+}
+
+fn cfield_new_internal_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+    let mut flat = Vec::with_capacity(1 + pos.len());
+    flat.push(w_type);
+    flat.extend_from_slice(&pos);
+    cfield_new_internal_from(&flat, kwargs)
+}
+
+fn cfield_new_internal_from(args: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let n_args = args.len();
+    let kw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwargs.unwrap_or(pyre_object::PY_NULL));
     let get = |name: &str, position: usize| {
-        pyre_interpreter::builtins::resolve_pos_or_kw(
-            pos.get(position).copied(),
-            kwargs,
-            name,
-            "CField",
-            position,
-        )
+        let positional = if position < n_args {
+            let value = pyre_object::gc_roots::shadow_stack_get(args_base + position);
+            if value.is_null() { None } else { Some(value) }
+        } else {
+            None
+        };
+        let kwargs = {
+            let value = pyre_object::gc_roots::shadow_stack_get(kw_slot);
+            if value.is_null() { None } else { Some(value) }
+        };
+        pyre_interpreter::builtins::resolve_pos_or_kw(positional, kwargs, name, "CField", position)
     };
     let internal = get("_internal_use", 6)?
         .is_some_and(|value| pyre_interpreter::baseobjspace::is_true(value).unwrap_or(false));
@@ -1952,6 +1986,15 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
     Ok(obj)
 }
 
+/// Keyword path: extras belong to `structure_init_args`.
+fn structure_new_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> PyResult {
+    let _ = args;
+    structure_new(&[w_type])
+}
+
 /// Field names in base-first order (`init_pos_args`).
 fn field_names_base_first(cls: PyObjectRef) -> Vec<String> {
     let mut names = Vec::new();
@@ -1971,20 +2014,48 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
             "__init__ requires self",
         ));
     }
+    structure_init_from(args[0], &args[1..], None)
+}
+
+/// Keyword path: field names stay on `Arguments` (`func__args__`).
+fn structure_init_args(
+    self_: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let (pos, kwargs) = pyre_interpreter::builtins::arguments_pos_and_kwargs(args)?;
+    structure_init_from(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+fn structure_init_from(
+    self_: PyObjectRef,
+    pos: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> PyResult {
     // The argument slice is the caller's own native array, which no root
     // walker updates, so an initialiser that moves is named by its pre-move
     // address once an earlier `setattr_str` has allocated.  Pin every argument
     // and take the movable operands back out of their slots.
     let roots = pyre_object::gc_roots::push_roots();
-    let args_slot = roots.base();
-    for &arg in args {
+    let obj_slot = roots.base();
+    let _ = roots.pin_root(self_);
+    let pos_len = pos.len();
+    let pos_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in pos {
         let _ = roots.pin_root(arg);
     }
-    let obj = || roots.get(args_slot);
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
-    let pos_len = pos.len();
-    // The keyword carrier, when present, is the trailing argument.
-    let kw_slot = kwargs.map(|_| args_slot + args.len() - 1);
+    let kw_slot = kwargs.map(|kw| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(kw);
+        slot
+    });
+    let obj = || roots.get(obj_slot);
     let cls = unsafe { pyre_object::w_instance_get_type(obj()) };
     let names = field_names_base_first(cls);
 
@@ -1994,11 +2065,7 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     for i in 0..pos_len {
-        pyre_interpreter::baseobjspace::setattr_str(
-            obj(),
-            &names[i],
-            roots.get(args_slot + 1 + i),
-        )?;
+        pyre_interpreter::baseobjspace::setattr_str(obj(), &names[i], roots.get(pos_base + i))?;
     }
 
     if let Some(kw_slot) = kw_slot {
@@ -2017,9 +2084,6 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
                 continue;
             }
             let key = pyre_interpreter::baseobjspace::str_utf8_w(key_obj)?.to_string();
-            if key == "__pyre_kw__" {
-                continue;
-            }
             // Duplicate positional + keyword assignment for the same field.
             if let Some(pos_idx) = names.iter().position(|n| *n == key)
                 && pos_idx < pos_len
@@ -2281,7 +2345,7 @@ fn array_init(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let obj = args[0];
-    let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
+    let pos = &args[1..];
     let npos = pos.len();
     let roots = pyre_object::gc_roots::push_roots();
     let pos_base = roots.publish(pos);
@@ -2854,7 +2918,7 @@ fn pointer_init(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let obj = args[0];
-    let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
+    let pos = &args[1..];
     if let Some(&val) = pos.first()
         && !unsafe { pyre_object::is_none(val) }
     {

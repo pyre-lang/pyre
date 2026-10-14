@@ -7,7 +7,9 @@
 //! this module is the behaviour surface (class-getitem constructor,
 //! parameter collection, and the typedef methods).
 
-use crate::{make_builtin_function, make_builtin_function_with_arity};
+use crate::{
+    make_builtin_function, make_builtin_function_passthrough1, make_builtin_function_with_arity,
+};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 
@@ -292,15 +294,31 @@ fn ga_hash(args: &[PyObjectRef]) -> crate::PyResult {
 /// `GenericAlias.__call__` (`_pypy_generic_alias.py`).
 fn ga_call(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
+    ga_call_origin(self_, |origin| {
+        crate::builtins::call_forwarding_args(origin, &args[1..])
+    })
+}
+
+/// Keyword path: `space.call_args(origin, __args__)`.
+fn ga_call_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
+    if !unsafe { is_generic_alias(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor requires a 'types.GenericAlias' object",
+        ));
+    }
+    ga_call_origin(self_, |origin| crate::call::call_args(origin, args))
+}
+
+fn ga_call_origin(
+    self_: PyObjectRef,
+    call_origin: impl FnOnce(PyObjectRef) -> crate::PyResult,
+) -> crate::PyResult {
     let origin = unsafe { w_generic_alias_get_origin(self_) };
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_);
     let _ = pyre_object::gc_roots::pin_root(origin);
-    let result = crate::builtins::call_forwarding_args(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 1) },
-        &args[1..],
-    )?;
+    let result = call_origin(unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 1) })?;
     let _ = pyre_object::gc_roots::pin_root(result);
     crate::call::set_orig_class(
         unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 2) },
@@ -1526,7 +1544,6 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
             Some(1),
         ),
         ("__hash__", ga_hash, Some(1)),
-        ("__call__", ga_call, None),
         ("__getattribute__", ga_getattribute, Some(2)),
         ("__iter__", ga_iter, Some(1)),
         ("__dir__", ga_dir, Some(1)),
@@ -1542,6 +1559,13 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
             )
         };
     }
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__call__",
+            make_builtin_function_passthrough1("__call__", ga_call, ga_call_args)
+        )
+    };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,

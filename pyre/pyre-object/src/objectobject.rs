@@ -214,8 +214,16 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
         crate::gc_hook::try_gc_write_barrier(raw);
         raw as PyObjectRef
     } else {
-        majit_gc::header::alloc_with_gc_header(value, type_id) as PyObjectRef
+        alloc_instance_object_fallback(value, type_id)
     }
+}
+
+/// Host fallback when the GC nursery hook is not installed (lib tests,
+/// snapshot tools).  `alloc_with_gc_header` is not in CallRegistry, so
+/// the rtyper must not walk this arm from `descr__new__`.
+#[majit_macros::dont_look_inside]
+fn alloc_instance_object_fallback(value: W_ObjectObject, type_id: u32) -> PyObjectRef {
+    majit_gc::header::alloc_with_gc_header(value, type_id) as PyObjectRef
 }
 
 /// Typeptr and GC tid [`alloc_instance_object`] stamps for `w_class`.

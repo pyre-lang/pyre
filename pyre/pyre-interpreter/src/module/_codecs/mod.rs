@@ -1958,13 +1958,7 @@ fn code_page_positional<'a>(
     name: &str,
     args: &'a [PyObjectRef],
 ) -> Result<&'a [PyObjectRef], crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(format!(
-            "_codecs.{name}() takes no keyword arguments"
-        )));
-    }
-    Ok(positional)
+    Ok(args)
 }
 
 /// Split `(str[, errors])` for the two encoders that name their own code page.

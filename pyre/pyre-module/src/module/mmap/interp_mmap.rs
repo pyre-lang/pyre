@@ -972,17 +972,44 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // `interp_mmap.py __new__ = interp2app(mmap)` — the class call
     // `mmap.mmap(fileno, length, ...)` lands here.  The common builtin
     // argument binder below supplies PyPy's named/defaulted gateway shape.
+    let mmap_new_sig = {
+        #[cfg(unix)]
+        {
+            pyre_interpreter::gateway::Signature::new(
+                vec![
+                    "cls", "fileno", "length", "flags", "prot", "access", "offset", "trackfd",
+                ],
+                None,
+                None,
+                0,
+                1,
+            )
+        }
+        #[cfg(windows)]
+        {
+            pyre_interpreter::gateway::Signature::new(
+                vec!["cls", "fileno", "length", "tagname", "access", "offset"],
+                None,
+                None,
+                0,
+                1,
+            )
+        }
+    };
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(|args| {
-            if args.is_empty() {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "mmap() requires fileno + length",
-                ));
-            }
-            mmap_construct(args[0], &args[1..])
-        })
+        pyre_interpreter::typedef::make_new_descr_with_signature(
+            |args| {
+                if args.is_empty() {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "mmap() requires fileno + length",
+                    ));
+                }
+                mmap_construct(args[0], &args[1..])
+            },
+            mmap_new_sig,
+        )
     );
 
     // close() — munmap and zero the pointer.

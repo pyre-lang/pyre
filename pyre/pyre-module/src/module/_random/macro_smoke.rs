@@ -194,12 +194,14 @@ mod tests {
     fn keyword_only_bound_slot_is_not_counted_as_positional() {
         pyre_interpreter::typedef::init_typeobjects();
         let signature = _kwonly_bound_probe_pyre_sig().expect("derived signature");
-        let bound = pyre_interpreter::call::bind_kwargs_to_signature(
+        let bound = pyre_interpreter::call::parse_builtin_signature(
             &signature,
             "_kwonly_bound_probe",
             &[w_int_new(40)],
             &[w_str_new("adjustment")],
             &[w_int_new(2)],
+            None,
+            pyre_object::PY_NULL,
         )
         .expect("signature binding");
         let result = _kwonly_bound_probe(&bound).expect("bound keyword-only scope");
@@ -216,12 +218,14 @@ mod tests {
             /*kwonlyargcount*/ 0,
             /*posonlyargcount*/ 0,
         );
-        let bound = pyre_interpreter::call::bind_kwargs_to_signature(
+        let bound = pyre_interpreter::call::parse_builtin_signature(
             &signature,
             "probe",
             &[w_int_new(1)],
             &[w_str_new("alpha"), w_str_new("beta")],
             &[w_int_new(2), w_int_new(3)],
+            None,
+            pyre_object::PY_NULL,
         )
         .expect("unmatched keywords should pack into **kwargs");
         assert_eq!(bound.len(), 2);
@@ -247,24 +251,28 @@ mod tests {
 
         // The positional-only `base` binds fine by position, and `offset`
         // still binds by keyword.
-        let bound = pyre_interpreter::call::bind_kwargs_to_signature(
+        let bound = pyre_interpreter::call::parse_builtin_signature(
             &signature,
             "_posonly_bound_probe",
             &[w_int_new(40)],
             &[w_str_new("offset")],
             &[w_int_new(2)],
+            None,
+            pyre_object::PY_NULL,
         )
         .expect("signature binding");
         let result = _posonly_bound_probe(&bound).expect("bound positional-only scope");
         assert_eq!(unsafe { w_int_get_value(result) }, 42);
 
         // Passing the positional-only `base` as a keyword is a TypeError.
-        let err = pyre_interpreter::call::bind_kwargs_to_signature(
+        let err = pyre_interpreter::call::parse_builtin_signature(
             &signature,
             "_posonly_bound_probe",
             &[],
             &[w_str_new("base")],
             &[w_int_new(40)],
+            None,
+            pyre_object::PY_NULL,
         )
         .expect_err("positional-only name as keyword must error");
         assert_eq!(err.kind, pyre_interpreter::PyErrorKind::TypeError);
@@ -295,7 +303,7 @@ mod tests {
 
     /// A `#[pyre_methods]` instance method with a positional-or-keyword and a
     /// keyword-only parameter binds identically whether the keyword arrives
-    /// positionally or by name through `bind_kwargs_to_signature` — the same
+    /// positionally or by name through `parse_builtin_signature` — the same
     /// invariant the caller relies on to hand the wrapper a marker-free,
     /// PY_NULL-padded scope.
     #[test]
@@ -315,12 +323,14 @@ mod tests {
             /*kwonlyargcount*/ 1,
             /*posonlyargcount*/ 1,
         );
-        let bound = pyre_interpreter::call::bind_kwargs_to_signature(
+        let bound = pyre_interpreter::call::parse_builtin_signature(
             &signature,
             "combine",
             &[obj, w_int_new(3)],
             &[w_str_new("bias")],
             &[w_int_new(5)],
+            None,
+            pyre_object::PY_NULL,
         )
         .expect("signature binding");
         // 7 * 3 + 5 through the bound (marker-free, PY_NULL-padded) scope.

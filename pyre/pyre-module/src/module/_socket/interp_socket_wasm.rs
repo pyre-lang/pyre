@@ -29,6 +29,24 @@ fn socket_type() -> PyObjectRef {
     })
 }
 
+fn socket_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let cls = args
+        .first()
+        .copied()
+        .filter(|w_cls| unsafe { pyre_object::is_type(*w_cls) })
+        .unwrap_or_else(socket_type);
+    Ok(pyre_object::w_instance_new(cls))
+}
+
+/// Keyword path: extras belong to `__init__`.
+fn socket_descr_new_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let _ = args;
+    socket_descr_new(&[w_type])
+}
+
 fn init_socket_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -39,14 +57,10 @@ fn init_socket_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(|args| {
-            let cls = args
-                .first()
-                .copied()
-                .filter(|w_cls| unsafe { pyre_object::is_type(*w_cls) })
-                .unwrap_or_else(socket_type);
-            Ok(pyre_object::w_instance_new(cls))
-        })
+        pyre_interpreter::typedef::make_new_descr_passthrough1(
+            socket_descr_new,
+            socket_descr_new_args,
+        )
     );
     // The one call this type would have to make, and the one it cannot: there
     // is no descriptor for a socket to be, so construction reports that rather

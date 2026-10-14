@@ -3092,10 +3092,10 @@ pub unsafe fn descr_builtinfunction__new__(
 /// name=None, argdefs=None, closure=None, kwdefaults=None)`.
 ///
 /// `args[0]` is the class (the `function` type); the remaining
-/// positional args plus the trailing `__pyre_kw__` dict
-/// (`split_builtin_kwargs`) supply the constructor parameters, so both
+/// positional args supply the constructor parameters, so both
 /// `FunctionType(code, g)` and `FunctionType(code, g, closure=c,
-/// kwdefaults=k)` reach the same slot resolution.
+/// kwdefaults=k)` reach the same slot resolution. Keyword names stay on
+/// `Arguments` for `descr_function_new_args`.
 pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `args[0]` is `cls`; the constructor parameters start at index 1. All six
     // are positional-or-keyword, so the shared binder owns the arity count,
@@ -3628,31 +3628,20 @@ pub unsafe fn descr_method_get(
 
 #[inline]
 pub fn descr_method_call(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let method = require_method(
-        positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+        args.first().copied().unwrap_or(pyre_object::PY_NULL),
         "__call__",
     )?;
-    let call_args = positional.get(1..).unwrap_or(&[]);
-    if !crate::builtins::has_real_kwargs(kwargs) {
-        return crate::call::call_function_impl_result(method, call_args);
-    }
-    let keyword_args: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = unsafe {
-        pyre_object::w_dict_str_entries(kwargs.unwrap())
-            .into_iter()
-            .filter(|(name, _)| name != "__pyre_kw__")
-            .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name), value))
-            .collect()
-    };
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "method call has no current frame",
-            ));
-        }
-        crate::call::call_with_kwargs(unsafe { &mut *frame }, method, call_args, &keyword_args)
-    })
+    crate::call::call_function_impl_result(method, args.get(1..).unwrap_or(&[]))
+}
+
+/// `function.py Method.descr_call` keyword path — `space.call_args`.
+pub fn descr_method_call_args(
+    method: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> crate::PyResult {
+    let method = require_method(method, "__call__")?;
+    crate::call::call_args(method, args)
 }
 
 #[inline]
@@ -4463,9 +4452,22 @@ pub fn funccall_valuestack(
     // function.py:201-203 — fallback: build Arguments via make_arguments
     // (carries methodcall + w_function for diagnostics) and dispatch through
     // call_args.
-    let args = frame.make_arguments(nargs, methodcall, func);
+    //
+    // Pin off the still-live frame slots, then dropvalues.  Copying into a
+    // native Vec first (`make_arguments` / `peekvalues`) leaves a window
+    // where a collection forwards the frame slots but not the copy, and
+    // HOPELESS builtins (`make_builtin_function`, arity 0x400) always land
+    // here because `nargs == 0x400` never matches `fastcall_N`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.base();
+    let _ = _roots.pin_root(func);
+    for i in 0..nargs {
+        let _ = _roots.pin_root(frame.peekvalue(nargs - 1 - i));
+    }
     unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-    funccall(func, &args)
+    let func_now = _roots.get(root_base);
+    let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
+    funccall(func_now, &args_w)
 }
 
 /// function.py `_flat_pycall` — create frame directly from stack.

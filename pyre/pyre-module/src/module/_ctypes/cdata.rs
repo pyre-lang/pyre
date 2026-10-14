@@ -783,7 +783,7 @@ fn simplecdata_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
             "__init__ requires self",
         ));
     };
-    let (pos, _kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
+    let pos = &args[1..];
     if pos.len() > 1 {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "__init__ expected at most 1 argument, got {}",

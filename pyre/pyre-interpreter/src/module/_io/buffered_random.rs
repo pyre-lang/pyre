@@ -715,8 +715,7 @@ impl W_BufferedRandom {
 impl W_BufferedRandom {
     #[staticmethod]
     fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        let given = params.len().saturating_sub(1) + crate::builtins::real_kwarg_count(kwargs);
+        let given = args.len().saturating_sub(1);
         if given > 2 {
             return Err(crate::PyError::type_error(format!(
                 "BufferedRandom() takes at most 2 arguments ({} given)",

@@ -347,11 +347,10 @@ pub mod deque_iter {
     }
 
     fn constructor_args(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
-        let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
         // `__new__`'s descriptor ABI leaves the requested class at the front
         // of the varargs slice (the typed `_cls` slot is the descriptor
         // receiver).  PyPy's W_DequeIter__new__ starts parsing after it.
-        let positional = positional.get(1..).unwrap_or(&[]);
+        let positional = args.get(1..).unwrap_or(&[]);
         if positional.is_empty() || positional.len() > 2 {
             return Err(crate::PyError::type_error(format!(
                 "_deque_iterator expected 1 or 2 arguments, got {}",
@@ -504,8 +503,7 @@ pub mod deque_rev_iter {
     impl W_DequeRevIter {
         #[staticmethod]
         fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let positional = positional.get(1..).unwrap_or(&[]);
+            let positional = args.get(1..).unwrap_or(&[]);
             if positional.is_empty() || positional.len() > 2 {
                 return Err(crate::PyError::type_error(format!(
                     "_deque_reverse_iterator expected 1 or 2 arguments, got {}",

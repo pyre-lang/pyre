@@ -1455,7 +1455,7 @@ impl Arguments {
     ///                           w_kw_defs, blindargs)
     ///     return scope_w
     /// ```
-    fn _parse(
+    pub(crate) fn _parse(
         &self,
         w_firstarg: PyObjectRef,
         signature: &crate::gateway::Signature,
