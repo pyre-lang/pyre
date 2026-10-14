@@ -125,6 +125,14 @@ pub trait JitPolicy {
         true
     }
 
+    /// Capture `look_inside_function` for helpers minted after
+    /// `find_all_graphs`. `policy.py look_inside_graph` delegates to the
+    /// policy in use; a late `alloc_and_set` family must see that override
+    /// rather than this default `true`.
+    fn snapshot_look_inside_function(&self) -> Box<dyn Fn(&FunctionGraph) -> bool> {
+        Box::new(|_func| true)
+    }
+
     /// policy.py `_reject_function(func)`.
     ///
     /// `_elidable_function_` is always opaque. So is a function whose
@@ -299,6 +307,11 @@ impl JitPolicy for StopAtXPolicy {
     /// policy.py: `return func not in self.funcs`.
     fn look_inside_function(&self, func: &FunctionGraph) -> bool {
         !self.funcs.iter().any(|f| f == &func.name)
+    }
+
+    fn snapshot_look_inside_function(&self) -> Box<dyn Fn(&FunctionGraph) -> bool> {
+        let funcs = self.funcs.clone();
+        Box::new(move |func| !funcs.iter().any(|f| f == &func.name))
     }
 }
 
@@ -730,6 +743,19 @@ mod tests {
         let other = make_func("other", vec![]);
         assert!(!policy.look_inside_function(&stop));
         assert!(policy.look_inside_function(&other));
+    }
+
+    /// Late mint reads this snapshot, not a fresh default policy.
+    #[test]
+    fn stop_at_x_snapshot_look_inside_function_matches_live() {
+        let policy = StopAtXPolicy::new(vec!["stop_me".into()]);
+        let snap = policy.snapshot_look_inside_function();
+        let stop = make_func("stop_me", vec![]);
+        let other = make_func("other", vec![]);
+        assert_eq!(snap(&stop), policy.look_inside_function(&stop));
+        assert_eq!(snap(&other), policy.look_inside_function(&other));
+        assert!(!snap(&stop));
+        assert!(snap(&other));
     }
 
     /// `policy.py:71-83`: a graph the codewriter refuses to look inside must

@@ -1120,6 +1120,35 @@ pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsB
     Some(block)
 }
 
+/// Residual `look_inside_iff` trampoline (`rlib/jit.py`) for a fixed
+/// `GcArray(OBJECTPTR)` fill. `dont_look_inside` publishes this to
+/// `HELPER_FNADDRS` as the executable `getfunctionptr` target.
+/// `item` lives across `alloc_items_block_gc`, which can collect: pin it
+/// like `alloc_instance_items_block` (`push_roots` / `pin_root`, then
+/// `shadow_stack_get`). Pin the block before the write-barrier fill.
+#[majit_macros::dont_look_inside]
+pub fn _ll_fixed_alloc_and_set_nonnull_r_trampoline(
+    count: i64,
+    item: PyObjectRef,
+) -> *mut ItemsBlock {
+    let count = if count < 0 { 0 } else { count as usize };
+    let _roots = crate::gc_roots::push_roots();
+    let item_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(item);
+    unsafe {
+        let (block, _) = alloc_items_block_gc(count);
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+        let block = crate::gc_roots::shadow_stack_get(item_slot + 1) as *mut ItemsBlock;
+        let n = items_block_capacity(block).min(count);
+        let mut i = 0usize;
+        while i < n {
+            items_block_set_ref(block, i, crate::gc_roots::shadow_stack_get(item_slot));
+            i += 1;
+        }
+        block
+    }
+}
+
 /// Allocate a fresh `ItemsBlock` with the given capacity via
 /// `std::alloc::alloc`. This is the `MAJIT_GC_ITEMSBLOCK=0` fallback;
 /// the default path is the moving-nursery `alloc_items_block_gc` above
@@ -2460,6 +2489,35 @@ mod tests {
         );
         assert!(!arr.is_null());
         assert_eq!(gcarray_len(arr), 1);
+    }
+
+    #[test]
+    fn r_trampoline_fills_the_block() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        let item = 0x1000usize as PyObjectRef;
+        let block = _ll_fixed_alloc_and_set_nonnull_r_trampoline(3, item);
+        unsafe {
+            assert_eq!(items_block_capacity(block), 3);
+            let base = items_block_items_base(block);
+            assert_eq!(*base, item);
+            assert_eq!(*base.add(1), item);
+            assert_eq!(*base.add(2), item);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn residual_r_alloc_and_set_trampoline_is_published() {
+        let module = module_path!().trim_end_matches("::tests");
+        let mut published = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
+        let path = format!("{module}::_ll_fixed_alloc_and_set_nonnull_r_trampoline");
+        assert!(
+            published.contains(&path.as_str()),
+            "{path} is not published"
+        );
     }
 
     #[test]

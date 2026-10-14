@@ -2747,11 +2747,12 @@ fn call_target_variant_name(target: &CallTarget) -> &'static str {
     }
 }
 
-/// View of the support flags `find_all_graphs` recorded. Late-minted
-/// helpers call `look_inside_graph` on this view so they see those
-/// flags, not a separately constructed policy.
+/// View of the policy `find_all_graphs` recorded. Late-minted helpers
+/// call `look_inside_graph` on this view so they see those flags and
+/// `look_inside_function`, not a separately constructed default policy.
 struct BfsPolicyView<'a> {
     state: &'a mut crate::policy::JitPolicyState,
+    look_inside_function: &'a dyn Fn(&FunctionGraph) -> bool,
 }
 
 impl JitPolicy for BfsPolicyView<'_> {
@@ -2760,6 +2761,9 @@ impl JitPolicy for BfsPolicyView<'_> {
     }
     fn state_mut(&mut self) -> &mut crate::policy::JitPolicyState {
         self.state
+    }
+    fn look_inside_function(&self, func: &FunctionGraph) -> bool {
+        (self.look_inside_function)(func)
     }
 }
 
@@ -2815,6 +2819,10 @@ pub struct CallControl {
     /// `look_inside_graph` against this state so they see the same flags
     /// BFS used.
     bfs_policy_state: crate::policy::JitPolicyState,
+    /// `look_inside_function` of that same policy (`policy.py
+    /// look_inside_graph` delegates to it). Captured because
+    /// `BfsPolicyView` cannot hold the original trait object.
+    bfs_look_inside_function: Box<dyn Fn(&FunctionGraph) -> bool>,
     /// `PipelineConfig::helper_graphs` — host-declared BFS seeds beside the
     /// portals (`call.py inline_calls_to`).
     helper_seed_graphs: Vec<CallPath>,
@@ -3666,6 +3674,7 @@ impl CallControl {
             method_to_impl_types: HashMap::new(),
             candidate_graphs: HashSet::new(),
             bfs_policy_state: crate::policy::JitPolicyState::new(),
+            bfs_look_inside_function: Box::new(|_| true),
             helper_seed_graphs: Vec::new(),
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
@@ -5381,10 +5390,10 @@ impl CallControl {
     }
 
     /// Admit `path` when `policy.look_inside_graph` would, using the flags
-    /// `find_all_graphs` recorded (`call.py find_all_graphs`). A helper
-    /// minted after that walk (`alloc_and_set`) goes through this so a
-    /// `_jit_look_inside_ = False` trampoline stays residual the way BFS
-    /// would have left it.
+    /// and `look_inside_function` `find_all_graphs` recorded (`call.py
+    /// find_all_graphs`). A helper minted after that walk (`alloc_and_set`)
+    /// goes through this so a `_jit_look_inside_ = False` trampoline stays
+    /// residual the way BFS would have left it.
     pub fn add_candidate_graph_if_look_inside(&mut self, path: CallPath) {
         let Some(graph) = self.function_graphs.get(&path) else {
             return;
@@ -5393,6 +5402,7 @@ impl CallControl {
         let see = {
             let mut view = BfsPolicyView {
                 state: &mut self.bfs_policy_state,
+                look_inside_function: self.bfs_look_inside_function.as_ref(),
             };
             JitPolicy::look_inside_graph(&mut view, &graph)
         };
@@ -5462,6 +5472,24 @@ impl CallControl {
 
     pub fn register_function_fnaddr(&mut self, path: CallPath, fnaddr: i64) {
         self.function_fnaddrs.insert(path, fnaddr);
+    }
+
+    /// Copy a bound trace-call address from `src` onto `dest`.
+    ///
+    /// Residual CALL of a minted `look_inside_iff` trampoline
+    /// (`rlib/jit.py`) uses `getfunctionptr` of an ordinary translated
+    /// function. The identity-specific graph name is not in
+    /// `HELPER_FNADDRS`; the kind leaf is. The reloc key stays the
+    /// published spelling.
+    pub fn alias_function_fnaddr(&mut self, dest: CallPath, src: &CallPath) {
+        let Some(&addr) = self.function_fnaddrs.get(src) else {
+            return;
+        };
+        let key = self.fnaddr_registry_keys.get(src).cloned();
+        self.function_fnaddrs.insert(dest.clone(), addr);
+        if let Some(key) = key {
+            self.fnaddr_registry_keys.insert(dest, key);
+        }
     }
 
     /// Consume a `#[jit_module]::__majit_helper_trace_fnaddrs()` entry.
@@ -6992,8 +7020,10 @@ impl CallControl {
     }
 
     fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy, helper_roots: &[CallPath]) {
-        // Late-minted helpers reuse these flags in `look_inside_graph`.
+        // Late-minted helpers reuse these flags and `look_inside_function`
+        // in `look_inside_graph` (`policy.py look_inside_graph`).
         self.bfs_policy_state = policy.state().clone();
+        self.bfs_look_inside_function = policy.snapshot_look_inside_function();
         // RPython call.py find_all_graphs: BFS from portal targets.
         // For each graph, scan all Call ops. If guess_call_kind would
         // return 'regular' (i.e. graphs_from returns a graph AND it's

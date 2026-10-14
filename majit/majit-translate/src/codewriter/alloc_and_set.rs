@@ -95,6 +95,9 @@ pub(crate) fn ll_fixed_alloc_and_set_path(
     // `look_inside_iff` (`rlib/jit.py`): `unroll_safe(func)` then
     // `func._annspecialcase_ = "specialize:call_location"` on the
     // original and the trampoline. The wrapper `f` does not get it.
+    // Bind the kind-leaf residual address before residualizing the
+    // trampoline: `getfunctionptr` of an ordinary translated function.
+    bind_kind_trampoline_fnaddr(cc, &names.trampoline, &identity.item_ty);
     register(
         cc,
         &names.nonnull,
@@ -121,10 +124,54 @@ fn register(cc: &mut CallControl, name: &str, mut graph: FunctionGraph, hints: &
     }
     // BFS admits a callee only when `policy.look_inside_graph` is true
     // (`call.py find_all_graphs`). A helper minted after that walk skips
-    // BFS; run the same gate on the flags that walk recorded so a
-    // `_jit_look_inside_ = False` trampoline stays residual.
+    // BFS; run the same gate on the flags and `look_inside_function`
+    // that walk recorded so a `_jit_look_inside_ = False` trampoline
+    // stays residual.
     cc.register_function_graph(path.clone(), graph);
     cc.add_candidate_graph_if_look_inside(path);
+}
+
+/// Kind leaf published by `HELPER_FNADDRS` for the residual trampoline.
+/// Identity-specific graphs alias this address (`look_inside_iff`
+/// trampoline is an ordinary translated function).
+pub(crate) fn kind_trampoline_leaf(item_ty: &ValueType) -> &'static str {
+    match item_ty {
+        ValueType::Float | ValueType::SingleFloat => "_ll_fixed_alloc_and_set_nonnull_f_trampoline",
+        ValueType::Ref(_) | ValueType::Str => "_ll_fixed_alloc_and_set_nonnull_r_trampoline",
+        _ => "_ll_fixed_alloc_and_set_nonnull_i_trampoline",
+    }
+}
+
+/// Crate-stripped `CallPath` `register_macro_helper_trace_fnaddr` binds
+/// first for this kind's `HelperFnAddr.path`.
+fn kind_trampoline_fnaddr_key(item_ty: &ValueType) -> CallPath {
+    let leaf = kind_trampoline_leaf(item_ty);
+    match item_ty {
+        ValueType::Ref(_) | ValueType::Str => CallPath::from_segments(["object_array", leaf]),
+        _ => CallPath::from_segments(["lltypesystem", "rlist", leaf]),
+    }
+}
+
+/// `HelperFnAddr.path` (`concat!(module_path!(), "::", name)`) consumed
+/// by `register_macro_helper_trace_fnaddr`.
+#[cfg(test)]
+fn kind_trampoline_helper_fnaddr_path(item_ty: &ValueType) -> String {
+    let crate_name = match item_ty {
+        ValueType::Ref(_) | ValueType::Str => "pyre_object",
+        _ => "majit_rlib",
+    };
+    format!("{crate_name}::{}", kind_trampoline_fnaddr_key(item_ty))
+}
+
+fn bind_kind_trampoline_fnaddr(cc: &mut CallControl, trampoline: &str, item_ty: &ValueType) {
+    let dest = CallPath::from_segments([trampoline]);
+    if cc.lookup_function_fnaddr(&dest).is_some() {
+        return;
+    }
+    let src = kind_trampoline_fnaddr_key(item_ty);
+    if cc.lookup_function_fnaddr(&src).is_some() {
+        cc.alias_function_fnaddr(dest, &src);
+    }
 }
 
 fn sanitize_array_id(id: &str) -> String {
@@ -679,7 +726,20 @@ mod tests {
     }
 
     fn mint(identity: &FixedArrayRepeat) -> (CallControl, AllocAndSetNames) {
+        mint_with_kind_fnaddr(identity, Some(0x1000))
+    }
+
+    fn mint_with_kind_fnaddr(
+        identity: &FixedArrayRepeat,
+        addr: Option<i64>,
+    ) -> (CallControl, AllocAndSetNames) {
         let mut cc = CallControl::new();
+        if let Some(addr) = addr {
+            cc.register_macro_helper_trace_fnaddr(
+                &kind_trampoline_helper_fnaddr_path(&identity.item_ty),
+                addr,
+            );
+        }
         let _ = ll_fixed_alloc_and_set_path(&mut cc, identity);
         let names = alloc_and_set_names(&identity.array_type_id);
         (cc, names)
@@ -730,7 +790,7 @@ mod tests {
 
     /// `dont_look_inside` is excluded by `look_inside_graph`, not by
     /// leaf name: the trampoline is registered, `graphs_from` is None,
-    /// `guess_call_kind` is Residual.
+    /// `guess_call_kind` is Residual, and the kind-leaf address is bound.
     #[test]
     fn trampoline_is_residual_not_a_candidate() {
         let (cc, names) = mint(&i64_identity());
@@ -743,6 +803,13 @@ mod tests {
         let tramp_call = call_op(&names.trampoline);
         assert!(cc.graphs_from(&tramp_call).is_none());
         assert_eq!(cc.guess_call_kind(&tramp_call), CallKind::Residual);
+        assert_eq!(cc.lookup_function_fnaddr(&tramp_path), Some(0x1000));
+        let OpKind::Call { target, .. } = &tramp_call.kind else {
+            panic!("call_op is a Call");
+        };
+        let binding = cc.fnaddr_binding_for_target(target);
+        assert!(!binding.symbolic, "residual trampoline must be executable");
+        assert!(!crate::codewriter::call::is_symbolic_fnaddr(binding.addr));
 
         for name in [
             &names.outer,
@@ -754,6 +821,39 @@ mod tests {
             let path = CallPath::from_segments([name.as_str()]);
             assert!(cc.is_candidate(&path), "{name} must stay a candidate");
             assert_eq!(cc.guess_call_kind(&call_op(name)), CallKind::Regular);
+        }
+    }
+
+    /// `register_macro_helper_trace_fnaddr` consumes a `HelperFnAddr.path`
+    /// and `bind_kind_trampoline_fnaddr` aliases that canonical key onto
+    /// the identity trampoline.
+    #[test]
+    fn consumer_binds_each_kind_trampoline_from_helper_fnaddr_path() {
+        for identity in [i64_identity(), float_identity(), ptr_identity()] {
+            let mut cc = CallControl::new();
+            cc.register_macro_helper_trace_fnaddr(
+                &kind_trampoline_helper_fnaddr_path(&identity.item_ty),
+                0x1000,
+            );
+            assert_eq!(
+                cc.lookup_function_fnaddr(&kind_trampoline_fnaddr_key(&identity.item_ty)),
+                Some(0x1000),
+            );
+            let _ = ll_fixed_alloc_and_set_path(&mut cc, &identity);
+            let names = alloc_and_set_names(&identity.array_type_id);
+            let tramp_path = CallPath::from_segments([names.trampoline.as_str()]);
+            assert!(
+                !cc.is_candidate(&tramp_path),
+                "look_inside_graph refuses `_jit_look_inside_ = False`"
+            );
+            assert_eq!(cc.lookup_function_fnaddr(&tramp_path), Some(0x1000));
+            let tramp_call = call_op(&names.trampoline);
+            let OpKind::Call { target, .. } = &tramp_call.kind else {
+                panic!("call_op is a Call");
+            };
+            let binding = cc.fnaddr_binding_for_target(target);
+            assert!(!binding.symbolic, "{}", names.trampoline);
+            assert!(!crate::codewriter::call::is_symbolic_fnaddr(binding.addr));
         }
     }
 
@@ -796,19 +896,61 @@ mod tests {
         let mut policy = crate::policy::DefaultJitPolicy::new();
         policy.state.set_supports_floats(true);
         cc.find_all_graphs(&mut policy);
-        let _ = ll_fixed_alloc_and_set_path(&mut cc, &float_identity());
-        let names = alloc_and_set_names(&float_identity().array_type_id);
+        let identity = float_identity();
+        cc.register_macro_helper_trace_fnaddr(
+            &kind_trampoline_helper_fnaddr_path(&identity.item_ty),
+            0x1000,
+        );
+        let _ = ll_fixed_alloc_and_set_path(&mut cc, &identity);
+        let names = alloc_and_set_names(&identity.array_type_id);
         let tramp_path = CallPath::from_segments([names.trampoline.as_str()]);
         assert!(cc.has_function_graph(&tramp_path));
         assert!(
             !cc.is_candidate(&tramp_path),
             "look_inside_graph refuses `_jit_look_inside_ = False`"
         );
+        assert_eq!(cc.lookup_function_fnaddr(&tramp_path), Some(0x1000));
         for name in family_names(&names) {
             let path = CallPath::from_segments([name]);
             assert!(cc.is_candidate(&path), "{name} must stay a candidate");
             assert_eq!(cc.guess_call_kind(&call_op(name)), CallKind::Regular);
         }
+    }
+
+    /// `StopAtXPolicy.look_inside_function` is the BFS policy, so a late
+    /// mint of a named helper stays opaque (`policy.py look_inside_graph`).
+    #[test]
+    fn late_family_respects_stop_at_x_policy() {
+        let mut cc = CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "portal"]);
+        cc.register_function_graph(portal.clone(), FunctionGraph::new("portal"));
+        cc.mark_portal(portal);
+        let identity = i64_identity();
+        let names = alloc_and_set_names(&identity.array_type_id);
+        let mut policy = crate::policy::StopAtXPolicy::new(vec![names.outer.clone()]);
+        cc.find_all_graphs(&mut policy);
+        cc.register_macro_helper_trace_fnaddr(
+            &kind_trampoline_helper_fnaddr_path(&identity.item_ty),
+            0x1000,
+        );
+        let _ = ll_fixed_alloc_and_set_path(&mut cc, &identity);
+        let outer = CallPath::from_segments([names.outer.as_str()]);
+        assert!(
+            !cc.is_candidate(&outer),
+            "StopAtXPolicy.look_inside_function must refuse the late outer"
+        );
+        for name in [
+            names.jit.as_str(),
+            names.nojit.as_str(),
+            names.nonnull.as_str(),
+            names.wrapper.as_str(),
+        ] {
+            let path = CallPath::from_segments([name]);
+            assert!(cc.is_candidate(&path), "{name} must stay a candidate");
+        }
+        let tramp = CallPath::from_segments([names.trampoline.as_str()]);
+        assert!(!cc.is_candidate(&tramp));
+        assert_eq!(cc.lookup_function_fnaddr(&tramp), Some(0x1000));
     }
 
     /// Outer's false `we_are_jitted` arm is `_ll_alloc_and_set_nojit`,

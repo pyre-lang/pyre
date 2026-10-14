@@ -505,6 +505,46 @@ pub unsafe fn alloc_typed_items_block_immortal(cap: usize) -> *mut TypedItemsBlo
     }
 }
 
+fn clamp_repeat_count(count: i64) -> usize {
+    if count < 0 { 0 } else { count as usize }
+}
+
+unsafe fn fill_typed_items_block<T: Copy>(block: *mut TypedItemsBlock, count: usize, item: T) {
+    unsafe {
+        let n = typed_items_block_capacity(block).min(count);
+        let base = typed_items_block_items_base(block) as *mut T;
+        let mut i = 0usize;
+        while i < n {
+            *base.add(i) = item;
+            i += 1;
+        }
+    }
+}
+
+/// Residual `look_inside_iff` trampoline (`rlib/jit.py`) for a fixed
+/// `GcArray(Signed)` fill. `dont_look_inside` publishes this to
+/// `HELPER_FNADDRS` as the executable `getfunctionptr` target.
+#[majit_macros::dont_look_inside]
+pub fn _ll_fixed_alloc_and_set_nonnull_i_trampoline(count: i64, item: i64) -> *mut TypedItemsBlock {
+    let count = clamp_repeat_count(count);
+    unsafe {
+        let block = alloc_typed_items_block_nursery(count, gc_int_array_gc_type_id());
+        fill_typed_items_block(block, count, item);
+        block
+    }
+}
+
+/// Residual `look_inside_iff` trampoline for a fixed `GcArray(Float)` fill.
+#[majit_macros::dont_look_inside]
+pub fn _ll_fixed_alloc_and_set_nonnull_f_trampoline(count: i64, item: f64) -> *mut TypedItemsBlock {
+    let count = clamp_repeat_count(count);
+    unsafe {
+        let block = alloc_typed_items_block_nursery(count, gc_float_array_gc_type_id());
+        fill_typed_items_block(block, count, item);
+        block
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +605,52 @@ mod tests {
         let _guard = declaration_lock();
         set_gc_float_array_gc_type_id(7);
         set_gc_float_array_gc_type_id(8);
+    }
+
+    #[test]
+    fn i_trampoline_fills_the_block() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        let block = _ll_fixed_alloc_and_set_nonnull_i_trampoline(3, 7);
+        unsafe {
+            assert_eq!(typed_items_block_capacity(block), 3);
+            let base = typed_items_block_items_base(block) as *mut i64;
+            assert_eq!(*base, 7);
+            assert_eq!(*base.add(1), 7);
+            assert_eq!(*base.add(2), 7);
+        }
+    }
+
+    #[test]
+    fn f_trampoline_fills_the_block() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        let block = _ll_fixed_alloc_and_set_nonnull_f_trampoline(2, 1.5);
+        unsafe {
+            assert_eq!(typed_items_block_capacity(block), 2);
+            let base = typed_items_block_items_base(block) as *mut f64;
+            assert_eq!(*base, 1.5);
+            assert_eq!(*base.add(1), 1.5);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn residual_alloc_and_set_trampolines_are_published() {
+        let module = module_path!().trim_end_matches("::tests");
+        let mut published = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
+        for leaf in [
+            "_ll_fixed_alloc_and_set_nonnull_i_trampoline",
+            "_ll_fixed_alloc_and_set_nonnull_f_trampoline",
+        ] {
+            let path = format!("{module}::{leaf}");
+            assert!(
+                published.contains(&path.as_str()),
+                "{path} is not published"
+            );
+        }
     }
 }

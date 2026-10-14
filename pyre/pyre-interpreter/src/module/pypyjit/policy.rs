@@ -119,6 +119,11 @@ impl JitPolicy for PyPyJitPolicy {
 
         true
     }
+
+    fn snapshot_look_inside_function(&self) -> Box<dyn Fn(&FunctionGraph) -> bool> {
+        let this = self.clone();
+        Box::new(move |func| JitPolicy::look_inside_function(&this, func))
+    }
 }
 
 #[cfg(test)]
