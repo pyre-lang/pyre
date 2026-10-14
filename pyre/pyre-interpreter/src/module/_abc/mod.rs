@@ -458,13 +458,16 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             version,
         ))?;
 
-        // Re-read `bases` off the live class: the tuple is itself a nursery
-        // object, and `getattr` / `collect_iterable` below collect.
+        // `bases = cls.__bases__` is read once: a metaclass hook run by the
+        // lookups below may rebind `cls.__bases__`, and the loop still walks
+        // the original tuple.  It is a nursery object and `getattr` /
+        // `collect_iterable` collect, so it is rooted and reloaded.
         let bases = unsafe { w_type_get_bases(roots.get(cls_slot)) };
         if !bases.is_null() && unsafe { is_tuple(bases) } {
             let n_bases = unsafe { w_tuple_len(bases) };
+            let bases_slot = roots.pin_roots(&[bases]);
             for i in 0..n_bases {
-                let bases = unsafe { w_type_get_bases(roots.get(cls_slot)) };
+                let bases = roots.get(bases_slot);
                 let Some(mut base) = (unsafe { w_tuple_getitem(bases, i as i64) }) else {
                     continue;
                 };
