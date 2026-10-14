@@ -7632,11 +7632,14 @@ impl CallControl {
 
     /// RPython `CallControl.getcalldescr` / `Transformer.rewrite_call`:
     /// `Void` arguments remain in the flow graph but are absent from the
-    /// low-level call's `NON_VOID_ARGS`. Charon can leave a zero-sized closure
-    /// receiver as `Ref` at its construction site even though the callee's
-    /// declared parameter is `Void`; use the authoritative `FUNC.ARGS`
-    /// positions at this ABI boundary instead of erasing that SSA value
-    /// globally.
+    /// low-level call's `NON_VOID_ARGS`. Drop a slot when the declared
+    /// `FUNC.ARGS` type is Void or when the actual's `concretetype` is
+    /// Void (`jtransform.py add_in_correct_list` returns on
+    /// `kind == 'void'`; `call.py getcalldescr` filters
+    /// `x.concretetype is not Void`). Charon can leave a zero-sized
+    /// closure receiver as `Ref` at its construction site even though
+    /// the callee's declared parameter is `Void`; the declared-Void
+    /// half of the drop still uses `FUNC.ARGS`.
     pub(crate) fn non_void_actual_args_for_target(
         &self,
         target: &CallTarget,
@@ -7646,15 +7649,12 @@ impl CallControl {
             return args.to_vec();
         };
         let declared = graph_arg_types(&graph);
-        if declared.len() != args.len() {
+        match drop_void_declared_or_actual(args, &declared) {
+            Some(filtered) => filtered,
             // Leave malformed arity untouched so `getcalldescr` reports the
             // orthodox hard error instead of silently hiding an argument.
-            return args.to_vec();
+            None => args.to_vec(),
         }
-        args.iter()
-            .zip(declared)
-            .filter_map(|(arg, ty)| (ty != crate::model::ValueType::Void).then(|| arg.clone()))
-            .collect()
     }
 
     /// Same drop as [`Self::non_void_actual_args_for_target`], for an
@@ -7686,13 +7686,10 @@ impl CallControl {
             return drop_void_concretetype();
         };
         let declared = graph_arg_types(&graph);
-        if declared.len() != args.len() {
-            return drop_void_concretetype();
+        match drop_void_declared_or_actual(args, &declared) {
+            Some(filtered) => filtered,
+            None => drop_void_concretetype(),
         }
-        args.iter()
-            .zip(declared)
-            .filter_map(|(arg, ty)| (ty != crate::model::ValueType::Void).then(|| arg.clone()))
-            .collect()
     }
 
     /// The shared low-level result type of an indirect-call family.
@@ -7914,33 +7911,64 @@ fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
 fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
     graph_arg_types(graph)
         .iter()
-        .filter_map(|ty| match ty {
-            // RPython `history.getkind(BOOL_TYPE)` returns `'int'`;
-            // `CallControl.getcalldescr` records Bool in `FUNC.ARGS` under the
-            // same `'i'` register kind as `Signed`. Bool aliases to Int so the
-            // wildcard does not silently re-classify it as Ref.
-            // `history.getkind`: Unsigned and SingleFloat bank as `'int'`.
-            // Int128 / UInt128 are too wide and `getkind` raises.
-            crate::model::ValueType::Int
-            | crate::model::ValueType::Bool
-            | crate::model::ValueType::Unsigned
-            | crate::model::ValueType::SingleFloat => Some(Type::Int),
-            // `Str` / `StringBuilder` are GC pointers (`getkind` → `'ref'`).
-            crate::model::ValueType::Ref(_)
-            | crate::model::ValueType::Str
-            | crate::model::ValueType::StringBuilder => Some(Type::Ref),
-            crate::model::ValueType::Float => Some(Type::Float),
-            crate::model::ValueType::Void => None,
-            // `history.getkind` raises NotImplementedError for a type that
-            // is neither Void, a supported Primitive, nor a Ptr.
-            crate::model::ValueType::Int128
-            | crate::model::ValueType::UInt128
-            | crate::model::ValueType::Unknown
-            | crate::model::ValueType::State => {
-                panic!("getkind: type {ty:?} not supported")
-            }
-        })
+        .filter_map(calldescr_type_of_value_type)
         .collect()
+}
+
+fn calldescr_type_of_value_type(ty: &crate::model::ValueType) -> Option<Type> {
+    match ty {
+        // RPython `history.getkind(BOOL_TYPE)` returns `'int'`;
+        // `CallControl.getcalldescr` records Bool in `FUNC.ARGS` under the
+        // same `'i'` register kind as `Signed`. Bool aliases to Int so the
+        // wildcard does not silently re-classify it as Ref.
+        // `history.getkind`: Unsigned and SingleFloat bank as `'int'`.
+        // Int128 / UInt128 are too wide and `getkind` raises.
+        crate::model::ValueType::Int
+        | crate::model::ValueType::Bool
+        | crate::model::ValueType::Unsigned
+        | crate::model::ValueType::SingleFloat => Some(Type::Int),
+        // `Str` / `StringBuilder` are GC pointers (`getkind` → `'ref'`).
+        crate::model::ValueType::Ref(_)
+        | crate::model::ValueType::Str
+        | crate::model::ValueType::StringBuilder => Some(Type::Ref),
+        crate::model::ValueType::Float => Some(Type::Float),
+        crate::model::ValueType::Void => None,
+        // `history.getkind` raises NotImplementedError for a type that
+        // is neither Void, a supported Primitive, nor a Ptr.
+        crate::model::ValueType::Int128
+        | crate::model::ValueType::UInt128
+        | crate::model::ValueType::Unknown
+        | crate::model::ValueType::State => {
+            panic!("getkind: type {ty:?} not supported")
+        }
+    }
+}
+
+fn actual_is_void(arg: &crate::flowspace::model::Variable) -> bool {
+    crate::model::FunctionGraph::concretetype_of(arg) == crate::model::ConcreteType::Void
+}
+
+/// Drop a slot when declared `FUNC.ARGS` or the actual `concretetype`
+/// is Void. `None` when arity does not match the declared list.
+fn drop_void_declared_or_actual(
+    args: &[crate::flowspace::model::Variable],
+    declared: &[crate::model::ValueType],
+) -> Option<Vec<crate::flowspace::model::Variable>> {
+    if declared.len() != args.len() {
+        return None;
+    }
+    Some(
+        args.iter()
+            .zip(declared)
+            .filter_map(|(arg, ty)| {
+                if *ty == crate::model::ValueType::Void || actual_is_void(arg) {
+                    None
+                } else {
+                    Some(arg.clone())
+                }
+            })
+            .collect(),
+    )
 }
 
 /// RPython parity for `call.py:222` `FUNC.RESULT`. Maps the declared
@@ -17178,6 +17206,86 @@ mod tests {
             &[actual_receiver, actual_value.clone()],
         );
         assert_eq!(filtered, vec![actual_value]);
+    }
+
+    /// `jtransform.py add_in_correct_list`: `if kind == 'void': return`.
+    /// A residual actual whose `concretetype` is Void has no register even
+    /// when `FUNC.ARGS` still lists Int.
+    #[test]
+    fn residual_void_actual_is_dropped_even_when_func_args_is_int() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["takes_int"]);
+        let mut callee = FunctionGraph::new("takes_int");
+        let formal = callee.alloc_value_var();
+        callee.push_inputarg_var(callee.startblock, formal.clone());
+        callee.push_op_with_result_var(
+            callee.startblock,
+            OpKind::Input {
+                name: "n".to_string(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            formal,
+        );
+        cc.register_function_graph(path, callee);
+
+        let actual = crate::flowspace::model::Variable::new();
+        actual.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            crate::model::ConcreteType::Void,
+        ));
+        let filtered = cc
+            .non_void_actual_args_for_target(&CallTarget::function_path(["takes_int"]), &[actual]);
+        assert!(
+            filtered.is_empty(),
+            "Void actual is omitted from NON_VOID_ARGS"
+        );
+    }
+
+    /// `call.py getcalldescr` compares NON_VOID_ARGS against FUNC.ARGS
+    /// with Void dropped independently. A Void actual against a Signed
+    /// declared slot is `[] != [Signed]` and raises.
+    #[test]
+    #[should_panic(expected = "calling a function with signature")]
+    fn getcalldescr_rejects_void_actual_against_int_func_arg() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["takes_int"]);
+        let mut graph = FunctionGraph::new("takes_int");
+        let arg = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, arg.clone());
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "n".to_string(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            arg,
+        );
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(path, graph);
+
+        let actual = crate::flowspace::model::Variable::new();
+        actual.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            crate::model::ConcreteType::Void,
+        ));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["takes_int"]),
+                args: crate::model::call_args([actual]),
+                result_ty: ValueType::Void,
+            },
+        };
+        let mut cache = AnalysisCache::default();
+        let _ = cc.getcalldescr(
+            &op,
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
     }
 
     /// The `@jit.dont_look_inside` builder residual helpers residualize only

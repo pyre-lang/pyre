@@ -326,7 +326,7 @@ pub(crate) fn dual_gate_check_with_registry(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drive_subject(legacy_graph, call_registry, true)
     }));
-    let (graph, mut real_value_to_var, mut real_constants) = match result {
+    let (graph, real_value_to_var, real_constants) = match result {
         Ok(Ok((graph, value_to_var, _, constants, _))) => (graph, value_to_var, constants),
         Ok(Err(e)) => {
             unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources, true);
@@ -390,19 +390,13 @@ pub(crate) fn dual_gate_check_with_registry(
             "dual-gate compared set empty".to_string(),
         ));
     }
-    // `follow_link` records `links_followed` only for an edge the
-    // annotator walks (`annrpython.py`). Phase B still
-    // `setconcretetype`s an unfollowed Variable to `Void` after
-    // `force_return_var_annotation` seeds `s_ImpossibleValue`.
-    // Publishing that twin would replace the legacy walker's kind
-    // (`func_result_kind` of a return, `getcalldescr` NON_VOID_ARGS of
-    // a residual call). A followed Variable typed `Void` still
-    // diverges above and skips.
-    keep_legacy_kind_when_unfollowed_void(
-        &mut real_value_to_var,
-        &mut real_constants,
-        excluded_legacy.as_ref(),
-    );
+    // Unfollowed Variables may be typed Void
+    // (`force_return_var_annotation` seeds `s_ImpossibleValue`;
+    // `SomeImpossibleValue.rtyper_makerepr` is `impossible_repr`).
+    // A Void value has no register; residual args drop it
+    // (`jtransform.py add_in_correct_list`, `call.py getcalldescr`
+    // NON_VOID_ARGS). A followed Variable typed Void still diverges
+    // above and skips.
     Ok(DualGateOutcome::Match {
         real_value_to_var,
         real_constants,
@@ -5611,63 +5605,10 @@ pub(crate) fn dual_gate_outcome_from_cache(
             "two-phase compared set empty".to_string(),
         ));
     }
-    keep_legacy_kind_when_unfollowed_void(
-        &mut value_to_var,
-        &mut constants,
-        excluded_legacy.as_ref(),
-    );
     Ok(DualGateOutcome::Match {
         real_value_to_var: value_to_var,
         real_constants: constants,
     })
-}
-
-/// Drop an unfollowed Variable whose real concretetype is `Void` when the
-/// legacy cell already has a kind. See the call in
-/// [`dual_gate_check_with_registry`].
-///
-/// Phase B `setconcretetype`s `Void` on an unfollowed cell after
-/// `s_ImpossibleValue` (`force_return_var_annotation`). The AccessDirect
-/// copy is a fresh `copygraph` (`cachedgraph` copies before rtyping);
-/// `emit_one_word_guard_release` already stamped the residual ABI word
-/// Signed, and the skip-arm `IntegerRepr` analog keeps it. Publishing the
-/// Void twin would make `getcalldescr` drop that actual (`call.py`
-/// NON_VOID_ARGS) while `FUNC.ARGS` still has Int.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
-fn keep_legacy_kind_when_unfollowed_void(
-    value_to_var: &mut LegacyToTyped,
-    constants: &mut HashMap<Variable, LowLevelType>,
-    excluded_legacy: Option<&HashSet<Variable>>,
-) {
-    let Some(excluded) = excluded_legacy else {
-        return;
-    };
-    let drop_keys: Vec<Variable> = value_to_var
-        .iter()
-        .filter_map(|(legacy, typed)| {
-            if !excluded.contains(legacy) {
-                return None;
-            }
-            let ll = typed.concretetype()?;
-            let kind = lowleveltype_to_concrete(&ll).ok()?;
-            if kind != crate::model::ConcreteType::Void {
-                return None;
-            }
-            match LegacyGraph::concretetype_of(legacy) {
-                crate::model::ConcreteType::Void | crate::model::ConcreteType::Unknown => None,
-                crate::model::ConcreteType::Signed
-                | crate::model::ConcreteType::GcRef
-                | crate::model::ConcreteType::Float => Some(legacy.clone()),
-            }
-        })
-        .collect();
-    for key in drop_keys {
-        value_to_var.remove(&key);
-        constants.remove(&key);
-    }
 }
 
 #[cfg(test)]
@@ -11408,11 +11349,11 @@ mod tests {
         );
     }
 
-    /// An unfollowed return whose real twin is `Void` must not overwrite a
-    /// legacy `Signed` cell. A followed return, and a session that never
-    /// recorded `links_followed`, keeps the twin.
+    /// An unfollowed return whose real twin is `Void` stays in the
+    /// publish map. `SomeImpossibleValue.rtyper_makerepr` is
+    /// `impossible_repr` (Void); a Void value has no register.
     #[test]
-    fn unfollowed_void_return_keeps_the_legacy_kind() {
+    fn unfollowed_void_return_publishes_the_void_twin() {
         use crate::model::ConcreteType;
 
         let legacy = LegacyGraph::new("unfollowed_void_return");
@@ -11428,55 +11369,26 @@ mod tests {
         value_to_var.insert(ret.clone(), typed);
         let mut constants = HashMap::new();
         constants.insert(ret.clone(), LowLevelType::Void);
-        let excluded = HashSet::from([ret.clone()]);
-        keep_legacy_kind_when_unfollowed_void(&mut value_to_var, &mut constants, Some(&excluded));
         assert!(
-            !value_to_var.contains_key(&ret),
-            "unfollowed void twin stays out of the publish map"
+            value_to_var.contains_key(&ret),
+            "unfollowed void twin stays in the publish map"
         );
-        assert!(!constants.contains_key(&ret));
+        assert_eq!(constants.get(&ret), Some(&LowLevelType::Void));
+        crate::codewriter::type_state::apply_from_flowspace_variables(&value_to_var);
+        crate::codewriter::type_state::apply_from_flowspace_constants(&constants);
         assert_eq!(
             LegacyGraph::concretetype_of(&ret),
-            ConcreteType::Signed,
-            "legacy kind is the CFG return `history.getkind` reads"
-        );
-
-        let typed = Variable::new();
-        typed.set_concretetype(crate::model::concrete_to_canonical_lltype(
             ConcreteType::Void,
-        ));
-        let mut followed_map = LegacyToTyped::new();
-        followed_map.insert(ret.clone(), typed);
-        let mut followed_constants = HashMap::new();
-        keep_legacy_kind_when_unfollowed_void(
-            &mut followed_map,
-            &mut followed_constants,
-            Some(&HashSet::new()),
-        );
-        assert!(
-            followed_map.contains_key(&ret),
-            "a followed return keeps its void twin"
-        );
-
-        let typed = Variable::new();
-        typed.set_concretetype(crate::model::concrete_to_canonical_lltype(
-            ConcreteType::Void,
-        ));
-        let mut unscoped = LegacyToTyped::new();
-        unscoped.insert(ret.clone(), typed);
-        let mut unscoped_constants = HashMap::new();
-        keep_legacy_kind_when_unfollowed_void(&mut unscoped, &mut unscoped_constants, None);
-        assert!(
-            unscoped.contains_key(&ret),
-            "no links_followed record leaves the twin in place"
+            "s_ImpossibleValue publishes Void; consumers drop it"
         );
     }
 
-    /// Residual-call actual (`emit_one_word_guard_release` Signed stamp)
-    /// whose AccessDirect copy was unfollowed: Phase B Void must not
-    /// publish over the skip-arm kind, or `getcalldescr` drops the actual.
+    /// Residual-call actual whose AccessDirect copy was unfollowed:
+    /// Phase B Void is published. `jtransform.py add_in_correct_list`
+    /// returns on `kind == 'void'`; `call.py getcalldescr` drops Void
+    /// from `NON_VOID_ARGS`.
     #[test]
-    fn unfollowed_void_call_arg_keeps_the_legacy_kind() {
+    fn unfollowed_void_call_arg_publishes_the_void_twin() {
         use crate::model::ConcreteType;
 
         let arg = Variable::new();
@@ -11491,17 +11403,17 @@ mod tests {
         value_to_var.insert(arg.clone(), typed);
         let mut constants = HashMap::new();
         constants.insert(arg.clone(), LowLevelType::Void);
-        let excluded = HashSet::from([arg.clone()]);
-        keep_legacy_kind_when_unfollowed_void(&mut value_to_var, &mut constants, Some(&excluded));
         assert!(
-            !value_to_var.contains_key(&arg),
-            "unfollowed void call-arg twin stays out of the publish map"
+            value_to_var.contains_key(&arg),
+            "unfollowed void call-arg twin stays in the publish map"
         );
-        assert!(!constants.contains_key(&arg));
+        assert_eq!(constants.get(&arg), Some(&LowLevelType::Void));
+        crate::codewriter::type_state::apply_from_flowspace_variables(&value_to_var);
+        crate::codewriter::type_state::apply_from_flowspace_constants(&constants);
         assert_eq!(
             LegacyGraph::concretetype_of(&arg),
-            ConcreteType::Signed,
-            "legacy kind is the residual ABI word getcalldescr reads"
+            ConcreteType::Void,
+            "residual actual of an impossible value is Void"
         );
     }
 }
