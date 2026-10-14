@@ -335,4 +335,29 @@ mod tests {
              like GcCache.get_size_descr()"
         );
     }
+
+    /// `virtualizable.py` `cpu.fielddescrof(VTYPE, 'vable_token')` is
+    /// `descr.py get_field_descr`'s cached object, so the vinfo token
+    /// descr is the SizeDescr row: same fieldname, offset, and
+    /// `index_in_parent` (`heaptracker.get_fielddescr_index_in`).
+    #[test]
+    fn pyframe_vinfo_token_descr_is_the_size_descrs_listed_row() {
+        let info = build_pyframe_virtualizable_info();
+        let token = info.token_field_descr();
+        let listed = crate::descr::pyframe_vable_token_descr();
+        let token_fd = token.as_field_descr().expect("token FieldDescr");
+        let listed_fd = listed.as_field_descr().expect("listed FieldDescr");
+        assert_eq!(token_fd.offset(), listed_fd.offset());
+        assert_eq!(token_fd.field_key(), listed_fd.field_key());
+        assert_eq!(token_fd.index_in_parent(), listed_fd.index_in_parent());
+        assert_eq!(token_fd.field_type(), listed_fd.field_type());
+        assert!(
+            token_fd.get_parent_descr().is_some(),
+            "vinfo token descr carries the PyFrame SizeDescr parent"
+        );
+        assert!(
+            token_fd.get_vinfo().is_some(),
+            "finalize_arc stamps get_vinfo on the listed geometry"
+        );
+    }
 }
