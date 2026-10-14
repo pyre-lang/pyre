@@ -1699,7 +1699,9 @@ pub fn seed_bridge_virtualizable_boxes(
             RebuiltValue::Box(n, ty) => fail_values.get(*n).map(|&bits| typed(*ty, bits)),
             RebuiltValue::Const(Const::Int(i)) => Some(Value::Int(*i)),
             RebuiltValue::Const(Const::Float(f)) => Some(Value::Float(*f)),
-            RebuiltValue::Const(Const::Ref(r)) => Some(Value::Ref(*r)),
+            RebuiltValue::Const(Const::Ref(r)) => {
+                Some(Value::Ref(majit_ir::const_ptr_table::resolve(*r)))
+            }
             // Unassigned has nothing to write. A virtual is materialized
             // below (`ResumeDataBoxReader.allocate` / `getvirtual_ptr`)
             // and its concrete is the allocated object, not a deadframe slot.
@@ -2063,7 +2065,7 @@ mod tests {
             | majit_ir::resumedata::TAGCONST as i32) as i16;
         let storage = crate::resume::new_resume_storage(
             Vec::new(),
-            vec![Const::Ref(GcRef(0x1111))],
+            vec![Const::from_gcref(GcRef(0x1111))],
             Vec::new(),
             Vec::new(),
         );

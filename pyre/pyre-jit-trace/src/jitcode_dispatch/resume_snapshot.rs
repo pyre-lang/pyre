@@ -1527,8 +1527,10 @@ pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
     // Python's call sentinel.  LOAD_SPECIAL records exactly that constant for
     // its `self_or_null` half, including the `__exit__` pair retained below a
     // nested CALL inside a `with` body.
-    if let OpRef::ConstPtr(value) = opref {
-        return Some(value.as_usize() as pyre_object::PyObjectRef);
+    if let OpRef::ConstPtr(index) = opref {
+        return Some(
+            majit_ir::const_ptr_table::resolve(index).as_usize() as pyre_object::PyObjectRef
+        );
     }
     let null_is_a_value = null_ref_is_a_value(opref);
     match ctx.trace_ctx.concrete_of_opref(opref) {

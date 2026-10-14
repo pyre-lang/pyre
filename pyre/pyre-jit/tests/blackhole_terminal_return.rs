@@ -64,7 +64,7 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
                     .zip(kinds)
                     .map(|(value, kind)| match kind {
                         Type::Int => Const::Int(value),
-                        Type::Ref => Const::Ref(GcRef(value as usize)),
+                        Type::Ref => Const::from_gcref(GcRef(value as usize)),
                         Type::Float => Const::Float(f64::from_bits(value as u64)),
                         Type::Void => unreachable!(),
                     })

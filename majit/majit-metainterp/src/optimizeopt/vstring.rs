@@ -1308,7 +1308,7 @@ impl OptString {
                 return Some(OptimizationResult::Remove);
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
-            let arg_null = Operand::const_(Const::Ref(majit_ir::GcRef::NULL));
+            let arg_null = Operand::const_(Const::from_gcref(majit_ir::GcRef::NULL));
             let mut eq_op = Op::new(OpCode::PtrEq, &[arg1.clone(), arg_null]);
             eq_op.pos().set(op.pos().get());
             // vstring.py:785-786: replace_op_with(PTR_EQ, ...) then self.emit(op)

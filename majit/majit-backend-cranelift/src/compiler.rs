@@ -9396,10 +9396,12 @@ fn has_inline_constptr(ops: &[Op]) -> bool {
 
 /// Re-read every non-null reference constant of `ops` from `table`, the
 /// `GcTable` the compile of these ops filled: `remove_constptr` and the
-/// fail-arg `_gcref_index` put each such constant there, keyed by the address
-/// it had at that compile. The retained ops still name that address; the slot
-/// holds the address after any collection since. `None` when a constant is
-/// not in the table, which refuses the merge.
+/// fail-arg `_gcref_index` put each such constant there, keyed by the
+/// address it had at that compile (`compile_key`). `history.py` `ConstPtr`
+/// intern already forwards the intern slot, so `const_value` after a
+/// collection is the current `slot`, not the compile-time key. Match
+/// either. `None` when a constant is not in the table, which refuses the
+/// merge.
 fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> Option<()> {
     let refresh = |arg: &majit_ir::operand::Operand| -> Option<majit_ir::operand::Operand> {
         let Some(majit_ir::Value::Ref(gcref)) = arg.const_value() else {
@@ -9409,7 +9411,8 @@ fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> 
             return Some(arg.clone());
         }
         let table = table?;
-        let index = (0..table.len()).find(|&i| table.compile_key(i) == gcref.0)?;
+        let index = (0..table.len())
+            .find(|&i| table.compile_key(i) == gcref.0 || table.slot(i).0 == gcref.0)?;
         Some(majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
             table.slot(index),
         )))
@@ -27730,6 +27733,32 @@ mod tests {
             ))],
         );
         assert!(refresh_retained_constptrs(std::slice::from_ref(&used), None).is_none());
+    }
+
+    #[test]
+    fn refresh_matches_forwarded_gc_table_slot() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(type_id, 16);
+        let table = majit_gc::GcTable::from_gcrefs(&[root]);
+        gc.remember_gc_table(&table);
+        let used = Op::new(
+            OpCode::SameAsR,
+            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                root,
+            ))],
+        );
+        gc.collect_nursery();
+        let moved = table.slot(0);
+        assert_ne!(moved, root);
+        assert_eq!(used.arg(0).const_value(), Some(majit_ir::Value::Ref(moved)));
+        assert!(
+            refresh_retained_constptrs(std::slice::from_ref(&used), Some(table.as_ref())).is_some()
+        );
     }
 
     #[test]

@@ -2759,7 +2759,9 @@ impl OptContext {
             let minted = match opref {
                 OpRef::ConstInt(v) => Some(Operand::const_from_value(Value::Int(v))),
                 OpRef::ConstFloat(v) => Some(Operand::const_from_value(Value::Float(v))),
-                OpRef::ConstPtr(v) => Some(Operand::const_from_value(Value::Ref(v))),
+                OpRef::ConstPtr(v) => Some(Operand::const_from_value(Value::Ref(
+                    majit_ir::const_ptr_table::resolve(v),
+                ))),
                 _ => None,
             };
             if let Some(ref op) = minted {
@@ -6739,7 +6741,9 @@ impl OptContext {
         match opref {
             OpRef::ConstInt(v) => return Some(Value::Int(v)),
             OpRef::ConstFloat(v) => return Some(Value::Float(v)),
-            OpRef::ConstPtr(v) => return Some(Value::Ref(v)),
+            OpRef::ConstPtr(v) => {
+                return Some(Value::Ref(majit_ir::const_ptr_table::resolve(v)));
+            }
             // Non-constant OpRefs walk the forwarding chain below to find a
             // value forwarded onto them by `make_constant`.
             _ => {}
@@ -11054,7 +11058,7 @@ mod boxref_forwarding_tests {
         let recorder = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT);
         let host = majit_ir::InputArg::from_type_rc(Type::Ref, BASE + SLOT);
         let host_arg = Operand::from_bound_inputarg(&host);
-        host_arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
+        host_arg.set_forwarded_const(majit_ir::Const::from_gcref(majit_ir::GcRef(0)));
         ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
         ctx.register_carried_host(&host_arg);
 
@@ -11176,7 +11180,7 @@ mod boxref_forwarding_tests {
         // The position a shifted read would land on if the base were not 0.
         let decoy = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT + 11);
         let decoy_arg = Operand::from_bound_inputarg(&decoy);
-        decoy_arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
+        decoy_arg.set_forwarded_const(majit_ir::Const::from_gcref(majit_ir::GcRef(0)));
         ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
         ctx.register_carried_host(&decoy_arg);
 

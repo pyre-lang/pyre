@@ -126,10 +126,8 @@ impl ShortPreamble {
 
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for r in refs {
-                if let OpRef::ConstPtr(gcref) = r {
-                    visitor(gcref);
-                }
+            for r in refs.iter() {
+                r.trace_const_ptr(visitor);
             }
         }
 
@@ -143,8 +141,8 @@ impl ShortPreamble {
             exported_state.walk_const_ptr_refs_mut(visitor);
         }
         for (_, konst) in self.constants.iter_mut() {
-            if let majit_ir::Const::Ref(gcref) = konst {
-                visitor(gcref)
+            if let majit_ir::Const::Ref(index) = konst {
+                majit_ir::const_ptr_table::trace_index(*index, visitor);
             }
         }
         for info in self.inputarg_infos.iter_mut().flatten() {
@@ -2454,20 +2452,16 @@ pub struct ExtendedShortPreambleBuilder {
 impl ExtendedShortPreambleBuilder {
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for r in refs {
-                if let OpRef::ConstPtr(gcref) = r {
-                    visitor(gcref);
-                }
+            for r in refs.iter() {
+                r.trace_const_ptr(visitor);
             }
         }
 
         fn visit_opref_set(set: &mut FxIndexSet<OpRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
             let refs: Vec<OpRef> = set.iter().copied().collect();
             set.clear();
-            for mut r in refs {
-                if let OpRef::ConstPtr(gcref) = &mut r {
-                    visitor(gcref);
-                }
+            for r in refs {
+                r.trace_const_ptr(visitor);
                 set.insert(r);
             }
         }

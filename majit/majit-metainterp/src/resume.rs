@@ -1490,7 +1490,7 @@ pub fn tagged_to_source(
     }
     if tagged_eq(tagged, NULLREF) {
         // history.py CONST_NULL = ConstPtr(null). resume.py:1589 parity.
-        return ResumeValueSource::Constant(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
+        return ResumeValueSource::Constant(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
     }
     let (num, tag_bits) = untag(tagged);
     match tag_bits {
@@ -2101,7 +2101,7 @@ impl EncodedResumeData {
                 // the free `decode_box(tagged: i16, ..)`'s NULLREF
                 // fast-path so encoder/decoder stay symmetric.
                 ENCODED_NULLREF => {
-                    ResumeValueSource::Constant(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
+                    ResumeValueSource::Constant(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL))
                 }
                 ENCODED_UNINITIALIZED => ResumeValueSource::Uninitialized,
                 ENCODED_UNAVAILABLE => ResumeValueSource::Unavailable,
@@ -3277,8 +3277,8 @@ impl ResumeDataLoopMemo {
         // holds exclusive access to this optimizer memo.
         let consts = unsafe { self.consts.as_mut_vec_for_gc() };
         for c in consts.iter_mut() {
-            if let majit_ir::Const::Ref(slot) = c {
-                visitor(slot);
+            if let majit_ir::Const::Ref(index) = c {
+                majit_ir::const_ptr_table::trace_index(*index, visitor);
             }
         }
         if self.refs.is_empty() {
@@ -3292,8 +3292,12 @@ impl ResumeDataLoopMemo {
         for (_, &tagged) in self.refs.iter() {
             let (num, _) = untag(tagged);
             let idx = (num - TAG_CONST_OFFSET) as usize;
-            if let Some(majit_ir::Const::Ref(gcref)) = self.consts.get(idx) {
-                rebuilt.insert(gcref.0 as i64, tagged);
+            if let Some(majit_ir::Const::Ref(index)) = self.consts.get(idx) {
+                let addr = majit_ir::const_ptr_table::resolve(*index);
+                if addr.is_null() {
+                    continue;
+                }
+                rebuilt.insert(addr.0 as i64, tagged);
             }
         }
         self.refs = rebuilt;
@@ -3404,13 +3408,14 @@ impl ResumeDataLoopMemo {
                 }
                 tag_i64(encode_len(index), TAGCONST)
             }
-            majit_ir::Const::Ref(gcref) => {
+            majit_ir::Const::Ref(index) => {
                 // resume.py val = 0 → NULLREF sentinel (no pool
                 // entry allocated). `NULLREF = tag(-1, TAGCONST)` —
                 // encoder emits `tag_i64(-1, TAGCONST)` and the
                 // matching decoder in `decode_box` recognizes
                 // `ENCODED_NULLREF` before the positive-index branch.
-                let raw = gcref.as_usize() as i64;
+                let gcref = majit_ir::const_ptr_table::resolve(*index);
+                let raw = gcref.0 as i64;
                 if raw == 0 {
                     return tag_i64(ENCODED_NULLREF, TAGCONST);
                 }
@@ -3418,16 +3423,16 @@ impl ResumeDataLoopMemo {
                     let (num, _) = untag(tagged_i16);
                     return tag_i64(encode_len((num - TAG_CONST_OFFSET) as usize), TAGCONST);
                 }
-                let index = self.consts.len();
+                let pool_index = self.consts.len();
                 unsafe {
                     self.consts
-                        .push_during_optimization(majit_ir::Const::Ref(*gcref));
+                        .push_during_optimization(majit_ir::Const::Ref(*index));
                 }
                 // See the Int arm on why an unrepresentable tag skips the cache.
-                if let Ok(tagged_i16) = tag((index as i32) + TAG_CONST_OFFSET, TAGCONST) {
+                if let Ok(tagged_i16) = tag((pool_index as i32) + TAG_CONST_OFFSET, TAGCONST) {
                     self.refs.insert(raw, tagged_i16);
                 }
-                tag_i64(encode_len(index), TAGCONST)
+                tag_i64(encode_len(pool_index), TAGCONST)
             }
             majit_ir::Const::Float(v) => {
                 // resume.py _newconst (no dedup for floats in RPython).
@@ -4710,7 +4715,7 @@ pub fn decode_box(
         TAGCONST => {
             if tagged_eq(tagged, NULLREF) {
                 // bridgeopt.py:51: box = CONST_NULL (history.py).
-                DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
+                DecodedBox::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL))
             } else {
                 // bridgeopt.py:54: box = resumestorage.rd_consts[num - TAG_CONST_OFFSET]
                 // — direct list index, IndexError on out-of-range. A
@@ -5963,7 +5968,7 @@ mod tests {
             offset: 0,
             fieldnums: vec![tagged],
         };
-        let mut consts = vec![majit_ir::Const::Ref(majit_ir::GcRef(0x1000))];
+        let mut consts = vec![majit_ir::Const::from_gcref(majit_ir::GcRef(0x1000))];
         let virtual_info = virtual_info_from_rd(&rd);
         let VirtualInfo::VRawSlice { parent, .. } = virtual_info else {
             panic!("expected VRawSlice");
@@ -5972,7 +5977,7 @@ mod tests {
 
         // Model the root walker forwarding rd_consts during the allocation
         // window. The later field decode must observe the new pointer.
-        consts[0] = majit_ir::Const::Ref(majit_ir::GcRef(0x2000));
+        consts[0] = majit_ir::Const::from_gcref(majit_ir::GcRef(0x2000));
         let mut reader = ResumeDataDirectReader::new(
             &[0, 0],
             &consts,
@@ -8398,7 +8403,7 @@ mod setfields_tests {
         assert!(ptr_fd.is_pointer_field());
         assert_eq!(ptr_fd.field_type(), Type::Int);
         let tagged = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
-        let consts = [Const::Ref(GcRef(0x1111))];
+        let consts = [Const::from_gcref(GcRef(0x1111))];
         let alloc = RecAllocator::default();
         allocate_virtual_obj(
             parent,
@@ -8421,7 +8426,7 @@ mod setfields_tests {
         let (parent, ptr_fd, int_fd) = pointer_as_int_parent();
         let tagged_ref = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
         let tagged_int = tag(7, TAGINT).unwrap();
-        let consts = [Const::Ref(GcRef(0x2222))];
+        let consts = [Const::from_gcref(GcRef(0x2222))];
         let alloc = RecAllocator::default();
         allocate_virtual_obj(
             parent,
@@ -8454,7 +8459,7 @@ mod setfields_tests {
         );
         fd.set_parent_descr(&parent);
         let tagged = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
-        let consts = [Const::Ref(GcRef(0x3333))];
+        let consts = [Const::from_gcref(GcRef(0x3333))];
         let alloc = RecAllocator::default();
         allocate_virtual_obj(
             parent,
@@ -8480,7 +8485,7 @@ mod setfields_tests {
             descr_size: 32,
         };
         let vinfo = virtual_info_from_rd(&rd);
-        let consts = [Const::Ref(GcRef(0x4444))];
+        let consts = [Const::from_gcref(GcRef(0x4444))];
         let alloc = RecAllocator::default();
         let mut reader = ResumeDataDirectReader::new(
             &[0, 0],
@@ -8530,7 +8535,7 @@ mod setfields_tests {
         };
         let tagged_ref = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
         let tagged_int = tag(9, TAGINT).unwrap();
-        let consts = [Const::Ref(GcRef(0x5555))];
+        let consts = [Const::from_gcref(GcRef(0x5555))];
         let alloc = RecAllocator::default();
         allocate_virtual_obj(
             parent,
@@ -8569,7 +8574,7 @@ mod setfields_tests {
             field_size: 8,
         };
         let tagged_ref = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
-        let consts = [Const::Ref(GcRef(0x8888))];
+        let consts = [Const::from_gcref(GcRef(0x8888))];
         let alloc = RecAllocator::default();
         allocate_virtual_obj(
             parent,
@@ -8634,7 +8639,7 @@ mod setfields_tests {
             }
             other => panic!("expected VirtualObj, got {other:?}"),
         }
-        let consts = [Const::Ref(GcRef(0x6666))];
+        let consts = [Const::from_gcref(GcRef(0x6666))];
         let alloc = RecAllocator::default();
         let mut reader = ResumeDataDirectReader::new(
             &[0, 0],
@@ -8690,7 +8695,7 @@ mod setfields_tests {
             descr_size: 24,
         };
         let vinfo = virtual_info_from_rd(&rd);
-        let consts = [Const::Ref(GcRef(0x7777))];
+        let consts = [Const::from_gcref(GcRef(0x7777))];
         let alloc = RecAllocator::default();
         let mut reader = ResumeDataDirectReader::new(
             &[0, 0],
@@ -8828,8 +8833,9 @@ pub fn resume_register_box(
             Some((majit_ir::OpRef::input_arg_typed(*n as u32, *kind), bits))
         }
         RebuiltValue::Const(majit_ir::Const::Int(v)) => Some((majit_ir::OpRef::const_int(*v), *v)),
-        RebuiltValue::Const(majit_ir::Const::Ref(g)) => {
-            Some((majit_ir::OpRef::const_ptr(*g), g.0 as i64))
+        RebuiltValue::Const(majit_ir::Const::Ref(index)) => {
+            let g = majit_ir::const_ptr_table::resolve(*index);
+            Some((majit_ir::OpRef::ConstPtr(*index), g.0 as i64))
         }
         RebuiltValue::Const(majit_ir::Const::Float(f)) => {
             Some((majit_ir::OpRef::const_float(*f), f.to_bits() as i64))

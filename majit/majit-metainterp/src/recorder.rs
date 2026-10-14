@@ -150,8 +150,8 @@ impl Snapshot {
                 // `build_vable_snapshot_boxes` / `build_vref_snapshot_boxes`
                 // tag their entries by `OpRef::ty()` without asking whether the
                 // operand is constant, so this arm can hold an inline gcref too.
-                SnapshotTagged::Box(OpRef::ConstPtr(gcref), _) => visitor(gcref),
-                SnapshotTagged::Const(..) | SnapshotTagged::Box(..) => {}
+                SnapshotTagged::Box(op, _) => op.trace_const_ptr(visitor),
+                SnapshotTagged::Const(..) => {}
             }
         }
     }

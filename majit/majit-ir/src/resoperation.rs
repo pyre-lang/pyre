@@ -43,10 +43,11 @@ pub enum OpRef {
     /// `ConstInt`. Equality / Hash bitwise via `f64::to_bits()`
     /// per RPython `_get_hash_` / `same_constant` (history.py/292).
     ConstFloat(f64),
-    /// history.py `ConstPtr.value` carried inline as `GcRef`. See
-    /// `ConstInt`. The inline `GcRef` lives directly in the `OpRef` and
-    /// must be visited by the GC walker that traces the op-graph.
-    ConstPtr(GcRef),
+    /// history.py `ConstPtr`. The payload is an index into
+    /// [`crate::const_ptr_table`], not the referent address. The
+    /// collector updates that one slot; every copy of this `OpRef`
+    /// names it. `as_const_ptr` reads the address at the use.
+    ConstPtr(u32),
     /// resoperation.py `InputArgInt` — `type = 'i'`. Payload: input
     /// arg slot position.
     InputArgInt(u32),
@@ -94,7 +95,10 @@ impl PartialEq for OpRef {
             (ConstInt(a), ConstInt(b)) => a == b,
             // history.py ConstFloat.same_constant: bitwise compare
             (ConstFloat(a), ConstFloat(b)) => a.to_bits() == b.to_bits(),
-            (ConstPtr(a), ConstPtr(b)) => a.0 == b.0,
+            // history.py ConstPtr.same_constant compares `value`.
+            // Interning gives one index per referent, so the index is
+            // that comparison and it does not change when the nursery moves.
+            (ConstPtr(a), ConstPtr(b)) => a == b,
             _ => false,
         }
     }
@@ -118,7 +122,9 @@ impl std::hash::Hash for OpRef {
             OpRef::ConstInt(v) => v.hash(state),
             // history.py ConstFloat._get_hash_: bitwise
             OpRef::ConstFloat(v) => v.to_bits().hash(state),
-            OpRef::ConstPtr(v) => v.0.hash(state),
+            // Index, not address. history.py ConstPtr._get_hash_ is
+            // identityhash(value); the index is stable for the same reason.
+            OpRef::ConstPtr(v) => v.hash(state),
         }
     }
 }
@@ -133,7 +139,7 @@ impl OpRef {
             OpRef::None => (0, 0),
             OpRef::ConstInt(v) => (4, v as u64),
             OpRef::ConstFloat(v) => (5, v.to_bits()),
-            OpRef::ConstPtr(v) => (6, v.0 as u64),
+            OpRef::ConstPtr(v) => (6, v as u64),
             OpRef::InputArgInt(x) => (7, x as u64),
             OpRef::InputArgFloat(x) => (8, x as u64),
             OpRef::InputArgRef(x) => (9, x as u64),
@@ -364,11 +370,11 @@ impl OpRef {
     /// Backends use this as a guard before any `.raw()` call on a
     /// constant: Const variants carry the value directly
     /// (history.py:227/268/314) and have no u32 raw encoding.
-    pub const fn inline_const_bits(self) -> Option<i64> {
+    pub fn inline_const_bits(self) -> Option<i64> {
         match self {
             Self::ConstInt(v) => Some(v),
             Self::ConstFloat(v) => Some(v.to_bits() as i64),
-            Self::ConstPtr(v) => Some(v.0 as i64),
+            Self::ConstPtr(v) => Some(crate::const_ptr_table::resolve(v).0 as i64),
             _ => None,
         }
     }
@@ -396,7 +402,7 @@ impl OpRef {
         match self {
             Self::ConstInt(v) => Some(Value::Int(v)),
             Self::ConstFloat(v) => Some(Value::Float(v)),
-            Self::ConstPtr(v) => Some(Value::Ref(v)),
+            Self::ConstPtr(v) => Some(Value::Ref(crate::const_ptr_table::resolve(v))),
             _ => None,
         }
     }
@@ -543,9 +549,9 @@ impl OpRef {
         OpRef::ConstFloat(v)
     }
 
-    /// history.py `ConstPtr.value: gcref` carried inline.
-    pub const fn const_ptr(v: GcRef) -> OpRef {
-        OpRef::ConstPtr(v)
+    /// history.py `ConstPtr(value)`. Interns `v` and stores the index.
+    pub fn const_ptr(v: GcRef) -> OpRef {
+        OpRef::ConstPtr(crate::const_ptr_table::intern(v))
     }
 
     /// Mint an inline-Const OpRef from a `Value` per RPython
@@ -557,7 +563,7 @@ impl OpRef {
         match value {
             Value::Int(i) => OpRef::ConstInt(*i),
             Value::Float(f) => OpRef::ConstFloat(*f),
-            Value::Ref(r) => OpRef::ConstPtr(*r),
+            Value::Ref(r) => OpRef::const_ptr(*r),
             Value::Void => {
                 panic!("Value::Void has no Const subclass per resoperation.py / history.py")
             }
@@ -582,9 +588,16 @@ impl OpRef {
         }
     }
 
-    /// Extract the inline `GcRef` from `ConstPtr`; `None` for any
-    /// other variant.
-    pub const fn as_const_ptr(self) -> Option<GcRef> {
+    /// Current `ConstPtr.value`. `None` for any other variant.
+    pub fn as_const_ptr(self) -> Option<GcRef> {
+        match self {
+            Self::ConstPtr(v) => Some(crate::const_ptr_table::resolve(v)),
+            _ => None,
+        }
+    }
+
+    /// Index into [`crate::const_ptr_table`]. `None` for any other variant.
+    pub const fn const_ptr_index(self) -> Option<u32> {
         match self {
             Self::ConstPtr(v) => Some(v),
             _ => None,
@@ -3342,26 +3355,32 @@ impl AsRef<Op> for Op {
 }
 
 impl OpRef {
-    /// Visit this reference's inline `ConstPtr` `GcRef` slot, if it holds one.
+    /// Trace this reference's `ConstPtr` table slot, if it holds one.
     ///
     /// [`Operand::walk_const_ptr_refs`]'s counterpart for the flat `OpRef`
-    /// banks.  `ConstPtr` carries its `GcRef` by value, so a walker that has to
-    /// forward a moved object must reach the slot in the bank; a copy would be
-    /// visited and then thrown away.
+    /// banks. The word is a table index; `trace_index` forwards
+    /// `ConstPtr.value` while this holder is live.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        if let OpRef::ConstPtr(gcref) = self {
-            visitor(gcref);
+        // The word is the index. `history.py` `ConstPtr.value` is the
+        // table slot this holder keeps alive.
+        self.trace_const_ptr(visitor);
+    }
+
+    /// Forward `ConstPtr.value` when this word is a live holder.
+    /// The index itself does not move, so a shared borrow is enough.
+    pub fn trace_const_ptr(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if let OpRef::ConstPtr(index) = *self {
+            crate::const_ptr_table::trace_index(index, visitor);
         }
     }
 }
 
 impl Op {
-    /// Visit every inline `ConstPtr.value` slot carried by this operation.
+    /// Trace every `ConstPtr` table slot this operation holds.
     ///
     /// RPython's GC traces `ResOperation.args` / `fail_args` object fields
-    /// directly. Pyre stores `ConstPtr.value` in `OpRef::ConstPtr`, so
-    /// long-lived op graphs must expose the actual mutable slots to the GC
-    /// walker instead of copying the pointer values aside.
+    /// directly. Pyre stores a `const_ptr_table` index on `OpRef::ConstPtr`,
+    /// so long-lived op graphs must `trace_index` those holders.
     pub fn walk_const_ptr_refs_mut(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
         for arg in self.args_slice().iter() {
             arg.walk_const_ptr_refs(visitor);

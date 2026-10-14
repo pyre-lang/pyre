@@ -2763,9 +2763,9 @@ impl TraceCtx {
 
     /// RPython parity: Ref constants preserve their type so guard
     /// fail_args are correctly typed during guard failure recovery.
-    /// history.py `ConstPtr.value` is inline on the Box; pyre
-    /// mirrors with `OpRef::ConstPtr(GcRef)`. The op-graph walker
-    /// forwards these slots across minor collection.
+    /// history.py `ConstPtr.value` is a field on the Box; pyre
+    /// stores a `const_ptr_table` index on `OpRef::ConstPtr`. The
+    /// op-graph walker traces that index across minor collection.
     pub fn const_ref(&mut self, value: i64) -> OpRef {
         OpRef::const_ptr(majit_ir::GcRef(value as usize))
     }
@@ -4886,11 +4886,9 @@ impl TraceCtx {
             Some(Value::Ref(identity)) => Some(identity.as_usize()),
             _ => None,
         };
-        if let Some(boxes) = self.virtualizable_boxes.as_mut() {
-            for slot in boxes.iter_mut() {
-                if let OpRef::ConstPtr(gcref) = slot {
-                    visitor(gcref);
-                }
+        if let Some(boxes) = self.virtualizable_boxes.as_ref() {
+            for slot in boxes {
+                slot.trace_const_ptr(&mut visitor);
             }
         }
         // The cell names either the identity or a different object: a frontend

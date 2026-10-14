@@ -222,8 +222,8 @@ impl MIFrame {
     /// The packed blackhole-entry root array can itself be forwarded before
     /// `_copy_data_from_miframe` runs.  `ConstPtr.value` is the owner.
     pub fn set_forwarded_ref_value(&mut self, index: usize, value: i64) {
-        if let Some(OpRef::ConstPtr(gcref)) = self.ref_regs[index].as_mut() {
-            *gcref = majit_ir::GcRef(value as usize);
+        if let Some(OpRef::ConstPtr(slot)) = self.ref_regs[index] {
+            majit_ir::const_ptr_table::set_slot(slot, majit_ir::GcRef(value as usize));
         }
     }
 

@@ -1376,6 +1376,9 @@ impl MiniMarkGC {
         // incminimark.py — allocate_nursery finalizes the first threshold.
         gc.set_major_threshold_from(0.0, 0.0);
         gc._setup_guard_is_object();
+        // `ConstPtr.value` lives in `const_ptr_table`. Register before
+        // the first minor so the table is a root on this collector.
+        crate::install_const_ptr_table_walker();
         gc
     }
 
@@ -3558,6 +3561,9 @@ impl MiniMarkGC {
         } else {
             crate::shadow_stack::ExtraRootWalkKind::Minor
         };
+        // One wave for this root walk. Holders trace `ConstPtr` indexes;
+        // a second visit must not write `ConstPtr.value` again.
+        let _const_ptr_wave = majit_ir::const_ptr_table::Wave::enter();
         crate::shadow_stack::set_extra_root_walk_kind(extra_root_walk_kind);
         let mut visit_extra_area = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
@@ -3569,6 +3575,11 @@ impl MiniMarkGC {
         }
         // Multi-registrar walker fan-out (rd_consts const-pool, etc.).
         crate::shadow_stack::walk_extra_roots(|gcref| {
+            self.drag_out_root(gcref);
+        });
+        // `history.py` `ConstPtr` intern-to-holder window. A minor before
+        // extra-area `trace_index` still forwards the table slot.
+        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
             self.drag_out_root(gcref);
         });
         crate::shadow_stack::set_extra_root_walk_kind(
@@ -6088,6 +6099,9 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
             result.push((*gcref, label));
         });
+        majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
+            result.push((*gcref, "young_const_ptrs"));
+        });
         // Monotone: the hint only ever grows, so a collection that happens to
         // see fewer roots does not send the next one back through the ladder.
         self.root_snapshot_capacity
@@ -6132,6 +6146,12 @@ impl MiniMarkGC {
     }
 
     fn seed_major_roots(&mut self) {
+        // `history.py` `ConstPtr` dies with its last holder. Open a
+        // live generation so `trace_index` stamps the slots extra-root
+        // walkers still hold; `finish_incremental_marking` frees the rest.
+        majit_ir::const_ptr_table::begin_major_live();
+        // One wave for this marking root walk. See the minor path.
+        let _const_ptr_wave = majit_ir::const_ptr_table::Wave::enter();
         // incminimark.py collect_roots: root_walker.walk_roots()
         // seeds stack roots for a major marking cycle. Mirror the same
         // root sets as minor collection, but mark old objects instead of
@@ -6175,6 +6195,11 @@ impl MiniMarkGC {
         Self::walk_stack_shaped_roots(|gcref, site| seed(self, gcref, site, false));
         crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
             seed(self, *gcref, label, true);
+        });
+        // Intern during this major still sits in the young list. Do not
+        // drain: `collect_young_const_ptrs` runs at pre-sweep.
+        majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
+            seed(self, *gcref, "young_const_ptrs", true);
         });
         // Objects already moved to a death queue remain ordinary roots until
         // app-level code pops them. Registered live finalizers are deliberately
@@ -6815,6 +6840,9 @@ impl MiniMarkGC {
         if !self.full_collect_owns_cycle {
             crate::shadow_stack::walk_extra_roots(|gcref| {
                 self.seed_major_extra_root(*gcref, "rescan_extra_root");
+            });
+            majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
+                self.seed_major_extra_root(*gcref, "rescan_young_const_ptrs");
             });
         }
         // TLS exception cells live on the per-mutator frame area for the
@@ -8431,6 +8459,14 @@ impl MiniMarkGC {
             }
         }
         self.oldgen_nonmoving_marked = self.oldgen_nonmoving_active;
+        // Extra-root walkers have stamped every live `ConstPtr` slot.
+        // Drain intern-during-mark first so those slots stamp `live` and
+        // forward; a slot no holder marked is then dead, matching
+        // `history.py` dropping the box when no trace, descr, or op holds it.
+        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
+            self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
+        });
+        majit_ir::const_ptr_table::sweep_untraced();
         // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
         // the candidate sets have been frozen and before the state changes.
         self.stat_ac_arenas_count = self.oldgen.arenas_count();

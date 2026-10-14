@@ -797,8 +797,8 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
     for map in maps {
         for boxes in map.iter_mut().flatten() {
             for sb in boxes {
-                if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref
-                    && !gcref.is_null()
+                if let majit_ir::OpRef::ConstPtr(index) = sb.opref
+                    && index != 0
                 {
                     slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
                 }
@@ -1301,7 +1301,7 @@ mod byte_snapshot_map_tests {
     fn snapshot_roots_follow_map_buffers_into_optimizer() {
         let mut boxes = vec![Some(
             vec![SnapshotBox::typed(
-                OpRef::ConstPtr(GcRef(0x1000)),
+                OpRef::const_ptr(GcRef(0x1000)),
                 Type::Ref,
             )]
             .into(),
@@ -1313,10 +1313,10 @@ mod byte_snapshot_map_tests {
         assert_eq!(slots.len(), 1);
         // Simulate the collector forwarding a rooted constant after the map
         // tuple and its Vec handles moved into the final optimizer owner.
-        unsafe { *(slots[0] as *mut OpRef) = OpRef::ConstPtr(GcRef(0x2000)) };
+        unsafe { *(slots[0] as *mut OpRef) = OpRef::const_ptr(GcRef(0x2000)) };
         assert_eq!(
             optimizer.snapshot_boxes[0].as_ref().unwrap()[0].opref,
-            OpRef::ConstPtr(GcRef(0x2000))
+            OpRef::const_ptr(GcRef(0x2000))
         );
     }
 
@@ -3395,11 +3395,10 @@ pub fn record_discarded_level_traceback_for_recording(exc_value: i64, w_code: i6
 }
 
 /// framework.py `root_walker.walk_roots` per-op helper: visit every
-/// inline `ConstPtr.value` slot stored in `op.args` and `op.fail_args`.
-/// history.py `ConstPtr.value` is inline on the Box object; pyre
-/// stores it inline on `OpRef::ConstPtr(GcRef)` so each `&mut
-/// OpRef` slot in `Op::args` / `Op::fail_args` is the canonical
-/// forwardable Ref site.
+/// `ConstPtr` stored in `op.args` and `op.fail_args`.
+/// history.py `ConstPtr.value` is a field on the Box; pyre stores a
+/// `const_ptr_table` index on `OpRef::ConstPtr`. `trace_index`
+/// forwards the table slot while this holder is live.
 fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     for arg in op.args_slice().iter() {
         arg.walk_const_ptr_refs(visitor);
@@ -3498,8 +3497,8 @@ impl<M: Clone> MetaInterp<M> {
             // GC cycles.
             let consts = unsafe { pool.as_mut_vec_for_gc() };
             for c in consts.iter_mut() {
-                if let Const::Ref(slot) = c {
-                    visitor(slot);
+                if let Const::Ref(index) = c {
+                    majit_ir::const_ptr_table::trace_index(*index, visitor);
                 }
             }
         }
@@ -3668,12 +3667,12 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// framework.py `root_walker.walk_roots` hook for the stashed
-    /// retrace state. Every `OpRef::ConstPtr(GcRef)` appearing
-    /// in `partial.ops[i].args[j]` (or `fail_args[j]`) carries an
-    /// inline Ref per history.py `ConstPtr.value`. RPython's
-    /// `TreeLoop.operations` (`history.py`) is walked through the
-    /// Python object graph automatically; pyre's `Vec<Op>` lives in
-    /// Rust storage so the embedder registers this walker.
+    /// retrace state. Every `OpRef::ConstPtr` in
+    /// `partial.ops[i].args[j]` (or `fail_args[j]`) names a
+    /// `const_ptr_table` slot (`history.py` `ConstPtr.value`).
+    /// RPython's `TreeLoop.operations` is walked through the Python
+    /// object graph; pyre's `Vec<Op>` lives in Rust storage so the
+    /// embedder registers this walker.
     pub fn walk_partial_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         if let Some(partial) = self.partial_trace.as_mut() {
             for op in partial.ops.iter_mut() {
@@ -3689,11 +3688,10 @@ impl<M: Clone> MetaInterp<M> {
     /// (in-progress) trace recorder. RPython's `MetaInterp.history`
     /// (`pyjitpl.py self.history = History()`) holds the in-progress
     /// `TreeLoop.operations` and is traced through the Python object
-    /// graph automatically.  pyre's recorder stores ops as
-    /// `Vec<Op>` in Rust memory, so any `OpRef::ConstPtr(GcRef)`
-    /// stored in `op.args[j]` or `op.fail_args[j]` (history.py:314
-    /// `ConstPtr.value`) needs explicit walking to survive minor
-    /// collection.
+    /// graph automatically. pyre's recorder stores ops as
+    /// `Vec<Op>` in Rust memory, so any `OpRef::ConstPtr` in
+    /// `op.args[j]` or `op.fail_args[j]` traces its table index
+    /// (`history.py` `ConstPtr.value`) through a minor collection.
     ///
     /// history.py `RefFrontendOp` identity is `_index`. A `Vec<bool>` sized
     /// by the recorder marks a box already in the live worklist so `_heapc_deps`
@@ -3719,11 +3717,11 @@ impl<M: Clone> MetaInterp<M> {
     pub fn walk_active_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         // pyjitpl.py `self.framestack` — `MIFrame.copy_constants()`
         // (pyjitpl/frame.rs) stores `jitcode.constants_r` entries as
-        // `OpRef::ConstPtr(GcRef)` in `ref_regs`. history.py
-        // `ConstPtr.value` is an inline gcref field traced through the
-        // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
-        // storage needs an explicit walker. Independent of `self.tracing`:
-        // frames are pushed for both recording and recursive-portal calls.
+        // `OpRef::ConstPtr` indexes in `ref_regs`. history.py
+        // `ConstPtr.value` is a gcref field traced through the Python
+        // object graph; pyre's `Vec<Option<OpRef>>` needs an explicit
+        // walker. Independent of `self.tracing`: frames are pushed for
+        // both recording and recursive-portal calls.
         //
         // history.py `RefFrontendOp._resref` is a field of the FrontendOp
         // Python object. The collector traces it only while that box is
@@ -3734,23 +3732,19 @@ impl<M: Clone> MetaInterp<M> {
         // GCREFs alive.
         for frame in self.framestack.frames.iter_mut() {
             for slot in frame.ref_regs.iter_mut() {
-                // Forward the inline `ConstPtr` gcref in place; non-Const
+                // Forward the interned `ConstPtr` table slot; non-Const
                 // positions (ResOp / InputArg refs) carry no inline ref.
-                if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                    visitor(gcref);
+                if let Some(opref) = slot.as_ref() {
+                    opref.trace_const_ptr(&mut visitor);
                 }
             }
         }
-        if let Some(OpRef::ConstPtr(gcref)) = self.last_exc_box.as_mut() {
-            visitor(gcref);
+        if let Some(op) = self.last_exc_box.as_ref() {
+            op.trace_const_ptr(&mut visitor);
         }
-        if let Some((op1, op2)) = self.exc_resume.as_mut() {
-            if let OpRef::ConstPtr(gcref) = op1 {
-                visitor(gcref);
-            }
-            if let OpRef::ConstPtr(gcref) = op2 {
-                visitor(gcref);
-            }
+        if let Some((op1, op2)) = self.exc_resume.as_ref() {
+            op1.trace_const_ptr(&mut visitor);
+            op2.trace_const_ptr(&mut visitor);
         }
         if let (Some(values), Some(types)) = (
             self.pending_frontend_boxes.as_mut(),
@@ -3784,9 +3778,7 @@ impl<M: Clone> MetaInterp<M> {
         // `OpRef`; a `ConstPtr` entry's inline gcref is forwarded in place —
         // history.py `ConstPtr.value` is a gcref attribute of the Box.
         for r in trace_ctx.initial_inputarg_consts.iter_mut() {
-            if let OpRef::ConstPtr(gcref) = r {
-                visitor(gcref);
-            }
+            r.trace_const_ptr(&mut visitor);
         }
         // The per-guard snapshot side table copies inline gcrefs out of the
         // `ref_regs` slots walked above into words of its own; see
@@ -3799,48 +3791,44 @@ impl<M: Clone> MetaInterp<M> {
         // `[virtualbox, vrefbox]`. The OpRef is the Box; the `usize` is
         // `box.getref_base()` for the concrete `JitVirtualRef*`.
         for (op, ptr) in &mut trace_ctx.virtualref_boxes {
-            if let OpRef::ConstPtr(gcref) = op {
-                visitor(gcref);
-            }
+            op.trace_const_ptr(&mut visitor);
             if *ptr != 0 {
                 let mut gcref = GcRef(*ptr);
                 visitor(&mut gcref);
                 *ptr = gcref.0;
             }
         }
+        // heapcache.py CacheEntry — field values / replacements /
+        // loop-invariant results as `OpRef`. A `ConstPtr` slot is a
+        // table index; `trace_index` forwards `ConstPtr.value` while
+        // the cache holds it. Heapcache key ownership is a separate
+        // census from the independently rooted CALL_PURE constants below.
         trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
         for mp in &mut trace_ctx.current_merge_points {
             for gb in &mut mp.green_boxes {
-                if let OpRef::ConstPtr(gcref) = &mut gb.opref {
-                    visitor(gcref);
-                }
+                gb.opref.trace_const_ptr(&mut visitor);
             }
         }
         if let Some(reds) = trace_ctx.live_portal_reds.as_mut() {
             for (op, ty) in reds {
                 if *ty == Type::Ref {
-                    if let OpRef::ConstPtr(gcref) = op {
-                        visitor(gcref);
-                    }
+                    op.trace_const_ptr(&mut visitor);
                 }
             }
         }
         if let Some(boxes) = trace_ctx.close_jump_boxes.as_mut() {
             for (op, ty) in boxes {
                 if *ty == Type::Ref {
-                    if let OpRef::ConstPtr(gcref) = op {
-                        visitor(gcref);
-                    }
+                    op.trace_const_ptr(&mut visitor);
                 }
             }
         }
-        if let Some(OpRef::ConstPtr(mut gcref)) = trace_ctx.forced_virtualizable() {
-            visitor(&mut gcref);
-            trace_ctx.set_forced_virtualizable(Some(OpRef::const_ptr(gcref)));
+        // The interned index does not move; `trace_index` forwards the slot.
+        if let Some(op) = trace_ctx.forced_virtualizable() {
+            op.trace_const_ptr(&mut visitor);
         }
-        if let Some(OpRef::ConstPtr(mut gcref)) = trace_ctx.bridge_saved_exc_op() {
-            visitor(&mut gcref);
-            trace_ctx.bridge_saved_exc_op = Some(OpRef::const_ptr(gcref));
+        if let Some(op) = trace_ctx.bridge_saved_exc_op() {
+            op.trace_const_ptr(&mut visitor);
         }
 
         // history.py `RefFrontendOp._resref` is a field of the FrontendOp
@@ -3996,9 +3984,7 @@ impl<M: Clone> MetaInterp<M> {
             let r = unsafe { &mut *(slot_addr as *mut majit_ir::OpRef) };
             // Forward the snapshot slot's inline const gcref in place (an
             // in-place `ConstPtr.value` update).
-            if let majit_ir::OpRef::ConstPtr(gcref) = r {
-                visitor(gcref);
-            }
+            r.trace_const_ptr(&mut visitor);
         }
     }
 
@@ -5604,10 +5590,12 @@ impl<M: Clone> MetaInterp<M> {
             // ConstPtrs until `self.tracing` is assigned.
             // `orig_vable_ptr_from_trace_ctx` reads that slot first.
             let vable_const_index = virtualizable_arg_index.unwrap_or(index_of_virtualizable);
-            if let Some(OpRef::ConstPtr(gcref)) =
-                ctx.initial_inputarg_consts.get_mut(vable_const_index)
+            if let Some(OpRef::ConstPtr(slot)) = ctx.initial_inputarg_consts.get(vable_const_index)
             {
-                *gcref = majit_ir::GcRef(virtualizable_ptr as usize);
+                majit_ir::const_ptr_table::set_slot(
+                    *slot,
+                    majit_ir::GcRef(virtualizable_ptr as usize),
+                );
             }
         }
 
@@ -8303,7 +8291,9 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|driver| driver.virtualizable_arg_index())
             .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
             .and_then(|const_ref| match const_ref {
-                OpRef::ConstPtr(gcref) => Some(gcref.0 as *const u8),
+                OpRef::ConstPtr(index) => {
+                    Some(majit_ir::const_ptr_table::resolve(*index).0 as *const u8)
+                }
                 _ => None,
             });
         if let Some(ptr) = from_consts {
@@ -10439,8 +10429,8 @@ impl<M: Clone> MetaInterp<M> {
                 .and_then(|driver| driver.virtualizable_arg_index())
                 .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
                 .and_then(|value| match value {
-                    OpRef::ConstPtr(reference) if !reference.is_null() => {
-                        Some(reference.0 as *const u8)
+                    OpRef::ConstPtr(index) if *index != 0 => {
+                        Some(majit_ir::const_ptr_table::resolve(*index).0 as *const u8)
                     }
                     _ => None,
                 });
@@ -30079,9 +30069,9 @@ mod tests {
 
     #[test]
     fn walk_active_trace_refs_forwards_inline_const_ptr() {
-        // history.py:314 parity for the in-progress recorder: a
-        // minor collection during tracing must forward inline
-        // `OpRef::ConstPtr(GcRef)` slots stored in the active
+        // history.py `ConstPtr.value` parity for the in-progress
+        // recorder: a minor collection during tracing must forward
+        // `OpRef::ConstPtr` table slots stored in the active
         // `Trace::ops` Vec.
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
@@ -30193,6 +30183,19 @@ mod tests {
         ));
     }
 
+    /// Put the original address back. `intern` finds a slot by the address
+    /// currently stored there, so a forwarded slot would mint a second index.
+    struct RestoreConstPtr {
+        index: u32,
+        addr: GcRef,
+    }
+
+    impl Drop for RestoreConstPtr {
+        fn drop(&mut self) {
+            majit_ir::const_ptr_table::set_slot(self.index, self.addr);
+        }
+    }
+
     #[test]
     fn walk_active_trace_refs_forwards_snapshot_const_ptr() {
         // `get_list_of_active_snapshot_boxes` copies a constant ref register's
@@ -30201,19 +30204,24 @@ mod tests {
         // the whole trace, so a collection during tracing must forward them.
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        let index = majit_ir::const_ptr_table::intern(GcRef(0x91_0000_A000));
+        let _restore = RestoreConstPtr {
+            index,
+            addr: GcRef(0x91_0000_A000),
+        };
         trace_ctx.snapshots.push(crate::recorder::Snapshot {
             resume_position: -1,
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: 4,
                 boxes: vec![
-                    crate::recorder::SnapshotTagged::Const(0xA000, Type::Ref),
+                    crate::recorder::SnapshotTagged::Const(0x91_0000_A000, Type::Ref),
                     // Same bits, non-Ref type: an integer, not an address.
                     crate::recorder::SnapshotTagged::Const(0xA000, Type::Int),
                 ],
             }],
             vable_boxes: vec![crate::recorder::SnapshotTagged::Box(
-                OpRef::const_ptr(GcRef(0xA000)),
+                OpRef::ConstPtr(index),
                 Type::Ref,
             )],
             vref_boxes: vec![crate::recorder::SnapshotTagged::Box(
@@ -30224,15 +30232,19 @@ mod tests {
         meta.tracing = Some(trace_ctx);
 
         meta.walk_active_trace_refs(|slot| {
-            if slot.0 == 0xA000 {
-                slot.0 = 0xB000;
+            if slot.0 == 0x91_0000_A000 {
+                slot.0 = 0x91_0000_B000;
             }
         });
 
         let snapshot = &meta.tracing.as_ref().unwrap().snapshots[0];
         assert_eq!(
             snapshot.frames[0].boxes[0],
-            crate::recorder::SnapshotTagged::Const(0xB000, Type::Ref)
+            crate::recorder::SnapshotTagged::Const(0x91_0000_B000, Type::Ref)
+        );
+        assert_eq!(
+            majit_ir::const_ptr_table::resolve(index),
+            GcRef(0x91_0000_B000)
         );
         assert_eq!(
             snapshot.frames[0].boxes[1],
@@ -30240,7 +30252,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.vable_boxes[0],
-            crate::recorder::SnapshotTagged::Box(OpRef::const_ptr(GcRef(0xB000)), Type::Ref)
+            crate::recorder::SnapshotTagged::Box(OpRef::ConstPtr(index), Type::Ref)
         );
         assert_eq!(
             snapshot.vref_boxes[0],
@@ -30481,7 +30493,7 @@ mod tests {
         descr
             .as_fail_descr()
             .expect("resume guard")
-            .set_rd_consts(Some(vec![majit_ir::Const::Ref(GcRef(0x1000))]));
+            .set_rd_consts(Some(vec![majit_ir::Const::from_gcref(GcRef(0x1000))]));
         let mut exit_layouts = crate::FxIndexMap::default();
         exit_layouts.insert(
             0,
@@ -30526,20 +30538,30 @@ mod tests {
         meta.walk_rd_consts_refs(|_| seen += 1);
         assert_eq!(seen, 0, "a clean compiled graph is absent from a minor");
 
+        // `rd_consts` stores a table index. The collector forwards
+        // `const_ptr_table`, not the pool word.
+        let stored = descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .rd_consts_arc()
+            .expect("pool")[0];
         meta.remember_compiled_graph_write();
         meta.walk_rd_consts_refs(|slot| {
             seen += 1;
-            slot.0 = 0x2000;
+            if slot.0 == 0x1000 {
+                *slot = GcRef(0x2000);
+            }
         });
-        assert_eq!(seen, 1);
-        assert!(matches!(
+        assert_eq!(seen, 1, "a dirty pool traces its Const::Ref slot");
+        assert_eq!(
             descr
                 .as_fail_descr()
                 .expect("resume guard")
                 .rd_consts_arc()
                 .expect("pool")[0],
-            majit_ir::Const::Ref(GcRef(0x2000))
-        ));
+            stored
+        );
+        assert_eq!(stored.getref_base(), GcRef(0x2000));
         meta.walk_rd_consts_refs(|_| seen += 1);
         assert_eq!(seen, 1, "the publication barrier is consumed once");
 
@@ -30559,7 +30581,8 @@ mod tests {
 
         let pred_tt = crate::history::TargetToken::new_loop(11);
         let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
-        sp.constants.insert(0, majit_ir::Const::Ref(GcRef(0x3000)));
+        sp.constants
+            .insert(0, majit_ir::Const::from_gcref(GcRef(0x3000)));
         pred_tt.attrs().short_preamble = Some(sp);
 
         let pred = std::sync::Arc::new(JitCellToken::new(11));
@@ -30602,7 +30625,8 @@ mod tests {
 
         let kept_tt = crate::history::TargetToken::new_loop(12);
         let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
-        sp.constants.insert(0, majit_ir::Const::Ref(GcRef(0x4000)));
+        sp.constants
+            .insert(0, majit_ir::Const::from_gcref(GcRef(0x4000)));
         kept_tt.attrs().short_preamble = Some(sp);
 
         let kept = std::sync::Arc::new(JitCellToken::new(12));
@@ -32154,7 +32178,7 @@ mod tests {
         ctx.ensure_ops_materialized();
         assert_eq!(
             ctx.initial_inputarg_consts.first().copied(),
-            Some(OpRef::ConstPtr(majit_ir::GcRef(forwarded)))
+            Some(OpRef::const_ptr(majit_ir::GcRef(forwarded)))
         );
         assert_eq!(
             ctx.virtualizable_entry_at(0),
