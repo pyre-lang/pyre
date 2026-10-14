@@ -382,16 +382,16 @@ fn create_spec_for_method(w_function: PyObjectRef, w_type: PyObjectRef) -> PyObj
     let name = if !w_function.is_null()
         && unsafe { pyre_interpreter::function::is_function(w_function) }
     {
-        unsafe { pyre_interpreter::function::function_get_name(w_function) }
+        unsafe { pyre_interpreter::function::function_get_name(w_function) }.to_string()
     } else {
-        "?"
+        "?".to_string()
     };
     let class_name = if !w_function.is_null()
         && unsafe { pyre_interpreter::function::is_function(w_function) }
         && !w_type.is_null()
         && unsafe { pyre_object::is_type(w_type) }
     {
-        unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_type, name) }
+        unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_type, &name) }
             .map(|(w_realclass, _)| unsafe { pyre_object::w_type_get_name(w_realclass) })
             .unwrap_or_else(|| unsafe { pyre_object::w_type_get_name(w_type) })
     } else if !w_type.is_null() && unsafe { pyre_object::is_type(w_type) } {
@@ -403,7 +403,7 @@ fn create_spec_for_method(w_function: PyObjectRef, w_type: PyObjectRef) -> PyObj
 }
 
 fn create_spec_for_function(w_func: PyObjectRef) -> PyObjectRef {
-    let name = unsafe { pyre_interpreter::function::function_get_name(w_func) };
+    let name = unsafe { pyre_interpreter::function::function_get_name(w_func) }.to_string();
     let w_module = unsafe { (*(w_func as *const pyre_interpreter::function::Function)).w_module };
     let text = if unsafe { pyre_interpreter::function::function_has_builtin_code(w_func) } {
         if let Some(module) = module_name_wtf8(w_module) {

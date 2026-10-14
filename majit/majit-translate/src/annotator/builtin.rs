@@ -324,6 +324,28 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         crate::runtime_names::modules::MALLOC_RAW,
         malloc_raw_alloc,
     );
+    // `majit_gc::header::alloc_varsize_with_gc_header_immortal[_zeroed]` —
+    // `malloc_varsize` + `init_gc_object_immortal`. Concrete helpers, so a
+    // look-inside graph would poison `alloc_lowlevel_string` /
+    // `alloc_utf8_payload`. Result is `*mut u8`, the same `SomePtr`
+    // shell `alloc_zeroed` uses (`raw_alloc_ptr_somevalue`). A
+    // classdef-less `SomeInstance` here unions with every other
+    // instance and poisons field classdefs (`dstrategy`).
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_IMMORTAL,
+        alloc_varsize_gc_header,
+    );
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_IMMORTAL_ZEROED,
+        alloc_varsize_gc_header,
+    );
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::modules::DEALLOC_VARSIZE_GC_HEADER,
+        dealloc_varsize_gc_header,
+    );
     // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
     // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
     // (`flowspace/model.rs`'s `bootstrap_std_modules`).  Lowers identity
@@ -2570,6 +2592,44 @@ fn malloc_raw_alloc(
     }
 }
 
+/// Analyzer for `majit_gc::header::alloc_varsize_with_gc_header_immortal`
+/// / `_zeroed` — `(payload_size, type_id) -> *mut u8`.
+///
+/// `lltype.malloc_varsize` analogue: residualised so the annotator does
+/// not walk `std::alloc::Layout` / `GcHeader::write`. Overflow and
+/// allocation failure return null. The `*mut u8` shell is the same
+/// `SomePtr` `alloc_zeroed` uses (`raw_alloc_ptr_somevalue`); a
+/// classdef-less `SomeInstance` would union with typed instances.
+fn alloc_varsize_gc_header(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "alloc_varsize_with_gc_header_immortal() expects (payload_size, type_id)",
+        ));
+    }
+    let _ = arg_at(args_s, 0, "alloc_varsize_with_gc_header_immortal");
+    let _ = arg_at(args_s, 1, "alloc_varsize_with_gc_header_immortal");
+    Ok(raw_alloc_ptr_somevalue())
+}
+
+/// Analyzer for `majit_gc::header::dealloc_varsize_with_gc_header` —
+/// `(payload, payload_size) -> ()`. Void, like `std.alloc.dealloc`.
+fn dealloc_varsize_gc_header(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "dealloc_varsize_with_gc_header() expects (payload, payload_size)",
+        ));
+    }
+    Ok(s_none())
+}
+
 /// Upstream `robjmodel_r_dict(...)` (builtin.py).
 pub fn robjmodel_r_dict(
     bk: &Rc<Bookkeeper>,
@@ -3152,6 +3212,37 @@ mod tests {
     }
 
     #[test]
+    fn alloc_varsize_gc_header_is_nullable_byte_ptr() {
+        let out = alloc_varsize_gc_header(
+            &bk(),
+            &[
+                Some(SomeValue::Integer(SomeInteger::default())),
+                Some(SomeValue::Integer(SomeInteger::default())),
+            ],
+            &no_kwds(),
+        )
+        .expect("varsize immortal alloc annotates");
+        match out {
+            SomeValue::Ptr(_) => {}
+            other => panic!("expected SomePtr *mut u8 shell, got {other:?}"),
+        }
+        let none = dealloc_varsize_gc_header(
+            &bk(),
+            &[
+                Some(SomeValue::Instance(SomeInstance::new(
+                    None,
+                    true,
+                    Default::default(),
+                ))),
+                Some(SomeValue::Integer(SomeInteger::default())),
+            ],
+            &no_kwds(),
+        )
+        .expect("varsize immortal dealloc annotates");
+        assert_eq!(none, s_none());
+    }
+
+    #[test]
     fn registry_contains_mass_registered_builtins() {
         // upstream builtin.py:191-195 scans `builtin_*` prefixes.
         assert!(is_registered("range"));
@@ -3165,6 +3256,15 @@ mod tests {
         assert!(is_registered("min"));
         assert!(is_registered("max"));
         assert!(is_registered(crate::runtime_names::modules::MALLOC));
+        assert!(is_registered(
+            crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_IMMORTAL
+        ));
+        assert!(is_registered(
+            crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_IMMORTAL_ZEROED
+        ));
+        assert!(is_registered(
+            crate::runtime_names::modules::DEALLOC_VARSIZE_GC_HEADER
+        ));
     }
 
     #[test]
@@ -3179,6 +3279,9 @@ mod tests {
         assert!(is_registered("rarithmetic.intmask"));
         assert!(is_registered("majit_rlib.jit.conditional_call1"));
         assert!(is_registered("majit_rlib.jit.conditional_call_elidable1"));
+        assert!(is_registered(
+            crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_IMMORTAL
+        ));
         assert!(is_registered("rpython.rlib.objectmodel.instantiate"));
         assert!(is_registered("rpython.rlib.objectmodel.hlinvoke"));
         assert!(is_registered("weakref.ref"));

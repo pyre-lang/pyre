@@ -172,8 +172,11 @@ pub fn try_alloc_bytes_block(bytes: &[u8]) -> Option<*mut BytesBlock> {
     let block = match route_bytes_block(size) {
         BlockRoute::Managed(raw) => raw,
         BlockRoute::Refused => return None,
-        // SAFETY: the layout is non-zero — the header alone occupies a word.
-        BlockRoute::Raw => unsafe { std::alloc::alloc(bytes_block_layout(bytes.len())) },
+        // Off-heap `rstr.STR` `chars` array (`rstr.py`): stamp
+        // `init_gc_object_immortal` in front of the payload.
+        BlockRoute::Raw => {
+            majit_gc::header::alloc_varsize_with_gc_header_immortal(size, bytes_block_gc_type_id())
+        }
     };
     if block.is_null() {
         return None;
@@ -210,17 +213,10 @@ pub fn try_alloc_bytes_block_zeroed(len: usize) -> Option<*mut BytesBlock> {
             raw
         }
         BlockRoute::Refused => return None,
-        BlockRoute::Raw => {
-            // A length that overruns the address space has no layout at all,
-            // and is the same refusal as one the allocator declines.
-            let layout =
-                std::alloc::Layout::from_size_align(size, std::mem::align_of::<BytesBlock>())
-                    .ok()?;
-            // `PyObject_Calloc` — a large block's pages arrive zero already, so
-            // asking the allocator for them beats writing `len` NULs over them.
-            // SAFETY: the layout is non-zero — the header alone occupies a word.
-            unsafe { std::alloc::alloc_zeroed(layout) }
-        }
+        BlockRoute::Raw => majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(
+            size,
+            bytes_block_gc_type_id(),
+        ),
     };
     if block.is_null() {
         return None;
@@ -233,11 +229,13 @@ pub fn try_alloc_bytes_block_zeroed(len: usize) -> Option<*mut BytesBlock> {
     }
 }
 
-/// The `[header | chars]` layout of a block holding `len` bytes.
+/// The `[GcHeader | length | chars]` layout of a raw-fallback block holding
+/// `len` bytes. `alloc_varsize_with_gc_header_immortal` prepends the header;
+/// this size is the abort path's reported request.
 fn bytes_block_layout(len: usize) -> std::alloc::Layout {
     std::alloc::Layout::from_size_align(
-        BYTES_BLOCK_CHARS_OFFSET + len,
-        std::mem::align_of::<BytesBlock>(),
+        majit_gc::header::GcHeader::SIZE + BYTES_BLOCK_CHARS_OFFSET + len,
+        majit_gc::header::GcHeader::SIZE,
     )
     .expect("bytes block layout")
 }
@@ -675,6 +673,19 @@ pub unsafe fn bytes_like_data(obj: PyObjectRef) -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alloc_bytes_block_raw_stamps_init_gc_object_immortal_flags() {
+        // Unit tests take the no-hook Raw arm (`bytes_block_gc_type_id` is 0).
+        let block = alloc_bytes_block(b"leaf");
+        assert!(!block.is_null());
+        unsafe {
+            let hdr = majit_gc::header::header_of(block as usize);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+            assert_eq!(bytes_block_chars(block), b"leaf");
+        }
+    }
 
     /// `typedef.py _getusercls(W_BytesObject)`: exact bytes keep the bare
     /// payload and a subclass instance is `W_BytesObjectUser` carrying

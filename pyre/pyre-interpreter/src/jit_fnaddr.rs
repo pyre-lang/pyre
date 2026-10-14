@@ -1373,6 +1373,27 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "majit_gc::bh_probe_note_store",
         bh_probe_note_store_word,
     );
+    // Residual `malloc_varsize` / `init_gc_object_immortal` leaves the
+    // translator emits as `functionptr_with_external_name`. Publish the
+    // word-compatible signatures so a jitcode that reaches one binds.
+    pa2(
+        &mut entries,
+        "majit_gc::header::alloc_varsize_with_gc_header_immortal",
+        "alloc_varsize_with_gc_header_immortal",
+        majit_gc::header::alloc_varsize_with_gc_header_immortal,
+    );
+    pa2(
+        &mut entries,
+        "majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed",
+        "alloc_varsize_with_gc_header_immortal_zeroed",
+        majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed,
+    );
+    upa2(
+        &mut entries,
+        "majit_gc::header::dealloc_varsize_with_gc_header",
+        "dealloc_varsize_with_gc_header",
+        majit_gc::header::dealloc_varsize_with_gc_header,
+    );
 
     // RPython annotator PBC parity for `BuiltinCode.func`: every generated
     // interp2app wrapper is a possible value of the indirect function-pointer

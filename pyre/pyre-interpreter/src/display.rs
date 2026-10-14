@@ -1026,7 +1026,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             let name = builtin_code_name(obj());
             format!("<code {name}>")
         } else if std::ptr::eq(tp, &crate::function::SLOT_WRAPPER_TYPE as *const PyType) {
-            let name = function_get_name(obj());
+            let name = function_get_name(obj()).to_string();
             let owner = crate::function::fget_func_objclass(obj())?;
             let owner_name = pyre_object::w_type_get_name(owner);
             format!("<slot wrapper '{name}' of '{owner_name}' objects>")
@@ -1034,7 +1034,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             tp,
             &crate::function::METHOD_DESCRIPTOR_TYPE as *const PyType,
         ) {
-            let name = function_get_name(obj());
+            let name = function_get_name(obj()).to_string();
             let owner = crate::function::fget_func_objclass(obj())?;
             let owner_name = pyre_object::w_type_get_name(owner);
             format!("<method '{name}' of '{owner_name}' objects>")
@@ -1042,9 +1042,9 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // function.py BuiltinFunction.descr_function_repr.  Same text
             // the `__repr__` this type registers in `typedef.rs` produces;
             // this native arm is the one `repr()` actually reaches.
-            let name = function_get_name(obj());
+            let name = function_get_name(obj()).to_string();
             let w_self = crate::function::function_get_self_or_none(obj());
-            crate::function::builtin_function_repr_text(name, w_self)
+            crate::function::builtin_function_repr_text(&name, w_self)
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
             // function.py Function.descr_function_repr —
             // `self.getrepr(space, 'function %s' % self.qualname)`, and

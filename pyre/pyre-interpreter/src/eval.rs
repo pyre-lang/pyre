@@ -7081,10 +7081,10 @@ result = (
             "slot-wrapper carrier must be walked too"
         );
 
-        // `name` is the one declared offset this walk skips: an immortal
-        // function's name box comes from `malloc_raw`, so the collector never
-        // owns it, while a managed function's GC box is reached through the
-        // type id's offsets.
+        // `name` is the one declared offset this walk skips: it is an rstr
+        // `STR` leaf (`function.py self.name`). An immortal function's name
+        // is `init_gc_object_immortal`; a managed function's is reached
+        // through the type id's offsets. Neither needs this extra-root walk.
         let exempt = std::mem::offset_of!(crate::function::Function, name);
         let mut expected: Vec<usize> = crate::function::FUNCTION_GC_PTR_OFFSETS
             .iter()

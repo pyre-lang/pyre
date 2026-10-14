@@ -82,7 +82,7 @@ impl LoopAsmResources {
         descr: std::sync::Arc<crate::failguard::WasmFailDescr>,
     ) -> usize {
         let cell = Box::new(crate::failguard::FailDescrCell::new(descr));
-        let ptr = &*cell as *const crate::failguard::FailDescrCell as usize;
+        let ptr = crate::failguard::FailDescrCell::thin_ptr(&cell);
         self.fail_cells.push(cell);
         ptr
     }

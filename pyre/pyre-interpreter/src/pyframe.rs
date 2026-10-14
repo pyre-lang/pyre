@@ -6385,13 +6385,14 @@ impl PyFrame {
             _roots.get(root_base + 1),
             execution_context,
         )?;
-        let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+        // Reload the argument tail of `live` from the forwarded slots; the
+        // buffer that published the roots is the one handed on.
         for i in 0..args.len() {
-            current_args.push(_roots.get(root_base + 3 + i));
+            live[3 + i] = _roots.get(root_base + 3 + i);
         }
         Ok(Self::finish_for_call_with_globals_obj(
             _roots.get(root_base) as *const (),
-            &current_args,
+            &live[3..],
             _roots.get(root_base + 1),
             execution_context,
             _roots.get(root_base + 2),
@@ -6425,13 +6426,14 @@ impl PyFrame {
         let root_base = _roots.pin_roots(&live);
         let w_builtin =
             crate::baseobjspace::frame_builtin_obj(_roots.get(root_base + 1), execution_context);
-        let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+        // Reload the argument tail of `live` from the forwarded slots; the
+        // buffer that published the roots is the one handed on.
         for i in 0..args.len() {
-            current_args.push(_roots.get(root_base + 3 + i));
+            live[3 + i] = _roots.get(root_base + 3 + i);
         }
         Self::finish_for_call_with_globals_obj(
             _roots.get(root_base) as *const (),
-            &current_args,
+            &live[3..],
             _roots.get(root_base + 1),
             execution_context,
             _roots.get(root_base + 2),

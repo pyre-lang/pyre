@@ -1632,6 +1632,15 @@ impl CrateLoweringState {
             // `external_buffer_view` is an Acquire load of a multi-word
             // aggregate. This caller returns one exception-bridge word.
             "typedef::buffer_as_bytes_like",
+            // `majit_gc::header` varsize immortal helpers (`malloc_varsize`
+            // + `init_gc_object_immortal`). Stamp here so the dispatcher
+            // does not look inside; `collect_policy_opaque` still harvests
+            // only LLBC hints, so HOST_ENV keeps Layer-3b.
+            "header::alloc_varsize_with_gc_header_immortal",
+            "header::alloc_varsize_with_gc_header_immortal_zeroed",
+            "header::alloc_varsize_with_gc_header_immortal_zeroed_flag",
+            "header::dealloc_varsize_with_gc_header",
+            "header::varsize_immortal_layout",
         ] {
             dont_look_inside.insert(path.to_string());
         }
@@ -16065,6 +16074,46 @@ impl<'a> Lowering<'a> {
         self.retype_word(mir_bb, addr, &ValueType::Int, &ValueType::Unsigned)
     }
 
+    /// Item address for `ptr::copy_nonoverlapping`. A
+    /// `typed_items_block_items_base` / `items_block_items_base` result is
+    /// the array header (`l.items`); `raw_memcopy` wants `items[0]`, so
+    /// add `itemoffsetof`. A pair-slice `as_ptr` is already that address.
+    fn copy_nonoverlapping_item_addr(
+        &mut self,
+        mir_bb: usize,
+        value: Variable,
+        local: Option<usize>,
+        ty: Option<&TyRef>,
+    ) -> Option<Variable> {
+        if local.is_some_and(|base| {
+            base_traces_to_typed_items_block_accessor(self.body, base, self.llbc)
+        }) {
+            return Some(self.items_block_item_address(
+                mir_bb,
+                value,
+                &[
+                    "majit_rlib",
+                    "lltypesystem",
+                    "rlist",
+                    "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
+                ],
+            ));
+        }
+        if local.is_some_and(|base| base_traces_to_items_block_accessor(self.body, base, self.llbc))
+        {
+            return Some(self.items_block_item_address(
+                mir_bb,
+                value,
+                &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
+            ));
+        }
+        let ty = ty?;
+        raw_ptr_one_word_item_kind(ty, self.llbc)?;
+        let from =
+            tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids);
+        Some(self.retype_word(mir_bb, value, &from, &ValueType::Unsigned))
+    }
+
     /// The pair's item word type for a slice helper: the helpers take and
     /// return `usize` for an int item.
     fn pair_helper_item_ty(kind: majit_ir::rvec::VecItemKind) -> ValueType {
@@ -24298,6 +24347,24 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `utf8_payload_wtf8` / `utf8_payload_bytes` are views of an
+                // rstr `STR` header (`Function.name`, `W_UnicodeObject._utf8`).
+                // Alias dest to that STR so `from_utf8_unchecked` /
+                // `as_str_unchecked` keep `SomeString` instead of a byte list.
+                if args.len() == 1 && self.is_utf8_payload_wtf8_identity(&reg) {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), false);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() == 1 && self.is_utf8_payload_bytes_identity(&reg) {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `String|str|Wtf8|Wtf8Buf::as_bytes` — the UTF-8 / WTF-8
                 // byte view of a string.  A string IS its byte sequence in
                 // the lifted value model (the immutable `rpy_string`), so
@@ -27317,6 +27384,98 @@ impl<'a> Lowering<'a> {
                 } else {
                     (segments, method_hint)
                 };
+                // `Vec::set_len(n)` is `l.length = n` (`lltypesystem/rlist.py`
+                // `ll_newlist` after `ll_newlist_hint`). There is no
+                // `ll_vec_set_len` helper; write the header `len` word.
+                // `VecFieldPart::Len` is the inline-field projection
+                // (`inline_vec_field_part`); on this owner `fielddescrof`
+                // would mint `len.len` with no parent SizeDescr
+                // (`get_field_descr`). The codewriter stores the word
+                // (`vec_set_header_word`).
+                if args.len() == 2
+                    && rust_vec_std_leaf(&original_segments) == Some("set_len")
+                    && first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc))
+                        .is_some()
+                {
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: args[0].clone(),
+                            field: FieldDescriptor::new("len", Some("alloc::vec::Vec".to_string())),
+                            value: crate::model::LinkArg::Value(args[1].clone()),
+                            ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `ptr::copy_nonoverlapping::<T>(src, dst, n)` is
+                // `rgc.ll_arraycopy` / `llmemory.raw_memcopy` of `n`
+                // items (`rlist.py` `ll_arraycopy`). A one-word `T` is
+                // `ll_slice_arraycopy_*`; `typed_items_block_items_base`
+                // dests are the header, so add `itemoffsetof` first.
+                if args.len() == 3 && self.is_ptr_copy_nonoverlapping(&reg) {
+                    let kind = first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| raw_ptr_one_word_item_kind(ty, self.llbc))
+                        .or_else(|| {
+                            second_arg_ty
+                                .as_ref()
+                                .and_then(|ty| raw_ptr_one_word_item_kind(ty, self.llbc))
+                        });
+                    if let Some(kind) = kind
+                        && let Some(src) = self.copy_nonoverlapping_item_addr(
+                            mir_bb,
+                            args[0].clone(),
+                            arg_locals.first().copied().flatten(),
+                            first_arg_ty.as_ref(),
+                        )
+                        && let Some(dst) = self.copy_nonoverlapping_item_addr(
+                            mir_bb,
+                            args[1].clone(),
+                            arg_locals.get(1).copied().flatten(),
+                            second_arg_ty.as_ref(),
+                        )
+                    {
+                        let zero = self.emit_const_uint(mir_bb, 0);
+                        let count_from = third_arg_ty
+                            .as_ref()
+                            .map(|ty| {
+                                tyref_to_value_type_with(
+                                    ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                    self.gc_struct_ids,
+                                )
+                            })
+                            .unwrap_or(ValueType::Unsigned);
+                        let count = self.retype_word(
+                            mir_bb,
+                            args[2].clone(),
+                            &count_from,
+                            &ValueType::Unsigned,
+                        );
+                        let _ = self.emit_path_call(
+                            mir_bb,
+                            majit_ir::rvec::slice_helper_path(
+                                majit_ir::rvec::SliceOp::ArrayCopy,
+                                kind,
+                            ),
+                            vec![src, dst, zero.clone(), zero, count],
+                            ValueType::Void,
+                        );
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
                 // A `Vec` of one-word items is the raw header `RustVecRepr`
                 // lowers; its constructors, `push`, and `as_ptr` /
                 // `as_mut_ptr` call the `ll_vec_*` helper that repr names
@@ -33379,6 +33538,30 @@ impl<'a> Lowering<'a> {
         fd.item_meta.name_path().rsplit("::").next() == Some("w_str_get_wtf8")
     }
 
+    /// `utf8_payload_wtf8(*const UnicodeValueStorage) -> &Wtf8` — the STR
+    /// header is already the string value (`Utf8Str` maps to `ValueType::Str`).
+    fn is_utf8_payload_wtf8_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().rsplit("::").next() == Some("utf8_payload_wtf8")
+    }
+
+    /// `utf8_payload_bytes(*const UnicodeValueStorage) -> &[u8]` — byte view
+    /// of the same rstr `STR` header.
+    fn is_utf8_payload_bytes_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().rsplit("::").next() == Some("utf8_payload_bytes")
+    }
+
     /// `String::as_bytes` / `<str>::as_bytes` / `Wtf8::as_bytes` /
     /// `Wtf8Buf::as_bytes` — the byte view of a string.  A string is its
     /// byte sequence in the lifted value model (`String`/`&str`/`Wtf8`
@@ -34320,6 +34503,16 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::ptr::copy")
+    }
+
+    /// `core::ptr::copy_nonoverlapping` / `std::ptr::copy_nonoverlapping`.
+    fn is_ptr_copy_nonoverlapping(&self, reg: &RegularCall) -> bool {
+        regular_call_name_path(reg, self.llbc).is_some_and(|path| {
+            matches!(
+                path.as_str(),
+                "core::ptr::copy_nonoverlapping" | "std::ptr::copy_nonoverlapping"
+            )
+        })
     }
 
     /// The body-side `from_raw_parts` half of
@@ -59006,7 +59199,12 @@ fn dont_look_inside_return_container_root(
         None
     };
     let ty = payload.as_ref().unwrap_or(output);
-    let spelling = tyref_to_field_layout_string(ty, llbc, gc_struct_ids);
+    // One-word-item `Vec` is `*mut Vec<…>` (`annotation_struct_field_type`);
+    // `tyref_to_field_layout_string` writes `isize` and the stub would be
+    // `SomeInteger`. The `look_inside_iff` wrapper then merges that with
+    // the inlined `_orig_` body's `SomeRustVec` (`ll_newlist` after
+    // `l.length = n`).
+    let spelling = annotation_struct_field_type(ty, llbc, gc_struct_ids);
     slice_or_vec_container_root_spelling(&spelling).map(str::to_string)
 }
 
@@ -59049,6 +59247,14 @@ mod slice_or_vec_container_root_spelling_tests {
         assert_eq!(
             slice_or_vec_container_root_spelling("Vec<u8>"),
             Some("Vec<u8>")
+        );
+        assert_eq!(
+            slice_or_vec_container_root_spelling("*mut Vec<*mut u8>"),
+            Some("*mut Vec<*mut u8>")
+        );
+        assert_eq!(
+            slice_or_vec_container_root_spelling("Vec<*mut u8>"),
+            Some("Vec<*mut u8>")
         );
         assert_eq!(slice_or_vec_container_root_spelling("&Engine"), None);
         assert_eq!(slice_or_vec_container_root_spelling("*mut PyObject"), None);
@@ -70660,6 +70866,12 @@ fn pair_item_kind_of_node(
     )
 }
 
+/// One-word item kind of `*const T` / `*mut T` for `copy_nonoverlapping`.
+fn raw_ptr_one_word_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    let pointee = type_node_raw_ptr_pointee(tyref_node(ty, llbc)?, llbc)?;
+    pair_item_kind_of_node(pointee, llbc)
+}
+
 /// The item kind of a `core::slice::iter::Iter<T>` / `IterMut<T>` over one-word
 /// items.  Such an iterator local is a range iterator over the indices of the
 /// slice, with the slice's item pointer in its second slot.
@@ -71664,6 +71876,8 @@ fn is_alloc_vec_from_elem(segments: &[String]) -> bool {
 /// call on a `Vec` of one-word items: the constructors read the item from
 /// the result type, `push` / `as_ptr` / `as_mut_ptr` from the receiver.
 /// `as_ptr` / `as_mut_ptr` are `ll_items` (`rlist.py`: `return l.items`).
+/// `Vec::set_len` is a `FieldWrite` of the header `len` word (`l.length = n`),
+/// not a `VecOp` helper.
 fn rust_vec_std_call(
     segments: &[String],
     nargs: usize,
@@ -84599,6 +84813,135 @@ mod tests {
                 "Vec::{leaf} on Vec<i64> must call {expected:?}; ops={ops:?}"
             );
         }
+    }
+
+    #[test]
+    fn one_word_item_vec_set_len_writes_the_len_word() {
+        let generics = |types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "regions": [], "types": types, "const_generics": [], "trait_refs": []
+            })
+        };
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics(vec![i64_ty.clone()])}
+        });
+        let unit =
+            serde_json::json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": generics(vec![])}});
+        let vec_decl = {
+            let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
+                .iter()
+                .map(|s| serde_json::json!({"Ident": [s, 0]}))
+                .collect();
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": {
+                    "name": name,
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 1}
+                    }},
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [], "inline": null, "rename": null, "public": true
+                    },
+                    "is_local": false
+                },
+                "kind": {"Struct": []}
+            })
+        };
+        let llbc = std_extern_call_fixture_with_types(
+            "vec_set_len",
+            &["alloc", "vec", "<Impl>", "set_len"],
+            &[vec_ty, usize_ty],
+            unit,
+            vec![vec_decl],
+        );
+        let graph = super::lower_function(&llbc, "vec_set_len").expect("lower Vec::set_len");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, ty: ValueType::Int, .. }
+                    if field.name == "len"
+                        && field.owner_root.as_deref() == Some("alloc::vec::Vec")
+                        && field.vec_part.is_none()
+            )),
+            "Vec::set_len must write the header len word; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. }
+                    if field.vec_part == Some(crate::model::VecFieldPart::Len)
+            )),
+            "Vec::set_len must not mint a parentless len.len FieldWrite; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "set_len")
+            )),
+            "Vec::set_len must not remain a FunctionPath; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn one_word_copy_nonoverlapping_is_slice_arraycopy() {
+        let generics = |types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "regions": [], "types": types, "const_generics": [], "trait_refs": []
+            })
+        };
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let i64_ptr = serde_json::json!({"RawPtr": [i64_ty.clone(), "Const"]});
+        let i64_mut_ptr = serde_json::json!({"RawPtr": [i64_ty, "Mut"]});
+        let unit =
+            serde_json::json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": generics(vec![])}});
+        let llbc = std_extern_call_fixture_with_types(
+            "copy_i64",
+            &["core", "ptr", "copy_nonoverlapping"],
+            &[i64_ptr, i64_mut_ptr, usize_ty],
+            unit,
+            vec![],
+        );
+        let graph =
+            super::lower_function(&llbc, "copy_i64").expect("lower ptr::copy_nonoverlapping");
+        let ops = graph_ops(&graph);
+        let expected: Vec<String> = majit_ir::rvec::slice_helper_path(
+            majit_ir::rvec::SliceOp::ArrayCopy,
+            majit_ir::rvec::VecItemKind::Int,
+        )
+        .split("::")
+        .map(str::to_string)
+        .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments == &expected && args.len() == 5
+            )),
+            "copy_nonoverlapping of *i64 must be ll_slice_arraycopy_i; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "copy_nonoverlapping")
+            )),
+            "copy_nonoverlapping must not remain a FunctionPath; ops={ops:?}"
+        );
     }
 
     #[test]

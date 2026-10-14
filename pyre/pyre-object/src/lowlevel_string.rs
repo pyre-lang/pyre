@@ -3,10 +3,11 @@
 //! In a running interpreter a low-level string is a varsize GC leaf, matching
 //! RPython's `GcStruct('rpy_string', ...)`.  Before the GC registry is installed
 //! (principally unit tests), allocation falls back to an identically laid-out
-//! raw block.  Both forms are laid out
-//! as `{ hash: Signed @0, len: usize @8, chars: [item; len] @16.. }`. The `len`
-//! word is the RPython varsize length and, for the raw fallback only, also the
-//! allocation capacity used to reconstruct its freeing `Layout`.
+//! raw block stamped `init_gc_object_immortal`.  Both forms are laid out
+//! as `{ hash: Signed @0, len: usize @8, chars: [item; len] @16.. }` after the
+//! `GcHeader`. The `len` word is the RPython varsize length and, for the raw
+//! fallback only, also the payload size used to reconstruct its freeing
+//! `Layout` (header size plus payload).
 //!
 //! These are the leaf primitives behind the `newstr`/`newunicode`/`strsetitem`
 //! blackhole ops and the StringBuilder buffer (`current_buf`, STRINGPIECE `buf`).
@@ -131,14 +132,13 @@ fn alloc_lowlevel_string(
         }
         ptr
     } else {
-        let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
-            .expect("low-level string layout");
-        let ptr = unsafe {
-            if zero_fill {
-                std::alloc::alloc_zeroed(layout)
-            } else {
-                std::alloc::alloc(layout)
-            }
+        // Off-heap `rstr.STR` / `UNICODE` is still a `GcStruct` (`rstr.py`):
+        // a prebuilt `rpy_string` carries `init_gc_object_immortal`. The
+        // pointer handed out is the address after the header.
+        let ptr = if zero_fill {
+            majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(total_size, tid)
+        } else {
+            majit_gc::header::alloc_varsize_with_gc_header_immortal(total_size, tid)
         };
         if ptr.is_null() {
             return 0;
@@ -183,23 +183,25 @@ pub fn bh_free_lowlevel_string(string: i64, base_size: usize, item_size: usize) 
         return;
     }
     let capacity = bh_lowlevel_string_len(string);
-    let total_size = base_size + capacity * item_size;
-    let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
-        .expect("low-level string layout");
-    unsafe { std::alloc::dealloc(string as *mut u8, layout) };
+    let Some(items_size) = capacity.checked_mul(item_size) else {
+        return;
+    };
+    let Some(payload_size) = base_size.checked_add(items_size) else {
+        return;
+    };
+    unsafe { majit_gc::header::dealloc_varsize_with_gc_header(string as *mut u8, payload_size) };
 }
 
 /// STR / UNICODE width `(base_size, item_size)` of the low-level string at
 /// `buf`, read from its GC type id.
 ///
-/// A GC-managed buffer carries the width in its header tid — the collector's own
-/// record of the element size — exactly as `rgc.ll_shrink_array` recovers the
-/// element type from the array it is handed. A raw-fallback buffer (no GC owner,
-/// principally unit tests) has no header to read and defaults to STR, the only
-/// width the raw path allocates. The `gc_owns_object` guard before the header
-/// read mirrors `majit_gc::gc_finalizer_has_run`.
+/// A buffer carries the width in its header tid — the collector's own record
+/// of the element size — exactly as `rgc.ll_shrink_array` recovers the element
+/// type from the array it is handed. Off-heap raw STR / UNICODE payloads now
+/// stamp `init_gc_object_immortal` too, so the tid is readable whether or not
+/// the collector owns the object. An unpublished tid (0) defaults to STR.
 fn shrink_array_width(buf: i64) -> (usize, usize) {
-    if buf != 0 && majit_gc::gc_owns_object(buf as usize) {
+    if buf != 0 {
         let tid = unsafe { (*majit_gc::header::header_of(buf as usize)).type_id() };
         if tid != 0 && tid == lowlevel_unicode_gc_type_id() {
             return (LOWLEVEL_UNICODE_BASE_SIZE, 4);
@@ -709,6 +711,9 @@ mod tests {
         let buf = bh_alloc_str_nofill(4);
         assert_ne!(buf, 0);
         unsafe {
+            let hdr = majit_gc::header::header_of(buf as usize);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert_eq!(*(buf as *const usize), 0);
             assert_eq!(
                 *((buf as *const u8).add(LOWLEVEL_STRING_LEN_OFFSET) as *const usize),

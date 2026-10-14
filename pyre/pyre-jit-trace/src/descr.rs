@@ -2340,13 +2340,11 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // `function.py self.name = forcename or code.co_name` — a
-            // pointer to the name string's storage.  It is pointer-shaped and
-            // the runtime walker visits it, so it belongs in the census; the
-            // storage itself may be GC-managed (a mortal function's own box) or
-            // permanent (a builtin's `malloc_raw` box, or the code object's
-            // borrowed `co_name`), which the walker's managed-heap guard sorts
-            // out.
+            // `function.py self.name = forcename or code.co_name` — the
+            // rstr `STR` payload (`w_str_storage` of `co_name`). It is
+            // pointer-shaped and the runtime walker visits it, so it belongs
+            // in the census. A managed payload is a nursery/old-gen leaf; an
+            // immortal payload carries `init_gc_object_immortal`.
             quasi("name", f::FUNCTION_NAME_OFFSET),
             // `w_name` has no `function.py:34-42` twin — upstream's `name?` is
             // the str this field wraps — so it stays a plain mutable slot.
@@ -4065,7 +4063,7 @@ pub fn function_closure_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_CLOSURE_OFFSET)
 }
 
-/// `function.py:51 self.name` — the pointer to the name string's storage.
+/// `Function.__init__` `self.name` — the rstr `STR` payload of `co_name`.
 pub fn function_name_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_NAME_OFFSET)
 }

@@ -145,6 +145,16 @@ pub(crate) mod modules {
     pub(crate) const MALLOC_TYPED_MANAGED: &str = "pyre_object.lltype.malloc_typed_managed";
     pub(crate) const MALLOC_TYPED_STABLE: &str = "pyre_object.lltype.malloc_typed_stable";
     pub(crate) const MALLOC_RAW: &str = "pyre_object.lltype.malloc_raw";
+    /// `majit_gc::header` varsize immortal helpers (`init_gc_object_immortal`
+    /// / `malloc_varsize` analogue). Concrete, so they need the same HOST_ENV
+    /// residual as `malloc_typed` rather than a look-inside graph.
+    pub(crate) const GC_HEADER: &str = "majit_gc.header";
+    pub(crate) const ALLOC_VARSIZE_GC_HEADER_IMMORTAL: &str =
+        "majit_gc.header.alloc_varsize_with_gc_header_immortal";
+    pub(crate) const ALLOC_VARSIZE_GC_HEADER_IMMORTAL_ZEROED: &str =
+        "majit_gc.header.alloc_varsize_with_gc_header_immortal_zeroed";
+    pub(crate) const DEALLOC_VARSIZE_GC_HEADER: &str =
+        "majit_gc.header.dealloc_varsize_with_gc_header";
 }
 
 /// The crate names the consumer's LLBC set extracts under.

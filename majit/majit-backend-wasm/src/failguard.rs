@@ -790,13 +790,23 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
 ///
 /// The cell is the unit `LoopAsmResources` (or the finish singleton array)
 /// keeps alive. `get_latest_descr` casts `jf_descr` back to this cell.
+///
+/// Layout matches `majit_ir::FailDescrCell`: an `init_gc_object_immortal`
+/// header word immediately before the payload `thin_ptr` names, so
+/// `header_of` / `IncrementalMiniMarkGC.visit` is in-bounds.
+#[repr(C)]
 pub struct FailDescrCell {
+    header: u64,
     descr: parking_lot::Mutex<Arc<WasmFailDescr>>,
 }
+
+const _: () = assert!(std::mem::offset_of!(FailDescrCell, descr) == majit_ir::GC_HEADER_WORD_SIZE);
+const _: () = assert!(std::mem::align_of::<FailDescrCell>() <= majit_ir::GC_HEADER_WORD_SIZE);
 
 impl FailDescrCell {
     pub fn new(descr: Arc<WasmFailDescr>) -> Self {
         Self {
+            header: majit_ir::GC_IMMORTAL_LEAF_HEADER,
             descr: parking_lot::Mutex::new(descr),
         }
     }
@@ -808,6 +818,19 @@ impl FailDescrCell {
     pub fn set(&self, descr: Arc<WasmFailDescr>) {
         *self.descr.lock() = descr;
     }
+
+    /// Payload address stored in `jf_descr` / `jf_force_descr`.
+    pub fn thin_ptr(cell: &Self) -> usize {
+        std::ptr::addr_of!(cell.descr) as usize
+    }
+
+    /// Inverse of [`thin_ptr`].
+    ///
+    /// # Safety
+    /// `addr` must be [`thin_ptr`] of a live cell.
+    pub unsafe fn from_thin_ptr<'a>(addr: usize) -> &'a Self {
+        unsafe { &*((addr - majit_ir::GC_HEADER_WORD_SIZE) as *const Self) }
+    }
 }
 
 /// Read the descr an exit stored in `jf_descr` or `jf_force_descr`.
@@ -815,7 +838,7 @@ pub fn descr_at(cell: usize) -> Option<Arc<WasmFailDescr>> {
     if cell == 0 {
         return None;
     }
-    Some(unsafe { &*(cell as *const FailDescrCell) }.get())
+    Some(unsafe { FailDescrCell::from_thin_ptr(cell) }.get())
 }
 
 /// Publish the real descr into a cell `build_wasm_module` allocated.
@@ -823,7 +846,7 @@ pub fn fill_exit_cell(cell: usize, descr: Arc<WasmFailDescr>) {
     if cell == 0 {
         return;
     }
-    unsafe { &*(cell as *const FailDescrCell) }.set(descr);
+    unsafe { FailDescrCell::from_thin_ptr(cell) }.set(descr);
 }
 
 /// Allocate the cell whose address the exit stores in `jf_descr`.
@@ -853,7 +876,7 @@ pub fn alloc_exit_cell(sink: usize, fail_index: u32) -> usize {
     });
     if sink == 0 {
         let cell = Box::new(FailDescrCell::new(descr));
-        let ptr = &*cell as *const FailDescrCell as usize;
+        let ptr = FailDescrCell::thin_ptr(&cell);
         Box::leak(cell);
         return ptr;
     }
@@ -866,7 +889,7 @@ fn thin_descr_ptr(descr: &DescrRef) -> usize {
 }
 
 fn cell_addr(cell: &FailDescrCell) -> usize {
-    cell as *const FailDescrCell as usize
+    FailDescrCell::thin_ptr(cell)
 }
 
 /// `jf_descr` immediate captured for one reserved finish exit.

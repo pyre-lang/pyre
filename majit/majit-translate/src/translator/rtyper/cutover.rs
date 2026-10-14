@@ -2267,6 +2267,18 @@ fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
     {
         return Some(SKIP_PTR_COPY_NONOVERLAPPING);
     }
+    // `majit_gc::header::alloc_varsize_with_gc_header_immortal[_zeroed]`
+    // / `dealloc_varsize_with_gc_header` are `malloc_varsize` operations
+    // (`init_gc_object_immortal`), not graphs. Their bodies walk
+    // `std::alloc::Layout` / `GcHeader::write`, which poisons every
+    // string/bytes payload allocator that calls them. Skip the user-graph
+    // entry so Layer-3b reaches the HOST_ENV builtin (`alloc_varsize_gc_header`).
+    // `majit_gc` is not a local extract crate, so `canonical_dedup_key`
+    // keeps the crate root; the crate-stripped and leaf-only aliases are
+    // the same callable (`is_jit_conditional_call_residual` shape).
+    if is_varsize_gc_header_alloc(canonical_strip) {
+        return Some(SKIP_VARSIZE_GC_HEADER_ALLOC);
+    }
     None
 }
 
@@ -2275,6 +2287,10 @@ const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
 
 /// [`registration_decline`] reason for `rlib/jit.py ConditionalCallEntry`.
 const SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY: &str = "skip-jit-conditional-call-extregistry";
+
+/// [`registration_decline`] reason for `majit_gc::header` varsize immortal
+/// allocators (`malloc_varsize` / `init_gc_object_immortal`).
+const SKIP_VARSIZE_GC_HEADER_ALLOC: &str = "skip-varsize-gc-header-alloc";
 
 /// Residual `majit_rlib::jit::conditional_call0..4` /
 /// `conditional_call_elidable1`. `canonical_dedup_key` strips the crate
@@ -2297,6 +2313,30 @@ fn is_jit_conditional_call_residual(canonical_strip: &[String]) -> bool {
             | "conditional_call3"
             | "conditional_call4"
             | "conditional_call_elidable1"
+    )
+}
+
+/// Residual `majit_gc::header::alloc_varsize_with_gc_header_immortal*` /
+/// `dealloc_varsize_with_gc_header`. `canonical_dedup_key` keeps `majit_gc`
+/// (not a local extract crate), so both `["majit_gc","header",leaf]` and
+/// the crate-stripped `["header",leaf]` / leaf-only aliases name the same
+/// HOST_ENV entry.
+fn is_varsize_gc_header_alloc(canonical_strip: &[String]) -> bool {
+    let leaf = match canonical_strip {
+        [crate_name, module, leaf] if crate_name == "majit_gc" && module == "header" => {
+            leaf.as_str()
+        }
+        [module, leaf] if module == "header" => leaf.as_str(),
+        [leaf] => leaf.as_str(),
+        _ => return false,
+    };
+    matches!(
+        leaf,
+        "alloc_varsize_with_gc_header_immortal"
+            | "alloc_varsize_with_gc_header_immortal_zeroed"
+            | "alloc_varsize_with_gc_header_immortal_zeroed_flag"
+            | "dealloc_varsize_with_gc_header"
+            | "varsize_immortal_layout"
     )
 }
 
@@ -3057,11 +3097,24 @@ fn residual_stub_result_shell(
 /// `SomeInstance(classdef)` of a by-value ADT result
 /// (`FunctionGraph::return_class_root`), whose payload reads
 /// (`__discriminant`, `__pos_0`) the classdef-less shell cannot annotate.
-/// `None` when the token is not `ref` or the graph declares neither.
+///
+/// A one-word-item `Vec` residual is `SomeRustVec` (`project_rust_vec`).
+/// Its FUNC.RESULT token is `i64` (`history.getkind` of the raw header),
+/// so the `ref` gate would miss it and the stub would be `SomeInteger` —
+/// `Integer ∪ RustVec` at a `look_inside_iff` wrapper return
+/// (`ll_vec_alloc_and_set_nonnull_r`).
+/// `None` when the token is not `ref` (and not that `Vec` header) or the
+/// graph declares neither.
 fn declared_return_annotation(
     registry: &CallRegistry,
     graph: &LegacyGraph,
 ) -> Option<crate::annotator::model::SomeValue> {
+    if let Some(spelling) = graph.return_container_root.as_deref() {
+        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        if matches!(projected, crate::annotator::model::SomeValue::RustVec(_)) {
+            return Some(projected);
+        }
+    }
     if graph.return_type.as_deref() != Some("ref") {
         return None;
     }
@@ -5668,6 +5721,79 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("HOST_ENV must resolve majit_rlib.jit.{leaf}"));
             assert!(crate::annotator::builtin::is_registered(host.qualname()));
+        }
+    }
+
+    /// Residual `majit_gc::header` varsize immortal allocators are
+    /// `malloc_varsize` operations, not graphs. Layer-1 would otherwise
+    /// beat HOST_ENV and the annotator would walk `std::alloc::Layout`.
+    #[test]
+    fn varsize_gc_header_allocs_are_declined_and_host_env_wins() {
+        let public_leaves = [
+            "alloc_varsize_with_gc_header_immortal",
+            "alloc_varsize_with_gc_header_immortal_zeroed",
+            "dealloc_varsize_with_gc_header",
+        ];
+        let private_leaves = [
+            "alloc_varsize_with_gc_header_immortal_zeroed_flag",
+            "varsize_immortal_layout",
+        ];
+        for leaf in public_leaves.iter().chain(private_leaves.iter()) {
+            assert_eq!(
+                registration_decline(&["majit_gc".into(), "header".into(), (*leaf).into()]),
+                Some(SKIP_VARSIZE_GC_HEADER_ALLOC),
+                "{leaf}"
+            );
+            assert_eq!(
+                registration_decline(&["header".into(), (*leaf).into()]),
+                Some(SKIP_VARSIZE_GC_HEADER_ALLOC),
+                "header::{leaf}"
+            );
+            assert_eq!(
+                registration_decline(&[(*leaf).into()]),
+                Some(SKIP_VARSIZE_GC_HEADER_ALLOC),
+                "leaf {leaf}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["majit_gc".into(), "header".into(), "header_of".into()]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for leaf in public_leaves {
+            let path = crate::parse::CallPath::from_segments(["majit_gc", "header", leaf]);
+            let mut graph = LegacyGraph::new(leaf);
+            graph.set_return(graph.startblock, None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for leaf in public_leaves {
+            let key = FunctionPathKey::from_segments(["majit_gc", "header", leaf]);
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {leaf}"
+            );
+            let host = crate::flowspace::model::host_env_callable(
+                &["majit_gc", "header", leaf]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|| panic!("HOST_ENV must resolve majit_gc.header.{leaf}"));
+            assert!(crate::annotator::builtin::is_registered(host.qualname()));
+            let stripped = crate::flowspace::model::host_env_callable(
+                &["header", leaf]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|| panic!("HOST_ENV must resolve header.{leaf}"));
+            assert!(crate::annotator::builtin::is_registered(
+                stripped.qualname()
+            ));
         }
     }
 
@@ -9675,6 +9801,27 @@ mod tests {
             matches!(list.listdef.s_value(), SomeValue::Integer(_)),
             "u8 items are integers, got {:?}",
             list.listdef.s_value()
+        );
+    }
+
+    #[test]
+    fn one_word_vec_residual_on_the_i64_token_is_rustvec() {
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("ll_vec_alloc_and_set_nonnull_r_trampoline");
+        graph.return_type = Some("i64".into());
+        assert_eq!(declared_return_annotation(&registry, &graph), None);
+        graph.return_container_root = Some("Vec<*mut u8>".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a one-word Vec residual declares its annotation");
+        let SomeValue::RustVec(vec) = declared else {
+            panic!("a one-word Vec residual is SomeRustVec, got {declared:?}")
+        };
+        assert_eq!(
+            vec.item_kind(),
+            Some(majit_ir::rvec::VecItemKind::Ref),
+            "Vec<*mut u8> items are managed references"
         );
     }
 

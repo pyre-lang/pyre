@@ -4717,12 +4717,13 @@ impl MiniMarkGC {
         // object marking never has to reach.
         let obj = unsafe { (*rawrefcount::pyobj(mirror)).ob_link };
         let alive = if !self.is_managed_heap_object(obj) {
-            // Upstream reaches the flag test unconditionally because every
-            // RPython GC object has a header, prebuilt ones included — which is
-            // what its GCFLAG_NO_HEAP_PTRS arm is for.  `malloc_typed` objects
-            // here live outside both generations with no header at all, so
-            // there is no flag word at that address to read.  Nothing sweeps
-            // them either, so nothing can prove one dead.
+            // Off-heap `malloc_typed` / `malloc_typed_immortal` objects carry a
+            // real `GcHeader` (`alloc_with_gc_header` /
+            // `alloc_with_gc_header_immortal`). Interned exact-str wrappers
+            // use `init_gc_object_immortal` (`GCFLAG_NO_HEAP_PTRS`); nothing
+            // sweeps either family. Headerless R3 (`Box::into_raw` /
+            // `malloc_raw`) still has no flag word to read, so it is alive
+            // by not being in either generation.
             true
         } else {
             let hdr = unsafe { header_of(obj) };
@@ -7046,8 +7047,7 @@ impl MiniMarkGC {
             }
             // A root may name mapped host storage the production walks skip:
             // `walk_rbigint_parts_cache` yields headerless `std::alloc` digit
-            // blocks, and a recorded trace `Ref` can hold `Function.name`
-            // storage. See `debug_accept_host_storage_child`.
+            // blocks. See `debug_accept_host_storage_child`.
             if !self.debug_child_is_traceable(root.0) {
                 if self.debug_accept_host_storage_child(root.0) {
                     continue;
@@ -7102,7 +7102,7 @@ impl MiniMarkGC {
                     continue;
                 }
                 // A slot may name mapped host storage on purpose
-                // (`Function.name`, see `debug_accept_host_storage_child`).
+                // (see `debug_accept_host_storage_child`).
                 // An unmapped word, a nursery address and a retired-nursery
                 // address are the defects this walk reports.
                 if !self.debug_child_is_traceable(child) {
@@ -7122,14 +7122,12 @@ impl MiniMarkGC {
     /// Mapped host storage the collector never moves, as a root or a child.
     ///
     /// The minor and major traces skip a root or child `is_managed_heap_object`
-    /// rejects. `Function.name` (`FUNCTION_NAME_OFFSET`) is such a child by
-    /// design, in an immortal builtin (a `malloc_raw` String) and in a
-    /// collector-owned function alike (`FunctionName::Borrowed`, the
-    /// `co_name` of a `Box::into_raw`'d code object that is never freed). An
-    /// unmapped word is not host storage: an integer in a GC slot is what
-    /// this walk exists to report. Nursery addresses (an interior pointer
-    /// included) and retired-nursery addresses are collector territory and
-    /// never take this skip.
+    /// rejects. Header-bearing immortal leaves (`init_gc_object_immortal`)
+    /// are skipped by `visit`'s `NO_HEAP_PTRS` test instead. An unmapped word
+    /// is not host storage: an integer in a GC slot is what this walk exists
+    /// to report. Nursery addresses (an interior pointer included) and
+    /// retired-nursery addresses are collector territory and never take this
+    /// skip.
     fn debug_accept_host_storage_child(&self, child: usize) -> bool {
         self.debug_outside_collector(child) && self.debug_address_mapped(child)
     }
@@ -7921,21 +7919,36 @@ impl MiniMarkGC {
     }
 
     /// Grey one child reference: if it is a managed, not-yet-visited heap
-    /// object, set VISITED and push it onto the gray stack. The
-    /// `is_managed_heap_object` guard mirrors `seed_major_root`: a
-    /// `Ptr(GcStruct)` field can transiently point at memory outside the
-    /// GC-managed heap during the L1/L2 stepping-stone state (e.g.
-    /// `W_TupleObject.wrappeditems` → `std::alloc`'d ItemsBlock). In that
-    /// window calling `header_of` on the field would dereference memory before
-    /// the std::alloc'd block. Upstream RPython `_collect_obj`
-    /// (incminimark.py) does not need this guard because RPython's
-    /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
-    /// away once every `gc_ptr_offsets` target is a real GC allocation.
+    /// object, set VISITED and push it onto the gray stack.
+    ///
+    /// `IncrementalMiniMarkGC.visit` reads `hdr.tid & (GCFLAG_VISITED |
+    /// GCFLAG_NO_HEAP_PTRS)` first. Every `grey_child` target now carries a
+    /// readable `GcHeader`: interned exact-str wrappers, off-heap `rstr.STR`
+    /// / `BytesBlock` payloads (`init_gc_object_immortal`),
+    /// `Function.name` (the function's name `STR`, which *is* the code's
+    /// name string object), the no-hook `malloc_typed` fallbacks for
+    /// exact `W_ListObject` / `W_TupleObject`, and `FailDescrCell` /
+    /// `descr_instance_ptr` cells (`init_gc_object_immortal` flags, the
+    /// word `jf_descr` / `jf_force_descr` name). Membership stays for families
+    /// whose header is readable but not an immortal leaf: R2 non-leaf types /
+    /// modules / BuiltinCode / those list and tuple fallbacks (`malloc_typed`,
+    /// flags=0), and the R7 ItemsBlock fallback (zeroed header).
     fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
-        if addr == 0 || !self.is_managed_heap_object(addr) {
+        if addr == 0 || self.is_tagged_immediate(addr) {
             return;
         }
         let hdr = unsafe { header_of(addr) };
+        // `IncrementalMiniMarkGC.visit`: `if hdr.tid & (GCFLAG_VISITED |
+        // GCFLAG_NO_HEAP_PTRS): return 0`.
+        if unsafe {
+            (*hdr).has_flag(GcFlags::GCFLAG_VISITED)
+                || (*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS)
+        } {
+            return;
+        }
+        if !self.is_managed_heap_object(addr) {
+            return;
+        }
         // incminimark `visit`: forwarding stubs exist only inside
         // `collect_nursery`, which updates every slot naming one before it
         // returns. A slot that still names a stub here is a missed root or
@@ -14259,24 +14272,21 @@ mod tests {
 
     #[test]
     fn major_mark_skips_unmanaged_field_target() {
-        // An old-gen object's `gc_ptr_offsets` field may point at a
-        // `std::alloc`-backed (non-GC) block while some object fields are
-        // still host allocations rather than managed-GC allocations.
-        // The major-mark walker must skip such fields rather than
-        // dereferencing memory before the unmanaged block as a
-        // `GcHeader`. This test catches regression of the
-        // `is_managed_heap_object` guard in `mark_object`.
+        // `IncrementalMiniMarkGC.visit` returns on
+        // `hdr.tid & (GCFLAG_VISITED | GCFLAG_NO_HEAP_PTRS)`. A prebuilt
+        // immortal (`init_gc_object_immortal`) carries `GCFLAG_NO_HEAP_PTRS`,
+        // so `grey_child` skips it without stamping VISITED and without
+        // putting it on the gray stack.
         let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::simple(ptr_size));
 
-        // Allocate parent in old-gen. Field pointer will be set to a
-        // raw `Box::into_raw` block — what `std::alloc` does for an
-        // unmigrated `wrappeditems` / `items` slot today.
         let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
-        let unmanaged = Box::into_raw(Box::new(0xCAFEBABEu64));
+        let immortal = crate::header::alloc_with_gc_header_immortal(0xCAFEBABEu64, leaf_tid);
+        let immortal_ref = GcRef(immortal as usize);
         unsafe {
-            *(parent.0 as *mut GcRef) = GcRef(unmanaged as usize);
+            *(parent.0 as *mut GcRef) = immortal_ref;
         }
 
         let mut root = parent;
@@ -14284,27 +14294,22 @@ mod tests {
             gc.roots.add(&mut root);
         }
 
-        // Major collection — without the guard this would crash on
-        // `header_of(unmanaged)` reading invalid memory.
         gc.collect_full();
 
-        // Parent survived because it is rooted; the unmanaged target
-        // was correctly skipped.
+        // Parent survived because it is rooted; the immortal target was
+        // skipped by the header test and never stamped VISITED.
         assert_eq!(gc.oldgen.object_count(), 1);
+        assert!(unsafe { (*header_of(immortal_ref.0)).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS) });
+        assert!(!unsafe { (*header_of(immortal_ref.0)).has_flag(GcFlags::GCFLAG_VISITED) });
 
         gc.roots.clear();
-        unsafe {
-            drop(Box::from_raw(unmanaged));
-        }
     }
 
     #[test]
     fn major_mark_skips_unmanaged_varsize_item_target() {
-        // Same scenario, varsize variant: an `items_have_gc_ptrs = true`
-        // array can hold unmanaged pointers while item storage is still
-        // host-allocated. The mark
-        // walker's variable-part loop must also guard with
-        // `is_managed_heap_object`.
+        // Same `IncrementalMiniMarkGC.visit` skip, varsize items: a
+        // prebuilt immortal item (`init_gc_object_immortal`,
+        // `GCFLAG_NO_HEAP_PTRS`) is skipped by the header test.
         let ptr_size = std::mem::size_of::<GcRef>();
         let length_offset = 0;
         let base_size = 8; // length field (Signed)
@@ -14318,17 +14323,18 @@ mod tests {
             true,
             Vec::new(),
         ));
+        let leaf_tid = gc.register_type(TypeInfo::simple(ptr_size));
 
         let total_payload = base_size + ptr_size * length;
         let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + total_payload);
         unsafe {
             *(parent.0 as *mut usize) = length;
         }
-        let unmanaged_a = Box::into_raw(Box::new(0xDEADBEEFu64));
-        let unmanaged_b = Box::into_raw(Box::new(0xFEEDFACEu64));
+        let immortal_a = crate::header::alloc_with_gc_header_immortal(0xDEADBEEFu64, leaf_tid);
+        let immortal_b = crate::header::alloc_with_gc_header_immortal(0xFEEDFACEu64, leaf_tid);
         unsafe {
-            *((parent.0 + base_size) as *mut GcRef) = GcRef(unmanaged_a as usize);
-            *((parent.0 + base_size + ptr_size) as *mut GcRef) = GcRef(unmanaged_b as usize);
+            *((parent.0 + base_size) as *mut GcRef) = GcRef(immortal_a as usize);
+            *((parent.0 + base_size + ptr_size) as *mut GcRef) = GcRef(immortal_b as usize);
         }
 
         let mut root = parent;
@@ -14338,12 +14344,10 @@ mod tests {
 
         gc.collect_full();
         assert_eq!(gc.oldgen.object_count(), 1);
+        assert!(!unsafe { (*header_of(immortal_a as usize)).has_flag(GcFlags::GCFLAG_VISITED) });
+        assert!(!unsafe { (*header_of(immortal_b as usize)).has_flag(GcFlags::GCFLAG_VISITED) });
 
         gc.roots.clear();
-        unsafe {
-            drop(Box::from_raw(unmanaged_a));
-            drop(Box::from_raw(unmanaged_b));
-        }
     }
 
     #[test]

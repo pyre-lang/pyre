@@ -544,7 +544,7 @@ impl ExitDescr {
     /// [`majit_ir::descr_instance_ptr`], or a guard cell rooted by the
     /// loop's `asmmemmgr_gcreftracers` for as long as the deadframe is read.
     pub unsafe fn from_cell(addr: usize) -> Self {
-        let cell = unsafe { &*(addr as *const majit_ir::FailDescrCell) };
+        let cell = unsafe { majit_ir::FailDescrCell::from_thin_ptr(addr) };
         ExitDescr {
             ptr: std::sync::Arc::as_ptr(&cell.descr),
             owned: false,

@@ -1,6 +1,9 @@
 pub use collector::HEAP_DUMP_EIO;
 pub use gcreftracer::{GcTable, install_gc_table_walker};
-pub use header::{GCREF, GCREFOpaque, GcType};
+pub use header::{
+    GC_FLAG_SHIFT, GC_HEADER_WORD_SIZE, GC_IMMORTAL_LEAF_HEADER, GC_TYPE_ID_BITS,
+    GCFLAG_NO_HEAP_PTRS, GCFLAG_TRACK_YOUNG_PTRS, GCREF, GCREFOpaque, GcType,
+};
 /// GC traits and interfaces for the JIT.
 ///
 /// The GC subsystem provides:
@@ -120,7 +123,7 @@ bitflags::bitflags! {
         /// tracking and this is set anyway to shorten the write barrier. On old
         /// and prebuilt objects it is usually set, and writing a pointer clears
         /// it.
-        const GCFLAG_TRACK_YOUNG_PTRS = 1 << 0;
+        const GCFLAG_TRACK_YOUNG_PTRS = majit_ir::GCFLAG_TRACK_YOUNG_PTRS;
         /// Set on a prebuilt object unless it is already listed in
         /// `prebuilt_root_objects`.
         ///
@@ -136,7 +139,7 @@ bitflags::bitflags! {
         /// object runs the barrier. Upstream gets that from the GC transform; a
         /// hand-written store that skips it leaves a heap pointer behind a set
         /// flag, and marking then walks past a live object.
-        const GCFLAG_NO_HEAP_PTRS = 1 << 1;
+        const GCFLAG_NO_HEAP_PTRS = majit_ir::GCFLAG_NO_HEAP_PTRS;
         /// The object survived a major collection.
         const GCFLAG_VISITED = 1 << 2;
         /// Set on a nursery object whose id or identityhash was asked for:
