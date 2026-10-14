@@ -1284,7 +1284,14 @@ impl OptVirtualize {
                 {
                     (buf_ref, 0)
                 }
-                None => return OptimizationResult::PassOn,
+                None => {
+                    // virtualize.py optimize_RAW_LOAD_I: not a virtual raw
+                    // buffer. `return self.emit(op)` then
+                    // `optimizer.py _emit_operation` `force_box`es arg0, so a
+                    // virtual kwargs storage header is allocated before the
+                    // load rather than compiled as a dangling Unique.
+                    return OptimizationResult::PassOn;
+                }
             };
             let parent_box = ctx.get_box_replacement_operand_opt(parent);
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) =
@@ -7266,6 +7273,63 @@ mod tests {
         );
         assert_eq!(result[0].opcode, OpCode::RawStore);
         assert_eq!(result[1].opcode, OpCode::RawLoadI);
+    }
+
+    #[test]
+    fn test_raw_load_of_unwritten_virtual_buffer_force_boxes() {
+        // virtualize.py optimize_RAW_LOAD_I: a virtual raw buffer with no
+        // stored item at this offset raises InvalidRawOperation and falls
+        // through to `return self.emit(op)`; optimizer.py `_emit_operation`
+        // then `force_box`es arg0. A kwargs `Vec` header is
+        // `raw_malloc_varsize_char`; without the force the load would
+        // compile a dereference of the dangling Unique.
+        let malloc_descr = majit_ir::descr::make_call_descr(
+            vec![Type::Int, Type::Int],
+            Type::Int,
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CanRaise,
+                OopSpecIndex::RawMallocVarsizeChar,
+            ),
+        );
+        let ad = raw_arraydescr();
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::CallI,
+                &[
+                    Operand::const_from_value(Value::Int(0x2000)),
+                    Operand::const_from_value(Value::Int(24)),
+                ],
+                malloc_descr,
+            ),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 0),
+                    Operand::const_from_value(Value::Int(16)),
+                ],
+                ad,
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_default_pipeline_typed(&ops, &[0], &[]);
+        let opcodes: Vec<OpCode> = result.iter().map(|o| o.opcode).collect();
+        assert!(
+            opcodes.contains(&OpCode::CallI),
+            "unwritten virtual raw buffer must be force_boxed before RAW_LOAD; got {opcodes:?}"
+        );
+        assert!(
+            opcodes.contains(&OpCode::RawLoadI),
+            "RAW_LOAD of the forced header remains; got {opcodes:?}"
+        );
+        let call_at = opcodes.iter().position(|&op| op == OpCode::CallI).unwrap();
+        let load_at = opcodes
+            .iter()
+            .position(|&op| op == OpCode::RawLoadI)
+            .unwrap();
+        assert!(
+            call_at < load_at,
+            "force_box emits CALL_I before RAW_LOAD; {opcodes:?}"
+        );
     }
 
     #[test]
