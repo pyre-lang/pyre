@@ -2102,6 +2102,23 @@ fn ca_complete_after_bridge_walk(
     None
 }
 
+/// Whether the failing guard's jitdriver has no virtualizable.
+///
+/// `warmspot.py assembler_call_helper` is built per jitdriver and passes its
+/// own `jitdriver_sd` to `handle_fail`, so `resume_in_blackhole` reads that
+/// driver's `virtualizable_info`. One helper serves every driver here; the
+/// failing guard's `rd_loop_token.outermost_jitdriver_sd` names the same
+/// driver. A `generatorentry` callee has no virtualizable.
+fn guard_driver_has_no_vable(descr_arc: &std::sync::Arc<dyn majit_ir::Descr>) -> bool {
+    let (driver, _) = crate::eval::driver_pair();
+    descr_arc
+        .as_fail_descr()
+        .and_then(majit_backend::descr_owning_jct)
+        .and_then(|token| token.outermost_jitdriver_index)
+        .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
+        .is_some_and(|has_vinfo| !has_vinfo)
+}
+
 fn jit_blackhole_resume_from_guard(
     descr_addr: usize,
     deadframe: *mut majit_backend::jitframe::JitFrame,
@@ -2232,18 +2249,7 @@ fn jit_blackhole_resume_from_guard(
         } else {
             None
         };
-        // `warmspot.py assembler_call_helper` is built per jitdriver and
-        // passes its own `jitdriver_sd` to `handle_fail`, so
-        // `resume_in_blackhole` reads that driver's `virtualizable_info`.
-        // One helper serves every driver here; the failing guard's
-        // `rd_loop_token.outermost_jitdriver_sd` names the same driver. A
-        // `generatorentry` callee has no virtualizable.
-        let novable = descr_arc
-            .as_fail_descr()
-            .and_then(majit_backend::descr_owning_jct)
-            .and_then(|token| token.outermost_jitdriver_index)
-            .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
-            .is_some_and(|has_vinfo| !has_vinfo);
+        let novable = guard_driver_has_no_vable(&descr_arc);
         let result = blackhole_resume_via_rd_numb(
             storage.rd_numb_ref().expect("rd_numb"),
             storage.rd_consts().unwrap_or(&[]),
@@ -5025,7 +5031,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 &mut raw_values,
                 &exit_layout,
                 guard_exc,
-                false,
+                guard_driver_has_no_vable(&descr_arc),
                 savedata,
             );
             handle_blackhole_result(bh).unwrap_or(0)
