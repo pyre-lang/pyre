@@ -6142,7 +6142,16 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
         *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
     };
-    !arr_ptr.is_null() && unsafe { &*arr_ptr }.as_slice().len() >= nlocals + below.len() + 1
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals + below.len() + 1 {
+        return false;
+    }
+    // `flush_walk_end_state_after_outer_call` still calls
+    // `write_back_outer_locals` after the callee returns. Prove that publish
+    // target here so the only remaining post-run failure is
+    // `store_boxed_frame_local` after a collection moved the outer frame to
+    // an address the GC no longer owns — that case commits AfterApplied
+    // rather than replaying.
+    can_write_back_outer_locals(ctx, frame)
 }
 
 /// Take a copy of `frame`'s locals so a caller that publishes over them can put

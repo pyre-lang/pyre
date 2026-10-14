@@ -8255,6 +8255,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 return resolved_inline_decline(op.pc, line!());
             }
         };
+    // Every reason `latch_operator_tail_return` can refuse (mirror, paused
+    // parents, this caller, the tail parent, blackhole preflight) is known
+    // here. Decline to the residual CALL before the dunder body runs.
+    if let Some(tail) = operator_tail
+        && !super::residual_call::can_latch_operator_tail_return(
+            ctx,
+            &precomputed_parent_frame,
+            tail,
+        )
+    {
+        return resolved_inline_decline(op.pc, line!());
+    }
 
     let mut callable_guard_op = callable_guard_op;
     let mut callable_guard_value = callable_guard_value;
@@ -9541,11 +9553,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // a paused caller image.  `compute_inline_caller_frame` failures were
     // residualized before the seed, so there is no caller-boundary collapse.
     let parent_frame = precomputed_parent_frame;
-    // Cloned before the sub-walk moves `parent_frame` into the inline
-    // frame guard. After the dunder returns, a post-return guard or a
-    // post-return abort snapshots the caller plus the operator tail, and
-    // `_inline_frame` has already dropped.
-    let operator_tail_caller = operator_tail.is_some().then(|| parent_frame.clone());
     let callee_frame_materialized_has_resume = callee_frame_seeded;
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
@@ -9734,7 +9741,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // return only reads as a raise when the callee installed the exception.
     // Nothing between here and the sub-walk writes the slot.
     let exc_before_subwalk = ctx.last_exc_value();
-    let (mut callee_outcome, callee_class_of_last_exc_is_const) = {
+    let (mut callee_outcome, callee_class_of_last_exc_is_const, operator_tail_caller) = {
         {
             let parent_state = ctx.frame_state.borrow();
             let mut state = callee_state.borrow_mut();
@@ -10316,7 +10323,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
-        (result, class_of_last_exc_is_const)
+        // After the dunder returns, take the caller from the rooted
+        // session framestack entry. `_inline_frame` still holds this
+        // level; a pre-call clone of `InlineParentFrame` is unrooted.
+        let operator_tail_caller =
+            operator_tail.and_then(|_| _inline_frame.rooted_immediate_caller());
+        (result, class_of_last_exc_is_const, operator_tail_caller)
     };
     // `executioncontext.py leave`, in the original's `finally`
     // position: the sub-walk block above is an expression that always
@@ -10487,6 +10499,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     let result_type = unsafe { (*concrete).ob_type } as i64;
                     let result_type_const = ctx.trace_ctx.const_int(result_type);
                     let Some(caller) = operator_tail_caller.as_ref() else {
+                        if fbw_executed_effect_count() != executed_effects_before {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                None,
+                                crate::operator_continuation::OperatorTail::Format,
+                                value,
+                            );
+                        }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     };
                     walker_emit_operator_tail_result_guard(
@@ -10531,6 +10552,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // drops would replay the CALL (`LoopBearingCalleeInlineUnsupported`
                     // with no latch) and run `__len__` twice.
                     let Some(caller) = operator_tail_caller.as_ref() else {
+                        if fbw_executed_effect_count() != executed_effects_before {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                None,
+                                crate::operator_continuation::OperatorTail::Len,
+                                value,
+                            );
+                        }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     };
                     if !len_value.is_some_and(|value| value >= 0) {
@@ -10554,41 +10584,30 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         ConcreteValue::Ref(obj) => obj,
                         _ => pyre_object::PY_NULL,
                     };
-                    let raw = if pyre_object::tagged_int::CAN_BE_TAGGED
-                        && pyre_object::tagged_int::is_tagged_int(concrete)
-                    {
-                        let lowbit =
-                            crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, value, true);
-                        walker_emit_operator_tail_result_guard(
-                            ctx,
-                            op.pc,
-                            crate::operator_continuation::OperatorTail::Len,
-                            caller,
-                            value,
-                            OpCode::GuardTrue,
-                            &[lowbit],
-                        )?;
-                        crate::helpers::emit_untag_int(
-                            ctx.trace_ctx,
-                            value,
-                            pyre_object::tagged_int::untag_int(concrete),
-                        )
-                    } else {
-                        let result_type = unsafe { (*concrete).ob_type } as i64;
-                        let result_type_const = ctx.trace_ctx.const_int(result_type);
-                        walker_emit_operator_tail_result_guard(
-                            ctx,
-                            op.pc,
-                            crate::operator_continuation::OperatorTail::Len,
-                            caller,
-                            value,
-                            OpCode::GuardClass,
-                            &[value, result_type_const],
-                        )?;
-                        let (int_type, intval_descr) =
-                            crate::state::int_or_bool_unbox_type_descr(concrete);
-                        walker_unbox_int_typed(ctx, op.pc, value, int_type, intval_descr)?
-                    };
+                    // Tag test then `GuardClass`, both with the tail-resume
+                    // snapshot: a prior `walker_emit_operator_tail_result_guard`
+                    // `GuardClass` used to mark the class known first and
+                    // suppress `walker_unbox_int_typed`'s tagged-pointer test.
+                    let (int_type, intval_descr) =
+                        crate::state::int_or_bool_unbox_type_descr(concrete);
+                    let raw = walker_unbox_int_typed_with_guard(
+                        ctx,
+                        op.pc,
+                        value,
+                        int_type,
+                        intval_descr,
+                        |ctx, op_pc, opcode, args| {
+                            walker_emit_operator_tail_result_guard(
+                                ctx,
+                                op_pc,
+                                crate::operator_continuation::OperatorTail::Len,
+                                caller,
+                                value,
+                                opcode,
+                                args,
+                            )
+                        },
+                    )?;
                     let zero = ctx.trace_ctx.const_int(0);
                     let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw, zero]);
                     ctx.trace_ctx
@@ -10629,6 +10648,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     == Some(crate::operator_continuation::OperatorTail::Truth)
                 {
                     let Some(caller) = operator_tail_caller.as_ref() else {
+                        if fbw_executed_effect_count() != executed_effects_before {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                None,
+                                crate::operator_continuation::OperatorTail::Truth,
+                                value,
+                            );
+                        }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     };
                     match truth_bool_result_int(ctx, op.pc, value, concrete_for_shadow, caller)? {
@@ -13771,9 +13799,6 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     receiver_op: OpRef,
     concrete_receiver: pyre_object::PyObjectRef,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(None);
-    }
     let Some((w_type, version_tag, w_len, attr_cell)) =
         (unsafe { pyre_interpreter::baseobjspace::len_fast_path(concrete_receiver) })
     else {
@@ -13797,6 +13822,14 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         return Ok(None);
     };
     if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+    // `capture_resumedata` (`pyjitpl.py`) needs the tail image before the
+    // call is entered. A later latch failure would replay `__len__`.
+    if !super::residual_call::operator_tail_resume_image_capturable(
+        ctx,
+        crate::operator_continuation::OperatorTail::Len,
+    ) {
         return Ok(None);
     }
 
@@ -13873,10 +13906,28 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     tail: crate::operator_continuation::OperatorTail,
     result: OpRef,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if let Some(caller) = caller {
-        let _ = super::residual_call::latch_operator_tail_return(ctx, caller, tail, result);
+    // The dunder has already run. `callee_inline_unsupported` is the
+    // residual-not-abort class for a CALL that was never entered;
+    // `blackhole_required` keeps `leaves_complete_image` so a published
+    // latch can convert through `convert_and_run_from_pyjitpl`
+    // (`blackhole.py`).
+    if let Some(caller) = caller
+        && super::residual_call::latch_operator_tail_return(ctx, caller, tail, result)
+    {
+        return Err(DispatchError::callee_inline_abort(op_pc, true));
     }
-    Err(DispatchError::callee_inline_unsupported(op_pc))
+    // Unreachable after the pre-inline `can_latch_operator_tail_return`
+    // admission. Census + debug only: a release panic would hide the
+    // convert-in-place path `convert_and_run_from_pyjitpl` (`blackhole.py`)
+    // is supposed to take.
+    crate::jitcode_dispatch::census_record("OperatorTailLatchFailed");
+    debug_assert!(
+        false,
+        "operator-tail latch failed after the dunder ran; \
+         convert_and_run_from_pyjitpl copies live frames"
+    );
+    let _ = ctx.session.borrow_mut().claim_abort_coordinate(true);
+    Err(DispatchError::callee_inline_abort(op_pc, true))
 }
 
 /// Turn `__bool__`'s returned box into the int `is_true` answers.
@@ -13898,20 +13949,29 @@ fn truth_bool_result_int<Sym: WalkSym>(
         ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_bool(obj) } => obj,
         _ => return Ok(None),
     };
-    let result_type = unsafe { (*obj).ob_type } as i64;
-    let result_type_const = ctx.trace_ctx.const_int(result_type);
-    walker_emit_operator_tail_result_guard(
-        ctx,
-        op_pc,
-        crate::operator_continuation::OperatorTail::Truth,
-        caller,
-        value,
-        OpCode::GuardClass,
-        &[value, result_type_const],
-    )?;
     let bit = i64::from(unsafe { pyre_object::w_bool_get_value(obj) });
     let (int_type, intval_descr) = crate::state::int_or_bool_unbox_type_descr(obj);
-    let raw = walker_unbox_int_typed(ctx, op_pc, value, int_type, intval_descr)?;
+    // Same decision as the typed-unbox path: no `GuardClass` when the
+    // class is already known, and the tag test (when `CAN_BE_TAGGED`)
+    // before that class guard, both carrying the Truth tail snapshot.
+    let raw = walker_unbox_int_typed_with_guard(
+        ctx,
+        op_pc,
+        value,
+        int_type,
+        intval_descr,
+        |ctx, op_pc, opcode, args| {
+            walker_emit_operator_tail_result_guard(
+                ctx,
+                op_pc,
+                crate::operator_continuation::OperatorTail::Truth,
+                caller,
+                value,
+                opcode,
+                args,
+            )
+        },
+    )?;
     Ok(Some((raw, ConcreteValue::Int(bit))))
 }
 
@@ -13940,7 +14000,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if ctx.fbw_mode.inline_subwalk || !ctx.is_authoritative_executor || r_args.len() != 1 {
+    if !ctx.is_authoritative_executor || r_args.len() != 1 {
         return Ok(None);
     }
 
@@ -14001,6 +14061,15 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     };
     if body_facts.owns_loop_header {
         decline!("__bool__ owns a loop header");
+    }
+    // Same admission as `capture_resumedata`: the Truth tail image must be
+    // capturable before `__bool__` runs, or the residual `is_true_lookup`
+    // path is taken instead of replaying the dunder.
+    if !super::residual_call::operator_tail_resume_image_capturable(
+        ctx,
+        crate::operator_continuation::OperatorTail::Truth,
+    ) {
+        decline!("operator-tail resume image not capturable");
     }
 
     let _roots = pyre_object::gc_roots::push_roots();
@@ -16705,6 +16774,14 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
             "{}.__format__ takes {nparams} params",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
         ));
+    }
+    // Refuse before the record-time sample and the sub-walk: a latch that
+    // cannot be built after `__format__` would replay the dunder.
+    if !super::residual_call::operator_tail_resume_image_capturable(
+        ctx,
+        crate::operator_continuation::OperatorTail::Format,
+    ) {
+        decline!("operator-tail resume image not capturable");
     }
 
     // If this straight-line body is safe to sample, refuse a bad result

@@ -3958,6 +3958,9 @@ fn try_adopt_multi_frame_blackhole(
     // `enter`: publish `ec.topframeref = <this level's frame>` before it runs.
     let set_topframeref = |frame_ptr: i64| {
         if frame_ptr == 0 {
+            // Codeless continuation: no PyFrame to publish. `finish_level`
+            // already restored `topframeref` to the leaving callee's
+            // `f_backref` (`executioncontext.py leave`).
             return;
         }
         unsafe {
@@ -3998,6 +4001,16 @@ fn try_adopt_multi_frame_blackhole(
         // they were taken, reversed. A codeless continuation has no PyFrame
         // and was never charged.
         if frame_ptr != 0 {
+            // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
+            // before the caller's residuals run. Entering the next real frame
+            // republishes it through `set_topframeref`; a codeless
+            // continuation's enter is a no-op, so the tail would otherwise
+            // keep the finished callee published. A Len tail that then calls
+            // `__index__` (or a Format tail that raises) would see that
+            // callee as `f_back`.
+            unsafe {
+                (*ec).topframeref = (*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref;
+            }
             level_recursion.borrow_mut().pop();
         }
     };
@@ -5489,15 +5502,14 @@ fn run_perfn_walk<Sym: WalkSym>(
                             crate::jitcode_dispatch::census_record("MidBodyDeclineBeforeRun");
                         }
                         Err(MidBodyDecline::AfterRun(_)) => {
-                            // WalkAbort did not run. The rebuild's
-                            // `execute_frame` already ran the remaining
-                            // callee body, then
-                            // `flush_walk_end_state_after_outer_call`
-                            // declined — the invariant
-                            // `try_commit_midbody_abort_inner` marks with
-                            // `debug_assert`. Entry replay would re-execute
-                            // that body. Commit AfterApplied so the rebuilt
-                            // run stands.
+                            // `execute_frame` already ran the remaining callee
+                            // body. `convert_and_run_from_pyjitpl`
+                            // (`blackhole.py`) continues the live frames;
+                            // entry replay would re-run that region. The
+                            // flush's remaining post-run failure is
+                            // `store_boxed_frame_local` after a collection
+                            // moved the outer frame, which cannot be known
+                            // before the run — commit AfterApplied anyway.
                             crate::jitcode_dispatch::census_record("MidBodyDeclineAfterRun");
                             let _ = commit_walk_end(
                                 flush_committed,

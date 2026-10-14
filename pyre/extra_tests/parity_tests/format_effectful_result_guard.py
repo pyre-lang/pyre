@@ -29,12 +29,15 @@ class C:
 obj = C()
 obj.out = "s"
 raised = 0
+msg = None
 for i in range(N):
     if i == SWITCH:
         obj.out = 42
     try:
         f"{obj:s}"
-    except TypeError:
+    except TypeError as e:
+        if msg is None:
+            msg = str(e)
         raised += 1
 
 assert C.calls == N, (C.calls, N)
@@ -60,5 +63,6 @@ for i in range(N):
 assert D.calls == N, (D.calls, N)
 assert traced_raised == N, (traced_raised, N)
 
+print(msg)
 print("OK")
 

@@ -1474,77 +1474,152 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
     Some(miframe)
 }
 
-/// Latch caller + operator tail after the dunder has already returned.
+/// Whether the operator-tail resume image can be captured at all.
+///
+/// `capture_resumedata` (`pyjitpl.py`) requires the live framestack, the
+/// vstack mirror, and every paused parent to be copyable before a call is
+/// entered. The same gates are what [`latch_operator_tail_return`] would
+/// refuse after the dunder ran; testing them first lets the walk take the
+/// ordinary residual instead of replaying an effectful body.
+pub(crate) fn operator_tail_resume_image_capturable<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    tail: crate::operator_continuation::OperatorTail,
+) -> bool {
+    prepare_operator_tail_latch(ctx, None, tail, None).is_some()
+}
+
+/// Same image as [`latch_operator_tail_return`], without a result box yet.
+///
+/// The dunder has not run; the tail still carries its placeholder in r0.
+/// Result concreteness is an execution-driven walk invariant, checked only
+/// when publishing the returned box.
+pub(crate) fn can_latch_operator_tail_return<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    caller: &InlineParentFrame,
+    tail: crate::operator_continuation::OperatorTail,
+) -> bool {
+    prepare_operator_tail_latch(ctx, Some(caller), tail, None).is_some()
+}
+
+/// Latch the enclosing frames, the immediate caller, and the operator tail
+/// after the dunder has already returned.
 ///
 /// `_inline_frame` has dropped, so the session framestack no longer holds
-/// the tail. The convert image is the same one a post-return guard
-/// snapshots: the paused caller plus the tail with the returned box in r0.
-/// `convert_and_run_from_pyjitpl` (`blackhole.py`) continues in the tail,
-/// which runs the operator's post-call check and never re-enters the dunder.
+/// the tail. `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`
+/// (`blackhole.py`) copy every frame, and `multi_frame_blackhole_preflight`
+/// requires frame 0 to be the walked portal, so start from every existing
+/// paused parent, outermost first — the same walk as
+/// `build_multi_frame_miframe`. Then the immediate caller and the tail with
+/// the returned box in r0. The convert continues in the tail, which runs
+/// the operator's post-call check and never re-enters the dunder.
 pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     caller: &InlineParentFrame,
     tail: crate::operator_continuation::OperatorTail,
     result: OpRef,
 ) -> bool {
-    let origin = "operator-tail-return";
-    let Some(caller_mf) = build_parent_miframe(ctx, caller, origin, 0) else {
-        latchdbg!("origin={origin} caller");
+    let Some(image) = prepare_operator_tail_latch(ctx, Some(caller), tail, Some(result)) else {
         return false;
     };
-    let Some(mut tail_parent) = super::operator_continuation_parent_frame(tail) else {
-        latchdbg!("origin={origin} tail-parent");
-        return false;
-    };
-    let stamped = match ctx.trace_ctx.concrete_of_opref(result) {
-        Some(majit_ir::Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => {
-            OpRef::const_ptr(gc)
-        }
-        Some(majit_ir::Value::Int(i)) => {
-            let boxed = pyre_object::w_int_new(i);
-            OpRef::const_ptr(majit_ir::GcRef(boxed as usize))
-        }
-        _ => {
-            latchdbg!("origin={origin} result-concrete");
-            return false;
-        }
-    };
-    tail_parent.boxes = vec![stamped];
-    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(tail_parent.jitcode_index as i32)
-    else {
-        latchdbg!("origin={origin} tail-pjc");
-        return false;
-    };
-    let Some(tail_mf) = build_codeless_continuation_parent(ctx, &tail_parent, &pjc, origin, 1)
-    else {
-        latchdbg!("origin={origin} tail-miframe");
-        return false;
-    };
-    let mut framestack = majit_metainterp::MIFrameStack::empty();
-    framestack.push(caller_mf);
-    framestack.push(tail_mf);
-    if !multi_frame_blackhole_preflight(ctx, &framestack, origin) {
-        return false;
-    }
-    let last_exc_value = match ctx.last_exc_value_concrete() {
-        ConcreteValue::Ref(value) => value as i64,
-        _ => 0,
-    };
-    let mirror_stack = capture_vstack_mirror_image(ctx, origin);
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
-        *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
-            framestack,
-            last_exc_value,
-            raising_exception: false,
-            mirror_stack,
-            origin,
-        });
+        *slot.borrow_mut() = Some(image);
     });
     census_record("OperatorTailReturnLatched");
     if fbw_debug_abort_enabled() {
         eprintln!("[operator-tail-return-latched] tail={}", tail.name());
     }
     true
+}
+
+fn prepare_operator_tail_latch<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    caller: Option<&InlineParentFrame>,
+    tail: crate::operator_continuation::OperatorTail,
+    result: Option<OpRef>,
+) -> Option<LatchedMultiFrameBlackhole> {
+    let origin = "operator-tail-return";
+    // `try_adopt_multi_frame_blackhole` requires the mirror for WalkAbort.
+    // Capture it first so a missing image publishes nothing, rather than a
+    // latch whose adopt then declines into entry replay of the dunder.
+    let mirror_stack = if ctx.fbw_mode.inline_subwalk {
+        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
+            latchdbg!("origin={origin} mf-root-parent-stack");
+            return None;
+        };
+        mirror_stack
+    } else {
+        let Some(mirror_stack) = capture_vstack_mirror_image(ctx, origin) else {
+            latchdbg!("origin={origin} mirror");
+            return None;
+        };
+        mirror_stack
+    };
+    let mut framestack = majit_metainterp::MIFrameStack::empty();
+    {
+        let session = ctx.session.borrow();
+        for (index, parent) in session
+            .framestack
+            .iter()
+            .flat_map(|inline| inline.parents.iter())
+            .enumerate()
+        {
+            let Some(miframe) = build_parent_miframe(ctx, parent, origin, index) else {
+                latchdbg!("origin={origin} enclosing index={index}");
+                return None;
+            };
+            framestack.push(miframe);
+        }
+    }
+    let enclosing = framestack.frames.len();
+    if let Some(caller) = caller {
+        let Some(caller_mf) = build_parent_miframe(ctx, caller, origin, enclosing) else {
+            latchdbg!("origin={origin} caller");
+            return None;
+        };
+        framestack.push(caller_mf);
+    }
+    let mut tail_parent = super::operator_continuation_parent_frame(tail)?;
+    if let Some(result) = result {
+        let stamped = match ctx.trace_ctx.concrete_of_opref(result) {
+            Some(majit_ir::Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => {
+                OpRef::const_ptr(gc)
+            }
+            Some(majit_ir::Value::Int(i)) => {
+                let boxed = pyre_object::w_int_new(i);
+                OpRef::const_ptr(majit_ir::GcRef(boxed as usize))
+            }
+            _ => {
+                latchdbg!("origin={origin} result-concrete");
+                return None;
+            }
+        };
+        tail_parent.boxes = vec![stamped];
+    }
+    let pjc = crate::state::pyjitcode_for_jitcode_index(tail_parent.jitcode_index as i32)?;
+    let tail_index = if caller.is_some() {
+        enclosing + 1
+    } else {
+        enclosing
+    };
+    let tail_mf = build_codeless_continuation_parent(ctx, &tail_parent, &pjc, origin, tail_index)?;
+    framestack.push(tail_mf);
+    // The preflight judges a stack that ends in a real frame below the
+    // codeless tail. Without the caller the stack is not that shape yet;
+    // `can_latch_operator_tail_return` runs it once the caller is built.
+    if caller.is_some() && !multi_frame_blackhole_preflight(ctx, &framestack, origin) {
+        return None;
+    }
+    let last_exc_value = match ctx.last_exc_value_concrete() {
+        ConcreteValue::Ref(value) => value as i64,
+        _ => 0,
+    };
+    Some(LatchedMultiFrameBlackhole {
+        framestack,
+        last_exc_value,
+        raising_exception: false,
+        mirror_stack: Some(mirror_stack),
+        origin,
+    })
 }
 
 fn copy_captured_parent_blackhole<Sym: WalkSym>(

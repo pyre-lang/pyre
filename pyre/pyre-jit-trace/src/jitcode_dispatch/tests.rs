@@ -75,6 +75,58 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
 }
 
 #[test]
+fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let roots = WalkSessionRoots::new(&session);
+    let parent = |word: usize| InlineParentFrame {
+        jitcode_index: 0,
+        call_jitcode_pc: None,
+        call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
+        blackhole: Some(InlineParentBlackhole {
+            resume_pc: 0,
+            int_values: Vec::new(),
+            ref_values: vec![(0, (word + 0x10) as pyre_object::PyObjectRef)],
+            float_values: Vec::new(),
+        }),
+        resume_coord: ParentResumeCoord::Backxlat(0),
+        resume_marker_jit_pc: None,
+        boxes: vec![OpRef::const_ptr(majit_ir::GcRef(word + 0x20))],
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+    };
+    let pre_call = parent(0x1000);
+    let stale = pre_call.clone();
+    let frame = InlineFrameGuard::enter(&session, 0, false, vec![pre_call]);
+    majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+        if (0x1000..0x2000).contains(&root.0) {
+            root.0 += 0x80;
+        }
+    });
+    assert_eq!(stale.call_stack_overrides[0].1 as usize, 0x1000);
+    assert_eq!(
+        stale.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
+        0x1010
+    );
+    assert_eq!(stale.boxes[0], OpRef::const_ptr(majit_ir::GcRef(0x1020)));
+    let live = frame
+        .rooted_immediate_caller()
+        .expect("the level stores the immediate caller");
+    assert_eq!(live.call_stack_overrides[0].1 as usize, 0x1080);
+    assert_eq!(
+        live.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
+        0x1090
+    );
+    assert_eq!(live.boxes[0], OpRef::const_ptr(majit_ir::GcRef(0x10a0)));
+    drop(frame);
+    drop(roots);
+}
+
+#[test]
 fn session_root_callback_rejects_a_borrow_across_collection() {
     let session = std::cell::RefCell::new(WalkSession::default());
     let held = session.borrow();
@@ -294,6 +346,146 @@ fn every_continuation_parent_carries_the_pending_result_placeholder() {
             "{tail:?}: resume-pc liveness names r0, so the parent snapshot needs a matching box",
         );
     }
+}
+
+fn dummy_operator_tail_caller() -> InlineParentFrame {
+    InlineParentFrame {
+        jitcode_index: 0,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(0),
+        resume_marker_jit_pc: None,
+        boxes: Vec::new(),
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+    }
+}
+
+/// `capture_vstack_mirror_image` returns `None` when the walk mirror is
+/// invalid. The pre-inline admission must then decline so the walk takes
+/// the ordinary residual instead of entering the dunder.
+#[test]
+fn operator_tail_latch_without_a_mirror_declines_before_inline() {
+    reset_single_frame_blackhole();
+    let mut tc = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let caller = dummy_operator_tail_caller();
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert!(
+        !operator_tail_resume_image_capturable(
+            &wc,
+            crate::operator_continuation::OperatorTail::Len,
+        ),
+        "a missing vstack mirror must refuse the resume image before inline",
+    );
+    assert!(
+        !can_latch_operator_tail_return(
+            &wc,
+            &caller,
+            crate::operator_continuation::OperatorTail::Len,
+        ),
+        "a missing vstack mirror must refuse the latch before inline",
+    );
+    assert!(
+        !multi_frame_blackhole_is_latched(),
+        "a refused pre-inline admission must publish nothing",
+    );
+}
+
+/// `MIFrame.opimpl_guard_class` records nothing when `is_class_known`.
+/// Format / Len / Truth pin the observed class through the same helper.
+#[test]
+fn operator_tail_known_class_result_records_no_guard_class() {
+    let mut tc = fresh_trace_ctx();
+    let result = OpRef::input_arg_ref(0);
+    tc.heap_cache_mut().class_now_known(result);
+    assert!(
+        tc.heap_cache().is_class_known(result),
+        "the fixture must pin a non-constant box",
+    );
+    let type_const = tc.const_int(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let caller = dummy_operator_tail_caller();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    walker_emit_operator_tail_result_guard(
+        &mut wc,
+        0,
+        crate::operator_continuation::OperatorTail::Format,
+        &caller,
+        result,
+        majit_ir::OpCode::GuardClass,
+        &[result, type_const],
+    )
+    .expect("a known-class GuardClass is a no-op");
+    drop(wc);
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "a known-class result must not record GuardClass",
+    );
+    assert!(
+        !tc.ops()
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardClass),
+        "no GuardClass op on a class the heap cache already knows",
+    );
 }
 
 /// One `residual_call_r_i/iRd>i` with an empty argument varlist, whose funcbox
