@@ -736,3 +736,13 @@ fn single_byte_and_fits_in_32bits() {
     assert!(rx86::single_byte(0) && rx86::single_byte(-128) && !rx86::single_byte(128));
     assert!(rx86::fits_in_32bits(0x12345) && !rx86::fits_in_32bits(2147483648));
 }
+
+#[test]
+fn call_mem_encoding() {
+    // `CALL_s` / `CALL_b`: `FF /2`, no REX.W.
+    enc_bytes!(mc => rx86::call_s(&mut mc, 0), [0xFF, 0x14, 0x24]);
+    enc_bytes!(mc => rx86::call_s(&mut mc, 32), [0xFF, 0x54, 0x24, 0x20]);
+    enc_bytes!(mc => rx86::call_s(&mut mc, 128), [0xFF, 0x94, 0x24, 0x80, 0x00, 0x00, 0x00]);
+    enc_bytes!(mc => rx86::call_b(&mut mc, 8), [0xFF, 0x55, 0x08]);
+    enc_bytes!(mc => rx86::call_b(&mut mc, 128), [0xFF, 0x95, 0x80, 0x00, 0x00, 0x00]);
+}
