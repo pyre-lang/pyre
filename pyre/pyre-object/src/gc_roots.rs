@@ -969,7 +969,11 @@ pub extern "C" fn reload_top_root_jit_abi(root: PyObjectRef) -> PyObjectRef {
 /// `extern "C"` residual entry for [`reload_top_root_at`].
 #[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn reload_top_root_at_jit_abi(root: PyObjectRef, slot: usize) -> PyObjectRef {
-    reload_top_root_at(root, majit_gc::shadow_stack::slot_from_cached(slot))
+    // SAFETY: the JIT passes the `root_stack_slot` word cached for this thread,
+    // matching the existing `*_jit_abi` contract.
+    reload_top_root_at(root, unsafe {
+        majit_gc::shadow_stack::slot_from_cached(slot)
+    })
 }
 
 /// Publish a complete translated livevar set before performing any

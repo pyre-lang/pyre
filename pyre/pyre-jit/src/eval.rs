@@ -335,7 +335,11 @@ fn reload_cached(raw_slot: usize, frame: *mut PyFrame) -> *mut PyFrame {
     if raw_slot == 0 {
         FrameView::reload(frame)
     } else {
-        FrameView::reload_entered(majit_gc::shadow_stack::slot_from_cached(raw_slot), frame)
+        // SAFETY: `raw_slot` is the word `cache_root_stack_slot` stored for this thread.
+        FrameView::reload_entered(
+            unsafe { majit_gc::shadow_stack::slot_from_cached(raw_slot) },
+            frame,
+        )
     }
 }
 
@@ -10956,7 +10960,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         f = if raw_slot == 0 {
             gc_roots::reload_top_root(f as *mut PyFrame as pyre_object::PyObjectRef) as *mut PyFrame
         } else {
-            reload_loop_frame!(f, majit_gc::shadow_stack::slot_from_cached(raw_slot))
+            // SAFETY: `raw_slot` is the word `cache_root_stack_slot` stored for this thread.
+            reload_loop_frame!(f, unsafe {
+                majit_gc::shadow_stack::slot_from_cached(raw_slot)
+            })
         };
 
         let pc = unsafe { &*f }.next_instr();
@@ -10989,7 +10996,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let root_slot = if marker_ec.is_null() {
             majit_gc::shadow_stack::shadow_stack_slot()
         } else {
-            majit_gc::shadow_stack::slot_from_cached(unsafe { (*marker_ec).root_stack_slot.get() })
+            // SAFETY: the word is `root_stack_slot` as `cache_root_stack_slot` stored for this thread.
+            unsafe { majit_gc::shadow_stack::slot_from_cached((*marker_ec).root_stack_slot.get()) }
         };
         // `f` is the marker's red `frame` — the one frame value declared
         // live across the split, as PyFrame.dispatch's `self` is upstream.
