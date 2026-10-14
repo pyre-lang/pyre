@@ -7984,6 +7984,69 @@ pub(crate) enum CallResultSlot {
     At(usize),
 }
 
+/// The register `_setup_return_value_*` (`blackhole.py`) fills when a callee
+/// returns to a level resumed at `resume_pc`: `code[resume_pc - 1]`, the
+/// result operand of the call that ends there, in the bank its argcodes
+/// name after `>` (`MIFrame._result_argcode`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CallResultRegister {
+    /// No call ends at `resume_pc`.
+    Unknown,
+    /// The call has no result operand.
+    Void,
+    /// A Ref-bank result register.
+    Ref(usize),
+    /// An Int- or Float-bank result register.
+    NonRef,
+}
+
+pub(crate) fn call_result_register(jitcode_index: u32, resume_pc: usize) -> CallResultRegister {
+    let Some(payload) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return CallResultRegister::Unknown;
+    };
+    let code = payload.jitcode.code.as_slice();
+    let Some(call) = crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
+    else {
+        return CallResultRegister::Unknown;
+    };
+    match call.argcodes.split_once('>') {
+        None => CallResultRegister::Void,
+        Some((_, "r")) => code
+            .get(resume_pc - 1)
+            .map_or(CallResultRegister::Unknown, |&color| {
+                CallResultRegister::Ref(color as usize)
+            }),
+        Some(_) => CallResultRegister::NonRef,
+    }
+}
+
+/// [`CallResultSlot`] of a level resumed at `resume_pc` whose `boxes` are the
+/// `nboxes` live registers there, int bank first, then ref, then float.
+pub(crate) fn call_result_slot(
+    jitcode_index: u32,
+    resume_pc: usize,
+    nboxes: usize,
+) -> CallResultSlot {
+    let color = match call_result_register(jitcode_index, resume_pc) {
+        CallResultRegister::Ref(color) => color,
+        CallResultRegister::Void => return CallResultSlot::Dead,
+        CallResultRegister::Unknown | CallResultRegister::NonRef => return CallResultSlot::Unknown,
+    };
+    let Some(live) = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+        jitcode_index as i32,
+        resume_pc as i32,
+    ) else {
+        return CallResultSlot::Unknown;
+    };
+    if nboxes != live.int.len() + live.ref_.len() + live.float.len() {
+        return CallResultSlot::Unknown;
+    }
+    match live.ref_.iter().position(|&c| c as usize == color) {
+        Some(pos) => CallResultSlot::At(live.int.len() + pos),
+        None => CallResultSlot::Dead,
+    }
+}
+
 impl InlineParentFrame {
     fn attach_live_caller(
         mut self,
@@ -8074,6 +8137,8 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        // `__init__`'s result register is pending, not live, at the resume
+        // pc, so `boxes` has no place for a finished `__init__`'s result.
         result_slot: CallResultSlot::Unknown,
     })
 }
@@ -8097,6 +8162,7 @@ pub(crate) fn operator_continuation_parent_frame(
     let jitcode_index = crate::operator_continuation::jitcode_index(tail)?;
     let resume_pc = crate::operator_continuation::resume_pc(tail)?;
     let boxes = vec![OpRef::const_ptr(majit_ir::GcRef::NULL)];
+    let result_slot = call_result_slot(jitcode_index as u32, resume_pc, boxes.len());
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
@@ -8113,7 +8179,7 @@ pub(crate) fn operator_continuation_parent_frame(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
-        result_slot: CallResultSlot::Unknown,
+        result_slot,
     })
 }
 
