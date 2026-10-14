@@ -2982,11 +2982,16 @@ pub fn unicodedata_decimal(
 }
 
 /// Upstream `analyze()` registered for `OrderedDict` (builtin.py).
+/// Zero-argument: extra positionals/keywords are a TypeError, matching
+/// Python binding of `def analyze():`.
 pub fn analyze(
     bk: &Rc<Bookkeeper>,
-    _args_s: &[Option<SomeValue>],
-    _kwds: &HashMap<String, Option<SomeValue>>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
+    if !args_s.is_empty() || !kwds.is_empty() {
+        return Err(AnnotatorError::new("OrderedDict() takes no arguments"));
+    }
     // upstream returns `SomeOrderedDict(bk.getdictdef())`; the Rust port
     // collapses `SomeDict`/`SomeOrderedDict` (see `model.rs`'s
     // `SomeOrderedDict` alias).
@@ -4960,5 +4965,43 @@ mod tests {
             return;
         }
         panic!("expected constant SomeInteger(15)");
+    }
+
+    /// `analyze()` (`builtin.py`) is zero-argument; `OrderedDict()` annotates
+    /// as `SomeOrderedDict`.
+    #[test]
+    fn ordereddict_analyze_zero_args_returns_somedict() {
+        let out = analyze(&bk(), &[], &no_kwds()).expect("OrderedDict()");
+        assert!(
+            matches!(out, SomeValue::Dict(_)),
+            "zero-arg OrderedDict is SomeDict, got {out:?}"
+        );
+    }
+
+    /// Extra constructor arguments are rejected rather than silently
+    /// dropped (`def analyze():`).
+    #[test]
+    fn ordereddict_analyze_rejects_positional_source() {
+        let err = analyze(
+            &bk(),
+            &[Some(SomeValue::Integer(SomeInteger::default()))],
+            &no_kwds(),
+        )
+        .expect_err("OrderedDict(source)");
+        let msg = err.msg.unwrap_or_default();
+        assert!(msg.contains("takes no arguments"), "got {msg}");
+    }
+
+    #[test]
+    fn call_builtin_ordereddict_rejects_positional_source() {
+        let err = call_builtin(
+            &bk(),
+            "collections.OrderedDict",
+            &[Some(SomeValue::Integer(SomeInteger::default()))],
+            &no_kwds(),
+        )
+        .expect_err("collections.OrderedDict(source)");
+        let msg = err.msg.unwrap_or_default();
+        assert!(msg.contains("takes no arguments"), "got {msg}");
     }
 }
