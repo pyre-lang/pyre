@@ -60794,6 +60794,10 @@ mod slice_or_vec_container_root_spelling_tests {
             slice_or_vec_container_root_spelling("Vec<*mut u8>"),
             Some("Vec<*mut u8>")
         );
+        assert_eq!(
+            slice_or_vec_container_root_spelling("*mut Vec<usize>"),
+            Some("*mut Vec<usize>")
+        );
         assert_eq!(slice_or_vec_container_root_spelling("&Engine"), None);
         assert_eq!(slice_or_vec_container_root_spelling("*mut PyObject"), None);
         assert_eq!(slice_or_vec_container_root_spelling("[u8; 4]"), None);
@@ -86120,11 +86124,11 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::Method { name, .. },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if name == "contains"
+                } if super::fmt_path_ends_with(segments, &["range", "Range", "contains"])
             )),
-            "Range::contains must lower as Method; ops={ops:?}"
+            "Range::contains must lower as FunctionPath; ops={ops:?}"
         );
     }
 

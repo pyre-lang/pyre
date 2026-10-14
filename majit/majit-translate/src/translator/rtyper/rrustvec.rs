@@ -18,6 +18,7 @@ use majit_ir::rvec::{
     VEC_CAP_WORD, VEC_LEN_WORD, VEC_PTR_WORD, VecItemKind, VecOp, vec_helper_path,
 };
 
+use crate::annotator::model::SomeValue;
 use crate::flowspace::model::{ConstValue, Hlvalue};
 use crate::model::ConcreteType;
 use crate::translator::rtyper::error::TyperError;
@@ -212,6 +213,22 @@ impl Repr for RustVecRepr {
             "len",
             "ptr",
         )?))
+    }
+
+    /// `PtrRepr.rtype_getattr` (rptr.py): a bound method forwards the
+    /// receiver; `len` is `getfield` of the header word `rtype_setattr`
+    /// writes.
+    fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        let attr = hop_arg_const_string(hop, 1)?;
+        if matches!(&*hop.s_result.borrow(), Some(SomeValue::BuiltinMethod(_))) {
+            return hop.inputarg(self, 0).map(Some);
+        }
+        if attr != "len" {
+            return Err(self.missing_rtype_operation(&format!("getattr_{attr}")));
+        }
+        let void = LowLevelType::Void;
+        let vlist = hop.inputargs(vec![ConvertedTo::from(self), ConvertedTo::from(&void)])?;
+        Ok(hop.genop("getfield", vlist, GenopResult::LLType(LowLevelType::Signed)))
     }
 
     /// `ll_length`.
@@ -482,6 +499,8 @@ pub fn rtype_newrustvec(hop: &HighLevelOp) -> RTypeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
 
     #[test]
     fn header_lltype_is_a_raw_int_kind_pointer() {
@@ -701,5 +720,126 @@ mod tests {
             }
             other => panic!("expected Variable, got {other:?}"),
         }
+    }
+
+    fn rust_vec_hop(
+        rtyper: &std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        opname: &str,
+        args: Vec<Hlvalue>,
+    ) -> (
+        HighLevelOp,
+        std::rc::Rc<std::cell::RefCell<LowLevelOpList>>,
+        Arc<dyn Repr>,
+    ) {
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        let r = rust_vec_repr(rtyper, VecItemKind::Int);
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                opname.to_string(),
+                args.clone(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(args);
+        (hop, llops, r)
+    }
+
+    fn const_string_annotation(value: &str) -> SomeValue {
+        use crate::annotator::model::SomeString;
+        use crate::flowspace::model::Constant;
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(value)));
+        SomeValue::String(s_attr)
+    }
+
+    /// `PtrRepr.rtype_setattr` (rptr.py): `setfield` of the header `len`.
+    #[test]
+    fn rtype_setattr_len_emits_setfield() {
+        use crate::annotator::model::{SomeInteger, SomeRustVec};
+        use crate::flowspace::model::{Constant, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+
+        let (_ann, rtyper) = setup_rtyper();
+        let r_signed = signed_repr();
+        let v_vec = Variable::new();
+        let r_vec_ty = rust_vec_repr(&rtyper, VecItemKind::Int);
+        v_vec.set_concretetype(Some(r_vec_ty.lowleveltype().clone()));
+        let v_n = Variable::new();
+        v_n.set_concretetype(Some(LowLevelType::Signed));
+        let (hop, llops, r) = rust_vec_hop(
+            &rtyper,
+            "setattr",
+            vec![
+                Hlvalue::Variable(v_vec),
+                Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::byte_str("len"),
+                    LowLevelType::Void,
+                )),
+                Hlvalue::Variable(v_n),
+            ],
+        );
+        hop.args_s.borrow_mut().extend([
+            SomeValue::RustVec(SomeRustVec::for_kind(VecItemKind::Int)),
+            const_string_annotation("len"),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(r.clone()),
+            Some(crate::translator::rtyper::rmodel::impossible_repr() as Arc<dyn Repr>),
+            Some(r_signed as Arc<dyn Repr>),
+        ]);
+        assert!(r.rtype_setattr(&hop).unwrap().is_none());
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "setfield");
+        assert_eq!(ops.ops[0].args.len(), 3);
+    }
+
+    /// `PtrRepr.rtype_getattr` (rptr.py): `getfield` of the header `len`.
+    #[test]
+    fn rtype_getattr_len_emits_getfield() {
+        use crate::annotator::model::{SomeInteger, SomeRustVec};
+        use crate::flowspace::model::{Constant, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+
+        let (_ann, rtyper) = setup_rtyper();
+        let r_signed = signed_repr();
+        let v_vec = Variable::new();
+        let r_vec_ty = rust_vec_repr(&rtyper, VecItemKind::Int);
+        v_vec.set_concretetype(Some(r_vec_ty.lowleveltype().clone()));
+        let (hop, llops, r) = rust_vec_hop(
+            &rtyper,
+            "getattr",
+            vec![
+                Hlvalue::Variable(v_vec),
+                Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::byte_str("len"),
+                    LowLevelType::Void,
+                )),
+            ],
+        );
+        hop.args_s.borrow_mut().extend([
+            SomeValue::RustVec(SomeRustVec::for_kind(VecItemKind::Int)),
+            const_string_annotation("len"),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(r.clone()),
+            Some(crate::translator::rtyper::rmodel::impossible_repr() as Arc<dyn Repr>),
+        ]);
+        *hop.s_result.borrow_mut() = Some(SomeValue::Integer(SomeInteger::new(false, false)));
+        *hop.r_result.borrow_mut() = Some(r_signed);
+        let result = r.rtype_getattr(&hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        assert_eq!(ops.ops[0].args.len(), 2);
     }
 }

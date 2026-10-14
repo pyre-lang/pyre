@@ -1426,33 +1426,51 @@ fn init_somerustvec_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // `Vec::set_len(n)` is `l.length = n` (`ll_newlist` after the hint
-    // allocation). Void, like `SomePtr.setattr`.
+    // `SomePtr.getattr` (lltype.py) on the raw `{ptr, len, cap}` header.
+    register(
+        reg,
+        OpKind::GetAttr,
+        SomeValueTag::RustVec,
+        Specialization {
+            apply: pure(|ann, hl| {
+                let s = ann
+                    .annotation(&hl.args[0])
+                    .expect("rustvec.getattr: self unbound");
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("rustvec.getattr: attr unbound");
+                let SomeValue::RustVec(s_vec) = s else {
+                    unreachable!("RustVec-tag dispatch must carry SomeRustVec, got {s:?}");
+                };
+                s_vec
+                    .getattr(&s_attr)
+                    .unwrap_or_else(|err| std::panic::panic_any(err))
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    // `SomePtr.setattr` (lltype.py) — "just doing checking", void.
     register(
         reg,
         OpKind::SetAttr,
         SomeValueTag::RustVec,
         Specialization {
             apply: Box::new(|ann, hl| {
+                let s = ann
+                    .annotation(&hl.args[0])
+                    .expect("rustvec.setattr: self unbound");
                 let s_attr = ann
                     .annotation(&hl.args[1])
                     .expect("rustvec.setattr: attr unbound");
-                let attr = s_attr
-                    .const_()
-                    .and_then(ConstValue::as_pystr)
-                    .expect("setattr on Vec must be a constant str");
-                if attr != "len" {
-                    panic!("AnnotatorError: Cannot find attribute {attr:?} on SomeRustVec");
-                }
                 let s_value = ann
                     .annotation(&hl.args[2])
                     .expect("rustvec.setattr: value unbound");
-                match s_value {
-                    SomeValue::Integer(_) => {}
-                    other => {
-                        panic!("AnnotatorError: Vec len write needs an integer, got {other:?}")
-                    }
-                }
+                let SomeValue::RustVec(s_vec) = s else {
+                    unreachable!("RustVec-tag dispatch must carry SomeRustVec, got {s:?}");
+                };
+                s_vec
+                    .setattr(&s_attr, &s_value)
+                    .unwrap_or_else(|err| std::panic::panic_any(err));
                 None
             }),
             can_only_throw: CanOnlyThrow::Absent,
@@ -6633,27 +6651,92 @@ mod tests {
     }
 
     #[test]
-    fn rust_vec_setattr_len_is_void() {
-        use crate::annotator::model::SomeRustVec;
+    fn rust_vec_setattr_len_annotates_as_void_and_rejects_other_fields() {
+        use super::super::model::SomeRustVec;
         use majit_ir::rvec::VecItemKind;
         let ann = mk_ann();
+        let s_vec = SomeValue::RustVec(SomeRustVec::for_kind(VecItemKind::Int));
         let mut v_vec = Variable::named("v");
+        ann.setbinding(&mut v_vec, s_vec.clone());
+        let mut v_n = Variable::named("n");
         ann.setbinding(
-            &mut v_vec,
-            SomeValue::RustVec(SomeRustVec::for_kind(VecItemKind::Int)),
+            &mut v_n,
+            SomeValue::Integer(SomeInteger::new_with_knowntype(true, KnownType::Ruint)),
         );
-        let hl = HLOperation::new(
+        let hl_len = HLOperation::new(
             OpKind::SetAttr,
             vec![
-                Hlvalue::Variable(v_vec),
+                Hlvalue::Variable(v_vec.clone()),
                 Hlvalue::Constant(Constant::new(ConstValue::byte_str("len"))),
-                Hlvalue::Constant(Constant::new(ConstValue::Int(3))),
+                Hlvalue::Variable(v_n.clone()),
             ],
         );
         assert!(
-            hl.consider(&ann).expect("setattr len").is_none(),
-            "Vec len write is void"
+            hl_len.consider(&ann).expect("setattr len").is_none(),
+            "SomePtr.setattr is void"
         );
+
+        let hl_signed = HLOperation::new(
+            OpKind::SetAttr,
+            vec![
+                Hlvalue::Variable(v_vec.clone()),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("len"))),
+                Hlvalue::Variable({
+                    let mut v = Variable::named("n_signed");
+                    ann.setbinding(&mut v, SomeValue::Integer(SomeInteger::new(true, false)));
+                    v
+                }),
+            ],
+        );
+        assert!(
+            hl_signed
+                .consider(&ann)
+                .expect("setattr len Signed")
+                .is_none()
+        );
+
+        let hl_cap = HLOperation::new(
+            OpKind::SetAttr,
+            vec![
+                Hlvalue::Variable(v_vec.clone()),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("cap"))),
+                Hlvalue::Variable(v_n),
+            ],
+        );
+        let err = hl_cap
+            .consider(&ann)
+            .expect_err("setattr of cap must stay an annotator error");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("no field \"cap\""),
+            "got {err:?}"
+        );
+
+        let hl_get = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v_vec.clone()),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("len"))),
+            ],
+        );
+        let got = hl_get.consider(&ann).expect("getattr len").unwrap();
+        assert!(matches!(got, SomeValue::Integer(_)), "got {got:?}");
+
+        let hl_append = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v_vec),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("append"))),
+            ],
+        );
+        let SomeValue::BuiltinMethod(bound) =
+            hl_append.consider(&ann).expect("getattr append").unwrap()
+        else {
+            panic!("Vec.append must still resolve through find_method");
+        };
+        assert_eq!(bound.analyser_name, "rustvec_method_append");
     }
 
     #[test]
