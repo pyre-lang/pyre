@@ -3193,6 +3193,111 @@ fn record_struct_id(
         .or_insert(Some(id));
 }
 
+/// Publish a `type T = Struct<…>` alias as its own layout identity.
+///
+/// Charon records the monomorph's rustc field offsets on the alias
+/// TypeDecl, while the generic struct declaration keeps symbolic
+/// `OffsetOf`. A field read of the alias must use those offsets.
+fn register_type_alias_struct(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    target: &str,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    struct_origins: &mut std::collections::HashMap<String, String>,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    known_struct_names: &mut std::collections::HashSet<String>,
+) {
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return;
+    };
+    if fields.is_empty() {
+        return;
+    }
+    let Some(layout) = td.layout_for_target(llbc, target) else {
+        return;
+    };
+    let name = td.item_meta.name_path();
+    let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    let canonical_name = strip_crate_prefix(&name);
+    let rows: Vec<crate::front::semantic::FieldRow> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let fname = field_decl_name(i, f);
+            let field_ty = published_struct_field_layout(&name, &fname, &f.ty, llbc, gc_struct_ids);
+            field_decl_row(i, f, field_ty)
+        })
+        .collect();
+    struct_fields.fields.insert(name.clone(), rows.clone());
+    struct_fields
+        .fields
+        .insert(canonical_name.clone(), rows.clone());
+    let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
+    record_struct_id(struct_ids, name.clone(), sid);
+    record_struct_id(struct_ids, canonical_name.clone(), sid);
+    // A later Struct/Enum with the same leaf keeps that leaf. Poisoning the
+    // resolver slot would drop both layouts; skip the alias leaf instead.
+    let leaf_free = match struct_ids.get(&leaf) {
+        None => true,
+        Some(existing) => *existing == Some(sid),
+    };
+    if leaf_free {
+        struct_fields.fields.insert(leaf.clone(), rows);
+        record_struct_id(struct_ids, leaf.clone(), sid);
+    }
+    let mut field_offsets = std::collections::HashMap::new();
+    for (i, f) in fields.iter().enumerate() {
+        let fname = f
+            .name
+            .clone()
+            .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
+        let Some(off) = layout.struct_field_offset(i) else {
+            continue;
+        };
+        field_offsets.insert(fname, off);
+    }
+    if field_offsets.is_empty() {
+        return;
+    }
+    exact_layouts.insert(
+        sid,
+        crate::front::semantic::ExactLayout {
+            size: layout.size,
+            align: layout.align,
+            field_offsets,
+            host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
+        },
+    );
+    let segs: Vec<&str> = name.split("::").collect();
+    let module = if segs.len() >= 2 {
+        segs[1..segs.len() - 1].join("::")
+    } else {
+        String::new()
+    };
+    struct_origins.entry(leaf.clone()).or_insert(module);
+    let attr_rows: Vec<(String, ValueType)> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let fname = field_decl_name(i, f);
+            let attr_ty = tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc, gc_struct_ids);
+            (fname, attr_ty)
+        })
+        .collect();
+    struct_field_attrs.insert(canonical_name.clone(), attr_rows);
+    known_struct_names.insert(name);
+    known_struct_names.insert(canonical_name);
+    if leaf_free {
+        known_struct_names.insert(leaf);
+    }
+}
+
 /// Record every spelling of an ADT whose fields are raw words.
 /// `GcKind::Raw` also covers classed structs that are not GC headers
 /// (a strategy singleton, a type object). Those stay instances.
@@ -3875,10 +3980,24 @@ fn derive_program_metadata(
             // A union's fields all start at offset 0 and only one is live,
             // so there is no field-offset row to project; the declarations
             // that reach here are foreign (`windows-sys`' `IN_ADDR_0`).
-            TypeDeclKind::Union(_)
-            | TypeDeclKind::Alias(_)
-            | TypeDeclKind::Opaque
-            | TypeDeclKind::Unknown => {}
+            TypeDeclKind::Alias(_) => {
+                // Charon keeps `type T = Struct<…>` as its own TypeDecl with
+                // the monomorph's rustc layout. Generic struct offsets are
+                // symbolic `OffsetOf`. Publish the alias under its own StructId.
+                register_type_alias_struct(
+                    td,
+                    llbc,
+                    &target,
+                    gc_struct_ids,
+                    &mut struct_fields,
+                    &mut exact_layouts,
+                    &mut struct_ids,
+                    &mut struct_origins,
+                    &mut struct_field_attrs,
+                    &mut known_struct_names,
+                );
+            }
+            TypeDeclKind::Union(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
         }
     }
 
@@ -21664,20 +21783,26 @@ impl<'a> Lowering<'a> {
                 },
             }
         };
+        if variant_idx.is_none()
+            && let Some(fields) = type_decl_struct_fields(td, self.llbc)
+        {
+            // `type Alias = Struct<…>` is an Alias whose fields live on
+            // the generic struct. Keep the alias as owner so
+            // `exact_layouts` uses the monomorph's rustc offsets.
+            let f = fields.get(field_idx)?;
+            let name = f
+                .name
+                .clone()
+                .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(field_idx));
+            let ty = clone_tyref(&f.ty);
+            let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
+                &name_path,
+                self.tombstoned_leaves,
+            ));
+            let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
+            return Some((owner_root, name, ty, owner_id, host_index));
+        }
         match (&td.kind, variant_idx) {
-            (TypeDeclKind::Struct(fields), None) => {
-                let f = fields.get(field_idx)?;
-                let name = f.name.clone().unwrap_or_else(|| {
-                    majit_charon_reader::ullbc::positional_field_name(field_idx)
-                });
-                let ty = clone_tyref(&f.ty);
-                let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
-                    &name_path,
-                    self.tombstoned_leaves,
-                ));
-                let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
-                Some((owner_root, name, ty, owner_id, host_index))
-            }
             (TypeDeclKind::Enum(variants), Some(vidx)) => {
                 let variant = variants.get(vidx as usize)?;
                 let f = variant.fields.get(field_idx)?;
@@ -30760,6 +30885,41 @@ impl<'a> Lowering<'a> {
         self.enqueue_spec(fd, &reg.generics)
     }
 
+    /// Residual call path for a generic `dont_look_inside` helper.
+    ///
+    /// `enqueue_spec` refuses that body, so the unspecialized template
+    /// path would bind every instantiation to one funcptr.
+    /// `annlowlevel.specialize` / `getfunctionptr(graph)` give each
+    /// specialized graph its own address; name the residual the same way
+    /// from the call site's type arguments, without building a graph.
+    fn residual_generic_fun_segments(
+        &self,
+        fd: &FunDecl,
+        generics: &serde_json::Value,
+    ) -> Option<Vec<String>> {
+        if !crate::front::clause_spec::decl_is_generic(fd) {
+            return None;
+        }
+        let path = fd.item_meta.name_path();
+        if !self.dont_look_inside.contains(&strip_crate_prefix(&path)) {
+            return None;
+        }
+        // Impl methods go through `enqueue_spec` (`cachedgraph`). A free
+        // function is the residual whose address `jit_fnaddr` publishes
+        // per instantiation.
+        if impl_method_owner_for_fundecl(self.llbc, fd).is_some() {
+            return None;
+        }
+        let names = crate::front::clause_spec::residual_inst_type_names(generics, self.llbc)?;
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let leaf = path.rsplit("::").next().unwrap_or("fn");
+        let leaf = format!(
+            "{leaf}{}",
+            majit_ir::helper_fnaddr::residual_inst_suffix(&name_refs)
+        );
+        Some(spec_segments(self.llbc, fd, &leaf))
+    }
+
     /// Impl method named by a `TraitImpl` trait ref, specialized when that
     /// impl's own clauses are concrete. A `Clause` ref returns `None` so
     /// the call keeps the trait-declaration path.
@@ -30829,22 +30989,23 @@ impl<'a> Lowering<'a> {
         if self.callee_is_host_builtin(fd) {
             return None;
         }
-        // Inside a spec copy every concrete instantiation gets its own
-        // graph, including a `dont_look_inside` helper with no trait
-        // clauses. Outside, only a clause-bearing callee with a TraitImpl
-        // ref is copied.
-        let trait_refs = if self.spec_body {
-            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?
-        } else {
-            if !spec.borrow_mut().body_has_own_clause(fd, self.llbc) {
-                return None;
-            }
-            let path = fd.item_meta.name_path();
-            if self.dont_look_inside.contains(&strip_crate_prefix(&path)) {
-                return None;
-            }
-            crate::front::clause_spec::concrete_trait_refs(generics, self.llbc)?
-        };
+        // A free-function `dont_look_inside` helper is a residual call
+        // (`residual_generic_fun_segments` / the monomorph's funcptr).
+        // An impl method has no HELPER_FNADDRS row (`HelperFnAddrSkip::Generic`
+        // and the impl-path split), so `FunctionDesc.cachedgraph` is its
+        // specialized graph.
+        let path = fd.item_meta.name_path();
+        if self.dont_look_inside.contains(&strip_crate_prefix(&path))
+            && impl_method_owner_for_fundecl(self.llbc, fd).is_none()
+        {
+            return None;
+        }
+        // `FunctionDesc.cachedgraph`: each concrete instantiation is
+        // its own graph, including a look-inside generic whose body
+        // names no `Clause`. The inner residual then sees the type
+        // arguments. A still-open `Clause` ref refuses (`None`).
+        let trait_refs =
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
         let leaf = fd
@@ -30961,6 +31122,9 @@ impl<'a> Lowering<'a> {
                         return (spec_segments(self.llbc, fd, &leaf), None);
                     }
                     if let Some(segments) = self.specialized_fun_segments(fd, reg) {
+                        return (segments, None);
+                    }
+                    if let Some(segments) = self.residual_generic_fun_segments(fd, &reg.generics) {
                         return (segments, None);
                     }
                     // Blanket `impl<T, U: From<T>> Into<U> for T`
@@ -45097,9 +45261,7 @@ fn struct_field_index_named(ty: &TyRef, llbc: &Llbc, name: &str) -> Option<usize
     if decl.published_struct_copy {
         return None;
     }
-    let TypeDeclKind::Struct(fields) = &decl.kind else {
-        return None;
-    };
+    let fields = type_decl_struct_fields(decl, llbc)?;
     fields
         .iter()
         .position(|field| field.name.as_deref() == Some(name))
@@ -57736,6 +57898,9 @@ fn declared_adt_struct_id(
     }
     match &td.kind {
         TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) => Some(struct_id_for_type_decl(td)),
+        TypeDeclKind::Alias(_) if type_decl_struct_fields(td, llbc).is_some() => {
+            Some(struct_id_for_type_decl(td))
+        }
         _ => None,
     }
 }
@@ -57826,6 +57991,9 @@ fn adt_def_is_raw_storage(
                 .iter()
                 .all(|field| field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, stack))
         }),
+        TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
+            .and_then(adt_node_def_id)
+            .is_some_and(|id| adt_def_is_raw_storage(id, llbc, gc_struct_ids, stack)),
         _ => false,
     };
     stack.pop();
@@ -61727,6 +61895,26 @@ fn type_node_peel_aliases<'l>(
         }
     }
     None
+}
+
+/// Struct field list of `td`, peeling a `type T = Struct<…>` alias.
+///
+/// Charon keeps a type alias as `TypeDeclKind::Alias` whose body is the
+/// generic struct. Field projections still name those fields.
+fn type_decl_struct_fields<'a>(td: &'a TypeDecl, llbc: &'a Llbc) -> Option<&'a [FieldDecl]> {
+    match &td.kind {
+        TypeDeclKind::Struct(fields) => Some(fields.as_slice()),
+        TypeDeclKind::Alias(body) => {
+            let node = body.get("aliased_ty").unwrap_or(body);
+            let peeled = type_node_peel_aliases(node, llbc)?;
+            let inner = llbc.type_by_id(adt_node_def_id(peeled)?)?;
+            match &inner.kind {
+                TypeDeclKind::Struct(fields) => Some(fields.as_slice()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The array element type behind an `Index::index` / `IndexMut::index_mut`

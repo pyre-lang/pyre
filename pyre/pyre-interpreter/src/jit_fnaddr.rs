@@ -74,6 +74,12 @@ impl<T> ResidualSlot for *mut T {}
 impl<T> ResidualRet for *const T {}
 impl<T> ResidualRet for *mut T {}
 
+/// One-word `repr(transparent)` dict keys. `ObjectKey` / `IdentitySetKey`
+/// are two words and stay off this trait.
+impl ResidualSlot for pyre_object::identitydict::IdentityKey {}
+impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
+impl ResidualSlot for pyre_object::celldict::StrKey {}
+
 /// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
 /// reaches.  `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so
 /// each of the raw functions is `(usize) -> usize`, `(usize) -> usize` and
@@ -489,6 +495,72 @@ fn p5<
     f: fn(A1, A2, A3, A4, A5) -> R,
 ) {
     push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+fn interned_residual_inst_path(template: &str, type_names: &[&str]) -> &'static str {
+    intern_fnaddr_path(format!(
+        "{template}{}",
+        majit_ir::helper_fnaddr::residual_inst_suffix(type_names)
+    ))
+}
+
+fn p1_inst<A1: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    template: &'static str,
+    f: fn(A1) -> R,
+    type_names: &[&str],
+) {
+    p1(
+        entries,
+        interned_residual_inst_path(template, type_names),
+        f,
+    );
+}
+
+fn p2_inst<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    template: &'static str,
+    f: fn(A1, A2) -> R,
+    type_names: &[&str],
+) {
+    p2(
+        entries,
+        interned_residual_inst_path(template, type_names),
+        f,
+    );
+}
+
+fn p3_inst<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    template: &'static str,
+    f: fn(A1, A2, A3) -> R,
+    type_names: &[&str],
+) {
+    p3(
+        entries,
+        interned_residual_inst_path(template, type_names),
+        f,
+    );
+}
+
+fn p5_inst<
+    A1: ResidualSlot,
+    A2: ResidualSlot,
+    A3: ResidualSlot,
+    A4: ResidualSlot,
+    A5: ResidualSlot,
+    R: ResidualRet,
+>(
+    entries: &mut Vec<(&'static str, i64)>,
+    template: &'static str,
+    f: fn(A1, A2, A3, A4, A5) -> R,
+    type_names: &[&str],
+) {
+    p5(
+        entries,
+        interned_residual_inst_path(template, type_names),
+        f,
+    );
 }
 
 #[inline]
@@ -5335,65 +5407,86 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::rordereddict::dict_count_py_div",
         pyre_object::rordereddict::dict_count_py_div,
     );
-    // `ll_dict_resize.oopspec = 'odict.resize(d)'` residual. The int-key
-    // monomorph is `IntDictStorage`.
+    // `ll_dict_resize.oopspec = 'odict.resize(d)'` residual. Oopspec is
+    // not `dont_look_inside`, so the residual path stays the template.
     p1(
         &mut entries,
         "pyre_object::rordereddict::ll_dict_resize",
         pyre_object::rordereddict::ll_dict_resize
             as fn(&mut pyre_object::dictmultiobject::IntDictStorage),
     );
-    p1(
+    // Generic `dont_look_inside` helpers skip HELPER_FNADDRS
+    // (`HelperFnAddrSkip::Generic`). Each concrete instantiation is its
+    // own funcptr (`annlowlevel.specialize` / `getfunctionptr`); bind
+    // every RDict monomorph under `residual_inst_suffix`.
+    register_rdict_dont_look_inside_inst::<
+        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::IntKeyHash,
+    >(&mut entries);
+    register_rdict_setitem_inst::<
+        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::IntKeyHash,
+    >(&mut entries);
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::dictmultiobject::ObjectKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::ObjectKeyBuildHasher,
+    >(&mut entries);
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::dictmultiobject::BytesKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::BytesKeyHash,
+    >(&mut entries);
+    register_rdict_setitem_inst::<
+        pyre_object::dictmultiobject::BytesKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::BytesKeyHash,
+    >(&mut entries);
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::identitydict::IdentityKey,
+        pyre_object::PyObjectRef,
+        std::collections::hash_map::RandomState,
+    >(&mut entries);
+    register_rdict_setitem_inst::<
+        pyre_object::identitydict::IdentityKey,
+        pyre_object::PyObjectRef,
+        std::collections::hash_map::RandomState,
+    >(&mut entries);
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::celldict::StrKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::StrKeyBuildHasher,
+    >(&mut entries);
+    register_rdict_setitem_inst::<
+        pyre_object::celldict::StrKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::StrKeyBuildHasher,
+    >(&mut entries);
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::dictmultiobject::ObjectKey,
+        (),
+        pyre_object::dictmultiobject::ObjectKeyBuildHasher,
+    >(&mut entries);
+    register_rdict_dont_look_inside_inst::<i64, (), pyre_object::dictmultiobject::IntKeyHash>(
         &mut entries,
-        "pyre_object::rordereddict::ll_dict_remove_deleted_items",
-        pyre_object::rordereddict::ll_dict_remove_deleted_items
-            as fn(&mut pyre_object::dictmultiobject::IntDictStorage),
     );
-    // `look_inside_iff` trampolines for the IntDictStorage monomorph.
-    // Generic + receiver forms skip HELPER_FNADDRS; bind the free-function
-    // trampolines the dispatch residualizes when the dict is not virtual.
-    p3(
-        &mut entries,
-        "pyre_object::rordereddict::ll_dict_lookup_trampoline",
-        pyre_object::rordereddict::ll_dict_lookup_trampoline
-            as fn(&pyre_object::dictmultiobject::IntDictStorage, u64, &i64) -> isize,
-    );
-    p3(
-        &mut entries,
-        "pyre_object::rordereddict::ll_dict_contains_trampoline",
-        pyre_object::rordereddict::ll_dict_contains_trampoline
-            as fn(&pyre_object::dictmultiobject::IntDictStorage, u64, &i64) -> bool,
-    );
-    p3(
-        &mut entries,
-        "pyre_object::rordereddict::ll_dict_del_trampoline",
-        pyre_object::rordereddict::ll_dict_del_trampoline
-            as fn(&mut pyre_object::dictmultiobject::IntDictStorage, u64, usize),
-    );
-    p5(
-        &mut entries,
-        "pyre_object::rordereddict::ll_dict_setitem_lookup_done_trampoline",
-        pyre_object::rordereddict::ll_dict_setitem_lookup_done_trampoline
-            as fn(
-                &mut pyre_object::dictmultiobject::IntDictStorage,
-                u64,
-                isize,
-                i64,
-                pyre_object::PyObjectRef,
-            ),
-    );
-    p1(
-        &mut entries,
-        "pyre_object::rordereddict::ll_dict_grow_trampoline",
-        pyre_object::rordereddict::ll_dict_grow_trampoline
-            as fn(&mut pyre_object::dictmultiobject::IntDictStorage) -> bool,
-    );
-    p2(
-        &mut entries,
-        "pyre_object::rordereddict::ll_dictnext_trampoline",
-        pyre_object::rordereddict::ll_dictnext_trampoline
-            as fn(&pyre_object::dictmultiobject::IntDictStorage, usize) -> isize,
-    );
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::dictmultiobject::BytesKey,
+        (),
+        pyre_object::dictmultiobject::BytesKeyHash,
+    >(&mut entries);
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::celldict::StrKey,
+        (),
+        pyre_object::dictmultiobject::StrKeyBuildHasher,
+    >(&mut entries);
+    register_rdict_dont_look_inside_inst::<
+        pyre_object::setobject::IdentitySetKey,
+        (),
+        std::collections::hash_map::RandomState,
+    >(&mut entries);
 
     // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
     // residual-call targets emitted by
@@ -5421,6 +5514,94 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     merge_macro_helper_fnaddrs(&mut entries);
 
     (entries, abi_unsound_arguments)
+}
+
+fn register_rdict_dont_look_inside_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
+where
+    K: std::hash::Hash
+        + Eq
+        + Copy
+        + pyre_object::rordereddict::EntryDummy
+        + pyre_object::rordereddict::GcRefOffsets,
+    V: Copy + pyre_object::rordereddict::EntryDummy + pyre_object::rordereddict::GcRefOffsets,
+    S: std::hash::BuildHasher,
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+{
+    let kvs = [
+        std::any::type_name::<K>(),
+        std::any::type_name::<V>(),
+        std::any::type_name::<S>(),
+    ];
+    let kvsk = [
+        std::any::type_name::<K>(),
+        std::any::type_name::<V>(),
+        std::any::type_name::<S>(),
+        std::any::type_name::<K>(),
+    ];
+    p1_inst(
+        entries,
+        "pyre_object::rordereddict::ll_dict_grow_trampoline",
+        pyre_object::rordereddict::ll_dict_grow_trampoline::<K, V, S>,
+        &kvs,
+    );
+    p1_inst(
+        entries,
+        "pyre_object::rordereddict::ll_dict_remove_deleted_items",
+        pyre_object::rordereddict::ll_dict_remove_deleted_items::<K, V, S>,
+        &kvs,
+    );
+    p2_inst(
+        entries,
+        "pyre_object::rordereddict::ll_dictnext_trampoline",
+        pyre_object::rordereddict::ll_dictnext_trampoline::<K, V, S>,
+        &kvs,
+    );
+    p3_inst(
+        entries,
+        "pyre_object::rordereddict::ll_dict_del_trampoline",
+        pyre_object::rordereddict::ll_dict_del_trampoline::<K, V, S>,
+        &kvs,
+    );
+    p3_inst(
+        entries,
+        "pyre_object::rordereddict::ll_dict_lookup_trampoline",
+        pyre_object::rordereddict::ll_dict_lookup_trampoline::<K, V, S, K>,
+        &kvsk,
+    );
+    p3_inst(
+        entries,
+        "pyre_object::rordereddict::ll_dict_contains_trampoline",
+        pyre_object::rordereddict::ll_dict_contains_trampoline::<K, V, S, K>,
+        &kvsk,
+    );
+}
+
+fn register_rdict_setitem_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
+where
+    K: ResidualSlot
+        + std::hash::Hash
+        + Eq
+        + Copy
+        + pyre_object::rordereddict::EntryDummy
+        + pyre_object::rordereddict::GcRefOffsets,
+    V: ResidualSlot
+        + Copy
+        + pyre_object::rordereddict::EntryDummy
+        + pyre_object::rordereddict::GcRefOffsets,
+    S: std::hash::BuildHasher,
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+{
+    let kvs = [
+        std::any::type_name::<K>(),
+        std::any::type_name::<V>(),
+        std::any::type_name::<S>(),
+    ];
+    p5_inst(
+        entries,
+        "pyre_object::rordereddict::ll_dict_setitem_lookup_done_trampoline",
+        pyre_object::rordereddict::ll_dict_setitem_lookup_done_trampoline::<K, V, S>,
+        &kvs,
+    );
 }
 
 fn intern_fnaddr_path(s: String) -> &'static str {
