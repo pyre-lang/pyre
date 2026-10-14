@@ -19,6 +19,10 @@
 //! which is what `pyrex`'s `default = [..., "pyre-module"]` already
 //! expresses. `math` and `cmath` are `default_modules` and stay here.
 
+// `(lo..hi).contains(&x)` is a `Range::contains` call the trace walker does
+// not descend; a JIT-visible range check stays two comparisons.
+#![allow(clippy::manual_range_contains)]
+
 /// Adapt a `W_Root` sweep hook (`fn(PyObjectRef)`) to the collector's
 /// address-taking `DestructorFn`.
 macro_rules! gc_destructor {

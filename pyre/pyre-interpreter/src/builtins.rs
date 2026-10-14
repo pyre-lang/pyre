@@ -2960,7 +2960,7 @@ fn memoryview_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// Python 3.14 `memoryview.index(value, start=0, stop=sys.maxsize)`.
 fn memoryview_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let n_args = args.len();
-    if !(2..=4).contains(&n_args) {
+    if n_args < 2 || n_args > 4 {
         return Err(crate::PyError::type_error(format!(
             "index expected at most 3 arguments, got {}",
             n_args.saturating_sub(1)

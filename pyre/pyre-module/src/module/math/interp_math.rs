@@ -538,7 +538,7 @@ use pyre_interpreter::objspace::descroperation::{
 // float-to-int cast is exact).
 majit_math2_gateway!(pow, |x, y| {
     let e = _int_frexp_exponent_raw(x);
-    if (-1021..=1024).contains(&e) {
+    if e >= -1021 && e <= 1024 {
         let e_abs = if e < 0 { -e } else { e };
         let y_abs = if y < 0.0 { -y } else { y };
         if y_abs * ((e_abs + 1) as f64) < 1000.0
@@ -748,10 +748,11 @@ pub fn __majit_wrap_math_ldexp(args: &[PyObjectRef]) -> PyResult {
             // frexp exponent `e` of `x` has `-1021 <= e + exp <= 1024`.
             if x.is_finite()
                 && (x >= f64::MIN_POSITIVE || x <= -f64::MIN_POSITIVE)
-                && (-1022..=1023).contains(&exp)
+                && exp >= -1022
+                && exp <= 1023
             {
                 let e = _int_frexp_exponent_raw(x) + exp;
-                if (-1021..=1024).contains(&e) {
+                if e >= -1021 && e <= 1024 {
                     return _float_ldexp(x, exp);
                 }
             }
@@ -784,7 +785,7 @@ pub fn __majit_wrap_math_isqrt(args: &[PyObjectRef]) -> PyResult {
         } {
             let n = unsafe { pyre_object::w_int_get_value(w_n) };
             const EXACT_FLOAT_INT: i64 = 1 << 53;
-            if (1..EXACT_FLOAT_INT).contains(&n) {
+            if n >= 1 && n < EXACT_FLOAT_INT {
                 return _int_isqrt(n);
             }
         }

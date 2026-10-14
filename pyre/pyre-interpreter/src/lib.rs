@@ -13,6 +13,9 @@
     clippy::iter_skip_next,
     clippy::macro_metavars_in_unsafe,
     clippy::manual_memcpy,
+    // `(lo..hi).contains(&x)` is a `Range::contains` call the trace walker
+    // does not descend; a JIT-visible range check stays two comparisons.
+    clippy::manual_range_contains,
     clippy::manual_unwrap_or_default,
     clippy::missing_safety_doc,
     clippy::module_inception,
