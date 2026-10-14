@@ -575,14 +575,21 @@ pub(crate) fn lower_indirect_calls_with(
             } => (target, args, result_ty, op.result),
             _ => unreachable!("site filter mismatch"),
         };
-        let (trait_root, method_name) = match target {
+        let (trait_root, method_name, attached) = match target {
             CallTarget::Indirect {
                 trait_root,
                 method_name,
-            } => (trait_root, method_name),
+                graphs,
+            } => (trait_root, method_name, graphs),
             _ => unreachable!("site filter mismatch"),
         };
-        let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
+        // `annotate_access_directly` stamps the specialized row on the
+        // op (`row_of_graphs.values()`). Prefer that family so lowering
+        // emits the AccessDirect copies the annotator selected.
+        let family = match attached {
+            Some(family) if !family.is_empty() => family,
+            _ => call_control.all_impls_for_indirect(&trait_root, &method_name),
+        };
         // An empty lookup is an unknown family. Collapsing it to `None`
         // on the shared graph makes effect analysis report random effects
         // for a call the analyzers previously did not enumerate. Leave the

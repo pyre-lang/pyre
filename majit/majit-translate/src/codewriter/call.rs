@@ -365,16 +365,31 @@ pub(crate) fn inherit_split_portal_access_directly(
     }
 }
 
-fn call_op_names_target(op: &SpaceOperation, target: &CallPath) -> bool {
+/// Whether `op` names `target` as a callee graph. `FunctionPath` spellings
+/// go through `resolve` (`callable_graph_path`: `crate::m::f` /
+/// local-crate-root → `m::f` when that names the registered graph), the
+/// same identity `call_op_callees` uses. `Method.resolved_path`,
+/// `CallTarget::Indirect.graphs`, and the `IndirectCall` `graphs` family
+/// already hold resolved graph paths.
+fn call_op_names_target(
+    op: &SpaceOperation,
+    target: &CallPath,
+    resolve: impl Fn(&CallPath) -> CallPath,
+) -> bool {
     match &op.kind {
         OpKind::Call {
             target: call_target,
             ..
         } => match call_target {
             CallTarget::FunctionPath { segments, .. } => {
-                CallPath::from_segments(segments.iter().map(String::as_str)) == *target
+                let spelled = CallPath::from_segments(segments.iter().map(String::as_str));
+                resolve(&spelled) == *target
             }
             CallTarget::Method { resolved_path, .. } => resolved_path.as_ref() == Some(target),
+            CallTarget::Indirect {
+                graphs: Some(graphs),
+                ..
+            } => graphs.iter().any(|path| path == target),
             _ => false,
         },
         OpKind::IndirectCall {
@@ -382,6 +397,16 @@ fn call_op_names_target(op: &SpaceOperation, target: &CallPath) -> bool {
             ..
         } => graphs.iter().any(|path| path == target),
         _ => false,
+    }
+}
+
+/// Replace every `from` slot in a call-family row with `to`
+/// (`rpbc.py` `row_of_graphs.values()` after `default_specialize`).
+fn replace_family_member(family: &mut [CallPath], from: &CallPath, to: &CallPath) {
+    for graph_path in family {
+        if graph_path == from {
+            *graph_path = to.clone();
+        }
     }
 }
 
@@ -2248,7 +2273,9 @@ impl StoreCore {
     }
 
     /// Every `CallPath` spelling of the funcobj `path` names, including
-    /// `path`. Alias identity is the stored `GraphKey`.
+    /// `path`. Alias identity is the stored `GraphKey`. Sorted by
+    /// `CallPath.segments`. A path with no graph key returns `[path]`
+    /// immediately.
     pub(crate) fn alias_paths(&self, path: &CallPath) -> Vec<CallPath> {
         self.register_declared();
         let map = self.path_to_key.borrow();
@@ -6494,6 +6521,68 @@ impl CallControl {
         if from == to {
             return;
         }
+        // Resolve the FunctionPath spelling before the mutable graph borrow.
+        // `from` is the graph identity `call_op_callees` already resolved;
+        // the op may still spell `crate::m::f` / a local-crate root.
+        // Trait `CallTarget::Indirect` and empty `IndirectCall` families
+        // expand here too (`all_impls_for_indirect` / builtin wrappers),
+        // the same rows `call_op_callees` would yield, so the selected
+        // graph can be written onto the op (`row_of_graphs.values()`).
+        let from_aliases = self.function_graphs.alias_paths(from);
+        enum ExpandFamily {
+            Trait(String, String),
+            BuiltinWrappers,
+        }
+        let (spelled_function_path, expand) = {
+            let Some(graph) = self.function_graphs.get(caller) else {
+                return;
+            };
+            let Some(op) = graph
+                .blocks
+                .get(block_idx)
+                .and_then(|block| block.operations.get(op_idx))
+            else {
+                return;
+            };
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => (
+                    Some(CallPath::from_segments(segments.iter().map(String::as_str))),
+                    None,
+                ),
+                OpKind::Call {
+                    target:
+                        CallTarget::Indirect {
+                            graphs: None,
+                            trait_root,
+                            method_name,
+                        },
+                    ..
+                } => (
+                    None,
+                    Some(ExpandFamily::Trait(trait_root.clone(), method_name.clone())),
+                ),
+                OpKind::IndirectCall {
+                    graphs: Some(graphs),
+                    ..
+                } if graphs.is_empty() => (None, Some(ExpandFamily::BuiltinWrappers)),
+                _ => (None, None),
+            }
+        };
+        let function_path_matches = spelled_function_path
+            .as_ref()
+            .is_some_and(|spelled| from_aliases.contains(&self.resolved_callable_path(spelled)));
+        let mut expanded = match expand {
+            Some(ExpandFamily::Trait(trait_root, method_name)) => {
+                Some(self.all_impls_for_indirect(&trait_root, &method_name))
+            }
+            Some(ExpandFamily::BuiltinWrappers) => {
+                Some(self.builtin_wrapper_indirect_graphs().to_vec())
+            }
+            None => None,
+        };
         let Some(graph) = self.function_graphs.get_mut(caller) else {
             return;
         };
@@ -6507,8 +6596,7 @@ impl CallControl {
         match &mut op.kind {
             OpKind::Call { target, .. } => match target {
                 CallTarget::FunctionPath { segments, .. } => {
-                    let spelled = CallPath::from_segments(segments.iter().map(String::as_str));
-                    if spelled == *from {
+                    if function_path_matches {
                         *segments = to.segments.clone();
                     }
                 }
@@ -6517,17 +6605,20 @@ impl CallControl {
                         *resolved_path = Some(to.clone());
                     }
                 }
+                CallTarget::Indirect { graphs, .. } => {
+                    let family = graphs.get_or_insert_with(|| expanded.take().unwrap_or_default());
+                    replace_family_member(family, from, to);
+                }
                 _ => {}
             },
             OpKind::IndirectCall {
                 graphs: Some(graphs),
                 ..
             } => {
-                for graph_path in graphs {
-                    if graph_path == from {
-                        *graph_path = to.clone();
-                    }
+                if graphs.is_empty() {
+                    *graphs = expanded.take().unwrap_or_default();
                 }
+                replace_family_member(graphs, from, to);
             }
             _ => {}
         }
@@ -6664,9 +6755,13 @@ impl CallControl {
                     CallTarget::Indirect {
                         trait_root,
                         method_name,
+                        graphs,
                     },
                 ..
-            } => self.all_impls_for_indirect(trait_root, method_name),
+            } => match graphs {
+                Some(graphs) => graphs.clone(),
+                None => self.all_impls_for_indirect(trait_root, method_name),
+            },
             // `call.py CallControl.guess_call_kind` direct_call.  These three
             // classifications are attached to the single
             // `funcobj` and so apply to the direct branch
@@ -6999,10 +7094,7 @@ impl CallControl {
                 let targets = self.function_graphs.alias_paths(&path);
                 let to_scan: Vec<CallPath> = entered.iter().cloned().collect();
                 for caller in to_scan {
-                    if Self::graph_call_ops_name_target(
-                        self.function_graphs.get(&caller).as_deref(),
-                        &targets,
-                    ) {
+                    if self.graph_call_ops_name_target(&caller, &targets) {
                         todo.push(caller);
                     }
                 }
@@ -7010,21 +7102,23 @@ impl CallControl {
         }
     }
 
-    /// Whether any call op in `graph` names one of `targets` (`FunctionPath`
-    /// segments, `Method.resolved_path`, or an `IndirectCall` family
-    /// slot). `targets` is every alias of the graph whose returnblock
-    /// changed (`GraphStore::alias_paths`); `annrpython.py` `notify` /
-    /// `reflowfromposition` reflows every caller of that graph object,
-    /// whatever spelling the call op used.
-    fn graph_call_ops_name_target(graph: Option<&FunctionGraph>, targets: &[CallPath]) -> bool {
-        let Some(graph) = graph else {
+    /// Whether any call op in `caller` names one of `targets` (`FunctionPath`
+    /// segments, `Method.resolved_path`, a `CallTarget::Indirect` family
+    /// slot, or an `IndirectCall` family slot). `targets` is every alias
+    /// of the graph whose returnblock changed (`GraphStore::alias_paths`);
+    /// `annrpython.py` `notify` / `reflowfromposition` reflows every caller
+    /// of that graph object, whatever spelling the call op used.
+    /// FunctionPath spellings are resolved with `callable_graph_path` so
+    /// `crate::m::f` names `m::f`.
+    fn graph_call_ops_name_target(&self, caller: &CallPath, targets: &[CallPath]) -> bool {
+        let Some(graph) = self.function_graphs.get(caller) else {
             return false;
         };
         graph.blocks.iter().any(|block| {
             block.operations.iter().any(|op| {
-                targets
-                    .iter()
-                    .any(|target| call_op_names_target(op, target))
+                targets.iter().any(|target| {
+                    call_op_names_target(op, target, |path| self.resolved_callable_path(path))
+                })
             })
         })
     }
@@ -8102,6 +8196,13 @@ impl CallControl {
             }
         }
         None
+    }
+
+    /// Graph identity of a direct-call spelling: `callable_graph_path` when
+    /// that names a registered graph, otherwise the raw spelling.
+    fn resolved_callable_path(&self, path: &CallPath) -> CallPath {
+        self.callable_graph_path(path)
+            .unwrap_or_else(|| path.clone())
     }
 
     /// The registered graph identity for a direct call — `funcobj.graph`.
@@ -10061,6 +10162,7 @@ impl CallControl {
         if let CallTarget::Indirect {
             trait_root,
             method_name,
+            graphs,
         } = target
         {
             // Same fold as `rpbc.rs`'s `lower_indirect_calls` and as `getcalldescr`'s
@@ -10071,7 +10173,12 @@ impl CallControl {
             // `cached_can_raise_family`'s `No` initialiser without the loop
             // body ever running, i.e. "an unregistered family cannot
             // raise".  `None` is the honest answer and gives `Yes`.
-            let graphs = self.all_impls_for_indirect(trait_root, method_name);
+            // A specialized row stamped on the op is the family the
+            // annotator selected (`row_of_graphs.values()`).
+            let graphs = match graphs {
+                Some(graphs) if !graphs.is_empty() => graphs.clone(),
+                _ => self.all_impls_for_indirect(trait_root, method_name),
+            };
             let graphs = (!graphs.is_empty()).then_some(graphs);
             return self.cached_can_raise_family(graphs.as_deref(), cache);
         }
@@ -14885,6 +14992,98 @@ mod tests {
         assert_access_directly_copy(&cc, &g_path, &[0]);
     }
 
+    /// A return change reflows a caller that spells the callee
+    /// `crate::id` / `pyre_interpreter::id`. `call_op_names_target` must
+    /// use `callable_graph_path` identity; raw spelling never equals the
+    /// registered `id` path `alias_paths` yields.
+    #[test]
+    fn return_change_reflows_a_caller_that_spells_the_callee_crate_qualified() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = CallControl::new();
+            let g_path = CallPath::from_segments(["g"]);
+            let mut g = FunctionGraph::new("g");
+            let gp = g.alloc_value_var();
+            g.block_mut(g.startblock).inputargs.push(gp);
+            cc.register_function_graph(g_path.clone(), g);
+
+            let id_path = CallPath::from_segments(["id"]);
+            let mut id = FunctionGraph::new("id");
+            let f = id.alloc_value_var();
+            id.block_mut(id.startblock).inputargs.push(f.clone());
+            let hinted = id.alloc_value_var();
+            id.block_mut(id.startblock).operations.push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["hint_access_directly"]),
+                    args: crate::model::call_args([f]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+            id.set_return(id.startblock, Some(hinted));
+            cc.register_function_graph(id_path.clone(), id);
+
+            let crate_spelling = CallPath::from_segments(["crate", "id"]);
+            let local_spelling = CallPath::from_segments(["pyre_interpreter", "id"]);
+            let caller_path = CallPath::from_segments(["caller"]);
+            let mut caller = FunctionGraph::new("caller");
+            let entry = caller.startblock;
+            let arg = caller.alloc_value_var();
+            let result_crate = caller.alloc_value_var();
+            let result_local = caller.alloc_value_var();
+            caller.block_mut(entry).operations.push(SpaceOperation {
+                result: Some(result_crate.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(
+                        crate_spelling.segments.iter().map(String::as_str),
+                    ),
+                    args: crate::model::call_args([arg.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+            caller.block_mut(entry).operations.push(SpaceOperation {
+                result: Some(result_local.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(
+                        local_spelling.segments.iter().map(String::as_str),
+                    ),
+                    args: crate::model::call_args([arg]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+            caller.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                    args: crate::model::call_args([result_crate]),
+                    result_ty: ValueType::Void,
+                },
+            });
+            caller.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                    args: crate::model::call_args([result_local]),
+                    result_ty: ValueType::Void,
+                },
+            });
+            cc.register_function_graph(caller_path.clone(), caller);
+
+            // Seed `id` first so the caller is processed first (`todo` is
+            // LIFO) while the return flag is still unset; the return
+            // change must then reflow the crate-qualified caller.
+            cc.annotate_access_directly(&[id_path.clone(), caller_path]);
+
+            assert!(
+                cc.function_graphs()
+                    .get(&id_path)
+                    .expect("id")
+                    .access_directly_return
+            );
+            assert_regular_not_access_directly(&cc, &g_path);
+            assert_access_directly_copy(&cc, &g_path, &[0]);
+        });
+    }
+
     /// A function reached both regularly and with a flagged argument yields
     /// two candidate paths and two JitCodes. `access_directly` lives only on
     /// the copy; the regular caller's op still names the original path.
@@ -15168,6 +15367,86 @@ mod tests {
         assert_no_access_directly_copy(&cc, &g_path);
     }
 
+    /// A caller that spells the callee `crate::inner` /
+    /// `pyre_interpreter::inner` retargets at the AccessDirect copy
+    /// registered as `inner`. Raw-spelling match in `retarget_call_op`
+    /// leaves the op naming the origin, so BFS never reaches the copy.
+    #[test]
+    fn crate_qualified_call_retargets_access_directly_copy() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = CallControl::new();
+            let inner_path = CallPath::from_segments(["inner"]);
+            let mut inner = FunctionGraph::new("inner");
+            let ip = inner.alloc_value_var();
+            inner.block_mut(inner.startblock).inputargs.push(ip);
+            cc.register_function_graph(inner_path.clone(), inner);
+
+            let crate_spelling = CallPath::from_segments(["crate", "inner"]);
+            let local_spelling = CallPath::from_segments(["pyre_interpreter", "inner"]);
+            let caller_path = CallPath::from_segments(["caller"]);
+            let mut caller = FunctionGraph::new("caller");
+            let entry = caller.startblock;
+            let frame = caller.alloc_value_var();
+            let hinted = caller.alloc_value_var();
+            caller.block_mut(entry).operations.push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["hint_access_directly"]),
+                    args: crate::model::call_args([frame]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+            caller.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(
+                        crate_spelling.segments.iter().map(String::as_str),
+                    ),
+                    args: crate::model::call_args([hinted.clone()]),
+                    result_ty: ValueType::Void,
+                },
+            });
+            caller.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(
+                        local_spelling.segments.iter().map(String::as_str),
+                    ),
+                    args: crate::model::call_args([hinted]),
+                    result_ty: ValueType::Void,
+                },
+            });
+            cc.register_function_graph(caller_path.clone(), caller);
+
+            let mut policy = crate::policy::DefaultJitPolicy::new();
+            cc.find_helper_graphs(&mut policy, &[caller_path.clone()]);
+
+            let ad = access_directly_path(&inner_path);
+            assert!(
+                cc.is_candidate(&ad),
+                "BFS must reach the AccessDirect copy retargeted from crate-qualified spelling"
+            );
+            assert_regular_not_access_directly(&cc, &inner_path);
+            assert_access_directly_copy(&cc, &inner_path, &[0]);
+
+            let caller = cc.function_graphs().get(&caller_path).expect("caller");
+            let targets: Vec<_> = caller.blocks[0]
+                .operations
+                .iter()
+                .filter_map(call_op_target_path)
+                .collect();
+            assert_eq!(
+                targets.iter().filter(|path| *path == &ad).count(),
+                2,
+                "both crate-qualified calls must name the copy: {targets:?}"
+            );
+            assert!(
+                !targets.contains(&crate_spelling) && !targets.contains(&local_spelling),
+                "crate-qualified origin spellings must be retargeted: {targets:?}"
+            );
+        });
+    }
+
     /// `f -> g -> id(hinted)` flags `f`'s result the way `recursivecall`
     /// reads `binding(graph.getreturnvar())` off each callee, so a
     /// consumer of `f` builds an AccessDirect copy.
@@ -15347,6 +15626,218 @@ mod tests {
 
         assert_regular_not_access_directly(&cc, &g_path);
         assert_no_access_directly_copy(&cc, &g_path);
+    }
+
+    /// A trait call whose implementation receives a flagged frame: after
+    /// `annotate_access_directly` the op names the `__AccessDirect_None`
+    /// implementation and discovery reaches it. The impl is identity so a
+    /// flagged return reflows the caller (`call_op_names_target` on the
+    /// retargeted family) and flags `g`.
+    #[test]
+    fn trait_call_with_flagged_frame_names_accessdirect_impl() {
+        let mut cc = CallControl::new();
+        let impl_path = CallPath::for_impl_method("A", "run");
+        let mut impl_graph = FunctionGraph::new("A::run");
+        let x = impl_graph.alloc_value_var();
+        impl_graph.block_mut(impl_graph.startblock).inputargs.push(x.clone());
+        impl_graph.set_return(impl_graph.startblock, Some(x));
+        cc.register_trait_method("run", Some("Handler"), "A", impl_graph);
+
+        let g_path = CallPath::from_segments(["g"]);
+        cc.register_function_graph(g_path.clone(), graph_with_formals("g", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::indirect("Handler", "run"),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([result]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path.clone()]);
+
+        let ad = access_directly_path(&impl_path);
+        let caller = cc.function_graphs().get(&caller_path).expect("caller");
+        match &caller.block(caller.startblock).operations[1].kind {
+            OpKind::Call {
+                target: CallTarget::Indirect { graphs, .. },
+                ..
+            } => {
+                assert_eq!(
+                    graphs.as_ref(),
+                    Some(&vec![ad.clone()]),
+                    "trait call must name the AccessDirect implementation"
+                );
+            }
+            other => panic!("expected CallTarget::Indirect, got {other:?}"),
+        }
+        assert!(
+            cc.is_candidate(&ad),
+            "discovery must reach the AccessDirect implementation"
+        );
+        assert_regular_not_access_directly(&cc, &impl_path);
+        assert_access_directly_copy(&cc, &impl_path, &[0]);
+        assert_regular_not_access_directly(&cc, &g_path);
+        assert_access_directly_copy(&cc, &g_path, &[0]);
+    }
+
+    /// An `IndirectCall { graphs: Some([]) }` builtin-wrapper call with a
+    /// flagged argument: retarget materializes the expanded family onto
+    /// the op with the AccessDirect wrapper in place
+    /// (`row_of_graphs.values()`).
+    #[test]
+    fn empty_indirect_call_materializes_accessdirect_wrapper_family() {
+        let mut cc = CallControl::new();
+        let wrapper = CallPath::from_segments(["fixture", "__majit_wrap_cdata_call"]);
+        cc.register_function_graph(
+            wrapper.clone(),
+            graph_with_formals("__majit_wrap_cdata_call", 1),
+        );
+        cc.register_function_fnaddr(wrapper.clone(), 0x1000);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let funcptr = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::IndirectCall {
+                funcptr,
+                args: vec![hinted],
+                graphs: Some(Vec::new()),
+                family_key: None,
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path.clone()]);
+
+        let ad = access_directly_path(&wrapper);
+        let caller = cc.function_graphs().get(&caller_path).expect("caller");
+        match &caller.block(caller.startblock).operations[1].kind {
+            OpKind::IndirectCall {
+                graphs: Some(graphs),
+                ..
+            } => {
+                assert!(
+                    graphs.contains(&ad),
+                    "empty IndirectCall family must contain the AccessDirect wrapper: {graphs:?}"
+                );
+            }
+            other => panic!("expected IndirectCall with graphs, got {other:?}"),
+        }
+        assert_access_directly_copy(&cc, &wrapper, &[0]);
+    }
+
+    /// A family member that receives an unflagged argument stays regular:
+    /// the op keeps naming the origin graph and no AccessDirect copy is
+    /// created.
+    #[test]
+    fn unflagged_family_member_stays_regular() {
+        let mut cc = CallControl::new();
+        let impl_path = CallPath::for_impl_method("A", "run");
+        cc.register_trait_method("run", Some("Handler"), "A", graph_with_formals("A::run", 1));
+        let wrapper = CallPath::from_segments(["fixture", "__majit_wrap_plain"]);
+        cc.register_function_graph(wrapper.clone(), graph_with_formals("__majit_wrap_plain", 1));
+        cc.register_function_fnaddr(wrapper.clone(), 0x2000);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let plain = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::indirect("Handler", "run"),
+                args: crate::model::call_args([plain.clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        let funcptr = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::IndirectCall {
+                funcptr,
+                args: vec![plain],
+                graphs: Some(Vec::new()),
+                family_key: None,
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path.clone()]);
+
+        let caller = cc.function_graphs().get(&caller_path).expect("caller");
+        match &caller.block(caller.startblock).operations[0].kind {
+            OpKind::Call {
+                target: CallTarget::Indirect { graphs, .. },
+                ..
+            } => {
+                assert!(
+                    graphs.is_none()
+                        || graphs.as_ref().is_some_and(|family| {
+                            family.contains(&impl_path)
+                                && !family.iter().any(is_access_directly_path)
+                        }),
+                    "unflagged trait family must stay regular: {graphs:?}"
+                );
+            }
+            other => panic!("expected CallTarget::Indirect, got {other:?}"),
+        }
+        match &caller.block(caller.startblock).operations[1].kind {
+            OpKind::IndirectCall { graphs, .. } => {
+                assert!(
+                    graphs.as_ref().is_some_and(|family| {
+                        family.is_empty()
+                            || (family.contains(&wrapper)
+                                && !family.iter().any(is_access_directly_path))
+                    }),
+                    "unflagged wrapper family must stay regular: {graphs:?}"
+                );
+            }
+            other => panic!("expected IndirectCall, got {other:?}"),
+        }
+        assert_regular_not_access_directly(&cc, &impl_path);
+        assert_no_access_directly_copy(&cc, &impl_path);
+        assert_regular_not_access_directly(&cc, &wrapper);
+        assert_no_access_directly_copy(&cc, &wrapper);
     }
 
     /// A loopy regular graph that is also reached AccessDirect stays residual
@@ -15874,6 +16365,41 @@ mod tests {
         assert_eq!(cc.lookup_function_fnaddr(&source), Some(0x22));
         assert_eq!(cc.lookup_function_fnaddr(&alias), Some(0x22));
         assert!(cc.has_function_fnaddr(&alias));
+    }
+
+    /// Two aliases of one graph with distinct `function_fnaddrs` entries:
+    /// `alias_paths` is sorted, and a miss probes that order so the chosen
+    /// alias (and its address) is the lexicographically first every time.
+    #[test]
+    fn alias_paths_are_sorted_and_fnaddr_fallback_is_deterministic() {
+        let later = CallPath::from_segments(["z", "f"]);
+        let earlier = CallPath::from_segments(["a", "f"]);
+        let miss = CallPath::from_segments(["m", "f"]);
+        let graph = FunctionGraph::new("f");
+
+        let mut store = GraphStore::new();
+        store.insert(later.clone(), graph.clone());
+        store.insert(earlier.clone(), graph.clone());
+        store.share_path(miss.clone(), &later);
+        assert_eq!(
+            store.alias_paths(&later),
+            vec![earlier.clone(), miss.clone(), later.clone()]
+        );
+        assert_eq!(store.alias_paths(&miss), store.alias_paths(&earlier));
+
+        let mut cc = CallControl::new();
+        cc.register_function_graph(later.clone(), graph.clone());
+        cc.register_function_graph(earlier.clone(), graph);
+        cc.function_graphs.share_path(miss.clone(), &later);
+        cc.register_function_fnaddr(later.clone(), 0xB);
+        cc.register_function_fnaddr(earlier.clone(), 0xA);
+        assert_eq!(cc.lookup_function_fnaddr(&later), Some(0xB));
+        assert_eq!(cc.lookup_function_fnaddr(&earlier), Some(0xA));
+        assert_eq!(cc.lookup_function_fnaddr(&miss), Some(0xA));
+        let binding = cc.fnaddr_binding_for_target(&CallTarget::function_path(["m", "f"]));
+        assert_eq!(binding.path, earlier.canonical_key());
+        assert_eq!(binding.addr, 0xA);
+        assert!(!binding.symbolic);
     }
 
     #[test]
