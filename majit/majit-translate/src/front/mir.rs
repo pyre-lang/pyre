@@ -5778,16 +5778,40 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::from_raw_parts::rewire_from_raw_parts_sites(&mut lo.graph);
         // Word-sized `saturating_add` clamp (`front::saturating_add`) splits
         // the residual call into `sum = a + b; if uint_lt(sum, a) { Unsigned
-        // max } else { sum }`.  `int_add` is its own op, so the sites live on
-        // `saturating_add_sites`, not `saturating_sub_sites`.  No new
-        // unreachable blocks (both arms forward to the original
-        // continuation), so the sweep gate below does not need the count.
-        let _saturating_add_rewritten = if lo.saturating_add_sites.is_empty() {
+        // max } else { sum }`.  Signed `{i64,isize}` is `add_ovf` +
+        // LastException MIN/MAX select.  `int_add` is its own op, so the
+        // sites live on `saturating_add_sites`, not `saturating_sub_sites`.
+        let saturating_add_rewritten = if lo.saturating_add_sites.is_empty() {
             0
         } else {
             crate::front::saturating_add::rewire_saturating_add_call_sites(
                 &mut lo.graph,
                 &lo.saturating_add_sites,
+            )
+        };
+        if !lo.char_len_utf8_sites.is_empty() {
+            crate::front::char_len_utf8::rewire_char_len_utf8_call_sites(
+                &mut lo.graph,
+                &lo.char_len_utf8_sites,
+            );
+        }
+        if !lo.is_ascii_whitespace_sites.is_empty() {
+            crate::front::is_ascii_whitespace::rewire_is_ascii_whitespace_call_sites(
+                &mut lo.graph,
+                &lo.is_ascii_whitespace_sites,
+            );
+        }
+        let div_ceil_rewritten = if lo.div_ceil_sites.is_empty() {
+            0
+        } else {
+            crate::front::div_ceil::rewire_div_ceil_call_sites(&mut lo.graph, &lo.div_ceil_sites)
+        };
+        let char_from_u32_rewritten = if lo.char_from_u32_sites.is_empty() {
+            0
+        } else {
+            crate::front::char_from_u32::rewire_char_from_u32_call_sites(
+                &mut lo.graph,
+                &lo.char_from_u32_sites,
             )
         };
         // Word-sized `saturating_mul` clamp (`front::saturating_mul`) splits
@@ -5978,7 +6002,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
             || slice_is_ascii_rewritten > 0
+            || saturating_add_rewritten > 0
             || saturating_sub_rewritten > 0
+            || div_ceil_rewritten > 0
+            || char_from_u32_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
             || expect_rewritten > 0
@@ -9055,15 +9082,28 @@ struct Lowering<'a> {
     /// `front::slice_ascii` post-pass applies after body lowering (see
     /// [`crate::front::slice_ascii::SliceIsAsciiSite`]).
     slice_is_ascii_sites: Vec<crate::front::slice_ascii::SliceIsAsciiSite>,
-    /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
-    /// diamond (`if a < b { 0 } else { a - b }`) the
+    /// `{uN}::saturating_sub(a, b)` and signed `{i64,isize}::saturating_sub`
+    /// call sites recorded for the clamp diamond the
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
     /// [`crate::front::saturating_sub::SaturatingSubSite`]).
     saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
-    /// Word-sized `{usize,u64}::saturating_add(a, b)` call sites. `int_add`
-    /// is a separate op from `int_sub`, so these are not stored on
+    /// Word-sized `{usize,u64}::saturating_add(a, b)` and signed
+    /// `{i64,isize}::saturating_add(a, b)` call sites. `int_add` is a
+    /// separate op from `int_sub`, so these are not stored on
     /// `saturating_sub_sites`.
     saturating_add_sites: Vec<crate::front::saturating_add::SaturatingAddSite>,
+    /// `char::len_utf8(c)` call sites recorded for the four-term UTF-8
+    /// length sum `front::char_len_utf8` splices in place.
+    char_len_utf8_sites: Vec<crate::front::char_len_utf8::CharLenUtf8Site>,
+    /// `u8::is_ascii_whitespace(b)` call sites recorded for the five-eq
+    /// OR `front::is_ascii_whitespace` splices in place.
+    is_ascii_whitespace_sites: Vec<crate::front::is_ascii_whitespace::IsAsciiWhitespaceSite>,
+    /// Unsigned `{uN,usize}::div_ceil(a, b)` call sites recorded for the
+    /// quot/rem diamond `front::div_ceil` synthesizes.
+    div_ceil_sites: Vec<crate::front::div_ceil::DivCeilSite>,
+    /// `char::from_u32(x)` call sites recorded for the Unicode-scalar
+    /// Option diamond `front::char_from_u32` synthesizes.
+    char_from_u32_sites: Vec<crate::front::char_from_u32::CharFromU32Site>,
     /// Word-sized `{u64,usize}::saturating_mul(a, b)` call results recorded
     /// for the unsigned high-word clamp diamond `front::saturating_mul`
     /// synthesizes after body lowering.
@@ -9896,6 +9936,10 @@ impl<'a> Lowering<'a> {
             slice_is_ascii_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
             saturating_add_sites: Vec::new(),
+            char_len_utf8_sites: Vec::new(),
+            is_ascii_whitespace_sites: Vec::new(),
+            div_ceil_sites: Vec::new(),
+            char_from_u32_sites: Vec::new(),
             saturating_mul_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
@@ -15198,21 +15242,22 @@ impl<'a> Lowering<'a> {
                                     end: arg_vars[1].clone(),
                                 },
                             );
-                            // Word-sized signed exclusive `(a..b).contains(&x)`
-                            // — the same I64/Isize gate as RangeInclusive.
-                            // Captured here because exclusive Range is a
-                            // struct aggregate, not a `new` call.  The
-                            // contains post-pass pairs this with
-                            // `Range::contains` and is consumer-gated, so
-                            // a for-loop / slice-index range stays the
-                            // ordinary ctor + FieldWrite path.
-                            if tyref_is_int_range(dest_ty, self.llbc) {
+                            // Scalar exclusive `(a..b).contains(&x)` — the
+                            // same element gate as RangeInclusive.  Captured
+                            // here because exclusive Range is a struct
+                            // aggregate, not a `new` call.  The contains
+                            // post-pass pairs this with `Range::contains`
+                            // and is consumer-gated, so a for-loop /
+                            // slice-index range stays the ordinary ctor +
+                            // FieldWrite path.
+                            if let Some(elem) = tyref_is_int_range(dest_ty, self.llbc) {
                                 self.range_inclusive_new_sites.push(
                                     crate::front::range_contains::RangeInclusiveNewSite {
                                         result_var: res.clone(),
                                         lo: arg_vars[0].clone(),
                                         hi: arg_vars[1].clone(),
                                         exclusive: true,
+                                        elem,
                                     },
                                 );
                             }
@@ -20958,9 +21003,11 @@ impl<'a> Lowering<'a> {
                 // (`ctypeprim.W_CTypePrimitive`); a helper with a graph is
                 // `guess_call_kind` → `'regular'` (`call.py`) → `inline_call`.
                 if let Some((lo, hi)) = promoted_int_range_inclusive_bounds(self.llbc, id)
-                    && tyref_is_int_range_inclusive(&place_ty, self.llbc)
+                    && let Some(elem) = tyref_is_int_range_inclusive(&place_ty, self.llbc)
                 {
-                    return Ok(self.emit_promoted_int_range_inclusive(mir_bb, lo, hi, &place_ty));
+                    return Ok(
+                        self.emit_promoted_int_range_inclusive(mir_bb, lo, hi, &place_ty, elem)
+                    );
                 }
                 let segments = self.global_segments(mir_bb, id)?;
                 // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
@@ -22086,6 +22133,7 @@ impl<'a> Lowering<'a> {
         lo: i64,
         hi: i64,
         place_ty: &TyRef,
+        elem: crate::front::range_contains::RangeContainsElem,
     ) -> Variable {
         let bb_id = self.block_id[mir_bb];
         let lo_v = self
@@ -22128,6 +22176,7 @@ impl<'a> Lowering<'a> {
                 lo: lo_v,
                 hi: hi_v,
                 exclusive: false,
+                elem,
             });
         res
     }
@@ -30576,11 +30625,13 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
-        // Word-sized `{u64,usize}::saturating_add`.  Narrow unsigned
-        // saturating add is not a word carry (`u32::MAX + 1` does not wrap
-        // in the word bank), so the dest atom is required here — the same
-        // width gate as unsigned `checked_add`.  `int_add` is recorded on
-        // its own site list; the sub pass never sees these producers.
+        // Word-sized `{u64,usize}::saturating_add`, or signed
+        // `{i64,isize}::saturating_add`.  Narrow unsigned saturating add
+        // is not a word carry (`u32::MAX + 1` does not wrap in the word
+        // bank), so the dest atom is required here — the same width gate
+        // as unsigned `checked_add`.  Signed uses `add_ovf` at the JIT
+        // int-bank width.  `int_add` is recorded on its own site list;
+        // the sub pass never sees these producers.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -30588,14 +30639,26 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_add"])
-            && self
+        {
+            if self
                 .tyref_literal_uint_atom(&call.dest.ty)
                 .is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom)
-        {
-            self.saturating_add_sites
-                .push(crate::front::saturating_add::SaturatingAddSite {
-                    result_var: result_var.clone(),
-                });
+            {
+                self.saturating_add_sites
+                    .push(crate::front::saturating_add::SaturatingAddSite {
+                        result_var: result_var.clone(),
+                        signed: false,
+                    });
+            } else if self
+                .tyref_literal_int_atom(&call.dest.ty)
+                .is_some_and(crate::front::checked_arith::is_ovf_width_int_atom)
+            {
+                self.saturating_add_sites
+                    .push(crate::front::saturating_add::SaturatingAddSite {
+                        result_var: result_var.clone(),
+                        signed: true,
+                    });
+            }
         }
         // Word-sized `{u64,usize}::saturating_mul`.  Narrow unsigned
         // saturating mul is not a word high-word test (`u32::MAX *
@@ -30862,9 +30925,8 @@ impl<'a> Lowering<'a> {
         // keeps the raw `FunctionPath` segments), residualized as an
         // unregistered callee the rtyper census Skips.  Restricted to unsigned
         // receivers (every observed site is `usize`/`u16`/`u32`): the clamp
-        // floors at zero via `a < b`; a signed `saturating_sub` floors at
-        // `TYPE_MIN` (a different diamond) and stays residual.  A resolution
-        // miss leaves the residual call.
+        // floors at zero via `a < b`; signed `i64`/`isize` uses `sub_ovf`
+        // + MIN/MAX.  A resolution miss leaves the residual call.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -30887,10 +30949,8 @@ impl<'a> Lowering<'a> {
         // (`call.dest.ty`), which is present even when the bounds are
         // literal constants — the common `(0..=255)` shape passes
         // `Operand::Const` bounds, so gating the operand types instead
-        // would miss them.  A float / narrower-width range never records a
-        // site and declines cleanly (both calls stay residual, census
-        // Skip).  The op is still emitted normally; the post-pass removes
-        // it once the paired `contains` folds.
+        // would miss them.  The op is still emitted normally; the
+        // post-pass removes it once the paired `contains` folds.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -30898,7 +30958,7 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && fmt_path_ends_with(segments, &["range", "RangeInclusive", "new"])
-            && tyref_is_int_range_inclusive(&call.dest.ty, self.llbc)
+            && let Some(elem) = tyref_is_int_range_inclusive(&call.dest.ty, self.llbc)
         {
             self.range_inclusive_new_sites.push(
                 crate::front::range_contains::RangeInclusiveNewSite {
@@ -30906,6 +30966,7 @@ impl<'a> Lowering<'a> {
                     lo: args[0].clone().into_variable(),
                     hi: args[1].clone().into_variable(),
                     exclusive: false,
+                    elem,
                 },
             );
         }
@@ -30916,10 +30977,9 @@ impl<'a> Lowering<'a> {
         // `["range", "RangeInclusive", "contains"]`, NOT a
         // `CallTarget::Method`.  Gate on the receiver operand type
         // (`first_arg_ty`) resolving to the opaque `RangeInclusive` ADT
-        // over an int element so a same-named `contains` on any other type
-        // — or a float range — is never recorded; the post-pass pairs each
-        // recorded site with its producing `new` and declines on any
-        // structural mismatch.
+        // over a scalar element so a same-named `contains` on any other
+        // type is never recorded; the post-pass pairs each recorded site
+        // with its producing `new` and declines on any structural mismatch.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -30929,7 +30989,8 @@ impl<'a> Lowering<'a> {
             && fmt_path_ends_with(segments, &["range", "RangeInclusive", "contains"])
             && first_arg_ty
                 .as_ref()
-                .is_some_and(|t| tyref_is_int_range_inclusive(t, self.llbc))
+                .and_then(|t| tyref_is_int_range_inclusive(t, self.llbc))
+                .is_some()
         {
             self.range_contains_sites
                 .push(crate::front::range_contains::RangeContainsSite {
@@ -30942,10 +31003,9 @@ impl<'a> Lowering<'a> {
         // `CallTarget::Method { name: "contains" }` (receiver `args[0]`,
         // value `args[1]`).  A FunctionPath spelling ending
         // `["range", "Range", "contains"]` is recorded too.  Gate on the
-        // receiver resolving to `Range` over I64/Isize — the same
-        // element types as RangeInclusive — so a float range, a
-        // narrower-width range, and a same-named `contains` on any other
-        // type are never recorded.
+        // receiver resolving to `Range` over a scalar element — the same
+        // element types as RangeInclusive — so a same-named `contains` on
+        // any other type is never recorded.
         if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && match target {
@@ -30957,11 +31017,90 @@ impl<'a> Lowering<'a> {
             }
             && first_arg_ty
                 .as_ref()
-                .is_some_and(|t| tyref_is_int_range(t, self.llbc))
+                .and_then(|t| tyref_is_int_range(t, self.llbc))
+                .is_some()
         {
             self.range_contains_sites
                 .push(crate::front::range_contains::RangeContainsSite {
                     result_var: result_var.clone(),
+                });
+        }
+        // Capture `char::len_utf8(c)` for the four-term UTF-8 length sum
+        // `front::char_len_utf8` splices in place.  Opaque core; a miss
+        // leaves the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && fmt_path_ends_with(segments, &["char", "methods", "<Impl>", "len_utf8"])
+        {
+            self.char_len_utf8_sites
+                .push(crate::front::char_len_utf8::CharLenUtf8Site {
+                    result_var: result_var.clone(),
+                });
+        }
+        // Capture `u8::is_ascii_whitespace(b)` for the five-eq OR
+        // `front::is_ascii_whitespace` splices in place.  Only the `u8`
+        // inherent method exists; a non-`U8` receiver is left residual.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && fmt_path_ends_with(segments, &["num", "<Impl>", "is_ascii_whitespace"])
+            && first_arg_ty.as_ref().is_some_and(|ty| {
+                self.tyref_literal_uint_atom(ty) == Some("U8")
+                    || self
+                        .tyref_peel_ref_to_pointee(ty)
+                        .is_some_and(|peeled| self.tyref_literal_uint_atom(&peeled) == Some("U8"))
+            })
+        {
+            self.is_ascii_whitespace_sites.push(
+                crate::front::is_ascii_whitespace::IsAsciiWhitespaceSite {
+                    result_var: result_var.clone(),
+                },
+            );
+        }
+        // Capture unsigned `{uN,usize}::div_ceil(a, b)` for the quot/rem
+        // diamond `front::div_ceil` synthesizes.  Signed `div_ceil` stays
+        // residual.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["num", "<Impl>", "div_ceil"])
+            && self.tyref_literal_uint_atom(&call.dest.ty).is_some()
+        {
+            self.div_ceil_sites
+                .push(crate::front::div_ceil::DivCeilSite {
+                    result_var: result_var.clone(),
+                });
+        }
+        // Capture `char::from_u32(x)` for the Unicode-scalar Option
+        // diamond `front::char_from_u32` synthesizes.  A destination that
+        // is not a resolvable `Option` leaves the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && fmt_path_ends_with(segments, &["char", "methods", "<Impl>", "from_u32"])
+            && let Some((option_owner, some_owner, payload_ty)) = self
+                .resolve_bool_then_option_dest(dest_class_ty)
+                .or_else(|| self.resolve_bool_then_option_dest(&call.dest.ty))
+        {
+            self.char_from_u32_sites
+                .push(crate::front::char_from_u32::CharFromU32Site {
+                    result_var: result_var.clone(),
+                    option_owner,
+                    some_owner,
+                    payload_ty,
                 });
         }
         // Capture `Option::unwrap_or(opt, default)` /
@@ -37234,20 +37373,31 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve a recognized `{uN}::saturating_sub(a, b)` call into a
-    /// [`crate::front::saturating_sub::SaturatingSubSite`].  Gated on an
-    /// **unsigned** result type (`saturating_sub` returns the receiver `uN`):
-    /// the unsigned clamp floors at zero via `a < b`.  A signed `saturating_sub`
-    /// floors at `TYPE_MIN` (a different diamond) and is left residual (`None`).
+    /// Resolve a recognized `{uN}` / `{i64,isize}::saturating_sub(a, b)`
+    /// call into a [`crate::front::saturating_sub::SaturatingSubSite`].
+    /// Unsigned floors at zero via `a < b`; signed `i64`/`isize` uses
+    /// `sub_ovf` + MIN/MAX.  A narrower signed width is left residual.
     fn recognize_saturating_sub_site(
         &self,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::saturating_sub::SaturatingSubSite> {
-        self.tyref_literal_uint_atom(dest_ty)?;
-        Some(crate::front::saturating_sub::SaturatingSubSite {
-            result_var: result_var.clone(),
-        })
+        if self.tyref_literal_uint_atom(dest_ty).is_some() {
+            return Some(crate::front::saturating_sub::SaturatingSubSite {
+                result_var: result_var.clone(),
+                signed: false,
+            });
+        }
+        if self
+            .tyref_literal_int_atom(dest_ty)
+            .is_some_and(crate::front::checked_arith::is_ovf_width_int_atom)
+        {
+            return Some(crate::front::saturating_sub::SaturatingSubSite {
+                result_var: result_var.clone(),
+                signed: true,
+            });
+        }
+        None
     }
 
     /// Resolve a recognized `Option::unwrap_or(opt, default)` /
@@ -60508,26 +60658,21 @@ fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
         })
 }
 
-/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
-/// `adt_path` whose sole element type is a word-sized signed integer
-/// (`I64` / `Isize`).  `require_opaque` is the RangeInclusive extraction
-/// shape; exclusive `Range` is a struct ADT and must not require it.
+/// The compare family of `ty`'s sole type argument when `ty` (after
+/// stripping `&`/`&mut`/`*` wrappers) resolves to `adt_path`.
+/// `require_opaque` is the RangeInclusive extraction shape; exclusive
+/// `Range` is a struct ADT and must not require it.
 fn tyref_is_word_signed_range_adt(
     ty: &TyRef,
     llbc: &Llbc,
     adt_path: &str,
     require_opaque: bool,
-) -> bool {
-    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return false;
-    };
-    let Some(adt) = node
+) -> Option<crate::front::range_contains::RangeContainsElem> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let adt = node
         .as_object()
         .and_then(|m| m.get("Adt"))
-        .and_then(|v| v.as_object())
-    else {
-        return false;
-    };
+        .and_then(|v| v.as_object())?;
     let is_range = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
@@ -60535,44 +60680,69 @@ fn tyref_is_word_signed_range_adt(
                 && td.item_meta.name_path() == adt_path
         });
     if !is_range {
-        return false;
+        return None;
     }
     let elem = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())
         .and_then(|t| t.first())
-        .and_then(|n| strip_ty_wrappers(n, llbc));
-    matches!(
-        elem.and_then(|e| e.as_object())
-            .and_then(|m| m.get("Scalar"))
-            .and_then(|l| l.get("Integer"))
-            .and_then(|l| l.get("Signed"))
-            .and_then(serde_json::Value::as_str),
-        Some("I64" | "Isize")
-    )
+        .and_then(|n| strip_ty_wrappers(n, llbc))?;
+    range_contains_elem_of_ty_node(elem)
 }
 
-/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
-/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
-/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
-/// both the `new` and the `contains` recording of the
+fn range_contains_elem_of_ty_node(
+    node: &serde_json::Value,
+) -> Option<crate::front::range_contains::RangeContainsElem> {
+    use crate::front::range_contains::RangeContainsElem;
+    let scalar = node.as_object()?.get("Scalar")?;
+    let obj = scalar.as_object()?;
+    if let Some(int) = obj.get("Integer").and_then(serde_json::Value::as_object) {
+        if let Some(s) = int.get("Signed").and_then(serde_json::Value::as_str) {
+            return match s {
+                "I8" | "I16" | "I32" | "I64" | "Isize" => Some(RangeContainsElem::Signed),
+                _ => None,
+            };
+        }
+        if let Some(u) = int.get("Unsigned").and_then(serde_json::Value::as_str) {
+            return match u {
+                "U8" | "U16" | "U32" | "U64" | "Usize" => Some(RangeContainsElem::Unsigned),
+                _ => None,
+            };
+        }
+    }
+    if let Some(f) = obj.get("Float").and_then(serde_json::Value::as_str) {
+        return match f {
+            "F32" | "F64" => Some(RangeContainsElem::Float),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// The compare family when `ty` resolves to the foreign opaque
+/// `core::ops::range::RangeInclusive` ADT over a scalar element.
+/// Gates both the `new` and the `contains` recording of the
 /// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
-/// type — and a float / narrower-width range — is never folded to
-/// integer compares.  The element type is read from the ADT reference's
-/// `generics.types[0]`, so it is available even when the `new` bounds are
-/// literal constants (whose operand types the front does not carry);
-/// float ranges decline cleanly (both calls stay residual, census Skip).
-fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+/// type is never folded.  The element type is read from the ADT
+/// reference's `generics.types[0]`, so it is available even when the
+/// `new` bounds are literal constants (whose operand types the front
+/// does not carry).
+fn tyref_is_int_range_inclusive(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<crate::front::range_contains::RangeContainsElem> {
     tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::RangeInclusive", true)
 }
 
-/// True when `ty` resolves to exclusive `core::ops::range::Range` over
-/// `I64` / `Isize` — the same integer element gate as
-/// [`tyref_is_int_range_inclusive`].  Exclusive Range is a struct ADT
-/// (not Opaque).  Float exclusive ranges decline the same way inclusive
-/// float ranges do.
-fn tyref_is_int_range(ty: &TyRef, llbc: &Llbc) -> bool {
+/// The compare family when `ty` resolves to exclusive
+/// `core::ops::range::Range` over a scalar element — the same element
+/// gate as [`tyref_is_int_range_inclusive`].  Exclusive Range is a
+/// struct ADT (not Opaque).
+fn tyref_is_int_range(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<crate::front::range_contains::RangeContainsElem> {
     tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::Range", false)
 }
 
@@ -83108,10 +83278,9 @@ mod tests {
     }
 
     /// The float range in `complex_pow` (`descroperation.rs`,
-    /// `(-100.0..=100.0)`) is out of the int-only fold's scope: the
-    /// element gate rejects the `F64` type, so BOTH residual range calls
-    /// survive (the graph census-Skips as before — no regression, no
-    /// float→int miscompile).  Ignored by default (loads the real LLBC).
+    /// `(-100.0..=100.0)`) folds to the two-compare expansion (`le` +
+    /// `ge` + `bitand`), not `int_between`.  Ignored by default (loads
+    /// the real LLBC).
     #[test]
     #[ignore]
     fn range_contains_fold_real_declines_float_range() {
@@ -83138,14 +83307,37 @@ mod tests {
                 })
                 .count()
         };
-        assert!(
-            range_call("new") >= 1,
-            "float range constructor stays residual (fold out of scope)"
+        let binop = |name: &str| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == name))
+                .count()
+        };
+        let int_between = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "int_between"
+                )
+            })
+            .count();
+        assert_eq!(
+            range_call("new"),
+            0,
+            "float RangeInclusive::new is folded away"
         );
-        assert!(
-            range_call("contains") >= 1,
-            "float range contains stays residual (fold out of scope)"
+        assert_eq!(
+            range_call("contains"),
+            0,
+            "float RangeInclusive::contains is folded away"
         );
+        assert_eq!(int_between, 0, "float must not use int_between");
+        assert!(binop("le") >= 1 && binop("ge") >= 1 && binop("bitand") >= 1);
     }
 
     /// Exclusive `(1..EXACT_FLOAT_INT).contains(&n)` in
@@ -83205,11 +83397,9 @@ mod tests {
         );
     }
 
-    /// Exclusive float `Range<f64>::contains` is out of the int-only
-    /// fold's scope, the same element gate as RangeInclusive float.
     /// `__majit_wrap_math_asin` is `(-1.0..=1.0)` (inclusive float) and
-    /// stays residual; no exclusive float Range is rewritten to integer
-    /// compares.  Ignored by default (loads the real module LLBC).
+    /// folds to the two-compare expansion; no exclusive `Range::contains`
+    /// is present.  Ignored by default (loads the real module LLBC).
     #[test]
     #[ignore]
     fn range_contains_fold_real_declines_float_exclusive_range() {
@@ -83250,14 +83440,35 @@ mod tests {
                 )
             })
             .count();
+        let binop = |name: &str| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == name))
+                .count()
+        };
+        let int_between = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "int_between"
+                )
+            })
+            .count();
         assert_eq!(
             exclusive_contains, 0,
             "asin has no exclusive Range::contains (float pin is RangeInclusive)"
         );
-        assert!(
-            inclusive_contains >= 1,
-            "float RangeInclusive::contains stays residual (fold out of scope)"
+        assert_eq!(
+            inclusive_contains, 0,
+            "float RangeInclusive::contains is folded away"
         );
+        assert_eq!(int_between, 0, "float must not use int_between");
+        assert!(binop("le") >= 1 && binop("ge") >= 1 && binop("bitand") >= 1);
     }
 
     /// `formatting::char_arg` narrows its BigInt to `u32`, not `i64`.  The
