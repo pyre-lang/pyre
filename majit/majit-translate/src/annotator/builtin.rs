@@ -42,15 +42,6 @@
 //!
 //! # Deferred entries
 //!
-//! A few upstream analysers require rtyper-phase machinery that has
-//! not landed yet. They are registered but return
-//! `AnnotatorError::new("<name>: rtyper-phase only")` so
-//! `simplify_graph` paths that accidentally dispatch through them fail
-//! loudly instead of silently annotating as `SomeObject`:
-//!
-//! * `rpython.rlib.objectmodel.hlinvoke` — needs
-//!   `rpython.rtyper.llannotation.lltype_to_annotation` and
-//!   `rpython.rtyper.rmodel.Repr`.
 //! * `unicodedata.decimal` — deliberately errors at annotation time
 //!   (matches upstream `builtin.py:300-303`).
 
@@ -2699,19 +2690,64 @@ fn r_dict_helper(
     Ok(SomeValue::Dict(SomeDict::new(dictdef)))
 }
 
-/// Upstream `robjmodel_hlinvoke(...)` (builtin.py).
+/// Upstream `robjmodel_hlinvoke(s_repr, s_llcallable, *args_s)` (builtin.py).
 ///
-/// rtyper-phase only — consumes `rmodel.Repr`, `TyperError`,
-/// `lltype_to_annotation`. Returns a clear `AnnotatorError` until the
-/// rtyper bridge lands.
+/// Reads the constant `Repr` (`s_repr.const`), walks
+/// `get_r_implfunc` / `get_s_signatures`, then returns
+/// `lltype_to_annotation(r_func.rtyper.getrepr(s_ret).lowleveltype)`.
 pub fn robjmodel_hlinvoke(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[Option<SomeValue>],
+    args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    Err(AnnotatorError::new(
-        "hlinvoke: rtyper-phase only, not supported in annotator",
-    ))
+    use crate::flowspace::argument::CallShape;
+    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+    use crate::translator::rtyper::rbuiltin::repr_from_const;
+
+    let s_repr = arg_at(args_s, 0, "hlinvoke");
+    if !s_repr.is_constant() {
+        return Err(AnnotatorError::new(
+            "hlinvoke expects a constant repr as first argument",
+        ));
+    }
+    let const_value = s_repr
+        .const_()
+        .ok_or_else(|| AnnotatorError::new("hlinvoke expects a constant repr as first argument"))?;
+    let r_callable = repr_from_const(const_value)
+        .ok_or_else(|| AnnotatorError::new("hlinvoke expects a constant repr as first argument"))?;
+    let (r_func, nimplicitarg) = r_callable
+        .get_r_implfunc()
+        .map_err(|e| AnnotatorError::new(e.to_string()))?;
+    // `s_llcallable` is args_s[1]; extra args start at 2.
+    // upstream: `nbargs = len(args_s) + nimplicitarg` where `*args_s`
+    // is everything after `s_llcallable`.
+    if args_s.len() < 2 {
+        return Err(AnnotatorError::new("hlinvoke: missing callable argument"));
+    }
+    let extra = args_s.len() - 2;
+    let nbargs = extra + nimplicitarg;
+    let shape = CallShape {
+        shape_cnt: nbargs,
+        shape_keys: Vec::new(),
+        shape_star: false,
+    };
+    let s_sigs = r_func
+        .get_s_signatures(&shape)
+        .map_err(|e| AnnotatorError::new(e.to_string()))?;
+    if s_sigs.len() != 1 {
+        return Err(AnnotatorError::new(format!(
+            "cannot hlinvoke callable {} with not uniform annotations: {s_sigs:?}",
+            r_callable.repr_string()
+        )));
+    }
+    let s_ret = s_sigs[0].1.clone();
+    let rtyper = r_func
+        .rtyper()
+        .ok_or_else(|| AnnotatorError::new("hlinvoke: r_func.rtyper is not attached"))?;
+    let rresult = rtyper
+        .getrepr(&s_ret)
+        .map_err(|e| AnnotatorError::new(e.to_string()))?;
+    Ok(lltype_to_annotation(rresult.lowleveltype().clone()))
 }
 
 /// Upstream `robjmodel_keepalive_until_here(*args_s)` (builtin.py).
@@ -3144,6 +3180,7 @@ mod tests {
         assert!(is_registered("majit_rlib.jit.conditional_call1"));
         assert!(is_registered("majit_rlib.jit.conditional_call_elidable1"));
         assert!(is_registered("rpython.rlib.objectmodel.instantiate"));
+        assert!(is_registered("rpython.rlib.objectmodel.hlinvoke"));
         assert!(is_registered("weakref.ref"));
         assert!(is_registered("pdb.set_trace"));
     }
@@ -4387,6 +4424,7 @@ mod tests {
             // `flowspace/model.rs::populate_host_env::register_r_uint`.
             ("rpython.rlib.objectmodel", "keepalive_until_here"),
             ("rpython.rlib.objectmodel", "free_non_gc_object"),
+            ("rpython.rlib.objectmodel", "hlinvoke"),
             ("rpython.rtyper.lltypesystem.lltype", "cast_ptr_to_int"),
             ("rpython.rtyper.lltypesystem.lltype", "cast_int_to_ptr"),
             ("rpython.rtyper.lltypesystem.lltype", "direct_ptradd"),

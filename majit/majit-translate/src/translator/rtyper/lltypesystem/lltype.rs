@@ -4105,6 +4105,19 @@ impl Struct {
         Self::_build(name, fields, GcKind::Gc, vec![], hints, true)
     }
 
+    /// `GcStruct(name, *fields, adtmeths={...}, hints={...})`.
+    /// `get_ll_dict` (`rordereddict.py`) installs both the `dict` hint
+    /// and the `keyhash` / `keyeq` / `r_rdict_eqfn` / `r_rdict_hashfn` /
+    /// `paranoia` adtmeths on the same `dicttable` struct.
+    pub fn gc_with_adtmeths_and_hints(
+        name: &str,
+        fields: Vec<(String, ConcretetypePlaceholder)>,
+        adtmeths: Vec<(String, ConstValue)>,
+        hints: Vec<(String, ConstValue)>,
+    ) -> Self {
+        Self::_build(name, fields, GcKind::Gc, adtmeths, hints, true)
+    }
+
     /// `GcStruct(name, *fields, rtti=True)` — upstream
     /// `RttiStruct._install_extras(rtti=True)` (`lltype.py`) mints
     /// an `_opaque` of type `RuntimeTypeInfo` with `_name` = the struct

@@ -134,14 +134,14 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///
 ///   * rbuiltin.py — `min` / `max` landed (`ll_min` / `ll_max`
 ///     helper graphs keyed per argument lltype).
-///   * rbuiltin.py — `reversed` (need `Repr::newiter` trait
-///     method + iterator repr family)
+///   * rbuiltin.py — `reversed` registered (`rtype_builtin_reversed`
+///     via `Repr::newiter`).
 ///   * rbuiltin.py — `object.__init__` is trivial and landed.
 ///     `EnvironmentError.__init__` stores `errno` / `strerror` /
 ///     `filename` through `InstanceRepr::setfield`.
 ///     `WindowsError.__init__` stores `winerror` the same way.
-///   * rbuiltin.py — `objectmodel.hlinvoke` (PBC-callable
-///     dispatch)
+///   * rbuiltin.py — `objectmodel.hlinvoke` landed (`rtype_hlinvoke`
+///     plus `robjmodel_hlinvoke`).
 ///   * rbuiltin.py — `range` / `xrange` / `enumerate`
 ///     (delegate to ported `rrange.py`)
 ///   * rbuiltin.py — `lltype.malloc` / `free` family fully
@@ -188,9 +188,9 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///   * rbuiltin.py — `objectmodel.instantiate` (PBC handling +
 ///     `rclass.rtype_new_instance`)
 ///   * rbuiltin.py — `OrderedDict` / `objectmodel.r_dict` /
-///     `objectmodel.r_ordereddict` lower through
-///     `OrderedDictRepr::ll_newdict` and, when `custom_eq_hash`,
-///     store `fnkeyeq` / `fnkeyhash`.
+///     `objectmodel.r_ordereddict` registered (`rtype_dict_constructor`
+///     via `OrderedDictRepr::ll_newdict`; `custom_eq_hash` stores
+///     `fnkeyeq` / `fnkeyhash`).
 ///   * rbuiltin.py — weakref family low-level path
 ///     (`weakref_create/deref`, `cast_ptr_to_weakrefptr`,
 ///     `cast_weakrefptr_to_ptr` — ported; high-level `BaseWeakRefRepr`
@@ -230,6 +230,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("min", rtype_builtin_min),
         // rbuiltin.py:246-250
         ("max", rtype_builtin_max),
+        // rbuiltin.py `typer_for(reversed)`
+        ("reversed", rtype_builtin_reversed),
         // rbuiltin.py:709-715
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
@@ -316,6 +318,18 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ),
         // rbuiltin.py
         ("rpython.rlib.objectmodel", "instantiate", rtype_instantiate),
+        // rbuiltin.py `typer_for(objectmodel.hlinvoke)`
+        ("rpython.rlib.objectmodel", "hlinvoke", rtype_hlinvoke),
+        // rbuiltin.py `typer_for(objectmodel.r_dict)` /
+        // `typer_for(objectmodel.r_ordereddict)`
+        ("rpython.rlib.objectmodel", "r_dict", rtype_dict_constructor),
+        (
+            "rpython.rlib.objectmodel",
+            "r_ordereddict",
+            rtype_dict_constructor,
+        ),
+        // rbuiltin.py `typer_for(OrderedDict)` (`from collections import OrderedDict`)
+        ("collections", "OrderedDict", rtype_dict_constructor),
         // rbuiltin.py — `rtype_const_result` is registered for
         // four upstream callables.  `front::mir` synthesises the
         // production dispatch path; these entries keep the registry
@@ -5539,6 +5553,70 @@ mod tests {
         );
     }
 
+    fn assert_findbltintyper(host: HostObject, expected: BuiltinTyperFn, label: &str) {
+        let f = BuiltinFunctionRepr::new(host)
+            .findbltintyper()
+            .unwrap_or_else(|e| panic!("{label}: findbltintyper: {e}"));
+        assert!(
+            std::ptr::eq(f as *const (), expected as *const ()),
+            "{label} must resolve to the registered typer"
+        );
+    }
+
+    #[test]
+    fn findbltintyper_resolves_reversed() {
+        // rbuiltin.py `typer_for(reversed)` — production dispatch is
+        // `BuiltinFunctionRepr.findbltintyper`, not a direct typer call.
+        let host = HOST_ENV
+            .lookup_builtin("reversed")
+            .expect("HOST_ENV missing builtin `reversed`");
+        assert_findbltintyper(host, rtype_builtin_reversed, "reversed");
+    }
+
+    #[test]
+    fn findbltintyper_resolves_hlinvoke_and_dict_constructors() {
+        // rbuiltin.py `typer_for(objectmodel.hlinvoke)` /
+        // `typer_for(objectmodel.r_dict)` /
+        // `typer_for(objectmodel.r_ordereddict)` /
+        // `typer_for(OrderedDict)`.
+        let hlinvoke = HOST_ENV
+            .import_module("rpython.rlib.objectmodel")
+            .and_then(|m| m.module_get("hlinvoke"))
+            .expect("HOST_ENV missing objectmodel.hlinvoke");
+        assert_findbltintyper(hlinvoke, rtype_hlinvoke, "objectmodel.hlinvoke");
+        for (module, attr, label) in [
+            ("rpython.rlib.objectmodel", "r_dict", "objectmodel.r_dict"),
+            (
+                "rpython.rlib.objectmodel",
+                "r_ordereddict",
+                "objectmodel.r_ordereddict",
+            ),
+            ("collections", "OrderedDict", "collections.OrderedDict"),
+        ] {
+            let host = HOST_ENV
+                .import_module(module)
+                .and_then(|m| m.module_get(attr))
+                .unwrap_or_else(|| panic!("HOST_ENV missing {label}"));
+            assert_findbltintyper(host, rtype_dict_constructor, label);
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn findbltintyper_resolves_EnvironmentError_init() {
+        // rbuiltin.py `typer_for(EnvironmentError.__init__)`.  The
+        // HostObject must live in HOST_ENV; `install_default_typers`
+        // skips names that `lookup_builtin` does not return.
+        let host = HOST_ENV
+            .lookup_builtin("EnvironmentError.__init__")
+            .expect("HOST_ENV missing `EnvironmentError.__init__` qualname builtin");
+        assert_findbltintyper(
+            host,
+            rtype_EnvironmentError__init__,
+            "EnvironmentError.__init__",
+        );
+    }
+
     #[test]
     fn install_default_typers_registers_cast_int_to_adr_from_llmemory_module() {
         // rbuiltin.py — `@typer_for(llmemory.cast_int_to_adr)`.
@@ -6668,6 +6746,15 @@ mod tests {
         rtyper: &std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
         with_signature: bool,
     ) -> std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> {
+        hlinvoke_function_n_args(ann, rtyper, with_signature, 0)
+    }
+
+    fn hlinvoke_function_n_args(
+        ann: &std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        rtyper: &std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        with_signature: bool,
+        n_args: usize,
+    ) -> std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> {
         use crate::annotator::description::{CallTableRow, DescEntry, FunctionDesc};
         use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
         use crate::flowspace::argument::Signature;
@@ -6678,18 +6765,27 @@ mod tests {
         use std::cell::{Cell, RefCell};
         use std::rc::Rc;
 
+        let arg_names: Vec<String> = (0..n_args).map(|i| format!("a{i}")).collect();
         let fd = Rc::new(RefCell::new(FunctionDesc::new(
             ann.bookkeeper.clone(),
             None,
             "f",
-            Signature::new(Vec::new(), None, None),
+            Signature::new(arg_names.clone(), None, None),
             None,
             None,
         )));
         if with_signature {
             let family = fd.borrow().base.getcallfamily().expect("callfamily");
             let func = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
-            let graph = FunctionGraph::new("f", Block::shared(Vec::new()));
+            let inputs: Vec<crate::flowspace::model::Hlvalue> = (0..n_args)
+                .map(|i| {
+                    let v = crate::flowspace::model::Variable::named(format!("a{i}"));
+                    *v.annotation.borrow_mut() =
+                        Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::default())));
+                    crate::flowspace::model::Hlvalue::Variable(v)
+                })
+                .collect();
+            let graph = FunctionGraph::new("f", Block::shared(inputs));
             {
                 let block = graph.returnblock.borrow();
                 let crate::flowspace::model::Hlvalue::Variable(ret) = &block.inputargs[0] else {
@@ -6701,7 +6797,7 @@ mod tests {
             let py = Rc::new(PyGraph {
                 graph: Rc::new(RefCell::new(graph)),
                 func,
-                signature: RefCell::new(Signature::new(Vec::new(), None, None)),
+                signature: RefCell::new(Signature::new(arg_names, None, None)),
                 defaults: RefCell::new(None),
                 access_directly: Cell::new(false),
             });
@@ -6713,7 +6809,7 @@ mod tests {
             );
             family.borrow_mut().calltables.insert(
                 crate::flowspace::argument::CallShape {
-                    shape_cnt: 0,
+                    shape_cnt: n_args,
                     shape_keys: Vec::new(),
                     shape_star: false,
                 },
@@ -6795,6 +6891,96 @@ mod tests {
                 .iter()
                 .map(|op| op.opname.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_hlinvoke_from_objectmodel_module() {
+        // rbuiltin.py — `@typer_for(objectmodel.hlinvoke)`.
+        let host = HOST_ENV
+            .import_module("rpython.rlib.objectmodel")
+            .and_then(|m| m.module_get("hlinvoke"))
+            .expect("HOST_ENV missing objectmodel.hlinvoke");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `objectmodel.hlinvoke`"
+        );
+    }
+
+    #[test]
+    fn hlinvoke_annotates_and_rtypes_through_the_pipeline() {
+        // Upstream `test_hlinvoke_simple` (`rtyper/test/test_rpbc.py`):
+        // annotate `ll_h(R, f, x): return hlinvoke(R, f, x, 2)` then
+        // `specialize_more_blocks`. The graph is a `simple_call` of the
+        // HOST_ENV `objectmodel.hlinvoke` HostObject — not a hand-built
+        // HighLevelOp.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
+            Variable,
+        };
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let r_fn = hlinvoke_function_n_args(&ann, &rtyper, true, 2);
+
+        let hlinvoke = HOST_ENV
+            .import_module("rpython.rlib.objectmodel")
+            .and_then(|m| m.module_get("hlinvoke"))
+            .expect("HOST_ENV missing objectmodel.hlinvoke");
+
+        let x = Variable::named("x");
+        let startblock = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let graph = FunctionGraph::new("ll_h", startblock.clone());
+        let result = Variable::named("r");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "simple_call",
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(hlinvoke))),
+                Hlvalue::Constant(Constant::new(repr_const(std::sync::Arc::clone(&r_fn)))),
+                Hlvalue::Constant(Constant::new(ConstValue::None)),
+                Hlvalue::Variable(x),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(2))),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(result)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let graph = graph.into_ref();
+
+        let annotated = ann
+            .build_graph_types(
+                &graph,
+                &[Some(SomeValue::Integer(SomeInteger::default()))],
+                true,
+            )
+            .expect("hlinvoke call must annotate");
+        assert!(
+            matches!(annotated, Some(SomeValue::Integer(_))),
+            "robjmodel_hlinvoke result is lltype_to_annotation of the callable return, got {annotated:?}"
+        );
+
+        rtyper
+            .specialize_more_blocks()
+            .expect("hlinvoke call must rtype");
+        let startblock = graph.borrow().startblock.clone();
+        let ops = startblock.borrow().operations.clone();
+        assert!(
+            ops.iter().any(|op| op.opname == "direct_call"),
+            "rtype_hlinvoke dispatch of a constant function emits direct_call, ops={:?}",
+            ops.iter().map(|op| op.opname.as_str()).collect::<Vec<_>>()
         );
     }
 }
