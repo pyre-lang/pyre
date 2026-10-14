@@ -4295,6 +4295,7 @@ pub fn translate_op(
                 CallTarget::Indirect {
                     method_name,
                     trait_root,
+                    ..
                 } => {
                     dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
                 }
@@ -10925,10 +10926,7 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::Indirect {
-                    trait_root: "MyTrait".into(),
-                    method_name: "do_it".into(),
-                },
+                target: crate::model::CallTarget::indirect("MyTrait", "do_it"),
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
             },

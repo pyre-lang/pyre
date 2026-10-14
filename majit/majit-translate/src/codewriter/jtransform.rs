@@ -13877,6 +13877,7 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
         CallTarget::Indirect {
             trait_root,
             method_name,
+            ..
         } => crate::parse::CallPath::from_segments([trait_root.as_str(), method_name.as_str()]),
         CallTarget::UnsupportedExpr => crate::parse::CallPath::from_segments(["<unsupported>"]),
     }

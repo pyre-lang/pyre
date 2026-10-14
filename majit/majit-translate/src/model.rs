@@ -313,6 +313,14 @@ pub enum CallTarget {
     Indirect {
         trait_root: String,
         method_name: String,
+        /// Selected call-family row (`rpbc.py FunctionsPBCRepr.call` /
+        /// `row_of_graphs.values()`), stamped by
+        /// `annotate_access_directly` so discovery and
+        /// `lower_indirect_calls` follow the specialized graphs.
+        /// Transient (`#[serde(skip)]`) — the rtyper rewrite copies it
+        /// onto [`OpKind::IndirectCall::graphs`].
+        #[serde(skip, default)]
+        graphs: Option<Vec<crate::parse::CallPath>>,
     },
     UnsupportedExpr,
 }
@@ -437,6 +445,7 @@ impl CallTarget {
         Self::Indirect {
             trait_root: trait_root.into(),
             method_name: method_name.into(),
+            graphs: None,
         }
     }
 
@@ -600,6 +609,7 @@ impl fmt::Display for CallTarget {
             CallTarget::Indirect {
                 trait_root,
                 method_name,
+                ..
             } => write!(f, "<dyn {trait_root}>::{method_name}"),
             CallTarget::UnsupportedExpr => f.write_str("<unsupported-call-expr>"),
         }

@@ -1142,6 +1142,14 @@ impl CallRegistry {
     /// "create once, share thereafter" contract at
     /// `bookkeeper.py`).
     ///
+    /// Existing-entry identity is [`Self::lookup_registered`] (exact
+    /// key plus `alias` rows), not the stripping [`Self::lookup`].
+    /// `Bookkeeper.getdesc` keys by `Constant(pyobj)` identity; a
+    /// `crate::m::f` spelling is the same callable only when populate
+    /// registered it as an alias (`canonical_dedup_key` /
+    /// `free_function_alias_paths`). Callsite resolution still uses
+    /// [`Self::lookup`].
+    ///
     /// Re-registration with a *different* `Signature` panics — upstream
     /// `description.py FunctionDesc.__init__` binds the signature
     /// to the underlying Python function object once at creation time,
@@ -1151,7 +1159,7 @@ impl CallRegistry {
     /// than silently route the second caller through the first
     /// caller's signature.
     pub fn get_or_register(&self, key: FunctionPathKey, signature: Signature) -> Rc<FunctionEntry> {
-        if let Some(existing) = self.lookup(&key) {
+        if let Some(existing) = self.lookup_registered(&key) {
             assert_eq!(
                 existing.function_desc.borrow().signature,
                 signature,
@@ -1742,6 +1750,57 @@ mod tests {
                 .expect_graph()
                 .unwrap();
             assert!(!Rc::ptr_eq(&g_inst, &g_tuple));
+        });
+    }
+
+    #[test]
+    fn get_or_register_does_not_reuse_bare_entry_for_crate_qualified_key() {
+        // `lookup` strips a leading `crate` / local-crate root so a
+        // callsite can resolve the same FunctionDesc. `get_or_register`
+        // must not: `Bookkeeper.getdesc` keys by `Constant(pyobj)`
+        // identity (`bookkeeper.py`). Crate-qualified spellings of one
+        // callable become the same desc only through `alias` (populate
+        // `canonical_dedup_key` / GraphStore `free_function_alias_paths`).
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let bk = Rc::new(Bookkeeper::new());
+            let registry = CallRegistry::new(bk);
+            let sig = signature(&["x"]);
+            let bare =
+                registry.get_or_register(FunctionPathKey::from_segments(["m", "f"]), sig.clone());
+            let crate_key = FunctionPathKey::from_segments(["crate", "m", "f"]);
+            let crate_entry = registry.get_or_register(crate_key.clone(), sig.clone());
+            assert!(
+                !Rc::ptr_eq(&bare, &crate_entry),
+                "get_or_register(crate::m::f) must not reuse the bare m::f entry"
+            );
+            let local_key = FunctionPathKey::from_segments(["pyre_interpreter", "m", "f"]);
+            let local_entry = registry.get_or_register(local_key, sig.clone());
+            assert!(
+                !Rc::ptr_eq(&bare, &local_entry),
+                "get_or_register(local_crate::m::f) must not reuse the bare m::f entry"
+            );
+            assert_eq!(registry.len(), 3);
+
+            let other =
+                registry.get_or_register(FunctionPathKey::from_segments(["n", "g"]), sig.clone());
+            let stripped_hit = registry
+                .lookup(&FunctionPathKey::from_segments(["crate", "n", "g"]))
+                .expect("lookup still strips for callsite resolution");
+            assert!(
+                Rc::ptr_eq(&other, &stripped_hit),
+                "stripped lookup must keep resolving an unregistered crate spelling"
+            );
+
+            let canonical = FunctionPathKey::from_segments(["p", "h"]);
+            let aliased = registry.get_or_register(canonical.clone(), sig.clone());
+            let alias = FunctionPathKey::from_segments(["crate", "p", "h"]);
+            registry.alias(alias.clone(), &canonical);
+            let via_alias = registry.get_or_register(alias, sig);
+            assert!(
+                Rc::ptr_eq(&aliased, &via_alias),
+                "get_or_register must reuse a registered crate-qualified alias"
+            );
+            assert_eq!(registry.len(), 5);
         });
     }
 
