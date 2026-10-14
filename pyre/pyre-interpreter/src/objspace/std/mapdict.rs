@@ -2210,6 +2210,48 @@ pub unsafe fn getattribute_hook_fast_path(
     Some((w_type, version_tag, map, w_getattribute, cell))
 }
 
+/// Builtin-type twin of [`getattribute_hook_fast_path`] for a receiver whose
+/// class opted into dispatching its own `__getattribute__`.
+///
+/// `W_LibObject` is not a mapdict carrier, so the instance oracle returns
+/// `None` before it ever sees `descr_getattribute`.  `getattr_str` still
+/// selects that slot (`baseobjspace.rs` `w_type_dispatches_own_getattribute`)
+/// and `descroperation.py getattr` traces into the `interp2app` wrapper.
+/// There is no instance map.  A type `__getattr__` declines for the same
+/// AttributeError-fallback reason as the instance oracle.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn own_getattribute_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
+    if w_obj.is_null()
+        || unsafe { pyre_object::is_type(w_obj) }
+        || unsafe { pyre_object::is_module(w_obj) }
+    {
+        return None;
+    }
+    let w_type = unsafe { (*w_obj).w_class };
+    if w_type.is_null() || !unsafe { pyre_object::w_type_dispatches_own_getattribute(w_type) } {
+        return None;
+    }
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some() {
+        return None;
+    }
+    let cell = unsafe {
+        crate::baseobjspace::type_attr_object_cell(
+            w_type,
+            rustpython_wtf8::Wtf8::new("__getattribute__"),
+        )
+    };
+    Some((w_type, version_tag, w_getattribute, cell))
+}
+
 /// Type-receiver twin of [`getattribute_hook_fast_path`].
 ///
 /// `W_TypeObject` has no mapdict storage, so the instance oracle returns

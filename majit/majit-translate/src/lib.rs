@@ -896,6 +896,62 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     paths
 }
 
+/// Owner segment of a harvested method path: a Rust type name, or
+/// Charon's `<Impl>` / `<Trait>` rendering of a non-Ident name segment.
+fn harvest_owner_is_type_or_impl(owner: &str) -> bool {
+    owner.starts_with(|c: char| c.is_uppercase()) || owner.starts_with('<')
+}
+
+/// Stamp harvested decorator hints onto funcobjs that never appear in
+/// `program.functions` (no body, or the body did not lower).
+///
+/// RPython binds `_elidable_function_` / `oopspec` / the GC-transformer
+/// hints on the funcobj either way: `guess_call_kind` reads `func.oopspec`
+/// (`call.py`), `getcalldescr` reads `_elidable_function_` for
+/// `EF_ELIDABLE_*`, and a missing `cannot_raise` makes `getcalldescr`
+/// record `GUARD_NO_EXCEPTION`. An un-lowered `#[elidable_promote]`
+/// original (`_orig_*_unlikely_name`) is the residual `call_pure` the
+/// wrapper looks into; skipping `"elidable"` here left that residual as
+/// `CallR` instead of `CallPureR`.
+fn apply_harvested_funcobj_hints(
+    call_control: &mut crate::call::CallControl,
+    harvested_hints: &std::collections::HashMap<String, Vec<String>>,
+) {
+    use crate::codewriter::call::DecoratorAttr;
+    for (path_str, hints) in harvested_hints {
+        if hints.iter().all(|h| DecoratorAttr::from_hint(h).is_none()) {
+            continue;
+        }
+        let segs: Vec<&str> = path_str.split("::").collect();
+        let Some((name, module_segs)) = segs.split_last() else {
+            continue;
+        };
+        // `Type::method` is not a free function. Aliasing it as bare
+        // `method` would share the GraphStore row with an unrelated
+        // `module::method` (e.g. `RootStackGuard::get` vs
+        // `baseobjspace::get`). Charon renders inherent impls as
+        // `<Impl>` (`ItemMeta::render_name_path`), which is not
+        // uppercase; `rbigint::<Impl>::invert` is `@jit.elidable`
+        // (`RBigInt.invert`) and must not stamp `_elidable_function_`
+        // onto `descroperation::invert`. `call.py` getattr is on the
+        // method funcobj; `policy.py _reject_function` /
+        // `look_inside_graph` then residualizes the wrong graph and
+        // `graphs_from` never enters `_int_invert`.
+        let paths = if module_segs
+            .last()
+            .is_some_and(|s| harvest_owner_is_type_or_impl(s))
+        {
+            vec![crate::parse::CallPath::from_segments(segs.iter().copied())]
+        } else {
+            let module = module_segs.join("::");
+            free_function_alias_paths(name, &module)
+        };
+        for p in &paths {
+            call_control.mark_decorator_hints(p, hints);
+        }
+    }
+}
+
 /// `MAJIT_PROFILE_PIPELINE=1` phase profiler: elapsed wall time plus the
 /// process high-water RSS at each mark, so a phase's contribution to the
 /// translation prepass's peak footprint is visible next to its cost in time.
@@ -2478,48 +2534,9 @@ fn analyze_pipeline_from_module_paths(
     }
     // A helper may never appear in `program.functions` (no body, or the
     // body did not lower) and still be the target of a residual call.
-    // `#[oopspec]` / `cannot_raise` live on the funcobj either way:
-    // `guess_call_kind` reads `func.oopspec` (`call.py`), and a missing
-    // `cannot_raise` makes `getcalldescr` record GUARD_NO_EXCEPTION.
-    for (path_str, hints) in &program.harvested_hints {
-        let cannot_raise = hints
-            .iter()
-            .any(|h| h == "cannot_raise" || h == "elidable_cannot_raise");
-        let oopspecs: Vec<&str> = hints
-            .iter()
-            .filter_map(|h| h.strip_prefix("oopspec:"))
-            .collect();
-        if !cannot_raise && oopspecs.is_empty() {
-            continue;
-        }
-        let segs: Vec<&str> = path_str.split("::").collect();
-        let Some((name, module_segs)) = segs.split_last() else {
-            continue;
-        };
-        // `Type::method` is not a free function. Aliasing it as bare
-        // `method` would share the GraphStore row with an unrelated
-        // `module::method` (e.g. `RootStackGuard::get` vs
-        // `baseobjspace::get`).
-        let paths = if module_segs
-            .last()
-            .is_some_and(|s| s.starts_with(|c: char| c.is_uppercase()))
-        {
-            vec![crate::parse::CallPath::from_segments(segs.iter().copied())]
-        } else {
-            let module = module_segs.join("::");
-            free_function_alias_paths(name, &module)
-        };
-        for p in &paths {
-            for spec in &oopspecs {
-                call_control.mark_oopspec(p.clone(), (*spec).to_string());
-            }
-        }
-        if cannot_raise {
-            for p in paths {
-                call_control.mark_cannot_raise_assertion(p);
-            }
-        }
-    }
+    // Decorator attrs live on the funcobj either way (`call.py`
+    // `guess_call_kind` / `getcalldescr`).
+    apply_harvested_funcobj_hints(&mut call_control, &program.harvested_hints);
 
     // RPython: setup_jitdriver(jitdriver_sd) — register every explicit
     // portal and its green/red layout. Portal binding and graph discovery
@@ -4218,5 +4235,367 @@ mod portal_driver_tests {
             )
             .is_some()
         );
+    }
+}
+
+/// Harvested decorator hints on helpers missing from `program.functions`.
+#[cfg(test)]
+mod harvested_funcobj_hints_tests {
+    use super::*;
+    use crate::call::{AnalysisCache, CallControl};
+    use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
+    use crate::parse::CallPath;
+    use majit_ir::descr::{ExtraEffect, OopSpecIndex};
+    use majit_ir::value::Type;
+
+    fn direct_call_op(target: CallTarget) -> SpaceOperation {
+        SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target,
+                args: vec![],
+                result_ty: ValueType::Void,
+            },
+        }
+    }
+
+    /// `RBigInt::invert` is `@jit.elidable` (`rbigint.py`). Charon's
+    /// crate-less duplicate marker must not set `_elidable_function_` on
+    /// `descroperation::invert`, or `policy.py _reject_function` /
+    /// `look_inside_graph` residualizes that free function and
+    /// `graphs_from` never enters `_int_invert`.
+    #[test]
+    fn rbigint_elidable_invert_does_not_mark_descroperation_invert() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/majit-rlib.ullbc"
+        );
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load majit-rlib.ullbc");
+        let harvested =
+            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = CallControl::new();
+            let graph = FunctionGraph::new("invert");
+            for alias in free_function_alias_paths("invert", "objspace::descroperation") {
+                cc.register_function_graph(alias, graph.clone());
+            }
+            apply_harvested_funcobj_hints(&mut cc, &harvested);
+            assert!(
+                !cc.is_elidable(&CallTarget::function_path([
+                    "objspace",
+                    "descroperation",
+                    "invert",
+                ])),
+                "descroperation::invert must stay look-inside"
+            );
+            assert!(
+                !cc.is_elidable(&CallTarget::function_path(["invert"])),
+                "bare invert alias shares the free-function graph"
+            );
+        });
+    }
+
+    /// Charon `ItemMeta::render_name_path` spells inherent impls as
+    /// `<Impl>` (`rbigint.py` `RBigInt.invert`). `free_function_alias_paths`
+    /// on that leaf would share the GraphStore row with
+    /// `descroperation::invert`; `call.py` getattr / `policy.py
+    /// _reject_function` then residualize the wrong funcobj.
+    #[test]
+    fn harvested_impl_elidable_invert_does_not_alias_free_invert() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cc = CallControl::new();
+            let graph = FunctionGraph::new("invert");
+            for alias in free_function_alias_paths("invert", "objspace::descroperation") {
+                cc.register_function_graph(alias, graph.clone());
+            }
+            let mut harvested = std::collections::HashMap::new();
+            harvested.insert(
+                "rbigint::<Impl>::invert".to_string(),
+                vec!["elidable".to_string()],
+            );
+            apply_harvested_funcobj_hints(&mut cc, &harvested);
+            assert!(
+                !cc.is_elidable(&CallTarget::function_path([
+                    "objspace",
+                    "descroperation",
+                    "invert",
+                ])),
+                "descroperation::invert must stay look-inside"
+            );
+            assert!(
+                !cc.is_elidable(&CallTarget::function_path(["invert"])),
+                "bare invert alias shares the free-function graph"
+            );
+            assert!(
+                cc.is_elidable(&CallTarget::function_path(["rbigint", "<Impl>", "invert"])),
+                "RBigInt.invert remains elidable on its own funcobj"
+            );
+        });
+    }
+
+    /// An un-lowered `#[elidable_promote]` original is residual: harvested
+    /// `"elidable"` must still set `_elidable_function_` so `getcalldescr`
+    /// emits `EF_ELIDABLE_CAN_RAISE` (`call.py`).
+    #[test]
+    fn harvested_elidable_on_unlowered_helper_is_elidable() {
+        crate::local_crates::with_local_crate_root("pyre_module", || {
+            let mut cc = CallControl::new();
+            let mut harvested = std::collections::HashMap::new();
+            harvested.insert(
+                "module::_cffi_backend::lib_obj::_orig_get_attr_elidable_unlikely_name".to_string(),
+                vec!["elidable".to_string()],
+            );
+            apply_harvested_funcobj_hints(&mut cc, &harvested);
+
+            let crate_qualified = CallTarget::function_path([
+                "pyre_module",
+                "module",
+                "_cffi_backend",
+                "lib_obj",
+                "_orig_get_attr_elidable_unlikely_name",
+            ]);
+            assert!(
+                cc.is_elidable(&crate_qualified),
+                "crate-qualified residual of an un-lowered elidable original"
+            );
+            assert!(cc.is_elidable(&CallTarget::function_path([
+                "module",
+                "_cffi_backend",
+                "lib_obj",
+                "_orig_get_attr_elidable_unlikely_name",
+            ])));
+
+            let mut cache = AnalysisCache::default();
+            let descriptor = cc.getcalldescr(
+                &direct_call_op(crate_qualified.clone()),
+                vec![Type::Ref, Type::Ref],
+                Type::Ref,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            );
+            assert_eq!(
+                descriptor.extra_info.extraeffect,
+                ExtraEffect::ElidableCanRaise,
+            );
+            assert!(descriptor.extra_info.check_is_elidable());
+
+            // Residual `call_pure` names the word-ABI trampoline
+            // (`getfunctionptr`); `_elidable_function_` lives on the
+            // user orig (`user_path_behind_majit_call_target`).
+            let trampoline = CallTarget::function_path([
+                "__fn_const",
+                "pyre_module",
+                "module",
+                "_cffi_backend",
+                "lib_obj",
+                "__majit_call_target__orig_get_attr_elidable_unlikely_name",
+            ]);
+            assert!(
+                cc.is_elidable(&trampoline),
+                "elidable follows __majit_call_target_ to the harvested orig"
+            );
+            let mut cache = AnalysisCache::default();
+            let descriptor = cc.getcalldescr(
+                &direct_call_op(trampoline),
+                vec![Type::Ref, Type::Ref],
+                Type::Ref,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            );
+            assert_eq!(
+                descriptor.extra_info.extraeffect,
+                ExtraEffect::ElidableCanRaise,
+            );
+            assert!(descriptor.extra_info.check_is_elidable());
+
+            // A policy-opaque stub registered under the crate-qualified
+            // spelling must not hide the harvested `_elidable_function_`
+            // on the crate-stripped orig (`call.py` getattr on the user
+            // funcobj). Without `alt.elidable` on crate-strip, getcalldescr
+            // emits EF_RANDOM_EFFECTS and residual CALL rather than CALL_PURE.
+            cc.register_function_graph(
+                CallPath::from_segments([
+                    "pyre_module",
+                    "module",
+                    "_cffi_backend",
+                    "lib_obj",
+                    "_orig_get_attr_elidable_unlikely_name",
+                ]),
+                FunctionGraph::new("_orig_get_attr_elidable_unlikely_name"),
+            );
+            assert!(
+                cc.is_elidable(&crate_qualified),
+                "crate-qualified opaque stub must not hide harvested elidable"
+            );
+        });
+    }
+
+    /// Production `pyre-module.ullbc`: the `#[elidable_promote]` wrapper's
+    /// residual orig call must get `EF_ELIDABLE_CAN_RAISE` (`call.py`
+    /// `getattr(func, "_elidable_function_", False)` on the renamed orig).
+    #[test]
+    fn product_get_attr_elidable_orig_residual_is_elidable_can_raise() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-module.ullbc"
+        );
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-module.ullbc");
+        let harvested =
+            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+        let orig_key = "module::_cffi_backend::lib_obj::_orig_get_attr_elidable_unlikely_name";
+        assert!(
+            harvested
+                .get(orig_key)
+                .is_some_and(|hints| hints.iter().any(|h| h == "elidable")),
+            "harvested orig hints: {:?}",
+            harvested.get(orig_key)
+        );
+
+        crate::local_crates::with_local_crate_root("pyre_module", || {
+            let graph = crate::front::mir::lower_function(
+                &llbc,
+                "pyre_module::module::_cffi_backend::lib_obj::get_attr_elidable",
+            )
+            .expect("lower get_attr_elidable wrapper");
+
+            let orig_ops: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call { target, .. } => {
+                        let rendered = format!("{target:?}");
+                        if rendered.contains("get_attr") || rendered.contains("orig") {
+                            Some((op.clone(), rendered))
+                        } else {
+                            None
+                        }
+                    }
+                    OpKind::IndirectCall { graphs, .. } => {
+                        let rendered = format!("{graphs:?}");
+                        if rendered.contains("get_attr") || rendered.contains("orig") {
+                            Some((op.clone(), rendered))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+            let wrapper_calls: Vec<String> = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .map(|op| format!("{:?}", op.kind))
+                .collect();
+            assert!(
+                !orig_ops.is_empty(),
+                "wrapper graph calls: {wrapper_calls:?}"
+            );
+            eprintln!("wrapper calls ({}): {wrapper_calls:?}", wrapper_calls.len());
+            for (op, rendered) in &orig_ops {
+                eprintln!("orig residual op: {rendered} kind={:?}", op.kind);
+            }
+
+            let mut cc = CallControl::new();
+            apply_harvested_funcobj_hints(&mut cc, &harvested);
+
+            for (op, rendered) in &orig_ops {
+                let OpKind::Call { target, .. } = &op.kind else {
+                    panic!("orig residual is not a direct Call: {rendered}");
+                };
+                assert!(
+                    cc.is_elidable(target),
+                    "is_elidable({rendered}) after harvest; target={target:?}"
+                );
+                let mut cache = AnalysisCache::default();
+                let descriptor = cc.getcalldescr(
+                    op,
+                    vec![Type::Ref, Type::Ref],
+                    Type::Ref,
+                    OopSpecIndex::None,
+                    None,
+                    &mut cache,
+                    None,
+                );
+                assert_eq!(
+                    descriptor.extra_info.extraeffect,
+                    ExtraEffect::ElidableCanRaise,
+                    "getcalldescr({rendered})"
+                );
+            }
+
+            // Product prepass registers the orig graph (policy-opaque
+            // elidable still has a funcobj graph). Isolated harvest-only
+            // CallControl has none, so readwrite is bottom. Register the
+            // lowered orig and re-run getcalldescr — that is the product
+            // difference (`call.py` still analyzes `funcobj.graph`).
+            let orig_names = [
+                "pyre_module::module::_cffi_backend::lib_obj::_orig_get_attr_elidable_unlikely_name",
+                "module::_cffi_backend::lib_obj::_orig_get_attr_elidable_unlikely_name",
+            ];
+            let orig_lowered = orig_names.iter().find_map(|name| {
+                crate::front::mir::lower_function(&llbc, name)
+                    .ok()
+                    .map(|g| (*name, g))
+            });
+            match orig_lowered {
+                None => panic!("orig FunDecl did not lower; wrapper calls: {wrapper_calls:?}"),
+                Some((orig_name, orig_graph)) => {
+                    let orig_calls: Vec<String> = orig_graph
+                        .blocks
+                        .iter()
+                        .flat_map(|b| b.operations.iter())
+                        .map(|op| format!("{:?}", op.kind))
+                        .collect();
+                    eprintln!(
+                        "orig lowered as {orig_name}; {} ops: {orig_calls:?}",
+                        orig_calls.len()
+                    );
+                    let orig_path =
+                        CallPath::from_segments(orig_name.split("::").filter(|s| !s.is_empty()));
+                    cc.register_function_graph(orig_path, orig_graph);
+                    apply_harvested_funcobj_hints(&mut cc, &harvested);
+                    for (op, rendered) in &orig_ops {
+                        let mut cache = AnalysisCache::default();
+                        let descriptor = cc.getcalldescr(
+                            op,
+                            vec![Type::Ref, Type::Ref],
+                            Type::Ref,
+                            OopSpecIndex::None,
+                            None,
+                            &mut cache,
+                            None,
+                        );
+                        assert_eq!(
+                            descriptor.extra_info.extraeffect,
+                            ExtraEffect::ElidableCanRaise,
+                            "getcalldescr with orig graph registered ({rendered}); \
+                             orig_name={orig_name}; orig ops={orig_calls:?}; \
+                             wrapper calls={wrapper_calls:?}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// The same fallback still stamps `oopspec` that the previous skip
+    /// condition already forwarded.
+    #[test]
+    fn harvested_oopspec_still_applies() {
+        let mut cc = CallControl::new();
+        let mut harvested = std::collections::HashMap::new();
+        harvested.insert(
+            "rordereddict::dict_count_py_div".to_string(),
+            vec!["oopspec:int.py_div(x, y)".to_string()],
+        );
+        apply_harvested_funcobj_hints(&mut cc, &harvested);
+        let target = CallTarget::function_path(["rordereddict", "dict_count_py_div"]);
+        assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"));
     }
 }

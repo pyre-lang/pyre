@@ -4851,6 +4851,12 @@ impl CallControl {
 
     /// Look up effects on `path`, then on the crate-stripped spelling
     /// `harvest_hints_from_llbcs` uses (`rhai::grain::…` → `grain::…`).
+    ///
+    /// A residual `call_pure` names the `__majit_call_target_<fn>`
+    /// word-ABI trampoline (`getfunctionptr`); `_elidable_function_` /
+    /// `oopspec` live on `<fn>` (`call.py` getattr on the user funcobj,
+    /// same alias `path_user_or_crate_strip_marked` already follows for
+    /// `cannot_raise`).
     fn func_effects_with_crate_alias(&self, path: &CallPath) -> Option<FuncRef<'_>> {
         let direct = self.func_effects(path);
         if direct
@@ -4858,6 +4864,12 @@ impl CallControl {
             .is_some_and(|effects| effects.recorded_oopspec().is_some())
         {
             return direct;
+        }
+        if let Some(user) = user_path_behind_majit_call_target(path)
+            && let Some(alt) = self.func_effects_with_crate_alias(&user)
+            && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
+        {
+            return Some(alt);
         }
         // A callsite spells the defining crate (`pyre_module::module::…`)
         // while the harvest key and the module-qualified alias are
@@ -4872,7 +4884,13 @@ impl CallControl {
                 let stripped =
                     CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
                 if let Some(alt) = self.func_effects(&stripped)
-                    && (alt.recorded_oopspec().is_some() || direct.is_none())
+                    && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
+                {
+                    return Some(alt);
+                }
+                if let Some(user) = user_path_behind_majit_call_target(&stripped)
+                    && let Some(alt) = self.func_effects_with_crate_alias(&user)
+                    && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
                 {
                     return Some(alt);
                 }
@@ -7520,7 +7538,7 @@ impl CallControl {
     /// majit callers want the graph stored in `function_graphs` so we keep
     /// this lookup separate from the op-based `graphs_from`.
     pub fn direct_graph_for(&self, target: &CallTarget) -> Option<std::rc::Rc<FunctionGraph>> {
-        let path = self.target_to_path(target)?;
+        let path = self.direct_callee_graph_path(target, None)?;
         if !self.candidate_graphs.contains(&path) {
             return None;
         }
@@ -7541,6 +7559,28 @@ impl CallControl {
         self.function_graphs.contains_key(path) || self.opname_helper_paths.contains(path)
     }
 
+    /// `funcobj.graph` under `path`, or under the crate-stripped harvest
+    /// spelling (`pyre_module::module::…` → `module::…`) that
+    /// `harvest_hints_from_llbcs` and helper-seed registration use.
+    /// `call.py graphs_from` keys on graph identity, not on the call's
+    /// Charon `name_path()` spelling.
+    fn callable_graph_path(&self, path: &CallPath) -> Option<CallPath> {
+        if self.has_callable_graph(path) {
+            return Some(path.clone());
+        }
+        if path.segments.len() > 1 {
+            let root = path.segments[0].as_str();
+            if root == "crate" || crate::local_crates::is_local_crate_root(root) {
+                let stripped =
+                    CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
+                if self.has_callable_graph(&stripped) {
+                    return Some(stripped);
+                }
+            }
+        }
+        None
+    }
+
     /// The registered graph identity for a direct call — `funcobj.graph`.
     ///
     /// `target_to_path` may still return an unregistered 3+-segment
@@ -7553,7 +7593,7 @@ impl CallControl {
         _caller: Option<&CallPath>,
     ) -> Option<CallPath> {
         let path = self.target_to_path(target)?;
-        self.has_callable_graph(&path).then_some(path)
+        self.callable_graph_path(&path)
     }
 
     fn stamp_method_resolved_path(
@@ -18444,6 +18484,55 @@ mod tests {
             Some(vec![call_spelling.clone()]),
             "emit must use the same registered path BFS followed"
         );
+    }
+
+    /// Charon `name_path()` keeps the defining crate (`pyre_module::…`);
+    /// helper-seed / harvest registration is crate-stripped (`module::…`).
+    /// `graphs_from` must hit that funcobj so a look-inside wrapper is
+    /// Regular, not a residual CALL of its HELPER_FNADDR alias.
+    #[test]
+    fn graphs_from_and_bfs_agree_on_local_crate_qualified_function_path() {
+        crate::local_crates::with_local_crate_root("pyre_module", || {
+            let mut cc = CallControl::new();
+            let registered = CallPath::from_segments([
+                "module",
+                "_cffi_backend",
+                "lib_obj",
+                "get_attr_elidable",
+            ]);
+            let portal = CallPath::from_segments(["portal"]);
+            let spelled = CallTarget::function_path([
+                "pyre_module",
+                "module",
+                "_cffi_backend",
+                "lib_obj",
+                "get_attr_elidable",
+            ]);
+            cc.register_function_graph(portal.clone(), graph_calling("portal", spelled.clone()));
+            cc.register_function_graph(registered.clone(), FunctionGraph::new("get_attr_elidable"));
+            cc.mark_portal(portal.clone());
+
+            let mut policy = crate::policy::DefaultJitPolicy::new();
+            cc.find_all_graphs(&mut policy);
+            assert!(
+                cc.is_candidate(&registered),
+                "BFS must follow the crate-stripped funcobj, not skip the qualified call"
+            );
+
+            let portal_graph = cc
+                .function_graphs
+                .get(&portal)
+                .expect("portal graph")
+                .clone();
+            let op = &portal_graph.block(portal_graph.startblock).operations[0];
+            assert_eq!(
+                cc.graphs_from(op),
+                Some(vec![registered.clone()]),
+                "emit must use the registered stripped path BFS followed"
+            );
+            assert_eq!(cc.guess_call_kind(op), CallKind::Regular);
+            assert!(cc.direct_graph_for(&spelled).is_some());
+        });
     }
 
     /// A FunctionPath whose leaf equals an impl method's leaf must not

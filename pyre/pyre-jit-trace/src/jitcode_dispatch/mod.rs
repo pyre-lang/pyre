@@ -6946,7 +6946,9 @@ fn funcptr_concrete_int<Sym: WalkSym>(
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py) port for residual calls
 /// not completed by [`try_fold_pure_call_via_executor`].  That fast path
 /// handles cannot-raise elidable calls; can-raise elidable calls continue here
-/// so their exception state is observable.
+/// so their exception state is observable, then
+/// [`record_result_of_executed_pure_call`] runs `record_result_of_call_pure`
+/// (`pyjitpl.py MIFrame.execute_varargs`).
 ///
 /// Upstream calls `executor.execute_varargs(opnum, argboxes, descr,
 /// exc=can_raise, pure=is_elidable)` which dispatches through

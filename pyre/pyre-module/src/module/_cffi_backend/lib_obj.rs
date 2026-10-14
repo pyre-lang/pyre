@@ -25,12 +25,22 @@ pub struct W_LibObject {
 }
 
 fn lib_arg(w_lib: PyObjectRef) -> Result<&'static mut W_LibObject, PyError> {
-    W_LibObject::from_obj(w_lib).ok_or_else(|| {
-        PyError::type_error(format!(
-            "expected a Lib object, got '{}'",
-            pyre_interpreter::type_methods::arg_type_name(w_lib)
-        ))
-    })
+    // `@unwrap_spec(w_lib=lib_obj.W_LibObject)`: typed hit, miss residual
+    // (`cdataobj.rs` `cdata_arg` / `expected_cdata_object`).
+    match W_LibObject::from_obj(w_lib) {
+        Some(lib) => Ok(lib),
+        None => Err(unsafe { PyError::from_exc_object(expected_lib_object(w_lib)) }),
+    }
+}
+
+/// `@unwrap_spec(w_lib=lib_obj.W_LibObject)` miss — `oefmt`.
+#[majit_macros::dont_look_inside]
+fn expected_lib_object(w_got: PyObjectRef) -> PyObjectRef {
+    PyError::type_error(format!(
+        "expected a Lib object, got '{}'",
+        pyre_interpreter::type_methods::arg_type_name(w_got)
+    ))
+    .to_exc_object()
 }
 
 fn ffi_of(lib: &W_LibObject) -> Result<&'static mut W_FFIObject, PyError> {
@@ -388,16 +398,33 @@ fn get_attr(
     )))
 }
 
-fn lib_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+/// `W_LibObject.descr_getattribute`.
+///
+/// Named `__majit_wrap_*` and published below: `BuiltinCode.func` is a PBC
+/// whose family `builtin_wrapper_indirect_graphs` builds out of exactly the
+/// wrapper paths that carry a registered graph, and a traced `lib.name`
+/// LOAD_ATTR reaches this body through `bytecode_for_address` on the
+/// function's address.  Registered under any other name it has no member in
+/// that family, and every `lib.abs` stays a `bh_load_attr_fn` residual with
+/// `_get_attr_elidable` opaque behind it.
+pub fn __majit_wrap_lib_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let lib_slot = roots.pin_roots(&[args[0], args[1]]);
-    let value = get_attr(roots.get(lib_slot), roots.get(lib_slot + 1), true)?;
+    let args_base = roots.pin_roots(&[args[0], args[1]]);
+    // `descr_getattribute`: `_get_attr(w_attr, is_getattr=True)` then the
+    // `W_GlobSupport` read (`lib_obj.py`). The walker descends `_get_attr`
+    // onto `_get_attr_elidable` (`@jit.elidable_promote()`).
+    let value = get_attr(roots.get(args_base), roots.get(args_base + 1), true)?;
     if cglob::W_GlobSupport::from_obj(value).is_some() {
         cglob::read_global_var(value)
     } else {
         Ok(value)
     }
 }
+
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_lib_getattribute,
+    __majit_wrap_lib_getattribute
+);
 
 fn lib_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
@@ -630,7 +657,7 @@ fn init_lib_type(ns: PyObjectRef) {
             lib_repr as pyre_interpreter::gateway::BuiltinCodeFn,
             1u16,
         ),
-        ("__getattribute__", lib_getattribute, 2),
+        ("__getattribute__", __majit_wrap_lib_getattribute, 2),
         ("__setattr__", lib_setattr, 3),
         ("__delattr__", lib_delattr, 2),
         ("__dir__", lib_dir, 1),
