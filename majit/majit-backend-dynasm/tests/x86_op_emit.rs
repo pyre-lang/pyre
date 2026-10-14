@@ -4884,13 +4884,17 @@ fn assert_has(code: &[u8], needle: &[u8], what: &str) {
     );
 }
 
-fn assert_no_call_rax(code: &[u8]) {
-    for (i, window) in code.windows(2).enumerate() {
-        if window == [0xFF, 0xD0] {
-            let rex = i > 0 && code[i - 1] == 0x41;
-            assert!(rex, "residual fnloc must not be `call rax` at {i}");
-        }
-    }
+/// The residual call followed by its result store `mov [rbp+disp8], rax`
+/// (`48 89 45`). The pair pins the call site, so a `mov rax, fnloc` /
+/// `call rax` shape fails it. Scanning the whole buffer for `FF D0` instead
+/// also matches across instruction boundaries: the
+/// `_call_header_with_stack_check` slow path, emitted while another test has
+/// registered the stack-check addresses, ends in a `jmp rel32` whose last byte
+/// is `FF`, and the descr word after the code can start with `D0`.
+fn assert_call_site(code: &[u8], call: &[u8], what: &str) {
+    let mut site = call.to_vec();
+    site.extend_from_slice(&[0x48, 0x89, 0x45]);
+    assert_has(code, &site, what);
 }
 
 /// `CALL reg` (`FF /2`). `r8`–`r15` take a REX.B prefix.
@@ -4980,8 +4984,7 @@ fn residual_call_register_fnloc_is_call_reg() {
     assert_eq!(backend.get_int_value(&frame, 0), 99);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
-    assert_has(code, &arg_gpr_call(0), "call ARGUMENTS_GPR[0]");
+    assert_call_site(code, &arg_gpr_call(0), "call ARGUMENTS_GPR[0]");
 
     // One integer argument takes `ARGUMENTS_GPR[0]`, so the fnloc moves to
     // `ARGUMENTS_GPR[1]` and the call is that register.
@@ -4992,8 +4995,7 @@ fn residual_call_register_fnloc_is_call_reg() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
-    assert_has(code, &arg_gpr_call(1), "call ARGUMENTS_GPR[1]");
+    assert_call_site(code, &arg_gpr_call(1), "call ARGUMENTS_GPR[1]");
 
     // Four integer arguments fill the Win64 GPRs, so the fnloc spills to
     // `[rsp+32]`. SysV still has `r8` free (`ARGUMENTS_GPR[4]`).
@@ -5013,12 +5015,11 @@ fn residual_call_register_fnloc_is_call_reg() {
     assert_eq!(backend.get_int_value(&frame, 0), 10);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
     #[cfg(target_os = "windows")]
     let spilled = vec![0xFF, 0x54, 0x24, 0x20];
     #[cfg(not(target_os = "windows"))]
     let spilled = arg_gpr_call(4);
-    assert_has(code, &spilled, "call spilled or fifth GPR fnloc");
+    assert_call_site(code, &spilled, "call spilled or fifth GPR fnloc");
 }
 
 #[test]
@@ -5032,8 +5033,7 @@ fn residual_call_frame_fnloc_is_call_rbp() {
     assert_eq!(backend.get_int_value(&frame, 0), 99);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
-    assert_has(code, &expect, "call [rbp+input0]");
+    assert_call_site(code, &expect, "call [rbp+input0]");
 
     let (backend, token) =
         compile_indirect_call(false, None, &[rb(OpRef::const_int(42))], vec![Type::Int]);
@@ -5042,8 +5042,7 @@ fn residual_call_frame_fnloc_is_call_rbp() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
-    assert_has(code, &expect, "call [rbp+input0]");
+    assert_call_site(code, &expect, "call [rbp+input0]");
 }
 
 #[test]
