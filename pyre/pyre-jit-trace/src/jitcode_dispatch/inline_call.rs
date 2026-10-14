@@ -1552,20 +1552,40 @@ fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> O
     None
 }
 
+/// A write set is empty only when it is *known* empty.
+///
+/// `effectinfo.py EffectInfo.__new__` stores `None` for unknown writes
+/// (`EF_RANDOM_EFFECTS` only), never as "no writes".  After serde the raw
+/// `_write_descrs_*` lists are skipped, so a serialized descr has them
+/// `None` while its `write_descrs_*` bitstrings
+/// (`effectinfo.py bitstring_write_descrs_*`, `None` = wildcard) still
+/// record the writes.  Known empty: the raw list is `Some(empty)`, or the
+/// raw list is `None` and the matching bitstring is `Some` with every bit
+/// clear.  A `None` raw list with a `None` bitstring is unknown.
+fn write_set_is_known_empty<T>(raw: &Option<Vec<T>>, bits: &Option<Vec<u8>>) -> bool {
+    match raw {
+        Some(v) => v.is_empty(),
+        None => bits
+            .as_ref()
+            .is_some_and(|b| b.iter().all(|&byte| byte == 0)),
+    }
+}
+
 /// Whether `info` is the static form of a residual the walk would not have
 /// to undo: no random effects, no `forces_virtual_or_virtualizable`, and
-/// empty write-descr sets (`writeanalyze.py` / `effectinfo.py`).
+/// known-empty write-descr sets (`writeanalyze.py` / `effectinfo.py`).
 ///
 /// `effectinfo.py` blanks write descrs for elidable / loop-invariant
 /// (`EffectInfo.__new__`), so those extraeffects are already the empty
-/// write-set case. Match them first so a descr whose raw lists are still
-/// `None` (the `frozenset_or_none` image of no writes) stays rewindable.
-/// A `not_in_trace` callee is exempt for a different reason: what has to
-/// hold is not that the call left nothing behind, but that calling it
-/// again is harmless, because a rolled-back walk is another trace attempt
-/// and the region will be walked again.  `rlib/jit.py not_in_trace` states
-/// the contract that makes that true — the call is still made "by the jit
-/// tracing and blackholing, but not by the final assembler".
+/// write-set case and are matched first.  A `None` raw list is not that
+/// case: it is unknown unless the matching bitstring is `Some` with every
+/// bit clear.  A `not_in_trace` callee is exempt for a different reason:
+/// what has to hold is not that the call left nothing behind, but that
+/// calling it again is harmless, because a rolled-back walk is another
+/// trace attempt and the region will be walked again.  `rlib/jit.py
+/// not_in_trace` states the contract that makes that true — the call is
+/// still made "by the jit tracing and blackholing, but not by the final
+/// assembler".
 pub(crate) fn extra_info_is_rewindable_allocation(info: &majit_ir::EffectInfo) -> bool {
     if info.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
         return true;
@@ -1582,10 +1602,12 @@ pub(crate) fn extra_info_is_rewindable_allocation(info: &majit_ir::EffectInfo) -
     if info.has_random_effects() || info.check_forces_virtual_or_virtualizable() {
         return false;
     }
-    let empty_writes = |s: &Option<Vec<_>>| s.as_ref().is_none_or(|v| v.is_empty());
-    empty_writes(&info._write_descrs_fields)
-        && empty_writes(&info._write_descrs_arrays)
-        && empty_writes(&info._write_descrs_interiorfields)
+    write_set_is_known_empty(&info._write_descrs_fields, &info.write_descrs_fields)
+        && write_set_is_known_empty(&info._write_descrs_arrays, &info.write_descrs_arrays)
+        && write_set_is_known_empty(
+            &info._write_descrs_interiorfields,
+            &info.write_descrs_interiorfields,
+        )
 }
 
 /// Whether the residual call behind `descr_index` applies no effect the walk

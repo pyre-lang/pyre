@@ -13261,6 +13261,47 @@ fn extra_info_rewindable_allocation_includes_can_raise_with_empty_writes() {
 }
 
 #[test]
+fn extra_info_rewindable_allocation_absent_raw_write_set_is_not_empty() {
+    // Serialized descrs skip the raw `_write_descrs_*` lists (`None`)
+    // while the bitstrings still record writes.  `None` is unknown,
+    // not "no writes" (`effectinfo.py EffectInfo.__new__`).
+    let mut info = majit_ir::EffectInfo::default();
+    info._write_descrs_fields = None;
+    info._write_descrs_arrays = None;
+    info._write_descrs_interiorfields = None;
+
+    // (a) raw None + bitstring with a set bit → not rewindable
+    info.write_descrs_fields = Some(vec![0x01]);
+    info.write_descrs_arrays = Some(Vec::new());
+    info.write_descrs_interiorfields = Some(Vec::new());
+    assert!(!super::inline_call::extra_info_is_rewindable_allocation(
+        &info
+    ));
+
+    // (b) raw None + all-zero bitstring → rewindable
+    info.write_descrs_fields = Some(vec![0x00]);
+    assert!(super::inline_call::extra_info_is_rewindable_allocation(
+        &info
+    ));
+
+    // (c) raw None + bitstring None → not rewindable
+    info.write_descrs_fields = None;
+    info.write_descrs_arrays = None;
+    info.write_descrs_interiorfields = None;
+    assert!(!super::inline_call::extra_info_is_rewindable_allocation(
+        &info
+    ));
+
+    // (d) raw Some(empty) → rewindable
+    info._write_descrs_fields = Some(Vec::new());
+    info._write_descrs_arrays = Some(Vec::new());
+    info._write_descrs_interiorfields = Some(Vec::new());
+    assert!(super::inline_call::extra_info_is_rewindable_allocation(
+        &info
+    ));
+}
+
+#[test]
 fn walker_record_guard_exception_last_exc_is_guard_op_when_class_is_not_const() {
     // `pyjitpl.py handle_possible_exception` after
     // `execute_raised(..., constant=False)`: last_exc_box is the
