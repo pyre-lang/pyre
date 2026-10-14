@@ -12330,11 +12330,15 @@ impl CodeWriter {
 
                         // BuildSet(count): pops count items, pushes 1 set. Net: -(count-1).
                         //
-                        // Mirrors BuildMap's `new_array_clear` + unrolled
-                        // `setarrayitem_gc_r` array build, then a single
-                        // `build_set_from_array` residual consuming the forced
-                        // element array.  No arity cap: the length travels in
-                        // the array.
+                        // pyopcode.py BUILD_SET is `@jit.unroll_safe`
+                        // `space.newset()` plus one `call_method(..., 'add')`
+                        // per peeked item.  When `w_set_new` and
+                        // `set_add_value` are fully bound, record that
+                        // display (the BUILD_MAP `dict_display_new` /
+                        // `dict_display_setitem` twin).  Otherwise keep the
+                        // element array and the `build_set_from_array`
+                        // residual.  No arity cap on the residual path: the
+                        // length travels in the array.
                         Instruction::BuildSet { count } => {
                             let n = count.get(op_arg) as usize;
                             let mut item_values_rev = Vec::with_capacity(n);
@@ -12347,42 +12351,70 @@ impl CodeWriter {
                             // bottom-to-top order, so reverse the pop order.
                             let items: Vec<super::flow::FlowValue> =
                                 item_values_rev.into_iter().rev().collect();
-                            let array_var = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "new_array_clear",
-                                vec![
-                                    super::flow::FlowValue::Constant(
-                                        super::flow::Constant::signed(n as i64),
-                                    )
-                                    .into(),
-                                ],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            for (i, item) in items.into_iter().enumerate() {
-                                emit_graph_op_void(
+                            let display_bound =
+                                fully_bound_callee_body(inline_call_targets::SET_DISPLAY_NEW)
+                                    .is_some()
+                                    && fully_bound_callee_body(inline_call_targets::SET_ADD)
+                                        .is_some();
+                            let result_value = if display_bound {
+                                let set_value = emit_graph_op_with_result(
+                                    &mut graph,
                                     &current_block.block(),
-                                    "setarrayitem_gc_r",
-                                    vec![
-                                        super::flow::FlowValue::Variable(array_var).into(),
-                                        super::flow::FlowValue::Constant(
-                                            super::flow::Constant::signed(i as i64),
-                                        )
-                                        .into(),
-                                        item.into(),
-                                    ],
+                                    "set_display_new",
+                                    vec![],
+                                    Kind::Ref,
                                     py_pc as i64,
                                 );
-                            }
-                            let result_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "build_set_from_array",
-                                vec![super::flow::FlowValue::Variable(array_var).into()],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
+                                for item in items {
+                                    emit_graph_op_void(
+                                        &current_block.block(),
+                                        "set_add",
+                                        vec![
+                                            super::flow::FlowValue::Variable(set_value).into(),
+                                            item.into(),
+                                        ],
+                                        py_pc as i64,
+                                    );
+                                }
+                                set_value
+                            } else {
+                                let array_var = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "new_array_clear",
+                                    vec![
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(n as i64),
+                                        )
+                                        .into(),
+                                    ],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                for (i, item) in items.into_iter().enumerate() {
+                                    emit_graph_op_void(
+                                        &current_block.block(),
+                                        "setarrayitem_gc_r",
+                                        vec![
+                                            super::flow::FlowValue::Variable(array_var).into(),
+                                            super::flow::FlowValue::Constant(
+                                                super::flow::Constant::signed(i as i64),
+                                            )
+                                            .into(),
+                                            item.into(),
+                                        ],
+                                        py_pc as i64,
+                                    );
+                                }
+                                emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "build_set_from_array",
+                                    vec![super::flow::FlowValue::Variable(array_var).into()],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                )
+                            };
                             // Physically write the accumulator into its
                             // value-stack slot rather than only bumping the
                             // symbolic depth: `SET_ADD` / `MAP_ADD` read the
