@@ -345,10 +345,6 @@ impl Repr for FixedSizeListRepr {
 
     /// RPython `BaseListRepr.make_iterator_repr(self, *variant)`
     /// (`lltypesystem/rlist.py`).
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
-    )]
     fn make_iterator_repr(
         &self,
         variant: &[String],
@@ -1637,10 +1633,6 @@ impl Repr for ListRepr {
     /// RPython `BaseListRepr.make_iterator_repr(self, *variant)`
     /// (`lltypesystem/rlist.py`). The resized receiver is flagged so
     /// `ll_listnext` / `ll_revlistnext` read `length` via the struct header.
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
-    )]
     fn make_iterator_repr(
         &self,
         variant: &[String],

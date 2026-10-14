@@ -164,14 +164,26 @@ pub enum KnownType {
     List,
     /// `tuple` — the RPython `SomeTuple.knowntype = tuple`.
     Tuple,
-    /// `dict` — the RPython `SomeDict.knowntype = dict`.
+    /// `dict` — the RPython `SomeDict.knowntype = dict` before the
+    /// `SomeDict = SomeOrderedDict` rebind (`model.py`).
     Dict,
+    /// `collections.OrderedDict` — `SomeOrderedDict.knowntype` after
+    /// `SomeDict = SomeOrderedDict` (`model.py`).
+    OrderedDict,
+    /// `types.FunctionType` — `FunctionDesc.knowntype` (`description.py`).
+    FunctionType,
+    /// `types.MethodType` — `MethodDesc.knowntype` / `MethodOfFrozenDesc.knowntype`
+    /// (`description.py`).
+    MethodType,
+    /// `type(iter([]))` — `SomeIterator.knowntype` (`model.py`). Python 3
+    /// names this class `list_iterator`.
+    Iterator,
     /// `classdef.classdesc` — the RPython `SomeInstance.knowntype`.
     /// The `usize` is `ClassDesc.identity`; `None` when `classdef` is
     /// `None` (`knowntype = None` upstream).
     Instance(Option<usize>),
-    /// Not a type this port carries as its own tag (`SomePBC` of
-    /// functions, `SomeIterator`, `SomeException`, …).
+    /// Residual knowntype this port has not yet given its own tag
+    /// (`FrozenDesc.knowntype = type(pyobj)`, …).
     Other,
 }
 
@@ -202,6 +214,10 @@ impl fmt::Display for KnownType {
             KnownType::List => f.write_str("list"),
             KnownType::Tuple => f.write_str("tuple"),
             KnownType::Dict => f.write_str("dict"),
+            KnownType::OrderedDict => f.write_str("OrderedDict"),
+            KnownType::FunctionType => f.write_str("function"),
+            KnownType::MethodType => f.write_str("method"),
+            KnownType::Iterator => f.write_str("list_iterator"),
             // `SomeInstance.knowntype` is the classdesc, or `None`.
             KnownType::Instance(None) => f.write_str("None"),
             KnownType::Instance(Some(id)) => write!(f, "classdesc{id}"),
@@ -1302,7 +1318,7 @@ pub struct SomeDict {
 impl SomeDict {
     pub fn new(dictdef: DictDef) -> Self {
         SomeDict {
-            base: SomeObject::new(KnownType::Dict, false),
+            base: SomeObject::new(KnownType::OrderedDict, false),
             dictdef,
         }
     }
@@ -1310,8 +1326,9 @@ impl SomeDict {
 
 impl SomeObjectTrait for SomeDict {
     fn knowntype(&self) -> KnownType {
-        // `SomeDict.knowntype = dict`.
-        KnownType::Dict
+        // After `SomeDict = SomeOrderedDict` (`model.py`), every dict
+        // annotation carries `SomeOrderedDict.knowntype = OrderedDict`.
+        KnownType::OrderedDict
     }
     fn immutable(&self) -> bool {
         false
@@ -1355,7 +1372,7 @@ impl SomeIterator {
         enumerate_start: Option<crate::flowspace::model::ConstValue>,
     ) -> Self {
         SomeIterator {
-            base: SomeObject::new(KnownType::Other, false),
+            base: SomeObject::new(KnownType::Iterator, false),
             s_container: Box::new(s_container),
             variant,
             enumerate_start,
@@ -1365,7 +1382,8 @@ impl SomeIterator {
 
 impl SomeObjectTrait for SomeIterator {
     fn knowntype(&self) -> KnownType {
-        KnownType::Other
+        // `SomeIterator.knowntype = type(iter([]))` (`model.py`).
+        KnownType::Iterator
     }
     fn immutable(&self) -> bool {
         false
@@ -1568,7 +1586,8 @@ impl Eq for SomeException {}
 
 impl SomeObjectTrait for SomeException {
     fn knowntype(&self) -> KnownType {
-        KnownType::Other
+        // `SomeException` does not override `SomeObject.knowntype = object`.
+        KnownType::Object
     }
     fn immutable(&self) -> bool {
         false
@@ -1652,10 +1671,7 @@ impl SomePBC {
         pbc.base.knowntype = pbc
             .descriptions
             .values()
-            .map(|desc| match desc.kind() {
-                DescKind::Class => KnownType::Type,
-                _ => KnownType::Other,
-            })
+            .map(|desc| desc.knowntype())
             .reduce(commonbase)
             .unwrap_or(KnownType::Object);
         // upstream model.py — single-desc pyobj const hack:
@@ -4514,7 +4530,7 @@ mod tests {
         let s = SomeValue::Dict(SomeDict::new(dictdef));
         assert!(!s.immutable());
         assert!(s.can_be_none());
-        assert_eq!(s.knowntype(), KnownType::Dict);
+        assert_eq!(s.knowntype(), KnownType::OrderedDict);
     }
 
     #[test]
@@ -4630,6 +4646,25 @@ mod tests {
         assert_eq!(s_a.knowntype(), s_a2.knowntype());
         assert_ne!(s_a.knowntype(), s_b.knowntype());
         assert!(matches!(s_a.knowntype(), KnownType::Instance(Some(_))));
+    }
+
+    #[test]
+    fn someiterator_knowntype_is_list_iterator() {
+        // `SomeIterator.knowntype = type(iter([]))` (`model.py`).
+        let s = SomeValue::Iterator(SomeIterator::new(
+            SomeValue::Integer(SomeInteger::default()),
+            vec![],
+        ));
+        assert_eq!(s.knowntype(), KnownType::Iterator);
+        assert_eq!(s.knowntype().to_string(), "list_iterator");
+    }
+
+    #[test]
+    fn someexception_knowntype_inherits_object() {
+        // `SomeException` does not override `SomeObject.knowntype`.
+        let ve = ClassDef::new_standalone("ValueError", None);
+        let s = SomeValue::Exception(SomeException::new(vec![ve]));
+        assert_eq!(s.knowntype(), KnownType::Object);
     }
 
     #[test]
@@ -5444,7 +5479,7 @@ mod tests {
     fn somepbc_knowntype_uses_commonbase_fold() {
         let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
         let function_pbc = SomePBC::new(vec![fake_function_entry(&bk, "f")], false);
-        assert_eq!(function_pbc.knowntype(), KnownType::Other);
+        assert_eq!(function_pbc.knowntype(), KnownType::FunctionType);
 
         let class_pbc = SomePBC::new(vec![fake_class_entry(&bk, "C")], false);
         assert_eq!(class_pbc.knowntype(), KnownType::Type);

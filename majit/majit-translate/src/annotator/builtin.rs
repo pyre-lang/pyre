@@ -2905,6 +2905,11 @@ pub fn robjmodel_hlinvoke(
     use crate::translator::rtyper::llannotation::lltype_to_annotation;
     use crate::translator::rtyper::rbuiltin::repr_from_const;
 
+    // `robjmodel_hlinvoke(s_repr, s_llcallable, *args_s)` (`builtin.py`):
+    // both required arguments bind before the body reads `s_repr`.
+    if args_s.len() < 2 {
+        return Err(AnnotatorError::new("hlinvoke: missing callable argument"));
+    }
     let s_repr = arg_at(args_s, 0, "hlinvoke");
     if !s_repr.is_constant() {
         return Err(AnnotatorError::new(
@@ -2922,9 +2927,6 @@ pub fn robjmodel_hlinvoke(
     // `s_llcallable` is args_s[1]; extra args start at 2.
     // upstream: `nbargs = len(args_s) + nimplicitarg` where `*args_s`
     // is everything after `s_llcallable`.
-    if args_s.len() < 2 {
-        return Err(AnnotatorError::new("hlinvoke: missing callable argument"));
-    }
     let extra = args_s.len() - 2;
     let nbargs = extra + nimplicitarg;
     let shape = CallShape {
@@ -5003,5 +5005,32 @@ mod tests {
         .expect_err("collections.OrderedDict(source)");
         let msg = err.msg.unwrap_or_default();
         assert!(msg.contains("takes no arguments"), "got {msg}");
+    }
+
+    /// `robjmodel_hlinvoke(s_repr, s_llcallable, *args_s)` (`builtin.py`)
+    /// requires both positional arguments before the body reads `s_repr`.
+    #[test]
+    fn hlinvoke_missing_args_is_annotator_error_not_panic() {
+        let bk = bk();
+        let empty = call_builtin(&bk, "rpython.rlib.objectmodel.hlinvoke", &[], &no_kwds())
+            .expect_err("hlinvoke()");
+        let empty_msg = empty.msg.unwrap_or_default();
+        assert!(
+            empty_msg.contains("missing callable argument"),
+            "got {empty_msg}"
+        );
+
+        let one = call_builtin(
+            &bk,
+            "rpython.rlib.objectmodel.hlinvoke",
+            &[Some(SomeValue::Integer(SomeInteger::default()))],
+            &no_kwds(),
+        )
+        .expect_err("hlinvoke(repr)");
+        let one_msg = one.msg.unwrap_or_default();
+        assert!(
+            one_msg.contains("missing callable argument"),
+            "got {one_msg}"
+        );
     }
 }

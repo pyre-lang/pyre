@@ -759,6 +759,22 @@ impl DescEntry {
         }
     }
 
+    /// RPython `desc.knowntype` — the live Python type object each Desc
+    /// subclass stores (`description.py` / `classdesc.py`).
+    pub(crate) fn knowntype(&self) -> super::model::KnownType {
+        match self {
+            DescEntry::Func(_) => super::model::KnownType::FunctionType,
+            DescEntry::Method(_) | DescEntry::MethodOfFrozen(_) => {
+                super::model::KnownType::MethodType
+            }
+            DescEntry::Class(_) => super::model::KnownType::Type,
+            // `FrozenDesc.knowntype = new_or_old_class(pyobj)` is the
+            // frozen object's class; residual until that class is a
+            // [`KnownType`] tag.
+            DescEntry::Frozen(_) => super::model::KnownType::Other,
+        }
+    }
+
     /// RPython `type(desc)` classifier — maps enum variants back to
     /// the [`super::model::DescKind`] used by
     /// [`super::model::SomePBC::getKind`] (model.py).
@@ -1960,9 +1976,28 @@ impl FunctionDesc {
                 ))
             })?;
             // `specialize.py` `specialize_argtype`: `args_s[i].knowntype`.
-            key_parts.push(GraphCacheKey::KnownType(s.knowntype()));
+            // `FunctionDesc.cachedgraph` formats a `ClassDesc` through
+            // `.name` while cache identity stays the classdesc object.
+            key_parts.push(Self::argtype_knowntype_key(s));
         }
         self.maybe_star_args(GraphCacheKey::Tuple(key_parts), args_s)
+    }
+
+    /// `specialize_argtype` cache key for one `args_s[i].knowntype`.
+    /// Instance annotations keep `ClassDesc` identity for equality and
+    /// `ClassDesc.name` for `cachedgraph` formatting (`description.py`).
+    fn argtype_knowntype_key(s: &SomeValue) -> GraphCacheKey {
+        if let SomeValue::Instance(inst) = s
+            && let Some(classdef) = &inst.classdef
+        {
+            let classdesc = classdef.borrow().classdesc.clone();
+            let classdesc = classdesc.borrow();
+            return GraphCacheKey::Desc {
+                key: classdesc.identity,
+                name: classdesc.name.clone(),
+            };
+        }
+        GraphCacheKey::KnownType(s.knowntype())
     }
 
     /// RPython `specialize_arglistitemtype(funcdesc, args_s, i)`
@@ -3445,7 +3480,8 @@ mod tests {
     use crate::annotator::classdesc::ClassDef;
     use crate::annotator::listdef::ListDef;
     use crate::annotator::model::{
-        SomeDict, SomeInstance, SomeInteger, SomeList, SomeString, SomeTuple, SomeValue,
+        SomeDict, SomeException, SomeInstance, SomeInteger, SomeIterator, SomeList, SomePBC,
+        SomeString, SomeTuple, SomeValue,
     };
     use crate::flowspace::argument::CallShape;
     use rustpython_compiler::{Mode, compile as rp_compile};
@@ -3799,7 +3835,8 @@ mod tests {
     #[test]
     fn specialize_argtype_keys_list_tuple_dict_knowntype_not_shape() {
         // `specialize_argtype` keys `args_s[i].knowntype` (`list` /
-        // `tuple` / `dict`), so two lists of different items share a graph.
+        // `tuple` / `OrderedDict` after `SomeDict = SomeOrderedDict`),
+        // so two lists of different items share a graph.
         let (_ann, bk) = ann_bk();
         let fd = argtype_desc(bk, "g");
         let list_int = SomeValue::List(SomeList::new(ListDef::new(
@@ -3874,7 +3911,7 @@ mod tests {
             .expect_graph()
             .unwrap();
         assert!(Rc::ptr_eq(&d1, &d2));
-        assert_eq!(d1.graph.borrow().name, "g__dict");
+        assert_eq!(d1.graph.borrow().name, "g__OrderedDict");
     }
 
     #[test]
@@ -3915,6 +3952,60 @@ mod tests {
             .unwrap();
         assert!(Rc::ptr_eq(&g_a, &g_a2));
         assert!(!Rc::ptr_eq(&g_a, &g_b));
+        // `FunctionDesc.cachedgraph` formats a `ClassDesc` through `.name`
+        // (`description.py`); `pkg.A` becomes `pkg_A`.
+        assert_eq!(g_a.graph.borrow().name, "h__pkg_A");
+        assert_eq!(g_b.graph.borrow().name, "h__pkg_B");
+    }
+
+    #[test]
+    fn specialize_argtype_keeps_iterator_exception_function_pbc_keys_distinct() {
+        // `SomeIterator.knowntype = type(iter([]))`, `SomeException`
+        // inherits `object`, `FunctionDesc.knowntype = types.FunctionType`
+        // (`model.py` / `description.py`). Mapping all three to
+        // `KnownType::Other` reused one cached graph.
+        let (_ann, bk) = ann_bk();
+        let fd = argtype_desc(bk.clone(), "k");
+        let iterator = SomeValue::Iterator(SomeIterator::new(
+            SomeValue::Integer(SomeInteger::default()),
+            vec![],
+        ));
+        let exception = SomeValue::Exception(SomeException::new(vec![ClassDef::new_standalone(
+            "ValueError",
+            None,
+        )]));
+        let callee_func = compiled_graph_func("def callee():\n    return 1\n", Vec::new());
+        let callee_host = HostObject::new_user_function(callee_func.clone());
+        let callee = Rc::new(RefCell::new(FunctionDesc::new(
+            bk,
+            Some(callee_host),
+            "callee",
+            callee_func.code.as_ref().unwrap().signature.clone(),
+            Some(callee_func.defaults.clone()),
+            None,
+        )));
+        let function_pbc = SomeValue::PBC(SomePBC::new(vec![DescEntry::function(callee)], false));
+        let g_iter = fd
+            .specialize(&mut vec![Some(iterator)], None)
+            .expect("iterator")
+            .expect_graph()
+            .unwrap();
+        let g_exc = fd
+            .specialize(&mut vec![Some(exception)], None)
+            .expect("exception")
+            .expect_graph()
+            .unwrap();
+        let g_fn = fd
+            .specialize(&mut vec![Some(function_pbc)], None)
+            .expect("function pbc")
+            .expect_graph()
+            .unwrap();
+        assert_eq!(g_iter.graph.borrow().name, "k__list_iterator");
+        assert_eq!(g_exc.graph.borrow().name, "k__object");
+        assert_eq!(g_fn.graph.borrow().name, "k__function");
+        assert!(!Rc::ptr_eq(&g_iter, &g_exc));
+        assert!(!Rc::ptr_eq(&g_iter, &g_fn));
+        assert!(!Rc::ptr_eq(&g_exc, &g_fn));
     }
 
     #[test]

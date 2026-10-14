@@ -8881,6 +8881,13 @@ pub(crate) fn build_ll_dict_insert_helper_graph(
         var(&sdisplaced),
     ]);
 
+    // Miss returns NULL the way `ll_dict_get` does (`rordereddict.py`).
+    // `ConstValue::None` is only a valid constant for a pointer lltype.
+    if !matches!(value_lltype, LowLevelType::Ptr(_)) {
+        return Err(TyperError::message(format!(
+            "ll_dict_insert: value type {value_lltype:?} cannot represent None on miss"
+        )));
+    }
     let none_value = constant_with_lltype(ConstValue::None, value_lltype.clone());
     startblock.closeblock(vec![
         Link::new(
@@ -12297,7 +12304,7 @@ mod tests {
             dict_ptr,
             entries_ptr,
             key_lltype,
-            LowLevelType::Signed,
+            string_repr().lowleveltype().clone(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
@@ -12381,7 +12388,7 @@ mod tests {
             dict_ptr,
             entries_ptr,
             key_lltype,
-            LowLevelType::Signed,
+            string_repr().lowleveltype().clone(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
@@ -12396,6 +12403,30 @@ mod tests {
             hash_call.args.len(),
             3,
             "custom keyhash is direct_call(hash_fn, d, key)"
+        );
+    }
+
+    /// `ll_dict_insert` miss path is `None` as `value_lltype`. Signed
+    /// cannot hold that constant (`rordereddict.py` `ll_dict_get`).
+    #[test]
+    fn build_ll_dict_insert_rejects_non_pointer_value_type() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let err = build_ll_dict_insert_helper_graph(
+            "ll_dict_insert",
+            dict_ptr,
+            entries_ptr,
+            key_lltype,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            false,
+        )
+        .expect_err("Signed value type cannot represent miss None");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("cannot represent None"),
+            "expected miss-None diagnostic, got {text}"
         );
     }
 
@@ -13231,8 +13262,31 @@ mod tests {
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         rtyper.initialize_exceptiondata().expect("rtyper init");
-        let repr = make_custom_eq_hash_dict_repr(rtyper.clone());
+        let repr = {
+            let (eq, hash) = custom_eq_hash_reprs();
+            let dictdef = DictDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::String(SomeString::new(false, false)),
+                true,
+                false,
+                false,
+            );
+            Arc::new(
+                OrderedDictRepr::new(
+                    rtyper.clone(),
+                    signed_repr() as Arc<dyn Repr>,
+                    string_repr() as Arc<dyn Repr>,
+                    dictdef,
+                    Some((eq, hash)),
+                    false,
+                    false,
+                )
+                .expect("custom eq/hash ordered dict repr with pointer values"),
+            )
+        };
         let dict_lltype = repr.lowleveltype().clone();
+        let value_lltype = string_repr().lowleveltype().clone();
 
         let llops = Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
@@ -13243,9 +13297,9 @@ mod tests {
         let v_key = Variable::new();
         v_key.set_concretetype(Some(LowLevelType::Signed));
         let v_value = Variable::new();
-        v_value.set_concretetype(Some(LowLevelType::Signed));
+        v_value.set_concretetype(Some(value_lltype));
         let v_result = Variable::new();
-        v_result.set_concretetype(Some(LowLevelType::Signed));
+        v_result.set_concretetype(Some(string_repr().lowleveltype().clone()));
         let hop = HighLevelOp::new(
             rtyper,
             SpaceOperation::new(
@@ -13269,7 +13323,7 @@ mod tests {
         hop.args_r.borrow_mut().extend([
             Some(repr.clone() as Arc<dyn Repr>),
             Some(signed_repr() as Arc<dyn Repr>),
-            Some(signed_repr() as Arc<dyn Repr>),
+            Some(string_repr() as Arc<dyn Repr>),
         ]);
         let result = repr
             .rtype_method("insert", &hop)
