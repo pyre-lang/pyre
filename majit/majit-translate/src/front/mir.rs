@@ -14788,7 +14788,8 @@ impl<'a> Lowering<'a> {
                 // recorded; answer with that, and keep the two apart
                 // exactly as upstream does.
                 if let Some(logical_len) = self.array_view_logical_len_for_place(&place) {
-                    return Ok((None, logical_len));
+                    let bb_id = self.emit_bb(mir_bb);
+                    return Ok((None, self.bind_array_view_len_in_block(bb_id, logical_len)));
                 }
                 let len_leaf = if self
                     .string_byte_view_locals
@@ -26879,7 +26880,7 @@ impl<'a> Lowering<'a> {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
                     };
                     let len = if let Some(len_var) = self.array_view_logical_len_for_var(&args[0]) {
-                        len_var
+                        self.bind_array_view_len_in_block(bb_id, len_var)
                     } else if let Some(len_var) = fat_len {
                         len_var
                     } else {
@@ -26951,7 +26952,7 @@ impl<'a> Lowering<'a> {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
                     };
                     let res = if let Some(len_var) = self.array_view_logical_len_for_var(&args[0]) {
-                        len_var
+                        self.bind_array_view_len_in_block(bb_id, len_var)
                     } else if let Some(len_var) = fat_len {
                         len_var
                     } else {
@@ -34692,6 +34693,16 @@ impl<'a> Lowering<'a> {
                     .is_some_and(|current| current == *arg)
             })
             .map(|(_, len)| len.clone())
+    }
+
+    /// `l.length` as a value defined in `bb_id`.
+    ///
+    /// View creation records that word outside `local_var`, so
+    /// `FrameState.getoutputargs` / `flowcontext.py` `make_next_block`
+    /// do not carry it. A later `.len()` / `Rvalue::Len` must not name
+    /// the predecessor Variable on a link (`checkgraph` `definevar`).
+    fn bind_array_view_len_in_block(&mut self, bb_id: BlockId, len_var: Variable) -> Variable {
+        bind_array_view_len_in_block(&mut self.graph, bb_id, len_var)
     }
 
     /// Body-side `from_raw_parts` of [`Self::numeric_array_slice_view_owner`].
@@ -74301,6 +74312,40 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
     redirected
 }
 
+/// `l.length` as a value defined in `block`.
+///
+/// View creation records that word outside `local_var`, so
+/// `FrameState.getoutputargs` / `flowcontext.py` `make_next_block`
+/// do not carry it. A later `.len()` / `Rvalue::Len` must not name
+/// the predecessor Variable on a link (`checkgraph` `definevar`).
+///
+/// When `len_var` is already an inputarg or op result of `block`, it
+/// is returned. Otherwise this emits `same_as` so the dest / link
+/// operand is an op result of `block`. After the CFG closes,
+/// `thread_undefined_op_operands` (`ensure_variable_at_block_local`,
+/// `SSA_to_SSI`) threads the `same_as` operand. Calling
+/// `ensure_variable_at_block_local` during lowering would add an
+/// inputarg that framestate pass 2 then drops.
+pub(crate) fn bind_array_view_len_in_block(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    len_var: Variable,
+) -> Variable {
+    if graph.variable_defined_in_block(block, &len_var) {
+        return len_var;
+    }
+    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind: OpKind::UnaryOp {
+            op: "same_as".to_string(),
+            operand: len_var,
+            result_ty: ValueType::Int,
+        },
+    });
+    res
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -74614,6 +74659,60 @@ mod tests {
             other => panic!("expected FieldRead, got {other:?}"),
         }
     }
+
+    /// View `.len()` must not put a predecessor Variable on a consumer
+    /// link (`FrameState.getoutputargs`, `checkgraph` `definevar`).
+    #[test]
+    fn array_view_len_link_operand_is_defined_in_the_consumer_block() {
+        let mut graph = FunctionGraph::new("array_view_len_consumer");
+        let pred = graph.startblock;
+        let consumer = graph.create_block();
+        let len_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        graph.block_mut(pred).operations.push(SpaceOperation {
+            result: Some(len_var.clone()),
+            kind: OpKind::ConstInt(3),
+        });
+        graph.set_goto(pred, consumer, vec![]);
+
+        assert!(
+            !graph.variable_defined_in_block(consumer, &len_var),
+            "predecessor length is not a definition in the consumer"
+        );
+        let bound = super::bind_array_view_len_in_block(&mut graph, consumer, len_var.clone());
+        assert_ne!(
+            bound.id(),
+            len_var.id(),
+            "consumer must not name the predecessor Variable on a link"
+        );
+        assert!(
+            graph.variable_defined_in_block(consumer, &bound),
+            "same_as result is defined in the consumer (`checkgraph` definevar)"
+        );
+        match graph.block(consumer).operations.last().map(|op| &op.kind) {
+            Some(OpKind::UnaryOp { op, operand, .. }) if op == "same_as" => {
+                assert_eq!(operand.id(), len_var.id());
+            }
+            other => panic!("expected same_as of the predecessor length, got {other:?}"),
+        }
+        graph.set_return(consumer, Some(bound.clone()));
+        match graph.block(consumer).exits[0].args.as_slice() {
+            [LinkArg::Value(v)] => {
+                assert!(
+                    graph.variable_defined_in_block(consumer, v),
+                    "return link operand is defined in the source block"
+                );
+                assert_eq!(v.id(), bound.id());
+            }
+            other => panic!("expected one return value, got {other:?}"),
+        }
+        let same = super::bind_array_view_len_in_block(&mut graph, pred, len_var.clone());
+        assert_eq!(
+            same.id(),
+            len_var.id(),
+            "a length already defined in the block is reused"
+        );
+    }
+
     use majit_charon_reader::{
         Llbc,
         ullbc::{NameSeg, TyRef},
