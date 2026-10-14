@@ -23022,29 +23022,39 @@ pub extern "C" fn generatorentry_portal_c(
 /// ([`GeneratorThrow`]), `0` for a plain sent value.
 pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg: PyObjectRef, throw: usize) -> PyResult {
     use pyre_object::generator::*;
-    // `frame = self.frame`. Read before the pins so that every exit leaves
-    // the same three roots: the bracket is then static, and the translator
-    // removes it the way `gctransform/framework.py push_roots` is added
-    // only after the codewriter has read the graph.
-    let frame_ptr = unsafe { w_generator_get_frame(gen_obj) } as *mut crate::pyframe::PyFrame;
-    // Pin a GC-owned frame. An unmanaged `FrameBox::from_raw` allocation
-    // (`owner_root: None`) is not a `GcRef`; publishing it lets a
-    // collection rewrite the pointer, so its slot holds null instead.
-    // `try_gc_owns_object` is the gate. `FrameAnchor` publishes the
-    // same pointer as `GcRef`, so it is not a substitute.
-    let frame_owned = !frame_ptr.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(frame_ptr as pyre_object::gc_hook::GCREF);
+    // Every exit leaves the same three roots: the bracket is then static,
+    // and the translator removes it the way `gctransform/framework.py
+    // push_roots` is added only after the codewriter has read the graph.
     let _roots = pyre_object::gc_roots::push_roots();
     let gen_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(gen_obj);
     let arg_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_arg);
+    // `frame = self.frame`, read off the pinned generator: a pin above can
+    // wait behind a collection that moves the frame, and the generator's
+    // edge is what that collection updates.
+    // Pin a GC-owned frame. An unmanaged `FrameBox::from_raw` allocation
+    // (`owner_root: None`) is not a `GcRef`; publishing it lets a
+    // collection rewrite the pointer, so its slot holds null instead.
+    // `try_gc_owns_object` is the gate. `FrameAnchor` publishes the
+    // same pointer as `GcRef`, so it is not a substitute.
+    let frame_owned = {
+        let frame =
+            unsafe { w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot)) };
+        !frame.is_null()
+            && pyre_object::gc_hook::try_gc_owns_object(frame as pyre_object::gc_hook::GCREF)
+    };
     let frame_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(if frame_owned {
-        frame_ptr as PyObjectRef
+        unsafe {
+            w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot)) as PyObjectRef
+        }
     } else {
         pyre_object::PY_NULL
     });
+    let frame_ptr =
+        unsafe { w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot)) }
+            as *mut crate::pyframe::PyFrame;
     unsafe {
         if w_generator_is_exhausted(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
             return genentry_raise_finished(
