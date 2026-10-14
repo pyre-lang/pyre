@@ -423,75 +423,134 @@ fn negative_cache_version_compare(
 /// `app_abc.py _abc_init` — install the three collections and the
 /// negative-cache generation, then compute `__abstractmethods__`.
 fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if let Some(mut cls) = args.first().copied() {
+    if let Some(cls) = args.first().copied() {
+        // A heap type is born in the nursery (`w_type_new`). Every
+        // allocation below can collect, so `cls` lives on the shadow stack
+        // for the whole body and is re-read from its slot after each
+        // collecting call — the same livevar set `gct_fv_gc_malloc` would
+        // emit around those constructors (`framework.py`).
+        let roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = roots.pin_roots(&[cls]);
+        // Slot indices of abstract-method names pinned on `roots`.  A plain
+        // `Vec<PyObjectRef>` is not a root area, so the names cannot sit
+        // there across `getattr` / `isabstractmethod_w`.  `RootedItems`
+        // must own the shadow-stack top while it pushes, so the names stay
+        // on this outer bracket until the frozenset constructor, which
+        // opens `RootedItems` on top and copies from these slots.
+        let mut abstract_slots: Vec<usize> = Vec::new();
+
         // `app_abc.py:74-77` — registry and both caches are per-class for the
         // same reason: resolved up the MRO, one base's would answer for every
         // descendant ABC, and a hit on `Rational` would satisfy `Integral`.
-        // Each value is built before the call that stores it, so that no
-        // allocation happens between reading `cls` and using it.
         for name in ["_abc_registry", "_abc_cache", "_abc_negative_cache"] {
-            let fresh = pyre_object::with_roots!(cls => new_simple_weak_set())?;
-            pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::setattr_str(cls, name, fresh))?;
+            let mut fresh = new_simple_weak_set()?;
+            pyre_object::with_roots!(fresh => pyre_interpreter::baseobjspace::setattr_str(
+                roots.get(cls_slot),
+                name,
+                fresh,
+            ))?;
         }
-        let version = w_int_new(INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64);
-        pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::setattr_str(
-            cls,
+        // `space.newint` (`intobject.py wrapint`) allocates the version box.
+        let mut version = w_int_new(INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64);
+        pyre_object::with_roots!(version => pyre_interpreter::baseobjspace::setattr_str(
+            roots.get(cls_slot),
             "_abc_negative_cache_version",
-            version
+            version,
         ))?;
-        let mut abstract_names = Vec::new();
-        let mut bases = unsafe { w_type_get_bases(cls) };
+
+        // Re-read `bases` off the live class: the tuple is itself a nursery
+        // object, and `getattr` / `collect_iterable` below collect.
+        let bases = unsafe { w_type_get_bases(roots.get(cls_slot)) };
         if !bases.is_null() && unsafe { is_tuple(bases) } {
-            for i in 0..unsafe { w_tuple_len(bases) } {
-                let Some(base) = (unsafe { w_tuple_getitem(bases, i as i64) }) else {
+            let n_bases = unsafe { w_tuple_len(bases) };
+            for i in 0..n_bases {
+                let bases = unsafe { w_type_get_bases(roots.get(cls_slot)) };
+                let Some(mut base) = (unsafe { w_tuple_getitem(bases, i as i64) }) else {
                     continue;
                 };
                 // app_abc.py:67-71 — `getattr(..., set())` defaults only a
                 // missing attribute.  A descriptor failure is observable and
                 // any iterable, not just a set/frozenset, supplies names.
-                let names = match pyre_object::with_roots!(bases, cls => pyre_interpreter::baseobjspace::getattr_str(
-                    base,
-                    "__abstractmethods__",
-                )) {
+                let names = match pyre_object::with_roots!(base => {
+                    pyre_interpreter::baseobjspace::getattr_str(base, "__abstractmethods__")
+                }) {
                     Ok(names) => names,
                     Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
                         w_set_new()
                     }
                     Err(err) => return Err(err),
                 };
-                for mut name in pyre_object::with_roots!(bases, cls => pyre_interpreter::builtins::collect_iterable(names))?
-                {
+                let mut names = names;
+                let collected = pyre_object::with_roots!(names => {
+                    pyre_interpreter::builtins::collect_iterable(names)
+                })?;
+                let n_names = collected.len();
+                let name_base = roots.pin_roots(&collected);
+                for j in 0..n_names {
+                    let mut name = roots.get(name_base + j);
                     // `_py_abc.py:69` — object-level getattr validates that
                     // every supplied abstract-method name is a string, then
                     // lets descriptors and metaclass attributes provide an
                     // implementation.  Only a missing attribute defaults.
-                    let value = match pyre_object::with_roots!(bases, cls, name => pyre_interpreter::baseobjspace::getattr(cls, name))
-                    {
+                    let value = match pyre_object::with_roots!(name => {
+                        pyre_interpreter::baseobjspace::getattr(roots.get(cls_slot), name)
+                    }) {
                         Ok(value) => value,
                         Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
                             w_none()
                         }
                         Err(err) => return Err(err),
                     };
-                    if pyre_object::with_roots!(bases, cls, name => pyre_interpreter::baseobjspace::isabstractmethod_w(value))?
-                    {
-                        abstract_names.push(name);
+                    let mut value = value;
+                    if pyre_object::with_roots!(name, value => {
+                        pyre_interpreter::baseobjspace::isabstractmethod_w(value)
+                    })? {
+                        abstract_slots.push(name_base + j);
                     }
                 }
             }
         }
-        let namespace = unsafe { w_type_get_dict_ptr(cls) as PyObjectRef };
+        // Re-read the namespace off the live class: the type dict moves
+        // with the heap type, and the items vec is iterated across
+        // `unwrap_cell` (`w_int_new` for an `IntMutableCell`) and
+        // `isabstractmethod_w`.
+        let mut namespace = unsafe { w_type_get_dict_ptr(roots.get(cls_slot)) as PyObjectRef };
         if !namespace.is_null() {
-            for (mut name, value) in unsafe { w_dict_items(namespace) } {
-                let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
-                if pyre_object::with_roots!(cls, name => pyre_interpreter::baseobjspace::isabstractmethod_w(value))?
-                {
-                    abstract_names.push(name);
+            let pairs = pyre_object::with_roots!(namespace => unsafe { w_dict_items(namespace) });
+            let mut flat = Vec::with_capacity(pairs.len() * 2);
+            for (name, value) in pairs {
+                flat.push(name);
+                flat.push(value);
+            }
+            let n_pairs = flat.len() / 2;
+            let flat_base = roots.pin_roots(&flat);
+            for j in 0..n_pairs {
+                // `unwrap_cell` can allocate, so `name` is read after it.
+                let mut value =
+                    unsafe { pyre_object::celldict::unwrap_cell(roots.get(flat_base + 2 * j + 1)) };
+                let mut name = roots.get(flat_base + 2 * j);
+                if pyre_object::with_roots!(name, value => {
+                    pyre_interpreter::baseobjspace::isabstractmethod_w(value)
+                })? {
+                    abstract_slots.push(flat_base + 2 * j);
                 }
             }
         }
-        let methods = w_frozenset_from_items(&abstract_names);
-        pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::setattr_str(cls, "__abstractmethods__", methods))?;
+        // `app_abc.py _abc_init` `cls.__abstractmethods__ = frozenset(abstracts)`.
+        // `w_frozenset_from_items` allocates; `RootedItems` owns the top while
+        // it pushes copies of the already-pinned names (`gc_roots.rs`).
+        {
+            let mut abstract_names = pyre_object::gc_roots::RootedItems::new();
+            for &slot in &abstract_slots {
+                abstract_names.push(roots.get(slot));
+            }
+            let mut methods = w_frozenset_from_items(&abstract_names.take());
+            pyre_object::with_roots!(methods => pyre_interpreter::baseobjspace::setattr_str(
+                roots.get(cls_slot),
+                "__abstractmethods__",
+                methods,
+            ))?;
+        }
 
         // `app_abc.py _abc_init` — fold a `__abc_tpflags__` in the class body
         // into the structural-match marker, then drop the attribute.
@@ -507,23 +566,30 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
         // otherwise. The mask is the observable behaviour -- `__abc_tpflags__ =
         // (1 << 5) | 1` sets the sequence marker -- so mask here and hand the
         // primitive the single bit its own contract is written against.
-        if unsafe { is_type(cls) }
-            && let Some(w_flags) = pyre_interpreter::type_dict_lookup(cls, "__abc_tpflags__")
+        if unsafe { is_type(roots.get(cls_slot)) }
+            && let Some(w_flags) =
+                pyre_interpreter::type_dict_lookup(roots.get(cls_slot), "__abc_tpflags__")
         {
             // `PyDict_Pop(dict, &_Py_ID(__abc_tpflags__), &flags)` -- take the
             // entry out of the type dict itself, and take it before validating.
             // A metaclass `__delattr__` never sees this, and a value the checks
             // below reject is consumed all the same, so a subclass re-running
             // `_abc_init` does not inherit the same rejection.
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[w_flags, cls]);
-            let flags_slot = base;
-            let cls_slot = base + 1;
-            pyre_interpreter::type_dict_delete(roots.get(cls_slot), "__abc_tpflags__");
+            // `type_dict_lookup` unwraps an `IntMutableCell` through
+            // `w_int_new`, so `cls` is re-read from the outer slot rather
+            // than the copy captured before the lookup.
+            let flag_roots = pyre_object::gc_roots::push_roots();
+            let flag_base = flag_roots.pin_roots(&[w_flags, roots.get(cls_slot)]);
+            let flags_slot = flag_base;
+            let flag_cls_slot = flag_base + 1;
+            pyre_interpreter::type_dict_delete(flag_roots.get(flag_cls_slot), "__abc_tpflags__");
             unsafe {
-                pyre_interpreter::baseobjspace::mutated(roots.get(cls_slot), "__abc_tpflags__")
+                pyre_interpreter::baseobjspace::mutated(
+                    flag_roots.get(flag_cls_slot),
+                    "__abc_tpflags__",
+                )
             };
-            let w_flags = roots.get(flags_slot);
+            let w_flags = flag_roots.get(flags_slot);
             // `PyLong_CheckExact` -- an `int` subclass, `bool` included, is
             // consumed and ignored, as is anything that is not an int at all.
             // Both int representations spell `int`, so both are exact.
@@ -537,7 +603,10 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
                     ));
                 }
                 if flags & COLLECTION_FLAGS != 0 {
-                    set_collection_flag_of(roots.get(cls_slot), flags & COLLECTION_FLAGS)?;
+                    set_collection_flag_of(
+                        flag_roots.get(flag_cls_slot),
+                        flags & COLLECTION_FLAGS,
+                    )?;
                 }
             }
         }
