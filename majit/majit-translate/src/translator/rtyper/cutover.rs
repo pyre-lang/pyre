@@ -329,7 +329,7 @@ pub(crate) fn dual_gate_check_with_registry(
     let (graph, mut real_value_to_var, mut real_constants) = match result {
         Ok(Ok((graph, value_to_var, _, constants, _))) => (graph, value_to_var, constants),
         Ok(Err(e)) => {
-            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
+            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources, true);
             let msg = format!("{e}");
             if is_known_unported(&msg) {
                 return Ok(DualGateOutcome::Skip(msg));
@@ -337,7 +337,7 @@ pub(crate) fn dual_gate_check_with_registry(
             return Err(format!("real path failed: {msg}"));
         }
         Err(payload) => {
-            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
+            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources, true);
             let msg = crate::annotator::model::panic_payload_text(&*payload)
                 .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
             if is_known_unported(&msg) {
@@ -436,6 +436,17 @@ pub(crate) fn dual_gate_check_with_registry(
 ///   so `total_calltable_size` and `get_concrete_calltable`'s size
 ///   invariant hold; the family's cached concrete calltable is
 ///   dropped so it rebuilds against the fresh graph)
+///
+/// Two-phase Phase B is rtype-only: annotation has finished, so a
+/// later `pycall` will not `recursivecall` a replacement
+/// (`description.py FunctionDesc.pycall` → `annrpython.py
+/// recursivecall`). `FunctionRepr.convert_to_concrete_llfn`
+/// (`rpbc.py`) then `getcallable`s the calltable row
+/// (`lltype.getfunctionptr` walks `graph.getargs()`). Replacing
+/// `FunctionDesc.cache` with a never-flowed lift makes those getargs
+/// unbound. Phase B therefore keeps the original cache graph
+/// (`replace_cache = false`) — the one `FunctionDesc.cachedgraph` /
+/// `bookkeeper.getdesc` identity upstream keeps in `translator.graphs`.
 #[derive(Default)]
 struct SubjectSessionSnapshot {
     fixed_graphs: HashSet<crate::flowspace::model::GraphKey>,
@@ -459,6 +470,7 @@ fn unpoison_failed_subject_callees(
     call_registry: &CallRegistry,
     session_at_entry: &SubjectSessionSnapshot,
     lift_sources: &crate::codewriter::call::GraphStore,
+    replace_cache: bool,
 ) {
     let Some((annotator, rtyper)) = call_registry.session_if_started() else {
         return;
@@ -505,6 +517,11 @@ fn unpoison_failed_subject_callees(
             generation.retain(|bkey, _| !stale_block_keys.contains(bkey));
         }
         annotator.blocked_graphs.borrow_mut().shift_remove(&gkey);
+        if !replace_cache {
+            // Phase B: keep FunctionDesc.cache / calltable on this graph.
+            // getfunctionptr still reads its bound getargs.
+            continue;
+        }
         annotator
             .translator
             .graphs
@@ -4654,6 +4671,7 @@ fn run_two_phase_prepass_inner(
                         call_registry,
                         &session_at_entry,
                         function_graphs,
+                        true,
                     );
                 }));
             }
@@ -5035,6 +5053,7 @@ fn run_phase_b_rtype_isolated(
                             call_registry,
                             &session_at_entry,
                             lift_sources,
+                            false,
                         );
                     }));
                     break;
@@ -9693,6 +9712,91 @@ mod tests {
                 .borrow()
                 .contains_key(&GraphKey::of(&stale)),
             "discarded graph must not remain in blocked_graphs"
+        );
+    }
+
+    #[test]
+    fn phase_b_unpoison_keeps_annotated_functiondesc_cache_graph() {
+        let _lock = anchor_lock();
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::flowspace::model::GraphKey;
+        use crate::translator::rtyper::call_registry::{CallRegistry, FunctionPathKey};
+
+        let mut source = LegacyGraph::new("cached_callee");
+        let vars = mint_vars(&mut source, 2);
+        let value = vars[1].clone();
+        source.blocks = vec![
+            Block {
+                id: source.startblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(value.clone())],
+                    source.returnblock,
+                )],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: source.returnblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            },
+        ];
+        setbinding(&value, ValueType::Int);
+
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let signature =
+            crate::flowspace::argument::Signature::new(vec!["arg0".to_string()], None, None);
+        let lifted = lift_callee_to_pygraph(&source, signature.clone(), &registry)
+            .expect("callee must lift");
+        let stale = lifted.graph.clone();
+        registry.register_callee(
+            FunctionPathKey::from_segments(["cached_callee"]),
+            signature,
+            lifted,
+        );
+        let (annotator, _) = registry.ensure_session().expect("session must initialize");
+        for arg in stale.borrow().getargs() {
+            if let Hlvalue::Variable(var) = arg {
+                setbinding(&var, ValueType::Int);
+            }
+        }
+        let session_at_entry = SubjectSessionSnapshot::capture_fixed_only(&registry);
+        annotator
+            .fixed_graphs
+            .borrow_mut()
+            .insert(GraphKey::of(&stale), stale.clone());
+
+        unpoison_failed_subject_callees(
+            &registry,
+            &session_at_entry,
+            &crate::codewriter::call::GraphStore::default(),
+            false,
+        );
+
+        assert!(
+            registry.find_entry_with_cached_graph(&stale).is_some(),
+            "Phase B must keep FunctionDesc.cache on the annotated graph"
+        );
+        assert!(
+            stale.borrow().getargs().iter().all(|value| match value {
+                Hlvalue::Variable(var) => var.annotation.borrow().is_some(),
+                _ => true,
+            }),
+            "the cached graph's getargs must stay bound for getfunctionptr"
+        );
+        assert!(
+            !annotator
+                .fixed_graphs
+                .borrow()
+                .contains_key(&GraphKey::of(&stale)),
+            "the failed graph must leave fixed_graphs"
         );
     }
 
