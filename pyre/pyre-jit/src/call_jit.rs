@@ -69,6 +69,17 @@ thread_local! {
         const { UnsafeCell::new(None) };
 }
 
+/// Drop the `CA_WALK_*` handshake.  It belongs to one CALL_ASSEMBLER guard
+/// failure: the bridge hook stamps it and the blackhole hook that runs right
+/// after reads it.  When the bridge hook completes the callee itself, the
+/// blackhole hook does not run, and a stamp left behind would be read by the
+/// next guard failure of the same frame as if its own walk had adopted state.
+fn reset_ca_walk_handshake() {
+    CA_WALK_ADOPTED_FRAME.with(|c| c.set(0));
+    CA_WALK_FINISHED_FRAME.with(|c| c.set(0));
+    CA_WALK_RESUME_FRAME.with(|c| c.set(0));
+}
+
 struct FrameRoot {
     depth: usize,
 }
@@ -4532,6 +4543,8 @@ fn jit_ca_handle_guard_failure(
     // `num_values == 0` would leave such a guard without a counter tick, and so
     // without a bridge, forever. Only a null pointer with a non-zero length is
     // unusable — that pairing cannot be turned into a slice at all.
+    // A stamp from an earlier failure is not this guard's.
+    reset_ca_walk_handshake();
     if deadframe.is_null() {
         return None;
     }
@@ -4692,6 +4705,10 @@ fn jit_ca_handle_guard_failure(
         );
     }
 
+    if !matches!(resolution, BridgeResolution::ResumeBlackhole) {
+        // The callee completes here; no blackhole hook reads the stamp.
+        reset_ca_walk_handshake();
+    }
     match resolution {
         BridgeResolution::CompiledContinue => {
             // compile.py handle_fail must_compile arm raises
@@ -4969,9 +4986,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 // `jitexc.py` `ExitFrameWithExceptionRef`: deliver it
                 // ahead of the guard-state blackhole, which would resume
                 // the frame the exception already left.
-                CA_WALK_FINISHED_FRAME.with(|c| c.set(0));
-                CA_WALK_ADOPTED_FRAME.with(|c| c.set(0));
-                CA_WALK_RESUME_FRAME.with(|c| c.set(0));
+                reset_ca_walk_handshake();
                 pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
                 return match completion {
                     CaFrameCompletion::Raised(cv) => ca_finish_raise_word(cv),
