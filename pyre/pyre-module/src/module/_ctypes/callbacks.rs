@@ -13,8 +13,11 @@ use pyre_object::PyObjectRef;
 ))]
 mod imp {
     use super::PyObjectRef;
-    use crate::module::_ctypes::{cdata, funcptr};
+    use crate::module::_ctypes::callproc::{CTypeLayout, CallbackThunk, FfiType};
+    use crate::module::_ctypes::{callproc, cdata, funcptr};
     use core::ffi::c_void;
+    use majit_rlib::clibffi::{CALLBACK_TP, FFI_CIFP, VOIDPP};
+    use majit_rlib::rffi::VOIDP;
     use parking_lot::Mutex;
     use rustpython_host_env::ctypes as host_ctypes;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -37,7 +40,7 @@ mod imp {
         #[allow(dead_code)]
         slot: Box<usize>,
         #[allow(dead_code)]
-        thunk: host_ctypes::CallbackThunk<ThunkUserdata>,
+        thunk: CallbackThunk<ThunkUserdata>,
     }
 
     unsafe impl Send for StoredThunk {}
@@ -70,7 +73,7 @@ mod imp {
         let root_slot = slot_ptr as *mut pyre_object::gc_hook::GCREF;
         unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
 
-        let thunk = host_ctypes::CallbackThunk::new(
+        let thunk = CallbackThunk::new(
             ffi_arg_types,
             ffi_res_type,
             Box::new(ThunkUserdata {
@@ -79,7 +82,7 @@ mod imp {
             }),
             thunk_callback,
         );
-        let code = thunk.code_ptr().0 as usize;
+        let code = thunk.code_ptr();
 
         // A foreign caller may retain a callback pointer indefinitely; pyre has
         // no proof point for unregistering it, so the rooted slot and closure
@@ -88,14 +91,12 @@ mod imp {
         Ok(Some(code))
     }
 
-    fn ffi_type_for_arg(
-        at: PyObjectRef,
-    ) -> Result<host_ctypes::FfiType, pyre_interpreter::PyError> {
+    fn ffi_type_for_arg(at: PyObjectRef) -> Result<FfiType, pyre_interpreter::PyError> {
         if funcptr::argtype_is_pointer_kind(at) {
-            return Ok(host_ctypes::ffi_pointer_type());
+            return Ok(callproc::ffi_pointer_type());
         }
         if let Some(tc) = cdata::type_code_of(at)
-            && let Some(ty) = host_ctypes::ffi_type_from_code(&tc)
+            && let Some(ty) = callproc::ffi_type_from_code(&tc)
         {
             return Ok(ty);
         }
@@ -105,31 +106,28 @@ mod imp {
     /// Lower the same recursive layout foreign calls use to the callback CIF.
     /// Struct field kinds determine register classification on every major
     /// ABI; a byte-struct of the same size is not equivalent.
-    fn ffi_type_for_layout(
-        layout: &host_ctypes::CTypeLayout,
-    ) -> Result<host_ctypes::FfiType, pyre_interpreter::PyError> {
-        use host_ctypes::CTypeLayout;
+    fn ffi_type_for_layout(layout: &CTypeLayout) -> Result<FfiType, pyre_interpreter::PyError> {
         match layout {
             CTypeLayout::Simple(code) => {
                 let mut buf = [0u8; 4];
-                host_ctypes::ffi_type_from_code(code.encode_utf8(&mut buf)).ok_or_else(|| {
+                callproc::ffi_type_from_code(code.encode_utf8(&mut buf)).ok_or_else(|| {
                     pyre_interpreter::PyError::type_error("unknown callback argument type")
                 })
             }
-            CTypeLayout::Pointer => Ok(host_ctypes::ffi_pointer_type()),
+            CTypeLayout::Pointer => Ok(callproc::ffi_pointer_type()),
             CTypeLayout::Struct { fields, .. } => fields
                 .iter()
                 .map(ffi_type_for_layout)
                 .collect::<Result<Vec<_>, _>>()
-                .map(host_ctypes::FfiType::structure),
+                .map(FfiType::structure),
             CTypeLayout::Array {
                 element, length, ..
-            } => Ok(host_ctypes::ffi_repeat_type(
+            } => Ok(callproc::ffi_repeat_type(
                 ffi_type_for_layout(element)?,
                 *length,
             )),
             CTypeLayout::Union { size, .. } | CTypeLayout::Opaque { size } => {
-                Ok(host_ctypes::ffi_byte_struct(*size))
+                Ok(callproc::ffi_byte_struct(*size))
             }
         }
     }
@@ -137,9 +135,9 @@ mod imp {
     fn ffi_result_width(ret: &funcptr::Ret) -> usize {
         match ret {
             funcptr::Ret::Void => 0,
-            // host_env intentionally declares ctypes long double (`g`) as
-            // libffi f64, so use the CIF width rather than its 16-byte cdata
-            // storage size on Unix.
+            // ctypes long double (`g`) is declared to libffi as `double`, so
+            // use the CIF width rather than its 16-byte cdata storage size
+            // on Unix.
             funcptr::Ret::Code(code) if code == "g" => 8,
             funcptr::Ret::Code(code) => host_ctypes::simple_type_size(code).unwrap_or(0),
             funcptr::Ret::Pointer(_) => host_ctypes::pointer_size(),
@@ -179,13 +177,11 @@ mod imp {
         }
     }
 
-    fn ffi_type_for_ret(
-        ret: &funcptr::Ret,
-    ) -> Result<host_ctypes::FfiType, pyre_interpreter::PyError> {
+    fn ffi_type_for_ret(ret: &funcptr::Ret) -> Result<FfiType, pyre_interpreter::PyError> {
         match ret {
-            funcptr::Ret::Void => Ok(host_ctypes::ffi_void_type()),
+            funcptr::Ret::Void => Ok(callproc::ffi_void_type()),
             funcptr::Ret::Code(c) => {
-                host_ctypes::ffi_type_from_code(c).ok_or_else(invalid_callback_result_type)
+                callproc::ffi_type_from_code(c).ok_or_else(invalid_callback_result_type)
             }
             funcptr::Ret::Pointer(_) | funcptr::Ret::Aggregate(_) => {
                 Err(invalid_callback_result_type())
@@ -198,27 +194,24 @@ mod imp {
     }
 
     unsafe extern "C" fn thunk_callback(
-        _cif: &host_ctypes::FfiCif,
-        result: &mut c_void,
-        args: *const *const c_void,
-        userdata: &ThunkUserdata,
+        _cif: FFI_CIFP,
+        result: VOIDP,
+        args: VOIDPP,
+        userdata: VOIDP,
     ) {
+        let userdata = unsafe { &*(userdata as *const ThunkUserdata) };
         if userdata.result_width != 0 {
-            unsafe {
-                std::ptr::write_bytes(
-                    (result as *mut c_void).cast::<u8>(),
-                    0,
-                    userdata.result_width,
-                )
-            };
+            unsafe { std::ptr::write_bytes(result.cast::<u8>(), 0, userdata.result_width) };
         }
         let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-            thunk_callback_inner(result, args, userdata)
+            thunk_callback_inner(result, args as *const *const c_void, userdata)
         }));
     }
 
+    const _: CALLBACK_TP = thunk_callback;
+
     unsafe fn thunk_callback_inner(
-        result: &mut c_void,
+        result: VOIDP,
         args: *const *const c_void,
         userdata: &ThunkUserdata,
     ) {
@@ -255,7 +248,7 @@ mod imp {
                 write_result(
                     current_obj(),
                     pyre_object::gc_roots::shadow_stack_get(value_slot),
-                    result as *mut c_void,
+                    result,
                 )
             }
             Err(error) => Err(error),

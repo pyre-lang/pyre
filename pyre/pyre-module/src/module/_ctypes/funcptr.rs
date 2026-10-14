@@ -3,17 +3,17 @@
 //! `__new__` resolves and stores a function-pointer address (`"_ptr"`) from a
 //! `(name, dll)` pair, a bare integer address, or nothing (NULL).  `__call__`
 //! marshals scalar Python arguments into libffi values and performs the call
-//! through `host_env`, then decodes the scalar result.
+//! through [`super::callproc`], then decodes the scalar result.
 //!
-//! All host/FFI work is delegated to `rustpython_host_env::ctypes`.  Arguments
-//! are marshalled into `CallArg`s and the return type into a `CallRet`, then the
-//! call runs through the single `call` entry point, which performs the libffi
-//! call and decodes the result.  By-reference arguments — `byref()` carriers,
-//! `_Pointer`/`Array` instances, and pointer-typed cdata — lower to
-//! `CallArg::Pointer(addr)`; by-value struct/union arguments and returns lower
-//! to `CallArg::Aggregate` / `CallRet::Aggregate`; a pointer-typed `restype`
-//! wraps the returned address in a fresh instance.
+//! Arguments are marshalled into `CallArg`s and the return type into a
+//! `CallRet`, then the call runs through `_call_function_pointer`.  By-reference
+//! arguments — `byref()` carriers, `_Pointer`/`Array` instances, and
+//! pointer-typed cdata — lower to `CallArg::Pointer(addr)`; by-value
+//! struct/union arguments and returns lower to `CallArg::Aggregate` /
+//! `CallRet::Aggregate`; a pointer-typed `restype` wraps the returned address
+//! in a fresh instance.
 
+use super::callproc::{self, CTypeLayout, CallArg, CallError, CallOptions, CallRet, CallValue};
 use super::cdata::{self, TypeCode};
 use super::stginfo::{self, ParamFunc};
 use pyre_object::PyObjectRef;
@@ -373,35 +373,33 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
 
 /// The borrow a marshalled argument is handed to the call as; the borrow ends
 /// with the call, and `owned` outlives it.
-fn owned_arg_as_call_arg(arg: &OwnedArg) -> host_ctypes::CallArg<'_> {
+fn owned_arg_as_call_arg(arg: &OwnedArg) -> CallArg<'_> {
     match arg {
-        OwnedArg::Typed(code, buf) => host_ctypes::CallArg::Typed {
+        OwnedArg::Typed(code, buf) => CallArg::Typed {
             code: code.as_str(),
             buffer: buf.as_slice(),
         },
-        OwnedArg::Int(v) => host_ctypes::CallArg::Int(*v),
-        OwnedArg::Double(v) => host_ctypes::CallArg::Double(*v),
-        OwnedArg::Pointer(v) => host_ctypes::CallArg::Pointer(*v),
-        OwnedArg::Aggregate(layout, buf) => host_ctypes::CallArg::Aggregate {
+        OwnedArg::Int(v) => CallArg::Int(*v),
+        OwnedArg::Double(v) => CallArg::Double(*v),
+        OwnedArg::Pointer(v) => CallArg::Pointer(*v),
+        OwnedArg::Aggregate(layout, buf) => CallArg::Aggregate {
             layout,
             buffer: buf.as_slice(),
         },
     }
 }
 
-fn call_error(e: host_ctypes::CallError) -> pyre_interpreter::PyError {
+fn call_error(e: CallError) -> pyre_interpreter::PyError {
     match e {
-        host_ctypes::CallError::NullFunctionPointer => {
+        CallError::NullFunctionPointer => {
             pyre_interpreter::PyError::value_error("NULL function pointer")
         }
-        host_ctypes::CallError::UnknownTypeCode(c) => {
+        CallError::UnknownTypeCode(c) => {
             pyre_interpreter::PyError::type_error(format!("unsupported type code {c:?}"))
         }
-        host_ctypes::CallError::BufferTooSmall { expected, got } => {
-            pyre_interpreter::PyError::value_error(format!(
-                "aggregate argument buffer too small: expected {expected}, got {got}"
-            ))
-        }
+        CallError::BufferTooSmall { expected, got } => pyre_interpreter::PyError::value_error(
+            format!("aggregate argument buffer too small: expected {expected}, got {got}"),
+        ),
     }
 }
 
@@ -1175,7 +1173,7 @@ enum OwnedArg {
     Double(f64),
     Pointer(usize),
     /// A by-value aggregate: its recursive layout and a copy of its bytes.
-    Aggregate(host_ctypes::CTypeLayout, Vec<u8>),
+    Aggregate(CTypeLayout, Vec<u8>),
 }
 
 pub(super) fn is_simple_subclass(ty: PyObjectRef) -> bool {
@@ -1575,7 +1573,7 @@ fn invoke(
     owned: &[OwnedArg],
     ret: Ret,
     flags: i64,
-) -> Result<host_ctypes::CallValue, pyre_interpreter::PyError> {
+) -> Result<CallValue, pyre_interpreter::PyError> {
     // Build the aggregate return layout (if any) up front so it outlives the
     // borrowed `CallRet` handed to the call.
     let ret_layout = match &ret {
@@ -1583,20 +1581,20 @@ fn invoke(
         _ => None,
     };
     let restype = match &ret {
-        Ret::Void => host_ctypes::CallRet::Void,
-        Ret::Code(c) => host_ctypes::CallRet::Code(c.as_str()),
-        Ret::Pointer(_) => host_ctypes::CallRet::Code("P"),
-        Ret::Aggregate(_) => host_ctypes::CallRet::Aggregate(
-            ret_layout.as_ref().expect("aggregate restype has a layout"),
-        ),
+        Ret::Void => CallRet::Void,
+        Ret::Code(c) => CallRet::Code(c.as_str()),
+        Ret::Pointer(_) => CallRet::Code("P"),
+        Ret::Aggregate(_) => {
+            CallRet::Aggregate(ret_layout.as_ref().expect("aggregate restype has a layout"))
+        }
     };
 
     // Borrow the owned data as `CallArg`s; these borrows end with the call.
     // A signature no wider than the inline row is handed over without a heap
     // allocation of its own, which is otherwise a whole allocation per call.
-    let mut inline = [host_ctypes::CallArg::Int(0); INLINE_CALL_ARGS];
-    let mut spilled: Vec<host_ctypes::CallArg> = Vec::new();
-    let host_args: &[host_ctypes::CallArg] = if owned.len() <= INLINE_CALL_ARGS {
+    let mut inline = [CallArg::Int(0); INLINE_CALL_ARGS];
+    let mut spilled: Vec<CallArg> = Vec::new();
+    let host_args: &[CallArg] = if owned.len() <= INLINE_CALL_ARGS {
         for (slot, arg) in inline.iter_mut().zip(owned) {
             *slot = owned_arg_as_call_arg(arg);
         }
@@ -1606,11 +1604,11 @@ fn invoke(
         &spilled
     };
 
-    let options = host_ctypes::CallOptions {
+    let options = CallOptions {
         use_errno: flags & FUNCFLAG_USE_ERRNO != 0,
         use_last_error: flags & FUNCFLAG_USE_LASTERROR != 0,
     };
-    // `clibffi.py:350-352` declares `ffi_call` with the default
+    // `clibffi.py c_ffi_call` declares `ffi_call` with the default
     // `releasegil='auto'`, i.e. released: the callee is arbitrary foreign code
     // and may block on another Python thread's progress.  The caller's `owned`
     // / `keepalive` hold the marshalled buffers across the released window.
@@ -1619,7 +1617,7 @@ fn invoke(
     // process.
     let result = {
         let _blocked = pyre_interpreter::module::thread::before_external_block();
-        super::seh::guard(|| host_ctypes::call(addr, host_args, restype, options))
+        super::seh::guard(|| callproc::call(addr, host_args, restype, options))
     };
     result?.map_err(call_error)
 }
@@ -1680,9 +1678,9 @@ fn call_settled(
 /// The status word a returned scalar carries.  A COM method answers an
 /// `HRESULT` whatever its declared restype would otherwise make of the bytes.
 #[allow(dead_code)]
-fn scalar_int_result(result: &host_ctypes::CallValue) -> i32 {
+fn scalar_int_result(result: &CallValue) -> i32 {
     let mut word = [0u8; 4];
-    if let host_ctypes::CallValue::Scalar(bytes) = result {
+    if let CallValue::Scalar(bytes) = result {
         let n = bytes.len().min(word.len());
         word[..n].copy_from_slice(&bytes[..n]);
     }
@@ -1700,7 +1698,7 @@ fn scalar_int_result(result: &host_ctypes::CallValue) -> i32 {
 fn com_status(
     obj: PyObjectRef,
     com: Option<(usize, usize)>,
-    result: &host_ctypes::CallValue,
+    result: &CallValue,
 ) -> Option<Result<PyObjectRef, pyre_interpreter::PyError>> {
     let (this_ptr, iid) = com_error_iid(obj, com)?;
     let hresult = scalar_int_result(result);
@@ -1715,7 +1713,7 @@ fn com_status(
 fn com_status(
     _obj: PyObjectRef,
     _com: Option<(usize, usize)>,
-    _result: &host_ctypes::CallValue,
+    _result: &CallValue,
 ) -> Option<Result<PyObjectRef, pyre_interpreter::PyError>> {
     None
 }
@@ -1977,20 +1975,20 @@ fn from_outparam(value: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::Py
 /// The Python value a returned `CallValue` becomes under return type `ret`.
 fn build_return_value(
     ret: Ret,
-    result: host_ctypes::CallValue,
+    result: CallValue,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     match ret {
         Ret::Pointer(rt) => {
             let p = match result {
-                host_ctypes::CallValue::Pointer(p) => p,
-                host_ctypes::CallValue::Scalar(b) => host_ctypes::read_pointer_from_buffer(&b),
+                CallValue::Pointer(p) => p,
+                CallValue::Scalar(b) => host_ctypes::read_pointer_from_buffer(&b),
                 _ => 0,
             };
             wrap_pointer_result(rt, p)
         }
         Ret::Aggregate(ty) => {
             let bytes = match result {
-                host_ctypes::CallValue::Aggregate(b) => b,
+                CallValue::Aggregate(b) => b,
                 _ => Vec::new(),
             };
             make_aggregate_instance(ty, &bytes)
@@ -2001,11 +1999,11 @@ fn build_return_value(
             // type: a scalar carries its register image, a pointer-code result
             // its address bytes.
             let bytes = match result {
-                host_ctypes::CallValue::Void => {
+                CallValue::Void => {
                     return Ok(cdata::decoded_to_pyobject(host_ctypes::DecodedValue::None));
                 }
-                host_ctypes::CallValue::Scalar(b) | host_ctypes::CallValue::Aggregate(b) => b,
-                host_ctypes::CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
+                CallValue::Scalar(b) | CallValue::Aggregate(b) => b,
+                CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
             };
             Ok(cdata::decode_slot(&c, &bytes))
         }
@@ -2345,22 +2343,17 @@ pub(super) fn call_function(
         .into_iter()
         .map(|arg| marshal_default_arg(arg, &mut keepalive))
         .collect::<Result<Vec<_>, _>>()?;
-    let host_args: Vec<host_ctypes::CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
+    let host_args: Vec<CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
     let result = {
         let _blocked = pyre_interpreter::module::thread::before_external_block();
         super::seh::guard(|| {
-            host_ctypes::call(
-                addr,
-                &host_args,
-                host_ctypes::CallRet::Code("i"),
-                host_ctypes::CallOptions::default(),
-            )
+            callproc::call(addr, &host_args, CallRet::Code("i"), CallOptions::default())
         })
     };
     drop(keepalive);
     let bytes = match result?.map_err(call_error)? {
-        host_ctypes::CallValue::Scalar(b) => b,
-        host_ctypes::CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
+        CallValue::Scalar(b) => b,
+        CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
         _ => Vec::new(),
     };
     Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
@@ -2540,10 +2533,7 @@ fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, pyre_interpret
 /// Build the recursive `CTypeLayout` of a ctypes type, driven by its `StgInfo`
 /// `paramfunc`: simple → code, pointer → `Pointer`, array → element layout +
 /// length, struct/union → per-field layouts from `_fields_`.
-pub(super) fn build_layout(
-    mut t: PyObjectRef,
-) -> Result<host_ctypes::CTypeLayout, pyre_interpreter::PyError> {
-    use host_ctypes::CTypeLayout;
+pub(super) fn build_layout(mut t: PyObjectRef) -> Result<CTypeLayout, pyre_interpreter::PyError> {
     let mut info = stginfo::stginfo_of(t)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("type has no ctypes layout info"))?;
     let size = pyre_object::with_roots!(info, t => stginfo::stginfo_size(info));
