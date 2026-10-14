@@ -3430,75 +3430,101 @@ impl Bookkeeper {
                 } else {
                     s_value
                 };
+            // `rlist.py` `ll_length` is `return l.length`. A Vec field's
+            // length word is the parent `{name}.len` Signed getfield
+            // (`assembler` suffixes `.len`); getattr of that name must
+            // annotate without unioning Integer onto the Vec field itself.
+            let field_is_vec = matches!(&s_value, SomeValue::RustVec(_) | SomeValue::List(_));
             let mut classdef_mut = classdef.borrow_mut();
-            let attr = classdef_mut
-                .attrs
-                .entry(field_name.clone())
-                .or_insert_with(|| super::classdesc::Attribute::new(field_name.clone()));
-            // The slot may also hold the untyped FORCE_ATTRIBUTES
-            // shell: `register_struct_fields` seeds Ref-typed rows
-            // through `valuetype_to_someshell`, which renders every
-            // `ValueType::Ref(_)` as the bare
-            // `SomeInstance(classdef=None)` before this projection
-            // runs (`_init_classdef` applies the force list
-            // eagerly).  That shell carries strictly less
-            // information than this registry projection (typed
-            // lists, dicts, strings, classed instances), so
-            // replace it the same way the `Impossible` placeholder
-            // is filled — but ONLY that exact shell; any other
-            // value was produced by real annotation flow and stays
-            // (RPython grows class attrs monotonically).
-            let is_untyped_force_shell = matches!(
-                &attr.s_value,
-                SomeValue::Instance(inst)
-                    if inst.classdef.is_none()
-                        && !inst.can_be_none
-                        && inst.flags.is_empty()
-                        && inst.base.const_box.is_none()
-            );
-            // `tyref_to_attr_value_type` puts `Ptr(FuncType)` in the Int
-            // bank (`history.getkind`), so FORCE shells a `fn` /
-            // `Option<fn>` field as the Int-bank shell
-            // (`valuetype_to_someshell(Int)`: no const, signed,
-            // nonneg=false). The layout spelling is still a function
-            // pointer, and `project_struct_field_type` answers
-            // `SomePtr`. Replace ONLY that exact FORCE shell on a
-            // function-pointer spelling: it carries strictly less
-            // information than the registry projection, and leaving it
-            // makes a `fn` field read union `Integer ∪ Ptr(Func)` with
-            // `fn_null_constant`. Any other value was produced by real
-            // annotation flow and stays.
-            let is_fn_integer_force_shell = fn_ptr_somevalue_for_spelling_in(field_ty, Some(self))
-                .is_some()
-                && crate::codewriter::annotation_state::valuetype_to_someshell(
-                    &crate::model::ValueType::Int,
-                )
-                .is_some_and(|shell| shell == attr.s_value);
-            if matches!(attr.s_value, SomeValue::Impossible)
-                || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
-                || is_fn_integer_force_shell
             {
-                attr.s_value = s_value;
-            }
-            // A shaped aggregate's `__pos_N` is written by the constructor
-            // (`generalize_attr` of the element annotation). An untyped
-            // `Ref` force shell contains every instance, so that write
-            // cannot install the element's classdef. Drop the shell back
-            // to lattice bottom and let the constructor's value be the
-            // item annotation `SomeIterator.next` reads.
-            if (majit_ir::descr::is_shaped_tuple_name(n)
-                || majit_ir::descr::is_shaped_array_name(n))
-                && field_name.starts_with("__pos_")
-                && matches!(
+                let attr = classdef_mut
+                    .attrs
+                    .entry(field_name.clone())
+                    .or_insert_with(|| super::classdesc::Attribute::new(field_name.clone()));
+                // The slot may also hold the untyped FORCE_ATTRIBUTES
+                // shell: `register_struct_fields` seeds Ref-typed rows
+                // through `valuetype_to_someshell`, which renders every
+                // `ValueType::Ref(_)` as the bare
+                // `SomeInstance(classdef=None)` before this projection
+                // runs (`_init_classdef` applies the force list
+                // eagerly).  That shell carries strictly less
+                // information than this registry projection (typed
+                // lists, dicts, strings, classed instances), so
+                // replace it the same way the `Impossible` placeholder
+                // is filled — but ONLY that exact shell; any other
+                // value was produced by real annotation flow and stays
+                // (RPython grows class attrs monotonically).
+                let is_untyped_force_shell = matches!(
                     &attr.s_value,
                     SomeValue::Instance(inst)
                         if inst.classdef.is_none()
                             && !inst.can_be_none
                             && inst.flags.is_empty()
                             && inst.base.const_box.is_none()
-                )
-            {
-                attr.s_value = SomeValue::Impossible;
+                );
+                // `tyref_to_attr_value_type` puts `Ptr(FuncType)` in the Int
+                // bank (`history.getkind`), so FORCE shells a `fn` /
+                // `Option<fn>` field as the Int-bank shell
+                // (`valuetype_to_someshell(Int)`: no const, signed,
+                // nonneg=false). The layout spelling is still a function
+                // pointer, and `project_struct_field_type` answers
+                // `SomePtr`. Replace ONLY that exact FORCE shell on a
+                // function-pointer spelling: it carries strictly less
+                // information than the registry projection, and leaving it
+                // makes a `fn` field read union `Integer ∪ Ptr(Func)` with
+                // `fn_null_constant`. Any other value was produced by real
+                // annotation flow and stays.
+                let is_fn_integer_force_shell =
+                    fn_ptr_somevalue_for_spelling_in(field_ty, Some(self)).is_some()
+                        && crate::codewriter::annotation_state::valuetype_to_someshell(
+                            &crate::model::ValueType::Int,
+                        )
+                        .is_some_and(|shell| shell == attr.s_value);
+                if matches!(attr.s_value, SomeValue::Impossible)
+                    || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
+                    || is_fn_integer_force_shell
+                {
+                    attr.s_value = s_value;
+                }
+                // A shaped aggregate's `__pos_N` is written by the constructor
+                // (`generalize_attr` of the element annotation). An untyped
+                // `Ref` force shell contains every instance, so that write
+                // cannot install the element's classdef. Drop the shell back
+                // to lattice bottom and let the constructor's value be the
+                // item annotation `SomeIterator.next` reads.
+                if (majit_ir::descr::is_shaped_tuple_name(n)
+                    || majit_ir::descr::is_shaped_array_name(n))
+                    && field_name.starts_with("__pos_")
+                    && matches!(
+                        &attr.s_value,
+                        SomeValue::Instance(inst)
+                            if inst.classdef.is_none()
+                                && !inst.can_be_none
+                                && inst.flags.is_empty()
+                                && inst.base.const_box.is_none()
+                    )
+                {
+                    attr.s_value = SomeValue::Impossible;
+                }
+            }
+            if field_is_vec {
+                let len_name = format!("{field_name}.len");
+                let len_attr = classdef_mut
+                    .attrs
+                    .entry(len_name.clone())
+                    .or_insert_with(|| super::classdesc::Attribute::new(len_name.clone()));
+                let len_is_untyped_force_shell = matches!(
+                    &len_attr.s_value,
+                    SomeValue::Instance(inst)
+                        if inst.classdef.is_none()
+                            && !inst.can_be_none
+                            && inst.flags.is_empty()
+                            && inst.base.const_box.is_none()
+                );
+                if matches!(len_attr.s_value, SomeValue::Impossible) || len_is_untyped_force_shell {
+                    // Signed and nonneg: `ListRepr.length` is the count.
+                    len_attr.s_value = SomeValue::Integer(SomeInteger::new(true, false));
+                }
             }
         }
         Ok(())
@@ -7882,6 +7908,17 @@ mod tests {
         assert!(
             matches!(attr, SomeValue::RustVec(_)),
             "a *mut Vec of one-word items is SomeRustVec, got {attr:?}"
+        );
+        let len_attr = cd
+            .borrow()
+            .attrs
+            .get("weak_subclasses.len")
+            .expect("weak_subclasses.len attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(len_attr, SomeValue::Integer(ref i) if i.nonneg && !i.unsigned),
+            "rlist.py ll_length is return l.length (Signed nonneg), got {len_attr:?}"
         );
     }
 

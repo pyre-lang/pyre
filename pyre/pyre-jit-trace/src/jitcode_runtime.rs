@@ -277,32 +277,185 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
             )
         });
         let mut by_fnaddr = indexmap::IndexMap::with_capacity(entries.len());
+        let mut declined: Vec<usize> = Vec::new();
+        let paths = &jitcode_index().paths;
+        let impls = pyre_interpreter::dyn_impl_vtables();
+        let slot_offsets = vtable_method_slot_offsets();
         for (index, build_fnaddr) in entries {
+            let path = paths.get(index).map(|s| s.as_str()).unwrap_or("");
+            let method = path.rsplit_once("::").map(|(_, m)| m).unwrap_or("");
             let fnaddr = crate::runtime_fnaddr_patch::runtime_fnaddr(build_fnaddr) as usize;
-            // Identical-code folding can map several build-time addresses to
-            // one runtime address; retain the first target for that address.
-            //
-            // `pyjitpl.py bytecode_for_address` asserts the address is
-            // absent instead, because RPython's translation never folds two
-            // graphs onto one entry point. Keeping the first target is the
-            // only choice available here, but a wrong pick would otherwise be
-            // invisible, so name every dropped target once at startup.
-            match by_fnaddr.entry(fnaddr) {
-                indexmap::map::Entry::Vacant(slot) => {
-                    slot.insert(index);
+            // Identical-code folding can map several graphs onto one runtime
+            // address (`/OPT:ICF`, Mach-O coalescing). `pyjitpl.py
+            // bytecode_for_address` asserts the address is absent, because
+            // RPython never folds two graphs onto one entry point. The map
+            // is only sound when each address names one jitcode; keep-first
+            // would bind the first impl's body at every colliding slot.
+            // Decline an address only when two graphs with different
+            // method names share it. Same-name ICF (`length` on two
+            // impls) keeps the first target: declining both left
+            // `bytecode_for_address` empty and `len(d)` a residual
+            // CallI. The same graph is inserted once per alias
+            // (`runtime_fnaddr`, `runtime_fnaddr_by_path`, the rustc
+            // vtable slot); that is one jitcode, not a collision.
+            ict_insert_fnaddr(
+                &mut by_fnaddr,
+                &mut declined,
+                fnaddr,
+                index,
+                method,
+                paths,
+                build_fnaddr,
+            );
+            if let Some(runtime) = crate::runtime_fnaddr_patch::runtime_fnaddr_by_path(path) {
+                ict_insert_fnaddr(
+                    &mut by_fnaddr,
+                    &mut declined,
+                    runtime as usize,
+                    index,
+                    method,
+                    paths,
+                    build_fnaddr,
+                );
+            }
+            // Bind the rustc vtable slot the tracer loads (`FieldDescr.offset`
+            // of `method_{leaf}` on the matching `{vtable}`). Mirrors
+            // `CodeWriter.setup_indirectcalltargets` / `CallControl.graphs_from`
+            // without a method-name list.
+            let Some((impl_path, method)) = path.rsplit_once("::") else {
+                continue;
+            };
+            for impl_entry in impls {
+                if !ict_impl_path_matches(impl_path, impl_entry.impl_key) {
+                    continue;
                 }
-                indexmap::map::Entry::Occupied(kept) => majit_ir::debug::log_one(
-                    "jit-indirectcalltargets",
-                    &format!(
-                        "runtime fnaddr {fnaddr:#x} already resolves to target {}; \
-                         dropping target {index} (build fnaddr {build_fnaddr:#x})",
-                        kept.get()
-                    ),
-                ),
+                let Some(offset) =
+                    slot_offsets
+                        .iter()
+                        .find_map(|(trait_leaf, slot_method, off)| {
+                            (trait_leaf == impl_entry.trait_leaf && slot_method == method)
+                                .then_some(*off)
+                        })
+                else {
+                    continue;
+                };
+                let slot = unsafe {
+                    let p = (impl_entry.vtable as *const u8).add(offset) as *const usize;
+                    *p
+                };
+                ict_insert_fnaddr(
+                    &mut by_fnaddr,
+                    &mut declined,
+                    slot,
+                    index,
+                    method,
+                    paths,
+                    build_fnaddr,
+                );
             }
         }
         by_fnaddr
     });
+
+fn ict_impl_path_matches(impl_path: &str, impl_key: &str) -> bool {
+    impl_path == impl_key
+        || impl_path.ends_with(&format!("::{impl_key}"))
+        || impl_key.ends_with(&format!("::{impl_path}"))
+}
+
+fn ict_insert_fnaddr(
+    by_fnaddr: &mut indexmap::IndexMap<usize, usize>,
+    declined: &mut Vec<usize>,
+    fnaddr: usize,
+    index: usize,
+    method: &str,
+    paths: &[String],
+    build_fnaddr: i64,
+) {
+    if fnaddr == 0 || declined.contains(&fnaddr) {
+        return;
+    }
+    match by_fnaddr.entry(fnaddr) {
+        indexmap::map::Entry::Vacant(slot) => {
+            slot.insert(index);
+        }
+        indexmap::map::Entry::Occupied(kept) => {
+            let kept_index = *kept.get();
+            if kept_index == index {
+                return;
+            }
+            let kept_method = paths
+                .get(kept_index)
+                .and_then(|p| p.rsplit_once("::"))
+                .map(|(_, m)| m);
+            if kept_method != Some(method) {
+                majit_ir::debug::log_one(
+                    "jit-indirectcalltargets",
+                    &format!(
+                        "runtime fnaddr {fnaddr:#x} is shared by {method} \
+                         (index {index}, build {build_fnaddr:#x}) and {} \
+                         (index {kept_index}); declining both",
+                        kept_method.unwrap_or("?")
+                    ),
+                );
+                declined.push(fnaddr);
+                kept.shift_remove();
+            } else {
+                majit_ir::debug::log_one(
+                    "jit-indirectcalltargets",
+                    &format!(
+                        "runtime fnaddr {fnaddr:#x} already resolves to target {kept_index}; \
+                         dropping target {index} (build fnaddr {build_fnaddr:#x})"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// `{vtable}` `method_*` FieldDescr offsets, scanned once for ICT slot
+/// binding. Mirrors the descr table `setup_descrs` already owns; not a
+/// new side table.
+fn vtable_method_slot_offsets() -> Vec<(String, String, usize)> {
+    let mut slots = Vec::new();
+    let n = descr_count();
+    for i in 0..n {
+        let BhDescr::Field {
+            name,
+            owner,
+            offset,
+            ..
+        } = load_descr_uncached(i)
+        else {
+            continue;
+        };
+        if !name.starts_with("method_") {
+            continue;
+        }
+        if !(owner == "{vtable}" || owner.ends_with("::{vtable}")) {
+            continue;
+        }
+        let method = name.trim_start_matches("method_").to_string();
+        let trait_leaf = owner
+            .trim_end_matches("::{vtable}")
+            .trim_end_matches("{vtable}")
+            .rsplit("::")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if trait_leaf.is_empty() {
+            continue;
+        }
+        if slots
+            .iter()
+            .any(|(t, m, _)| t == &trait_leaf && m == &method)
+        {
+            continue;
+        }
+        slots.push((trait_leaf, method, offset));
+    }
+    slots
+}
 
 pub(crate) fn indirectcalltarget_index_for_address(fnaddress: usize) -> Option<usize> {
     INDIRECTCALLTARGET_BY_FNADDR.get(&fnaddress).copied()
@@ -4022,6 +4175,150 @@ mod tests {
             fnaddr
         );
         assert!(JITCODE_CELLS[index].get().is_some());
+    }
+
+    #[test]
+    fn ict_insert_fnaddr_declines_every_colliding_address() {
+        let paths = [
+            "crate::IntDictStrategy::length".to_string(),
+            "crate::UnicodeDictStrategy::length".to_string(),
+            "crate::BytesDictStrategy::getitem".to_string(),
+        ];
+        let mut by_fnaddr = indexmap::IndexMap::new();
+        let mut declined = Vec::new();
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x1000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x1000,
+            1,
+            "length",
+            &paths,
+            0x20,
+        );
+        assert_eq!(
+            by_fnaddr.get(&0x1000),
+            Some(&0),
+            "same method name on two impls keeps the first target: {by_fnaddr:?}"
+        );
+        assert!(declined.is_empty());
+
+        let mut by_fnaddr = indexmap::IndexMap::new();
+        let mut declined = Vec::new();
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x2000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x2000,
+            2,
+            "getitem",
+            &paths,
+            0x30,
+        );
+        assert!(by_fnaddr.is_empty(), "distinct names still decline");
+        assert_eq!(declined, vec![0x2000]);
+
+        let mut by_fnaddr = indexmap::IndexMap::new();
+        let mut declined = Vec::new();
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x3000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x4000,
+            1,
+            "length",
+            &paths,
+            0x20,
+        );
+        assert_eq!(by_fnaddr.get(&0x3000), Some(&0));
+        assert_eq!(by_fnaddr.get(&0x4000), Some(&1));
+        assert!(declined.is_empty());
+
+        let mut by_fnaddr = indexmap::IndexMap::new();
+        let mut declined = Vec::new();
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x5000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        ict_insert_fnaddr(
+            &mut by_fnaddr,
+            &mut declined,
+            0x5000,
+            0,
+            "length",
+            &paths,
+            0x10,
+        );
+        assert_eq!(
+            by_fnaddr.get(&0x5000),
+            Some(&0),
+            "patched fnaddr / path / vtable slot of one graph is one jitcode: {by_fnaddr:?}"
+        );
+        assert!(declined.is_empty());
+    }
+
+    #[test]
+    fn ict_map_keys_rustc_vtable_slot_for_int_dict_length() {
+        let vtables = pyre_interpreter::dyn_impl_vtables();
+        let int_impl = vtables
+            .iter()
+            .find(|entry| entry.impl_key.ends_with("IntDictStrategy"))
+            .expect("IntDictStrategy vtable");
+        let mut offset = None;
+        for i in 0..descr_count() {
+            let BhDescr::Field {
+                name,
+                owner,
+                offset: off,
+                ..
+            } = load_descr_uncached(i)
+            else {
+                continue;
+            };
+            if name == "method_length"
+                && owner.contains("DictStrategy")
+                && (owner == "{vtable}" || owner.ends_with("::{vtable}"))
+            {
+                offset = Some(off);
+                break;
+            }
+        }
+        let offset = offset.expect("method_length FieldDescr on DictStrategy {{vtable}}");
+        let slot = unsafe { *((int_impl.vtable as *const u8).add(offset) as *const usize) };
+        assert_ne!(slot, 0, "rustc vtable slot for length must be non-null");
+        assert!(
+            indirectcalltarget_index_for_address(slot).is_some(),
+            "ICT map must key the rustc vtable slot {slot:#x} for IntDictStrategy::length"
+        );
     }
 
     #[test]

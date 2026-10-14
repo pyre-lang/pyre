@@ -1192,6 +1192,118 @@ pub fn is_rewindable_root_bracket_residual_i64(fnaddr: i64) -> bool {
     is_rewindable_root_bracket_residual(fnaddr as usize)
 }
 
+/// One rustc vtable of a trait impl that can be an ICT candidate.
+///
+/// `CallControl.graphs_from` / `CodeWriter.setup_indirectcalltargets`
+/// already listed every dyn-call target graph. This table supplies the
+/// vtable pointer of each known impl so the runtime ICT map can key the
+/// slot the tracer loads (`jtransform.handle_getfield_typeptr` analog).
+/// Methods are not listed: every `method_*` FieldDescr on the matching
+/// `{vtable}` is bound.
+pub struct DynImplVtable {
+    pub impl_key: &'static str,
+    pub trait_leaf: &'static str,
+    pub vtable: *const (),
+}
+
+// Vtable addresses are process-lifetime rustc constants.
+unsafe impl Sync for DynImplVtable {}
+unsafe impl Send for DynImplVtable {}
+
+fn fat_vtable_word<T: ?Sized>(fat: *const T) -> *const () {
+    let words: [*const (); 2] = unsafe { std::mem::transmute_copy(&fat) };
+    words[1]
+}
+
+/// Impl-only fat/vtable pointers. Not a method set.
+pub fn dyn_impl_vtables() -> &'static [DynImplVtable] {
+    use pyre_object::dictmultiobject::DictStrategy;
+    use pyre_object::setobject::SetStrategy;
+    static TABLES: std::sync::OnceLock<Vec<DynImplVtable>> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        fn dict(impl_key: &'static str, fat: &'static dyn DictStrategy) -> DynImplVtable {
+            DynImplVtable {
+                impl_key,
+                trait_leaf: "DictStrategy",
+                vtable: fat_vtable_word(fat as *const dyn DictStrategy),
+            }
+        }
+        fn set(impl_key: &'static str, fat: &'static dyn SetStrategy) -> DynImplVtable {
+            DynImplVtable {
+                impl_key,
+                trait_leaf: "SetStrategy",
+                vtable: fat_vtable_word(fat as *const dyn SetStrategy),
+            }
+        }
+        vec![
+            dict(
+                "dictmultiobject::ObjectDictStrategy",
+                pyre_object::OBJECT_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "dictmultiobject::EmptyDictStrategy",
+                pyre_object::EMPTY_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "dictmultiobject::EmptyKwargsDictStrategy",
+                pyre_object::EMPTY_KWARGS_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "dictmultiobject::BytesDictStrategy",
+                pyre_object::BYTES_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "dictmultiobject::UnicodeDictStrategy",
+                pyre_object::UNICODE_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "dictmultiobject::IntDictStrategy",
+                pyre_object::INT_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "kwargsdict::KwargsDictStrategy",
+                pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "identitydict::IdentityDictStrategy",
+                pyre_object::identitydict::IDENTITY_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "mapdict::MapDictStrategy",
+                crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF.imp,
+            ),
+            dict(
+                "classdict::ClassDictStrategySlot",
+                crate::objspace::std::classdict::CLASS_DICT_STRATEGY_REF.imp,
+            ),
+            set(
+                "setobject::ObjectSetStrategy",
+                pyre_object::OBJECT_SET_STRATEGY_REF.imp,
+            ),
+            set(
+                "setobject::EmptySetStrategy",
+                pyre_object::EMPTY_SET_STRATEGY_REF.imp,
+            ),
+            set(
+                "setobject::IntegerSetStrategy",
+                pyre_object::INTEGER_SET_STRATEGY_REF.imp,
+            ),
+            set(
+                "setobject::BytesSetStrategy",
+                pyre_object::BYTES_SET_STRATEGY_REF.imp,
+            ),
+            set(
+                "setobject::AsciiSetStrategy",
+                pyre_object::ASCII_SET_STRATEGY_REF.imp,
+            ),
+            set(
+                "setobject::IdentitySetStrategy",
+                pyre_object::IDENTITY_SET_STRATEGY_REF.imp,
+            ),
+        ]
+    })
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
@@ -2082,6 +2194,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dictmultiobject::w_dict_len",
         "pyre_object::w_dict_len",
         pyre_object::dictmultiobject::w_dict_len,
+    );
+    upa1(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_length_object_strategy",
+        "pyre_object::w_dict_length_object_strategy",
+        pyre_object::dictmultiobject::w_dict_length_object_strategy,
+    );
+    upa1(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_length_int_strategy",
+        "pyre_object::w_dict_length_int_strategy",
+        pyre_object::dictmultiobject::w_dict_length_int_strategy,
+    );
+    upa1(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_length_bytes_strategy",
+        "pyre_object::w_dict_length_bytes_strategy",
+        pyre_object::dictmultiobject::w_dict_length_bytes_strategy,
     );
     // The wtf8-keyed dict adapters residualise their fallible `Wtf8::as_str`
     // dispatch: `wtf8_key_is_utf8` is the `bool` validity probe, and
@@ -6144,7 +6274,7 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
-        dict_entries_probe_hashed_word, dict_entries_probe_object_word,
+        dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
         is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
         jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
@@ -7128,6 +7258,40 @@ mod tests {
         assert_eq!(
             bindings["stack_check::PYRE_STACKTOOBIG"],
             &crate::stack_check::PYRE_STACKTOOBIG as *const _ as i64
+        );
+    }
+
+    #[test]
+    fn dyn_impl_vtables_are_nonnull_and_named_by_impl() {
+        let tables = dyn_impl_vtables();
+        assert!(
+            tables.len() >= 16,
+            "dict + set strategy impls, got {}",
+            tables.len()
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in tables {
+            assert!(!entry.vtable.is_null(), "{}", entry.impl_key);
+            assert!(
+                entry.trait_leaf == "DictStrategy" || entry.trait_leaf == "SetStrategy",
+                "{}",
+                entry.trait_leaf
+            );
+            assert!(
+                seen.insert(entry.impl_key),
+                "duplicate impl_key {}",
+                entry.impl_key
+            );
+        }
+        assert!(
+            tables
+                .iter()
+                .any(|e| e.impl_key.ends_with("IntDictStrategy"))
+        );
+        assert!(
+            tables
+                .iter()
+                .any(|e| e.impl_key.ends_with("IntegerSetStrategy"))
         );
     }
 

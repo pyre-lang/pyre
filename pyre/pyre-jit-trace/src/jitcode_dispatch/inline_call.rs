@@ -4583,7 +4583,7 @@ fn binop_nested_filter_enabled() -> bool {
 /// `cut_trace`'s own note records that truncating regressed a bench.  That is
 /// about `cut_trace` truncating for all of its callers, which this does not
 /// change: the seven outside this helper still take the operations alone.
-fn cut_declined_subwalk<Sym: WalkSym>(
+pub(crate) fn cut_declined_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
 ) {

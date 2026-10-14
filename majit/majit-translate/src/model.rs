@@ -852,6 +852,13 @@ impl FieldDescriptor {
         self
     }
 
+    /// A `{vtable}` method slot (`method_*`). The tracer loads these off a
+    /// promoted vtable word (`jtransform.handle_getfield_typeptr` analog);
+    /// the slot itself does not change.
+    pub fn is_vtable_method_slot(&self) -> bool {
+        is_vtable_method_slot_parts(self.owner_root.as_deref().unwrap_or(""), &self.name)
+    }
+
     /// Record the layout word of an opaque scalar field.
     pub fn with_scalar_word(mut self, word: ScalarFieldWord) -> Self {
         self.scalar_word = Some(word);
@@ -865,6 +872,13 @@ impl FieldDescriptor {
     pub fn suppresses_virtualizable(&self) -> bool {
         self.base_is_local_aggregate() || self.taken_by_address
     }
+}
+
+/// `{vtable}` owner plus a `method_*` leaf, including a qualified
+/// `Trait::{vtable}.method_foo` spelling.
+pub fn is_vtable_method_slot_parts(owner: &str, field_name: &str) -> bool {
+    let leaf = field_name.rsplit('.').next().unwrap_or(field_name);
+    leaf.starts_with("method_") && (owner == "{vtable}" || owner.ends_with("::{vtable}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

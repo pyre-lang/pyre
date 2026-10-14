@@ -13889,6 +13889,32 @@ fn handle<Sym: WalkSym>(
         "getfield_raw_i/id>i" => {
             let base = read_int_reg(code, op, 0, ctx)?;
             let descr = read_descr(code, op, 1, ctx)?;
+            let dst = code[op.pc + 4] as usize;
+            // ConstPtr + always-pure (`pyjitpl.py` getfield_gc): a constant
+            // vtable through an immutable `method_*` descr loads the slot
+            // now and substitutes a Const, recording no op. `heap.py`
+            // `optimize_getfield` does this for GetfieldGc*; GetfieldRawI
+            // is PassOn there, so the walker has to fold it.
+            if base.is_constant() && descr.is_always_pure() {
+                let folded = match (
+                    read_int_reg_concrete(code, op, 0, ctx),
+                    descr.as_field_descr(),
+                ) {
+                    (ConcreteValue::Int(ptr), Some(_)) if ptr != 0 => ctx
+                        .trace_ctx
+                        .field_sanity_load(ptr, &descr, majit_ir::Type::Int)
+                        .and_then(|v| match v {
+                            majit_ir::Value::Int(n) => Some(n),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                if let Some(n) = folded {
+                    let result = ctx.trace_ctx.const_int(n);
+                    write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(n))?;
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
             let concrete = match (
                 read_int_reg_concrete(code, op, 0, ctx),
                 descr.as_field_descr(),
@@ -13916,7 +13942,6 @@ fn handle<Sym: WalkSym>(
             if let ConcreteValue::Int(value) = concrete {
                 ctx.trace_ctx.set_opref_concrete(result, Value::Int(value));
             }
-            let dst = code[op.pc + 4] as usize;
             write_int_reg(ctx, op.pc, dst, result, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }

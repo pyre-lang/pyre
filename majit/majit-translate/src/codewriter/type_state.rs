@@ -243,6 +243,14 @@ pub(crate) fn promote_gc_field_bases(
     graph: &mut FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,
 ) {
+    // A `{vtable}` `method_*` slot is a function address. MIR types the
+    // FieldRead as a fn-pointer Ref; leaving that cell as GcRef assembles
+    // `getfield_gc_r` and `optimize_getfield` then `make_equal_to`s the
+    // Ref onto the ConstInt the load produces. Stamp here, immediately
+    // before the GC-base walk and SSI, so regalloc colours the slot in
+    // the int bank (`jtransform.handle_getfield_typeptr` analog: the
+    // slot read is a pure int load off the promoted vtable word).
+    stamp_vtable_method_slots(graph);
     // Address math and the two pointer casts name an int cell. A GcRef
     // or Unknown concretetype on that cell is what emits `int_add/ii>r`,
     // `cast_ptr_to_int/r>r`, and `cast_int_to_ptr/r>r`.
@@ -489,6 +497,32 @@ fn signed_gc_base_ids(
         }
     }
     ids
+}
+
+/// A `{vtable}` `method_*` FieldRead is a function address. MIR types it
+/// as a fn-pointer Ref; this pass puts the result in the int bank so
+/// the assembler emits `getfield_raw_i`.
+fn stamp_vtable_method_slots(graph: &mut FunctionGraph) {
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            {
+                let OpKind::FieldRead {
+                    field, ty, pure, ..
+                } = &mut op.kind
+                else {
+                    continue;
+                };
+                if !field.is_vtable_method_slot() {
+                    continue;
+                }
+                *ty = ValueType::Int;
+                *pure = true;
+            }
+            if let Some(result) = op.result.as_ref() {
+                FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+            }
+        }
+    }
 }
 
 /// Put address math and pointer casts back in the banks their opnames
@@ -1041,6 +1075,14 @@ pub(crate) fn field_owner_is_gc(
     field: &crate::model::FieldDescriptor,
     callcontrol: Option<&crate::call::CallControl>,
 ) -> bool {
+    // A rustc vtable is a static array of function addresses, not a GC
+    // object. `getattr(STRUCT, '_gckind', 'gc')` would default the
+    // unregistered `{vtable}` owner to gc and `promote_gc_field_bases`
+    // would cast the FatLen int word through `cast_int_to_ptr`, assembling
+    // `getfield_gc_r` of `method_*`.
+    if field.is_vtable_method_slot() {
+        return false;
+    }
     // The front records `Struct._gckind` on the descriptor. A Raw owner
     // stays a raw address even when this `CallControl` has no layout
     // registered for the leaf name (`getattr(..., '_gckind', 'gc')` is
@@ -1708,6 +1750,64 @@ mod tests {
         assert_eq!(call.1, 0, "Void must not fall into the int list");
         assert_eq!(call.0, 1);
         assert_eq!(call.2, "r");
+    }
+
+    #[test]
+    fn stamp_vtable_method_slots_retypes_a_fnptr_fieldread() {
+        let mut graph = FunctionGraph::new("vtable_slot");
+        let vtable = push_input(&mut graph, "vtable", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&vtable, ConcreteType::Signed);
+        let slot = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: vtable,
+                    field: FieldDescriptor::new(
+                        "method_length",
+                        Some("dictmultiobject::DictStrategy::{vtable}".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&slot, ConcreteType::GcRef);
+        graph.set_return(graph.startblock, Some(slot.clone()));
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&slot),
+            ConcreteType::Signed,
+            "method_* result must be an int-bank function address"
+        );
+        match &graph
+            .block(graph.startblock)
+            .operations
+            .last()
+            .unwrap()
+            .kind
+        {
+            OpKind::FieldRead {
+                ty, pure, field, ..
+            } => {
+                assert!(field.is_vtable_method_slot());
+                assert_eq!(*ty, ValueType::Int);
+                assert!(*pure);
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+        assert!(
+            !field_owner_is_gc(
+                &FieldDescriptor::new(
+                    "method_length",
+                    Some("dictmultiobject::DictStrategy::{vtable}".into()),
+                ),
+                None
+            ),
+            "{{vtable}} method slots are raw function addresses"
+        );
     }
 
     #[test]
