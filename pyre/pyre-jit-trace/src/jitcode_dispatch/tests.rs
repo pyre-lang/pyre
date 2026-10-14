@@ -34,6 +34,7 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     };
     let frames = vec![
         InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x1000)]),
@@ -1410,6 +1411,28 @@ fn portal_may_force_records_the_callee_execution_context() {
     );
 
     let session = std::cell::RefCell::new(WalkSession::default());
+    // The paused caller the after-call guards capture; it discards the
+    // call's result.
+    let _caller = InlineFrameGuard::enter(
+        &session,
+        0,
+        false,
+        vec![InlineParentFrame {
+            jitcode_index: jitcode_index as u32,
+            call_jitcode_pc: None,
+            call_stack_overrides: Vec::new(),
+            blackhole: None,
+            resume_coord: ParentResumeCoord::Backxlat(0),
+            resume_marker_jit_pc: Some(0),
+            boxes: Vec::new(),
+            registers_r: None,
+            registers_i: None,
+            registers_f: None,
+            frame_state: None,
+            caller_py_pc: None,
+            result_slot: CallResultSlot::Dead,
+        }],
+    );
     let regs_r = Vec::new();
     let regs_i = Vec::new();
     let regs_f = Vec::new();

@@ -971,6 +971,28 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         )
     });
 
+    // The NULLed result's position in `boxes`: `collect_outer_active_boxes`
+    // lists the live colors int bank first, then ref, then float.
+    let result_slot = match result_color {
+        None => CallResultSlot::Dead,
+        Some(result_color) => {
+            crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                jitcode_index as i32,
+                root_liveness_word,
+            )
+            .and_then(|live| {
+                let Some(pos) = live.ref_.iter().position(|&c| c as usize == result_color) else {
+                    return Some(CallResultSlot::Dead);
+                };
+                let idx = live.int.len() + pos;
+                (boxes.len() == live.int.len() + live.ref_.len() + live.float.len()
+                    && boxes.get(idx).is_some_and(|&b| opref_is_null_const_ptr(b)))
+                .then_some(CallResultSlot::At(idx))
+            })
+            .unwrap_or_default()
+        }
+    };
+
     Some(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
@@ -986,6 +1008,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot,
     })
 }
 
@@ -1091,6 +1114,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         crate::state::bridge_semantic_maps_from_jitcode_pc(recipe.jitcode_index, recipe.jitcode_pc);
     let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
     let mut boxes = Vec::with_capacity(banks.total_len());
+    let mut result_slot = CallResultSlot::Dead;
     // Per-color `(color, box)` pairs for the blackhole capture below, collected
     // alongside the liveness-ordered box list the snapshot consumes.
     let mut bh_int = Vec::with_capacity(banks.int.len());
@@ -1116,6 +1140,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     for &color in &banks.ref_ {
         let c = color as usize;
         if result_color == Some(c) {
+            result_slot = CallResultSlot::At(boxes.len());
             boxes.push(null_ref);
             continue;
         }
@@ -1197,6 +1222,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot,
     })
 }
 
@@ -1659,6 +1685,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 registers_f: None,
                 frame_state: None,
                 caller_py_pc: None,
+                result_slot: CallResultSlot::Unknown,
             });
             continue;
         }

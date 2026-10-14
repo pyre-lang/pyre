@@ -3370,6 +3370,11 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     is_being_profiled: bool,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
+    // The bridge resume captures its after-call guards on the paused callers;
+    // decline before the first recorded op when they cannot take the result.
+    if dst.is_none() && super::resume_snapshot::finished_callee_parent_frames(ctx).is_none() {
+        return Ok(None);
+    }
     // `do_recursive_call`'s funcbox and ABI, resolved before the first
     // recorded op so an unwired driver declines the inline instead of
     // leaving a half-emitted CALL behind.
@@ -3616,9 +3621,18 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     if let Some((dst_bank, dst)) = dst {
         write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)?;
     }
+    // `opimpl_jit_merge_point` pops the frame holding the merge point
+    // (`finishframe(None, leave_portal_frame=False)`) before its caller
+    // records the call, so the guards below capture the callers alone. The
+    // inline route is already in its caller; the bridge resume is still in
+    // the callee and scopes its captures to the callers.
+    let scope = GuardCaptureScope {
+        finished_callee_result: dst.is_none().then_some(ca_result),
+        ..Default::default()
+    };
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
     // Restore before either exception arm leaves the compiled caller.  Put
     // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
     // an emitted call-adjacent operation even when the restore stores fold.
@@ -3626,7 +3640,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     record_activation_release(ctx.trace_ctx, callee_ec, saved_depth, displaced_activation);
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     if exec_raised {
-        walker_record_guard_exception(ctx, pc)?;
+        walker_record_guard_exception_scoped(ctx, pc, scope)?;
         let exc = ctx
             .last_exc_value()
             .expect("exec_raised implies last_exc_value seeded by the Err branch");
@@ -3637,7 +3651,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         }));
     }
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
 
     Ok(Some(WalkerLoopCalleePortalRecord {
         result: ca_result,

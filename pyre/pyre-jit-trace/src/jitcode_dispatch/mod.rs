@@ -7881,6 +7881,13 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// gated kept-stack path.
     pub branch_guard_kept_recovered: &'a [(u16, OpRef)],
 
+    /// The result of a call recorded after its callee frame was finished
+    /// (`opimpl_jit_merge_point` with a non-zero `portal_call_depth`:
+    /// `finishframe(None, leave_portal_frame=False)`, then the caller's
+    /// `do_recursive_call`). The guard captures the paused callers alone,
+    /// the innermost holding this box in its result slot.
+    pub finished_callee_result: Option<OpRef>,
+
     /// Select which already-recorded guard op receives the resume position.
     /// Needed whenever the guard being captured is not the last thing recorded:
     /// `_nonstandard_virtualizable` (pyjitpl.py) emits its promote
@@ -7955,6 +7962,21 @@ struct InlineParentFrame {
     /// `f_lineno` for a getframe landing on this caller. `None` when the
     /// parent is a reconstructed image with no live CALL.
     caller_py_pc: Option<u32>,
+    /// Where `boxes` takes the result of the call this caller is paused in.
+    result_slot: CallResultSlot,
+}
+
+/// The slot of a paused caller's `boxes` that `make_result_of_lastop`
+/// (`pyjitpl.py`) fills when its call returns.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum CallResultSlot {
+    /// Not derived for this frame.
+    #[default]
+    Unknown,
+    /// The call's result is not live at the caller's resume point.
+    Dead,
+    /// Index into `boxes` of the NULL-seeded result.
+    At(usize),
 }
 
 impl InlineParentFrame {
@@ -8047,6 +8069,7 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     })
 }
 
@@ -8085,6 +8108,7 @@ pub(crate) fn operator_continuation_parent_frame(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     })
 }
 
@@ -9683,11 +9707,21 @@ pub(crate) fn walker_record_guard_exception<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
 ) -> Result<(), DispatchError> {
+    walker_record_guard_exception_scoped(ctx, pc, GuardCaptureScope::default())
+}
+
+/// [`walker_record_guard_exception`] with the capture scope its guard's
+/// snapshot takes.
+pub(crate) fn walker_record_guard_exception_scoped<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    scope: GuardCaptureScope<'_>,
+) -> Result<(), DispatchError> {
     let exc_obj = match ctx.last_exc_value_concrete() {
         ConcreteValue::Ref(p) if !p.is_null() => p,
         _ => {
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, pc)?;
+            walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
             return Ok(());
         }
     };
@@ -9707,7 +9741,7 @@ pub(crate) fn walker_record_guard_exception<Sym: WalkSym>(
     let guard_op = ctx
         .trace_ctx
         .record_guard(OpCode::GuardException, &[exc_type_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
     // `op.setref_base(val)` supplies the recording-time shadow without
     // changing the guard result's live replay identity.
     ctx.trace_ctx.set_opref_concrete(
