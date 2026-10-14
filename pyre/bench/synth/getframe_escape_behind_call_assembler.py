@@ -2,6 +2,9 @@
 # macOS reads 13.2-15.7x on dynasm (19.4x once); the ceiling is about twice
 # that. Every failing guard of a generatorentry trace resumes in the
 # blackhole, where `compile.py handle_fail` would compile a bridge.
+# wasm has its own baseline: it reads guard_failures 38074 against 38067 on
+# dynasm and cranelift, with the same loops and bridges. The cause of the
+# seven extra exits is not identified.
 # Regression oracle: a callee entered through a CALL_ASSEMBLER fold reads a
 # local out of a frame the trace is being recorded for, forcing it.  The
 # recording stops there and execution goes on from behind the call, with the
