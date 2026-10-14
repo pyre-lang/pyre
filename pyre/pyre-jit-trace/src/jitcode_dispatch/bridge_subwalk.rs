@@ -907,8 +907,10 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         .bridge_registers_r()
         .map(|regs| regs.to_vec())
         .unwrap_or_else(|| root_sym.registers_r().to_vec());
-    let result_color = unsafe { &(*root_sym.jitcode()).payload }
-        .result_color_trivia_for_jitcode_pc(root_pc)
+    // `u16::MAX`: the return stack is empty, so the call leaves no result.
+    let result_color_entry =
+        unsafe { &(*root_sym.jitcode()).payload }.result_color_trivia_for_jitcode_pc(root_pc);
+    let result_color = result_color_entry
         .map(|c| c as usize)
         .filter(|&c| c != u16::MAX as usize);
     if let Some(result_color) = result_color {
@@ -972,10 +974,14 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     });
 
     // The NULLed result's position in `boxes`: `collect_outer_active_boxes`
-    // lists the live colors int bank first, then ref, then float.
-    let result_slot = match result_color {
-        None => CallResultSlot::Dead,
-        Some(result_color) => {
+    // lists the live colors int bank first, then ref, then float. No entry
+    // (no table, or a trailing-trivia overshoot) does not say the result is
+    // dead, so the slot stays unknown; an empty return stack, or a color that
+    // is not live after the call, is a dead result.
+    let result_slot = match (result_color_entry, result_color) {
+        (None, _) => CallResultSlot::Unknown,
+        (Some(_), None) => CallResultSlot::Dead,
+        (Some(_), Some(result_color)) => {
             crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
                 jitcode_index as i32,
                 root_liveness_word,
@@ -1100,8 +1106,9 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(recipe.jitcode_index);
     let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
     let sentinel = u32::from(u16::MAX);
-    let result_color = pjc
-        .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
+    // `u16::MAX`: the return stack is empty, so the call leaves no result.
+    let result_color_entry = pjc.result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize);
+    let result_color = result_color_entry
         .map(|c| c as usize)
         .filter(|&c| c != u16::MAX as usize);
 
@@ -1114,7 +1121,12 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         crate::state::bridge_semantic_maps_from_jitcode_pc(recipe.jitcode_index, recipe.jitcode_pc);
     let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
     let mut boxes = Vec::with_capacity(banks.total_len());
-    let mut result_slot = CallResultSlot::Dead;
+    // No result-color entry: unknown slot. No result, or not live: dead.
+    let mut result_slot = if result_color_entry.is_some() {
+        CallResultSlot::Dead
+    } else {
+        CallResultSlot::Unknown
+    };
     // Per-color `(color, box)` pairs for the blackhole capture below, collected
     // alongside the liveness-ordered box list the snapshot consumes.
     let mut bh_int = Vec::with_capacity(banks.int.len());

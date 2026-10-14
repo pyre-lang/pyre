@@ -3278,7 +3278,16 @@ pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
             .collect::<Vec<_>>()
     };
     let caller = parent_frames.last()?;
-    if caller.result_slot == CallResultSlot::Unknown || !ctx.trace_ctx.vable_snapshot_buildable() {
+    if caller.result_slot == CallResultSlot::Unknown {
+        if super::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-finished-callee] result slot unknown: jitcode={} marker={:?}",
+                caller.jitcode_index, caller.resume_marker_jit_pc
+            );
+        }
+        return None;
+    }
+    if !ctx.trace_ctx.vable_snapshot_buildable() {
         return None;
     }
     Some(parent_frames)

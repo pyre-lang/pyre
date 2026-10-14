@@ -7968,6 +7968,11 @@ struct InlineParentFrame {
 
 /// The slot of a paused caller's `boxes` that `make_result_of_lastop`
 /// (`pyjitpl.py`) fills when its call returns.
+///
+/// `make_result_of_lastop` reads the target register from the live
+/// `MIFrame`'s bytecode. A paused caller here is a snapshot (`boxes` in
+/// liveness order), not a live frame, so the position is recorded where the
+/// snapshot is built.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) enum CallResultSlot {
     /// Not derived for this frame.
