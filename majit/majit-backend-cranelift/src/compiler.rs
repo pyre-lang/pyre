@@ -23108,13 +23108,13 @@ impl majit_backend::Backend for CraneliftBackend {
         fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
-        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
-        // llmodel.py `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
-        // ref store carries an implied write barrier, identical to the array
-        // ref setters. Without it a young value stored into an old managed
-        // struct is not remembered and the next minor collection can free it
-        // while still referenced.
+        // llmodel.py `bh_setfield_gc_r` → `write_ref_at_mem`: the ref store
+        // carries an implied write barrier (`transform_generic_set`, before
+        // the bare store), identical to the array ref setters. Without it a
+        // young value stored into an old managed struct is not remembered and
+        // the next minor collection can free it while still referenced.
         write_barrier_if_managed(majit_ir::GcRef(struct_ptr as usize));
+        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
     }
 
     /// llmodel.py bh_getarrayitem_gc_i: ofs=base_size, size+sign
@@ -23188,16 +23188,15 @@ impl majit_backend::Backend for CraneliftBackend {
     ) {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
-        unsafe {
-            *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
-        }
         // llmodel.py `write_ref_at_mem`: raw_store + "write
         // barrier is implied above". The barrier marks the target
         // container as dirty so the GC re-scans it for the freshly
-        // stored ref-typed slot. Matches the
-        // `write_barrier_if_managed` callsite shape used by other
-        // ref-storing backends.
+        // stored ref-typed slot; `transform_generic_set` puts it before
+        // the bare store.
         write_barrier_if_managed(majit_ir::GcRef(array_ptr as usize));
+        unsafe {
+            *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
+        }
     }
 
     /// llmodel.py bh_setarrayitem_gc_f.

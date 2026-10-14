@@ -4114,12 +4114,13 @@ pub trait Backend: Send {
     ) {
         let offset = fielddescr.as_offset();
         majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
-        // SAFETY: see `bh_setfield_gc_i`.
-        unsafe { crate::llmodel::write_ref_at_mem(struct_ptr as usize, offset, newvalue.0) };
         // The store target may be an old-gen object holding a young ref; the
         // active GC's barrier remembers it. No-op where no barrier is installed.
-        // This is the barrier `write_ref_at_mem` documents its callers as owing.
+        // This is the barrier `write_ref_at_mem` documents its callers as owing;
+        // `transform_generic_set` (framework.py) puts it before the bare store.
         majit_gc::gc_write_barrier(GcRef(struct_ptr as usize));
+        // SAFETY: see `bh_setfield_gc_i`.
+        unsafe { crate::llmodel::write_ref_at_mem(struct_ptr as usize, offset, newvalue.0) };
     }
     /// model.py / llmodel.py bh_setfield_gc_f. Size 8 is `FLOATSTORAGE`;
     /// size 4 demotes to f32.
@@ -4285,9 +4286,9 @@ pub trait Backend: Send {
         let item_addr = (array_ptr as usize)
             .wrapping_add(base_size)
             .wrapping_add((index as usize).wrapping_mul(std::mem::size_of::<usize>()));
+        majit_gc::gc_write_barrier(GcRef(array_ptr as usize));
         // SAFETY: see `bh_setfield_gc_i`.
         unsafe { (item_addr as *mut usize).write_unaligned(newvalue.0) };
-        majit_gc::gc_write_barrier(GcRef(array_ptr as usize));
     }
     /// model.py / llmodel.py bh_setarrayitem_gc_f → `FLOATSTORAGE`-width
     /// store at `base_size + index * WORD`.
