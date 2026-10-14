@@ -2670,24 +2670,6 @@ impl<'a> RegAlloc<'a> {
             self.faillocs_arena.push(None);
             return;
         }
-        if arg.is_constant() {
-            let tp = self.tp(arg);
-            if tp == Type::Float {
-                // `locs_for_fail` is `[self.loc(arg) for arg in getfailargs()]`.
-                // A float constant is `X86XMMRegisterManager.convert_to_imm`
-                // (`ConstFloatLoc`) once the data block is installed. The GPR
-                // manager's `convert_to_imm` would leave the bits as `ImmedFloat`.
-                let loc = self.loc(arg, tp);
-                self.faillocs_arena.push(Some(loc));
-            } else {
-                // Integer / ConstPtr stay on the GPR manager. `rm.loc` with
-                // no wrapper skips the movable-ConstPtr check in
-                // `X86RegisterManager.convert_to_imm`.
-                self.faillocs_arena
-                    .push(Some(self.rm.convert_to_imm(arg, &self.constants)));
-            }
-            return;
-        }
         let tp = self.tp(arg);
         // x86/regalloc.py `RegAlloc.locs_for_fail` calls `self.loc(arg)`:
         // a box reused from ResumeDataLoopMemo may be live only in this

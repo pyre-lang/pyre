@@ -2145,9 +2145,6 @@ struct GuardToken {
     /// [`FailDescrCell::thin_ptr`] baked into `jf_descr`. The `Box` lives
     /// on `Asm::fail_descrs` so the address stays valid.
     fail_cell_ptr: usize,
-    /// Constants to store in frame during recovery.
-    /// Each entry: (frame_slot_index, constant_value).
-    const_stores: Vec<(usize, i64)>,
     /// opassembler.py:515 GuardToken.gcmap.
     gcmap: *mut usize,
     /// `assembler.py implement_guard`'s `guard_token.pos_jump_offset` — the
@@ -2167,9 +2164,9 @@ struct GuardToken {
     /// `implement_guard` / `genop_guard_guard_not_invalidated` store
     /// `get_scratch_register_known_value()` here. `-1` is unknown.
     /// `generate_quick_failure` assigns it back
-    /// (`restore_scratch_register_known_value` emits no code) before the
-    /// const stores. A token whose recovery is not entered from its own
-    /// jump with r11 unchanged stays `-1`.
+    /// (`restore_scratch_register_known_value` emits no code). A token
+    /// whose recovery is not entered from its own jump with r11 unchanged
+    /// stays `-1`.
     known_scratch_value: i64,
 }
 
@@ -2531,11 +2528,6 @@ impl<'a> Assembler386<'a> {
         let low = unsafe { (from.value as *const i32).read_unaligned() };
         let high = unsafe { (from.value as *const i32).add(1).read_unaligned() };
         (low, high)
-    }
-
-    /// Bit pattern stored by `X86XMMRegisterManager.convert_to_imm`.
-    fn const_float_bits(from: crate::regloc::ConstFloatLoc) -> i64 {
-        unsafe { (from.value as *const i64).read_unaligned() }
     }
 
     /// `regalloc_immedmem2mem`: a `ConstFloatLoc` stored to a frame slot is
@@ -6787,37 +6779,23 @@ impl<'a> Assembler386<'a> {
             );
         }
 
-        // `llsupport/assembler.py store_info_on_descr` parity:
-        // encode each fail-arg location as a USHORT.  PyPy's encoding —
-        //   None              → 0xFFFF
-        //   GPR register      → position in `cpu.gen_regs`
-        //   float register    → len(gen_regs) + position in `cpu.float_regs`
-        //   stack             → (loc.value - base_ofs) // WORD
-        //                         (here: `f.get_position() + JITFRAME_FIXED_SIZE`)
-        // A constant fail-arg does not fit that USHORT. Pyre allocates a
-        // const-store slot, writes the bits, and encodes the slot so
-        // deopt reads a normal stack position (`_decode_pos`).
-        let mut const_stores: Vec<(usize, i64)> = Vec::new();
+        // `llsupport/assembler.py store_info_on_descr`:
+        // encode each fail-arg location as a USHORT —
+        //   None           → 0xFFFF
+        //   GPR register   → `gen_regs.index(loc)`
+        //   float register → len(gen_regs) + loc.value * coeff
+        //   stack          → (loc.value - base_ofs) // WORD
+        //                      (here: `f.get_position() + JITFRAME_FIXED_SIZE`)
         let rd_locs: majit_ir::RdLocs = faillocs
             .iter()
-            .map(|fl| {
-                // `locs_for_fail` → `self.loc`: a float constant is
-                // `ConstFloatLoc`. `store_info_on_descr` would encode
-                // `loc.is_float()` as `len(gen_regs) + loc.value * coeff`,
-                // and `ConstFloatLoc.value` is the pool address, not an xmm
-                // index. Copy the bits into the same const-store slot an
-                // `ImmedFloat` uses so `rd_locs` stays a jitframe position
-                // (`_decode_pos`).
-                let bits = match fl {
-                    None => return 0xFFFF,
-                    Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
-                    Some(Loc::ConstFloat(c)) => Self::const_float_bits(*c),
-                    Some(loc) => return deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
-                };
-                let slot = self.frame_depth;
-                self.frame_depth += 1;
-                const_stores.push((slot, bits));
-                slot as u16
+            .map(|fl| match fl {
+                None => 0xFFFF,
+                Some(loc) => match deadframe_slot_for_loc(loc) {
+                    Some(encoded) => encoded,
+                    None => panic!(
+                        "store_info_on_descr: cannot encode fail-arg loc {loc:?} (gen_regs.index)"
+                    ),
+                },
             })
             .collect();
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
@@ -6874,7 +6852,6 @@ impl<'a> Assembler386<'a> {
             fail_label,
             fail_descr: descr.clone(),
             fail_cell_ptr,
-            const_stores,
             gcmap,
             pos_jump_offset: None,
             guard_not_invalidated: false,
@@ -6981,12 +6958,6 @@ impl<'a> Assembler386<'a> {
             .pending_guard_tokens
             .pop()
             .expect("GUARD_NOT_FORCED_2 descriptor token");
-        for &(slot, value) in &token.const_stores {
-            let ofs = Self::slot_offset(slot);
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            self.load_scratch(value);
-            rx86::mov_br(&mut self.mc, ofs, scratch);
-        }
         // `store_force_descr`: `mov r11, descr`, `mov [jf_force_descr], r11`.
         let descr_ptr = token.fail_cell_ptr as i64;
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
@@ -6999,8 +6970,6 @@ impl<'a> Assembler386<'a> {
 
     /// `generate_quick_failure`.
     ///
-    /// Immediate fail-args are extra frame slots (`const_stores`). They are
-    /// written here, before the two pushes, so `rd_locs` still names them.
     /// `restore_scratch_register_known_value` assigns `known_scratch_value`
     /// and emits nothing, so a nearby constant is a `LEA` from the r11 the
     /// guard jump left behind. Then `PUSH` the descr and the gcmap and `JMP`
@@ -7021,13 +6990,6 @@ impl<'a> Assembler386<'a> {
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>fail_label);
         self.scratch_register_value = guard_token.known_scratch_value;
-
-        for &(slot, val) in &guard_token.const_stores {
-            let ofs = Self::slot_offset(slot);
-            self.load_scratch(val);
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            rx86::mov_br(&mut self.mc, ofs, scratch);
-        }
 
         // `PUSH` descr, then `PUSH` gcmap. The recovery pops gcmap first.
         self.push_imm(guard_token.fail_cell_ptr as i64);

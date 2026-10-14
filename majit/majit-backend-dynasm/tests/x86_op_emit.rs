@@ -1745,96 +1745,6 @@ fn failure_recovery_captures_a_pending_exception() {
     assert!(!majit_backend_dynasm::jit_exc_is_pending());
 }
 
-/// A box whose `pos` is the constant (`pack_op_pos`, shortpreamble /
-/// heap-const). `compute_vars_longevity` rejects a Const fail-arg
-/// (`assert not isinstance(arg, Const)`). `locs_for_fail` still lowers
-/// this box through `convert_to_imm`, and `generate_quick_failure`
-/// reloads the bits through r11.
-fn heap_const_failarg(value: i64) -> Operand {
-    let op = OpRc::new(Op::new(OpCode::SameAsI, &[]));
-    op.pos().set(OpRef::const_int(value));
-    Operand::from_bound_op(&op)
-}
-
-/// `INT_ADD` of a constant that does not fit imm32 loads it into r11
-/// (`_load_scratch`). The failing guard's recovery then reloads that
-/// same word and a word 40 bytes away (`restore_scratch_register_known_value`
-/// plus `LEA`). A far constant still takes `MOV_ri`.
-#[test]
-fn guard_recovery_reuses_known_scratch_value() {
-    const SCRATCH_BASE: i64 = 1i64 << 32;
-    const NEAR: i64 = SCRATCH_BASE + 40;
-    const FAR: i64 = SCRATCH_BASE + (1i64 << 40);
-
-    let _lock = lock_exception_cells();
-    let _clear = ClearExc;
-    majit_backend_dynasm::jit_exc_clear();
-
-    let mut backend = fresh_backend();
-    let token = JitCellToken::new(next_token_id());
-    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let i0 = inputargs[0].opref();
-    let add = Op::new(
-        OpCode::IntAdd,
-        &[rb(i0), rb(OpRef::const_int(SCRATCH_BASE))],
-    );
-    add.pos().set(OpRef::int_op(1));
-    let eq = Op::new(OpCode::IntEq, &[rb(i0), rb(OpRef::const_int(0))]);
-    eq.pos().set(OpRef::int_op(2));
-    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(2))]);
-    guard.pos().set(OpRef::void_op(3));
-    guard.setdescr(make_resume_guard_descr_typed(vec![
-        Type::Int,
-        Type::Int,
-        Type::Int,
-        Type::Int,
-    ]));
-    guard.set_fail_arg_types(vec![Type::Int, Type::Int, Type::Int, Type::Int]);
-    guard.setfailargs(
-        vec![
-            rb(OpRef::int_op(1)),
-            heap_const_failarg(SCRATCH_BASE),
-            heap_const_failarg(NEAR),
-            heap_const_failarg(FAR),
-        ]
-        .into(),
-    );
-    let ops = vec![
-        OpRc::new(add),
-        OpRc::new(eq),
-        OpRc::new(guard),
-        OpRc::new(finish(4)),
-    ];
-    backend
-        .compile_loop(&inputargs, &ops, &token)
-        .unwrap_or_else(|err| panic!("compile scratch guard: {err:?}"));
-
-    let mut mov_r11 = [0u8; 10];
-    mov_r11[0] = 0x49;
-    mov_r11[1] = 0xBB;
-    mov_r11[2..].copy_from_slice(&SCRATCH_BASE.to_le_bytes());
-    let code = compiled_bytes(&token);
-    let movs = code
-        .windows(mov_r11.len())
-        .filter(|w| *w == mov_r11)
-        .count();
-    assert_eq!(
-        movs, 1,
-        "recovery must reuse r11 instead of reloading {SCRATCH_BASE:#x}"
-    );
-    assert!(
-        code.windows(4).any(|w| w == [0x4D, 0x8D, 0x5B, 0x28]),
-        "recovery must lea r11, [r11+40] for the near constant"
-    );
-
-    let frame = backend.execute_token(&token, &[Value::Int(7)]);
-    assert!(!backend.get_latest_descr(&frame).is_finish());
-    assert_eq!(backend.get_int_value(&frame, 0), 7 + SCRATCH_BASE);
-    assert_eq!(backend.get_int_value(&frame, 1), SCRATCH_BASE);
-    assert_eq!(backend.get_int_value(&frame, 2), NEAR);
-    assert_eq!(backend.get_int_value(&frame, 3), FAR);
-}
-
 fn no_collect_effect() -> EffectInfo {
     let mut effect = EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None);
     effect.can_collect = false;
@@ -4974,13 +4884,17 @@ fn assert_has(code: &[u8], needle: &[u8], what: &str) {
     );
 }
 
-fn assert_no_call_rax(code: &[u8]) {
-    for (i, window) in code.windows(2).enumerate() {
-        if window == [0xFF, 0xD0] {
-            let rex = i > 0 && code[i - 1] == 0x41;
-            assert!(rex, "residual fnloc must not be `call rax` at {i}");
-        }
-    }
+/// The residual call followed by its result store `mov [rbp+disp8], rax`
+/// (`48 89 45`). The pair pins the call site, so a `mov rax, fnloc` /
+/// `call rax` shape fails it. Scanning the whole buffer for `FF D0` instead
+/// also matches across instruction boundaries: the
+/// `_call_header_with_stack_check` slow path, emitted while another test has
+/// registered the stack-check addresses, ends in a `jmp rel32` whose last byte
+/// is `FF`, and the descr word after the code can start with `D0`.
+fn assert_call_site(code: &[u8], call: &[u8], what: &str) {
+    let mut site = call.to_vec();
+    site.extend_from_slice(&[0x48, 0x89, 0x45]);
+    assert_has(code, &site, what);
 }
 
 /// `CALL reg` (`FF /2`). `r8`–`r15` take a REX.B prefix.
@@ -5070,8 +4984,7 @@ fn residual_call_register_fnloc_is_call_reg() {
     assert_eq!(backend.get_int_value(&frame, 0), 99);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
-    assert_has(code, &arg_gpr_call(0), "call ARGUMENTS_GPR[0]");
+    assert_call_site(code, &arg_gpr_call(0), "call ARGUMENTS_GPR[0]");
 
     // One integer argument takes `ARGUMENTS_GPR[0]`, so the fnloc moves to
     // `ARGUMENTS_GPR[1]` and the call is that register.
@@ -5082,8 +4995,7 @@ fn residual_call_register_fnloc_is_call_reg() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
-    assert_has(code, &arg_gpr_call(1), "call ARGUMENTS_GPR[1]");
+    assert_call_site(code, &arg_gpr_call(1), "call ARGUMENTS_GPR[1]");
 
     // Four integer arguments fill the Win64 GPRs, so the fnloc spills to
     // `[rsp+32]`. SysV still has `r8` free (`ARGUMENTS_GPR[4]`).
@@ -5103,12 +5015,11 @@ fn residual_call_register_fnloc_is_call_reg() {
     assert_eq!(backend.get_int_value(&frame, 0), 10);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
     #[cfg(target_os = "windows")]
     let spilled = vec![0xFF, 0x54, 0x24, 0x20];
     #[cfg(not(target_os = "windows"))]
     let spilled = arg_gpr_call(4);
-    assert_has(code, &spilled, "call spilled or fifth GPR fnloc");
+    assert_call_site(code, &spilled, "call spilled or fifth GPR fnloc");
 }
 
 #[test]
@@ -5122,8 +5033,7 @@ fn residual_call_frame_fnloc_is_call_rbp() {
     assert_eq!(backend.get_int_value(&frame, 0), 99);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
-    assert_has(code, &expect, "call [rbp+input0]");
+    assert_call_site(code, &expect, "call [rbp+input0]");
 
     let (backend, token) =
         compile_indirect_call(false, None, &[rb(OpRef::const_int(42))], vec![Type::Int]);
@@ -5132,8 +5042,7 @@ fn residual_call_frame_fnloc_is_call_rbp() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_no_call_rax(code);
-    assert_has(code, &expect, "call [rbp+input0]");
+    assert_call_site(code, &expect, "call [rbp+input0]");
 }
 
 #[test]
