@@ -22617,14 +22617,12 @@ pub unsafe fn generator_invoke_execute_frame(
     // Own bracket: a caller that resumes in a loop (`unpack_into`) and
     // indexes its own pins from a base does not see this call's pins.
     let _roots = pyre_object::gc_roots::push_roots();
-    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(gen_obj);
     // No closure: `and_then` lowers to `target:closure.call`, a symbolic
     // hash the portal walk cannot execute.
     // `w_arg_or_err` is one GC local in `_invoke_execute_frame` /
     // `execute_frame`. The sent value and a thrown `OperationError`
-    // (`error.py`) both occupy that local; publish them together on the
-    // caller bracket and reload both immediately before `execute_frame`.
+    // (`error.py`) both occupy that local; both are reloaded immediately
+    // before `execute_frame`.
     let input_word = match w_inputvalue {
         Some(v) if !v.is_null() => v,
         _ => pyre_object::PY_NULL,
@@ -22633,21 +22631,39 @@ pub unsafe fn generator_invoke_execute_frame(
         Some(err) => err.as_raw() as PyObjectRef,
         None => pyre_object::PY_NULL,
     };
-    let payload_base = pyre_object::gc_roots::pin_roots(&[input_word, operr_word]);
+    let (throw_words, throw_len) = match throw_args {
+        Some((words, len)) => (words, Some(len)),
+        None => ([pyre_object::PY_NULL; 3], None),
+    };
+    // Every managed argument is published as one run before the first
+    // normalization, the way `gctransform/framework.py push_roots` stores
+    // all livevars before the call that may collect; a word pinned after
+    // that normalization could still name a moved object.
+    let gen_slot = pyre_object::gc_roots::pin_roots(&[
+        gen_obj,
+        frame as *mut crate::pyframe::PyFrame as PyObjectRef,
+        input_word,
+        operr_word,
+        throw_words[0],
+        throw_words[1],
+        throw_words[2],
+    ]);
     let input_slot = if input_word.is_null() {
         None
     } else {
-        Some(payload_base)
+        Some(gen_slot + 2)
     };
     let operr_slot = if operr_word.is_null() {
         None
     } else {
-        Some(payload_base + 1)
+        Some(gen_slot + 3)
     };
     // `FrameAnchor::live` residualizes `&self` as a Ref. The anchor is one
     // word (the depth), so that Ref is the depth itself and the walk
     // refuses it. `frame_anchor_live` takes the depth as an int.
-    let frame_depth = crate::eval::frame_anchor_push(frame);
+    let frame_depth = crate::eval::frame_anchor_push(pyre_object::gc_roots::shadow_stack_get(
+        gen_slot + 1,
+    ) as *mut crate::pyframe::PyFrame);
     if w_generator_is_running(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
         // generator.py:112 `"%s already executing" % self.KIND`.
         crate::eval::frame_anchor_release(frame_depth);
@@ -22673,6 +22689,17 @@ pub unsafe fn generator_invoke_execute_frame(
             slot,
         ))),
         (_, operr) => operr,
+    };
+    let throw_args = match throw_len {
+        Some(len) => Some((
+            [
+                pyre_object::gc_roots::shadow_stack_get(gen_slot + 4),
+                pyre_object::gc_roots::shadow_stack_get(gen_slot + 5),
+                pyre_object::gc_roots::shadow_stack_get(gen_slot + 6),
+            ],
+            len,
+        )),
+        None => None,
     };
     // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
     // `execute_generator_frame` is look-inside and dispatches through
