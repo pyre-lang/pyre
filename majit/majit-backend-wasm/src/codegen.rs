@@ -5698,10 +5698,14 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         );
         idx
     });
+    // Assembler386.assemble_bridge then write_pending_failure_recoveries:
+    // each guard of the bridge gets generate_quick_failure, independent of
+    // rebuild_faillocs_from_descr (how THIS module was entered).
+    // `bridge_entry_arity` is that entry convention; `bridge_param_arities`
+    // is the recovery-stub family. Seeding this map with the entry arity
+    // made emit_guard_exit treat every guard as a typed tail-call, and a
+    // guard whose live fail-arg count was not the entry arity had no type.
     let mut bridge_param_type_indices = indexmap::IndexMap::new();
-    if let (Some(arity), Some(idx)) = (*bridge_entry_arity, bridge_entry_type_idx) {
-        bridge_param_type_indices.insert(arity, idx);
-    }
     let jit_call_type_idx = if needs_call {
         let idx = next_type_idx;
         next_type_idx += 1;
@@ -5768,7 +5772,10 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         next_type_idx += 1;
     }
     for arity in bridge_param_arities {
-        if bridge_param_type_indices.contains_key(&arity) {
+        if let (Some(entry_arity), Some(idx)) = (*bridge_entry_arity, bridge_entry_type_idx)
+            && arity == entry_arity
+        {
+            bridge_param_type_indices.insert(arity, idx);
             continue;
         }
         bridge_param_type_indices.insert(arity, next_type_idx);
@@ -11781,8 +11788,11 @@ struct BridgeDispatch<'a> {
     fail_index_base: u32,
     bridge_slot_local: u32,
     enabled: bool,
-    /// `arity -> indirect-call type` for armed parameter dispatch. Every
-    /// signature carries values as i64, including Float bit patterns.
+    /// `arity -> indirect-call type` for THIS module's guard-to-bridge
+    /// parameter tail-calls (`bridge_param_dispatch`). Empty means the guards
+    /// use frame-entry dispatch, including when THIS module itself is a
+    /// parameter-entered bridge (`bridge_entry_arity`). Every signature
+    /// carries values as i64, including Float bit patterns.
     param_type_indices: &'a indexmap::IndexMap<usize, u32>,
     inline_guards: &'a [InlineGuard<'a>],
     /// Depth of the innermost still-open preamble-region block, at the
@@ -12062,9 +12072,10 @@ fn emit_guard_exit(
         sink.br(inline_region_br_depth(inline, &dispatch, enclosing_frames));
         return;
     }
-    // A parameter signature does not arm a bridge: the dispatch cell array
-    // must exist too. The native backend harness has signatures but no wasm
-    // cells, and must use the ordinary guard recovery path.
+    // A parameter-entered module (`bridge_entry_arity`) is not itself
+    // parameter-dispatch for its guards: that family is `param_type_indices`,
+    // filled only from `bridge_param_arities`. Empty, or no cell array, is
+    // the frame-entry recovery path (Assembler386.generate_quick_failure).
     if !dispatch.enabled || dispatch.param_type_indices.is_empty() {
         emit_guard_spill(
             sink,

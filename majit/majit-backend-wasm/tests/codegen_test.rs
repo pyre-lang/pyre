@@ -4745,6 +4745,112 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
     );
 }
 
+fn parameter_entry_bridge_inputs(
+    inputargs: Vec<InputArgRc>,
+    ops: Vec<Op>,
+    bridge_param_dispatch: bool,
+) -> codegen::ModuleBuildInputs {
+    codegen::ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 4,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: Some(1),
+        bridge_param_dispatch,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    }
+}
+
+fn mixed_arity_parameter_entry_ops() -> (Vec<InputArgRc>, Vec<Op>) {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let ops = vec![
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    (inputargs, ops)
+}
+
+fn return_call_indirect_type_indices(bytes: &[u8]) -> Vec<u32> {
+    let mut indices = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while let Ok(op) = operators.read() {
+                if let wasmparser::Operator::ReturnCallIndirect { type_index, .. } = op {
+                    indices.push(type_index);
+                }
+            }
+        }
+    }
+    indices
+}
+
+#[test]
+fn parameter_entry_does_not_arm_guard_param_dispatch() {
+    // Assembler386.assemble_bridge rebuilds the entry from the source guard
+    // (`rebuild_faillocs_from_descr`) and then write_pending_failure_recoveries
+    // still emits generate_quick_failure for every guard of the bridge. The
+    // entry arity is not the recovery-stub family: a parameter-entered module
+    // whose own `bridge_param_dispatch` is off must use frame-entry dispatch
+    // for those guards. Seeding `param_type_indices` with the entry arity
+    // made emit_guard_exit look up the GuardTrue's live fail-arg count (2)
+    // in a map that only held the entry arity (1).
+    let (inputargs, ops) = mixed_arity_parameter_entry_ops();
+    let inputs = parameter_entry_bridge_inputs(inputargs, ops, false);
+    let (bytes, guards, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2, "GuardTrue and Finish");
+    let types = return_call_indirect_type_indices(&bytes);
+    assert!(
+        types.iter().any(|&t| t == 0),
+        "frame-entry epilogue uses type 0, got {types:?}"
+    );
+    assert!(
+        types.iter().all(|&t| t == 0),
+        "no typed guard tail-call when param dispatch is off, got {types:?}"
+    );
+}
+
+#[test]
+fn parameter_entry_registers_distinct_guard_fail_arities() {
+    // Same stream with param dispatch on: the GuardTrue's arity-2 recovery
+    // is a different wasm type from the arity-1 entry, and both are declared.
+    let (inputargs, ops) = mixed_arity_parameter_entry_ops();
+    let inputs = parameter_entry_bridge_inputs(inputargs, ops, true);
+    let (bytes, guards, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2, "GuardTrue and Finish");
+    let types = return_call_indirect_type_indices(&bytes);
+    assert!(
+        types.iter().any(|&t| t != 0),
+        "arity-2 guard tail-call uses a declared parameter type, got {types:?}"
+    );
+}
+
 #[test]
 fn building_a_module_does_not_stamp_the_guard_cell_on_its_descr() {
     // The caller can still decline after `build_wasm_module` returns (the host
