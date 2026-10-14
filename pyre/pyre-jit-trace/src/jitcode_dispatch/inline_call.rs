@@ -13916,16 +13916,12 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     {
         return Err(DispatchError::callee_inline_abort(op_pc, true));
     }
-    // Unreachable after the pre-inline `can_latch_operator_tail_return`
-    // admission. Census + debug only: a release panic would hide the
-    // convert-in-place path `convert_and_run_from_pyjitpl` (`blackhole.py`)
-    // is supposed to take.
+    // The pre-inline `can_latch_operator_tail_return` admission proved the
+    // mirror, the parents and the preflight. What can still refuse here is
+    // the returned box having no concrete value to stamp into the tail, or a
+    // caller the session no longer holds. No image is published then, so
+    // the abort recovers as an entry replay; the census row counts it.
     crate::jitcode_dispatch::census_record("OperatorTailLatchFailed");
-    debug_assert!(
-        false,
-        "operator-tail latch failed after the dunder ran; \
-         convert_and_run_from_pyjitpl copies live frames"
-    );
     let _ = ctx.session.borrow_mut().claim_abort_coordinate(true);
     Err(DispatchError::callee_inline_abort(op_pc, true))
 }

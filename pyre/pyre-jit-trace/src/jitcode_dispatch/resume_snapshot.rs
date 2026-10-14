@@ -3208,29 +3208,18 @@ fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(
 ///
 /// `ResumeDataLoopMemo.number` writes `jitcode_index, pc, [tagged...]` and
 /// `rebuild_from_numbering` splits that stream with `frame_value_count_at`
-/// at the same pc. Collecting from the paused banks is `get_list_of_active_boxes`
-/// at capture time; a stored image whose length disagrees is refused, so a
-/// parent cannot donate a tagged value into the next frame header.
+/// at the same pc. `frame.boxes` is the image the caller-frame constructor
+/// collected with the pending call result nulled
+/// (`MIFrame.get_list_of_active_boxes`, `in_a_call`); the paused banks hold
+/// the restored register, so they are not re-read here. An image whose
+/// length disagrees with the decoder's count is refused, so a parent cannot
+/// donate a tagged value into the next frame header.
 fn boxes_matching_resume_liveness(
     frame: &InlineParentFrame,
     pc_word: u32,
     op_pc: usize,
 ) -> Result<Vec<OpRef>, DispatchError> {
     let expected = crate::state::frame_value_count_at(frame.jitcode_index as i32, pc_word as i32);
-    if let (Some(regs_i), Some(regs_r), Some(regs_f)) =
-        (&frame.registers_i, &frame.registers_r, &frame.registers_f)
-        && let Ok(boxes) = collect_callee_active_boxes(
-            regs_i,
-            regs_r,
-            regs_f,
-            frame.jitcode_index,
-            op_pc,
-            pc_word as i32,
-        )
-        && boxes.len() == expected
-    {
-        return Ok(boxes);
-    }
     // No box is invented for a slot the image does not hold: a section of
     // the wrong length cannot be numbered, so the guard is not recorded.
     if frame.boxes.len() != expected {
@@ -3264,9 +3253,8 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     // `ResumeDataLoopMemo` pass (`resume.py` `number`). Each section's tagged
     // values are the live boxes at that frame's published pc, so the length
     // agrees with `get_current_position_info` / `frame_value_count_at` when
-    // cranelift rebuilds the numbering. Stored `in_a_call` images can differ
-    // from that window; re-collect from the paused banks, and refuse the
-    // capture when no image of the decoder's count exists.
+    // cranelift rebuilds the numbering. A stored `in_a_call` image whose
+    // length differs from that window refuses the capture.
     let mut captured: Vec<(u32, u32, u32, Vec<OpRef>)> = Vec::with_capacity(parent_frames.len());
     for frame in &parent_frames {
         let word = frame
