@@ -226,29 +226,6 @@ impl Repr for RustVecRepr {
         )
     }
 
-    /// `l.length = n` (`lltypesystem/rlist.py` `ll_newlist` after the
-    /// hint allocation). `Vec::set_len` writes the header `len` word;
-    /// there is no `ll_vec_set_len` helper.
-    fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
-        let attr = hop_arg_const_string(hop, 1)?;
-        if attr != "len" {
-            return Err(self.missing_rtype_operation(&format!("setattr_{attr}")));
-        }
-        let args_r = hop.args_r.borrow();
-        let r_value = args_r
-            .get(2)
-            .and_then(|r| r.as_ref())
-            .ok_or_else(|| TyperError::message("RustVecRepr.rtype_setattr missing value repr"))?;
-        let void = LowLevelType::Void;
-        let vlist = hop.inputargs(vec![
-            ConvertedTo::from(self),
-            ConvertedTo::from(&void),
-            ConvertedTo::from(r_value),
-        ])?;
-        hop.genop("setfield", vlist, GenopResult::Void);
-        Ok(None)
-    }
-
     /// `ll_getitem_fast`: the index is in bounds.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
         let v = hop.inputargs(vec![
@@ -286,8 +263,9 @@ impl Repr for RustVecRepr {
         )
     }
 
-    /// `rlist.py` `_ll_list_resize_really`: `l.length = newsize`.
-    /// `Vec::set_len` is that store on the raw header's `len` word.
+    /// `rlist.py` `_ll_list_resize_really`: `l.length = newsize`, and
+    /// `ll_newlist` after the hint allocation. `Vec::set_len` is that store
+    /// on the raw header's `len` word; there is no `ll_vec_set_len` helper.
     fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
         let attr = hop_arg_const_string(hop, 1)?;
         if attr != "len" {
