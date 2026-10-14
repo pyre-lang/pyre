@@ -334,8 +334,9 @@ pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
 ///
 /// Look-inside: the generated JIT records that split, so a walker
 /// descent of this function is the same graph the rtyper would emit
-/// from the interpreter source.  `jit_int_str` stays the fused residual
-/// for graph-level `UnaryOp { op: "str" }` only.
+/// from the interpreter source.  Graph-level `UnaryOp { op: "str" }`
+/// over an Int is `ll_int2dec` (`jtransform` `int_str_helper`); the
+/// wrap lives only here.
 ///
 /// # Safety
 /// `obj` must be a machine `int` (not bool, not long).

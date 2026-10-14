@@ -197,9 +197,12 @@ fn default_str_concat_helper() -> String {
     "jit_ll_strconcat".to_string()
 }
 
-/// The [`GraphTransformConfig::int_str_helper`] default, on the same terms.
+/// The [`GraphTransformConfig::int_str_helper`] default: pyre's own, in
+/// `pyre_object::lowlevel_string`, whose address `jit_fnaddr.rs` binds.  It
+/// is `ll_str.py ll_int2dec` over a Signed, returning `Ptr(STR)`, the
+/// operand type `ll_strconcat` concatenates.
 fn default_int_str_helper() -> String {
-    "jit_int_str".to_string()
+    "jit_ll_int2dec".to_string()
 }
 
 /// The [`GraphTransformConfig::str_eq_helper`] default, on the same terms:
@@ -4034,26 +4037,25 @@ impl<'a> Transformer<'a> {
                 RewriteResult::Identity(operand.clone())
             }
             // `str` over an unboxed integer renders the decimal string.
-            // `rint.py rtype_str` / `rstr.py ll_int2dec` lower `str(int)`
-            // to a `direct_call` of the render helper during rtyping, so
-            // the blackhole never sees a bare `int_str` op.  Pyre keeps
-            // `str(x)` as `UnaryOp { op: "str" }` through the graph; over
-            // an Int operand it lowers to the registered `jit_int_str`
-            // host extern (`pyre_object::unicodeobject`, address in
-            // `jit_fnaddr.rs`).  An int-only residual selects the
-            // canonical `ir` shape with an empty ref list
+            // `rint.py IntegerRepr.ll_str` / `rtype_str` is `ll_int2dec`
+            // (`ll_str.py`, `@jit.elidable`), returning `Ptr(STR)`.  The
+            // wrap (`space.newutf8`) is `intobject.py descr_str`, not this
+            // op.  Pyre keeps `str(x)` as `UnaryOp { op: "str" }` through
+            // the graph; over an Int operand it lowers to the registered
+            // `jit_ll_int2dec` host extern (`pyre_object::lowlevel_string`,
+            // address in `jit_fnaddr.rs`).  An int-only residual selects
+            // the canonical `ir` shape with an empty ref list
             // (`assembler.rs` `emit_canonical_call_void` `has_int` arm),
             // so it assembles to the wired `residual_call_ir_r/iIRd>r`.
             // Without this the op falls through to the unwired
             // `int_str/i>r` default.  Like `_ll_2_int_*` (route-(a)) the
             // helper carries no oopspec.
             //
-            // `CanRaise`, not an elidable effect: `ll_int2dec` is elidable
-            // but returns the rendered characters, and `descr_repr`
-            // (intobject.py) wraps them in a separate `space.newutf8`
-            // allocation.  `jit_int_str` performs both, and sharing that
-            // allocation between two renders of one operand is visible to
-            // `is_w`, which gives a `str` of `_len() > 1` storage identity.
+            // `EF_ELIDABLE_OR_MEMORYERROR` (`pypyjit test_string.py`
+            // `ll_int2dec__Signed` `EF=3`): `mallocstr` can raise
+            // MemoryError.  A fused wrap residual (`jit_int_str`) is a
+            // `W_UnicodeObject`; concatenating that with an rstr `STR`
+            // through `ll_strconcat` reads `w_class` as length.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -4062,6 +4064,14 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind_var(operand) == 'i'
                 && !self.config.int_str_helper.is_empty() =>
             {
+                // `IntegerRepr.ll_str` → `ll_int2dec`: the result is
+                // `Ptr(STR)`. Stamp so assembler coloring stays `'r'`,
+                // matching `jtransform.py` `getkind(op.result.concretetype)`.
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::GcRef,
+                );
                 let target = CallTarget::function_path([self.config.int_str_helper.as_str()]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 let mut ops = vec![funcptr_op];
@@ -4072,7 +4082,7 @@ impl<'a> Transformer<'a> {
                         descriptor: CallDescriptor::from_signature(
                             &[majit_ir::value::Type::Int],
                             majit_ir::value::Type::Ref,
-                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                            EffectInfo::new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None),
                         ),
                         args_i: vec![operand.clone()],
                         args_r: vec![],
@@ -17630,7 +17640,7 @@ mod tests {
     }
 
     #[test]
-    fn transform_graph_lowers_int_str_to_jit_int_str_residual_call() {
+    fn transform_graph_lowers_int_str_to_ll_int2dec_residual_call() {
         let mut graph = FunctionGraph::new("int_str");
         let n_var = graph
             .push_op_var(
@@ -17664,7 +17674,7 @@ mod tests {
         let ops = &transformed.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
         let expected_fnaddr =
-            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_int_str"]));
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_ll_int2dec"]));
         assert!(
             matches!(&ops[1].kind, OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr)
         );
@@ -17679,7 +17689,10 @@ mod tests {
                 indirect_targets,
             } => {
                 assert!(matches!(funcptr, CallFuncPtr::Value(_)));
-                assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+                assert_eq!(
+                    descriptor.extra_info.extraeffect,
+                    ExtraEffect::ElidableOrMemoryError
+                );
                 assert_eq!(args_i, &vec![n_var.clone()]);
                 assert!(args_r.is_empty());
                 assert!(args_f.is_empty());

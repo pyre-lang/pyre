@@ -3826,6 +3826,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_int_str",
         pyre_object::jit_int_str,
     );
+    // `jtransform` `int_str_helper` residual of `UnaryOp { op: "str" }` over
+    // an Int (`rint.py IntegerRepr.ll_str` → `ll_str.py ll_int2dec`).  The
+    // crate-root alias is the `CallTarget::function_path(["jit_ll_int2dec"])`
+    // spelling the rewrite emits.
+    cpa1(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_int2dec",
+        "pyre_object::jit_ll_int2dec",
+        pyre_object::lowlevel_string::jit_ll_int2dec,
+    );
     // `rgc.ll_shrink_array` residual target for the StringBuilder `build` tree
     // (`_handle_rgc_call` rewrites the oopspec residual to `["jit_ll_shrink_array"]`).
     // The non-virtual shrink reallocs a raw low-level string down to its final
