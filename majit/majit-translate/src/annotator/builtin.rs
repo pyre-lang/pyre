@@ -526,6 +526,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "pyre_object.gc_roots.reload_top_root_at",
         gc_root_reload_identity,
     );
+    analyzer_for(
+        &mut reg,
+        "pyre_object.gc_hook.try_gc_current_object_address",
+        gc_root_reload_identity,
+    );
     // `rlib/debug.py` — the assertion half of `check_not_access_directly`.
     analyzer_for(
         &mut reg,
@@ -1883,15 +1888,11 @@ fn cast_instance_intrinsic(
         };
     }
     if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+        // `lltype.py ann_cast_opaque_ptr` always returns the destination
+        // annotation. A GC-erasure identity around the cast
+        // (`reload_top_root`, `try_gc_current_object_address`) is peeled
+        // before annotation (`retarget_gc_erasure_identity_args`).
         return match operand {
-            // A pin/reload of a flagged virtualizable is an identity at
-            // annotation time (`gctransform` has not yet erased the type).
-            // Projecting to GCREF would drop `access_directly`.
-            SomeValue::Instance(inst)
-                if inst.flags.get("access_directly").copied().unwrap_or(false) =>
-            {
-                Ok(operand.clone())
-            }
             SomeValue::String(_)
             | SomeValue::Instance(_)
             | SomeValue::List(_)
@@ -3382,10 +3383,10 @@ mod tests {
         assert_eq!(flags_of(&out), vec!["other".to_string()]);
     }
 
-    /// A GCREF recast of a flagged virtualizable is the pin/reload identity
-    /// at annotation time: the flag must still be on the result.
+    /// An explicit GCREF cast is `ann_cast_opaque_ptr`: the destination
+    /// SomePtr, even when the operand carries `access_directly`.
     #[test]
-    fn cast_instance_gcref_keeps_access_directly_on_the_operand() {
+    fn cast_instance_gcref_of_access_directly_instance_is_someptr() {
         let bk = bk();
         let flagged = instance_of(&bk, "PyFrame", true, &["access_directly"]);
         let s_root = {
@@ -3398,7 +3399,10 @@ mod tests {
         let out =
             cast_instance_intrinsic(&bk, &[Some(flagged.clone()), Some(s_root)], &HashMap::new())
                 .expect("GCREF recast of a flagged instance");
-        assert_eq!(flags_of(&out), vec!["access_directly".to_string()]);
+        assert!(
+            matches!(out, SomeValue::Ptr(_)),
+            "GCREF must project dest as SomePtr, got {out:?}"
+        );
     }
 
     #[test]
@@ -3408,6 +3412,58 @@ mod tests {
         let out = gc_root_reload_identity(&bk, &[Some(flagged.clone())], &HashMap::new())
             .expect("reload is an identity");
         assert_eq!(flags_of(&out), vec!["access_directly".to_string()]);
+    }
+
+    /// `PyFrame::live_mut` after the GCREF pair is peeled: identity of
+    /// `self`, then the same-class back-cast, keeps `access_directly`.
+    #[test]
+    fn live_mut_forwarding_lookup_keeps_access_directly() {
+        let bk = bk();
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "LiveMutFrame".to_string(),
+            vec![("pycode".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("LiveMutFrame")
+            .expect("LiveMutFrame classdef");
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("access_directly".to_string(), true);
+        let flagged = SomeValue::Instance(SomeInstance::new(Some(classdef), false, flags));
+
+        let s_gcref = {
+            let mut s = crate::annotator::model::s_str0();
+            s.set_const_box(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::byte_str("GCREF"),
+            ));
+            s
+        };
+        let projected = cast_instance_intrinsic(
+            &bk,
+            &[Some(flagged.clone()), Some(s_gcref)],
+            &HashMap::new(),
+        )
+        .expect("GCREF recast of a flagged instance");
+        assert!(
+            matches!(projected, SomeValue::Ptr(_)),
+            "GCREF must project dest as SomePtr, got {projected:?}"
+        );
+
+        let current = gc_root_reload_identity(&bk, &[Some(flagged.clone())], &HashMap::new())
+            .expect("try_gc_current_object_address is an identity");
+        assert_eq!(flags_of(&current), vec!["access_directly".to_string()]);
+
+        let s_frame = {
+            let mut s = crate::annotator::model::s_str0();
+            s.set_const_box(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::byte_str("LiveMutFrame"),
+            ));
+            s
+        };
+        let live = cast_instance_intrinsic(&bk, &[Some(current), Some(s_frame)], &HashMap::new())
+            .expect("back-cast to LiveMutFrame");
+        assert_eq!(flags_of(&live), vec!["access_directly".to_string()]);
     }
 
     /// `rlib/debug.py` asserts; the port raises instead of dropping the
@@ -3582,6 +3638,9 @@ mod tests {
         ));
         assert!(is_registered("pyre_object.gc_roots.reload_top_root"));
         assert!(is_registered("pyre_object.gc_roots.reload_top_root_at"));
+        assert!(is_registered(
+            "pyre_object.gc_hook.try_gc_current_object_address"
+        ));
         assert!(is_registered("rpython.rlib.objectmodel.instantiate"));
         assert!(is_registered("rpython.rlib.objectmodel.hlinvoke"));
         assert!(is_registered("weakref.ref"));

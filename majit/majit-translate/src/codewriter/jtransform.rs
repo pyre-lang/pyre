@@ -13925,10 +13925,17 @@ pub(crate) fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
     path_segments_end_with(segments, &["lltype", name])
 }
 
-/// Residual stand-in for the GC transform's livevar reload. `rewrite_op_direct_call`
-/// folds it to the operand alias (`current_gc_ref`).
+/// Residual stand-in for the GC transform's livevar reload.
+/// `rewrite_op_direct_call` folds it to the operand alias.
+///
+/// Matched on the owner path `[.., "listobject", "current_gc_ref"]` (the
+/// FunDecl `pyre_object::listobject::current_gc_ref`, including a crate-stripped
+/// prefix) and the crate-root re-export `["pyre_object", "current_gc_ref"]`
+/// (`pub use listobject::*`). A user function named `current_gc_ref` is an
+/// ordinary call.
 pub(crate) fn is_current_gc_ref_path(segments: &[String]) -> bool {
-    segments.last().is_some_and(|s| s == "current_gc_ref")
+    path_segments_end_with(segments, &["listobject", "current_gc_ref"])
+        || segments == ["pyre_object", "current_gc_ref"]
 }
 
 /// `direct_ptradd`'s pointer argument as the front emitted it, before
@@ -23889,6 +23896,88 @@ mod tests {
                 ),
                 "ordinary call to {name} must not alias its argument"
             );
+        }
+    }
+
+    /// `current_gc_ref` is identified by its owner path, not the leaf.
+    /// A user function of that name is an ordinary call.
+    #[test]
+    fn current_gc_ref_matches_owner_path_not_leaf() {
+        let user: Vec<String> = ["user", "current_gc_ref"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !is_same_as_identity_call_path(&user),
+            "ordinary call to current_gc_ref must not alias its argument"
+        );
+
+        let helpers: [&[&str]; 2] = [
+            &["pyre_object", "listobject", "current_gc_ref"],
+            &["pyre_object", "current_gc_ref"],
+        ];
+        for segs in helpers {
+            let segments: Vec<String> = segs.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                is_same_as_identity_call_path(&segments),
+                "helper spelling {segs:?} is an identity call path"
+            );
+        }
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("current_gc_ref_calls");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_ty = ValueType::Ref(None);
+
+        let user_target = CallTarget::function_path(["user", "current_gc_ref"]);
+        let user_result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let user_op = SpaceOperation {
+            result: Some(user_result),
+            kind: OpKind::Call {
+                target: user_target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        assert!(
+            !matches!(
+                transformer.rewrite_op_direct_call(
+                    &user_op,
+                    &user_target,
+                    std::slice::from_ref(&arg),
+                    &result_ty,
+                    "current_gc_ref_calls",
+                    &mut graph,
+                ),
+                RewriteResult::Identity(_)
+            ),
+            "ordinary call to current_gc_ref must not alias its argument"
+        );
+
+        for segs in helpers {
+            let target = CallTarget::function_path(segs.iter().copied());
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            let rewritten = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                "current_gc_ref_calls",
+                &mut graph,
+            );
+            match rewritten {
+                RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+                _ => panic!("expected Identity alias for {segs:?}"),
+            }
         }
     }
 
