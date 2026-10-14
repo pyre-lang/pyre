@@ -35303,8 +35303,9 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the unary llop
-    /// `rewrite_op_cast_ptr_to_int` keeps, not a residual call.
+    /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the host call
+    /// `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr` accept.
+    /// `normalize_unary_op_name` rejects a unary op of either name.
     fn emit_host_cast_llop(
         &mut self,
         mir_bb: usize,
