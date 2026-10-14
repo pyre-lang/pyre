@@ -4515,21 +4515,29 @@ pub fn funccall_valuestack(
     // (carries methodcall + w_function for diagnostics) and dispatch through
     // call_args.
     //
-    // Pin off the still-live frame slots, then dropvalues.  Copying into a
-    // native Vec first (`make_arguments` / `peekvalues`) leaves a window
-    // where a collection forwards the frame slots but not the copy, and
-    // HOPELESS builtins (`make_builtin_function`, arity 0x400) always land
-    // here because `nargs == 0x400` never matches `fastcall_N`.
+    // `dropvalues` retires the frame slots, so pin `func` and the
+    // `peekvalues` slice on the shadow stack (`framework.py push_roots`)
+    // before dropping, and reload them (`shadow_stack_copy_range_into_vec`,
+    // `framework.py pop_roots`) for `call_args`.  HOPELESS builtins
+    // (`make_builtin_function`, arity 0x400) always land here because
+    // `nargs == 0x400` never matches `fastcall_N`.
+    //
+    // `pyframe.py peekvalues` allocates first (`[None] * n`) then copies
+    // from still-live frame slots with no further allocation, so the slice
+    // is already forwarded when it returns; `pin_roots` is the next call
+    // and does not allocate.  The per-argument loop lives in `pin_roots` /
+    // `shadow_stack_copy_range_into_vec`, not here — `function.py
+    // funccall_valuestack` has no loop.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
     let _ = _roots.pin_root(func);
-    for i in 0..nargs {
-        let _ = _roots.pin_root(frame.peekvalue(nargs - 1 - i));
-    }
+    let mut args =
+        unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
+    let _ = _roots.pin_roots(&args);
     unsafe { &mut *caller.live() }.dropvalues(dropvalues);
     let func_now = _roots.get(root_base);
-    let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
-    funccall(func_now, &args_w)
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(root_base + 1, &mut args);
+    funccall(func_now, &args)
 }
 
 /// function.py `_flat_pycall` — create frame directly from stack.
