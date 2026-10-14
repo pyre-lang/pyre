@@ -28133,28 +28133,28 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // `<Option<P> as PartialEq>::eq` / `ne` on a niche nullable
-                // pointer whose payload compares by address (`*mut T` /
-                // `*const T`, `NonNull<T>`, function pointer). `None` is
-                // null and `Some(p)` is `p`, so derived equality is address
-                // identity of the two words — the same `BinOp` `rclass.py`
-                // `rtype_eq` / `rtype_ne` lower to `ptr_eq` / `ptr_ne`.
-                // The payload gate keeps `&T` (pointee by value), `Box<T>`
-                // (by value), strings, and a non-niche aggregate Option
-                // residual. Operands arrive as `&Option<P>`; peel that one
+                // Option. Operands arrive as `&Option<P>`; peel that one
                 // reference. `Rvalue::Ref` aliases the borrow to the niche
-                // word.
+                // word (`Some(p)` is `p`). Two payload families share this
+                // `BinOp`:
+                //
+                // * Address identity (`*mut T` / `*const T`, `NonNull<T>`,
+                //   function pointer) — `rclass.py` `rtype_eq` / `rtype_ne`
+                //   → `ptr_eq` / `ptr_ne`.
+                // * String-family (`node_is_string_value`, including
+                //   `Option<&str>` / `Option<String>`) — `rstr.py`
+                //   `AbstractStringRepr.rtype_eq` / `rtype_ne` →
+                //   `ll_streq`, which already treats a null operand
+                //   (`if not s1 or not s2: return s1 == s2`).
+                //
+                // `&T` (pointee by value), `Box<T>` (by value), and a
+                // non-niche aggregate Option stay residual.
                 if args.len() == 2
                     && (fmt_path_ends_with(&segments, &["option", "Option", "eq"])
                         || fmt_path_ends_with(&segments, &["option", "Option", "ne"]))
                     && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
                         .iter()
-                        .all(|ty| {
-                            ty.is_some_and(|ty| {
-                                self.tyref_peel_ref_to_pointee(ty).is_some_and(|peeled| {
-                                    self.option_niche_payload_compares_by_address(&peeled)
-                                })
-                            })
-                        })
+                        .all(|ty| ty.is_some_and(|ty| self.option_niche_eq_ne_operand(ty)))
                 {
                     let leaf = if fmt_path_ends_with(&segments, &["option", "Option", "ne"]) {
                         "ne"
@@ -38629,6 +38629,50 @@ impl<'a> Lowering<'a> {
         self.llbc
             .type_by_id(def_id)
             .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull")
+    }
+
+    /// `true` when `option_ty` is a niche nullable `Option<P>` and `P` is
+    /// string-family ([`node_is_string_value`]): builtin `str`, `String`,
+    /// `Wtf8` / `Wtf8Buf` / `BytesBlock` / `Utf8Str`, including a shared
+    /// reference to those (`Option<&str>`). Under the niche model `None`
+    /// is the null string and `Some(c)` is the string `c` itself, so
+    /// derived equality is string contents — `rstr.py`
+    /// `AbstractStringRepr.rtype_eq` / `rtype_ne` → `ll_streq`.
+    fn option_niche_payload_compares_as_string(&self, option_ty: &TyRef) -> bool {
+        if !self.tyref_is_niche_option_ptr(option_ty) {
+            return false;
+        }
+        let Some(payload) = tyref_node(option_ty, self.llbc)
+            .and_then(|node| node.as_object())
+            .and_then(|m| m.get("Adt"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| type_decl_ref_generics(a, self.llbc))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+        else {
+            return false;
+        };
+        // Same unique trait-projection peel as
+        // [`Self::option_niche_payload_compares_by_address`].
+        let resolved_assoc = trait_payload_node(payload, self.llbc)
+            .and_then(|node| trait_assoc_projection_target(node, self.llbc));
+        let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
+        let payload = resolved_body.unwrap_or(payload);
+        let Some(node) = strip_ty_wrappers(payload, self.llbc) else {
+            return false;
+        };
+        node_is_string_value(node, self.llbc)
+    }
+
+    /// Operand of `<Option<P> as PartialEq>::eq` / `ne`: `&Option<P>`
+    /// peeled to the niche Option, whose payload compares by address or
+    /// as a string.
+    fn option_niche_eq_ne_operand(&self, ty: &TyRef) -> bool {
+        self.tyref_peel_ref_to_pointee(ty).is_some_and(|peeled| {
+            self.option_niche_payload_compares_by_address(&peeled)
+                || self.option_niche_payload_compares_as_string(&peeled)
+        })
     }
 
     /// Emit a null pointer for a nullable `Option` (`None`) as a
@@ -97336,6 +97380,134 @@ mod tests {
         assert!(
             has_is,
             "Option<String> match must contain an identity null-test"
+        );
+    }
+
+    /// `<Option<&str> as PartialEq>::ne` on two niche nullable strings
+    /// (`opt != Some(c)`). `trait_default_call_segments` rewrites
+    /// `PartialEq::ne` to `["option", "Option", "ne"]`; the fold emits
+    /// string `BinOp("ne")` (`rstr.py` `AbstractStringRepr.rtype_ne` →
+    /// `ll_streq`) instead of leaving that FunctionPath residual.
+    #[test]
+    fn niche_option_str_ne_lowers_to_string_binop() {
+        use crate::model::{CallTarget, OpKind};
+
+        let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span, "source_text": null, "is_local": true,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let str_ty = serde_json::json!({
+            "Adt": {"builtin": "Str", "generics": generics}
+        });
+        let str_ref = serde_json::json!({"Ref": ["Erased", str_ty, "Shared"]});
+        let option_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [str_ref],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let option_ref = serde_json::json!({"Ref": ["Erased", option_ty, "Shared"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let place =
+            |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "option", "Option"]),
+                    "kind": "Opaque"
+                }],
+                "fun_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(&["fixture", "cmp_option_str"]),
+                        "signature": {
+                            "is_unsafe": false,
+                            "inputs": [option_ref.clone(), option_ref.clone()],
+                            "output": bool_ty.clone()
+                        },
+                        "body": {"Unstructured": {"span": span,
+                            "locals": {"arg_count": 2, "locals": [
+                                {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                                {"index": 1, "name": "lhs", "span": span, "ty": option_ref.clone()},
+                                {"index": 2, "name": "rhs", "span": span, "ty": option_ref.clone()},
+                                {"index": 3, "name": null, "span": span, "ty": bool_ty.clone()}
+                            ]},
+                            "body": [
+                                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                                    "call": {
+                                        "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                        "args": [
+                                            {"Copy": place(1, &option_ref)},
+                                            {"Copy": place(2, &option_ref)}
+                                        ],
+                                        "dest": place(3, &bool_ty)
+                                    },
+                                    "target": 1, "on_unwind": 2
+                                }}}},
+                                {"statements": [{
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(0, &bool_ty),
+                                        {"Use": [{"Copy": place(3, &bool_ty)}, "Yes"]}
+                                    ]}
+                                }], "terminator": {"span": span, "kind": "Return"}},
+                                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                            ]
+                        }}
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(&["core", "option", "Option", "ne"]),
+                        "signature": {
+                            "is_unsafe": false,
+                            "inputs": [option_ref.clone(), option_ref.clone()],
+                            "output": bool_ty
+                        },
+                        "body": "Opaque"
+                    }
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc =
+            Llbc::from_slice(file.to_string().as_bytes()).expect("option-str fixture parses");
+        let graph = super::lower_function(&llbc, "cmp_option_str").expect("lower cmp_option_str");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                    _ => false,
+                })
+                .count(),
+            0,
+            "no residual `Option::ne` call survives the string-niche fold"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
+            "the comparison lowers to a string `BinOp(ne)`"
         );
     }
 
