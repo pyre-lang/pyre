@@ -4053,6 +4053,50 @@ pub fn rtype_direct_arrayitems(hop: &HighLevelOp, _kwds_i: &HashMap<String, usiz
     Ok(hop.genop("direct_arrayitems", vlist, GenopResult::LLType(lltype)))
 }
 
+/// `lltype_direct_ptradd` accepts a classdef-less `SomeInstance` for an
+/// `alloc_zeroed` `*mut u8` and returns `SomePtr`. `HighLevelOp::setup`
+/// still derives `InstanceRepr` from that operand annotation. Relabel
+/// only that shell: classdef-less source, `PtrRepr` result, pointer
+/// concretetype. Any other `InstanceRepr` stays rejected so the
+/// `PtrRepr` assert matches `rtype_direct_ptradd`.
+fn relabel_classdef_less_direct_ptradd_operand(hop: &HighLevelOp) {
+    use crate::translator::rtyper::rmodel::PtrRepr;
+
+    let already_ptr = hop
+        .args_r
+        .borrow()
+        .first()
+        .and_then(|r| r.as_ref())
+        .is_some_and(|r| r.repr_class_id() == ReprClassId::PtrRepr);
+    if already_ptr || hop.args_r.borrow().is_empty() {
+        return;
+    }
+    let classdef_less = hop
+        .args_s
+        .borrow()
+        .first()
+        .is_some_and(|s| matches!(s, SomeValue::Instance(inst) if inst.classdef.is_none()));
+    if !classdef_less {
+        return;
+    }
+    let result_is_ptr = hop
+        .r_result
+        .borrow()
+        .as_ref()
+        .is_some_and(|r| r.repr_class_id() == ReprClassId::PtrRepr);
+    if !result_is_ptr {
+        return;
+    }
+    let concrete = hop.args_v.borrow().first().and_then(|v| match v {
+        Hlvalue::Variable(var) => var.concretetype(),
+        Hlvalue::Constant(c) => c.concretetype.clone(),
+    });
+    let Some(LowLevelType::Ptr(ptr)) = concrete else {
+        return;
+    };
+    hop.args_r.borrow_mut()[0] = Some(Arc::new(PtrRepr::new(*ptr)) as Arc<dyn Repr>);
+}
+
 /// RPython `@typer_for(lltype.direct_ptradd) def rtype_direct_ptradd(hop)`
 /// (rbuiltin.py).
 ///
@@ -4065,10 +4109,10 @@ pub fn rtype_direct_arrayitems(hop: &HighLevelOp, _kwds_i: &HashMap<String, usiz
 ///     return hop.genop('direct_ptradd', vlist,
 ///                      resulttype=hop.r_result.lowleveltype)
 /// ```
-///
 pub fn rtype_direct_ptradd(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
+    relabel_classdef_less_direct_ptradd_operand(hop);
     let r_arg = arg_repr(hop, 0)?;
     // `assert isinstance(hop.args_r[0], rptr.PtrRepr)` (`rtype_direct_ptradd`).
     if r_arg.repr_class_id() != ReprClassId::PtrRepr {
@@ -6777,7 +6821,7 @@ mod tests {
     }
 
     #[test]
-    fn rtype_direct_ptradd_rejects_classdef_less_instance_with_ptr_concretetype() {
+    fn rtype_direct_ptradd_relabels_classdef_less_instance_with_ptr_concretetype() {
         use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
         use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
         use crate::translator::rtyper::rmodel::PtrRepr;
@@ -6804,11 +6848,53 @@ mod tests {
         let result_repr: Arc<dyn Repr> = Arc::new(PtrRepr::new(ptr));
         *hop.r_result.borrow_mut() = Some(result_repr);
 
+        let result = rtype_direct_ptradd(&hop, &HashMap::new())
+            .expect("classdef-less alloc_zeroed shell relabels to PtrRepr")
+            .expect("direct_ptradd returns a pointer");
+        assert_eq!(
+            hop.args_r.borrow()[0].as_ref().map(|r| r.repr_class_id()),
+            Some(ReprClassId::PtrRepr),
+            "the alloc_zeroed shell relabels InstanceRepr to PtrRepr"
+        );
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "direct_ptradd");
+    }
+
+    #[test]
+    fn rtype_direct_ptradd_rejects_classdef_less_instance_without_ptr_result() {
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let inst = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("root InstanceRepr");
+        let ptr = objectptr_type();
+        let var = Variable::named("base");
+        var.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr))));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )));
+        hop.args_s.borrow_mut().push(SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(None, false, Default::default()),
+        ));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(inst.clone() as Arc<dyn Repr>));
+        *hop.r_result.borrow_mut() = Some(inst as Arc<dyn Repr>);
+
         let err = rtype_direct_ptradd(&hop, &HashMap::new())
-            .expect_err("rtype_direct_ptradd asserts PtrRepr");
+            .expect_err("result must be PtrRepr to relabel");
         assert!(
             err.to_string().contains("must be PtrRepr"),
-            "a classdef-less InstanceRepr stays rejected, got {err}"
+            "a classdef-less InstanceRepr without a PtrRepr result stays rejected, got {err}"
         );
     }
 

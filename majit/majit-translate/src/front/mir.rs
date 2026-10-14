@@ -10936,7 +10936,9 @@ impl<'a> Lowering<'a> {
                 // value: emitting the const's nullary call leaves that path
                 // unregistered. `fold_op_list` keeps any operation it cannot
                 // prove safe, so a projected store, address-taking, or
-                // whole-value consumer leaves the aggregate.
+                // whole-value consumer leaves the aggregate. A whole-local
+                // copy is safe when that dest is itself only field-read
+                // (or copied onward the same way).
                 if !self.multi_assigned_locals.contains(&dest_local)
                     && !self.local_has_projected_store(dest_local)
                     && const_struct_uses_are_field_reads(self.llbc, self.body, dest_local)
@@ -26439,8 +26441,9 @@ impl<'a> Lowering<'a> {
                         self.gc_struct_ids,
                     ) && let Some(kind) = self.instance_narrow_for_type(&call.dest.ty, &args[0])
                     {
-                        let res = if let Some((base, offset)) =
-                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))
+                        let array_tail =
+                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?;
+                        let res = if let Some((base, offset)) = array_tail
                             && let Some(root) = tyref_class_root_with(
                                 &call.dest.ty,
                                 self.llbc,
@@ -32126,15 +32129,18 @@ impl<'a> Lowering<'a> {
     /// `direct_arrayitems` (`lltype.py`) is that field's address. The
     /// header is the field-read base; the byte offset is the field's
     /// layout offset (`array_items_base` for a length-prefixed array).
-    /// `dest_ty` is the `.cast()` dest (`*mut Entry<i64, PyObjectRef>`):
-    /// the instantiated element type at this use, which the generic
-    /// `GcEntries` declaration does not carry.
+    /// `get_array_token` reads `carray.items.offset` off the actual
+    /// array, so element alignment comes from the source local and
+    /// header. `dest_ty` is the `.cast()` dest and is only the
+    /// instantiated element when those source types have no layout.
+    /// An address-taken array field with no recoverable items offset
+    /// stops translation rather than emit a different address.
     fn taken_array_field_address(
         &self,
         bb_id: BlockId,
         var: &Variable,
         dest_ty: Option<&TyRef>,
-    ) -> Option<(Variable, u64)> {
+    ) -> Result<Option<(Variable, u64)>, LowerError> {
         let found = {
             let block = self.graph.block(bb_id);
             let mut found = None;
@@ -32152,13 +32158,21 @@ impl<'a> Lowering<'a> {
                 break;
             }
             found
-        }?;
-        let instantiated_align = dest_ty
-            .and_then(|ty| self.instantiated_elem_align_from_tyref(ty, &found.2))
-            .or_else(|| self.instantiated_elem_align_of_var(var, &found.2))
-            .or_else(|| self.instantiated_elem_align_of_var(&found.0, &found.2));
-        let offset = self.array_field_tail_offset(&found.1, &found.2, instantiated_align)?;
-        Some((found.0, offset))
+        };
+        let Some(found) = found else {
+            return Ok(None);
+        };
+        let instantiated_align = Self::array_tail_instantiated_elem_align(
+            self.instantiated_elem_align_of_var(var, &found.2),
+            self.instantiated_elem_align_of_var(&found.0, &found.2),
+            dest_ty.and_then(|ty| self.instantiated_elem_align_from_tyref(ty, &found.2)),
+        );
+        let offset = Self::array_field_items_offset(
+            self.array_field_tail_offset(&found.1, &found.2, instantiated_align),
+            &found.1,
+            &found.2,
+        )?;
+        Ok(Some((found.0, offset)))
     }
 
     /// Alignment of the array element named by MIR local `var`.
@@ -32331,6 +32345,32 @@ impl<'a> Lowering<'a> {
     fn array_field_tail_offset_fallback(word: usize, elem_align: Option<usize>) -> Option<u64> {
         let align = elem_align.filter(|&a| a > 0)?;
         Some(crate::codewriter::call::array_items_base(word, align) as u64)
+    }
+
+    /// `get_array_token` reads `carray.items.offset` off the actual array
+    /// type. Source local and header win over a `.cast()` dest so a
+    /// differently aligned reinterpret cannot change the items address.
+    fn array_tail_instantiated_elem_align(
+        source_local: Option<usize>,
+        source_header: Option<usize>,
+        dest: Option<usize>,
+    ) -> Option<usize> {
+        source_local.or(source_header).or(dest)
+    }
+
+    /// `direct_arrayitems` builds a pointer to item zero of the actual
+    /// array. Unknown items offset stops translation rather than select
+    /// a different address operation.
+    fn array_field_items_offset(
+        offset: Option<u64>,
+        owner: &str,
+        field: &str,
+    ) -> Result<u64, LowerError> {
+        offset.ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "direct_arrayitems: items offset of {owner}.{field} is unknown"
+            ))
+        })
     }
 
     /// `direct_arrayitems` (`lltype.py`) as `cast_ptr_to_int` + add +
@@ -34537,8 +34577,9 @@ impl<'a> Lowering<'a> {
 
     /// `(header as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` — `s.chars`
     /// (`rstr.py` `STR`). The add is on a `u8` pointer, the peeled base is
-    /// the low-level string header, and the dest is a `u8` pointer. `sub`
-    /// and any other pointee keep `rtype_direct_ptradd`.
+    /// the low-level string header (`*const Utf8Str` or `&Utf8Str`), and
+    /// the dest is a `u8` pointer. `sub` and any other pointee keep
+    /// `rtype_direct_ptradd`.
     fn is_string_header_chars_byte_ptr_add(
         &self,
         reg: &RegularCall,
@@ -44121,10 +44162,14 @@ fn is_lowlevel_string_header_adt_path(path: &str) -> bool {
     )
 }
 
-/// `*const Utf8Str` / `*mut Utf8Str` / `*const LowlevelStringHeader` — the
-/// rstr `STR` header (`rstr.py` `STR`).
+/// `*const Utf8Str` / `*mut Utf8Str` / `&Utf8Str` and the same shapes
+/// of `LowlevelStringHeader` — the rstr `STR` header (`rstr.py` `STR`).
+/// A reference-derived `(s as *const Utf8Str as *const u8)` peels to
+/// `&Utf8Str`; that is still `s.chars` (`ll_stritem_nonneg`).
 fn tyref_is_lowlevel_string_header_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
-    let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
+    let Some(pointee) =
+        tyref_peel_one_raw_ptr_node(ty, llbc).or_else(|| tyref_peel_one_ref_node(ty, llbc))
+    else {
         return false;
     };
     adt_node_def_id(pointee)
@@ -67031,13 +67076,19 @@ enum ConstStructUse {
     Other,
 }
 
-fn operand_const_struct_use(op: &Operand, dest: usize) -> ConstStructUse {
+fn operand_const_struct_use(
+    op: &Operand,
+    aliases: &std::collections::HashSet<usize>,
+) -> ConstStructUse {
     let (Operand::Copy(place) | Operand::Move(place)) = op else {
         return ConstStructUse::None;
     };
-    if place_is_field_projection_of_local(place, dest) {
+    if aliases
+        .iter()
+        .any(|&d| place_is_field_projection_of_local(place, d))
+    {
         ConstStructUse::FieldRead
-    } else if place_references_local(place, dest) {
+    } else if aliases.iter().any(|&d| place_references_local(place, d)) {
         ConstStructUse::Other
     } else {
         ConstStructUse::None
@@ -67052,47 +67103,148 @@ fn bump_const_struct_use(use_kind: ConstStructUse, fields: &mut usize, other: &m
     }
 }
 
-fn scan_rvalue_const_struct(rvalue: &Rvalue, dest: usize, fields: &mut usize, other: &mut usize) {
+fn place_is_const_struct_alias(place: &Place, aliases: &std::collections::HashSet<usize>) -> bool {
+    aliases
+        .iter()
+        .any(|&d| place_is_field_projection_of_local(place, d) || place_references_local(place, d))
+}
+
+fn rvalue_is_const_struct_alias_copy(
+    rvalue: &Rvalue,
+    place: &Place,
+    aliases: &std::collections::HashSet<usize>,
+) -> bool {
+    matches!(place.kind, PlaceKind::Local(j) if j != 0 && aliases.contains(&(j as usize)))
+        && matches!(
+            rvalue,
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _)
+                if matches!(src.kind, PlaceKind::Local(i) if aliases.contains(&(i as usize)))
+        )
+}
+
+fn scan_rvalue_const_struct(
+    rvalue: &Rvalue,
+    aliases: &std::collections::HashSet<usize>,
+    fields: &mut usize,
+    other: &mut usize,
+) {
     match rvalue {
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
         | Rvalue::Repeat(op, _, _, _)
         | Rvalue::ShallowInitBox(op, _) => {
-            bump_const_struct_use(operand_const_struct_use(op, dest), fields, other);
+            bump_const_struct_use(operand_const_struct_use(op, aliases), fields, other);
         }
         Rvalue::BinaryOp(_, lhs, rhs) => {
-            bump_const_struct_use(operand_const_struct_use(lhs, dest), fields, other);
-            bump_const_struct_use(operand_const_struct_use(rhs, dest), fields, other);
+            bump_const_struct_use(operand_const_struct_use(lhs, aliases), fields, other);
+            bump_const_struct_use(operand_const_struct_use(rhs, aliases), fields, other);
         }
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
-            if place_references_local(place, dest) {
+            if aliases.iter().any(|&d| place_references_local(place, d)) {
                 *other += 1;
             }
         }
         Rvalue::Len(place) | Rvalue::Discriminant(place) => {
-            if place_is_field_projection_of_local(place, dest) {
+            if aliases
+                .iter()
+                .any(|&d| place_is_field_projection_of_local(place, d))
+            {
                 *fields += 1;
-            } else if place_references_local(place, dest) {
+            } else if aliases.iter().any(|&d| place_references_local(place, d)) {
                 *other += 1;
             }
         }
         Rvalue::Aggregate(_, operands) => {
             for op in operands {
-                bump_const_struct_use(operand_const_struct_use(op, dest), fields, other);
+                bump_const_struct_use(operand_const_struct_use(op, aliases), fields, other);
             }
         }
         Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
     }
 }
 
+fn local_assignment_counts(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
+    let mut counts = vec![0usize; body.locals.locals.len()];
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let PlaceKind::Local(i) = place.kind
+            {
+                if let Some(count) = counts.get_mut(i as usize) {
+                    *count += 1;
+                }
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
+            && let PlaceKind::Local(i) = call.dest.kind
+        {
+            if let Some(count) = counts.get_mut(i as usize) {
+                *count += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Whole-local copies of `dest` that are themselves single-assignment.
+/// The return place is a whole-value consumer and is never an alias.
+fn const_struct_copy_aliases(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    let counts = local_assignment_counts(llbc, body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    let mut aliases = HashSet::from([dest]);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(j) = place.kind else {
+                    continue;
+                };
+                let j = j as usize;
+                if j == 0 || aliases.contains(&j) || counts.get(j).copied() != Some(1) {
+                    continue;
+                }
+                let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = rvalue else {
+                    continue;
+                };
+                let PlaceKind::Local(i) = src.kind else {
+                    continue;
+                };
+                if aliases.contains(&(i as usize)) {
+                    aliases.insert(j);
+                    grew = true;
+                }
+            }
+        }
+    }
+    aliases
+}
+
 /// `fold_op_list` keeps any operation it cannot prove safe. Fold a
-/// const-struct local only when every use is a field read: a projected
-/// store, address-taking, or whole-value consumer leaves the aggregate.
+/// const-struct local only when every use is a field read, including
+/// through single-assignment whole-local copies: a projected store,
+/// address-taking, or whole-value consumer leaves the aggregate.
 fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
     if dest == 0 {
         return false;
     }
+    let aliases = const_struct_copy_aliases(llbc, body, dest);
     let mut fields = 0usize;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
@@ -67103,16 +67255,18 @@ fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usi
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_const_struct(&rvalue, dest, &mut fields, &mut other);
-                    if matches!(place.kind, PlaceKind::Local(i) if i as usize == dest) {
-                    } else if place_is_field_projection_of_local(&place, dest)
-                        || place_references_local(&place, dest)
+                    if rvalue_is_const_struct_alias_copy(&rvalue, &place, &aliases) {
+                        continue;
+                    }
+                    scan_rvalue_const_struct(&rvalue, &aliases, &mut fields, &mut other);
+                    if matches!(place.kind, PlaceKind::Local(i) if aliases.contains(&(i as usize)))
                     {
+                    } else if place_is_const_struct_alias(&place, &aliases) {
                         other += 1;
                     }
                 }
                 Ok(StmtKind::Assert(assert)) => bump_const_struct_use(
-                    operand_const_struct_use(&assert.cond, dest),
+                    operand_const_struct_use(&assert.cond, &aliases),
                     &mut fields,
                     &mut other,
                 ),
@@ -67121,34 +67275,33 @@ fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usi
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_const_struct_use(
-                operand_const_struct_use(&discr, dest),
+                operand_const_struct_use(&discr, &aliases),
                 &mut fields,
                 &mut other,
             ),
             Ok(TermKind::Call { call, .. }) => {
                 if let CallFunc::Dynamic(op) = &call.func {
                     bump_const_struct_use(
-                        operand_const_struct_use(op, dest),
+                        operand_const_struct_use(op, &aliases),
                         &mut fields,
                         &mut other,
                     );
                 }
                 for arg in &call.args {
                     bump_const_struct_use(
-                        operand_const_struct_use(arg, dest),
+                        operand_const_struct_use(arg, &aliases),
                         &mut fields,
                         &mut other,
                     );
                 }
-                if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
-                } else if place_is_field_projection_of_local(&call.dest, dest)
-                    || place_references_local(&call.dest, dest)
+                if matches!(call.dest.kind, PlaceKind::Local(i) if aliases.contains(&(i as usize)))
                 {
+                } else if place_is_const_struct_alias(&call.dest, &aliases) {
                     other += 1;
                 }
             }
             Ok(TermKind::Assert { assert, .. }) => bump_const_struct_use(
-                operand_const_struct_use(&assert.cond, dest),
+                operand_const_struct_use(&assert.cond, &aliases),
                 &mut fields,
                 &mut other,
             ),
@@ -75579,6 +75732,37 @@ mod tests {
         assert_eq!(
             super::Lowering::array_field_tail_offset_fallback(4, None),
             None
+        );
+    }
+
+    /// `get_array_token` uses the actual array type. An 8-aligned source
+    /// tail must not pick up a 16-aligned `.cast()` dest.
+    #[test]
+    fn array_tail_elem_align_prefers_source_array_over_cast_dest() {
+        assert_eq!(
+            super::Lowering::array_tail_instantiated_elem_align(Some(8), None, Some(16)),
+            Some(8)
+        );
+        assert_eq!(
+            super::Lowering::array_tail_instantiated_elem_align(None, Some(8), Some(16)),
+            Some(8)
+        );
+        assert_eq!(
+            super::Lowering::array_tail_instantiated_elem_align(None, None, Some(8)),
+            Some(8)
+        );
+    }
+
+    /// `direct_arrayitems` constructs a pointer to item zero. Unknown
+    /// items offset stops translation rather than emit a different op.
+    #[test]
+    fn unknown_array_items_offset_stops_direct_arrayitems() {
+        let err = super::Lowering::array_field_items_offset(None, "GcEntries", "items")
+            .expect_err("unknown items offset must stop translation");
+        assert!(err.to_string().contains("direct_arrayitems"), "{err}");
+        assert_eq!(
+            super::Lowering::array_field_items_offset(Some(8), "GcEntries", "items").unwrap(),
+            8
         );
     }
 
@@ -89711,6 +89895,144 @@ mod tests {
                 .iter()
                 .any(|leaf| *leaf == "add"),
             "the header chars add must not residualize; graph={graph:#?}"
+        );
+    }
+
+    /// `(s as *const Utf8Str as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)`
+    /// for `s: &Utf8Str` is still `s.chars` (`ll_stritem_nonneg`).
+    fn header_ref_as_u8_add_chars_offset_fun(header_path: &[&str]) -> Llbc {
+        let u8_ptr = u8_raw_ptr_ty("Const");
+        let header_adt_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": empty_generics()
+            }
+        });
+        let header_ptr = serde_json::json!({
+            "RawPtr": [header_adt_ty, "Const"]
+        });
+        let header_ref = serde_json::json!({
+            "Ref": ["Erased", header_adt_ty, "Shared"]
+        });
+        let usize_t = usize_ty();
+        let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+        let header_adt = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(header_path, "", true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": isize_t, "attr_info": null},
+                {"name": "length", "ty": usize_t, "attr_info": null}
+            ]},
+            "layout": null
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "header_chars_view"], "", true),
+            "signature": {"is_unsafe": true, "inputs": [header_ref], "output": u8_ptr},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": u8_ptr},
+                    {"index": 1, "name": "s", "span": span_json(), "ty": header_ref},
+                    {"index": 2, "name": null, "span": span_json(), "ty": header_ptr},
+                    {"index": 3, "name": null, "span": span_json(), "ty": u8_ptr}
+                ]},
+                "body": [
+                    {
+                        "statements": [
+                            {
+                                "span": span_json(),
+                                "kind": {"Assign": [
+                                    {"kind": {"Local": 2}, "ty": header_ptr},
+                                    {"UnaryOp": [
+                                        {"Cast": {"RawPtr": [header_ref, header_ptr]}},
+                                        {"Move": {"kind": {"Local": 1}, "ty": header_ref}}
+                                    ]}
+                                ]}
+                            },
+                            {
+                                "span": span_json(),
+                                "kind": {"Assign": [
+                                    {"kind": {"Local": 3}, "ty": u8_ptr},
+                                    {"UnaryOp": [
+                                        {"Cast": {"RawPtr": [header_ptr, u8_ptr]}},
+                                        {"Move": {"kind": {"Local": 2}, "ty": header_ptr}}
+                                    ]}
+                                ]}
+                            }
+                        ],
+                        "terminator": {"span": span_json(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Move": {"kind": {"Local": 3}, "ty": u8_ptr}},
+                                {"Copy": {"kind": {"Global": {
+                                    "generics": empty_generics(),
+                                    "id": 1
+                                }}, "ty": usize_t}}
+                            ],
+                            "dest": {"kind": {"Local": 0}, "ty": u8_ptr}
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(
+                &["core", "ptr", "const_ptr", "<Impl>", "add"],
+                "",
+                false
+            ),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [u8_ptr, usize_t],
+                "output": u8_ptr
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [header_adt],
+                "fun_decls": [caller, callee],
+                "global_decls": [null, chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET")],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes())
+            .expect("header-ref-as-u8 chars-offset add fixture parses")
+    }
+
+    #[test]
+    fn utf8str_ref_as_u8_add_of_chars_offset_aliases_the_header() {
+        let llbc =
+            header_ref_as_u8_add_chars_offset_fun(&["pyre_object", "unicodeobject", "Utf8Str"]);
+        let graph = super::lower_function(&llbc, "header_chars_view").expect(
+            "lower (&Utf8Str as *const Utf8Str as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)",
+        );
+        assert!(
+            !graph_has_direct_ptradd(&graph),
+            "s.chars from &Utf8Str is the STR, not a displaced byte pointer; graph={graph:#?}"
+        );
+        assert!(
+            !call_leafs(&graph_ops(&graph))
+                .iter()
+                .any(|leaf| *leaf == "add"),
+            "the header-ref chars add must not residualize; graph={graph:#?}"
         );
     }
 
@@ -108788,9 +109110,30 @@ mod tests {
         assert!(!accepts(&address, 1), "address-taking");
 
         let whole = body_of(vec![stmt(serde_json::json!({
-            "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+            "Assign": [place_local(2), {"Discriminant": place_local(1)}]
         }))]);
         assert!(!accepts(&whole, 1), "whole-value consumer");
+
+        let copy_then_field = body_of(vec![
+            stmt(serde_json::json!({
+                "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+            })),
+            stmt(serde_json::json!({
+                "Assign": [place_local(0), {"Use": [{"Copy": field_place(2, 0)}, "No"]}]
+            })),
+        ]);
+        assert!(
+            accepts(&copy_then_field, 1),
+            "single-assignment copy then field read"
+        );
+
+        let copy_to_ret = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(0), {"Use": [{"Copy": place_local(1)}, "No"]}]
+        }))]);
+        assert!(
+            !accepts(&copy_to_ret, 1),
+            "copy to the return place is a whole-value consumer"
+        );
 
         assert!(
             !accepts(&reads, 0),
