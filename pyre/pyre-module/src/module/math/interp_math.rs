@@ -274,15 +274,26 @@ fn sqrt_from_double(x: f64) -> PyResult {
 /// `math1`'s `except ValueError: raise oefmt(...)`. The message builder
 /// is the except body, not the recorded success path.
 ///
-/// The residual trampoline is `f64 -> PyResult` (`helper_arg_from_i64`);
-/// a `PyError` argument is not a word, so that spelling would be a
-/// symbolic fnaddr on the catch path.
-#[majit_macros::dont_look_inside]
+/// `error.py oefmt` is `@specialize.arg(1)`: this body is
+/// `get_operrcls2.OpErrFmt.__init__` (`oefmt_one` / `make_pyerror_deferred_t`).
+/// `_compute_value` joins the stored pieces on first read, off the
+/// recorded success path.
+///
+/// `ll_math_sqrt`'s domain residual is already an effect, so a symbolic
+/// helper in this arm is `blocker_after_effect` on `__majit_wrap_math_sqrt`.
+/// `oefmt_single_t` pins across `kind_of_canonical_exc_class` and calls
+/// `str::as_ptr`; those are the helpers. `kind` is `ValueError` here, and
+/// the format is an interned `&str` literal (`__str_const`).
 fn sqrt_translate_ll_error(x: f64) -> PyResult {
-    Err(pyre_interpreter::PyError::value_error(format!(
-        "expected a nonnegative input, got {}",
-        float_repr(x)
-    )))
+    let payload = pyre_interpreter::display::jit_format_float_repr_rstr(x);
+    let w_fmt_x0 = pyre_object::unicodeobject::w_str_from_storage(payload);
+    let w_type = pyre_object::interp_exceptions::lookup_exc_class_for_kind(ExcKind::ValueError);
+    Err(pyre_interpreter::error::oefmt_one(
+        pyre_interpreter::PyErrorKind::ValueError,
+        w_type,
+        w_fmt_x0,
+        "expected a nonnegative input, got %s",
+    ))
 }
 
 /// interp_math.py `sqrt` = `math1(space, math.sqrt, w_x)`.
@@ -2242,4 +2253,40 @@ pub fn fma(args: &[PyObjectRef]) -> PyResult {
     let y = pyre_object::with_roots!(w_z => try_get_double(w_y))?;
     let z = try_get_double(w_z)?;
     map_err(pymath::math::fma(x, y, z))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `dont_look_inside` publishes a `HELPER_FNADDRS` trampoline. `math1`'s
+    /// `except ValueError` body is looked inside (`error.py oefmt`), so this
+    /// helper must not appear. `isclose_slow` stays residual with word args
+    /// and witnesses that the slice is populated; `sqrt_slow` takes
+    /// `&[PyObjectRef]` and is `HelperFnAddrSkip::FatPointerArg`.
+    #[test]
+    fn math_sqrt_translate_ll_error_is_looked_inside() {
+        let mut published = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
+        assert!(
+            published.iter().any(|path| path.contains("isclose_slow")),
+            "isclose_slow stays dont_look_inside: {published:?}"
+        );
+        assert!(
+            published
+                .iter()
+                .all(|path| !path.contains("sqrt_translate_ll_error")),
+            "math1 except ValueError is looked inside, not dont_look_inside"
+        );
+    }
+
+    /// `test_math.py test_exception_messages` for `math.sqrt(-1.1)`.
+    /// The kind tag follows `space.w_ValueError` once builtins have
+    /// registered the class; this crate-level test has no registry, so
+    /// `oefmt` keeps the bootstrap fallback and we check the message.
+    #[test]
+    fn math_sqrt_translate_ll_error_keeps_nonnegative_message() {
+        let err = sqrt_from_double(-1.1).expect_err("domain error");
+        assert_eq!(err.message_text(), "expected a nonnegative input, got -1.1");
+    }
 }

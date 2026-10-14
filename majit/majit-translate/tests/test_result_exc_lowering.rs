@@ -1275,6 +1275,83 @@ fn ll_math_sqrt_fuses_literal_domain_error() {
         "{name}: domain-error constructor must not survive: {leftover:?}"
     );
 }
+
+fn call_path_leaf(op: &OpKind) -> Option<(String, String)> {
+    match op {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            let path = segments.join("::");
+            let leaf = segments.last().cloned().unwrap_or_default();
+            let unspecialized = leaf
+                .split("__spec_")
+                .next()
+                .unwrap_or(leaf.as_str())
+                .to_string();
+            Some((path, unspecialized))
+        }
+        _ => None,
+    }
+}
+
+fn leftover_symbolic_oefmt_helpers(graph: &majit_translate::model::FunctionGraph) -> Vec<String> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| {
+            let (path, unspecialized) = call_path_leaf(&op.kind)?;
+            let hits = matches!(
+                unspecialized.as_str(),
+                "make_pyerror"
+                    | "value_error"
+                    | "oefmt"
+                    | "oefmt_single_t"
+                    | "oefmt_single_s"
+                    | "push_roots"
+                    | "kind_of_canonical_exc_class"
+                    | "FMT_PTR"
+                    | "FMT_LEN"
+            ) || (unspecialized == "from" && path.contains("String"))
+                || (unspecialized == "as_ptr" && path.contains("str"))
+                || (unspecialized == "len" && path.contains("core::str"));
+            hits.then_some(path)
+        })
+        .collect()
+}
+
+/// `math1`'s `except ValueError: raise oefmt(..., "%s", repr)` is looked
+/// inside (`error.py oefmt` / `OpErrFmt.__init__`). `String::from`,
+/// `make_pyerror`, and `oefmt_single_t` (`push_roots` / `str::as_ptr` /
+/// `kind_of_canonical_exc_class`) are symbolic fnaddrs; any one after
+/// `ll_math_sqrt`'s domain residual refuses the `__majit_wrap_math_sqrt`
+/// descent (`summarize_body_blockers_with` `blocker_after_effect`).
+#[test]
+fn sqrt_translate_ll_error_has_no_string_from_or_make_pyerror() {
+    let name = "sqrt_translate_ll_error";
+    let graph = lower_function(optional_module(), name).expect("lower");
+    let leftover = leftover_symbolic_oefmt_helpers(&graph);
+    assert!(
+        leftover.is_empty(),
+        "{name}: OpErrFmt.__init__ must not leave oefmt_single_t / push_roots / str::as_ptr: {leftover:?}"
+    );
+}
+
+/// `oefmt_one` is `get_operrcls2.OpErrFmt.__init__`: malloc + setfield.
+/// Walking `oefmt_single_t` after `formatd` is the `push_roots` blocker
+/// that residualises `math.sqrt` as `CallMayForceR`.
+#[test]
+fn oefmt_one_is_operrfmt_init_without_oefmt_single_t() {
+    let name = "oefmt_one";
+    let graph = lower_function(interp(), name).expect("lower");
+    let leftover = leftover_symbolic_oefmt_helpers(&graph);
+    assert!(
+        leftover.is_empty(),
+        "{name}: must tail-call make_pyerror_deferred_t, not oefmt_single_t: {leftover:?}"
+    );
+}
+
 fn return_producer<'a>(
     graph: &'a majit_translate::model::FunctionGraph,
     var: &majit_translate::flowspace::model::Variable,

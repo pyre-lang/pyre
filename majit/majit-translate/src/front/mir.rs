@@ -28297,6 +28297,34 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `core::str::<Impl>::len` on a string-family receiver
+                // is `len(s)` = `ll_strlen` (`rstr.py
+                // AbstractStringRepr.rtype_len`), planted as the
+                // `__strlen` marker the rtyper adapter and `jtransform`
+                // both lower. Slice/Vec/Wtf8 `len` have their own arms.
+                if args.len() == 1
+                    && self.is_str_len(&reg, first_arg_ty.as_ref(), const_arg_ty.as_ref())
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `core::str::<Impl>::contains(haystack, needle)` is the
                 // flowspace `contains` operation (`op.contains(container, item)`,
                 // `rstr.py` `rtype_contains`).  A `char` Pattern — including
@@ -37266,6 +37294,33 @@ impl<'a> Lowering<'a> {
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next();
         if leaf != Some("as_ptr") || !path.split("::").any(|seg| seg == "str") {
+            return false;
+        }
+        first_arg_ty.or(const_arg_ty).is_some_and(|ty| {
+            tyref_is_string_family(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
+        })
+    }
+
+    /// `core::str::<Impl>::len` on a string-family receiver is
+    /// `len(s)` = `ll_strlen` (`rstr.py AbstractStringRepr.rtype_len`),
+    /// planted as the `__strlen` marker the rtyper adapter and
+    /// `jtransform` both lower. Slice/Vec/Wtf8 `len` have their own
+    /// arms.
+    fn is_str_len(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        const_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        if leaf != Some("len") || !path.split("::").any(|seg| seg == "str") {
             return false;
         }
         first_arg_ty.or(const_arg_ty).is_some_and(|ty| {
@@ -120917,6 +120972,29 @@ mod tests {
         assert!(
             !graph_calls_leaf(&graph, "as_ptr"),
             "str::as_ptr must not remain residual, graph: {graph:#?}"
+        );
+    }
+
+    #[test]
+    fn str_len_rewrites_to_strlen_marker() {
+        let dest = usize_ty();
+        let graph = super::lower_function(
+            &std_extern_call_fixture(
+                "str_len",
+                &["core", "str", "<Impl>", "len"],
+                &[str_ref_ty()],
+                dest,
+            ),
+            "str_len",
+        )
+        .expect("lower str::len");
+        assert!(
+            graph_calls_leaf(&graph, "__strlen"),
+            "str::len must rewrite to __strlen, graph: {graph:#?}"
+        );
+        assert!(
+            !graph_calls_leaf(&graph, "len"),
+            "str::len must not remain residual, graph: {graph:#?}"
         );
     }
 

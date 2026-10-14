@@ -3534,11 +3534,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         LowLevelType::Float,
     ),
     (
-        &["std", "f64", "<Impl>", "fract"],
-        &["self"],
-        LowLevelType::Float,
-    ),
-    (
         &["std", "f64", "<Impl>", "ceil"],
         &["self"],
         LowLevelType::Float,
@@ -3559,16 +3554,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (
         &["std", "f64", "<Impl>", "powf"],
         &["self", "n"],
-        LowLevelType::Float,
-    ),
-    (
-        &["std", "f64", "<Impl>", "fract"],
-        &["self"],
-        LowLevelType::Float,
-    ),
-    (
-        &["core", "f64", "<Impl>", "fract"],
-        &["self"],
         LowLevelType::Float,
     ),
     (
@@ -10523,6 +10508,24 @@ mod tests {
                 .lookup(&FunctionPathKey::from_segments(["cell", "RefCell", "get"]))
                 .is_none(),
             "RefCell::get is not Cell::get"
+        );
+    }
+
+    /// `extfuncregistry.py` `_register` / `register_external` declare one
+    /// row per callable. `register_opaque_external` skips a key already
+    /// in the registry, so a second table row is dead and can drift.
+    #[test]
+    fn foreign_stdlib_externals_has_no_duplicate_key() {
+        let mut seen = HashSet::new();
+        let mut duplicates = Vec::new();
+        for (segments, _, _) in FOREIGN_STDLIB_EXTERNALS {
+            if !seen.insert(*segments) {
+                duplicates.push(*segments);
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "FOREIGN_STDLIB_EXTERNALS duplicate keys: {duplicates:?}"
         );
     }
 
