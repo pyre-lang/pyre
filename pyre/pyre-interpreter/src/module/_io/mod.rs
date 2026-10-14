@@ -59,6 +59,20 @@ pub fn text_io_wrapper_type() -> PyObjectRef {
     interp_textio::type_object()
 }
 
+/// Pin an IO receiver so a later [`from_pinned_slot`] can recover it after a
+/// collecting call. RPython's GC transform keeps `self` live
+/// (`interp_textio.py` / `interp_bufferedio.py` / `interp_fileio.py`); reload
+/// from the shadow-stack slot instead.
+pub(crate) fn pin_io_self(obj: PyObjectRef) -> usize {
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    pyre_object::gc_roots::shadow_stack_len() - 1
+}
+
+/// Re-read a typed IO payload from a shadow-stack slot.
+pub(crate) fn from_pinned_slot<T>(slot: usize) -> &'static mut T {
+    unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut T) }
+}
+
 /// Whether `obj` has the `W_BytesIO` layout, including a Python subclass.
 pub(crate) fn is_bytesio(obj: PyObjectRef) -> bool {
     W_BytesIO::from_obj(obj).is_some()
@@ -110,6 +124,8 @@ pub(crate) fn iobase_read_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
 
 /// `self.w_dict = w_dict` (`interp_iobase.py W_IOBase.getdict`).
 pub(crate) fn iobase_write_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    // framework.py transform_generic_set: barrier, then the store.
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     if let Some(inst) = W_FileIO::from_obj(obj) {
         inst.w_dict = w_dict;
         return;

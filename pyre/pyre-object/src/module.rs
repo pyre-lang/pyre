@@ -292,8 +292,8 @@ pub unsafe fn w_module_get_initialdict(obj: PyObjectRef) -> PyObjectRef {
 
 /// `mixedmodule.py save_module_content_for_future_reload` stores the copy.
 /// A managed holder records the edge through the minimark write barrier; an
-/// immortal one is root-walked by `walk_module_dicts_gc`, which the next minor
-/// runs only once the prebuilt family is dirty.
+/// immortal one is extra-rooted every minor by
+/// `walk_process_import_object_roots` (`Module.w_initialdict`).
 ///
 /// # Safety
 /// `obj` must point to a valid `Module`.

@@ -551,6 +551,68 @@ impl<K, V, S> RDict<K, V, S> {
         crate::gc_hook::try_gc_write_barrier(self as *const Self as crate::gc_hook::GCREF);
     }
 
+    /// `setfield_gc` write barrier on this dicttable (`d.entries = …`).
+    ///
+    /// `ll_dict_grow` / `ll_dict_remove_deleted_items` replace `d.entries`
+    /// with a newly malloc'd `DICTENTRYARRAY`. MiniMark traces that young
+    /// array from an already-old dicttable only through
+    /// `old_objects_pointing_to_young`, which this store must enter.
+    #[inline]
+    fn barrier_dicttable(&mut self) {
+        crate::gc_hook::try_gc_write_barrier(self as *mut Self as crate::gc_hook::GCREF);
+        // A `malloc_raw` table has no MiniMark header, so the field barrier
+        // cannot enter the remembered set. The prebuilt dirty bit is that
+        // store's write barrier (`remember_young_pointer` /
+        // `GCFLAG_NO_HEAP_PTRS` on prebuilts).
+        if !crate::gc_hook::try_gc_owns_object(self as *mut Self as crate::gc_hook::GCREF) {
+            crate::gc_roots::mark_prebuilt_roots_dirty();
+        }
+    }
+
+    /// `ll_dict_grow`'s `malloc` + `rgc.ll_arraycopy` + `d.entries = newitems`.
+    ///
+    /// rordereddict.py `ll_dict_grow`: `rgc.ll_arraycopy(d.entries, newitems,
+    /// 0, 0, len(d.entries))`. The table and old array stay on the shadow
+    /// stack across `_ll_malloc_entries`; `setfield_gc` on this dicttable
+    /// remembers an old table that now holds a young array.
+    fn replace_entries_array(&mut self, new_allocated: usize)
+    where
+        K: Copy + GcRefOffsets,
+        V: Copy + GcRefOffsets,
+        (K, V): GcEntriesType,
+    {
+        let _roots = crate::gc_roots::push_roots();
+        self.pin_table_and_entries();
+        let newitems = alloc_entries::<K, V>(new_allocated);
+        unsafe {
+            ll_arraycopy(self.entries, newitems, 0, 0, self.allocated_len());
+        }
+        self.barrier_self();
+        self.entries = newitems;
+        self.barrier_dicttable();
+    }
+
+    /// `AbstractTypedStrategy.copy`: clone this dicttable into a young box.
+    ///
+    /// `ll_dict_copy` mallocs a new `DICTENTRYARRAY` and may collect; the
+    /// clone's entries stay pinned until the box allocation publishes them
+    /// as a traced field.
+    pub fn clone_to_young_box(&self, tid: u32) -> *mut Self
+    where
+        K: Copy + GcRefOffsets + 'static,
+        V: Copy + GcRefOffsets + 'static,
+        S: Clone + 'static,
+        (K, V): GcEntriesType,
+    {
+        let _roots = crate::gc_roots::push_roots();
+        self.pin_table_and_entries();
+        let cloned = self.clone();
+        if !cloned.entries.is_null() {
+            let _ = crate::gc_roots::pin_root(cloned.entries as crate::pyobject::PyObjectRef);
+        }
+        crate::gc_storage::gc_alloc_young_storage_box(cloned, tid)
+    }
+
     /// The `entries` field slot, one GcRef (`d.entries`).
     #[inline]
     pub fn entries_slot(&mut self) -> *mut crate::gc_hook::GCREF {
@@ -1103,8 +1165,8 @@ where
 #[majit_macros::oopspec("odict.resize(d)")]
 pub fn ll_dict_resize<K, V, S>(d: &mut RDict<K, V, S>)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1116,8 +1178,8 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_remove_deleted_items<K, V, S>(d: &mut RDict<K, V, S>)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1151,17 +1213,7 @@ where
         return true;
     }
     let new_allocated = overallocate_entries_len(d.allocated_len());
-    let _roots = crate::gc_roots::push_roots();
-    d.pin_table_and_entries();
-    let newitems = alloc_entries::<K, V>(new_allocated);
-    // rordereddict.py `ll_dict_grow`: `rgc.ll_arraycopy(d.entries,
-    // newitems, 0, 0, len(d.entries))`.
-    unsafe {
-        ll_arraycopy(d.entries, newitems, 0, 0, d.allocated_len());
-    }
-
-    d.barrier_self();
-    d.entries = newitems;
+    d.replace_entries_array(new_allocated);
     d.generation = d.generation.wrapping_add(1);
     false
 }
@@ -1211,6 +1263,15 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
+    // `_ll_dict_setitem_lookup_done` livevars: `key` and `value` survive
+    // `ll_dict_grow` / `ll_dict_resize`. The transformer inserts
+    // `push_roots` around `_ll_malloc_entries`; without that bracket the
+    // pair's GC words stay in this frame and the write below stores the
+    // pre-move address (`ll_arraycopy` of an unrooted nursery key copies
+    // interiors). Same pin/reload as `map_keys_preserving_layout`.
+    let _roots = crate::gc_roots::push_roots();
+    let key_base = pin_key_gc_refs(&key);
+    let value_base = pin_key_gc_refs(&value);
     let mut reindexed = false;
     let mut rc = d.resize_counter - 3;
     // `_ll_malloc_entries` may collect (`ll_dict_grow` /
@@ -1243,6 +1304,8 @@ fn ll_dict_setitem_lookup_done_orig<K, V, S>(
         d.set_index_at(i as usize, d.next_slot() + VALID_OFFSET);
     }
     d.resize_counter = rc;
+    let key = reload_key_gc_refs(key, key_base);
+    let value = reload_key_gc_refs(value, value_base);
     let slot = d.num_ever_used_items;
     d.barrier_entries();
     unsafe {
@@ -1280,8 +1343,8 @@ pub fn ll_dict_setitem_lookup_done_trampoline<K, V, S>(
 /// `_ll_dict_del`. look_inside_iff(isvirtual(d) and isconstant(i)).
 pub fn ll_dict_del<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1294,8 +1357,8 @@ where
 
 fn ll_dict_del_orig<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1319,8 +1382,8 @@ where
 #[majit_macros::dont_look_inside]
 pub fn ll_dict_del_trampoline<K, V, S>(d: &mut RDict<K, V, S>, hash: u64, index: usize)
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1353,8 +1416,8 @@ fn reload_gcrefs<T: GcRefOffsets>(roots: &crate::gc_roots::RootScope, val: &mut 
 
 impl<K, V, S> RDict<K, V, S>
 where
-    K: Hash + Eq + Copy + EntryDummy,
-    V: Copy + EntryDummy,
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
@@ -1492,10 +1555,16 @@ where
     {
         let old_len = self.allocated_len();
         let shrink = self.num_live_items < old_len / 4;
+        let _roots = crate::gc_roots::push_roots();
+        self.pin_table_and_entries();
         let newitems = if shrink {
-            let _roots = crate::gc_roots::push_roots();
-            self.pin_table_and_entries();
-            alloc_entries::<K, V>(overallocate_entries_len(self.num_live_items))
+            let new_slot = crate::gc_roots::shadow_stack_len();
+            let newitems = alloc_entries::<K, V>(overallocate_entries_len(self.num_live_items));
+            let _ = crate::gc_roots::pin_root(newitems as crate::pyobject::PyObjectRef);
+            if !newitems.is_null() {
+                crate::gc_hook::try_gc_write_barrier_managed(newitems as crate::gc_hook::GCREF);
+            }
+            crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K, V>
         } else {
             // One barrier for the in-place writes (`llop.gc_writebarrier`).
             self.barrier_entries();
@@ -1539,6 +1608,7 @@ where
             crate::gc_hook::try_gc_write_barrier_managed(newitems as crate::gc_hook::GCREF);
             self.barrier_self();
             self.entries = newitems;
+            self.barrier_dicttable();
         }
         self.num_ever_used_items = self.num_live_items;
         let size = self.index_len();
@@ -1874,7 +1944,7 @@ where
     /// keys' hashes, not a copy of the old probe table.
     pub fn map_keys_preserving_layout<K2, S2>(&self, keys: &[K2]) -> RDict<K2, V, S2>
     where
-        K2: Hash + Eq + Copy + EntryDummy,
+        K2: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
         S2: BuildHasher + Default,
         (K2, V): GcEntriesType,
     {
@@ -1883,15 +1953,27 @@ where
         if n == 0 {
             return RDict::with_hasher(S2::default());
         }
+        let _roots = crate::gc_roots::push_roots();
+        self.pin_table_and_entries();
+        let mut key_slots = Vec::with_capacity(n);
+        for key in keys {
+            key_slots.push(pin_key_gc_refs(key));
+        }
+        let new_slot = crate::gc_roots::shadow_stack_len();
         let mut dst = RDict::with_hasher(S2::default());
         dst.entries = alloc_entries::<K2, V>(n);
+        let _ = crate::gc_roots::pin_root(dst.entries as crate::pyobject::PyObjectRef);
+        if !dst.entries.is_null() {
+            crate::gc_hook::try_gc_write_barrier_managed(dst.entries as crate::gc_hook::GCREF);
+        }
+        dst.entries = crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K2, V>;
         let mut live = 0usize;
         for slot in 0..n {
             if !self.entry_valid(slot) {
                 continue;
             }
             let value = self.entry_at(slot).value;
-            let key = keys[slot];
+            let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
             let hash = dst.hash_of(&key);
             dst.barrier_entries();
             unsafe {
@@ -1927,9 +2009,13 @@ where
     /// zero-filled, so their indexes do not move. `index_len` is
     /// [`Self::index_len`] from that same moment. Values are [`EntryDummy`];
     /// set storage stores `()`.
+    ///
+    /// `_ll_malloc_entries` may collect. Each key's GC refs are pinned before
+    /// that malloc and reloaded afterwards, the same `push_roots` / pop-roots
+    /// reread `try_grow_list_items_block_gc` uses for the old items block.
     pub fn from_preserved_slots(keys: &[K], live: &[bool], index_len: usize) -> Self
     where
-        K: Hash + Eq + Copy + EntryDummy,
+        K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
         V: Copy + EntryDummy,
         S: BuildHasher + Default,
         (K, V): GcEntriesType,
@@ -1939,14 +2025,25 @@ where
         if n == 0 {
             return Self::with_hasher(S::default());
         }
+        let _roots = crate::gc_roots::push_roots();
+        let mut key_slots = Vec::with_capacity(n);
+        for key in keys {
+            key_slots.push(pin_key_gc_refs(key));
+        }
+        let new_slot = crate::gc_roots::shadow_stack_len();
         let mut dst = Self::with_hasher(S::default());
         dst.entries = alloc_entries::<K, V>(n);
+        let _ = crate::gc_roots::pin_root(dst.entries as crate::pyobject::PyObjectRef);
+        if !dst.entries.is_null() {
+            crate::gc_hook::try_gc_write_barrier_managed(dst.entries as crate::gc_hook::GCREF);
+        }
+        dst.entries = crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K, V>;
         let mut nlive = 0usize;
         for slot in 0..n {
             if !live[slot] {
                 continue;
             }
-            let key = keys[slot];
+            let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
             let hash = dst.hash_of(&key);
             dst.barrier_entries();
             unsafe {
@@ -1984,15 +2081,7 @@ where
         let need = self.num_ever_used_items.saturating_add(additional);
         if need > entries_capacity {
             let new_n = need.max(overallocate_entries_len(entries_capacity));
-            let _roots = crate::gc_roots::push_roots();
-            self.pin_table_and_entries();
-            let newitems = alloc_entries::<K, V>(new_n);
-            unsafe {
-                ll_arraycopy(self.entries, newitems, 0, 0, self.allocated_len());
-            }
-
-            self.barrier_self();
-            self.entries = newitems;
+            self.replace_entries_array(new_n);
             self.generation = self.generation.wrapping_add(1);
         }
         let want = (self.num_live_items + additional) * 2;
@@ -2032,6 +2121,33 @@ pub fn dict_count_py_div(x: i64, y: i64) -> i64 {
         x.wrapping_sub(p)
     };
     r.wrapping_add(u >> 63)
+}
+
+/// Pin every GC ref inside `key` and return the first shadow-stack index.
+///
+/// `_ll_malloc_entries` may collect; a Rust slice of keys is not a root.
+/// `try_grow_list_items_block_gc` pins the old items block for the same
+/// reason and rereads it after the malloc.
+fn pin_key_gc_refs<K: GcRefOffsets>(key: &K) -> usize {
+    let base = crate::gc_roots::shadow_stack_len();
+    let key_addr = key as *const K as usize;
+    for &off in K::GC_REF_OFFSETS {
+        let ptr = unsafe { *((key_addr + off) as *const crate::pyobject::PyObjectRef) };
+        let _ = crate::gc_roots::pin_root(ptr);
+    }
+    base
+}
+
+/// Reload `key`'s GC refs from the shadow-stack run [`pin_key_gc_refs`] wrote.
+fn reload_key_gc_refs<K: GcRefOffsets + Copy>(mut key: K, base: usize) -> K {
+    let key_addr = &mut key as *mut K as usize;
+    for (i, &off) in K::GC_REF_OFFSETS.iter().enumerate() {
+        unsafe {
+            *((key_addr + off) as *mut crate::pyobject::PyObjectRef) =
+                crate::gc_roots::shadow_stack_get(base + i);
+        }
+    }
+    key
 }
 
 impl<K, V, S> FromIterator<(K, V)> for RDict<K, V, S>

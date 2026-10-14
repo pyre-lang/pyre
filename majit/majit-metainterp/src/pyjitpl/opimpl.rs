@@ -669,10 +669,7 @@ where
             let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                 panic!("BC_SETFIELD_GC: descrs[{descr_idx}] is not a BhDescr entry")
             });
-            let field_size = match bh {
-                crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
-                _ => 8,
-            };
+            let field_size = field_size_from_bh(bh, "BC_SETFIELD_GC");
             let offset = field_offset_from_bh(bh, "BC_SETFIELD_GC");
             let fielddescr = frame
                 .runtime_optimizer_descr(descr_idx)
@@ -768,10 +765,7 @@ where
             let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                 panic!("BC_SETFIELD_RAW: descrs[{descr_idx}] is not a BhDescr entry")
             });
-            let field_size = match bh {
-                crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
-                _ => 8,
-            };
+            let field_size = field_size_from_bh(bh, "BC_SETFIELD_RAW");
             let offset = field_offset_from_bh(bh, "BC_SETFIELD_RAW");
             let fielddescr = frame
                 .runtime_optimizer_descr(descr_idx)
@@ -1054,14 +1048,8 @@ where
             let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                 panic!("BC_GETFIELD_GC: descrs[{descr_idx}] is not a BhDescr entry")
             });
-            let (field_size, is_field_signed) = match bh {
-                crate::blackhole::BhDescr::Field {
-                    field_size,
-                    is_field_signed,
-                    ..
-                } => (*field_size, *is_field_signed),
-                _ => (8, false),
-            };
+            let field_size = field_size_from_bh(bh, "BC_GETFIELD_GC");
+            let is_field_signed = is_field_signed_from_bh(bh, "BC_GETFIELD_GC");
             let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC");
             let fielddescr = frame
                 .runtime_optimizer_descr(descr_idx)
@@ -1268,14 +1256,8 @@ where
             let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                 panic!("BC_GETFIELD_RAW_I: descrs[{descr_idx}] is not a BhDescr entry")
             });
-            let (field_size, is_field_signed) = match bh {
-                crate::blackhole::BhDescr::Field {
-                    field_size,
-                    is_field_signed,
-                    ..
-                } => (*field_size, *is_field_signed),
-                _ => (8, false),
-            };
+            let field_size = field_size_from_bh(bh, "BC_GETFIELD_RAW_I");
+            let is_field_signed = is_field_signed_from_bh(bh, "BC_GETFIELD_RAW_I");
             let offset = field_offset_from_bh(bh, "BC_GETFIELD_RAW_I");
             let fielddescr = frame
                 .runtime_optimizer_descr(descr_idx)

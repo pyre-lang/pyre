@@ -281,6 +281,8 @@ impl DictStrategy for IdentityDictStrategy {
     /// bucket for O(1) lookup + insertion-order preserving iteration.
     /// GC-managed box (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> crate::gc_hook::GCREF {
+        // `identitydict.py get_empty_storage`: erased `{}` is a nursery
+        // `dicttable`.
         crate::gc_storage::gc_alloc_young_storage_box(
             IdentityDictStorage::new(),
             identity_dict_storage_gc_type_id(),
@@ -404,11 +406,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// same IdentityDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let storage = identity_storage(w_dict);
-        // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
-        let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-            storage.clone(),
-            identity_dict_storage_gc_type_id(),
-        );
+        let new_storage = storage.clone_to_young_box(identity_dict_storage_gc_type_id());
         crate::dictmultiobject::w_dict_new_with(
             &IDENTITY_DICT_STRATEGY_REF,
             new_storage as crate::gc_hook::GCREF,

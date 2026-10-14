@@ -218,16 +218,24 @@ where
     let bytes = entries_payload_bytes::<K, V>(n);
     let tid = <(K, V)>::entries_gc_type_id();
     if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(tid, bytes);
+        // `_ll_malloc_entries`: `malloc(ENTRIES, n, zero=True)` is a
+        // nursery GC array. Rust hands out `&K` / `&V` into the block, so
+        // the address stays non-moving (`external_malloc(alloc_young=True)`)
+        // while the lifetime stays young: MiniMark drops young-rawmalloc
+        // remembered-set entries before the minor walk
+        // (`remove_young_arrays_from_old_objects_pointing_to_young`), so a
+        // discarded `type(name, (), {})` dict dies with its GetSets instead
+        // of promoting the type through a born-old `DICTENTRYARRAY`.
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_raw(tid, bytes);
         if !raw.is_null() {
-            // pyre adaptation of `_ll_malloc_entries`: Rust hands out `&K` / `&V`
-            // into the array, so the block is allocated on the non-moving tier,
-            // young (`external_malloc(..., alloc_young=True)`) so that a dropped
-            // dict gives its array back on the next minor as the nursery
-            // `DICTENTRYARRAY` does.  The no-collect entry zero-fills and never
-            // collects; the barrier is for a refused young birth, which lands
+            // pyre adaptation of `_ll_malloc_entries`: the collecting
+            // young-nonmoving malloc does not zero-fill; `malloc(..., zero=True)`
+            // does.  The barrier is for a refused young birth, which lands
             // in the old generation and may be filled with young items before
             // the next minor.
+            unsafe {
+                std::ptr::write_bytes(raw, 0, bytes);
+            }
             let entries = raw as *mut GcEntries<K, V>;
             unsafe {
                 (*entries).length = n;

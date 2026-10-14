@@ -110,4 +110,6 @@ pub(crate) mod std_identity;
 pub(crate) mod str_find;
 pub mod typestr;
 
-pub use semantic::{AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry};
+pub use semantic::{
+    AstGraphOptions, FieldRow, SemanticFunction, SemanticProgram, StructFieldRegistry,
+};

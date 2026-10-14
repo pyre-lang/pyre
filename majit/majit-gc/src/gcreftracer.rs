@@ -215,6 +215,16 @@ impl GcTable {
         unsafe { *((self.array_base_addr + i * WORD) as *const GcRef) }
     }
 
+    /// Current slot values, after any collection that forwarded them.
+    ///
+    /// `assembler.py` `_allgcrefs` is a GC list, so `patch_gcref_table`
+    /// writes the addresses the collector already updated. A Rust
+    /// `Vec<GcRef>` captured at rewrite is not a root; copy from here
+    /// after assemble instead of from that Vec.
+    pub fn slots(&self) -> Vec<GcRef> {
+        (0..self.array_length).map(|i| self.slot(i)).collect()
+    }
+
     /// Forward every slot in place. `gcreftracer.py gcrefs_trace`
     /// `gcrefs_trace`: each `array_base_addr + i*WORD` slot is handed to
     /// the GC as a root; writing back through the visitor forwards the
@@ -443,5 +453,37 @@ mod tests {
         let moved = table.slot(0);
         assert_ne!(moved, root, "the owning MiniMark forwards the slot");
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E700);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pinned_rewrite_gcrefs_survive_minor_before_in_code() {
+        // `assembler.py` `_allgcrefs` is a GC list: a collection between
+        // rewrite and `patch_gcref_table` forwards the entries, and
+        // `make_framework_tracer` writes those forwarded addresses.
+        // Parking the rewrite Vec in a heap table with a write barrier
+        // is that list.
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E700 };
+        let pinned = GcTable::from_gcrefs(&[root]);
+        owner.remember_gc_table(&pinned);
+        owner.do_collect_nursery();
+        let forwarded = pinned.slots();
+        assert_eq!(forwarded.len(), 1);
+        assert_ne!(forwarded[0], root, "pin table observes the move");
+        assert_eq!(unsafe { *(forwarded[0].0 as *const u64) }, 0xA11C_E700);
+
+        let mut buf = vec![GcRef(0); 1];
+        let _table = unsafe { GcTable::in_code(buf.as_mut_ptr() as usize, &forwarded) };
+        assert_eq!(
+            buf[0], forwarded[0],
+            "in_code copies the forwarded address, not the rewrite-time one"
+        );
     }
 }

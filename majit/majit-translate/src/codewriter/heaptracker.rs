@@ -116,11 +116,11 @@ pub fn callcontrol_has_vtable(cc: &CallControl, owner: &str) -> bool {
     owner_has_vtable_from_fields(owner, &|o| {
         let key = majit_ir::descr::canonical_struct_name(o);
         let entries = cc.struct_field_entries(&key)?;
-        let (n, ty) = entries.first()?;
-        let field = crate::model::FieldDescriptor::new(n.clone(), Some(key));
+        let first = entries.first()?;
+        let field = crate::model::FieldDescriptor::new(first.name.clone(), Some(key));
         let nested = cc
-            .is_known_struct(ty)
-            .then(|| majit_ir::descr::canonical_struct_name(ty));
+            .is_known_struct(&first.ty)
+            .then(|| majit_ir::descr::canonical_struct_name(&first.ty));
         Some((field, nested))
     })
 }
@@ -220,15 +220,15 @@ pub fn all_interiorfielddescrs(
             }
         }
     } else if let Some(fields) = gccache.struct_field_entries(&elem_name) {
-        for (name, field_type) in fields {
-            if name == "typeptr" || name.starts_with("c__pad") {
+        for row in fields {
+            if row.name == "typeptr" || row.name.starts_with("c__pad") {
                 continue;
             }
-            let (_, ir_type, _) = get_type_flag(field_type);
+            let (_, ir_type, _) = get_type_flag(&row.ty);
             if ir_type == majit_ir::value::Type::Void {
                 continue;
             }
-            if gccache.is_known_struct(field_type) {
+            if gccache.is_known_struct(&row.ty) {
                 return Err(majit_ir::UnsupportedFieldExc(
                     "unexpected array(struct(struct))".to_string(),
                 ));
@@ -257,19 +257,19 @@ pub fn all_interiorfielddescrs(
         return Ok(res);
     };
 
-    for (field_name, field_type) in fields {
-        if field_name == "typeptr" || field_name.starts_with("c__pad") {
+    for row in fields {
+        if row.name == "typeptr" || row.name.starts_with("c__pad") {
             continue;
         }
-        let (_, ir_type, _) = get_type_flag(field_type);
+        let (_, ir_type, _) = get_type_flag(&row.ty);
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
         let array_id = Some(array_type_id.to_string());
         let idx = gccache
             .descr_indices
-            .interiorfield_index(&array_id, field_name);
-        if let Some(descr) = gccache.interiorfielddescrof(idx, &array_id, field_name) {
+            .interiorfield_index(&array_id, &row.name);
+        if let Some(descr) = gccache.interiorfielddescrof(idx, &array_id, &row.name) {
             res.push(descr);
         }
     }
@@ -295,14 +295,16 @@ pub fn get_fielddescr_index_in(
     // `OBJECT` contributes only the skipped `typeptr`, so no inner leaf
     // shares a name with an outer payload field. Pyre's extra header leaf
     // (`PyObject.w_class`) would otherwise steal `Method.w_class`'s slot.
-    let has_direct = fields.iter().any(|(name, field_type)| {
-        if name != fieldname {
+    let has_direct = fields.iter().any(|row| {
+        if row.name != fieldname {
             return false;
         }
-        let (_, ir_type, _) = get_type_flag(field_type);
-        ir_type != majit_ir::value::Type::Void && !gccache.is_known_struct(field_type)
+        let (_, ir_type, _) = get_type_flag(&row.ty);
+        ir_type != majit_ir::value::Type::Void && !gccache.is_known_struct(&row.ty)
     });
-    for (name, field_type) in fields {
+    for row in fields {
+        let name = &row.name;
+        let field_type = &row.ty;
         let (_, ir_type, _) = get_type_flag(field_type);
         if ir_type == majit_ir::value::Type::Void {
             continue;
@@ -360,19 +362,21 @@ fn all_fielddescrs_into(
     else {
         return;
     };
-    for (name, field_type) in fields {
-        let (flag, ir_type, _) = get_type_flag(&field_type);
+    for row in fields {
+        let name = &row.name;
+        let field_type = &row.ty;
+        let (flag, ir_type, _) = get_type_flag(field_type);
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
-        if name.starts_with("c__pad") || is_header_word(struct_name, &name) {
+        if name.starts_with("c__pad") || is_header_word(struct_name, name) {
             continue;
         }
-        if gccache.is_known_struct(&field_type) {
-            all_fielddescrs_into(gccache, &field_type, only_gc, res);
+        if gccache.is_known_struct(field_type) {
+            all_fielddescrs_into(gccache, field_type, only_gc, res);
         } else if !only_gc || flag == majit_ir::descr::ArrayFlag::Pointer {
             let owner = Some(struct_name.to_string());
-            let idx = gccache.descr_indices.field_index(&owner, &name);
+            let idx = gccache.descr_indices.field_index(&owner, name);
             if let Some(descr) = gccache.fielddescrof(idx, struct_name, None, &name) {
                 res.push(descr);
             }

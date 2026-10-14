@@ -84,12 +84,11 @@ impl W_WinConsoleIO {
     }
 
     fn pin_self(&self) -> usize {
-        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
-        pyre_object::gc_roots::shadow_stack_len() - 1
+        super::pin_io_self(self.self_obj())
     }
 
     fn from_slot(slot: usize) -> &'static mut Self {
-        unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut Self) }
+        super::from_pinned_slot(slot)
     }
 
     fn check_closed(&self) -> Result<(), crate::PyError> {

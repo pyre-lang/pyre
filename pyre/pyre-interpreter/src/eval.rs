@@ -445,17 +445,27 @@ unsafe fn visit_prebuilt_declaration(
     }
 }
 
-/// `MethodCache` trace: GC-owned slots are edges of the cache object.
-/// A `malloc_typed` carrier has no header, so only its interior fields
-/// are visited.
+/// `MethodCache` trace: every `lookup_where` word is a GC edge of the
+/// cache object (`typeobject.py MethodCache.lookup_where`). MiniMark
+/// traces those fields unconditionally. `try_gc_owns_object` can answer
+/// false reentrantly from inside a minor (`dynasm_gc_owns_object`), and
+/// a skipped `visitor` leaves the pre-move address in the slot:
+/// `version_tag` is bumped only by `mutated()`, never by a relocating
+/// move (`walk_method_cache_gc`), so the next hit would read a swept
+/// heap type or its `def`. A `malloc_typed` carrier has no header, so
+/// its interior fields are visited after the edge.
 pub unsafe fn method_cache_custom_trace(
     _container: usize,
     visitor: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     unsafe {
         crate::baseobjspace::trace_method_cache_entries(&mut |slot| {
+            // Same order as `visit_prebuilt_declaration`: grey the slot
+            // first so a nursery type / function is forwarded even when
+            // the reentrant owns-check is false, then descend only into
+            // an immortal carrier the collector will never visit.
+            visitor(slot as *mut PyObjectRef as *mut majit_ir::GcRef);
             if pyre_object::gc_hook::try_gc_owns_object(*slot as pyre_object::gc_hook::GCREF) {
-                visitor(slot as *mut PyObjectRef as *mut majit_ir::GcRef);
                 return;
             }
             let mut fwd = |r: &mut majit_ir::GcRef| visitor(r);
@@ -1665,6 +1675,13 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         if let Some(hooks) = crate::importing::optional_module_hooks() {
             (hooks.walk_prebuilt_slots)(&mut fwd);
         }
+        // Immortal `Module.w_dict` / `MixedModule.w_initialdict` are young
+        // dicts in `malloc_typed` modules. `w_module_set_initialdict` dirties
+        // the prebuilt family, but `w_dict` is published at construction
+        // without that bit, and a minor that runs while the bit is clear
+        // leaves the field holding the pre-move address. Same shape as
+        // CodecState above: forward every collection.
+        unsafe { crate::importing::walk_process_import_object_roots(&mut fwd) };
     }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;

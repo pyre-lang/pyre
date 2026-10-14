@@ -158,14 +158,86 @@ impl SemanticFunction {
     }
 }
 
+/// One harvested struct-field registry row: the published name, the field
+/// type string, and whether Charon `FieldDecl::name` was `None`.
+///
+/// The front mints [`majit_charon_reader::ullbc::positional_field_name`]
+/// when that name is missing. The flag is the origin, not the spelling:
+/// a declared field called `__pos_0` stays `is_positional == false`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldRow {
+    pub name: String,
+    pub ty: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_positional: bool,
+}
+
+impl FieldRow {
+    pub fn named(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            is_positional: false,
+        }
+    }
+
+    pub fn positional(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            is_positional: true,
+        }
+    }
+}
+
+impl From<(String, String)> for FieldRow {
+    fn from((name, ty): (String, String)) -> Self {
+        Self::named(name, ty)
+    }
+}
+
+impl PartialEq<(String, String)> for FieldRow {
+    fn eq(&self, other: &(String, String)) -> bool {
+        self.name == other.0 && self.ty == other.1
+    }
+}
+
+impl<'de> Deserialize<'de> for FieldRow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum De {
+            Pair(String, String),
+            Full {
+                name: String,
+                ty: String,
+                #[serde(default)]
+                is_positional: bool,
+            },
+        }
+        match De::deserialize(deserializer)? {
+            De::Pair(name, ty) => Ok(Self::named(name, ty)),
+            De::Full {
+                name,
+                ty,
+                is_positional,
+            } => Ok(Self {
+                name,
+                ty,
+                is_positional,
+            }),
+        }
+    }
+}
+
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
-/// Maps struct_name → vec of (field_name, field_element_type).
+/// Maps struct_name → vec of field rows.
 /// `field_element_type` is the array element type when the field is an
 /// array container (e.g. `Vec<Point>` → `"Point"`), or the full type
 /// string for non-array fields.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StructFieldRegistry {
-    /// struct_name → [(field_name, full_field_type_string)]
+    /// struct_name → [FieldRow]
     pub fields: FieldRows,
     /// Suffix buckets for the key set of `fields`. Built on the first query
     /// that needs them and reused while the key-set fingerprint still
@@ -187,15 +259,16 @@ pub struct StructFieldRegistry {
     pub(crate) raw_word_owners: std::collections::HashSet<String>,
 }
 
-/// `struct_name → [(field_name, full_field_type_string)]`, with an O(1)
-/// key-set fingerprint. `insert` / `remove` / `entry` update the xor of
-/// the keys' hashes; a lookup compares that word and `len` and does not
-/// rescan the map. Reads deref to the inner map. Serializes as the inner
-/// map; deserializing goes through `From` so the fingerprint is recomputed.
+/// `struct_name → [FieldRow]`, with an O(1) key-set fingerprint. `insert` /
+/// `remove` / `entry` update the xor of the keys' hashes; a lookup compares
+/// that word and `len` and does not rescan the map. Reads deref to the inner
+/// map. Serializes as the inner map; deserializing goes through `From` so
+/// the fingerprint is recomputed. A `HashMap` of `(name, ty)` pairs becomes
+/// named rows (`is_positional == false`).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(from = "HashMap<String, Vec<(String, String)>>")]
+#[serde(from = "HashMap<String, Vec<FieldRow>>")]
 pub struct FieldRows {
-    map: HashMap<String, Vec<(String, String)>>,
+    map: HashMap<String, Vec<FieldRow>>,
     /// Xor of [`field_key_fp`] over the current keys. `0` when empty.
     key_fp: std::cell::Cell<u64>,
 }
@@ -209,8 +282,8 @@ impl Default for FieldRows {
     }
 }
 
-impl From<HashMap<String, Vec<(String, String)>>> for FieldRows {
-    fn from(map: HashMap<String, Vec<(String, String)>>) -> Self {
+impl From<HashMap<String, Vec<FieldRow>>> for FieldRows {
+    fn from(map: HashMap<String, Vec<FieldRow>>) -> Self {
         let key_fp = map.keys().fold(0u64, |acc, key| acc ^ field_key_fp(key));
         Self {
             map,
@@ -219,9 +292,27 @@ impl From<HashMap<String, Vec<(String, String)>>> for FieldRows {
     }
 }
 
+impl From<HashMap<String, Vec<(String, String)>>> for FieldRows {
+    fn from(map: HashMap<String, Vec<(String, String)>>) -> Self {
+        let map: HashMap<String, Vec<FieldRow>> = map
+            .into_iter()
+            .map(|(key, rows)| (key, rows.into_iter().map(FieldRow::from).collect()))
+            .collect();
+        Self::from(map)
+    }
+}
+
 impl From<FieldRows> for HashMap<String, Vec<(String, String)>> {
     fn from(rows: FieldRows) -> Self {
         rows.map
+            .into_iter()
+            .map(|(key, rows)| {
+                (
+                    key,
+                    rows.into_iter().map(|row| (row.name, row.ty)).collect(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -232,7 +323,7 @@ impl Serialize for FieldRows {
 }
 
 impl std::ops::Deref for FieldRows {
-    type Target = HashMap<String, Vec<(String, String)>>;
+    type Target = HashMap<String, Vec<FieldRow>>;
 
     fn deref(&self) -> &Self::Target {
         &self.map
@@ -240,8 +331,8 @@ impl std::ops::Deref for FieldRows {
 }
 
 impl IntoIterator for FieldRows {
-    type Item = (String, Vec<(String, String)>);
-    type IntoIter = std::collections::hash_map::IntoIter<String, Vec<(String, String)>>;
+    type Item = (String, Vec<FieldRow>);
+    type IntoIter = std::collections::hash_map::IntoIter<String, Vec<FieldRow>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.map.into_iter()
@@ -249,8 +340,8 @@ impl IntoIterator for FieldRows {
 }
 
 impl<'a> IntoIterator for &'a FieldRows {
-    type Item = (&'a String, &'a Vec<(String, String)>);
-    type IntoIter = std::collections::hash_map::Iter<'a, String, Vec<(String, String)>>;
+    type Item = (&'a String, &'a Vec<FieldRow>);
+    type IntoIter = std::collections::hash_map::Iter<'a, String, Vec<FieldRow>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.map.iter()
@@ -274,7 +365,7 @@ impl FieldRows {
     /// spelling (`Tuple<A,B>` / `Array<T;N>`), the rows its spelling
     /// derives: `TupleRepr` builds `TUPLE_TYPE` from the items whenever the
     /// rtyper asks (`rtuple.py`), so a shape needs no prior registration.
-    pub fn get(&self, key: &str) -> Option<&Vec<(String, String)>> {
+    pub fn get(&self, key: &str) -> Option<&Vec<FieldRow>> {
         self.map
             .get(key)
             .or_else(|| crate::front::mir::positional_shape_rows(key))
@@ -287,17 +378,18 @@ impl FieldRows {
     pub fn insert(
         &mut self,
         key: String,
-        value: Vec<(String, String)>,
-    ) -> Option<Vec<(String, String)>> {
+        value: impl IntoIterator<Item = impl Into<FieldRow>>,
+    ) -> Option<Vec<FieldRow>> {
+        let rows: Vec<FieldRow> = value.into_iter().map(Into::into).collect();
         let piece = field_key_fp(&key);
-        let replaced = self.map.insert(key, value);
+        let replaced = self.map.insert(key, rows);
         if replaced.is_none() {
             self.key_fp.set(self.key_fp.get() ^ piece);
         }
         replaced
     }
 
-    pub fn remove(&mut self, key: &str) -> Option<Vec<(String, String)>> {
+    pub fn remove(&mut self, key: &str) -> Option<Vec<FieldRow>> {
         let removed = self.map.remove(key)?;
         self.key_fp.set(self.key_fp.get() ^ field_key_fp(key));
         Some(removed)
@@ -314,18 +406,18 @@ impl FieldRows {
 /// [`HashMap::entry`] for [`FieldRows`]. `or_insert` folds a new key into
 /// the fingerprint; an occupied key leaves it unchanged.
 pub struct FieldRowsEntry<'a> {
-    inner: std::collections::hash_map::Entry<'a, String, Vec<(String, String)>>,
+    inner: std::collections::hash_map::Entry<'a, String, Vec<FieldRow>>,
     key_fp: &'a std::cell::Cell<u64>,
 }
 
 impl<'a> FieldRowsEntry<'a> {
-    pub fn or_insert(self, default: Vec<(String, String)>) -> &'a mut Vec<(String, String)> {
+    pub fn or_insert(self, default: Vec<FieldRow>) -> &'a mut Vec<FieldRow> {
         self.or_insert_with(|| default)
     }
 
-    pub fn or_insert_with<F>(self, default: F) -> &'a mut Vec<(String, String)>
+    pub fn or_insert_with<F>(self, default: F) -> &'a mut Vec<FieldRow>
     where
-        F: FnOnce() -> Vec<(String, String)>,
+        F: FnOnce() -> Vec<FieldRow>,
     {
         match self.inner {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -356,8 +448,19 @@ impl StructFieldRegistry {
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
         self.lookup_fields(owner)?
             .iter()
-            .find(|(name, _)| name == field_name)
-            .map(|(_, ty)| ty.as_str())
+            .find(|row| row.name == field_name)
+            .map(|row| row.ty.as_str())
+    }
+
+    /// True when the harvested row for `owner.field_name` came from a
+    /// `FieldDecl` whose `name` was `None`. False for a declared name,
+    /// including a declared `__pos_N`, and when the owner has no such row.
+    pub fn field_is_positional(&self, owner: &str, field_name: &str) -> bool {
+        self.lookup_fields(owner)
+            .into_iter()
+            .flatten()
+            .find(|row| row.name == field_name)
+            .is_some_and(|row| row.is_positional)
     }
 
     /// Declared field name at `index` for `owner`, using this registry's
@@ -365,8 +468,8 @@ impl StructFieldRegistry {
     /// has no row, the index is past the harvested list, or that slot's
     /// name is empty.
     pub fn field_name_at(&self, owner: &str, index: usize) -> Option<&str> {
-        let (name, _) = self.lookup_fields(owner)?.get(index)?;
-        (!name.is_empty()).then_some(name.as_str())
+        let row = self.lookup_fields(owner)?.get(index)?;
+        (!row.name.is_empty()).then_some(row.name.as_str())
     }
 
     /// True when `owner` is registered as an enum base class — its sole
@@ -386,13 +489,13 @@ impl StructFieldRegistry {
     /// Field rows for `owner`, after the same generic-argument strip and
     /// suffix resolution as [`Self::lookup_fields`]. `None` when the owner
     /// is not registered.
-    pub(crate) fn field_rows(&self, owner: &str) -> Option<Vec<(String, String)>> {
-        self.lookup_fields(owner).map(|rows| rows.to_vec())
+    pub(crate) fn field_rows(&self, owner: &str) -> Option<&[FieldRow]> {
+        self.lookup_fields(owner)
     }
 
     pub fn is_enum_base(&self, owner: &str) -> bool {
         self.lookup_fields(owner)
-            .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
+            .is_some_and(|rows| matches!(rows, [row] if row.name == "__discriminant"))
     }
 
     /// The registry key of the discriminant-only enum base `owner` names.
@@ -405,8 +508,7 @@ impl StructFieldRegistry {
     pub fn enum_base_registry_key(&self, owner: &str) -> Option<String> {
         let stripped = majit_ir::descr::strip_generic_args(owner);
         let owner = stripped.as_ref();
-        let is_disc =
-            |rows: &[(String, String)]| matches!(rows, [(name, _)] if name == "__discriminant");
+        let is_disc = |rows: &[FieldRow]| matches!(rows, [row] if row.name == "__discriminant");
         if self.fields.get(owner).is_some_and(|rows| is_disc(rows)) {
             return Some(owner.to_string());
         }
@@ -446,9 +548,10 @@ impl StructFieldRegistry {
             bucket.iter().any(|key| {
                 key.rsplit_once("::").is_some_and(|(parent, _variant)| {
                     majit_ir::descr::canonical_struct_name(parent) == canonical_owner
-                        && self.fields.get(key).is_some_and(|rows| {
-                            rows.iter().any(|(field, _)| field != "__discriminant")
-                        })
+                        && self
+                            .fields
+                            .get(key)
+                            .is_some_and(|rows| rows.iter().any(|row| row.name != "__discriminant"))
                 })
             })
         })
@@ -487,7 +590,7 @@ impl StructFieldRegistry {
                         && self
                             .fields
                             .get(key)
-                            .is_some_and(|rows| rows.iter().any(|(field, _)| field == field_name))
+                            .is_some_and(|rows| rows.iter().any(|row| row.name == field_name))
                 })
             })
         })
@@ -501,7 +604,7 @@ impl StructFieldRegistry {
     }
 
     /// Remove one registered key and drop the suffix buckets.
-    pub(crate) fn remove_field(&mut self, key: &str) -> Option<Vec<(String, String)>> {
+    pub(crate) fn remove_field(&mut self, key: &str) -> Option<Vec<FieldRow>> {
         let removed = self.fields.remove(key);
         if removed.is_some() {
             self.invalidate_field_path_index();
@@ -509,7 +612,7 @@ impl StructFieldRegistry {
         removed
     }
 
-    fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
+    fn lookup_fields(&self, owner: &str) -> Option<&[FieldRow]> {
         // A per-instantiation enum spelling (`Result<Tuple>`,
         // `Result<Tuple>::Ok`) shares the bare template's rows: the
         // reference-payload split exists only to separate annotator attr
@@ -597,7 +700,7 @@ pub(crate) struct FieldPathIndex {
 }
 
 impl FieldPathIndex {
-    fn build(fields: &HashMap<String, Vec<(String, String)>>, key_fp: u64) -> Self {
+    fn build(fields: &HashMap<String, Vec<FieldRow>>, key_fp: u64) -> Self {
         let mut by_last: rustc_hash::FxHashMap<String, Vec<String>> =
             rustc_hash::FxHashMap::default();
         let mut by_parent_last: rustc_hash::FxHashMap<String, Vec<String>> =

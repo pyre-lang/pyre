@@ -29,13 +29,12 @@ pub struct W_Super {
 /// `super` type) is the base layout; a user subclass is `W_SuperUser`.
 /// The three payload refs and `w_subtype` stay pinned across that malloc.
 ///
-/// Exact `W_Super` is `instantiate` / `malloc_fixedsize` (young).
+/// Exact `W_Super` is `instantiate` / `malloc_fixedsize` (collecting nursery).
 /// `_init_subclass` builds `super(w_type, w_type)` as a local; an
 /// old-gen proxy joins `old_objects_pointing_to_young` with
 /// `super_type` / `obj` the heap type (`incminimark.py`
 /// `collect_oldrefs_to_nursery`) and keeps the type alive across
-/// every minor. Young-nonmoving matches that nursery birth with a
-/// stable address for the raw field readers.
+/// every minor. Collecting nursery matches that birth.
 pub fn w_super_new(
     super_type: PyObjectRef,
     obj_type: PyObjectRef,
@@ -44,18 +43,58 @@ pub fn w_super_new(
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let base = crate::gc_roots::pin_roots(&[super_type, obj_type, obj, w_subtype]);
-    W_Super::allocate_instance(
-        W_Super {
-            ob: PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::shadow_stack_get(base + 3);
+    if !w_subtype.is_null()
+        && !std::ptr::eq(w_subtype, crate::pyobject::get_instantiate(&SUPER_TYPE))
+    {
+        return W_Super::allocate_instance(
+            W_Super {
+                ob: PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                super_type: crate::gc_roots::shadow_stack_get(base),
+                obj_type: crate::gc_roots::shadow_stack_get(base + 1),
+                obj: crate::gc_roots::shadow_stack_get(base + 2),
             },
-            super_type: crate::gc_roots::shadow_stack_get(base),
-            obj_type: crate::gc_roots::shadow_stack_get(base + 1),
-            obj: crate::gc_roots::shadow_stack_get(base + 2),
+            w_subtype,
+        );
+    }
+    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
+    let mut needs_write_barrier = true;
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
+        crate::gc_hook::try_gc_alloc_collecting_rooted(
+            W_SUPER_GC_TYPE_ID,
+            W_SUPER_OBJECT_SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    })
+    .allocated_or_abort(W_SUPER_OBJECT_SIZE)
+    .unwrap_or(std::ptr::null_mut());
+    let value = W_Super {
+        ob: PyObject {
+            ob_type: &SUPER_TYPE as *const PyType,
+            w_class: crate::pyobject::get_instantiate(&SUPER_TYPE),
         },
-        crate::gc_roots::shadow_stack_get(base + 3),
-    )
+        super_type: crate::gc_roots::shadow_stack_get(base),
+        obj_type: crate::gc_roots::shadow_stack_get(base + 1),
+        obj: crate::gc_roots::shadow_stack_get(base + 2),
+    };
+    if raw.is_null() {
+        let obj = crate::lltype::malloc_typed(value) as PyObjectRef;
+        crate::gc_hook::maybe_register_finalizer(obj);
+        return obj;
+    }
+    unsafe {
+        std::ptr::write(raw as *mut W_Super, value);
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
+        }
+    }
+    let obj = raw as PyObjectRef;
+    crate::gc_hook::maybe_register_finalizer(obj);
+    obj
 }
 
 #[inline]

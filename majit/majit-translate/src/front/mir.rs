@@ -112,9 +112,9 @@
 use majit_charon_reader::{
     Llbc,
     ullbc::{
-        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, GlobalDecl,
-        NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, StmtKind,
-        SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
+        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FieldDecl, FunDecl, FunId,
+        GlobalDecl, NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue,
+        StmtKind, SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
         const_fn_def_regular_id,
     },
 };
@@ -957,13 +957,11 @@ fn register_ref_enum_instantiation_rows(
             // primitive scalar is layout-safe there; a primitive in a
             // multi-field variant could reorder under `repr(Rust)`.
             let single_field = v.fields.len() == 1;
-            let mut rows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
+            let mut rows: Vec<crate::front::semantic::FieldRow> =
+                Vec::with_capacity(v.fields.len());
             let mut registrable = true;
             for (i, f) in v.fields.iter().enumerate() {
-                let fname = f
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
+                let fname = field_decl_name(i, f);
                 let concrete = substitute_field_type(&f.ty, &inst.args, llbc, gc_struct_ids);
                 let trimmed = concrete.trim();
                 // A sole pair-slice payload is its pointer and length words,
@@ -974,8 +972,8 @@ fn register_ref_enum_instantiation_rows(
                         break;
                     }
                     let len = pair_len_field_name(&fname);
-                    rows.push((fname, "usize".to_string()));
-                    rows.push((len, "usize".to_string()));
+                    rows.push(field_decl_row(i, f, "usize"));
+                    rows.push(crate::front::semantic::FieldRow::named(len, "usize"));
                     continue;
                 }
                 // Register a field only when it is layout-safe for the
@@ -994,7 +992,7 @@ fn register_ref_enum_instantiation_rows(
                     registrable = false;
                     break;
                 }
-                rows.push((fname, concrete));
+                rows.push(field_decl_row(i, f, concrete));
             }
             if !registrable {
                 continue;
@@ -1179,10 +1177,7 @@ fn register_ordereddict_i64_entry_rows(
         let mut hash = false;
         let mut concrete = true;
         for (index, field) in fields.iter().enumerate() {
-            let fname = field
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("__pos_{index}"));
+            let fname = field_decl_name(index, field);
             let concrete_ty = substitute_field_type(&field.ty, &args, llbc, gc_struct_ids);
             if concrete_ty.contains("??") {
                 concrete = false;
@@ -1195,7 +1190,7 @@ fn register_ordereddict_i64_entry_rows(
                 "f_hash" => hash = true,
                 _ => {}
             }
-            rows.push((fname, concrete_ty));
+            rows.push(field_decl_row(index, field, concrete_ty));
         }
         if !concrete || !key_is_i64 || !valid || !value || !hash {
             continue;
@@ -2792,7 +2787,10 @@ fn should_lower_function(
 /// allocation identity.
 pub(crate) fn positional_shape_metadata(
     shape: &str,
-) -> Option<(Vec<(String, String)>, Vec<(String, ValueType)>)> {
+) -> Option<(
+    Vec<crate::front::semantic::FieldRow>,
+    Vec<(String, ValueType)>,
+)> {
     if !majit_ir::descr::is_shaped_tuple_name(shape)
         && !majit_ir::descr::is_shaped_array_name(shape)
     {
@@ -2841,16 +2839,22 @@ pub(crate) fn positional_shape_metadata(
         // use that same pointer repr.  Scalar/float/string rows keep their
         // existing specialized spelling. An inline `[T; N]` item is that
         // array's bytes (`positional_field_type`), not a pointer to it.
-        let rows: Vec<(String, String)> = items
+        let rows: Vec<crate::front::semantic::FieldRow> = items
             .iter()
             .enumerate()
             .flat_map(|(index, ty)| {
                 let name = format!("__pos_{index}");
                 if pair_items[index] {
                     let len = pair_len_field_name(&name);
-                    return vec![(name, "usize".to_string()), (len, "usize".to_string())];
+                    return vec![
+                        crate::front::semantic::FieldRow::positional(name, "usize"),
+                        crate::front::semantic::FieldRow::named(len, "usize"),
+                    ];
                 }
-                vec![(name, positional_field_type(ty))]
+                vec![crate::front::semantic::FieldRow::positional(
+                    name,
+                    positional_field_type(ty),
+                )]
             })
             .collect();
         Some((rows, attrs))
@@ -2860,8 +2864,10 @@ pub(crate) fn positional_shape_metadata(
 /// [`positional_shape_metadata`]'s rows, made once per shape for the
 /// process: a pure function of the spelling, so the memo cannot change
 /// what any reader sees.
-pub(crate) fn positional_shape_rows(shape: &str) -> Option<&'static Vec<(String, String)>> {
-    type Rows = &'static Vec<(String, String)>;
+pub(crate) fn positional_shape_rows(
+    shape: &str,
+) -> Option<&'static Vec<crate::front::semantic::FieldRow>> {
+    type Rows = &'static Vec<crate::front::semantic::FieldRow>;
     static ROWS: std::sync::LazyLock<
         parking_lot::Mutex<std::collections::HashMap<String, Option<Rows>>>,
     > = std::sync::LazyLock::new(Default::default);
@@ -2878,8 +2884,10 @@ pub(crate) fn positional_shape_rows(shape: &str) -> Option<&'static Vec<(String,
 /// One-field GC cell `MutRef<T>` (`value: T`). The spelling is the layout,
 /// the same way [`positional_shape_rows`] is: the cell is not a Charon struct,
 /// so nothing registers it ahead of the first `new`.
-pub(crate) fn mut_ref_shape_rows(name: &str) -> Option<&'static Vec<(String, String)>> {
-    type Rows = &'static Vec<(String, String)>;
+pub(crate) fn mut_ref_shape_rows(
+    name: &str,
+) -> Option<&'static Vec<crate::front::semantic::FieldRow>> {
+    type Rows = &'static Vec<crate::front::semantic::FieldRow>;
     static ROWS: std::sync::LazyLock<
         parking_lot::Mutex<std::collections::HashMap<String, Option<Rows>>>,
     > = std::sync::LazyLock::new(Default::default);
@@ -2891,10 +2899,11 @@ pub(crate) fn mut_ref_shape_rows(name: &str) -> Option<&'static Vec<(String, Str
         return None;
     }
     let inner = inner.to_string();
-    *ROWS
-        .lock()
-        .entry(name.to_string())
-        .or_insert_with(|| Some(&*Box::leak(Box::new(vec![("value".to_string(), inner)]))))
+    *ROWS.lock().entry(name.to_string()).or_insert_with(|| {
+        Some(&*Box::leak(Box::new(vec![
+            crate::front::semantic::FieldRow::named("value", inner),
+        ])))
+    })
 }
 
 /// Byte size of the explicit `Result` / `Option` shell that carries
@@ -3052,6 +3061,29 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
 /// `ll_fixed_length` / `ll_fixed_items`). Rust spells the same storage
 /// `*mut ItemsBlock`. Exact Charon layout still supplies the pointer-sized
 /// offset; this spelling is the lowleveltype those operations key on.
+/// Registry row for a Charon field: the positional origin is
+/// `FieldDecl::name == None`, not the minted `__pos_N` spelling.
+fn field_decl_row(
+    index: usize,
+    field: &FieldDecl,
+    ty: impl Into<String>,
+) -> crate::front::semantic::FieldRow {
+    match &field.name {
+        Some(name) => crate::front::semantic::FieldRow::named(name.clone(), ty),
+        None => crate::front::semantic::FieldRow::positional(
+            majit_charon_reader::ullbc::positional_field_name(index),
+            ty,
+        ),
+    }
+}
+
+fn field_decl_name(index: usize, field: &FieldDecl) -> String {
+    field
+        .name
+        .clone()
+        .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(index))
+}
+
 fn published_struct_field_layout(
     type_path: &str,
     field_name: &str,
@@ -3273,16 +3305,17 @@ fn derive_program_metadata(
                 });
                 // A pair-slice field is its pointer word under the field's
                 // own name and its length word under `pair_len_field_name`.
-                let rows: Vec<(String, String)> = fields
+                let rows: Vec<crate::front::semantic::FieldRow> = fields
                     .iter()
                     .enumerate()
                     .flat_map(|(i, f)| {
-                        let fname = f.name.clone().unwrap_or_else(|| {
-                            majit_charon_reader::ullbc::positional_field_name(i)
-                        });
+                        let fname = field_decl_name(i, f);
                         if tyref_pair_field_kind(&f.ty, llbc).is_some() {
                             let len = pair_len_field_name(&fname);
-                            return vec![(fname, "usize".to_string()), (len, "usize".to_string())];
+                            return vec![
+                                field_decl_row(i, f, "usize"),
+                                crate::front::semantic::FieldRow::named(len, "usize"),
+                            ];
                         }
                         let layout = match (handle_field_index == Some(i), handle_payload.as_ref())
                         {
@@ -3301,7 +3334,7 @@ fn derive_program_metadata(
                                 &fname,
                                 layout,
                             );
-                        vec![(fname, field_ty)]
+                        vec![field_decl_row(i, f, field_ty)]
                     })
                     .collect();
                 let canonical_name = strip_crate_prefix(&name);
@@ -3680,7 +3713,8 @@ fn derive_program_metadata(
                         let variant_qual = format!("{name}::{}", v.name);
                         let variant_leaf = format!("{leaf}::{}", v.name);
                         let variant_canon = format!("{canon_base}::{}", v.name);
-                        let mut vrows: Vec<(String, String)> = Vec::with_capacity(v.fields.len());
+                        let mut vrows: Vec<crate::front::semantic::FieldRow> =
+                            Vec::with_capacity(v.fields.len());
                         let mut vattrs: Vec<(String, ValueType)> =
                             Vec::with_capacity(v.fields.len());
                         let mut voffsets: std::collections::HashMap<String, u64> =
@@ -3698,18 +3732,16 @@ fn derive_program_metadata(
                         // the sentinel `StructFieldRegistry::is_enum_base` reads to tell a
                         // base from a subclass.
                         if explicit_sum_shell && !v.fields.is_empty() {
-                            vrows.push((
-                                "__discriminant".to_string(),
-                                discr_ty.unwrap_or("i64").to_string(),
+                            vrows.push(crate::front::semantic::FieldRow::named(
+                                "__discriminant",
+                                discr_ty.unwrap_or("i64"),
                             ));
                             voffsets.insert("__discriminant".to_string(), 0);
                         }
                         // The shell's next free payload word.
                         let mut shell_word = 0u64;
                         for (i, f) in v.fields.iter().enumerate() {
-                            let fname = f.name.clone().unwrap_or_else(|| {
-                                majit_charon_reader::ullbc::positional_field_name(i)
-                            });
+                            let fname = field_decl_name(i, f);
                             // A pair-slice payload is its pointer and length
                             // words, the length under `pair_len_field_name`.
                             if tyref_pair_field_kind(&f.ty, llbc).is_some() {
@@ -3737,8 +3769,8 @@ fn derive_program_metadata(
                                 }
                                 vattrs.push((fname.clone(), ValueType::Unsigned));
                                 vattrs.push((len.clone(), ValueType::Unsigned));
-                                vrows.push((fname, "usize".to_string()));
-                                vrows.push((len, "usize".to_string()));
+                                vrows.push(field_decl_row(i, f, "usize"));
+                                vrows.push(crate::front::semantic::FieldRow::named(len, "usize"));
                                 continue;
                             }
                             // A bytecode-arg marker reads as a `u32` at runtime
@@ -3773,7 +3805,7 @@ fn derive_program_metadata(
                                 voffsets.insert(fname.clone(), off);
                             }
                             vattrs.push((fname.clone(), attr_ty));
-                            vrows.push((fname, row_ty));
+                            vrows.push(field_decl_row(i, f, row_ty));
                         }
                         struct_fields
                             .fields
@@ -3855,7 +3887,10 @@ fn derive_program_metadata(
         .iter_type_decls()
         .any(|td| td.item_meta.name_path() == compiler_constants_path)
     {
-        let rows = vec![("__pos_0".to_string(), "Box<[ConstantData]>".to_string())];
+        let rows = vec![crate::front::semantic::FieldRow::positional(
+            "__pos_0",
+            "Box<[ConstantData]>",
+        )];
         for key in [compiler_constants_path, "bytecode::Constants"] {
             struct_fields.fields.insert(key.to_string(), rows.clone());
             known_struct_names.insert(key.to_string());
@@ -4587,7 +4622,7 @@ pub(crate) fn harden_duplicate_leaf_metadata(
         if struct_fields
             .fields
             .get(&leaf)
-            .is_some_and(|rows| rows.len() == 1 && rows[0].0 == "__discriminant")
+            .is_some_and(|rows| rows.len() == 1 && rows[0].name == "__discriminant")
         {
             struct_fields.remove_field(&leaf);
         }
@@ -5674,21 +5709,23 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             );
         }
-        // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
-        // the residual `contains` method call in place with
-        // `int_between(a, x, b + 1)` (two comparisons when `b` is
-        // `i64::MAX`) and removes the paired
-        // residual `RangeInclusive::new` call in its predecessor block.  It
-        // threads the `new` bounds into the `contains` block via
-        // `ensure_variable_at_block` (touching predecessor link args /
-        // inputargs only — no fresh blocks, no detached edges).  Removing the
-        // cross-block `new` producer leaves its threaded range value dangling
-        // on the predecessor link arg, so a rewrite MUST be followed by
-        // `prune_dead_phis` to reclaim the dead threaded range inputarg /
-        // link args (the folded predicate never reads them) — run it unconditionally
-        // on any rewrite rather than relying on the gated sweep in
-        // `simplify_lowered_graph`.  Fail-safe: a structural mismatch leaves
-        // BOTH residual calls (rtyper Skip) and touches nothing.
+        // The `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold
+        // (`front::range_contains`) splices the residual `contains` call
+        // in place with `int_between` (two comparisons when the
+        // `int_between` contract cannot be proved) and removes the paired
+        // construction — residual `RangeInclusive::new`, or the exclusive
+        // `Range { start, end }` ctor + FieldWrites — in its predecessor
+        // block.  It threads the construction bounds into the `contains`
+        // block via `ensure_variable_at_block` (touching predecessor link
+        // args / inputargs only — no fresh blocks, no detached edges).
+        // Removing the cross-block producer leaves its threaded range
+        // value dangling on the predecessor link arg, so a rewrite MUST
+        // be followed by `prune_dead_phis` to reclaim the dead threaded
+        // range inputarg / link args (the folded predicate never reads
+        // them) — run it unconditionally on any rewrite rather than
+        // relying on the gated sweep in `simplify_lowered_graph`.
+        // Fail-safe: a structural mismatch leaves BOTH residual calls
+        // (rtyper Skip) and touches nothing.
         let range_contains_rewritten = if lo.range_contains_sites.is_empty() {
             0
         } else {
@@ -8815,8 +8852,9 @@ struct Lowering<'a> {
     /// for the unsigned high-word clamp diamond `front::saturating_mul`
     /// synthesizes after body lowering.
     saturating_mul_sites: Vec<Variable>,
-    /// `RangeInclusive::new(lo, hi)` call sites recorded for the
-    /// `(a..=b).contains(&x)` → `int_between(lo, x, hi + 1)` fold the
+    /// `RangeInclusive::new(lo, hi)` and exclusive int-`Range { start, end }`
+    /// construction sites recorded for the
+    /// `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold the
     /// `front::range_contains` post-pass synthesizes (see
     /// [`crate::front::range_contains::RangeInclusiveNewSite`]).
     range_inclusive_new_sites: Vec<crate::front::range_contains::RangeInclusiveNewSite>,
@@ -8838,9 +8876,9 @@ struct Lowering<'a> {
     /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
     /// `range_iter` candidate; both passes are consumer-gated.
     slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `RangeInclusive::contains(&self, &x)` call sites paired with the
-    /// `new` sites above by the `front::range_contains` post-pass (see
-    /// [`crate::front::range_contains::RangeContainsSite`]).
+    /// `RangeInclusive::contains` / `Range::contains` call sites paired
+    /// with the construction sites above by the `front::range_contains`
+    /// post-pass (see [`crate::front::range_contains::RangeContainsSite`]).
     range_contains_sites: Vec<crate::front::range_contains::RangeContainsSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
@@ -14926,6 +14964,24 @@ impl<'a> Lowering<'a> {
                                     end: arg_vars[1].clone(),
                                 },
                             );
+                            // Word-sized signed exclusive `(a..b).contains(&x)`
+                            // — the same I64/Isize gate as RangeInclusive.
+                            // Captured here because exclusive Range is a
+                            // struct aggregate, not a `new` call.  The
+                            // contains post-pass pairs this with
+                            // `Range::contains` and is consumer-gated, so
+                            // a for-loop / slice-index range stays the
+                            // ordinary ctor + FieldWrite path.
+                            if tyref_is_int_range(dest_ty, self.llbc) {
+                                self.range_inclusive_new_sites.push(
+                                    crate::front::range_contains::RangeInclusiveNewSite {
+                                        result_var: res.clone(),
+                                        lo: arg_vars[0].clone(),
+                                        hi: arg_vars[1].clone(),
+                                        exclusive: true,
+                                    },
+                                );
+                            }
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
                             && ctor
@@ -21729,6 +21785,7 @@ impl<'a> Lowering<'a> {
                 result_var: res.clone(),
                 lo: lo_v,
                 hi: hi_v,
+                exclusive: false,
             });
         res
     }
@@ -30077,6 +30134,7 @@ impl<'a> Lowering<'a> {
                     result_var: result_var.clone(),
                     lo: args[0].clone().into_variable(),
                     hi: args[1].clone().into_variable(),
+                    exclusive: false,
                 },
             );
         }
@@ -30101,6 +30159,34 @@ impl<'a> Lowering<'a> {
             && first_arg_ty
                 .as_ref()
                 .is_some_and(|t| tyref_is_int_range_inclusive(t, self.llbc))
+        {
+            self.range_contains_sites
+                .push(crate::front::range_contains::RangeContainsSite {
+                    result_var: result_var.clone(),
+                });
+        }
+        // Capture `Range::contains(&self, &x)` for the exclusive
+        // `(a..b).contains(&x)` fold.  Exclusive Range is a struct ADT,
+        // so `first_is_self` routes the call as a 2-arg
+        // `CallTarget::Method { name: "contains" }` (receiver `args[0]`,
+        // value `args[1]`).  A FunctionPath spelling ending
+        // `["range", "Range", "contains"]` is recorded too.  Gate on the
+        // receiver resolving to `Range` over I64/Isize — the same
+        // element types as RangeInclusive — so a float range, a
+        // narrower-width range, and a same-named `contains` on any other
+        // type are never recorded.
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && match target {
+                CallTarget::Method { name, .. } => name == "contains",
+                CallTarget::FunctionPath { segments, .. } => {
+                    fmt_path_ends_with(segments, &["range", "Range", "contains"])
+                }
+                _ => false,
+            }
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|t| tyref_is_int_range(t, self.llbc))
         {
             self.range_contains_sites
                 .push(crate::front::range_contains::RangeContainsSite {
@@ -59003,16 +59089,15 @@ fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
-/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
-/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
-/// both the `new` and the `contains` recording of the
-/// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
-/// type — and a float / narrower-width range — is never folded to
-/// integer compares.  The element type is read from the ADT reference's
-/// `generics.types[0]`, so it is available even when the `new` bounds are
-/// literal constants (whose operand types the front does not carry);
-/// float ranges decline cleanly (both calls stay residual, census Skip).
-fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+/// `adt_path` whose sole element type is a word-sized signed integer
+/// (`I64` / `Isize`).  `require_opaque` is the RangeInclusive extraction
+/// shape; exclusive `Range` is a struct ADT and must not require it.
+fn tyref_is_word_signed_range_adt(
+    ty: &TyRef,
+    llbc: &Llbc,
+    adt_path: &str,
+    require_opaque: bool,
+) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
         return false;
     };
@@ -59026,8 +59111,8 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
     let is_range = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
-            matches!(td.kind, TypeDeclKind::Opaque)
-                && td.item_meta.name_path() == "core::ops::range::RangeInclusive"
+            (!require_opaque || matches!(td.kind, TypeDeclKind::Opaque))
+                && td.item_meta.name_path() == adt_path
         });
     if !is_range {
         return false;
@@ -59046,6 +59131,29 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
             .and_then(serde_json::Value::as_str),
         Some("I64" | "Isize")
     )
+}
+
+/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
+/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
+/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
+/// both the `new` and the `contains` recording of the
+/// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
+/// type — and a float / narrower-width range — is never folded to
+/// integer compares.  The element type is read from the ADT reference's
+/// `generics.types[0]`, so it is available even when the `new` bounds are
+/// literal constants (whose operand types the front does not carry);
+/// float ranges decline cleanly (both calls stay residual, census Skip).
+fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::RangeInclusive", true)
+}
+
+/// True when `ty` resolves to exclusive `core::ops::range::Range` over
+/// `I64` / `Isize` — the same integer element gate as
+/// [`tyref_is_int_range_inclusive`].  Exclusive Range is a struct ADT
+/// (not Opaque).  Float exclusive ranges decline the same way inclusive
+/// float ranges do.
+fn tyref_is_int_range(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::Range", false)
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
@@ -79855,9 +79963,10 @@ mod tests {
             fields
                 .fields
                 .get("pyre_object::unicodeobject::W_UnicodeObject")
-                .is_some_and(
-                    |rows| rows.contains(&("value".to_string(), "*mut Wtf8Buf".to_string()))
-                ),
+                .is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| row.name == "value" && row.ty == "*mut Wtf8Buf")
+                }),
             "the declaration metadata must retain the physical storage row"
         );
         assert!(
@@ -79945,9 +80054,9 @@ mod tests {
         );
         assert_eq!(
             fields.fields.get("Constants"),
-            Some(&vec![(
-                "__pos_0".to_string(),
-                "Box<[ConstantData]>".to_string()
+            Some(&vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "Box<[ConstantData]>"
             )])
         );
         assert_eq!(
@@ -79956,28 +80065,35 @@ mod tests {
         );
         assert_eq!(
             fields.fields.get("ConstantData::Integer"),
-            Some(&vec![("value".to_string(), "BigInt".to_string())])
+            Some(&vec![crate::front::semantic::FieldRow::named(
+                "value", "BigInt"
+            )])
         );
         assert_eq!(
             fields.fields.get("ConstantData::Complex"),
-            Some(&vec![("value".to_string(), "Complex<f64>".to_string())])
+            Some(&vec![crate::front::semantic::FieldRow::named(
+                "value",
+                "Complex<f64>"
+            )])
         );
         assert_eq!(
             fields.fields.get("ConstantData::Str"),
-            Some(&vec![("value".to_string(), "Wtf8Buf".to_string())])
+            Some(&vec![crate::front::semantic::FieldRow::named(
+                "value", "Wtf8Buf"
+            )])
         );
         assert_eq!(
             fields.fields.get("ConstantData::Code"),
-            Some(&vec![(
-                "code".to_string(),
-                "Box<CodeObject<ConstantData>>".to_string()
+            Some(&vec![crate::front::semantic::FieldRow::named(
+                "code",
+                "Box<CodeObject<ConstantData>>"
             )])
         );
         assert_eq!(
             fields.fields.get("Complex"),
             Some(&vec![
-                ("re".to_string(), "f64".to_string()),
-                ("im".to_string(), "f64".to_string()),
+                crate::front::semantic::FieldRow::named("re", "f64"),
+                crate::front::semantic::FieldRow::named("im", "f64"),
             ])
         );
         // `attrs` is keyed by the crate-stripped path, and `strip_crate_prefix`
@@ -80855,6 +80971,118 @@ mod tests {
         );
     }
 
+    /// Exclusive `(1..EXACT_FLOAT_INT).contains(&n)` in
+    /// `__majit_wrap_math_isqrt` (pyre-module) folds to
+    /// `int_between(1, n, 1<<53)`.  Ignored by default (loads the real
+    /// module LLBC); run with `cargo test -p majit-translate --lib
+    /// range_contains_fold_real -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn range_contains_fold_real_exclusive_int_isqrt() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::MODULE_ULLBC;
+        let llbc = Llbc::load(path).expect("load real module LLBC");
+        let graph = super::lower_function(&llbc, "__majit_wrap_math_isqrt")
+            .unwrap_or_else(|e| panic!("lower __majit_wrap_math_isqrt: {e:?}"));
+
+        let range_call = |leaf: &str| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => super::fmt_path_ends_with(segments, &["range", "Range", leaf]),
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } => leaf == "contains" && name == "contains",
+                    _ => false,
+                })
+                .count()
+        };
+        let int_between = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, args }
+                        if opname == "int_between" && args.len() == 3
+                )
+            })
+            .count();
+
+        assert_eq!(
+            range_call("contains"),
+            0,
+            "__majit_wrap_math_isqrt: residual Range::contains removed"
+        );
+        assert!(
+            int_between >= 1,
+            "__majit_wrap_math_isqrt: int_between(1, n, 1<<53) emitted"
+        );
+    }
+
+    /// Exclusive float `Range<f64>::contains` is out of the int-only
+    /// fold's scope, the same element gate as RangeInclusive float.
+    /// `__majit_wrap_math_asin` is `(-1.0..=1.0)` (inclusive float) and
+    /// stays residual; no exclusive float Range is rewritten to integer
+    /// compares.  Ignored by default (loads the real module LLBC).
+    #[test]
+    #[ignore]
+    fn range_contains_fold_real_declines_float_exclusive_range() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::MODULE_ULLBC;
+        let llbc = Llbc::load(path).expect("load real module LLBC");
+        let graph = super::lower_function(&llbc, "__majit_wrap_math_asin")
+            .unwrap_or_else(|e| panic!("lower __majit_wrap_math_asin: {e:?}"));
+
+        let exclusive_contains = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if super::fmt_path_ends_with(
+                            segments,
+                            &["range", "Range", "contains"],
+                        )
+                )
+            })
+            .count();
+        let inclusive_contains = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if super::fmt_path_ends_with(
+                            segments,
+                            &["range", "RangeInclusive", "contains"],
+                        )
+                )
+            })
+            .count();
+        assert_eq!(
+            exclusive_contains, 0,
+            "asin has no exclusive Range::contains (float pin is RangeInclusive)"
+        );
+        assert!(
+            inclusive_contains >= 1,
+            "float RangeInclusive::contains stays residual (fold out of scope)"
+        );
+    }
+
     /// `formatting::char_arg` narrows its BigInt to `u32`, not `i64`.  The
     /// i64-specific fits/discriminant synthesis must decline and leave the
     /// original `TryFrom<&BigInt>` call residual.  Ignored by default because
@@ -81539,8 +81767,8 @@ mod tests {
         assert_eq!(
             fields.fields.get("fixture::Step::CloseLoop"),
             Some(&vec![
-                ("__discriminant".to_string(), "i64".to_string()),
-                ("loop_header_pc".to_string(), "i64".to_string()),
+                crate::front::semantic::FieldRow::named("__discriminant", "i64"),
+                crate::front::semantic::FieldRow::named("loop_header_pc", "i64"),
             ]),
             "the payload rows must follow the inherited tag, not start at slot 0"
         );
@@ -81556,7 +81784,10 @@ mod tests {
         );
         assert_eq!(
             fields.fields.get("fixture::Step"),
-            Some(&vec![("__discriminant".to_string(), "i64".to_string())]),
+            Some(&vec![crate::front::semantic::FieldRow::named(
+                "__discriminant",
+                "i64"
+            )]),
             "the base still carries the tag alone"
         );
 
@@ -82005,19 +82236,24 @@ mod tests {
     #[test]
     fn positional_shapes_derive_distinct_pointer_aware_rows_from_the_spelling() {
         let rows = |shape| super::positional_shape_metadata(shape).unwrap().0;
-        assert_eq!(rows("Array<i64;1>"), vec![("__pos_0".into(), "i64".into())]);
+        assert_eq!(
+            rows("Array<i64;1>"),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", "i64"
+            )]
+        );
         assert_eq!(
             rows("Array<bool;2>"),
             vec![
-                ("__pos_0".into(), "bool".into()),
-                ("__pos_1".into(), "bool".into())
+                crate::front::semantic::FieldRow::positional("__pos_0", "bool"),
+                crate::front::semantic::FieldRow::positional("__pos_1", "bool"),
             ]
         );
         assert_eq!(
             rows("Tuple<Union,Union>"),
             vec![
-                ("__pos_0".into(), "&Union".into()),
-                ("__pos_1".into(), "&Union".into())
+                crate::front::semantic::FieldRow::positional("__pos_0", "&Union"),
+                crate::front::semantic::FieldRow::positional("__pos_1", "&Union"),
             ],
             "instance-valued tuple items use the pointer repr recorded by their FORCE attrs",
         );
@@ -86783,6 +87019,10 @@ mod tests {
             .or_else(|| fields.fields.get("capture::closure"))
             .cloned()
             .expect("closure layout rows");
+        let layout_pairs: Vec<(String, String)> = layout_rows
+            .iter()
+            .map(|row| (row.name.clone(), row.ty.clone()))
+            .collect();
         assert!(
             fields.fields.contains_key(closure_key),
             "intern keys the full closure path; keys={:?}",
@@ -86791,12 +87031,12 @@ mod tests {
         crate::annotator::classdesc::register_struct_fields_with_layout(
             closure_key,
             attr_rows,
-            Some(layout_rows.as_slice()),
+            Some(layout_pairs.as_slice()),
         );
         crate::annotator::classdesc::register_struct_fields_with_layout(
             "capture::closure",
             attr_rows,
-            Some(layout_rows.as_slice()),
+            Some(layout_pairs.as_slice()),
         );
 
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -89978,9 +90218,9 @@ mod tests {
         );
     }
 
-    fn rows(spec: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn rows(spec: &[(&str, &str)]) -> Vec<crate::front::semantic::FieldRow> {
         spec.iter()
-            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .map(|(n, t)| crate::front::semantic::FieldRow::named(*n, *t))
             .collect()
     }
 
@@ -90745,14 +90985,14 @@ mod tests {
             prog.struct_fields
                 .fields
                 .get("a::same::Code")
-                .map(|rows| rows[0].0.as_str()),
+                .map(|rows| rows[0].name.as_str()),
             Some("n")
         );
         assert_eq!(
             prog.struct_fields
                 .fields
                 .get("b::same::Code")
-                .map(|rows| rows[0].0.as_str()),
+                .map(|rows| rows[0].name.as_str()),
             Some("m")
         );
         assert!(
@@ -101355,8 +101595,8 @@ mod tests {
             .filter(|(owner, _)| owner.ends_with("PyError"))
             .find_map(|(owner, rows)| {
                 rows.iter()
-                    .find(|(name, _)| name == "exc_object")
-                    .map(|(_, ty)| (owner.as_str(), ty.as_str()))
+                    .find(|row| row.name == "exc_object")
+                    .map(|row| (owner.as_str(), row.ty.as_str()))
             })
             .map(|(owner, ty)| (owner.to_string(), ty.to_string()))
             .expect("PyError.exc_object registry row");
@@ -104153,10 +104393,10 @@ mod tests {
         assert_eq!(
             program.struct_fields.fields.get(qualified),
             Some(&vec![
-                ("key".to_string(), "i64".to_string()),
-                ("f_valid".to_string(), "bool".to_string()),
-                ("value".to_string(), "*mut PyObject".to_string()),
-                ("f_hash".to_string(), "u64".to_string()),
+                crate::front::semantic::FieldRow::named("key", "i64"),
+                crate::front::semantic::FieldRow::named("f_valid", "bool"),
+                crate::front::semantic::FieldRow::named("value", "*mut PyObject"),
+                crate::front::semantic::FieldRow::named("f_hash", "u64"),
             ])
         );
         assert!(program.known_struct_names.contains(qualified));
@@ -104164,8 +104404,8 @@ mod tests {
             .struct_fields
             .fields
             .get("Entry")
-            .and_then(|rows| rows.iter().find(|(name, _)| name == "key"))
-            .map(|(_, ty)| ty.as_str());
+            .and_then(|rows| rows.iter().find(|row| row.name == "key"))
+            .map(|row| row.ty.as_str());
         assert_eq!(bare_key, Some("??TypeVar#0"));
         let published: Vec<_> = program
             .struct_fields

@@ -544,61 +544,66 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 ///   * the managed namespace object for heap types, or the off-GC
 ///     `DictStorage` values for static builtin types.
 ///
-/// Heap types are GC-managed (`w_type_new` / young-nonmoving
+/// Heap types are nursery GC objects (`w_type_new` / collecting
 /// `malloc_fixedsize`), so this trace keeps their owned GC edges live and
 /// forwards their slots.  The separate builtin-type walk covers Box-immortal
 /// builtin types, whose custom trace never fires.
 unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
-    f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut t.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut t.w_name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut t.w_qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut t.w_doc as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    // `name` points at a GC-managed leaf storage box (`String`, off-GC storage
-    // epic S5) for a mortal heap type; forward the field slot so a major GC greys
-    // the box, and the box tid's drop glue reclaims the buffer on sweep. An
-    // immortal type's `malloc_raw` name is not collector-owned, so the guard
-    // skips it.
-    if !t.name.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(t.name as pyre_object::gc_hook::GCREF)
     {
-        let name_slot = std::ptr::addr_of_mut!(t.name);
-        f(name_slot as *mut majit_ir::GcRef);
-    }
-    // `qualname` has the same ownership and storage shape as `name`.
-    if !t.qualname.is_null()
-        && pyre_object::gc_hook::try_gc_owns_object(t.qualname as pyre_object::gc_hook::GCREF)
-    {
-        let qualname_slot = std::ptr::addr_of_mut!(t.qualname);
-        f(qualname_slot as *mut majit_ir::GcRef);
-    }
-    if !t.mro_w.is_null() {
-        if pyre_object::gc_hook::try_gc_owns_object(t.mro_w as pyre_object::gc_hook::GCREF) {
-            // GC-owned type-9 block: forward the `mro_w` field slot; the
-            // varsize walker forwards items[0..len]. Forwarding each element
-            // instead would mark the elements but leave the block itself
-            // unmarked, so a major collection would sweep it (UAF). Mirrors
-            // `list_object_custom_trace`'s GC-owned branch.
+        let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
+        f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        f(&mut t.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        f(&mut t.w_name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        f(&mut t.w_qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        f(&mut t.w_doc as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        // `name` points at a GC-managed leaf storage box (`String`, off-GC storage
+        // epic S5) for a mortal heap type; forward the field slot so a major GC greys
+        // the box, and the box tid's drop glue reclaims the buffer on sweep. An
+        // immortal type's `malloc_raw` name is not collector-owned, so the guard
+        // skips it.
+        if !t.name.is_null()
+            && pyre_object::gc_hook::try_gc_owns_object(t.name as pyre_object::gc_hook::GCREF)
+        {
+            let name_slot = std::ptr::addr_of_mut!(t.name);
+            f(name_slot as *mut majit_ir::GcRef);
+        }
+        // `qualname` has the same ownership and storage shape as `name`.
+        if !t.qualname.is_null()
+            && pyre_object::gc_hook::try_gc_owns_object(t.qualname as pyre_object::gc_hook::GCREF)
+        {
+            let qualname_slot = std::ptr::addr_of_mut!(t.qualname);
+            f(qualname_slot as *mut majit_ir::GcRef);
+        }
+        if !t.mro_w.is_null() {
+            // Heap types allocate `mro_w` as a nursery GcArray
+            // (`alloc_mro_block_young_gc`). Forward the field slot the same
+            // way `dict` is forwarded below: `try_gc_owns_object` can answer
+            // false reentrantly from inside a minor (`dynasm_gc_owns_object`),
+            // and the element-only fallback then leaves the block itself
+            // unmarked so the next `lookup_where` walks a swept MRO
+            // (`sys.flags.optimize` after `gc.collect(0)`). A std::alloc
+            // fallback address is not in the nursery; the visitor no-ops.
             let mro_slot = std::ptr::addr_of_mut!(t.mro_w);
             f(mro_slot as *mut majit_ir::GcRef);
-        } else {
-            // std::alloc fallback block (no GC hook): forward each element in
-            // place — the block is stationary and the collector does not own it.
-            let mro = unsafe { &mut *t.mro_w };
-            for slot in mro.as_mut_slice().iter_mut() {
-                f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        }
+        if !t.weak_subclasses.is_null() {
+            let subs = unsafe { &mut *t.weak_subclasses };
+            for slot in subs.iter_mut() {
+                f(slot as *mut *mut pyre_object::weakref::Weakref as *mut majit_ir::GcRef);
             }
         }
+        f(std::ptr::from_mut(&mut t.dict).cast());
     }
-    if !t.weak_subclasses.is_null() {
-        let subs = unsafe { &mut *t.weak_subclasses };
-        for slot in subs.iter_mut() {
-            f(slot as *mut *mut pyre_object::weakref::Weakref as *mut majit_ir::GcRef);
-        }
-    }
-    f(std::ptr::from_mut(&mut t.dict).cast());
+    // `Terminator.w_cls` (`mapdict.py`) is a traced `_immutable_field_` on a
+    // GC terminator. pyre's terminator is `malloc_raw`; MiniMark never
+    // visits that immortal sidecar on its own. Forward it from the type
+    // that owns the terminator so a nursery heap type copy rewrites the
+    // slot (`LOAD_ATTR_slowpath` reads `map.terminator.w_cls`).
+    pyre_interpreter::objspace::std::mapdict::walk_type_terminator_w_cls(
+        obj_addr as pyre_object::PyObjectRef,
+        &mut |slot| f(slot as *mut majit_ir::GcRef),
+    );
 }
 
 /// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
@@ -825,11 +830,11 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     if strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Map
         && strategy.strategy_kind() != pyre_object::dictmultiobject::StrategyKind::Class
     {
-        if !dict.dstorage.is_null()
-            && pyre_object::gc_hook::try_gc_owns_object(
-                dict.dstorage as pyre_object::gc_hook::GCREF,
-            )
-        {
+        // Always grey `dstorage`. `try_gc_owns_object` can answer false
+        // reentrantly from inside a minor (`dynasm_gc_owns_object`), and a
+        // young-nonmoving dicttable then misses `VISITED_RMY`. `grey_child`
+        // no-ops an unmanaged `malloc_raw` fallback.
+        if !dict.dstorage.is_null() {
             let dstorage_slot = std::ptr::addr_of_mut!(dict.dstorage);
             f(dstorage_slot as *mut majit_ir::GcRef);
         }
@@ -1210,14 +1215,15 @@ unsafe fn module_dict_object_custom_trace(
     // minor-GC forward is a no-op.  Guard on GC ownership: a `tid == 0`
     // `malloc_raw` fallback box (unit tests / pre-init) has no GC hook.
     if pyre_object::dictmultiobject::is_module_dict(obj) {
+        // Same as `dict_object_custom_trace`: a young-nonmoving
+        // dicttable must be greyd even when `try_gc_owns_object` is
+        // false reentrantly. `grey_child` no-ops a `malloc_raw` fallback.
         let dstorage = std::ptr::addr_of_mut!(md.dstorage);
-        if !(*dstorage).is_null() && pyre_object::gc_hook::try_gc_owns_object(*dstorage) {
+        if !(*dstorage).is_null() {
             f(dstorage.cast());
         }
         let mstrategy = std::ptr::addr_of_mut!(md.mstrategy);
-        if !(*mstrategy).is_null()
-            && pyre_object::gc_hook::try_gc_owns_object(*mstrategy as pyre_object::gc_hook::GCREF)
-        {
+        if !(*mstrategy).is_null() {
             f(mstrategy.cast());
         }
         // A module holder owns the concrete ModuleDictStrategy.  Forward the

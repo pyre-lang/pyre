@@ -1782,6 +1782,17 @@ pub unsafe fn w_dict_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(&mut
     if obj.is_null() {
         return;
     }
+    // Grey the dicttable box (`W_DictMultiObject.dstorage`). Walking only
+    // the entries interiors leaves a young-nonmoving box without
+    // `VISITED_RMY`, and the next trace of `dstorage` reads a swept header.
+    // EmptyDictStrategy / EmptyKwargsDictStrategy store `erased(None)`
+    // (`get_empty_storage`); skip that null the way `dict_object_custom_trace`
+    // does. Visiting it would walk a slot the strategy has no storage for.
+    let dstorage_slot =
+        std::ptr::addr_of_mut!((*(obj as *mut W_DictObject)).dstorage) as *mut PyObjectRef;
+    if !(*dstorage_slot).is_null() {
+        visitor(unsafe { &mut *dstorage_slot });
+    }
     let strategy = unsafe { w_dict_get_strategy(obj) };
     let mut adapter = |slot: *mut PyObjectRef| {
         visitor(unsafe { &mut *slot });
@@ -1985,7 +1996,7 @@ pub fn w_module_dict_new() -> PyObjectRef {
     );
     let strategy_ref_slot = roots.publish(&[strategy_ref as PyObjectRef]);
     let storage = unsafe {
-        crate::gc_storage::gc_alloc_storage_box(
+        crate::gc_storage::gc_alloc_young_storage_box(
             (*strategy).get_empty_storage(),
             crate::celldict::module_dict_storage_gc_type_id(),
         )
@@ -2619,6 +2630,9 @@ pub unsafe fn w_module_dict_walk_gc_cells(
         return;
     }
     let md = &mut *(obj as *mut W_ModuleDictObject);
+    if !md.dstorage.is_null() {
+        visitor(unsafe { &mut *(std::ptr::addr_of_mut!(md.dstorage) as *mut PyObjectRef) });
+    }
     if w_module_dict_is_object_strategy(obj) {
         let object_storage = &mut *(md.dstorage as *mut ObjectDictStorage);
         for (key, value) in object_storage.iter_mut_for_trace() {
@@ -5178,11 +5192,11 @@ pub unsafe fn w_dict_copy_object_strategy(
 ) -> PyObjectRef {
     let dict = &*(w_dict as *const W_DictObject);
     let storage = &*(dict.dstorage as *const ObjectDictStorage);
-    // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
-    let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-        storage.clone(),
-        object_dict_storage_gc_type_id(),
-    );
+    // `AbstractTypedStrategy.copy` erases a cloned `r_dict` (`dicttable`),
+    // a nursery object. `type.__new__` copies the class namespace through
+    // this path (`w_dict_copy`); a born-old clone kept discarded types
+    // alive at every minor.
+    let new_storage = storage.clone_to_young_box(object_dict_storage_gc_type_id());
     w_dict_new_with(strategy, new_storage as GCREF)
 }
 
@@ -7631,12 +7645,10 @@ impl DictStrategy for ObjectDictStrategy {
 
     fn get_empty_storage(&self) -> GCREF {
         // `dictmultiobject.py get_empty_storage`: erased `r_dict(dict_keys_equal,
-        // hash_w)`.  Pyre's typed map is
-        // `IndexMap<ObjectKey, PyObjectRef>` — hash bucket for O(1)
-        // lookup that also preserves insertion order (CPython 3.7+ /
-        // PyPy3 dict semantics).  GC-managed box (`gc_alloc_storage_box`):
-        // `w_dict.dstorage = strategy.erase(new)` is a `setfield_gc`, the
-        // old box reclaimed by the sweep.
+        // hash_w)` = `GcStruct("dicttable")` (rdict.py), a nursery object.
+        // `kwargsdict.py get_empty_storage` already uses the young-nonmoving
+        // box; a born-old table stays on `old_objects_pointing_to_young` and
+        // keeps a discarded type's GetSets alive at every minor.
         crate::gc_storage::gc_alloc_young_storage_box(
             crate::dictmultiobject::object_dict_storage_new(),
             crate::dictmultiobject::object_dict_storage_gc_type_id(),
@@ -7820,6 +7832,9 @@ impl DictStrategy for BytesDictStrategy {
     /// (`setfield_gc` on reassign). The key is the block `unwrap` reads
     /// off the `bytes` object.
     fn get_empty_storage(&self) -> GCREF {
+        // `dictmultiobject.py get_empty_storage`: erased `{}` is a nursery
+        // `dicttable`. `ll_dict_grow`'s `d.entries = newitems` write barrier
+        // can remember a young `DICTENTRYARRAY` only from a MiniMark header.
         crate::gc_storage::gc_alloc_young_storage_box(
             crate::dictmultiobject::BytesDictStorage::new(),
             crate::dictmultiobject::bytes_dict_storage_gc_type_id(),
@@ -7973,11 +7988,8 @@ impl DictStrategy for BytesDictStrategy {
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);
-        // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
-        let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-            storage.clone(),
-            crate::dictmultiobject::bytes_dict_storage_gc_type_id(),
-        );
+        let new_storage =
+            storage.clone_to_young_box(crate::dictmultiobject::bytes_dict_storage_gc_type_id());
         crate::dictmultiobject::w_dict_new_with(&BYTES_DICT_STRATEGY_REF, new_storage as GCREF)
     }
 }
@@ -8028,11 +8040,10 @@ impl DictStrategy for UnicodeDictStrategy {
 
     fn get_empty_storage(&self) -> GCREF {
         // `dictmultiobject.py create_empty_unicode_key_dict`
-        // returns an empty `r_dict(unicode_eq, unicode_hash)`.  Pyre
-        // shares ObjectDictStrategy's `IndexMap<ObjectKey, PyObjectRef>`
-        // backing — str-keyed `dict_keys_equal` matches `unicode_eq`
-        // for the str fast-path callers (`dictmultiobject.py`).
-        // GC-managed box (`setfield_gc` on reassign).
+        // returns an empty `r_dict(unicode_eq, unicode_hash)`, a nursery
+        // `dicttable`. Type namespaces (`type(name, (), {})`) land here
+        // on the first str store; a born-old box promoted the type at
+        // every minor through the remembered set.
         crate::gc_storage::gc_alloc_young_storage_box(
             crate::dictmultiobject::object_dict_storage_new(),
             crate::dictmultiobject::object_dict_storage_gc_type_id(),
@@ -8299,6 +8310,8 @@ impl DictStrategy for IntDictStrategy {
     /// (CPython 3.7+ / PyPy3 dict semantics).  GC-managed box
     /// (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> GCREF {
+        // `dictmultiobject.py IntDictStrategy.get_empty_storage`: erased `{}`
+        // is a nursery `dicttable`.
         crate::gc_storage::gc_alloc_young_storage_box(
             crate::dictmultiobject::IntDictStorage::new(),
             crate::dictmultiobject::int_dict_storage_gc_type_id(),
@@ -8445,11 +8458,8 @@ impl DictStrategy for IntDictStrategy {
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         let dict = &*(w_dict as *const crate::dictmultiobject::W_DictObject);
         let storage = &*(dict.dstorage as *const crate::dictmultiobject::IntDictStorage);
-        // `gc_alloc_young_storage_box` is a non-moving young birth and never collects.
-        let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
-            storage.clone(),
-            crate::dictmultiobject::int_dict_storage_gc_type_id(),
-        );
+        let new_storage =
+            storage.clone_to_young_box(crate::dictmultiobject::int_dict_storage_gc_type_id());
         crate::dictmultiobject::w_dict_new_with(&INT_DICT_STRATEGY_REF, new_storage as GCREF)
     }
 }

@@ -379,9 +379,10 @@ majit_gc::global_hook!(static GC_ALLOC_COLLECTING_HOOK: GcAllocHookFn);
 /// for callers that hold no unrooted GC pointer across the allocation and run at
 /// a JIT safepoint (gcmap-rooted). The elidable bigint payload helpers were the
 /// first; the rooted sibling now also carries every list header
-/// (`w_list_new_with_strategy`), `w_weakref_new`, and builtin `str()`'s
-/// `w_str_from_wtf8_managed_collecting`. Heap-type headers (`w_type_new`)
-/// take the young-nonmoving twin.
+/// (`w_list_new_with_strategy`), heap-type headers (`w_type_new`),
+/// heap-type MRO arrays (`alloc_mro_block_young_gc`), exact `super`
+/// (`w_super_new`), `w_weakref_new`, and builtin `str()`'s
+/// `w_str_from_wtf8_managed_collecting`.
 pub fn register_gc_alloc_collecting_hook(hook: GcAllocHookFn) {
     GC_ALLOC_COLLECTING_HOOK.set(Some(hook));
 }

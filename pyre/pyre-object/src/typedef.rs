@@ -355,6 +355,68 @@ pub fn w_getset_property_new(
     })
 }
 
+/// `typedef.py GetSetProperty.copy_for_type`: `instantiate(GetSetProperty)`.
+///
+/// The TypeDef template (`w_getset_property_new`) stays on
+/// `malloc_typed_stable` so its address can live in `TYPEDEF_VALUE_ROOTS`.
+/// The copy is a regular nursery `W_Root` stored only in the heap type's
+/// dict; born-old copies joined `old_objects_pointing_to_young` at the
+/// creation barrier (`malloc_typed_stable`) and then received `w_objclass`
+/// without a second barrier, so a discarded `type(name, (), {})` stayed
+/// reachable through a dead GetSet at every minor (`W_TypeObject.add_subclass`
+/// never reused the slot).
+pub fn w_getset_property_instantiate(
+    fget: PyObjectRef,
+    fset: PyObjectRef,
+    fdel: PyObjectRef,
+    doc: PyObjectRef,
+    reqcls: PyObjectRef,
+    use_closure: bool,
+    name: PyObjectRef,
+    w_objclass: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let save = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_roots(&[fget, fset, fdel, doc, reqcls, name, w_objclass]);
+    let mut allocation_root: crate::gc_hook::GCREF = std::ptr::null_mut();
+    let mut needs_write_barrier = true;
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
+        crate::gc_hook::try_gc_alloc_collecting_rooted(
+            W_GETSET_PROPERTY_GC_TYPE_ID,
+            W_GETSET_PROPERTY_OBJECT_SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    })
+    .allocated_or_abort(W_GETSET_PROPERTY_OBJECT_SIZE)
+    .unwrap_or(std::ptr::null_mut());
+    let value = GetSetProperty {
+        ob: PyObject {
+            ob_type: &GETSET_DESCRIPTOR_TYPE as *const PyType,
+            w_class: crate::pyobject::get_instantiate(&GETSET_DESCRIPTOR_TYPE),
+        },
+        fget: crate::gc_roots::shadow_stack_get(save),
+        fset: crate::gc_roots::shadow_stack_get(save + 1),
+        fdel: crate::gc_roots::shadow_stack_get(save + 2),
+        doc: crate::gc_roots::shadow_stack_get(save + 3),
+        reqcls: crate::gc_roots::shadow_stack_get(save + 4),
+        name: crate::gc_roots::shadow_stack_get(save + 5),
+        w_objclass: crate::gc_roots::shadow_stack_get(save + 6),
+        w_qualname: PY_NULL,
+        use_closure,
+    };
+    if raw.is_null() {
+        return crate::lltype::malloc_typed(value) as PyObjectRef;
+    }
+    unsafe {
+        std::ptr::write(raw as *mut GetSetProperty, value);
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
+        }
+    }
+    raw as PyObjectRef
+}
+
 /// Test whether `obj` is a `GetSetProperty`.
 ///
 /// # Safety

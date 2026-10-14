@@ -1158,6 +1158,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     OuterActiveBoxesEntryTwin::Plain,
                     "guard_snapshot_guard_pc",
                 )
+            } else if let Some(live_pc) = scope.liveness_jit_pc {
+                // Resume and liveness share this later `-live-`.  The opcode
+                // floor would snapshot the landing, whose live set omits the
+                // caught exception a PUSH_EXC_INFO prev-nullity guard must
+                // carry (`pyjitpl.py` `get_list_of_active_boxes` at the
+                // interpreter pc that already bound `last_exc_value`).
+                (
+                    live_pc as i32,
+                    OuterActiveBoxesEntryTwin::Plain,
+                    "guard_snapshot_carried_live",
+                )
             } else {
                 let entry = unsafe {
                     crate::py_coord::first_floor_boundary_for_py(

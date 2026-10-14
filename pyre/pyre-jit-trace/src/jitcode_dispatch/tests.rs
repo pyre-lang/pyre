@@ -18402,3 +18402,222 @@ fn rooted_code_slot_forwards_across_collection() {
     assert_ne!(original as usize, live as usize);
     drop(roots);
 }
+
+/// `pyopcode.py PUSH_EXC_INFO` always saves `prev`; `POP_EXCEPT` always
+/// restores it (`pyframe.py _restore_exc_info` → `set_sys_exc_info3`).
+/// A residual-caught handler lands on PUSH_EXC_INFO with no later `-live-`
+/// to carry the nullity guard.  Completing the prev-save anyway arms the
+/// PUSH store / POP restore pair so `sys.exc_info()` is empty after the
+/// handler; declining left the caught exception visible.  The fold of
+/// `w_prev` to `const w_None` is skipped, but dst is bound to the GETFIELD
+/// (`Some`): a residual `current_exception_or_none` Call beside it is a
+/// second live prev box and scrambles blackhole resume failargs.
+#[test]
+fn push_exc_info_prev_save_completes_without_an_anchored_nullity_guard() {
+    use crate::jitcode_runtime::DecodedOp;
+    use crate::state::{ConcreteValue, PyreSym};
+
+    super::fbw_store_journal_reset();
+
+    let mut tc = fresh_trace_ctx();
+    let ec = dummy_ptr_eq_box(&mut tc);
+    let dst_box = dummy_ptr_eq_box(&mut tc);
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.set_execution_context(ec);
+
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+
+    let regs_r = vec![dst_box];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Null],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let op = DecodedOp {
+        key: "residual_call_r_r/iRd>r",
+        opname: "residual_call_r_r",
+        argcodes: "iRd>r",
+        pc: 0,
+        next_pc: 1,
+    };
+    let lowered = try_walker_lower_exc_info_residual(
+        &mut wc,
+        &[],
+        &op,
+        majit_ir::RuntimeHelperKind::CurrentExceptionOrNone,
+        &[],
+        'r',
+        0,
+    )
+    .expect("PUSH_EXC_INFO prev-save lowering");
+    assert_eq!(
+        lowered,
+        Some(()),
+        "no-anchor prev-save arms the pair and binds dst to the GETFIELD"
+    );
+    assert!(
+        FBW_EXC_PENDING_PUSH_SET.with(|c| c.get()),
+        "the following SetCurrentException is the PUSH store"
+    );
+    assert_eq!(
+        FBW_EXC_PREV.with(|s| s.borrow().len()),
+        1,
+        "POP_EXCEPT restores this saved prev, not the caught exception"
+    );
+
+    super::fbw_store_journal_reset();
+}
+
+/// Same residual-caught landing as
+/// [`push_exc_info_prev_save_completes_without_an_anchored_nullity_guard`]:
+/// no later `-live-` to carry the nullity guard.  Completing the prev-save
+/// must not bake `w_prev` from this run's nullity (`pyjitpl.py` records a
+/// guard at every branch it specializes).  dst is the GETFIELD itself, not
+/// `const w_None` and not a second residual Call; `FBW_EXC_PREV` is the
+/// same OpRef so resume has one prev box.
+#[test]
+fn push_exc_info_prev_save_without_anchor_does_not_bake_w_prev() {
+    use crate::jitcode_runtime::DecodedOp;
+    use crate::state::{ConcreteValue, PyreSym};
+
+    super::fbw_store_journal_reset();
+
+    let mut tc = fresh_trace_ctx();
+    let ec = dummy_ptr_eq_box(&mut tc);
+    let dst_box = dummy_ptr_eq_box(&mut tc);
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.set_execution_context(ec);
+
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+
+    let regs_r = vec![dst_box];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Null],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let op = DecodedOp {
+        key: "residual_call_r_r/iRd>r",
+        opname: "residual_call_r_r",
+        argcodes: "iRd>r",
+        pc: 0,
+        next_pc: 1,
+    };
+    let lowered = try_walker_lower_exc_info_residual(
+        &mut wc,
+        &[],
+        &op,
+        majit_ir::RuntimeHelperKind::CurrentExceptionOrNone,
+        &[],
+        'r',
+        0,
+    )
+    .expect("PUSH_EXC_INFO prev-save lowering");
+    assert_eq!(
+        lowered,
+        Some(()),
+        "dst is the GETFIELD so the residual current_exception_or_none call does not also stand"
+    );
+    let dst_post = wc.registers_r.get(0).expect("ref register in range");
+    assert_ne!(
+        dst_post, dst_box,
+        "dst is overwritten with the GETFIELD, not left for a residual Call"
+    );
+    assert!(
+        !dst_post.is_constant(),
+        "w_prev is not a baked constant when no nullity guard was emitted"
+    );
+    let saved_prev = FBW_EXC_PREV.with(|s| {
+        let stack = s.borrow();
+        assert_eq!(stack.len(), 1, "prev stack is armed");
+        stack[0].0
+    });
+    assert_eq!(
+        dst_post, saved_prev,
+        "dst and FBW_EXC_PREV are one prev box, not GETFIELD plus a residual Call"
+    );
+    assert_eq!(
+        wc.trace_ctx.opcode_of(saved_prev),
+        Some(majit_ir::OpCode::GetfieldGcR),
+        "saved prev is the recorded GETFIELD, not a baked constant"
+    );
+    assert!(
+        !wc.trace_ctx.ops().iter().any(|op| matches!(
+            op.opcode,
+            majit_ir::OpCode::GuardIsnull | majit_ir::OpCode::GuardNonnull
+        )),
+        "unanchored PUSH_EXC_INFO prev-save does not emit a nullity guard"
+    );
+    assert!(
+        FBW_EXC_PENDING_PUSH_SET.with(|c| c.get()),
+        "the following SetCurrentException is the PUSH store"
+    );
+
+    super::fbw_store_journal_reset();
+}

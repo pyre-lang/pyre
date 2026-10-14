@@ -2365,6 +2365,28 @@ impl DynasmBackend {
         let _ = with_dynasm_active_gc_mut(|gc| gc.remember_gc_table(&table));
     }
 
+    /// `gcreftracer.py` `make_framework_tracer` / `assembler.py` `_allgcrefs`:
+    /// rewrite's gcref list is a GC object, so a collection between
+    /// `rewrite_assembler` and `patch_gcref_table` forwards the entries.
+    /// A Rust `Vec<GcRef>` is not a root. Park the list in a heap table
+    /// and write-barrier it (`llop.gc_writebarrier(tr)`) before assemble
+    /// can collect, then copy [`GcTable::slots`] into the in-code array.
+    fn pin_rewrite_gcrefs(&self, gcrefs: &[GcRef]) -> Option<Arc<majit_gc::GcTable>> {
+        if gcrefs.is_empty() {
+            return None;
+        }
+        let table = majit_gc::GcTable::from_gcrefs(gcrefs);
+        let _ = with_dynasm_active_gc_mut(|gc| gc.remember_gc_table(&table));
+        Some(table)
+    }
+
+    fn gcrefs_after_assemble(pinned: Option<&majit_gc::GcTable>, gcrefs: Vec<GcRef>) -> Vec<GcRef> {
+        match pinned {
+            Some(table) => table.slots(),
+            None => gcrefs,
+        }
+    }
+
     // `set_constants_pool`, `set_next_trace_id`, and `set_next_header_pc`
     // are provided via the `Backend` trait impl below so
     // `compile_tmp_callback` and other backend-agnostic consumers can
@@ -3329,6 +3351,7 @@ impl Backend for DynasmBackend {
         let header_pc = self.next_header_pc;
         // gc.py rewrite_assembler parity: run GC rewriter before regalloc.
         let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
+        let pinned_gcrefs = self.pin_rewrite_gcrefs(&gcrefs);
         // The assembler stores the typed `Const` pool directly; each box
         // variant carries its own type (`Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
@@ -3440,6 +3463,7 @@ impl Backend for DynasmBackend {
         let rawstart = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_addr = compiled.entry_ptr() as usize;
         let code_size = compiled.buffer.len();
+        let gcrefs = Self::gcrefs_after_assemble(pinned_gcrefs.as_deref(), gcrefs);
         // SAFETY: `reserve_gcref_table` reserved `gcrefs.len()` words at
         // `rawstart`, in the arena block the token's CLT keeps alive.
         let gc_table =
@@ -3632,6 +3656,7 @@ impl Backend for DynasmBackend {
 
         let arglocs = Asm::rebuild_faillocs_from_descr(fail_descr, inputargs);
         let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
+        let pinned_gcrefs = self.pin_rewrite_gcrefs(&gcrefs);
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
@@ -3761,6 +3786,7 @@ impl Backend for DynasmBackend {
         let rawstart = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let bridge_addr = compiled.entry_ptr() as usize;
         let code_size = compiled.buffer.len();
+        let gcrefs = Self::gcrefs_after_assemble(pinned_gcrefs.as_deref(), gcrefs);
         // SAFETY: as in `compile_loop`.
         let gc_table =
             (!gcrefs.is_empty()).then(|| unsafe { majit_gc::GcTable::in_code(rawstart, &gcrefs) });

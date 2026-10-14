@@ -3772,6 +3772,16 @@ pub fn trace_and_compile_from_bridge(
         info.clone()
     };
 
+    // The live frame is a virtualizable GC object held by raw bridge-trace
+    // locals while retracing can collect. RPython keeps the virtualizable
+    // object GC-visible during retracing
+    // (`rpython/jit/metainterp/pyjitpl.py` `MetaInterp.interpret`); pyre
+    // roots the frame word so PyFrame's custom trace can forward
+    // `locals_cells_stack_w`. Resume rebuild, `start_bridge_tracing`, and
+    // `prepare_resume_from_failure` all allocate, so the root is taken
+    // before those calls and every later read goes through `FrameRoot::frame`.
+    let mut bridge_frame_root = FrameRoot::new(frame);
+
     // pyjitpl.py handle_guard_failure / compile.py _trace_and_compile_from_bridge:
     // frontend meta is the compiled_loops row on
     // `rd_loop_token.outermost_jitdriver_sd`, not leftover `active_jitdriver_sd`.
@@ -3782,7 +3792,7 @@ pub fn trace_and_compile_from_bridge(
         let (driver, _) = crate::eval::driver_pair();
         compiled_meta_for_bridge_source(driver.meta_interp(), descr_arc, green_key)
     };
-    let mut jit_state_local = build_jit_state(frame, &info);
+    let mut jit_state_local = build_jit_state(bridge_frame_root.frame(), &info);
     // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:
     // the guard fired inside a callee inlined into the trace, so the resume
     // pc is the INNERMOST frame's bytecode pc, which does not address the
@@ -3831,11 +3841,13 @@ pub fn trace_and_compile_from_bridge(
             "Resume::ForeignInnermostLastInstr",
         );
     } else {
-        frame.set_last_instr_from_next_instr(resume_pc);
+        bridge_frame_root
+            .frame()
+            .set_last_instr_from_next_instr(resume_pc);
     }
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(bridge_frame_root.frame()) };
     let env = PyreEnv;
-    let mut jit_state = build_jit_state(frame, &info);
+    let mut jit_state = build_jit_state(bridge_frame_root.frame(), &info);
 
     // A resume_pc on LOAD_CONST + RETURN_VALUE (or `n<=0` RETURN) is still
     // a live `handle_guard_failure` walk. RPython's `interpret()` records
@@ -3998,10 +4010,11 @@ pub fn trace_and_compile_from_bridge(
             // inside an inlined callee is a real bridge, not a decline.
             resumed_catch_level(&resume_coords)
         } else {
-            let off = if frame.last_instr < 0 {
+            let last_instr = bridge_frame_root.frame().last_instr;
+            let off = if last_instr < 0 {
                 0u32
             } else {
-                (frame.last_instr as u32) * 2
+                (last_instr as u32) * 2
             };
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off)
                 .map(|_| 0usize)
@@ -4015,11 +4028,12 @@ pub fn trace_and_compile_from_bridge(
     // An unwind that lands in the live frame discards the callee frames
     // (no inlined framestack left).  A catch inside a callee keeps the
     // carrier walk so the handler is recorded there.
+    let frame_pycode = bridge_frame_root.frame().pycode as usize;
     let unwind_to_live_frame = is_multiframe_resume
         && caught_in_frame
         && resume_coords
             .first()
-            .is_some_and(|&(outer_w_code, _)| outer_w_code == frame.pycode as usize);
+            .is_some_and(|&(outer_w_code, _)| outer_w_code == frame_pycode);
     let route_exc_edge = catch_level.is_some();
     // Discard inlined levels only when the raise unwinds *to* the live
     // frame.  A catch inside a callee still needs those levels as the
@@ -4085,7 +4099,9 @@ pub fn trace_and_compile_from_bridge(
     // to decline outright, so no existing resume changes shape.
     let resume_pc = match resume_coords.first() {
         Some(&(outer_w_code, outer_py_pc)) if unwind_to_live_frame => {
-            frame.set_last_instr_from_next_instr(outer_py_pc);
+            bridge_frame_root
+                .frame()
+                .set_last_instr_from_next_instr(outer_py_pc);
             if let Some(vsd) =
                 pyre_jit_trace::state::depth_based_vsd_for_wcode(outer_w_code, outer_py_pc)
             {
@@ -4096,13 +4112,6 @@ pub fn trace_and_compile_from_bridge(
         }
         _ => resume_pc,
     };
-
-    // The live frame is a virtualizable GC object held by raw bridge-trace
-    // locals while retracing can collect. RPython keeps the virtualizable
-    // object GC-visible during retracing
-    // (`rpython/jit/metainterp/pyjitpl.py:2839-2841`); pyre roots the frame
-    // word so PyFrame's custom trace can forward `locals_cells_stack_w`.
-    let mut bridge_frame_root = FrameRoot::new(frame);
 
     // pyjitpl.py interpret(): after start_retrace_from_guard, RPython
     // runs a single interpret() over the resumed frame state until the
@@ -4122,7 +4131,7 @@ pub fn trace_and_compile_from_bridge(
     // after the walk so the post-bridge interpreter resumes at the guard
     // point rather than mid-body or past a dropped loop iteration (a
     // value-stack underflow / off-by-one-iteration result otherwise).
-    let resume_state = frame.snapshot_for_tracing();
+    let resume_state = bridge_frame_root.frame().snapshot_for_tracing();
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
     // epilogue (`run_perfn_walk` in trace.rs) reads this flag: only when armed
