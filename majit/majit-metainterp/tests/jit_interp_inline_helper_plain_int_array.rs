@@ -31,7 +31,7 @@ struct CellReadState {
 fn dispatch_cell_read(program: &Bytecode, threshold: u32, cells: Vec<i64>) -> i64 {
     let mut driver: JitDriver<CellReadState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let state = CellReadState { cells };
+    let mut state = CellReadState { cells };
     {
         use majit_metainterp::JitState as _;
         state

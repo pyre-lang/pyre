@@ -41,8 +41,9 @@ struct Header {
 }
 
 /// Owned `rstr.STR` bytes. The pointer stays valid for the life of this value.
+/// Word-aligned so `*mut Header` writes are defined (`Header` is align 8).
 struct RpyStr {
-    buf: Vec<u8>,
+    buf: Vec<u64>,
 }
 
 impl RpyStr {
@@ -50,14 +51,16 @@ impl RpyStr {
         // `rstr.STR`: hash word, length word, chars, plus the extra NUL
         // `extra_item_after_alloc` counts in the token basesize.
         let chars_offset = std::mem::size_of::<Header>();
-        let mut buf = vec![0u8; chars_offset + bytes.len() + 1];
+        let byte_len = chars_offset + bytes.len() + 1;
+        let word_len = byte_len.div_ceil(std::mem::size_of::<u64>());
+        let mut buf = vec![0u64; word_len];
         unsafe {
             let header = buf.as_mut_ptr() as *mut Header;
             (*header).hash = 0;
             (*header).length = bytes.len();
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                buf.as_mut_ptr().add(chars_offset),
+                (buf.as_mut_ptr() as *mut u8).add(chars_offset),
                 bytes.len(),
             );
         }

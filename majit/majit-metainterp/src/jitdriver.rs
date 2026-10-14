@@ -11728,7 +11728,7 @@ mod tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             self.live_values.clone()
         }
 
@@ -11764,11 +11764,11 @@ mod tests {
             self.build_meta_calls.set(self.build_meta_calls.get() + 1);
         }
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             Vec::new()
         }
 
-        fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+        fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
             self.extract_live_values_calls
                 .set(self.extract_live_values_calls.get() + 1);
             Vec::new()
@@ -11805,7 +11805,7 @@ mod tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             Vec::new()
         }
 
@@ -11857,11 +11857,11 @@ mod tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             self.raw_live_values.clone()
         }
 
-        fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+        fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
             self.typed_live_values.clone()
         }
 
@@ -11896,7 +11896,7 @@ mod tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             Vec::new()
         }
 
@@ -11944,7 +11944,7 @@ mod tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             Vec::new()
         }
 
@@ -13523,7 +13523,7 @@ mod tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             // One inputarg so the trace records a valid input.
             vec![self.selected]
         }
@@ -13585,7 +13585,7 @@ mod tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             vec![self.selected]
         }
 
@@ -13996,7 +13996,7 @@ mod tests {
             type Env = ();
 
             fn build_meta(&self, _: usize, _: &()) {}
-            fn extract_live(&self, _: &()) -> Vec<i64> {
+            fn extract_live(&mut self, _: &()) -> Vec<i64> {
                 Vec::new()
             }
             fn create_sym(_: &(), _: usize) {}
@@ -14523,7 +14523,7 @@ mod tests {
             type Sym = ();
             type Env = ();
             fn build_meta(&self, _: usize, _: &()) {}
-            fn extract_live(&self, _: &()) -> Vec<i64> {
+            fn extract_live(&mut self, _: &()) -> Vec<i64> {
                 vec![0]
             }
             fn create_sym(_: &(), _: usize) {}
@@ -14615,7 +14615,7 @@ mod tests {
             type Sym = ();
             type Env = ();
             fn build_meta(&self, _: usize, _: &()) {}
-            fn extract_live(&self, _: &()) -> Vec<i64> {
+            fn extract_live(&mut self, _: &()) -> Vec<i64> {
                 vec![0]
             }
             fn create_sym(_: &(), _: usize) {}
@@ -14716,7 +14716,7 @@ mod tests {
             type Sym = ();
             type Env = ();
             fn build_meta(&self, _: usize, _: &()) {}
-            fn extract_live(&self, _: &()) -> Vec<i64> {
+            fn extract_live(&mut self, _: &()) -> Vec<i64> {
                 vec![0]
             }
             fn create_sym(_: &(), _: usize) {}
@@ -15406,7 +15406,7 @@ mod cross_loop_cut_close_tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             vec![0]
         }
 
@@ -15713,7 +15713,7 @@ mod jitcode_registry_tests {
 
         fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
             Vec::new()
         }
 

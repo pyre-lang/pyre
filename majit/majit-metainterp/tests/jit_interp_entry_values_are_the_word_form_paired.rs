@@ -76,7 +76,7 @@ fn the_entry_values_are_the_word_form_paired() {
         next: std::ptr::null_mut(),
         value: 7,
     };
-    let state = EveryKindState {
+    let mut state = EveryKindState {
         total: -3,
         regs: VirtArray::from_slice(&[11, i64::MIN]),
         head: &mut cell as *mut Cell as usize,

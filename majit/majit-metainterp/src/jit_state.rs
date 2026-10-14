@@ -266,23 +266,26 @@ pub trait JitState: Sized {
 
     fn build_meta(&self, header_pc: usize, env: &Self::Env) -> Self::Meta;
 
-    fn extract_live(&self, meta: &Self::Meta) -> Vec<i64>;
+    fn extract_live(&mut self, meta: &Self::Meta) -> Vec<i64>;
 
-    fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, meta: &Self::Meta) -> Vec<Value> {
         let raw = self.extract_live(meta);
         let types = self.live_value_types(meta);
         raw.into_iter()
-            .zip(types)
-            .map(|(v, t)| match t {
-                Type::Float => Value::Float(f64::from_bits(v as u64)),
-                Type::Ref => Value::Ref(GcRef(v as usize)),
+            .enumerate()
+            .map(|(i, v)| match types.get(i) {
+                Some(Type::Float) => Value::Float(f64::from_bits(v as u64)),
+                Some(Type::Ref) => Value::Ref(GcRef(v as usize)),
                 _ => Value::Int(v),
             })
             .collect()
     }
 
-    fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        self.extract_live(meta).iter().map(|_| Type::Int).collect()
+    /// Types-only: does not derive a store-through address.
+    ///
+    /// Missing entries are `Type::Int` in [`Self::extract_live_values`].
+    fn live_value_types(&self, _meta: &Self::Meta) -> Vec<Type> {
+        Vec::new()
     }
 
     /// Append this state's live values to `out` instead of returning a fresh
@@ -304,7 +307,7 @@ pub trait JitState: Sized {
     /// keeps exactly today's values and today's allocations. Overriding this
     /// method is what removes them.
     fn extract_live_values_into(
-        &self,
+        &mut self,
         meta: &Self::Meta,
         out: &mut Vec<Value>,
         raw: &mut Vec<i64>,
@@ -321,7 +324,7 @@ pub trait JitState: Sized {
     /// when `is_compatible` does not read meta and the reds do not either,
     /// so the entry can skip `IndexMap::get` of `CompiledEntry`. The default
     /// is the meta path.
-    fn fill_entry_reds_without_meta(&self, out: &mut Vec<Value>) -> bool {
+    fn fill_entry_reds_without_meta(&mut self, out: &mut Vec<Value>) -> bool {
         let _ = out;
         false
     }
@@ -330,14 +333,14 @@ pub trait JitState: Sized {
     /// words, in inputarg order. `false` when the state cannot produce them
     /// without the compiled meta (same condition as
     /// `fill_entry_reds_without_meta`).
-    fn fill_entry_raw_reds(&self, out: &mut Vec<i64>) -> bool {
+    fn fill_entry_raw_reds(&mut self, out: &mut Vec<i64>) -> bool {
         let _ = out;
         false
     }
 
     /// Append-to-buffer form of [`Self::extract_live`], for
     /// [`Self::extract_live_values_into`] implementations.
-    fn extract_live_into(&self, meta: &Self::Meta, out: &mut Vec<i64>) {
+    fn extract_live_into(&mut self, meta: &Self::Meta, out: &mut Vec<i64>) {
         out.extend(self.extract_live(meta));
     }
 
@@ -884,7 +887,7 @@ pub trait JitState: Sized {
     }
 
     fn virtualizable_heap_ptr(
-        &self,
+        &mut self,
         _meta: &Self::Meta,
         _virtualizable: &str,
         _info: &VirtualizableInfo,
@@ -1334,7 +1337,14 @@ pub trait JitState: Sized {
                     })
                     .and_then(|layout| layout.slot_types.clone())
             })
-            .unwrap_or_else(|| self.live_value_types(meta));
+            .unwrap_or_else(|| {
+                let types = self.live_value_types(meta);
+                if types.is_empty() {
+                    vec![Type::Int; frame.values.len()]
+                } else {
+                    types
+                }
+            });
         if types.len() != frame.values.len() {
             return false;
         }
@@ -1833,7 +1843,7 @@ mod tests {
         type Env = ();
 
         fn build_meta(&self, _: usize, _: &()) {}
-        fn extract_live(&self, _: &()) -> Vec<i64> {
+        fn extract_live(&mut self, _: &()) -> Vec<i64> {
             Vec::new()
         }
         fn create_sym(_: &(), _: usize) {}

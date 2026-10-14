@@ -115,7 +115,7 @@ fn heap_vable_cells_sum(program: &Bytecode, threshold: u32, frame: usize, n: i64
 fn heap_vable_live_index_sits_past_the_plain_int_array() {
     let mut frame = Frame { token: 0, acc: 0 };
     let frame_ptr = &mut frame as *mut Frame as usize;
-    let state = HeapVableAndCells {
+    let mut state = HeapVableAndCells {
         i: 0,
         n: N,
         cells: seeded_cells(),

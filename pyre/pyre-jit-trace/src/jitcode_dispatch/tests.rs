@@ -4229,12 +4229,14 @@ fn getarrayitem_raw_and_setarrayitem_raw_f_record_and_execute() {
             .expect("`getarrayitem_raw_i/iid>i` must be in insns table");
         let code = [byte, 0x00, 0x01, 0x00, 0x00, 0x02];
         let descr_pool = vec![crate::descr::raw_carray_descr(majit_ir::Type::Int, 8, true)];
-        let mut cell = [0u8; 16];
+        #[repr(C, align(8))]
+        struct Aligned([u8; 16]);
+        let mut cell = Aligned([0u8; 16]);
         let loaded: i64 = 0x0102_0304_0506_0708;
         unsafe {
-            std::ptr::write_unaligned(cell.as_mut_ptr().add(1).cast::<i64>(), loaded);
+            std::ptr::write_unaligned(cell.0.as_mut_ptr().add(1).cast::<i64>(), loaded);
         }
-        let addr = cell.as_ptr() as i64 + 1;
+        let addr = cell.0.as_ptr() as i64 + 1;
         assert_ne!(
             addr as usize % 8,
             0,

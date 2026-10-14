@@ -1,5 +1,6 @@
 use super::lower_value::struct_type_id_tokens;
 use super::*;
+use syn::spanned::Spanned;
 
 /// Length field of a varsize header (`descr.py` `get_field_arraylen_descr`).
 ///
@@ -829,6 +830,7 @@ impl<'c> Lowerer<'c> {
             return self.lower_vable_field_write(expr);
         }
         if let Some(&field_index) = config.state_scalars.get(&member_name) {
+            self.note_sub_jitcode_identity_slot(&member_name, field.member.span());
             let fi = field_index as u16;
             let binding = self.lower_value_expr(&assign.right)?;
             let src = binding.reg;
@@ -842,6 +844,7 @@ impl<'c> Lowerer<'c> {
         // ref(T) scalar: the RHS must lower to a ref binding (another ref
         // state read or a residual ref-returning call).
         if let Some((field_index, _)) = config.state_ref_scalars.get(&member_name) {
+            self.note_sub_jitcode_identity_slot(&member_name, field.member.span());
             let fi = *field_index as u16;
             let binding = self.lower_value_expr(&assign.right)?;
             if !matches!(binding.kind, BindingKind::Ref) {
@@ -855,6 +858,7 @@ impl<'c> Lowerer<'c> {
             return Some(());
         }
         if let Some(&field_index) = config.state_float_scalars.get(&member_name) {
+            self.note_sub_jitcode_identity_slot(&member_name, field.member.span());
             let fi = field_index as u16;
             let binding = self.lower_value_expr(&assign.right)?;
             if !matches!(binding.kind, BindingKind::Float) {
@@ -938,6 +942,7 @@ impl<'c> Lowerer<'c> {
                     quote! { __builder.vable_setfield_int_with_base(#base, #index, #dst); },
                 );
             } else {
+                self.note_sub_jitcode_identity_slot(&member_name, field.member.span());
                 self.emit_op(
                     OpMeta::linear(OpKind::StateField, vec![Register::int(dst)], vec![]),
                     quote! { __builder.store_state_field(#fi, #dst); },
@@ -983,10 +988,160 @@ impl<'c> Lowerer<'c> {
                 quote! { __builder.vable_setfield_float_with_base(#base, #index, #dst); },
             );
         } else {
+            self.note_sub_jitcode_identity_slot(&member_name, field.member.span());
             self.emit_op(
                 OpMeta::linear(OpKind::StateField, vec![Register::float(dst)], vec![]),
                 quote! { __builder.store_state_field_float(#fi, #dst); },
             );
+        }
+        Some(())
+    }
+
+    /// Recognizes `state.array_field[index] += value` and the other numeric
+    /// compound assignments on a plain `[int]`/`[float]` state array. Rust
+    /// evaluates `index` once, so the lowering shares one index register
+    /// between the raw get and set. Python's `a[i] += x` is a load, a binop,
+    /// and a store; `jtransform.py` `rewrite_op_getarrayitem` /
+    /// `rewrite_op_setarrayitem` raw arms emit `getarrayitem_raw_{i,f}` /
+    /// `setarrayitem_raw_{i,f}`. Shape matches
+    /// [`Self::lower_vable_array_update`]. An unsupported op or a kind
+    /// mismatch returns `None` the same way that sibling does.
+    pub(super) fn lower_state_array_update(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let binary = match expr {
+            Expr::Binary(binary) => binary,
+            _ => return None,
+        };
+        let index_expr = match &*binary.left {
+            Expr::Index(index) => index,
+            _ => return None,
+        };
+        let field = match &*index_expr.expr {
+            Expr::Field(field) => field,
+            _ => return None,
+        };
+        if !expr_matches_local_name(&field.base, "state") {
+            return None;
+        }
+        let member_name = named_member(&field.member)?;
+        // `[int; virt]` arrays are NOT handled here — they lower through
+        // `lower_vable_array_update`. Bail before lowering the index/rhs so
+        // they are not emitted twice when the dispatch falls through.
+        if config.state_virt_arrays.contains_key(&member_name) {
+            return None;
+        }
+        let &(array_index, item_kind) = config.state_arrays.get(&member_name)?;
+        let opcode = match item_kind {
+            ValueKind::Float => opcode_for_assign_binop_f(&binary.op)?,
+            ValueKind::Int => opcode_for_assign_binop(&binary.op)?,
+            ValueKind::Ref => return None,
+        };
+        let idx_binding = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(idx_binding.kind, BindingKind::Int) {
+            return None;
+        }
+        let idx_reg = idx_binding.reg;
+        let rhs = self.lower_value_expr(&binary.right)?;
+        match item_kind {
+            ValueKind::Float if !matches!(rhs.kind, BindingKind::Float) => return None,
+            ValueKind::Int if !matches!(rhs.kind, BindingKind::Int) => return None,
+            ValueKind::Ref => unreachable!(),
+            _ => {}
+        }
+        // Identity reds are the `{ptr, len}` pair; the get/set are the
+        // `dum_nocheck` item ops off the pointer (`rlist.py`
+        // `rtype_getitem` / `rtype_setitem`).
+        let base_reg = config
+            .int_identity_base()
+            .saturating_add(config.plain_int_scalar_count())
+            .saturating_add((array_index as u16).saturating_mul(2));
+        let lhs_reg = self.alloc_reg();
+
+        match item_kind {
+            ValueKind::Float => self.emit_op(
+                OpMeta::linear(
+                    OpKind::StateField,
+                    vec![Register::int(base_reg), Register::int(idx_reg)],
+                    vec![Register::float(lhs_reg)],
+                ),
+                quote! {
+                    let __descr_idx = __builder.add_raw_float_array_descr();
+                    __builder.getarrayitem_raw_f(#lhs_reg, #base_reg, #idx_reg, __descr_idx);
+                },
+            ),
+            ValueKind::Int => self.emit_op(
+                OpMeta::linear(
+                    OpKind::StateField,
+                    vec![Register::int(base_reg), Register::int(idx_reg)],
+                    vec![Register::int(lhs_reg)],
+                ),
+                quote! {
+                    let __descr_idx = __builder.add_raw_int_array_descr_signed(
+                        ::core::mem::size_of::<i64>(),
+                        true,
+                    );
+                    __builder.getarrayitem_raw_i(#lhs_reg, #base_reg, #idx_reg, __descr_idx);
+                },
+            ),
+            ValueKind::Ref => unreachable!(),
+        }
+
+        let dst = self.alloc_reg();
+        match item_kind {
+            ValueKind::Float => self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopF,
+                    vec![Register::float(lhs_reg), Register::float(rhs.reg)],
+                    vec![Register::float(dst)],
+                ),
+                binop_f_emit_tokens(dst, &opcode, lhs_reg, rhs.reg),
+            ),
+            ValueKind::Int => self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    Register::ints(&[lhs_reg, rhs.reg]),
+                    vec![Register::int(dst)],
+                ),
+                binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs.reg),
+            ),
+            ValueKind::Ref => unreachable!(),
+        }
+
+        match item_kind {
+            ValueKind::Float => self.emit_op(
+                OpMeta::linear(
+                    OpKind::StateField,
+                    vec![
+                        Register::int(base_reg),
+                        Register::int(idx_reg),
+                        Register::float(dst),
+                    ],
+                    vec![],
+                ),
+                quote! {
+                    let __descr_idx = __builder.add_raw_float_array_descr();
+                    __builder.setarrayitem_raw_f(#base_reg, #idx_reg, #dst, __descr_idx);
+                },
+            ),
+            ValueKind::Int => self.emit_op(
+                OpMeta::linear(
+                    OpKind::StateField,
+                    vec![
+                        Register::int(base_reg),
+                        Register::int(idx_reg),
+                        Register::int(dst),
+                    ],
+                    vec![],
+                ),
+                quote! {
+                    let __descr_idx = __builder.add_raw_int_array_descr_signed(
+                        ::core::mem::size_of::<i64>(),
+                        true,
+                    );
+                    __builder.setarrayitem_raw_i(#base_reg, #idx_reg, #dst, __descr_idx);
+                },
+            ),
+            ValueKind::Ref => unreachable!(),
         }
         Some(())
     }
@@ -1416,6 +1571,7 @@ impl<'c> Lowerer<'c> {
             return self.lower_vable_field_read(expr);
         }
         if let Some(&field_index) = config.state_scalars.get(&member_name) {
+            self.note_sub_jitcode_identity_slot(&member_name, field.member.span());
             let fi = field_index as u16;
             let reg = self.alloc_reg();
             // load_state_field reads the field at its int identity slot into
@@ -1447,6 +1603,7 @@ impl<'c> Lowerer<'c> {
         // ref(T) scalar: read into the ref register bank so a subsequent
         // getfield_gc reads its struct base from a real ref value.
         if let Some((field_index, struct_path)) = config.state_ref_scalars.get(&member_name) {
+            self.note_sub_jitcode_identity_slot(&member_name, field.member.span());
             let fi = *field_index as u16;
             let reg = self.alloc_reg();
             // Declare the ref identity slot as a read so the backward
@@ -1477,6 +1634,7 @@ impl<'c> Lowerer<'c> {
             });
         }
         if let Some(&field_index) = config.state_float_scalars.get(&member_name) {
+            self.note_sub_jitcode_identity_slot(&member_name, field.member.span());
             let fi = field_index as u16;
             let reg = self.alloc_reg();
             let slot = config.float_identity_base() + fi;
@@ -3699,6 +3857,205 @@ mod tests {
                 && !emitted.contains("UintLt")
                 && !emitted.contains("int_lt"),
             "plain [float] store must not emit a compare or guard: {emitted}"
+        );
+    }
+
+    /// `state.cells[i] += v` on a plain `[int]` is one index, a raw get, the
+    /// int binop, and a raw set. `jtransform.py` `rewrite_op_getarrayitem` /
+    /// `rewrite_op_setarrayitem` raw arms.
+    #[test]
+    fn plain_int_array_compound_assign_is_get_binop_set_raw_i() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Int));
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        lowerer.bindings.insert(
+            "v".to_string(),
+            Binding {
+                reg: 3,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: Expr = syn::parse_quote!(state.cells[i] += v);
+        lowerer
+            .lower_state_array_update(&expr)
+            .expect("plain [int] compound assign lowers");
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("getarrayitem_raw_i"), "{emitted}");
+        assert!(emitted.contains("setarrayitem_raw_i"), "{emitted}");
+        assert!(
+            emitted.contains("record_binop_i") && emitted.contains("IntAdd"),
+            "{emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if")
+                && !emitted.contains("UintLt")
+                && !emitted.contains("int_lt"),
+            "plain [int] compound assign must not emit a compare or guard: {emitted}"
+        );
+        assert!(
+            !lowerer
+                .op_metadata
+                .iter()
+                .any(|m| matches!(m.control, ControlFlowClass::ConditionalGuard)),
+            "plain [int] compound assign must not emit a guard: {:?}",
+            lowerer
+                .op_metadata
+                .iter()
+                .map(|m| format!("{:?}", m.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `state.cells[i] += v` on a plain `[float]` is one index, a raw get,
+    /// the float binop, and a raw set.
+    #[test]
+    fn plain_float_array_compound_assign_is_get_binop_set_raw_f() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Float));
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        lowerer.bindings.insert(
+            "v".to_string(),
+            Binding {
+                reg: 3,
+                kind: BindingKind::Float,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: Expr = syn::parse_quote!(state.cells[i] += v);
+        lowerer
+            .lower_state_array_update(&expr)
+            .expect("plain [float] compound assign lowers");
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("getarrayitem_raw_f"), "{emitted}");
+        assert!(emitted.contains("setarrayitem_raw_f"), "{emitted}");
+        assert!(emitted.contains("add_raw_float_array_descr"), "{emitted}");
+        assert!(
+            emitted.contains("record_binop_f") && emitted.contains("FloatAdd"),
+            "{emitted}"
+        );
+        assert!(
+            !emitted.contains("getarrayitem_raw_i") && !emitted.contains("setarrayitem_raw_i"),
+            "float cells must not lower as int: {emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if")
+                && !emitted.contains("UintLt")
+                && !emitted.contains("int_lt"),
+            "plain [float] compound assign must not emit a compare or guard: {emitted}"
+        );
+    }
+
+    /// `opcode_for_assign_binop_f` has no remainder; a kind mismatch is
+    /// refused the same way. Both return `None` with no raw get/set.
+    #[test]
+    fn plain_array_compound_assign_refuses_unsupported_op_and_kind_mismatch() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Float));
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        lowerer.bindings.insert(
+            "v".to_string(),
+            Binding {
+                reg: 3,
+                kind: BindingKind::Float,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: Expr = syn::parse_quote!(state.cells[i] %= v);
+        assert!(
+            lowerer.lower_state_array_update(&expr).is_none(),
+            "float remainder-assign is not in opcode_for_assign_binop_f"
+        );
+        assert!(
+            lowerer.statements.is_empty(),
+            "an unsupported op must not emit: {:?}",
+            lowerer
+                .statements
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+
+        let mut int_config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        int_config
+            .state_arrays
+            .insert("cells".into(), (0, ValueKind::Int));
+        let mut int_lowerer = Lowerer::new(Some(&int_config));
+        int_lowerer.bindings.insert(
+            "i".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        int_lowerer.bindings.insert(
+            "v".to_string(),
+            Binding {
+                reg: 3,
+                kind: BindingKind::Float,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: Expr = syn::parse_quote!(state.cells[i] += v);
+        assert!(
+            int_lowerer.lower_state_array_update(&expr).is_none(),
+            "int cells plus a float rhs is a kind mismatch"
+        );
+        let emitted = int_lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            !emitted.contains("getarrayitem_raw") && !emitted.contains("setarrayitem_raw"),
+            "a kind mismatch must not emit the raw get/set: {emitted}"
         );
     }
 }

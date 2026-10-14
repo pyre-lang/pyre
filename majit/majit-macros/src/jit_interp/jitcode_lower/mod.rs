@@ -13,9 +13,10 @@ mod regalloc;
 pub use api::GeneratedJitCodeBody;
 #[allow(unused_imports)]
 pub(crate) use api::{
-    CallerLocalLayout, assign_caller_local_layout, generate_inline_helper_jitcode_with_calls,
-    inline_helper_arg_classes, inline_helper_param_counts, inline_helper_param_layout,
-    inline_return_kind_class, try_generate_jitcode_body_parts_with_caller_bindings,
+    CallerLocalLayout, SubJitcodeBodyError, assign_caller_local_layout,
+    generate_inline_helper_jitcode_with_calls, inline_helper_arg_classes,
+    inline_helper_param_counts, inline_helper_param_layout, inline_return_kind_class,
+    try_generate_jitcode_body_parts_with_caller_bindings,
     try_generate_jitcode_pc_return_body_with_caller_bindings,
 };
 #[allow(unused_imports)]
@@ -334,9 +335,8 @@ impl LowererConfig {
     /// `MIFrame::setup_call` packs the dispatch JitCode's ref args densely;
     /// a `[.. ; virt]` identity follows the portal greens. A
     /// `virtualizable_fields` heap object is already a `ref(_)` scalar
-    /// and is that named red (`make_virtualizable_infos`
-    /// `index_of_virtualizable`), so its slot is the vable input
-    /// register itself.
+    /// (`warmspot.py` `make_virtualizable_infos` `index_of_virtualizable`)
+    /// and occupies `ref_identity_base + ref_pos` among those slots.
     pub(super) fn ref_identity_base(&self) -> u16 {
         let (_, refs, _) = self.portal_input_kind_counts();
         refs + u16::from(self.vable_var.is_some() && !self.heap_vable_is_ref_scalar())
@@ -384,6 +384,17 @@ impl LowererConfig {
         self.vable_var
             .as_ref()
             .is_some_and(|name| self.state_ref_scalars.contains_key(name))
+    }
+
+    /// Position of a `virtualizable_fields` object among the `ref(_)` /
+    /// `str` state fields (`warmspot.py` `make_virtualizable_infos`
+    /// `index_of_virtualizable`). `None` when the virtualizable is the
+    /// state itself (`[.. ; virt]`) or is not a ref scalar.
+    pub(super) fn heap_vable_ref_pos(&self) -> Option<u16> {
+        let name = self.vable_var.as_ref()?;
+        self.state_ref_scalars
+            .get(name)
+            .map(|(index, _)| *index as u16)
     }
 
     /// Int scalars that keep an independent identity slot (not redirected
@@ -1395,11 +1406,13 @@ impl LowererConfig {
         // of the virtualizable — converge onto the standard
         // virtualizable path: the state binding is the vable identity var.
         // Each virt array becomes a `vable_arrays` entry under its virt
-        // index. The dispatch lowerer overrides the identity ref register
-        // to 1 (the argbox order is `program`(ref reg 0), then the pushed
-        // vable identity → ref reg 1; see `with_vable_input_ref_reg(1)` in
-        // codegen_trace). `state_virt_arrays` stays populated; the
-        // raw-varray lowering branch is retired in a later task.
+        // index. The identity extra-push sits after `program` and every
+        // portal/carried ref green (`warmspot.py` `index_of_virtualizable`
+        // / `jd.num_green_args + jd.index_of_virtualizable`);
+        // `rebind_state_vable_input_ref_reg` stores that register as
+        // `portal_input_kind_counts().1`. `state_virt_arrays` stays
+        // populated; the raw-varray lowering branch is retired in a later
+        // task.
         if vable_var.is_none()
             && crate::jit_interp::state_is_vable_identity(
                 vable_decl,
@@ -1409,7 +1422,7 @@ impl LowererConfig {
             )
         {
             vable_var = Some("state".to_string());
-            vable_input_ref_reg = Some(1);
+            vable_input_ref_reg = None;
             for (name, &(idx, kind)) in &state_virt_arrays {
                 vable_arrays.insert(name.clone(), (idx, kind));
             }
@@ -1526,7 +1539,7 @@ impl LowererConfig {
                 }
             })
             .collect();
-        Self {
+        let mut config = Self {
             io_shims,
             calls,
             auto_calls,
@@ -1577,6 +1590,18 @@ impl LowererConfig {
                 .collect(),
             split_dispatch,
             switch_dispatch,
+        };
+        config.rebind_state_vable_input_ref_reg();
+        config
+    }
+
+    /// State-as-vable identity register: extra-push after every ref green.
+    /// `warmspot.py` `index_of_virtualizable` / `jd.num_green_args +
+    /// jd.index_of_virtualizable`. Heap `virtualizable_fields` keep the
+    /// register `with_vable_input_ref_reg` already bound.
+    fn rebind_state_vable_input_ref_reg(&mut self) {
+        if self.vable_var.as_deref() == Some("state") {
+            self.vable_input_ref_reg = Some(self.portal_input_kind_counts().1);
         }
     }
 
@@ -1591,6 +1616,7 @@ impl LowererConfig {
     pub(super) fn with_loop_carried_greens(&self, greens: Vec<(String, ValueKind)>) -> Self {
         let mut cloned = self.clone();
         cloned.loop_carried_greens = greens;
+        cloned.rebind_state_vable_input_ref_reg();
         cloned
     }
 
@@ -2447,17 +2473,33 @@ mod tests {
         split_dispatch: bool,
         has_infer_call_arm: bool,
     ) -> LowererConfig {
+        empty_lowerer_config_with_portal(
+            state_fields,
+            None,
+            split_dispatch,
+            has_infer_call_arm,
+            &[],
+        )
+    }
+
+    fn empty_lowerer_config_with_portal(
+        state_fields: Option<&crate::jit_interp::StateFieldsConfig>,
+        vable_decl: Option<&crate::jit_interp::VirtualizableDecl>,
+        split_dispatch: bool,
+        has_infer_call_arm: bool,
+        portal_green_params: &[(String, ValueKind)],
+    ) -> LowererConfig {
         let state_type = syn::parse_quote!(State);
         let env_type = syn::parse_quote!(Env);
         LowererConfig::new(
             &[],
             &[],
             false,
-            None,
+            vable_decl,
             state_fields,
             &[],
             &[],
-            &[],
+            portal_green_params,
             &[],
             &state_type,
             &env_type,
@@ -2478,9 +2520,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn split_dispatch_scalars_take_the_state_vable_path() {
-        let state_fields = crate::jit_interp::StateFieldsConfig {
+    fn int_acc_state_fields() -> crate::jit_interp::StateFieldsConfig {
+        crate::jit_interp::StateFieldsConfig {
             fields: vec![crate::jit_interp::StateFieldDecl {
                 name: syn::parse_quote!(acc),
                 kind: crate::jit_interp::StateFieldKind::Scalar {
@@ -2488,12 +2529,74 @@ mod tests {
                     rust_type: None,
                 },
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn split_dispatch_scalars_take_the_state_vable_path() {
+        let state_fields = int_acc_state_fields();
         let config = empty_lowerer_config(Some(&state_fields), true, false);
         assert_eq!(config.vable_var.as_deref(), Some("state"));
         assert_eq!(config.vable_input_ref_reg, Some(1));
+        assert_eq!(config.portal_input_kind_counts().1, 1);
+        assert_eq!(
+            config.ref_identity_base(),
+            config.vable_input_ref_reg.unwrap() + 1
+        );
         assert!(config.vable_fields.contains_key("acc"));
         assert!(config.is_state_vable_field("acc"));
+    }
+
+    #[test]
+    fn extra_portal_ref_green_places_state_vable_after_greens() {
+        let state_fields = int_acc_state_fields();
+        let portal = vec![("extra".to_string(), ValueKind::Ref)];
+        let config =
+            empty_lowerer_config_with_portal(Some(&state_fields), None, true, false, &portal);
+        assert_eq!(config.vable_var.as_deref(), Some("state"));
+        assert_eq!(config.vable_input_ref_reg, Some(2));
+        assert_eq!(config.portal_input_kind_counts().1, 2);
+        assert_eq!(
+            config.ref_identity_base(),
+            config.vable_input_ref_reg.unwrap() + 1
+        );
+        let with_carried =
+            config.with_loop_carried_greens(vec![("carried".into(), ValueKind::Ref)]);
+        assert_eq!(with_carried.vable_input_ref_reg, Some(3));
+        assert_eq!(with_carried.portal_input_kind_counts().1, 3);
+        assert_eq!(
+            with_carried.ref_identity_base(),
+            with_carried.vable_input_ref_reg.unwrap() + 1
+        );
+    }
+
+    #[test]
+    fn extra_portal_ref_green_does_not_rebind_heap_vable_input_reg() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(frame),
+                kind: crate::jit_interp::StateFieldKind::Ref(syn::parse_quote!(Frame)),
+            }],
+        };
+        let decl = crate::jit_interp::VirtualizableDecl {
+            var_name: syn::parse_quote!(frame),
+            token_offset: syn::parse_quote!(TOKEN_OFFSET),
+            fields: vec![],
+            arrays: vec![],
+        };
+        let portal = vec![("extra".to_string(), ValueKind::Ref)];
+        let config = empty_lowerer_config_with_portal(
+            Some(&state_fields),
+            Some(&decl),
+            false,
+            false,
+            &portal,
+        );
+        assert_eq!(config.vable_var.as_deref(), Some("frame"));
+        assert_eq!(config.vable_input_ref_reg, Some(0));
+        let with_carried =
+            config.with_loop_carried_greens(vec![("carried".into(), ValueKind::Ref)]);
+        assert_eq!(with_carried.vable_input_ref_reg, Some(0));
     }
 
     #[test]
@@ -2586,6 +2689,303 @@ mod tests {
         ));
         let config = empty_lowerer_config(Some(&state_fields), true, false);
         assert_int_and_str_take_the_state_vable_path(&config);
+    }
+
+    fn t5_heap_vable_state_fields() -> crate::jit_interp::StateFieldsConfig {
+        crate::jit_interp::StateFieldsConfig {
+            fields: vec![
+                crate::jit_interp::StateFieldDecl {
+                    name: syn::parse_quote!(ticks),
+                    kind: crate::jit_interp::StateFieldKind::Scalar {
+                        ir_type: syn::parse_quote!(int),
+                        rust_type: None,
+                    },
+                },
+                crate::jit_interp::StateFieldDecl {
+                    name: syn::parse_quote!(frame),
+                    kind: crate::jit_interp::StateFieldKind::Ref(syn::parse_quote!(Frame)),
+                },
+            ],
+        }
+    }
+
+    fn t5_heap_vable_decl() -> crate::jit_interp::VirtualizableDecl {
+        crate::jit_interp::VirtualizableDecl {
+            var_name: syn::parse_quote!(frame),
+            token_offset: syn::parse_quote!(FRAME_TOKEN_OFFSET),
+            fields: vec![crate::jit_interp::VableFieldDecl {
+                name: syn::parse_quote!(acc),
+                field_type: syn::parse_quote!(int),
+                offset: syn::parse_quote!(FRAME_ACC_OFFSET),
+            }],
+            arrays: vec![],
+        }
+    }
+
+    fn t5_heap_vable_config(split_dispatch: bool, has_infer_call_arm: bool) -> LowererConfig {
+        let state_fields = t5_heap_vable_state_fields();
+        let decl = t5_heap_vable_decl();
+        let mut config = empty_lowerer_config_with_portal(
+            Some(&state_fields),
+            Some(&decl),
+            split_dispatch,
+            has_infer_call_arm,
+            &[],
+        );
+        config.greens = vec![syn::parse_quote!(pc), syn::parse_quote!(program)];
+        config
+    }
+
+    fn assert_identity_slot_field(err: SubJitcodeBodyError, field: &str) {
+        match err {
+            SubJitcodeBodyError::IdentitySlot { field: got, .. } => {
+                assert_eq!(got, field);
+            }
+            other => panic!("expected IdentitySlot for `{field}`, got {other:?}"),
+        }
+    }
+
+    /// T5: `virtualizable_fields` + a leftover state scalar on a sub-JitCode
+    /// arm (`try_generate_jitcode_body_parts_with_caller_bindings` is the
+    /// infer / `inline_pipeline_*` path). Expansion must fail rather than
+    /// emit `load/store_state_field*` for the assembler identity-slot
+    /// assertion to trip at construct time.
+    #[test]
+    fn heap_vable_sub_jitcode_scalar_store_is_an_identity_slot_error() {
+        let config = t5_heap_vable_config(true, false);
+        assert_eq!(config.vable_var.as_deref(), Some("frame"));
+        assert!(!config.is_state_vable_field("ticks"));
+        let body: Expr = syn::parse_quote!({
+            state.ticks = state.ticks + 7;
+        });
+        let err =
+            match try_generate_jitcode_body_parts_with_caller_bindings(&body, Some(&config), &[]) {
+                Err(err) => err,
+                Ok(_) => panic!("sub-JitCode identity-slot store must fail expansion"),
+            };
+        assert_identity_slot_field(err, "ticks");
+    }
+
+    /// T5 split_dispatch route: a pure `pc += N` arm lowers through
+    /// `try_generate_jitcode_pc_return_body_with_caller_bindings`.
+    #[test]
+    fn heap_vable_split_pc_return_scalar_store_is_an_identity_slot_error() {
+        let config = t5_heap_vable_config(true, false);
+        let body: Expr = syn::parse_quote!({
+            state.ticks = state.ticks + 7;
+            pc += 1;
+        });
+        let locals = vec![("pc".to_string(), binding(0, BindingKind::Int))];
+        let err = match try_generate_jitcode_pc_return_body_with_caller_bindings(
+            &body,
+            Some(&config),
+            &locals,
+            1,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("split_dispatch identity-slot store must fail expansion"),
+        };
+        assert_identity_slot_field(err, "ticks");
+    }
+
+    #[test]
+    fn heap_vable_sub_jitcode_scalar_read_is_an_identity_slot_error() {
+        let config = t5_heap_vable_config(false, true);
+        let body: Expr = syn::parse_quote!({
+            let _x = state.ticks;
+        });
+        let err =
+            match try_generate_jitcode_body_parts_with_caller_bindings(&body, Some(&config), &[]) {
+                Err(err) => err,
+                Ok(_) => panic!("sub-JitCode identity-slot read must fail expansion"),
+            };
+        assert_identity_slot_field(err, "ticks");
+    }
+
+    /// Unlowerable statements on the sub-JitCode fallback keep the abort-stub
+    /// degrade path when the same arm also names an identity-slot scalar
+    /// (`jit_interp_macro_init_is_opaque`).
+    #[test]
+    fn unlowerable_sub_jitcode_arm_degrades_with_identity_scalar() {
+        let config = t5_heap_vable_config(true, false);
+        let body: Expr = syn::parse_quote!({
+            let n = pick!(0);
+            state.ticks = state.ticks + n;
+        });
+        let err =
+            match try_generate_jitcode_body_parts_with_caller_bindings(&body, Some(&config), &[]) {
+                Err(err) => err,
+                Ok(_) => panic!("unlowerable arm must stay a degrade"),
+            };
+        match err {
+            SubJitcodeBodyError::Degrade(reason) => {
+                assert!(!reason.is_empty(), "{reason}");
+            }
+            other => panic!("expected Degrade, got {other:?}"),
+        }
+    }
+
+    /// Portal machines without `split_dispatch` / infer-call keep identity
+    /// scalars; a rejected inline arm falls through to a sub-JitCode abort
+    /// stub (`jit_interp_macro_init_is_opaque` `dispatch_pre`).
+    #[test]
+    fn portal_fallback_sub_jitcode_with_identity_scalar_degrades() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(acc),
+                kind: crate::jit_interp::StateFieldKind::Scalar {
+                    ir_type: syn::parse_quote!(int),
+                    rust_type: None,
+                },
+            }],
+        };
+        let config = empty_lowerer_config(Some(&state_fields), false, false);
+        assert!(config.vable_var.is_none());
+        let body: Expr = syn::parse_quote!({
+            let n = pick!(0);
+            state.acc = state.acc + n;
+        });
+        let err =
+            match try_generate_jitcode_body_parts_with_caller_bindings(&body, Some(&config), &[]) {
+                Err(err) => err,
+                Ok(_) => panic!("unlowerable portal-fallback arm must stay a degrade"),
+            };
+        match err {
+            SubJitcodeBodyError::Degrade(_) => {}
+            other => panic!("expected Degrade, got {other:?}"),
+        }
+    }
+
+    /// Arms inlined into the portal JitCode may still use
+    /// `load/store_state_field*` (`assembler.rs`
+    /// `assert_sub_jitcode_has_no_identity_slots` is sub-JitCode only).
+    #[test]
+    fn portal_arm_heap_vable_scalar_store_still_emits_store_state_field() {
+        let config = t5_heap_vable_config(false, false);
+        let mut lowerer = Lowerer::new(Some(&config));
+        assert!(
+            !lowerer.in_dispatch_arm_body,
+            "portal lowering must not set the sub-JitCode flag"
+        );
+        assert!(
+            lowerer
+                .lower_stmt(&syn::parse_quote!(state.ticks = state.ticks + 7;))
+                .is_some()
+        );
+        let statements = &lowerer.statements;
+        let body = quote!(#(#statements)*).to_string();
+        assert!(
+            body.contains("store_state_field"),
+            "portal identity-slot store must still lower: {body}"
+        );
+        assert!(
+            !body.contains("compile_error"),
+            "portal identity-slot store must not fail expansion: {body}"
+        );
+    }
+
+    #[test]
+    fn state_vable_split_arm_does_not_use_identity_slot_ops() {
+        let state_fields = int_acc_state_fields();
+        let config = empty_lowerer_config(Some(&state_fields), true, false);
+        let body: Expr = syn::parse_quote!({
+            state.acc = state.acc + 7;
+        });
+        let (generated, _) =
+            try_generate_jitcode_body_parts_with_caller_bindings(&body, Some(&config), &[])
+                .expect("state-as-vable split arm must keep lowering");
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("vable_setfield"),
+            "split_dispatch without virtualizable_fields uses setfield_vable_*: {body}"
+        );
+        assert!(
+            !body.contains("store_state_field"),
+            "state-as-vable must not emit identity-slot stores: {body}"
+        );
+    }
+
+    #[test]
+    fn identity_slot_message_names_the_arm_and_field() {
+        let msg = SubJitcodeBodyError::identity_slot_message("OP_ADD", "ticks");
+        assert!(msg.contains("OP_ADD"), "{msg}");
+        assert!(msg.contains("ticks"), "{msg}");
+        assert!(
+            msg.contains("cannot reach identity-slot state reds"),
+            "{msg}"
+        );
+        assert!(msg.contains("virtualizable_fields"), "{msg}");
+        assert!(msg.contains("arm must not be split"), "{msg}");
+    }
+
+    #[test]
+    fn heap_vable_split_dispatch_arm_emits_compile_error() {
+        let config = t5_heap_vable_config(true, false);
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn mainloop(program: &Env) {
+                loop {
+                    jit_merge_point!(driver, program, pc; state);
+                    let opcode = program[pc];
+                    match opcode {
+                        1 => {
+                            state.ticks = state.ticks + 7;
+                            pc += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        };
+        let dispatch = crate::jit_interp::codegen_trace::find_dispatch_match(&func.block)
+            .expect("opcode dispatch");
+        let arms = crate::jit_interp::classify::classify_arms(&dispatch.arms);
+        let generated = lower_dispatch_body(&config, &func.block, &arms, &func.sig.output)
+            .expect("dispatch lowering keeps a body so compile_error! is in it");
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("compile_error"),
+            "sub-JitCode identity-slot access must fail expansion: {body}"
+        );
+        assert!(body.contains("ticks"), "{body}");
+        assert!(body.contains("cannot reach identity-slot"), "{body}");
+        assert!(
+            !body.contains("store_state_field (") && !body.contains("store_state_field("),
+            "must not emit the illegal identity-slot store: {body}"
+        );
+    }
+
+    #[test]
+    fn heap_vable_inlined_portal_arm_does_not_emit_compile_error() {
+        let config = t5_heap_vable_config(false, false);
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn mainloop(program: &Env) {
+                loop {
+                    jit_merge_point!(driver, program, pc; state);
+                    let opcode = program[pc];
+                    match opcode {
+                        1 => {
+                            state.ticks = state.ticks + 7;
+                            pc += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        };
+        let dispatch = crate::jit_interp::codegen_trace::find_dispatch_match(&func.block)
+            .expect("opcode dispatch");
+        let arms = crate::jit_interp::classify::classify_arms(&dispatch.arms);
+        let generated = lower_dispatch_body(&config, &func.block, &arms, &func.sig.output)
+            .expect("inlined portal arm must still lower");
+        let body = generated.body.to_string();
+        assert!(
+            !body.contains("compile_error"),
+            "inlined portal identity-slot store must not fail expansion: {body}"
+        );
+        assert!(
+            body.contains("store_state_field"),
+            "inlined portal arm may emit load/store_state_field*: {body}"
+        );
     }
 
     #[test]
@@ -2819,11 +3219,12 @@ mod tests {
             .state_arrays
             .insert("cells".into(), (0, ValueKind::Int));
         assert!(config.heap_vable_is_ref_scalar());
+        assert_eq!(config.heap_vable_ref_pos(), Some(0));
         assert_eq!(
             config.ref_identity_base(),
             config.portal_input_kind_counts().1,
             "make_virtualizable_infos names the object in the red list, so \
-             its ref-bank slot is the vable input register"
+             its ref-bank slot is ref_identity_base + ref_pos"
         );
         let mut regs = config.identity_slot_registers();
         regs.sort();
@@ -2833,6 +3234,46 @@ mod tests {
             vec![Register::int(base), Register::int(base + 1)],
             "the named red already carries the object; identity slots are \
              ptr then len only"
+        );
+    }
+
+    #[test]
+    fn heap_vable_occupies_its_declared_ref_slot_among_other_refs() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("frame".into());
+        config
+            .state_ref_scalars
+            .insert("extra".into(), (0, syn::parse_quote!(Extra)));
+        config
+            .state_ref_scalars
+            .insert("frame".into(), (1, syn::parse_quote!(Frame)));
+        assert_eq!(config.heap_vable_ref_pos(), Some(1));
+        assert_eq!(
+            config.ref_identity_base(),
+            config.portal_input_kind_counts().1,
+        );
+        let mut regs = config.identity_slot_registers();
+        regs.sort();
+        assert_eq!(
+            regs,
+            vec![Register::ref_(config.ref_identity_base())],
+            "the extra ref keeps its original index; the vable is the named red"
+        );
+
+        config.state_ref_scalars.clear();
+        config
+            .state_ref_scalars
+            .insert("frame".into(), (0, syn::parse_quote!(Frame)));
+        config
+            .state_ref_scalars
+            .insert("extra".into(), (1, syn::parse_quote!(Extra)));
+        assert_eq!(config.heap_vable_ref_pos(), Some(0));
+        let mut regs = config.identity_slot_registers();
+        regs.sort();
+        assert_eq!(
+            regs,
+            vec![Register::ref_(config.ref_identity_base() + 1)],
+            "the extra ref keeps its original index after the vable"
         );
     }
 

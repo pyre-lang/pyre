@@ -3273,7 +3273,22 @@ pub(super) fn lower_dispatch_chain(
                             // carry that reason to the install-time record instead
                             // of collapsing every cause into one string, the same
                             // way `ArmPattern::Unsupported(reason)` is carried below.
-                            Err(reason) => {
+                            Err(SubJitcodeBodyError::IdentitySlot { field, span }) => {
+                                // `assembler.rs` `assert_sub_jitcode_has_no_identity_slots`
+                                // remains the runtime backstop. Fail expansion at
+                                // the field so leftover identity-slot scalars are
+                                // diagnosed at the access (`MIFrame.setup_call` /
+                                // `bhimpl_inline_call_*`).
+                                let msg = SubJitcodeBodyError::identity_slot_message(
+                                    &degraded_arm_name,
+                                    &field,
+                                );
+                                (
+                                    syn::Error::new(span, msg).to_compile_error(),
+                                    dispatch_arm_inline_call_tokens(&[], &[]),
+                                )
+                            }
+                            Err(SubJitcodeBodyError::Degrade(reason)) => {
                                 let record_degraded = record_degraded_arm(&reason);
                                 (
                                     quote::quote! {
@@ -4049,8 +4064,10 @@ pub(crate) fn lower_dispatch_body(
     // (`pc` at i0, then portal and loop-carried int greens), and ref scalars at
     // `ref_regs[base..base+num_ref_scalars)` where base =
     // `ref_identity_base()` skips the dispatch JitCode's ref-bank arguments
-    // (`program` at r0, vable identity at r1 when present), seeded at walk
-    // start by `MIFrame.setup_call`.
+    // (`program` at r0, then a `[.. ; virt]` extra identity when present).
+    // A heap virtualizable is already a ref scalar at
+    // `ref_identity_base + ref_pos`, seeded at walk start by
+    // `MIFrame.setup_call`.
     // `alloc_reg` draws BOTH int and ref working registers from the single
     // `next_reg` counter, so floor it above the larger prefix: a working
     // register that aliased an identity slot would clobber a red

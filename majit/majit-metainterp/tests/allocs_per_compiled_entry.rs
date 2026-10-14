@@ -575,13 +575,19 @@ fn main() {
 /// remaining rows are backend-neutral. The figure was per-backend while
 /// dynasm still built its entry frame off the GC.
 ///
-/// All four allocations are shared by both backends:
+/// Three remaining allocations are shared by both backends:
 ///
 /// | n | site |
 /// |---|------|
-/// | 2 | `CounterState::extract_live_into` — TWO separate `extract_live()` calls, one `Vec<i64>` each: `JitState::extract_live_values`'s default (`jit_state.rs`) calls it and then `live_value_types`, whose default calls it AGAIN. A two-int-scalar state builds each Vec in one allocation (capacity 0→4, no regrowth); the 2 is a doubled traversal, not a regrowth |
+/// | 1 | `CounterState::extract_live_into` — `JitState::extract_live_values`'s default (`jit_state.rs`) calls `extract_live`. A two-int-scalar state builds the `Vec<i64>` in one allocation (capacity 0→4, no regrowth) |
 /// | 1 | `JitState::extract_live_values` default body in `jit_state.rs` — the `Vec<Value>` it collects into |
-/// | 1 | `JitState::live_value_types` default body in `jit_state.rs` — the `Vec<Type>` it collects into |
+/// | 1 | `CounterState::live_value_types` — the static `Vec<Type>` override (`codegen_state.rs`) that `extract_live_values`' default reads. Two `Type::Int` for the two int scalars, in `extract_live` order |
+///
+/// `live_value_types` is types-only and no longer calls `extract_live`
+/// (`maybe_compile_and_run` still takes the reds from `extract_live`). The
+/// trait default still returns an empty `Vec`; int-scalar / plain-array
+/// states get the static list so the default pairing sees one `Type::Int`
+/// per red.
 ///
 /// Four shared rows have gone since:
 ///
@@ -601,15 +607,16 @@ fn main() {
 ///   the finish latch, into the public run outcome, into the guard arm's own
 ///   copy — so there is nothing to hand back.
 ///
-/// ⚠ ALL FOUR ARE A PROPERTY OF THIS FIXTURE'S STATE SHAPE, not of the
+/// ⚠ ALL THREE ARE A PROPERTY OF THIS FIXTURE'S STATE SHAPE, not of the
 /// entry path in general. `codegen_state.rs`'s `generate_state_fields_jit_state`
 /// emits the non-allocating
 /// `extract_live_values_into` / `live_value_types_into` overrides only when the
 /// state has a ref scalar, a float scalar or a virt array; a state of int
-/// scalars only — which `CounterState` is — gets neither, and falls back to the
-/// allocating `JitState` defaults. A state that clears that gate pays 4 fewer.
+/// scalars only — which `CounterState` is — gets the allocating
+/// `extract_live_values` default plus a static `live_value_types` list.
+/// A state that clears that gate pays 3 fewer.
 ///
-/// `dynasm` adds NOTHING, and its four are the four shared rows above.
+/// `dynasm` adds NOTHING, and its three are the three shared rows above.
 ///
 /// It used to add three. The three that went:
 ///
@@ -665,4 +672,4 @@ fn main() {
 ///   `run_compiled_code_inner`, reached because this fixture had no GC at all;
 ///   see [`install_gc`]. The branch itself remains for a backend running
 ///   without a collector.
-const ALLOCS_PER_ENTRY: usize = 4;
+const ALLOCS_PER_ENTRY: usize = 3;

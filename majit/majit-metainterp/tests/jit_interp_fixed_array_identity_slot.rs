@@ -109,7 +109,7 @@ mod fixed_array_before_virt_array {
     /// `cells.len()`.
     #[test]
     fn the_identity_sits_past_the_plain_int_array_pointer() {
-        let state = FixedAndVirt {
+        let mut state = FixedAndVirt {
             ret: 0,
             cells: vec![0i64, 0i64],
             iregs: VirtArray::from_slice(&[0i64, 4, 0i64]),

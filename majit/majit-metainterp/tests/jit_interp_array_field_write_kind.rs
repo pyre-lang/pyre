@@ -98,7 +98,7 @@ struct PointerFieldState {
 fn pointer_field_only(program: &Bytecode, threshold: u32) -> i64 {
     let mut driver: JitDriver<PointerFieldState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let state = PointerFieldState { a: 0, sel: 0 };
+    let mut state = PointerFieldState { a: 0, sel: 0 };
     {
         use majit_metainterp::JitState as _;
         state

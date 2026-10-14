@@ -10608,7 +10608,7 @@ impl JitState for PyreJitState {
         }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         self.extract_live_values(_meta)
             .into_iter()
             .map(|value| match value {
@@ -10620,7 +10620,7 @@ impl JitState for PyreJitState {
             .collect()
     }
 
-    fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, meta: &Self::Meta) -> Vec<Value> {
         if meta.trace_extra_reds == 1 {
             self.pypyjit_live_values_with_ec(meta)
         } else {
@@ -10629,7 +10629,7 @@ impl JitState for PyreJitState {
     }
 
     fn extract_live_values_into(
-        &self,
+        &mut self,
         meta: &Self::Meta,
         out: &mut Vec<Value>,
         raw: &mut Vec<i64>,
@@ -12405,7 +12405,7 @@ impl JitState for PyreJitState {
     }
 
     fn virtualizable_heap_ptr(
-        &self,
+        &mut self,
         _meta: &Self::Meta,
         _virtualizable: &str,
         _info: &VirtualizableInfo,

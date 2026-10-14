@@ -153,7 +153,7 @@ impl JitState for UnpackJitState {
         }
     }
 
-    fn extract_live(&self, meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, meta: &Self::Meta) -> Vec<i64> {
         // The live reds are the tracer's InputArgs, not interpreter-frame
         // values; the dormant driver holds no concrete frame to project them
         // from.

@@ -123,7 +123,7 @@ impl JitState for GenEntryJitState {
         }
     }
 
-    fn extract_live(&self, meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, meta: &Self::Meta) -> Vec<i64> {
         // The live reds are the tracer's InputArgs; this driver projects no
         // interpreter frame.
         let _ = meta;

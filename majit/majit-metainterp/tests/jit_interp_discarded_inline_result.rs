@@ -160,7 +160,7 @@ struct DiscardOnlyState {
 fn dispatch_discard_only(program: &Bytecode, threshold: u32) -> i64 {
     let mut driver: JitDriver<DiscardOnlyState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let state = DiscardOnlyState { total: 0, sel: 0 };
+    let mut state = DiscardOnlyState { total: 0, sel: 0 };
     {
         use majit_metainterp::JitState as _;
         state

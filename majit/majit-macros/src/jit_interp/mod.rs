@@ -2340,7 +2340,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __driver: &mut majit_metainterp::JitDriver<#state_type>,
             __env: &#env_type,
             __pc: usize,
-            state: &#state_type,
+            state: &mut #state_type,
             #(#portal_green_param_decls)*
             #(#carried_param_decls)*
         ) -> ::core::option::Option<(
@@ -3973,7 +3973,7 @@ fn rewrite_body(
                                     &mut #driver,
                                     #env,
                                     #pc,
-                                    &#state,
+                                    &mut #state,
                                     #(#portal_green_args),*
                                     #(#carried_green_args),*
                                 );
@@ -4145,7 +4145,7 @@ fn rewrite_body(
                                     &mut #driver,
                                     #env,
                                     #pc,
-                                    &state,
+                                    &mut state,
                                     #(#portal_green_args),*
                                     #(#carried_green_args),*
                                 );

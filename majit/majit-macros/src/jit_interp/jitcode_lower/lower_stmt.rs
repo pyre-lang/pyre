@@ -1492,6 +1492,12 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_raw_store_stmt(expr) {
             return Some(());
         }
+        // Plain `[int]`/`[float]` compound assign then store. Update before
+        // write, matching the vable array pair. `jtransform.py`
+        // `rewrite_op_getarrayitem` / `rewrite_op_setarrayitem` raw arms.
+        if let Some(()) = self.lower_state_array_update(expr) {
+            return Some(());
+        }
         if let Some(()) = self.lower_state_array_write(expr) {
             return Some(());
         }

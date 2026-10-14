@@ -114,7 +114,7 @@ fn ref_state_field_lowers_load_and_store_state_field_ref() {
 fn ref_state_field_live_value_types_tags_ref_slot() {
     use majit_metainterp::JitState as _;
     let program: &Bytecode = &[OP_NOP];
-    let state = RefTestState { a: 7, sel: 0 };
+    let mut state = RefTestState { a: 7, sel: 0 };
     let meta = state.build_meta(0, program);
     let live = state.extract_live(&meta);
     let types = state.live_value_types(&meta);

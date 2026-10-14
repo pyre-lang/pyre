@@ -113,7 +113,7 @@ fn heap_frame_virtualizable_methods(
         }
 
         fn virtualizable_heap_ptr(
-            &self,
+            &mut self,
             _meta: &Self::Meta,
             _virtualizable: &str,
             _info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -154,11 +154,15 @@ fn heap_frame_virtualizable_methods(
 
         fn export_virtualizable_boxes(
             &self,
-            meta: &Self::Meta,
-            virtualizable: &str,
+            _meta: &Self::Meta,
+            _virtualizable: &str,
             info: &majit_metainterp::virtualizable::VirtualizableInfo,
         ) -> Option<(::std::vec::Vec<i64>, ::std::vec::Vec<usize>)> {
-            let __ptr = self.virtualizable_heap_ptr(meta, virtualizable, info)?;
+            // Named heap object's address is the stored `ref(_)` field.
+            let __ptr = self.#var_name as *const u8;
+            if __ptr.is_null() {
+                return None;
+            }
             if !info.can_read_all_array_lengths_from_heap() {
                 return None;
             }
@@ -412,34 +416,33 @@ fn generate_state_fields_jit_state(
     // the ref scalars among which the object sits. `extract_live`,
     // `live_value_types`, and `restore` emit that same order; the object
     // is a ref scalar, so `num_vable_identity_slots` stays 0. Restore
-    // reads it from the ref bank at `ref_pos`; that bank starts at the
-    // vable input register because the object IS that named red.
-    let heap_vable_index: Option<usize> = if !state_is_vable_identity {
+    // reads it from the ref bank at `ref_identity_base + ref_pos`.
+    let heap_vable_ref_pos: Option<usize> = if !state_is_vable_identity {
         config.virtualizable_decl.as_ref().map(|decl| {
             let name = decl.var_name.to_string();
-            let ref_pos = ref_scalars
+            ref_scalars
                 .iter()
                 .position(|(_, f)| f.name == name)
                 .unwrap_or_else(|| {
                     panic!("virtualizable_fields var `{name}` must be a `ref(_)` state field")
-                });
-            num_int_identity + ref_pos
+                })
         })
     } else {
         None
     };
+    let heap_vable_index: Option<usize> =
+        heap_vable_ref_pos.map(|ref_pos| num_int_identity + ref_pos);
     let carry_vable_boxes = state_is_vable_identity || heap_vable_index.is_some();
     // First ref-bank register available for ref-scalar identity slots.
     // `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
-    // from r0 (`program` at r0, the virtualizable identity at r1 when
-    // present — `with_vable_input_ref_reg(1)` in codegen_trace). A
-    // `[.. ; virt]` identity is that extra argument, so ref scalars start
-    // one past it. A `virtualizable_fields` heap object is already a
-    // `ref(_)` scalar and is that same named red (`make_virtualizable_infos`
-    // `index_of_virtualizable`), so its slot IS the vable input register
-    // and later ref scalars follow. Mirrors `LowererConfig::ref_identity_base`.
-    let vable_input_ref_reg: usize = 1 + portal_ref_greens + carried_ref_greens;
-    let ref_identity_base: usize = vable_input_ref_reg
+    // from r0 (`program` at r0). A `[.. ; virt]` identity is an extra
+    // argument after the portal greens, so ref scalars start one past it.
+    // A `virtualizable_fields` heap object is already a `ref(_)` scalar
+    // (`warmspot.py` `make_virtualizable_infos` `index_of_virtualizable`):
+    // every ref state field, that object included, occupies one register
+    // at `ref_identity_base + ref_pos`. Mirrors `LowererConfig::ref_identity_base`.
+    let portal_ref_bank_end: usize = 1 + portal_ref_greens + carried_ref_greens;
+    let ref_identity_base: usize = portal_ref_bank_end
         + usize::from(
             (config.virtualizable_decl.is_some() || state_is_vable_identity)
                 && heap_vable_index.is_none(),
@@ -492,20 +495,22 @@ fn generate_state_fields_jit_state(
         .map(|(_, f)| {
             let fname = &f.name;
             quote! {
-                values.push(self.#fname.as_ptr() as i64);
+                // JIT stores through this address (`setarrayitem_raw_*`), so
+                // it is derived from a mutable borrow.
+                values.push(self.#fname.as_mut_ptr() as i64);
                 values.push(self.#fname.len() as i64);
             }
         })
         .collect();
-    // One value: the virtualizable identity (`&state` ==
+    // One value: the virtualizable identity (`&mut state` ==
     // `virtualizable_heap_ptr`), NOT any array's data pointer —
     // `vable_getarrayitem_*` reaches every element from this base through the
     // storage each field registered, and all `[.. ; virt]` arrays share it.
     // Emitting it once
     // is `virtualizable.py load_list_of_boxes`; the lengths stay off the red vector
-    // (`virtualizable.py:150-153` reads them off the live object).
+    // (`virtualizable.py` reads them off the live object).
     let extract_vable_identity_part: TokenStream = if has_vable_identity {
-        quote! { values.push(self as *const Self as i64); }
+        quote! { values.push(self as *mut Self as i64); }
     } else {
         quote! {}
     };
@@ -652,7 +657,7 @@ fn generate_state_fields_jit_state(
         })
         .collect();
     // Reds in `extract_live` order: int scalars, then ptr then len per
-    // `[int]`, then the single `&state` identity (Ref) when the state has a
+    // `[int]`, then the single `&mut state` identity (Ref) when the state has a
     // virtualizable.  Mirrors `extract_scalar_parts` / `extract_array_parts` /
     // `extract_vable_identity_part` so the fresh reds match the callee loop's
     // input-arg layout and `live_value_types` routing.
@@ -667,10 +672,10 @@ fn generate_state_fields_jit_state(
     } else {
         quote! {}
     };
-    // The freshly-boxed `&state` identity feeds the one vable Ref slot; only
+    // The freshly-boxed `&mut state` identity feeds the one vable Ref slot; only
     // bound when the state is the virtualizable identity.
     let fresh_entry_base_let: TokenStream = if has_vable_identity {
-        quote! { let __base = &*__fresh as *const #state_type as i64; }
+        quote! { let __base = &mut *__fresh as *mut #state_type as i64; }
     } else {
         quote! {}
     };
@@ -688,7 +693,7 @@ fn generate_state_fields_jit_state(
             fn recursive_fresh_entry_reds(
                 &self,
             ) -> Option<(Vec<majit_ir::Value>, Box<dyn ::core::any::Any>)> {
-                let __fresh: Box<#state_type> = Box::new(#state_type {
+                let mut __fresh: Box<#state_type> = Box::new(#state_type {
                     #(#fresh_entry_scalar_inits)*
                     #(#fresh_entry_virt_array_inits)*
                 });
@@ -1065,8 +1070,8 @@ fn generate_state_fields_jit_state(
     // `extract_live_into` / `live_value_types_into` produce for readers that
     // want them apart, and pairing the two here would fill both buffers and
     // walk them again for every entry, so the pair is emitted directly.
-    // Emitted under the same condition as `live_value_types_into`, so a state
-    // with only int fields keeps the trait default.
+    // Emitted when a field is not Int: a state of int fields only keeps the
+    // trait default, which pairs `extract_live` words as `Type::Int`.
     let extract_live_value_scalar_parts: Vec<TokenStream> = scalars
         .iter()
         .map(|(_, f)| {
@@ -1079,14 +1084,16 @@ fn generate_state_fields_jit_state(
         .map(|(_, f)| {
             let fname = &f.name;
             quote! {
-                out.push(majit_ir::Value::Int(self.#fname.as_ptr() as i64));
+                // JIT stores through this address (`setarrayitem_raw_*`), so
+                // it is derived from a mutable borrow.
+                out.push(majit_ir::Value::Int(self.#fname.as_mut_ptr() as i64));
                 out.push(majit_ir::Value::Int(self.#fname.len() as i64));
             }
         })
         .collect();
     let extract_live_value_vable_identity_part: TokenStream = if has_vable_identity {
         quote! {
-            out.push(majit_ir::Value::Ref(majit_ir::GcRef(self as *const Self as usize)));
+            out.push(majit_ir::Value::Ref(majit_ir::GcRef(self as *mut Self as usize)));
         }
     } else {
         quote! {}
@@ -1111,7 +1118,7 @@ fn generate_state_fields_jit_state(
         if num_ref_scalars > 0 || has_vable_identity || num_float_scalars > 0 {
             quote! {
                 fn extract_live_values_into(
-                    &self,
+                    &mut self,
                     _meta: &#meta_ty,
                     out: &mut ::std::vec::Vec<majit_ir::Value>,
                     raw: &mut ::std::vec::Vec<i64>,
@@ -1135,7 +1142,7 @@ fn generate_state_fields_jit_state(
     let fill_entry_reds_without_meta_override: TokenStream = if steady_entry_without_meta {
         quote! {
             fn fill_entry_reds_without_meta(
-                &self,
+                &mut self,
                 out: &mut ::std::vec::Vec<majit_ir::Value>,
             ) -> bool {
                 #(#extract_live_value_scalar_parts)*
@@ -1166,7 +1173,11 @@ fn generate_state_fields_jit_state(
         .flat_map(|(_, f)| {
             let fname = &f.name;
             [
-                quote! { self.#fname.as_ptr() as i64 },
+                quote! {
+                    // JIT stores through this address (`setarrayitem_raw_*`), so
+                    // it is derived from a mutable borrow.
+                    self.#fname.as_mut_ptr() as i64
+                },
                 quote! { self.#fname.len() as i64 },
             ]
         })
@@ -1192,7 +1203,7 @@ fn generate_state_fields_jit_state(
         // `Vec::extend_from_slice`'s memmove. Spell the spare-capacity
         // arm as stores so the inline form keeps the outlined fast path.
         let raw_vable_expr: TokenStream = if has_vable_identity {
-            quote! { self as *const Self as i64 }
+            quote! { self as *mut Self as i64 }
         } else {
             quote! {}
         };
@@ -1214,7 +1225,7 @@ fn generate_state_fields_jit_state(
             .collect();
         quote! {
             #[inline]
-            fn fill_entry_raw_reds(&self, out: &mut ::std::vec::Vec<i64>) -> bool {
+            fn fill_entry_raw_reds(&mut self, out: &mut ::std::vec::Vec<i64>) -> bool {
                 let __len = out.len();
                 if out.capacity().wrapping_sub(__len) >= #raw_count {
                     unsafe {
@@ -1246,6 +1257,13 @@ fn generate_state_fields_jit_state(
         }
         None => quote! {},
     };
+    // Types-only: never derives a store-through address, so the receiver
+    // stays `&self` even when `extract_live` takes `&mut self`.
+    // `warmspot.py` `jd.red_args_types`: the red types are a static
+    // property of the jitdriver. Ref/float/vable states emit the
+    // buffer form (same condition as `extract_live_values_into`);
+    // int-scalar / plain-array states emit a static list matching
+    // `extract_live` order.
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || has_vable_identity || num_float_scalars > 0 {
             quote! {
@@ -1263,7 +1281,7 @@ fn generate_state_fields_jit_state(
                     // ptr then len Ints per `[int]`, then the ONE
                     // virtualizable identity (Ref), then appended ref scalars
                     // (Ref), then appended float scalars (Float).
-                    // The identity slot MUST be Ref so the live `&state` is a Ref
+                    // The identity slot MUST be Ref so the live `&mut state` is a Ref
                     // failarg (TAGBOX), which the resume reader decodes through
                     // `decode_ref` in both the vable section and the frame
                     // ref-liveness.
@@ -1287,7 +1305,24 @@ fn generate_state_fields_jit_state(
                 }
             }
         } else {
-            quote! {}
+            // Same `scalars` / `arrays` lists as `extract_scalar_parts` /
+            // `extract_array_parts`: one Int per int scalar, two Ints
+            // (ptr, then len) per plain array.
+            let static_live_types: Vec<TokenStream> = scalars
+                .iter()
+                .map(|_| quote! { majit_ir::Type::Int })
+                .chain(arrays.iter().flat_map(|_| {
+                    [
+                        quote! { majit_ir::Type::Int },
+                        quote! { majit_ir::Type::Int },
+                    ]
+                }))
+                .collect();
+            quote! {
+                fn live_value_types(&self, _meta: &#meta_ty) -> Vec<majit_ir::Type> {
+                    vec![#(#static_live_types),*]
+                }
+            }
         };
     let restore_banked_override: TokenStream = if num_ref_scalars > 0 || num_float_scalars > 0 {
         quote! {
@@ -1587,22 +1622,21 @@ fn generate_state_fields_jit_state(
                 use majit_metainterp::virtualizable::VirtualizableInfo;
                 // No `vable_token` field: the stack-local state struct is
                 // non-GC and never moved, so the token protocol is inert — the
-                // identity value (a `&state` pointer) is recovered straight
+                // identity value (a `&mut state` pointer) is recovered straight
                 // from the resume snapshot, not via a heap token. The struct's
                 // offset 0 is a live user field, so every token read/write must
                 // no-op rather than land there.
                 let mut __info = VirtualizableInfo::without_vable_token();
                 __info.name = "state".to_string();
                 __info.outer_executor_owns_state = #outer_executor_owns_state;
-                // The dispatch lowering binds the green ref `program` to ref
-                // register 0 (it is the base for `program[pc]` reads) and the
-                // `&state` virtualizable identity to ref register 1
-                // (`vable_input_ref_reg = 1`, jitcode_lower/mod.rs). Tell
-                // `initialize_virtualizable` to mint the standard box at that
-                // ref-bank index so it matches the traced vable base (the flat
-                // `num_green_args + index_of_virtualizable` ordinal would
-                // resolve to 0, the slot the green ref occupies).
-                __info.identity_ref_bank_index = Some(1);
+                // `warmspot.py` `index_of_virtualizable`: greens precede the
+                // virtualizable red (`jd.num_green_args +
+                // jd.index_of_virtualizable`). Extra-push of `&mut state` sits at
+                // `portal_ref_bank_end` (`1 + portal_ref_greens +
+                // carried_ref_greens`), which is `ref_identity_base - 1` and
+                // the same register `with_vable_input_ref_reg` binds from
+                // `portal_input_kind_counts().1`.
+                __info.identity_ref_bank_index = Some(#portal_ref_bank_end);
                 #identity_live_index_stmt
                 #(#scalar_field_parts)*
                 #(#virt_array_field_parts)*
@@ -1612,15 +1646,16 @@ fn generate_state_fields_jit_state(
             }
 
             fn virtualizable_heap_ptr(
-                &self,
+                &mut self,
                 _meta: &Self::Meta,
                 _virtualizable: &str,
                 _info: &majit_metainterp::virtualizable::VirtualizableInfo,
             ) -> Option<*mut u8> {
                 // The state struct is a stack-allocated mainloop local —
                 // stable and non-GC. Use its address as the vable identity
-                // heap pointer.
-                Some(self as *const Self as *mut u8)
+                // heap pointer. `setfield_vable_*` / `setarrayitem_vable_*`
+                // store through this address, so it is derived from `&mut self`.
+                Some(self as *mut Self as *mut u8)
             }
 
             // warmstate.py `execute_assembler`: all a compiled entry
@@ -1723,11 +1758,11 @@ fn generate_state_fields_jit_state(
                 decl.var_name
             );
         };
-        // The object is the named red at the vable input register
-        // (`with_vable_input_ref_reg` in codegen_trace), which is also
-        // `ref_identity_base` so restore reads it from the same slot
-        // `make_virtualizable_infos` indexes.
-        let identity_ref_bank_index = ref_identity_base;
+        // The object is the named red at `ref_identity_base + ref_pos`
+        // (`warmspot.py` `make_virtualizable_infos` `index_of_virtualizable`).
+        // `with_vable_input_ref_reg` binds vable ops to that same register.
+        let identity_ref_bank_index = ref_identity_base
+            + heap_vable_ref_pos.expect("heap_vable_index implies a declared ref_pos");
         heap_frame_virtualizable_methods(decl, struct_path, index, identity_ref_bank_index)
     } else {
         quote! {}
@@ -2072,7 +2107,7 @@ fn generate_state_fields_jit_state(
             // `execute_assembler` reds that are already unboxed locals, so the
             // entry path allocates nothing to describe them. The driver keeps
             // these buffers across calls, so a warm entry refills them.
-            fn extract_live_into(&self, _meta: &#meta_ty, values: &mut ::std::vec::Vec<i64>) {
+            fn extract_live_into(&mut self, _meta: &#meta_ty, values: &mut ::std::vec::Vec<i64>) {
                 #(#extract_scalar_parts)*
                 #(#extract_array_parts)*
                 #extract_vable_identity_part
@@ -2080,7 +2115,7 @@ fn generate_state_fields_jit_state(
                 #(#extract_float_scalar_parts)*
             }
 
-            fn extract_live(&self, _meta: &#meta_ty) -> Vec<i64> {
+            fn extract_live(&mut self, _meta: &#meta_ty) -> Vec<i64> {
                 let mut values = Vec::new();
                 self.extract_live_into(_meta, &mut values);
                 values

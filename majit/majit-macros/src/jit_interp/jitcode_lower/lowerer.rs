@@ -82,6 +82,11 @@ pub(super) struct Lowerer<'c> {
     /// model where `loop_header` lives only in the dispatch-equivalent
     /// JitCode.
     pub(super) in_dispatch_arm_body: bool,
+    /// First identity-slot field a sub-JitCode body tried to
+    /// `load/store_state_field*`. A fully-lowered body fails expansion
+    /// at that access. `MIFrame.setup_call` / `bhimpl_inline_call_*`
+    /// copy declared args only.
+    pub(super) sub_jitcode_identity_slot: Option<(String, proc_macro2::Span)>,
     /// Label for the dispatch loop start (BC_JIT_MERGE_POINT).
     /// Set by `lower_dispatch_body` so that `continue` statements
     /// in pre-dispatch match arms can emit BC_GOTO to restart the
@@ -174,6 +179,7 @@ impl<'c> Lowerer<'c> {
             nested_failure_reasons: Vec::new(),
             opcode_var_name: None,
             in_dispatch_arm_body: false,
+            sub_jitcode_identity_slot: None,
             dispatch_loop_label: None,
             pc_pinned: false,
             join_merge: HashMap::new(),
@@ -248,6 +254,34 @@ impl<'c> Lowerer<'c> {
         }
         self.nested_failure_reasons
             .append(&mut nested.nested_failure_reasons);
+        self.absorb_nested_identity_slot(nested);
+    }
+
+    /// Copy a child's recorded identity-slot access. Called when the child
+    /// returns (success or failure): an `if`/`loop` body that fully lowers
+    /// still named a portal red the callee cannot reach (`MIFrame.setup_call`).
+    pub(super) fn absorb_nested_identity_slot(&mut self, nested: &mut Lowerer<'_>) {
+        if self.sub_jitcode_identity_slot.is_none() {
+            self.sub_jitcode_identity_slot = nested.sub_jitcode_identity_slot.take();
+        }
+    }
+
+    /// Record the first identity-slot field a sub-JitCode body would
+    /// `load/store_state_field*`. The emit continues so a body that otherwise
+    /// lowers fails expansion after the statement loop; an arm that degrades
+    /// for another reason keeps its abort stub.
+    ///
+    /// `MIFrame.setup_call` / `bhimpl_inline_call_*` copy declared args
+    /// only. `warmspot.py` `make_virtualizable_infos` has one
+    /// virtualizable per jitdriver, so leftover state scalars stay portal
+    /// identity reds a callee cannot reach.
+    pub(super) fn note_sub_jitcode_identity_slot(&mut self, field: &str, span: proc_macro2::Span) {
+        if !self.in_dispatch_arm_body {
+            return;
+        }
+        if self.sub_jitcode_identity_slot.is_none() {
+            self.sub_jitcode_identity_slot = Some((field.to_string(), span));
+        }
     }
 
     pub(super) fn install_vable_input_binding(&mut self) {
