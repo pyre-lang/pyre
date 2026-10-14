@@ -24974,6 +24974,20 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<(A, B, …) as Default>::default` is `TupleRepr.newtuple`
+                // of each element's default: malloc of the tuple GcStruct
+                // plus one setfield per item. A residual
+                // `core::tuple::<Impl>::default` is not in CallRegistry.
+                if args.is_empty()
+                    && self.is_tuple_default(&reg, &call.dest.ty)
+                    && let Some(tuple) = self.emit_default_of_ty(bb_id, &call.dest.ty)
+                {
+                    self.local_var[dest_local] = Some(LocalValue::One(tuple));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
 
                 if args.len() == 1 && self.is_const_ptr_as_ref(&reg) {
                     self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
@@ -34623,6 +34637,204 @@ impl<'a> Lowering<'a> {
         };
         is_core_default_path(fd.item_meta.name_path().as_str())
             && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
+    }
+
+    /// `core::tuple::<Impl>::default` whose destination is a non-unit
+    /// tuple whose every element has a Default the front end already
+    /// lowers (scalar zero, void ZST, empty `Vec`, nested tuple).
+    fn is_tuple_default(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        is_core_tuple_default_path(fd.item_meta.name_path().as_str())
+            && tyref_is_tuple(dest_ty, self.llbc)
+            && self.can_emit_default_of_ty(dest_ty)
+    }
+
+    /// True when [`Self::emit_default_of_ty`] can build `ty` without a
+    /// residual `Default` call. Checked before any op is pushed so a
+    /// later unknown element does not leave a half-built tuple in the
+    /// block.
+    fn can_emit_default_of_ty(&self, ty: &TyRef) -> bool {
+        if tyref_is_tuple(ty, self.llbc) {
+            let mut idx = 0;
+            loop {
+                let Some(elem_ty) = tyref_tuple_element(ty, idx, self.llbc) else {
+                    return idx > 0;
+                };
+                if !self.can_emit_default_of_ty(&elem_ty) {
+                    return false;
+                }
+                idx += 1;
+            }
+        }
+        tyref_is_void_zst(ty, self.llbc)
+            || tyref_is_zero_sized(ty, self.llbc)
+            || tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc)
+            || tyref_is_vec_value(ty, self.llbc)
+    }
+
+    /// Default of `ty`: scalar zero, unit, empty `Vec` (`vec::Vec::new`
+    /// → `newlist` / `ll_newemptylist`), or `TupleRepr.newtuple` of those.
+    fn emit_default_of_ty(&mut self, bb_id: BlockId, ty: &TyRef) -> Option<Variable> {
+        if tyref_is_tuple(ty, self.llbc) {
+            return self.emit_tuple_of_element_defaults(bb_id, ty);
+        }
+        if tyref_is_void_zst(ty, self.llbc) || tyref_is_zero_sized(ty, self.llbc) {
+            return Some(self.emit_unit(bb_id));
+        }
+        if tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
+            return self.emit_zero_constant_of_ty(bb_id, ty);
+        }
+        if tyref_is_vec_value(ty, self.llbc) {
+            return Some(self.emit_vec_new(bb_id, ty));
+        }
+        None
+    }
+
+    fn emit_tuple_of_element_defaults(&mut self, bb_id: BlockId, ty: &TyRef) -> Option<Variable> {
+        let mut args = Vec::new();
+        let mut elem_tys = Vec::new();
+        let mut idx = 0;
+        loop {
+            let Some(elem_ty) = tyref_tuple_element(ty, idx, self.llbc) else {
+                break;
+            };
+            args.push(self.emit_default_of_ty(bb_id, &elem_ty)?);
+            elem_tys.push(elem_ty);
+            idx += 1;
+        }
+        if args.is_empty() {
+            return None;
+        }
+        // `TupleRepr.newtuple`: malloc of the tuple GcStruct plus one
+        // setfield per item. The frontend spelling is the same
+        // SyntheticTransparentCtor + FieldWrite chain a Charon tuple
+        // Aggregate already uses. Raw `OpKind::NewTuple` is the
+        // high-level `space.newtuple` op; when a graph still drops to
+        // the legacy walker it reaches the assembler as
+        // `newtuple/<kinds>>r`, and the production blackhole only
+        // wires `newtuple/rr>r`.
+        let kind = serde_json::json!({ "Tuple": serde_json::Value::Null });
+        let shape = self.aggregate_shape(&kind, ty, args.len()).ok()?;
+        let AggregateShape::Ctor(ctor) = shape else {
+            return None;
+        };
+        Some(self.emit_tuple_ctor_with_typed_fields(bb_id, &ctor, &args, &elem_tys))
+    }
+
+    /// `emit_aggregate_ctor` plus per-item `FieldWrite.ty` from the
+    /// element type. Tuple items may be Int (a `Vec` header) rather
+    /// than Ref; a hardcoded Ref write would emit `setfield_gc_r` of
+    /// an integer word.
+    fn emit_tuple_ctor_with_typed_fields(
+        &mut self,
+        bb_id: BlockId,
+        ctor: &AggregateCtor,
+        args: &[Variable],
+        elem_tys: &[TyRef],
+    ) -> Variable {
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: ctor.target.clone(),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+            },
+        });
+        for (i, field) in ctor.fields.iter().enumerate() {
+            if field.void {
+                continue;
+            }
+            let Some(value) = args.get(i) else {
+                continue;
+            };
+            let mut ty = elem_tys
+                .get(i)
+                .map(|elem_ty| {
+                    tyref_to_value_type_with(
+                        elem_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                    )
+                })
+                .unwrap_or(ValueType::Ref(None));
+            if matches!(ty, ValueType::Void) {
+                continue;
+            }
+            ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                &ctor.result_owner,
+                &field.name,
+                ty,
+            );
+            let value = match &field.narrow_root {
+                Some(root) => {
+                    let narrowed = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(narrowed.clone()),
+                        kind: crate::model::cast_instance_call(root, value.clone()),
+                    });
+                    narrowed
+                }
+                None => value.clone(),
+            };
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: res.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: field.name.clone(),
+                        owner_root: Some(ctor.result_owner.clone()),
+                        owner_id: ctor.owner_id,
+                        // Built by value: the store is not a dereference of a
+                        // live container (`base_is_local_aggregate`).
+                        base_is_deref: Some(false),
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    value: crate::model::LinkArg::Value(value),
+                    ty,
+                },
+            });
+        }
+        res
+    }
+
+    /// Empty `Vec::new()` — the same `vec::Vec::new` retarget
+    /// `flowspace_adapter` rewrites to `newlist()` / `ll_newemptylist`.
+    /// A raw `NewList` in a graph that still drops to the legacy walker
+    /// has no blackhole handler (`newlist/r>r`).
+    fn emit_vec_new(&mut self, bb_id: BlockId, dest_ty: &TyRef) -> Variable {
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["vec", "Vec", "new"]),
+                args: crate::model::call_args(vec![]),
+                result_ty: tyref_to_value_type_with(
+                    dest_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                ),
+            },
+        });
+        res
     }
 
     /// A `default` whose destination is zero-sized, or a struct declared
@@ -69501,6 +69713,16 @@ pub(crate) fn is_core_default_path(path: &str) -> bool {
     )
 }
 
+/// `<(A, B, …) as Default>::default` — Charon spells the tuple impl as
+/// `core::tuple::<Impl>::default`. Distinct from [`is_core_default_path`]
+/// (scalar / thin-pointer `core::default::<Impl>::default`).
+pub(crate) fn is_core_tuple_default_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "tuple", "<Impl>", "default"]
+    )
+}
+
 fn is_core_ptr_add_path(path: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
@@ -77025,6 +77247,17 @@ mod tests {
         ));
         assert!(!super::is_core_default_path(
             "core::default::Default::default"
+        ));
+        assert!(!super::is_core_default_path("core::tuple::<Impl>::default"));
+
+        assert!(super::is_core_tuple_default_path(
+            "core::tuple::<Impl>::default"
+        ));
+        assert!(!super::is_core_tuple_default_path(
+            "core::default::<Impl>::default"
+        ));
+        assert!(!super::is_core_tuple_default_path(
+            "core::tuple::Tuple::default"
         ));
 
         assert!(super::is_core_ptr_add_path(

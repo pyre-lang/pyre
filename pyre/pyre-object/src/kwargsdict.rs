@@ -284,6 +284,11 @@ unsafe fn kwargs_getitem_correct_indirection(
     None
 }
 
+crate::register_dyn_impl_vtable!(
+    DYN_IMPL_KwargsDictStrategy,
+    KwargsDictStrategy,
+    DictStrategy
+);
 impl DictStrategy for KwargsDictStrategy {
     fn strategy_kind(&self) -> crate::dictmultiobject::StrategyKind {
         crate::dictmultiobject::StrategyKind::Kwargs

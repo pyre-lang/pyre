@@ -876,9 +876,9 @@ unsafe fn module_dict_storage_custom_trace(
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::celldict::ModuleDictStorage);
     // `d.entries` is one GcRef. `walk_module_value_slot` stays on the owner walk.
-    f(storage.entries.entries_slot() as *mut majit_ir::GcRef);
+    f(storage.0.entries_slot() as *mut majit_ir::GcRef);
     storage
-        .entries
+        .0
         .visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 

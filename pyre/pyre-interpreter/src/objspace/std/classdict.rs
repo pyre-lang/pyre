@@ -34,6 +34,11 @@ impl ClassDictStrategy {
 /// per-space [`ClassDictStrategy`] so constructor identity matches upstream.
 struct ClassDictStrategySlot;
 
+pyre_object::register_dyn_impl_vtable!(
+    DYN_IMPL_ClassDictStrategySlot,
+    ClassDictStrategySlot,
+    DictStrategy
+);
 impl DictStrategy for ClassDictStrategySlot {
     fn strategy_kind(&self) -> StrategyKind {
         StrategyKind::Class

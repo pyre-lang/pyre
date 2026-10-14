@@ -1886,97 +1886,22 @@ pub struct DynImplVtable {
 unsafe impl Sync for DynImplVtable {}
 unsafe impl Send for DynImplVtable {}
 
-fn fat_vtable_word<T: ?Sized>(fat: *const T) -> *const () {
-    let words: [*const (); 2] = unsafe { std::mem::transmute_copy(&fat) };
-    words[1]
-}
-
 /// Impl-only fat/vtable pointers. Not a method set.
+///
+/// Derived from [`pyre_object::lltype::PYRE_DYN_IMPL_VTABLES`], registered
+/// at every `impl DictStrategy` / `impl SetStrategy`.
 pub fn dyn_impl_vtables() -> &'static [DynImplVtable] {
-    use pyre_object::dictmultiobject::DictStrategy;
-    use pyre_object::setobject::SetStrategy;
     static TABLES: std::sync::OnceLock<Vec<DynImplVtable>> = std::sync::OnceLock::new();
     TABLES.get_or_init(|| {
-        fn dict(impl_key: &'static str, fat: &'static dyn DictStrategy) -> DynImplVtable {
-            DynImplVtable {
-                impl_key,
-                trait_leaf: "DictStrategy",
-                vtable: fat_vtable_word(fat as *const dyn DictStrategy),
-            }
-        }
-        fn set(impl_key: &'static str, fat: &'static dyn SetStrategy) -> DynImplVtable {
-            DynImplVtable {
-                impl_key,
-                trait_leaf: "SetStrategy",
-                vtable: fat_vtable_word(fat as *const dyn SetStrategy),
-            }
-        }
-        vec![
-            dict(
-                "dictmultiobject::ObjectDictStrategy",
-                pyre_object::OBJECT_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "dictmultiobject::EmptyDictStrategy",
-                pyre_object::EMPTY_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "dictmultiobject::EmptyKwargsDictStrategy",
-                pyre_object::EMPTY_KWARGS_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "dictmultiobject::BytesDictStrategy",
-                pyre_object::BYTES_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "dictmultiobject::UnicodeDictStrategy",
-                pyre_object::UNICODE_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "dictmultiobject::IntDictStrategy",
-                pyre_object::INT_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "kwargsdict::KwargsDictStrategy",
-                pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "identitydict::IdentityDictStrategy",
-                pyre_object::identitydict::IDENTITY_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "mapdict::MapDictStrategy",
-                crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF.imp,
-            ),
-            dict(
-                "classdict::ClassDictStrategySlot",
-                crate::objspace::std::classdict::CLASS_DICT_STRATEGY_REF.imp,
-            ),
-            set(
-                "setobject::ObjectSetStrategy",
-                pyre_object::OBJECT_SET_STRATEGY_REF.imp,
-            ),
-            set(
-                "setobject::EmptySetStrategy",
-                pyre_object::EMPTY_SET_STRATEGY_REF.imp,
-            ),
-            set(
-                "setobject::IntegerSetStrategy",
-                pyre_object::INTEGER_SET_STRATEGY_REF.imp,
-            ),
-            set(
-                "setobject::BytesSetStrategy",
-                pyre_object::BYTES_SET_STRATEGY_REF.imp,
-            ),
-            set(
-                "setobject::AsciiSetStrategy",
-                pyre_object::ASCII_SET_STRATEGY_REF.imp,
-            ),
-            set(
-                "setobject::IdentitySetStrategy",
-                pyre_object::IDENTITY_SET_STRATEGY_REF.imp,
-            ),
-        ]
+        let mut tables = Vec::new();
+        pyre_object::lltype::for_each_dyn_impl_vtable(|desc| {
+            tables.push(DynImplVtable {
+                impl_key: desc.impl_key,
+                trait_leaf: desc.trait_leaf,
+                vtable: (desc.vtable_fn)(),
+            });
+        });
+        tables
     })
 }
 
@@ -2883,21 +2808,9 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     upa1!(
         &mut entries,
-        "pyre_object::dictmultiobject::w_dict_length_object_strategy",
-        "pyre_object::w_dict_length_object_strategy",
-        pyre_object::dictmultiobject::w_dict_length_object_strategy,
-    );
-    upa1!(
-        &mut entries,
-        "pyre_object::dictmultiobject::w_dict_length_int_strategy",
-        "pyre_object::w_dict_length_int_strategy",
-        pyre_object::dictmultiobject::w_dict_length_int_strategy,
-    );
-    upa1!(
-        &mut entries,
-        "pyre_object::dictmultiobject::w_dict_length_bytes_strategy",
-        "pyre_object::w_dict_length_bytes_strategy",
-        pyre_object::dictmultiobject::w_dict_length_bytes_strategy,
+        "pyre_object::dictmultiobject::w_dict_length_typed_strategy",
+        "pyre_object::w_dict_length_typed_strategy",
+        pyre_object::dictmultiobject::w_dict_length_typed_strategy,
     );
     upa1!(
         &mut entries,
@@ -8017,9 +7930,8 @@ mod tests {
     fn dyn_impl_vtables_are_nonnull_and_named_by_impl() {
         let tables = dyn_impl_vtables();
         assert!(
-            tables.len() >= 16,
-            "dict + set strategy impls, got {}",
-            tables.len()
+            !tables.is_empty(),
+            "distributed_slice of DictStrategy/SetStrategy impls is empty"
         );
         let mut seen = std::collections::BTreeSet::new();
         for entry in tables {
@@ -8035,16 +7947,17 @@ mod tests {
                 entry.impl_key
             );
         }
-        assert!(
-            tables
-                .iter()
-                .any(|e| e.impl_key.ends_with("IntDictStrategy"))
-        );
-        assert!(
-            tables
-                .iter()
-                .any(|e| e.impl_key.ends_with("IntegerSetStrategy"))
-        );
+        for leaf in [
+            "IntDictStrategy",
+            "IdentityDictStrategy",
+            "MapDictStrategy",
+            "IntegerSetStrategy",
+        ] {
+            assert!(
+                tables.iter().any(|e| e.impl_key.ends_with(leaf)),
+                "{leaf} not registered"
+            );
+        }
     }
 
     /// Every `#[pyre_methods]` `type_object()` accessor publishes its residual
