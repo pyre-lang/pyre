@@ -2653,13 +2653,29 @@ impl GcCache {
     ) -> Arc<SimpleFieldDescr> {
         // descr.py: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
-        // descr.py:220-221: cache[STRUCT][fieldname]
+        // descr.py get_field_descr: cache[STRUCT][fieldname]. `fieldname` is the
+        // STRUCT-local name. A caller that passed the display spelling
+        // (`"PyFrame.flags"`) still names that row when the cached descr
+        // occupies the same offset/size/type; nested paths that only share
+        // a leaf (`"a.block"` vs `"b.block"`) stay distinct keys.
         let cached = self
             ._cache_field
             .get(&struct_key)
             .and_then(|inner| inner.get(field_name))
             .cloned();
+        let cached = cached.or_else(|| {
+            self._cache_field.get(&struct_key).and_then(|inner| {
+                cached_field_same_physical_row(inner, field_name, offset, field_size, field_type)
+            })
+        });
         if let Some(descr) = cached {
+            if descr.field_key() != field_name {
+                self._cache_field
+                    .entry(struct_key.clone())
+                    .or_default()
+                    .entry(field_name.to_string())
+                    .or_insert_with(|| descr.clone());
+            }
             // field-cache identity: does this slot answer for the field the caller asked
             // about?  Passing the *cached* values for the three components
             // whose expected value is derived differently per build profile
@@ -2849,9 +2865,9 @@ impl GcCache {
             let found = SizeDescr::all_fielddescrs(size.as_ref())
                 .iter()
                 .find(|field| {
-                    field.field_key() == field_name
-                        && field.offset() == offset
+                    field.offset() == offset
                         && field.field_size() == field_size
+                        && field_keys_name_same_row(field.field_key(), field_name)
                 })?
                 .clone();
             let simple = try_downcast_arc::<SimpleFieldDescr>(found as DescrRef).ok()?;
@@ -6321,6 +6337,34 @@ pub use crate::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
 
 // ── Concrete descriptor implementations (descr.py) ──
 
+/// `descr.py cache[STRUCT][fieldname]` — `fieldname` is the STRUCT-local
+/// name. A caller that passed the display spelling `"PyFrame.flags"` still
+/// names the same row as `"flags"`. Nested paths that only share a leaf
+/// (`"a.block"` vs `"b.block"`) stay distinct keys.
+pub fn cache_fieldname(field_name: &str) -> &str {
+    field_name.rsplit('.').next().unwrap_or(field_name)
+}
+
+fn field_keys_name_same_row(listed: &str, asked: &str) -> bool {
+    listed == asked || cache_fieldname(listed) == cache_fieldname(asked)
+}
+
+fn cached_field_same_physical_row(
+    inner: &IndexMap<String, Arc<SimpleFieldDescr>>,
+    field_name: &str,
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+) -> Option<Arc<SimpleFieldDescr>> {
+    let leaf = cache_fieldname(field_name);
+    inner.values().cloned().find(|descr| {
+        descr.offset == offset
+            && descr.field_size == field_size
+            && descr.field_type == field_type
+            && cache_fieldname(descr.field_key()) == leaf
+    })
+}
+
 /// `descr.py name = '%s.%s' % (STRUCT._name, fieldname)` — locate the
 /// external `_cache_field[STRUCT][fieldname]` key inside the display name so
 /// every descriptor does not need a second owned string. Both the struct name
@@ -9735,6 +9779,106 @@ mod register_keyed_size_authority_tests {
         assert_eq!(first.index_in_parent, 1, "the parent's own list wins");
         let second = lookup(&mut gc);
         assert_eq!(second.index_in_parent, 1);
+    }
+
+    /// `descr.py cache[STRUCT][fieldname]` keys on the STRUCT-local name.
+    /// A caller that passed the display spelling still names that row.
+    #[test]
+    fn a_qualified_fieldname_is_the_struct_local_cache_key() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(11);
+        gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
+        let short = gc.get_field_descr(
+            key.clone(),
+            "flags",
+            Some("PyFrame.flags"),
+            48,
+            1,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Unsigned,
+            0,
+            false,
+            Some(10),
+        );
+        let qualified = gc.get_field_descr(
+            key.clone(),
+            "PyFrame.flags",
+            None,
+            48,
+            1,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Unsigned,
+            0,
+            false,
+            Some(10),
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&short, &qualified),
+            "qualified display spelling must hit cache[STRUCT][flags]"
+        );
+        assert_eq!(short.field_key(), "flags");
+        let reverse = gc.get_field_descr(
+            key,
+            "flags",
+            Some("PyFrame.flags"),
+            48,
+            1,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Unsigned,
+            0,
+            false,
+            Some(10),
+        );
+        assert!(std::sync::Arc::ptr_eq(&short, &reverse));
+    }
+
+    /// Nested paths that only share a leaf occupy different words and must
+    /// not collapse onto `cache[STRUCT][block]`.
+    #[test]
+    fn same_leaf_at_two_offsets_keeps_two_cache_rows() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(13);
+        gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
+        let outer = gc.get_field_descr(
+            key.clone(),
+            "block",
+            Some("Traceback.block"),
+            48,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(5),
+        );
+        let nested = gc.get_field_descr(
+            key.clone(),
+            "inner.block",
+            None,
+            64,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(7),
+        );
+        assert_eq!(outer.offset(), 48);
+        assert_eq!(nested.offset(), 64);
+        assert!(
+            !std::sync::Arc::ptr_eq(&outer, &nested),
+            "inner.block at a different offset is not Traceback.block"
+        );
     }
 
     /// The mint path binds a fieldless size-descr shell (`get_size_descr`

@@ -508,6 +508,34 @@ impl VirtualizableInfo {
             .enumerate()
             .map(|(j, a)| struct_descr_at(a.field_offset, &self._array_field_descrs[j]))
             .collect();
+        // virtualizable.py `cpu.fielddescrof(VTYPE, 'vable_token')` is
+        // `descr.py get_field_descr`'s cached object, the same row
+        // `heaptracker.all_fielddescrs` lists. The sequential mint above
+        // is `[token, statics, arrays]` numbering with an empty name; a
+        // SETFIELD through that spelling lands in `field_slot_index`'s
+        // unslotted band once the parent lists the token, and `force_box`
+        // then sees a leftover that is not a position in
+        // `all_fielddescrs`. Prefer the listed geometry and stamp the
+        // vinfo backref onto a clone so `get_vinfo()` still resolves.
+        if let Some(listed) = descr.as_size_descr().and_then(|sd| {
+            sd.all_fielddescrs()
+                .iter()
+                .find(|fd| fd.offset() == self.token_offset)
+                .cloned()
+        }) {
+            if let Some(simple) = listed
+                .as_any()
+                .and_then(|any| any.downcast_ref::<majit_ir::SimpleFieldDescr>())
+            {
+                let mut token = simple.clone();
+                if let Some(w) = vinfo.clone() {
+                    token = token.with_vinfo(w);
+                }
+                self.vable_token_descr = Some(std::sync::Arc::new(token));
+            } else {
+                self.vable_token_descr = Some(listed as DescrRef);
+            }
+        }
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
         // Identity-keyed on the FieldDescr this vinfo owns, the same
         // object the codewriter emits.

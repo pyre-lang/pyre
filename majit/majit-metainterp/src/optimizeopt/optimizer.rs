@@ -244,6 +244,14 @@ pub trait Optimization {
     /// starting AFTER the current pass. In majit, pass this index to
     /// `emit_extra` to achieve the same behavior.
     fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
+
+    /// Heap holds an `INT_*_OVF` until `emit_guard_operation` has
+    /// force_box'd the overflow guard's failargs, so SETFIELD_GC from
+    /// a listed `vable_token` force cannot sit between the ovf and
+    /// `GUARD_[NO_]OVERFLOW` (`aarch64/assembler.py` adjacency).
+    fn take_postponed_ovf(&mut self) -> Option<Op> {
+        None
+    }
 }
 
 /// optimizer.py `have_postprocess(cls)`.
@@ -5547,6 +5555,19 @@ impl Optimizer {
         let op_opcode = op.opcode;
         let op_result_type = op.result_type();
         let _ = reuse;
+        // `emit_guard_operation` force_box's failargs with
+        // `in_final_emission`, which appends SETFIELD_GC directly. An
+        // INT_*_OVF heap already released would sit in front of those
+        // stores. Emit the postponed ovf now, after the stores, so the
+        // assembler sees ovf immediately before GUARD_[NO_]OVERFLOW.
+        if matches!(op_opcode, OpCode::GuardOverflow | OpCode::GuardNoOverflow) {
+            for pass in self.passes.iter_mut() {
+                if let Some(ovf) = pass.take_postponed_ovf() {
+                    let _ = ctx.emit_rc(OpRc::new(ovf));
+                    break;
+                }
+            }
+        }
         let emitted_box = majit_ir::operand::Operand::from_bound_op(&op);
         let emitted = ctx.emit_rc(op);
         // optimizer.py `self._emittedoperations[op] = None` — `ctx.emit_rc`

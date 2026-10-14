@@ -1793,13 +1793,6 @@ fn emit_traceback_node<Sym: WalkSym>(
             3,
         ),
         (ctx.trace_ctx.const_ref(w_code as i64), 4),
-        (
-            ctx.trace_ctx
-                .const_ref(pyre_object::pyobject::get_instantiate(
-                    &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
-                ) as i64),
-            5,
-        ),
     ];
     for (value, index) in fields {
         let descr = crate::descr::pytraceback_field_descr(index);
@@ -1808,6 +1801,19 @@ fn emit_traceback_node<Sym: WalkSym>(
         ctx.trace_ctx
             .heapcache_setfield_cached(traceback, descr.index(), value);
     }
+    let header_class = ctx
+        .trace_ctx
+        .const_ref(pyre_object::pyobject::get_instantiate(
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
+        ) as i64);
+    let header_descr = crate::descr::w_class_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[traceback, header_class],
+        header_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(traceback, header_descr.index(), header_class);
 
     // `f_lineno` resolves through `offset2lineno(pycode, last_instr)` on every
     // read, so the frame itself has to carry the coordinate — the node's own

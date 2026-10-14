@@ -2379,6 +2379,11 @@ fn setfield_kind_matches(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool 
 fn named_field_keys_agree(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
     let slot_key = slot.field_key();
     let field_key = field.field_key();
+    // `descr.py cache[STRUCT][fieldname]` identity. A display spelling
+    // (`"PyFrame.flags"`) is unified onto the STRUCT-local row by
+    // `GcCache::get_field_descr_declaring` when offset/size/type match;
+    // those descrs then share `field_key()`. Overlay siblings at one
+    // offset (`dstorage` / `dstorage_as_gcref`) keep distinct keys.
     slot_key.is_empty() || field_key.is_empty() || slot_key == field_key
 }
 
@@ -2389,7 +2394,10 @@ fn named_field_keys_agree(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool
 /// `AbstractResumeDataReader.setfield` kind. Named fields with distinct
 /// `field_key()`s are not the same row even when they share
 /// `descr.index()` (`descr.py` `cache[STRUCT][fieldname]`).
-fn slot_in_field_list(fields: &[Arc<dyn FieldDescr>], field: &dyn FieldDescr) -> Option<u32> {
+pub(crate) fn slot_in_field_list(
+    fields: &[Arc<dyn FieldDescr>],
+    field: &dyn FieldDescr,
+) -> Option<u32> {
     if let Some(i) = fields.iter().position(|slot| {
         slot.index() == field.index()
             && slot.offset() == field.offset()
@@ -2416,9 +2424,38 @@ fn slot_in_field_list(fields: &[Arc<dyn FieldDescr>], field: &dyn FieldDescr) ->
         .position(|slot| {
             slot.offset() == field.offset()
                 && setfield_kind_matches(slot.as_ref(), field)
+                && slot.field_type() == field.field_type()
                 && named_field_keys_agree(slot.as_ref(), field)
         })
         .map(|i| i as u32)
+}
+
+/// Position of the unique `all_fielddescrs` row at `field.offset()`
+/// with the same setfield kind. `None` when that word is missing or
+/// shared by overlay siblings (`descr.py` `cache[STRUCT][fieldname]`).
+///
+/// A sequential mint (`virtualizable.py` `cpu.fielddescrof`) or a
+/// leftover extra-gc spelling can disagree on `field_key` with the
+/// listed row (`"vable_token"` vs `"PyFrame.vable_token"` / empty).
+/// `force_box` still walks by position, so a unique word at that
+/// offset is the listed slot.
+pub(crate) fn unique_offset_slot(
+    fields: &[Arc<dyn FieldDescr>],
+    field: &dyn FieldDescr,
+) -> Option<u32> {
+    let mut found = None;
+    for (i, slot) in fields.iter().enumerate() {
+        if slot.offset() == field.offset()
+            && setfield_kind_matches(slot.as_ref(), field)
+            && slot.field_type() == field.field_type()
+        {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i as u32);
+        }
+    }
+    found
 }
 
 /// Slot in `owner`'s `all_fielddescrs` when that is a SizeDescr that
@@ -2434,6 +2471,9 @@ pub(crate) fn parent_list_slot_in(owner: Option<&DescrRef>, field: &dyn FieldDes
     if let Some(size) = owner.and_then(|d| d.as_size_descr()) {
         let fields = size.all_fielddescrs();
         if let Some(i) = slot_in_field_list(fields, field) {
+            return i;
+        }
+        if let Some(i) = unique_offset_slot(fields, field) {
             return i;
         }
         // Owner `_fields` is the allocation list. A nested STRUCT slot
@@ -2721,7 +2761,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     };
     let named_apart = !field.field_key().is_empty()
         && !slot.field_key().is_empty()
-        && slot.field_key() != field.field_key();
+        && !named_field_keys_agree(slot, field);
     // Resume `AbstractResumeDataReader.setfield` classifies by
     // `is_pointer_field` / `is_float_field` / else. Empty-name flattened
     // leaves at one offset must not alias across that split.
