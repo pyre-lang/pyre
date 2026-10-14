@@ -412,45 +412,51 @@ mod tests {
 
     #[test]
     fn nested_scoped_roots_forward_every_frame_mirror_and_retire_independently() {
+        const BASE: usize = 0x98_0000_0000;
+        let _restore = [
+            crate::RestoreConstPtr::intern(BASE + 0x1000),
+            crate::RestoreConstPtr::intern(BASE + 0x2000),
+        ];
         let _runtime = crate::trace_ctx_for_test(0);
         let _stw = majit_gc::gc_sync::quiesce_mutators();
-        let outer = state_with_refs(0x1000);
-        let inner = state_with_refs(0x2000);
+        let outer = state_with_refs(BASE + 0x1000);
+        let inner = state_with_refs(BASE + 0x2000);
         let paused = outer.clone();
         let outer_root = outer.root();
         let inner_root = inner.root();
         drop(outer);
         majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-            if root.0 == 0x1000 || root.0 == 0x2000 {
+            if root.0 == BASE + 0x1000 || root.0 == BASE + 0x2000 {
                 root.0 += 0x80;
             }
         });
-        assert_refs(&paused, 0x1080);
-        assert_refs(&inner, 0x2080);
+        assert_refs(&paused, BASE + 0x1080);
+        assert_refs(&inner, BASE + 0x2080);
         assert!(matches!(
             paused.borrow().concrete_registers_r[1],
-            ConcreteValue::Int(0x1000)
+            ConcreteValue::Int(n) if n == (BASE + 0x1000) as i64
         ));
         drop(outer_root);
         majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-            if root.0 == 0x1080 || root.0 == 0x2080 {
+            if root.0 == BASE + 0x1080 || root.0 == BASE + 0x2080 {
                 root.0 += 0x80;
             }
         });
-        assert_refs(&paused, 0x1080);
-        assert_refs(&inner, 0x2100);
+        assert_refs(&paused, BASE + 0x1080);
+        assert_refs(&inner, BASE + 0x2100);
         drop(inner_root);
     }
 
     #[test]
     fn callee_writeback_releases_borrows_and_reads_forwarded_later_slots() {
+        const BASE: usize = 0x99_0000_0000;
         let _runtime = crate::trace_ctx_for_test(0);
         let _stw = majit_gc::gc_sync::quiesce_mutators();
         let mut shadow = CalleeLocalsShadow::default();
         shadow.set_concrete(1, 0, Value::Int(1000));
-        shadow.set_concrete(1, 1, Value::Ref(GcRef(0x1000)));
+        shadow.set_concrete(1, 1, Value::Ref(GcRef(BASE + 0x1000)));
         shadow.set_concrete(1, 2, Value::Float(2.5));
-        shadow.set_concrete(1, 3, Value::Ref(GcRef(0x2000)));
+        shadow.set_concrete(1, 3, Value::Ref(GcRef(BASE + 0x2000)));
         let state = WalkFrameState::new(WalkFrameStateData {
             callee_shadow: Some(shadow),
             ..WalkFrameStateData::default()
@@ -464,7 +470,7 @@ mod tests {
             // an unrooted shadow copy returns a stale later value.
             if matches!(value, Value::Int(_) | Value::Float(_)) {
                 majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                    if (0x1000..0x3000).contains(&root.0) {
+                    if (BASE + 0x1000..BASE + 0x3000).contains(&root.0) {
                         root.0 += 0x80;
                     }
                 });
@@ -475,9 +481,9 @@ mod tests {
             written,
             vec![
                 (0, Value::Int(1000)),
-                (1, Value::Ref(GcRef(0x1080))),
+                (1, Value::Ref(GcRef(BASE + 0x1080))),
                 (2, Value::Float(2.5)),
-                (3, Value::Ref(GcRef(0x2100))),
+                (3, Value::Ref(GcRef(BASE + 0x2100))),
             ]
         );
     }

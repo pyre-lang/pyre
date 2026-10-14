@@ -303,6 +303,19 @@ pub fn pypysig_ignore(signum: i32) -> bool {
 #[cfg(unix)]
 pub fn pypysig_reinstall(_signum: i32) {}
 
+/// Serialize crate tests that mutate the process-global eval-breaker word
+/// (registered ticker, pending-signal set, `EB_ASYNC` / `EB_STW`). Libtest
+/// runs `#[test]`s in one process; a nursery collection's `set_stw` overlapping
+/// `action_dispatcher`'s still-check leaves the registered ticker at `-1`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    static SIGNAL_EVAL_BREAKER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    pub(crate) fn signal_eval_breaker_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        SIGNAL_EVAL_BREAKER_TEST_LOCK.lock()
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -330,14 +343,22 @@ mod tests {
     /// Drives process-global signal state: installs a real SIGINT handler,
     /// registers this `ActionFlag` as the signal-driving ticker, raises a real
     /// signal, and asserts that the handler touches only atomic state until a
-    /// safe checkpoint synchronizes the ticker. Nothing serializes those
-    /// process globals, so this must stay the only test in the crate that
-    /// touches them — a second one running in parallel would race it. Tests
-    /// that merely build an `ActionFlag` are safe alongside it: the async-bit
-    /// mirror is gated on the registered ticker, so an unregistered flag's
-    /// `reset_ticker` never reaches the shared word.
+    /// safe checkpoint synchronizes the ticker. Nursery-collection tests in
+    /// this crate also arm the same `eval_breaker_word` (`EB_STW` via
+    /// `quiesce_mutators`): `eval::tests::clean_minor_forwards_declaration_slot_only_when_the_container_is_traced`,
+    /// `eval::tests::minor_forwards_interp2app_code_and_skips_the_immortal_header`,
+    /// `call::pack_varargs_tests::pack_varargs_rereads_a_young_positional_after_the_tuple_alloc`,
+    /// `call::pack_varargs_tests::resolve_kwargs_rereads_a_positional_across_the_kwonly_default_alloc`,
+    /// `call::pack_varargs_tests::resolve_kwargs_moves_the_young_kwargs_dict_across_empty_storage_alloc`.
+    /// Those tests take [`test_support::signal_eval_breaker_test_guard`] with
+    /// this one: if `EB_STW` is set when `action_dispatcher`'s still-check
+    /// runs, it `reset_ticker(-1)` and the post-dispatch `get_ticker() >= 0`
+    /// assertion fails. Tests that merely build an `ActionFlag` are safe
+    /// alongside it: the async-bit mirror is gated on the registered ticker,
+    /// so an unregistered flag's `reset_ticker` never reaches the shared word.
     #[test]
     fn signal_during_warmup_sets_async_bit() {
+        let _lock = test_support::signal_eval_breaker_test_guard();
         let _reset = ResetSignalState;
         let mut actionflag = ActionFlag::new();
         actionflag.reset_ticker(0);

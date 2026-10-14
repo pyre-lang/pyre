@@ -4772,8 +4772,8 @@ mod tests {
     #[test]
     fn walking_the_memo_forwards_its_ref_consts_and_rekeys_the_cache() {
         let mut memo = super::ResumeDataLoopMemo::new();
-        let before = 0x1000i64;
-        let after = 0x2000i64;
+        let before = 0x9B_0000_1000i64;
+        let after = 0x9B_0000_2000i64;
         let tagged = memo.getconst_ref(before).expect("pool the ref const");
         assert_eq!(
             memo.getconst_ref(before).unwrap(),

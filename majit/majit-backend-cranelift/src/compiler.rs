@@ -24373,6 +24373,7 @@ mod tests {
 
     #[test]
     fn loop_invariant_deopt_ref_with_preamble_use_survives_nursery_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24421,6 +24422,7 @@ mod tests {
     /// address. A later LABEL's fall-through must therefore not re-store it.
     #[test]
     fn a_later_labels_fallthrough_keeps_an_already_demoted_refs_forwarded_home() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24492,6 +24494,7 @@ mod tests {
     /// Int as a reference from the second iteration on.
     #[test]
     fn a_loop_labels_first_call_does_not_trace_a_word_the_back_edge_left_an_int_in() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24586,6 +24589,7 @@ mod tests {
 
     #[test]
     fn loop_invariant_deopt_ref_survives_backedge_after_nursery_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24636,6 +24640,7 @@ mod tests {
 
     #[test]
     fn earlier_label_deopt_ref_survives_nursery_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24689,6 +24694,7 @@ mod tests {
 
     #[test]
     fn demoted_ref_reloads_before_kept_local_jump_arg() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24850,6 +24856,7 @@ mod tests {
 
     #[test]
     fn register_carried_bridge_entry_roots_ref_before_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let (backend, token, root) = register_carried_bridge_fixture(0xD30F_00B1, 1_500_410);
         let in_code = backend.execute_token(
             &token,
@@ -24964,6 +24971,7 @@ mod tests {
 
     #[test]
     fn register_carried_overflow_failargs_stay_in_frame() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let (backend, token, root) = overflow_failarg_bridge_fixture(0xD30F_00C1, 1_500_420);
         let values = [
             Value::Int(10),
@@ -25014,6 +25022,7 @@ mod tests {
     /// entry; a collecting op after the LABEL must still see the Ref.
     #[test]
     fn jump_into_bridge_label_preserves_ref_failargs() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -25322,6 +25331,7 @@ mod tests {
     /// bridge call and is handed back to the loop at its forwarded address.
     #[test]
     fn merged_bridge_preserves_ref_input_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -27192,6 +27202,7 @@ mod tests {
 
     #[test]
     fn merged_exit_honours_redirected_rd_locs() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         // The carried ref is deopt-only, so `compute_loop_phi_keep` demotes
         // it and `apply_resident_failarg_locs` points `rd_locs` at that home.
         // A nursery allocation before the guard forwards the home. The merged
@@ -27720,6 +27731,7 @@ mod tests {
     /// `IntAddOvf` sits immediately before the guard so `last_ovf_flag` is set.
     #[test]
     fn guard_no_overflow_bridge_merges_when_bridge_has_no_exception() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(19);
         let ovf_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
@@ -27800,6 +27812,7 @@ mod tests {
     /// recompile.
     #[test]
     fn debug_merge_point_does_not_keep_bridge_separate() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(23);
         let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
@@ -28035,6 +28048,7 @@ mod tests {
 
     #[test]
     fn debug_merge_point_constptr_does_not_refuse_refresh() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let ptr = majit_ir::GcRef(0x3e5d_f0dc);
         let dbg = Op::new(
             OpCode::DebugMergePoint,
@@ -28063,6 +28077,7 @@ mod tests {
 
     #[test]
     fn refresh_matches_forwarded_gc_table_slot() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -29683,6 +29698,7 @@ mod tests {
 
     #[test]
     fn test_deadframe_exception_ref_survives_collection_after_execute_token() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let _exception_guard = exception_test_guard();
         jit_exc_clear();
 
@@ -34193,6 +34209,7 @@ mod tests {
     /// the nursery for jitframe + 2 user allocs (third overflows).
     #[test]
     fn test_gc_collecting_alloc_preserves_live_ref_inputs() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let payload_size: usize = 16;
         let alloc_size = majit_gc::header::GcHeader::SIZE + payload_size; // 24
 
@@ -34277,6 +34294,7 @@ mod tests {
 
     #[test]
     fn test_gc_collecting_alloc_preserves_live_ref_results() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34333,6 +34351,7 @@ mod tests {
 
     #[test]
     fn test_setfield_gc_from_old_object_keeps_young_ref_alive_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34638,6 +34657,7 @@ mod tests {
 
     #[test]
     fn test_call_i_preserves_live_ref_inputs_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34699,6 +34719,7 @@ mod tests {
     /// which may still name the corpse. Slot 0 is the moved input ref.
     #[test]
     fn test_raw_done_ref_returns_moved_object_after_minor_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34753,6 +34774,7 @@ mod tests {
 
     #[test]
     fn test_cond_call_n_preserves_live_ref_inputs_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34808,6 +34830,7 @@ mod tests {
 
     #[test]
     fn test_deadframe_ref_survives_collection_after_execute_token() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34867,6 +34890,7 @@ mod tests {
     /// nothing, which is exactly what the old-gen fixture next door does.
     #[test]
     fn test_deadframe_nursery_jitframe_moves_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
             large_object_threshold: 1 << 20,
@@ -34945,6 +34969,7 @@ mod tests {
     /// makes the holder's address irrelevant.
     #[test]
     fn test_moved_deadframe_still_reads_the_moved_jitframe() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
             large_object_threshold: 1 << 20,

@@ -7192,18 +7192,26 @@ mod tests {
         // reachable nested trace. Upstream warmstate.py bound_reached owns a
         // fresh MetaInterp per attempt; a translated collector sees all live
         // attempts. Verify that an inner anchor cannot hide outer frame banks.
+        use crate::RestoreConstPtr;
         use crate::jitcode_dispatch::RegisterBank;
         use crate::state::PyreSym;
         use majit_ir::{GcRef, OpRef};
 
+        const BASE: usize = 0x94_0000_0000;
+        let _restore = [
+            RestoreConstPtr::intern(BASE + 0x1000),
+            RestoreConstPtr::intern(BASE + 0x2000),
+            RestoreConstPtr::intern(BASE + 0x3000),
+            RestoreConstPtr::intern(BASE + 0x4000),
+        ];
         let _runtime = crate::trace_ctx_for_test(0);
         let ptr = |word| OpRef::const_ptr(GcRef(word));
         let outer = Box::new(PyreSym::new_uninit(OpRef::NONE));
         let inner = Box::new(PyreSym::new_uninit(OpRef::NONE));
-        outer.registers_r.replace(vec![ptr(0x1000)]);
-        inner.registers_r.replace(vec![ptr(0x2000)]);
-        let outer_bank = RegisterBank::new([ptr(0x3000), OpRef::input_arg_ref(0)]);
-        let inner_bank = RegisterBank::new([ptr(0x4000)]);
+        outer.registers_r.replace(vec![ptr(BASE + 0x1000)]);
+        inner.registers_r.replace(vec![ptr(BASE + 0x2000)]);
+        let outer_bank = RegisterBank::new([ptr(BASE + 0x3000), OpRef::input_arg_ref(0)]);
+        let inner_bank = RegisterBank::new([ptr(BASE + 0x4000)]);
         // Do not expose sentinel addresses to another test's real collector.
         let _stw = majit_gc::gc_sync::quiesce_mutators();
         let outer_anchor = super::TraceRoots::enter(&outer);
@@ -7216,7 +7224,7 @@ mod tests {
         // independently registered frame banks, not just the current anchor.
         {
             majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                if (0x1000..0x5000).contains(&root.0) {
+                if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
                     seen.push(root.0);
                     root.0 += 0x80;
                 }
@@ -7224,17 +7232,20 @@ mod tests {
         }
         drop(inner_registration);
         drop(inner_anchor);
-        assert_eq!(seen, [0x1000, 0x3000, 0x2000, 0x4000]);
-        assert_eq!(outer.registers_r.to_vec(), [ptr(0x1080)]);
-        assert_eq!(outer_bank.get(0), Some(ptr(0x3080)));
+        assert_eq!(
+            seen,
+            [BASE + 0x1000, BASE + 0x3000, BASE + 0x2000, BASE + 0x4000]
+        );
+        assert_eq!(outer.registers_r.to_vec(), [ptr(BASE + 0x1080)]);
+        assert_eq!(outer_bank.get(0), Some(ptr(BASE + 0x3080)));
         assert_eq!(outer_bank.get(1), Some(OpRef::input_arg_ref(0)));
-        assert_eq!(inner.registers_r.to_vec(), [ptr(0x2080)]);
-        assert_eq!(inner_bank.get(0), Some(ptr(0x4080)));
+        assert_eq!(inner.registers_r.to_vec(), [ptr(BASE + 0x2080)]);
+        assert_eq!(inner_bank.get(0), Some(ptr(BASE + 0x4080)));
 
         seen.clear();
         {
             majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                if (0x1000..0x5000).contains(&root.0) {
+                if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
                     seen.push(root.0);
                     root.0 += 0x80;
                 }
@@ -7242,9 +7253,9 @@ mod tests {
         }
         drop(outer_registration);
         drop(outer_anchor);
-        assert_eq!(seen, [0x1080, 0x3080]);
-        assert_eq!(outer.registers_r.to_vec(), [ptr(0x1100)]);
-        assert_eq!(outer_bank.get(0), Some(ptr(0x3100)));
+        assert_eq!(seen, [BASE + 0x1080, BASE + 0x3080]);
+        assert_eq!(outer.registers_r.to_vec(), [ptr(BASE + 0x1100)]);
+        assert_eq!(outer_bank.get(0), Some(ptr(BASE + 0x3100)));
     }
 
     #[test]

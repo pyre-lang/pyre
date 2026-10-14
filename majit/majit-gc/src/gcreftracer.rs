@@ -320,6 +320,8 @@ pub fn install_gc_table_walker() {
 mod tests {
     use super::*;
 
+    use crate::collector::const_ptr_table_test_guard;
+
     // `LIVE_GC_TABLES` is process-global. Production mutates it at compile
     // time and reads it inside a collection step; those are exclusive via
     // `gc_op` / GIL. The harness runs MiniMark tests in parallel, so the
@@ -329,22 +331,26 @@ mod tests {
 
     #[test]
     fn trace_forwards_slots_in_place() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let _serialize = GC_TABLE_WALK_LOCK.write();
-        let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
-        // A moving collection relocates 0x1000 -> 0x9000.
+        const A: GcRef = GcRef(0x9D_0000_1000);
+        const B: GcRef = GcRef(0x9D_0000_2000);
+        const A_MOVED: GcRef = GcRef(0x9D_0000_9000);
+        let table = GcTable::from_gcrefs(&[A, B]);
+        // A moving collection relocates A -> A_MOVED.
         table.trace(&mut |r| {
-            if r.0 == 0x1000 {
-                r.0 = 0x9000;
+            if *r == A {
+                *r = A_MOVED;
             }
         });
-        assert_eq!(table.slot(0), GcRef(0x9000));
-        assert_eq!(table.slot(1), GcRef(0x2000));
+        assert_eq!(table.slot(0), A_MOVED);
+        assert_eq!(table.slot(1), B);
         assert_eq!(
             table.compile_key(0),
-            0x1000,
+            A.0,
             "ConstPtr lookup keys stay at the compile-time address"
         );
-        assert_eq!(table.compile_key(1), 0x2000);
+        assert_eq!(table.compile_key(1), B.0);
         assert_eq!(
             table.base_addr(),
             table._owned.as_ref().unwrap().as_ptr() as usize
@@ -364,8 +370,12 @@ mod tests {
         // wasm `compile_loop` / `compile_bridge` run `rewrite_ops_for_gc`
         // (`rewrite.py` `remove_constptr`) and bind the table via
         // `bind_failarg_const_table`.
+        let _const_ptr_table = const_ptr_table_test_guard();
         let _serialize = GC_TABLE_WALK_LOCK.write();
-        let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
+        const A: GcRef = GcRef(0x9E_0000_1000);
+        const B: GcRef = GcRef(0x9E_0000_2000);
+        const A_MOVED: GcRef = GcRef(0x9E_0000_9000);
+        let table = GcTable::from_gcrefs(&[A, B]);
         // `base` is the value baked into the trace at compile time.
         let base = table.base_addr();
         // `GcRef` is `#[repr(transparent)]` over `usize` and `Cell<GcRef>`
@@ -375,16 +385,12 @@ mod tests {
             // SAFETY: `index < len`; the slot is a live `Cell<GcRef>` (usize).
             unsafe { *((base + index * core::mem::size_of::<usize>()) as *const usize) }
         };
-        assert_eq!(
-            baked_load(0),
-            0x1000,
-            "pre-move load reads the original ref"
-        );
-        assert_eq!(baked_load(1), 0x2000);
-        // A moving collection relocates 0x1000 -> 0x9000.
+        assert_eq!(baked_load(0), A.0, "pre-move load reads the original ref");
+        assert_eq!(baked_load(1), B.0);
+        // A moving collection relocates A -> A_MOVED.
         table.trace(&mut |r| {
-            if r.0 == 0x1000 {
-                r.0 = 0x9000;
+            if *r == A {
+                *r = A_MOVED;
             }
         });
         assert_eq!(
@@ -394,14 +400,15 @@ mod tests {
         );
         assert_eq!(
             baked_load(0),
-            0x9000,
+            A_MOVED.0,
             "post-move load via the baked base reads the forwarded ref"
         );
-        assert_eq!(baked_load(1), 0x2000, "unmoved ref unchanged");
+        assert_eq!(baked_load(1), B.0, "unmoved ref unchanged");
     }
 
     #[test]
     fn dropping_table_deregisters_from_walk() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let _serialize = GC_TABLE_WALK_LOCK.write();
         // A sentinel unlikely to collide with any other test's table.
         const SENTINEL: GcRef = GcRef(0x0000_DEAD_BEEF);
@@ -426,6 +433,7 @@ mod tests {
 
     #[test]
     fn pending_gc_tables_stay_on_the_remembering_minimark() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -458,6 +466,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn pinned_rewrite_gcrefs_survive_minor_before_in_code() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         // `assembler.py` `_allgcrefs` is a GC list: a collection between
         // rewrite and `patch_gcref_table` forwards the entries, and
         // `make_framework_tracer` writes those forwarded addresses.
