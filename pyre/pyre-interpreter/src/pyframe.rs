@@ -6354,20 +6354,26 @@ impl PyFrame {
             .chain(code.freevars.iter().map(AsRef::as_ref))
     }
 
-    /// pyframe.py `make_arguments` — build Arguments from the value
-    /// stack. `methodcall` and `w_function` are stored on the resulting
-    /// Arguments for diagnostic use (better error messages on argument
-    /// mismatch); pyre's call path currently passes only the positional
-    /// vector, so the parameters are recorded as part of the parity contract
-    /// without downstream consumers yet.
+    /// pyframe.py `make_arguments` — build `Arguments` from the value
+    /// stack. `methodcall` is stored on the result so
+    /// `argument.py _match_signature` can raise `ArgErrTooManyMethod`;
+    /// `w_function` is the constructor-only diagnostic prefix
+    /// `argument.py raise_type_error` uses when star expansion fails.
     #[inline]
     pub fn make_arguments(
         &self,
         nargs: usize,
-        _methodcall: bool,
-        _w_function: PyObjectRef,
-    ) -> Vec<PyObjectRef> {
-        self.peekvalues(nargs)
+        methodcall: bool,
+        w_function: PyObjectRef,
+    ) -> crate::argument::Arguments {
+        let args_w = self.peekvalues(nargs);
+        let w_function = if w_function.is_null() {
+            None
+        } else {
+            Some(w_function)
+        };
+        crate::argument::Arguments::new(&args_w, None, None, None, None, methodcall, w_function)
+            .expect("pyframe.py make_arguments has no star args")
     }
 
     /// PyPy-compatible argument list builder.
@@ -7946,5 +7952,21 @@ x = 7
         let still = locals_w!(frame)[0];
         assert!(!unsafe { pyre_object::is_cell(still) });
         assert_eq!(unsafe { pyre_object::w_int_get_value(still) }, 1);
+    }
+
+    /// pyframe.py `make_arguments` stores `methodcall` on the Arguments
+    /// object `argument.py _match_signature` reads.
+    #[test]
+    fn make_arguments_stores_methodcall_flag() {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile_exec("a = 1").expect("compile");
+        let mut frame = super::PyFrame::new(code);
+        frame.push(pyre_object::w_int_new(1));
+        let method = frame.make_arguments(1, true, pyre_object::PY_NULL);
+        assert!(method.methodcall);
+        assert_eq!(method.arguments_w.len(), 1);
+        let plain = frame.make_arguments(1, false, pyre_object::PY_NULL);
+        assert!(!plain.methodcall);
+        assert_eq!(plain.arguments_w.len(), 1);
     }
 }

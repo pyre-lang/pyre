@@ -1382,8 +1382,13 @@ pub fn cache_root_stack_slot(cached: &Cell<usize>) {
 /// Slot previously stored by [`cache_root_stack_slot`].
 ///
 /// A zero word has not been resolved yet and falls back to one resolve.
+///
+/// # Safety
+///
+/// `raw` is 0 or a word [`cache_root_stack_slot`] stored for the current
+/// thread.
 #[inline]
-pub fn slot_from_cached(raw: usize) -> ShadowStackSlot {
+pub unsafe fn slot_from_cached(raw: usize) -> ShadowStackSlot {
     if raw == 0 {
         shadow_stack_slot()
     } else {
@@ -2662,7 +2667,8 @@ mod tests {
         assert_ne!(raw, 0);
         cache_root_stack_slot(&cached);
         assert_eq!(cached.get(), raw);
-        let slot = slot_from_cached(raw);
+        // SAFETY: `raw` is the word `cache_root_stack_slot` stored for this thread.
+        let slot = unsafe { slot_from_cached(raw) };
         assert_eq!(unsafe { slot_top_ref(slot) }, top_ref());
         assert_eq!(unsafe { slot_top_ref(slot) }.0, 0x1111);
         pop_to(depth);

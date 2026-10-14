@@ -667,8 +667,9 @@ pub struct Arguments {
     /// `_collect_keyword_args` take the same flag as `jiton` upstream.
     pub jit_few_keywords: bool,
     /// argument.py `self.methodcall = methodcall`.  Default `false`
-    /// for the `positional_only` / `with_kw` shortcuts; the future
-    /// CALL_METHOD opcode port should set it `true`.
+    /// for the `positional_only` / `with_kw` shortcuts;
+    /// `pyframe.py make_arguments` stores the CALL methodcall flag here
+    /// so `_match_signature` can raise `ArgErrTooManyMethod`.
     pub methodcall: bool,
 }
 
