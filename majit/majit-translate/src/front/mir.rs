@@ -9267,6 +9267,13 @@ fn pygraph_initial_block(
         // resolved to `Int` above regardless of its own zero-sized
         // layout — never reaches this arm.
         //
+        // An empty class instance (`KwargsDictStrategy`) is still a
+        // `SomeInstance` (`description.py` `MethodDesc.func_args`);
+        // `tyref_input_class_root` names it, so the Input stays `Ref`
+        // and `derive_subject_inputcells` seeds the ClassDef.
+        // `Arg<T>` is a zero-sized marker (`tyref_is_bytecode_arg_marker`)
+        // even when the instantiation has a class_root; it stays Void.
+        //
         // A reference to a primitive is the same case in the other
         // bank. `lltype.Ptr.__new__` refuses a non-container pointee,
         // so `&i64` is not a GC ref: `Rvalue::Ref` aliases the scalar
@@ -9280,7 +9287,14 @@ fn pygraph_initial_block(
         // (RPython `DictStrategy` instance / `history.getkind` of a Gc
         // Ptr): rustc still passes the pointer, and RPython method
         // `indirect_call` always has self. See [`fundecl_keeps_zst_self`].
-        let mut ty = input_param_value_type(ty, &local.ty, llbc, keep_zst_self, i == 1);
+        let mut ty = input_param_value_type(
+            ty,
+            &local.ty,
+            llbc,
+            keep_zst_self,
+            i == 1,
+            tombstoned_leaves,
+        );
         // Same membership as [`gc_mut_ref_param_locals`], including the
         // residual exclusion: a cell parameter is the `MutRef<T>` the
         // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
@@ -9515,6 +9529,10 @@ impl<'a> Lowering<'a> {
             // param is never touched, and a fieldless enum — already
             // resolved to `Int` above regardless of its own zero-sized
             // layout — never reaches this arm.
+            // An empty class instance (`KwargsDictStrategy`) is still a
+            // `SomeInstance` (`description.py` `MethodDesc.func_args`);
+            // `tyref_input_class_root` names it, so the Input stays `Ref`.
+            // `Arg<T>` stays Void (`tyref_is_bytecode_arg_marker`).
             // Same banks as [`pygraph_initial_block`]: a reference to a
             // primitive is the scalar word (`history.py` `getkind` of
             // `&i64` is `int`), and a raw pointer to a wider scalar is
@@ -9523,7 +9541,14 @@ impl<'a> Lowering<'a> {
             // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
             // (the same kind as a GC impl in the family). See
             // [`fundecl_keeps_zst_self`].
-            let mut ty = input_param_value_type(ty, &local.ty, llbc, keep_zst_self, i == 1);
+            let mut ty = input_param_value_type(
+                ty,
+                &local.ty,
+                llbc,
+                keep_zst_self,
+                i == 1,
+                tombstoned_leaves,
+            );
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
             // `ClassDef`; only `Ref`-typed params consume it there.  A
@@ -20103,7 +20128,15 @@ impl<'a> Lowering<'a> {
                     // so the adapter can preserve its identity through phi
                     // simplification; a fresh undefined Void variable loses
                     // the constant representative on outgoing links.
-                    if tyref_is_void_zst(&place_ty, self.llbc)
+                    // A named empty class field is still an instance
+                    // (`tyref_keeps_empty_class_instance`); the read is
+                    // `InstanceRepr.getfield`, not Void.
+                    if (tyref_is_void_zst(&place_ty, self.llbc)
+                        && !tyref_keeps_empty_class_instance(
+                            &place_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        ))
                         || self.tyref_is_fieldless_enum(&inner.ty)
                         || self.tyref_is_borrowed_fieldless_enum(&inner.ty)
                     {
@@ -21324,8 +21357,12 @@ impl<'a> Lowering<'a> {
         // `lltype.Void` (`getkind == 'void'`): no constructor and no
         // register, only the `Constant(None, Void)` definition.
         // Fieldless enums stay discriminant integers and are handled
-        // above.
-        if tyref_is_void_zst(dest_ty, self.llbc) {
+        // above. A named empty class is still an instance
+        // (`Bookkeeper.immutablevalue` / `InstanceRepr.convert_const`);
+        // the constructor is interned to that prebuilt constant.
+        if tyref_is_void_zst(dest_ty, self.llbc)
+            && !tyref_keeps_empty_class_instance(dest_ty, self.llbc, self.tombstoned_leaves)
+        {
             return Ok(AggregateShape::Void);
         }
         // `Option<E>` over a dense fieldless enum E is the same
@@ -31796,6 +31833,19 @@ impl<'a> Lowering<'a> {
                 if matches!(td.kind, TypeDeclKind::Opaque) || td.published_struct_copy {
                     return None;
                 }
+                // A FunDecl with no unstructured body cannot be getattr'd
+                // off the receiver: Charon left the method Opaque, so
+                // Method's `getattr(recv, leaf)` + simple_call finds no
+                // classdict source. Keep Method for Enum combinators
+                // (`Option::unwrap_or`) whose folds key on
+                // `CallTarget::Method`. A Struct owner is minted as a
+                // field-only class (`Range<i64>` has start/end); route as
+                // FunctionPath so `front::range_contains` can fold
+                // `Range::contains` the same way `RangeInclusive::contains`
+                // folds (its owner is Opaque).
+                if !fd.has_unstructured_body() && matches!(td.kind, TypeDeclKind::Struct(_)) {
+                    return None;
+                }
                 // A raw struct or enum is an address, not a GC instance.
                 // `CallTarget::Method` would getattr the leaf off that
                 // address. The direct path is the fun-decl itself.
@@ -34856,6 +34906,9 @@ impl<'a> Lowering<'a> {
         if emitted.last().map(String::as_str) != Some("default") {
             return false;
         }
+        if tyref_keeps_empty_class_instance(dest_ty, self.llbc, self.tombstoned_leaves) {
+            return false;
+        }
         if tyref_is_zero_sized(dest_ty, self.llbc) {
             return true;
         }
@@ -34893,7 +34946,9 @@ impl<'a> Lowering<'a> {
     /// (`ObjectDictStrategy.get_empty_storage`). A `Default` with a
     /// payload stays a call, and a pyre `default` stays a call.
     fn is_void_zst_std_default(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
-        if !tyref_is_void_zst(dest_ty, self.llbc) {
+        if !tyref_is_void_zst(dest_ty, self.llbc)
+            || tyref_keeps_empty_class_instance(dest_ty, self.llbc, self.tombstoned_leaves)
+        {
             return false;
         }
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
@@ -57336,10 +57391,16 @@ pub(crate) fn collect_marked_class_ctor_stubs_from_llbc(
 /// argument is the hook `Option<*mut u8>`, not `self`.  The
 /// registration key is still [`impl_method_owner_for_fundecl`] +
 /// [`strip_crate_prefix`], matching the call-site
-/// `["GcAllocOutcome", "from_hook"]`.  Self-methods on a non-opaque
-/// owner (`allocated_or_abort`) stay out of this arm.  A zero-arg
-/// method on an opaque owner (`Default::default`) has no `self`; it
-/// is harvested with the opaque-owner methods because
+/// `["GcAllocOutcome", "from_hook"]`.
+///
+/// `Range::contains` on the extracted `Range` Struct is not harvested:
+/// `front::range_contains` folds the int half-open site to compares
+/// (the isqrt gateway's `0 < n < 2**53`-style checks), and a structural
+/// mismatch leaves the unregistered FunctionPath (census Skip).  A
+/// result type that cannot be modeled (`allocated_or_abort`'s RawPtr) is
+/// still declined by [`foreign_opaque_method_result_valuetype`].  A
+/// zero-arg method on an opaque owner (`Default::default`) has no
+/// `self`; it is harvested with the opaque-owner methods because
 /// `opaque_nullary_impl_target` emits that path.
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn collect_foreign_opaque_method_externals(
@@ -57380,8 +57441,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         // Bodyless foreign associated fn (`GcAllocOutcome::from_hook`):
         // unextracted crate, so the FunDecl has no body while the owner
         // TypeDecl is a full Enum.  Not a `self` method — that keeps the
-        // Opaque-owner BigInt path on the arm above and leaves
-        // `allocated_or_abort` unharvested here.
+        // Opaque-owner BigInt path on the arm above.
         let foreign_assoc_fn =
             !fd.item_meta.is_local && !fd.has_unstructured_body() && !self_receiver;
         if !opaque_method && !foreign_assoc_fn {
@@ -57634,15 +57694,20 @@ fn fundecl_keeps_zst_self(
 
 /// Declared-parameter ValueType, matching [`pygraph_initial_block`] /
 /// [`Lowering::new`]. A ZST `&self` on an `indirectcalltarget` trait impl
-/// stays `Ref`; every other void-ZST parameter is `Void`.
+/// stays `Ref`; a named empty-ADT ZST stays an instance of its empty class;
+/// every other void-ZST parameter is `Void`.
 fn input_param_value_type(
     ty: ValueType,
     local_ty: &TyRef,
     llbc: &Llbc,
     keep_zst_self: bool,
     is_first_param: bool,
+    tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> ValueType {
-    if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(local_ty, llbc) {
+    if matches!(ty, ValueType::Ref(None))
+        && tyref_is_void_zst(local_ty, llbc)
+        && !tyref_keeps_empty_class_instance(local_ty, llbc, tombstoned_leaves)
+    {
         if keep_zst_self && is_first_param {
             ty
         } else {
@@ -57734,11 +57799,10 @@ fn from_impl_conversion(
                 continue;
             };
             let path = crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, &method_name);
-            let pass_payload = fd
-                .signature
-                .inputs
-                .first()
-                .is_some_and(|ty| !tyref_is_void_zst(ty, llbc));
+            let pass_payload = fd.signature.inputs.first().is_some_and(|ty| {
+                !tyref_is_void_zst(ty, llbc)
+                    || tyref_keeps_empty_class_instance(ty, llbc, no_tombstoned_leaves())
+            });
             found.push(crate::front::result_exc::FromResidualConversion {
                 segments: path.segments,
                 pass_payload,
@@ -61250,7 +61314,9 @@ fn collect_by_value_struct_leaves(
             .name
             .clone()
             .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
-        if tyref_is_void_zst(&f.ty, llbc) {
+        if tyref_is_void_zst(&f.ty, llbc)
+            && !tyref_keeps_empty_class_instance(&f.ty, llbc, tombstoned)
+        {
             continue;
         }
         if tyref_pair_field_kind(&f.ty, llbc).is_some() {
@@ -62212,6 +62278,24 @@ fn tyref_is_unsafecell(ty: &TyRef, llbc: &Llbc) -> bool {
 fn tyref_is_bytecode_arg_marker(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc)
         .is_some_and(|p| p == "rustpython_compiler_core::bytecode::instruction::Arg")
+}
+
+/// An instance of a class with no fields is still an instance.
+/// `Bookkeeper.immutablevalue` of an instance is `SomeInstance(classdef)`
+/// (`bookkeeper.py`); `InstanceRepr.convert_const` materialises one
+/// prebuilt instance per class (`rclass.py convert_const`).
+/// `FunctionDesc.pycall` unions that constant into a callee `Ref` input
+/// (`description.py`).
+/// `Arg<T>` stays Void (`tyref_is_bytecode_arg_marker`). `()` and
+/// `PhantomData` have no class_root.
+fn tyref_keeps_empty_class_instance(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    tyref_is_void_zst(ty, llbc)
+        && !tyref_is_bytecode_arg_marker(ty, llbc)
+        && tyref_input_class_root(ty, llbc, tombstoned).is_some()
 }
 
 /// Whether a `TyRef` resolves (behind reference wrappers) to an exact
@@ -71754,7 +71838,10 @@ fn adt_variant_payload_type(
         .fields
         .first()?;
     let concrete = substitute_typevar_field(&field.ty, node, llbc)?;
-    if is_unit_type(&concrete, llbc) || tyref_is_void_zst(&concrete, llbc) {
+    if is_unit_type(&concrete, llbc)
+        || (tyref_is_void_zst(&concrete, llbc)
+            && !tyref_keeps_empty_class_instance(&concrete, llbc, tombstoned))
+    {
         return None;
     }
     let value = tyref_enum_payload_value_type(&concrete, llbc, tombstoned, gc_struct_ids);
@@ -85839,7 +85926,205 @@ mod tests {
                 .iter()
                 .any(|(segments, _, _)| segments.last().map(String::as_str)
                     == Some("allocated_or_abort")),
-            "self-method on a payload enum is not this harvest arm: {harvested:?}"
+            "RawPtr self-method on a payload enum is declined by result type: {harvested:?}"
+        );
+    }
+
+    /// Foreign inherent `Range::contains` whose FunDecl is Opaque while
+    /// the TypeDecl is a generic Struct (`TypeVar` fields, so it is not
+    /// raw storage). Mirrors `core::ops::range::Range::contains`.
+    fn range_contains_fixture() -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+        let item_meta = |name: Vec<serde_json::Value>, is_local: bool| {
+            serde_json::json!({
+                "name": name,
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let typevar = serde_json::json!({"TypeVar": {"Free": 0}});
+        let range_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics.clone()}
+        });
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let impl_seg = serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": {"Value": [0, range_ty.clone()]},
+            "kind": "InherentImplBlock"
+        }}});
+        let range = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(vec![
+                ident("core"), ident("ops"), ident("range"), ident("Range")
+            ], false),
+            "kind": {"Struct": [
+                {"name": "start", "ty": typevar.clone(), "attr_info": field_attr},
+                {"name": "end", "ty": typevar, "attr_info": field_attr}
+            ]}
+        });
+        let contains = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(
+                vec![
+                    ident("core"), ident("ops"), ident("range"), impl_seg, ident("contains")
+                ],
+                false,
+            ),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [range_ty.clone(), i64_ty.clone()],
+                "output": bool_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let caller = {
+            let locals = vec![
+                serde_json::json!({
+                    "index": 0,
+                    "name": null,
+                    "span": span(),
+                    "ty": bool_ty.clone()
+                }),
+                serde_json::json!({
+                    "index": 1,
+                    "name": "range",
+                    "span": span(),
+                    "ty": range_ty.clone()
+                }),
+                serde_json::json!({
+                    "index": 2,
+                    "name": "item",
+                    "span": span(),
+                    "ty": i64_ty.clone()
+                }),
+            ];
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": item_meta(vec![ident("fixture"), ident("range_contains")], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [range_ty.clone(), i64_ty.clone()],
+                    "output": bool_ty.clone()
+                },
+                "body": {
+                    "Unstructured": {
+                        "span": span(),
+                        "locals": {
+                            "arg_count": 2,
+                            "locals": locals
+                        },
+                        "body": [
+                            {
+                                "statements": [],
+                                "terminator": {
+                                    "span": span(),
+                                    "kind": {
+                                        "Call": {
+                                            "call": {
+                                                "func": {
+                                                    "Regular": {
+                                                        "kind": {"Fun": 1},
+                                                        "generics": generics.clone()
+                                                    }
+                                                },
+                                                "args": [
+                                                    {"Copy": {"kind": {"Local": 1}, "ty": range_ty.clone()}},
+                                                    {"Copy": {"kind": {"Local": 2}, "ty": i64_ty.clone()}}
+                                                ],
+                                                "dest": {"kind": {"Local": 0}, "ty": bool_ty.clone()}
+                                            },
+                                            "target": 2,
+                                            "on_unwind": 1
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "UnwindResume"}
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "Return"}
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [range],
+                "fun_decls": [caller, contains],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("Range::contains fixture Llbc parses")
+    }
+
+    #[test]
+    fn range_contains_is_not_harvested_as_function_path() {
+        // Int `Range::contains` folds through `front::range_contains`; the
+        // FunctionPath harvest arm that residualized it is gone.  A
+        // structural mismatch leaves the unregistered call (census Skip).
+        let llbc = range_contains_fixture();
+        let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+        assert!(
+            !harvested
+                .iter()
+                .any(|(segments, _, _)| segments.last().map(String::as_str) == Some("contains")),
+            "Range::contains must not be harvested: {harvested:?}"
+        );
+    }
+
+    #[test]
+    fn range_contains_lowers_as_method() {
+        // Exclusive `Range` is a struct ADT whose FunDecl is Opaque.
+        // `impl_method_owner` declines the Method hint for that shape so
+        // `front::range_contains` can fold `Range::contains` the same way
+        // `RangeInclusive::contains` folds (its owner is Opaque).
+        let llbc = range_contains_fixture();
+        let graph = super::lower_function(&llbc, "range_contains").expect("lower Range::contains");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "contains"
+            )),
+            "Range::contains must lower as Method; ops={ops:?}"
         );
     }
 
@@ -109578,8 +109863,8 @@ mod tests {
         );
         let graph = super::lower_function(&zst, "call_default").expect("zero-sized default");
         assert!(
-            !graph_calls_leaf(&graph, "default"),
-            "a zero-sized default is the unit, graph: {graph:#?}"
+            graph_calls_leaf(&graph, "default"),
+            "a named empty class default is an instance, graph: {graph:#?}"
         );
 
         let aligned = default_call_llbc(

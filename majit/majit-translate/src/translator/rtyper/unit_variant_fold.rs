@@ -192,11 +192,13 @@ pub(crate) fn is_zero_length_shaped_array(name: &str) -> bool {
 /// `OpKind::ConstRef(prebuilt_instance)`, mirroring
 /// `rtyper/rpbc.py::SingleFrozenPBCRepr`.
 pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc<Bookkeeper>>) {
-    // A zero-sized value is `lltype.Void` (`rtuple.TUPLE_TYPE` returns
+    // Unit `()` is `lltype.Void` (`rtuple.TUPLE_TYPE` returns
     // `Void` for an empty field list; `getkind(Void) == 'void'`). Flatten
     // allocates no register for it and `jtransform` drops it from call
     // arguments. Do this before the ref-constant folds so a fieldless
     // struct never becomes a `ConstRefNull` register.
+    // A named empty class is still an instance: intern it below to the
+    // prebuilt singleton (`InstanceRepr.convert_const`).
     //
     // `erase_zero_sized_ctors` already strips the ctor results it
     // classified. A second pass over every Void-typed call actual
@@ -212,6 +214,7 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
     let Some(bk) = bookkeeper else {
         return;
     };
+    let field_bases = collect_field_bases(graph);
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
             let OpKind::Call {
@@ -220,6 +223,7 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
                         name,
                         owner_path,
                         variant_tag,
+                        is_struct,
                         ..
                     },
                 args,
@@ -259,6 +263,25 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
                 op.kind = OpKind::ConstRef(instance);
                 continue;
             }
+            // A fieldless named struct (`PyreEnv`, `KwargsDictStrategy`) is
+            // an instance of a class with no fields. Payloads of a struct
+            // ctor go through FieldWrites, so an empty-arg ctor with no
+            // field traffic is that empty class. Intern by the leaf so
+            // the constant's class matches `tyref_input_class_root` on
+            // the callee Input (`InstanceRepr.convert_const`,
+            // `get_reusable_prebuilt_instance`).
+            if *is_struct {
+                let fieldless = op
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !field_bases.iter().any(|base| base == result));
+                if fieldless
+                    && let Some(instance) = intern_unit_variant_prebuilt_instance(bk, name, None)
+                {
+                    op.kind = OpKind::ConstRef(instance);
+                    continue;
+                }
+            }
             let mut segments = owner_path.clone();
             segments.push(name.clone());
             if !is_synthetic_unit_variant_path(&segments) {
@@ -274,33 +297,16 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
     }
 }
 
-/// Drop a zero-sized constructor from the graph.
+/// Drop a unit `()` constructor from the graph.
 ///
 /// `rtuple.py` `TUPLE_TYPE` returns `lltype.Void` for an empty field list,
 /// and `jtransform.py` `add_in_correct_list` skips `kind == 'void'`. A
-/// fieldless struct (no field traffic on the constructed value) and a
-/// zero-arg `Tuple` used only as a call operand are that case: the value
+/// zero-arg `Tuple` used only as a call operand is that case: the value
 /// gets `concretetype = Void`, the constructor op goes away, and every
-/// call argument list loses it. The callee side is the same test on the
-/// parameter (`ValueType::Void` / `getkind == 'void'`), so the caller
-/// passes one fewer argument and the callee expects one fewer.
+/// call argument list loses it. A named empty class is an instance, not
+/// Void; those constructors intern to a prebuilt constant instead.
 fn erase_zero_sized_ctors(graph: &mut FunctionGraph) {
     use crate::model::{ConcreteType, FunctionGraph};
-
-    let mut field_bases = Vec::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            match &op.kind {
-                OpKind::FieldRead { base, .. }
-                | OpKind::FieldWrite { base, .. }
-                | OpKind::InteriorFieldRead { base, .. }
-                | OpKind::InteriorFieldWrite { base, .. }
-                | OpKind::VableFieldRead { base, .. }
-                | OpKind::VableFieldWrite { base, .. } => field_bases.push(base.clone()),
-                _ => {}
-            }
-        }
-    }
 
     let mut void_vars = Vec::new();
     for block in &graph.blocks {
@@ -308,10 +314,7 @@ fn erase_zero_sized_ctors(graph: &mut FunctionGraph) {
             let OpKind::Call {
                 target:
                     CallTarget::SyntheticTransparentCtor {
-                        name,
-                        owner_path,
-                        is_struct,
-                        ..
+                        name, owner_path, ..
                     },
                 args,
                 ..
@@ -325,9 +328,7 @@ fn erase_zero_sized_ctors(graph: &mut FunctionGraph) {
             let Some(result) = op.result.clone() else {
                 continue;
             };
-            let unit_tuple = owner_path.is_empty() && name == "Tuple";
-            let fieldless_struct = *is_struct && !field_bases.iter().any(|base| base == &result);
-            if !unit_tuple && !fieldless_struct {
+            if !(owner_path.is_empty() && name == "Tuple") {
                 continue;
             }
             if !zst_uses_are_call_args(graph, &result) {
@@ -434,6 +435,24 @@ fn strip_void_call_operands(
     }
 }
 
+fn collect_field_bases(graph: &FunctionGraph) -> Vec<crate::flowspace::model::Variable> {
+    let mut field_bases = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::FieldRead { base, .. }
+                | OpKind::FieldWrite { base, .. }
+                | OpKind::InteriorFieldRead { base, .. }
+                | OpKind::InteriorFieldWrite { base, .. }
+                | OpKind::VableFieldRead { base, .. }
+                | OpKind::VableFieldWrite { base, .. } => field_bases.push(base.clone()),
+                _ => {}
+            }
+        }
+    }
+    field_bases
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,17 +548,12 @@ mod tests {
         assert_ne!(a.identity_id(), other.identity_id());
     }
 
-    /// A fieldless struct built in the prologue, live across a merge point,
-    /// and passed to a method is `lltype.Void`: no ref register, and the
-    /// plain backward `-live-` pass does not grow a set for it.
+    /// A fieldless named struct built in the prologue, live across a merge
+    /// point, and passed to a method is `Constant(prebuilt instance)`
+    /// (`InstanceRepr.convert_const` / `get_reusable_prebuilt_instance`).
     #[test]
-    fn zst_across_merge_point_has_no_ref_register() {
-        use crate::flatten::{FlatOp, RegKind, flatten_graph};
-        use crate::liveness::compute_liveness;
-        use crate::model::{ConcreteType, FunctionGraph, ValueType, call_args};
-        use crate::regalloc::{
-            augment_canonical_exceptblock_on_graph, perform_all_register_allocations,
-        };
+    fn zst_across_merge_point_is_prebuilt_instance() {
+        use crate::model::{FunctionGraph, ValueType, call_args};
 
         let mut graph = FunctionGraph::new("zst_merge");
         let entry = graph.startblock;
@@ -558,7 +572,7 @@ mod tests {
             )
             .unwrap();
         let tag = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
-        FunctionGraph::set_concretetype_of_inline(&tag, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&tag, crate::model::ConcreteType::Signed);
         graph.push_op_var(entry, OpKind::Live, false);
         graph.push_op_var(
             entry,
@@ -592,14 +606,16 @@ mod tests {
         );
         graph.set_goto(entry, entry, Vec::new());
 
-        fold_unit_variant_ctors(&mut graph, None);
-        assert_eq!(
+        let bk = Rc::new(Bookkeeper::new());
+        fold_unit_variant_ctors(&mut graph, Some(&bk));
+        assert_ne!(
             FunctionGraph::concretetype_of(&zst),
-            ConcreteType::Void,
-            "the ZST value is void"
+            crate::model::ConcreteType::Void,
+            "the named empty class is an instance, not Void"
         );
         let mut saw_ctor = false;
-        let mut saw_null = false;
+        let mut saw_prebuilt = false;
+        let mut call_passes_zst = false;
         for block in &graph.blocks {
             for op in &block.operations {
                 match &op.kind {
@@ -607,38 +623,35 @@ mod tests {
                         target: CallTarget::SyntheticTransparentCtor { .. },
                         ..
                     } => saw_ctor = true,
-                    OpKind::ConstRefNull => saw_null = true,
-                    OpKind::Call { args, .. } => {
-                        assert!(
-                            args.iter().all(|arg| arg.as_variable() != Some(&zst)),
-                            "the call still passes the ZST"
-                        );
+                    OpKind::ConstRef(instance) if op.result.as_ref() == Some(&zst) => {
+                        saw_prebuilt = true;
+                        let class = instance
+                            .instance_class()
+                            .expect("prebuilt instance has a class");
+                        let leaf = class
+                            .qualname()
+                            .rsplit(['.', ':'])
+                            .next()
+                            .unwrap_or(class.qualname());
+                        assert_eq!(leaf, "Marker", "intern leaf matches Input class_root");
+                    }
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        args,
+                        ..
+                    } if name == "dispatch_cold" => {
+                        call_passes_zst = args.iter().any(|arg| arg.as_variable() == Some(&zst));
                     }
                     _ => {}
                 }
             }
         }
         assert!(!saw_ctor, "fieldless ctor survived");
-        assert!(!saw_null, "ZST lowered to ConstRefNull");
-
-        augment_canonical_exceptblock_on_graph(&mut graph);
-        let mut regallocs = perform_all_register_allocations(&graph);
         assert!(
-            regallocs
-                .get(&RegKind::Ref)
-                .is_none_or(|alloc| !alloc.coloring.contains_key(&zst)),
-            "ZST occupies a ref register"
+            saw_prebuilt,
+            "named empty class interned as prebuilt instance"
         );
-        let mut flat = flatten_graph(&graph, &mut regallocs);
-        compute_liveness(&mut flat, &regallocs);
-        for insn in &flat.insns {
-            if let FlatOp::Live { live_values } = insn {
-                assert!(
-                    live_values.iter().all(|reg| reg.kind != RegKind::Ref),
-                    "live set gained a ref: {live_values:?}"
-                );
-            }
-        }
+        assert!(call_passes_zst, "the call must pass the instance");
     }
 
     /// Skip-arm `legacy_resolve` can leave a declared-Int residual actual

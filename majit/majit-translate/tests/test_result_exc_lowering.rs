@@ -1646,8 +1646,8 @@ fn eval_loop_converts_bytecode_corruption_before_raising() {
                 continue;
             }
             assert!(
-                from_args.is_empty(),
-                "BytecodeCorruption is a void zero-sized type; From::from has no FUNC.ARGS slot"
+                !from_args.is_empty(),
+                "BytecodeCorruption is a named empty class; From::from receives the instance"
             );
             converted = true;
         }

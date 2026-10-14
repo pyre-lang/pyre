@@ -809,22 +809,7 @@ impl RPythonTyper {
             }
         }
         // rtyper.py — `return getfunctionptr(graph, getconcretetype)`.
-        // `getconcretetype` is `bindingrepr(v).lowleveltype`. Unbound
-        // return is `lltype.Void` (`callparse.py` `getrresult`); seed
-        // fills getargs only (`rpbc.py` `FunctionReprBase.call`). A
-        // skip-subject / ZST-erased graph leaves the return unbound,
-        // and `bindingrepr` panics `KeyError: no binding for arg`.
-        let return_var = match graph.graph.borrow().getreturnvar() {
-            Hlvalue::Variable(v) => Some(v),
-            _ => None,
-        };
-        let result_ll = super::callparse::getrresult(self, graph)?.lowleveltype();
         getfunctionptr(&graph.graph, |v| {
-            if let (Hlvalue::Variable(var), Some(ret)) = (v, return_var.as_ref())
-                && var == ret
-            {
-                return Ok(result_ll.clone());
-            }
             self.bindingrepr(v).map(|r| r.lowleveltype().clone())
         })
     }
@@ -6837,61 +6822,6 @@ mod tests {
             panic!("expected _ptr_obj::Func");
         };
         assert!(func_obj.graph.is_some());
-    }
-
-    #[test]
-    fn getcallable_unbound_return_is_void_like_getrresult() {
-        // `callparse.getrresult`: no return annotation → `lltype.Void`.
-        // `RDict::new` after ZST-self drop is empty getargs plus that
-        // unbound return; `bindingrepr` on it was `KeyError: no binding
-        // for arg` (`annrpython.py` `binding`).
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = RPythonTyper::new(&ann);
-        let code = HostCode {
-            id: HostCode::fresh_identity(),
-            co_name: "new".into(),
-            co_filename: "<test>".into(),
-            co_firstlineno: 1,
-            co_nlocals: 0,
-            co_argcount: 0,
-            co_stacksize: 0,
-            co_flags: 0,
-            co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
-            co_varnames: Vec::new(),
-            co_freevars: Vec::new(),
-            co_cellvars: Vec::new(),
-            consts: Vec::new(),
-            names: Vec::new(),
-            co_lnotab: Vec::new(),
-            exceptiontable: Vec::new().into_boxed_slice(),
-            signature: Signature::new(Vec::new(), None, None),
-        };
-        let graph = Rc::new(PyGraph::new(
-            GraphFunc::new("new", Constant::new(ConstValue::Dict(Default::default()))),
-            &code,
-        ));
-        {
-            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-            let graph_borrow = graph.graph.borrow();
-            for arg in graph_borrow.startblock.borrow_mut().inputargs.iter_mut() {
-                if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
-                    v.set_concretetype(Some(LowLevelType::Signed));
-                    v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
-                }
-            }
-        }
-
-        let llfn = rtyper
-            .getcallable(&graph)
-            .expect("unbound return is Void, not KeyError");
-        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
-        let PtrTarget::Func(func_t) = &llfn._TYPE.TO else {
-            panic!("expected Func ptr, got {:?}", llfn._TYPE.TO);
-        };
-        assert_eq!(
-            func_t.result,
-            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void
-        );
     }
 
     #[test]
