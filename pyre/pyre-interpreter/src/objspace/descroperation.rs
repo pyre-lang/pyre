@@ -1273,6 +1273,14 @@ pub(crate) fn ll_int_py_mod(x: i64, y: i64) -> i64 {
     r.wrapping_add(y & (u >> 63))
 }
 
+/// `support.py` `_ll_1_int_abs`. No-branch; the shift is `LONG_BIT - 1`
+/// on Signed. `wrapping_*` keeps this body free of panic edges.
+/// `abs(MIN)` wraps to `MIN`.
+pub(crate) extern "C" fn _ll_1_int_abs(x: i64) -> i64 {
+    let mask = x >> 63;
+    (x ^ mask).wrapping_sub(mask)
+}
+
 /// `support.py` `_ll_2_int_floordiv`: no-branch reverse of [`ll_int_py_div`].
 ///
 /// `x // y` is [`ll_int_py_div`] (`oopspec` `int.py_div`). The shift is
@@ -3706,7 +3714,6 @@ pub(crate) unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
 }
 
 pub const FLOAT_MATH1_ABS: i64 = 0;
-pub const FLOAT_MATH1_SQRT: i64 = 1;
 pub const FLOAT_MATH1_SIN: i64 = 2;
 pub const FLOAT_MATH1_COS: i64 = 3;
 pub const FLOAT_MATH1_TAN: i64 = 4;
@@ -3741,12 +3748,11 @@ pub const FLOAT_MATH1_LDEXP: i64 = 31;
 pub const FLOAT_MATH1_ISQRT: i64 = 32;
 pub const FLOAT_MATH1_ISCLOSE: i64 = 33;
 
-/// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
+/// Hub so `_float_{sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
 /// `inline(never)` keeps every arm in the graph when a caller passes a constant.
 #[inline(never)]
 pub fn _float_math1(x: f64, kind: i64) -> PyResult {
     match kind {
-        FLOAT_MATH1_SQRT => _float_sqrt(x),
         FLOAT_MATH1_SIN => _float_sin(x),
         FLOAT_MATH1_COS => _float_cos(x),
         FLOAT_MATH1_TAN => _float_tan(x),
@@ -7663,17 +7669,24 @@ pub(crate) fn sqrt_nonneg(x: f64) -> f64 {
     x.sqrt()
 }
 
-/// ll_math.py `ll_math_sqrt` after the domain pin: `W_FloatObject(sqrt_nonneg(x))`.
-#[inline(never)]
-pub fn _float_sqrt(x: f64) -> PyResult {
-    let floatval = sqrt_nonneg(x);
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
-        },
-        floatval,
-    }) as PyObjectRef)
+/// ll_math.py `ll_math_sqrt`.
+///
+/// `x < 0.0` raises ValueError("math domain error"); a finite non-negative
+/// goes through [`sqrt_nonneg`]; +inf or nan is returned as-is.
+///
+/// `support.py` `_ll_1_ll_math_ll_math_sqrt = ll_math.ll_math_sqrt` is
+/// this same function object under the canonical `inline_calls_to`
+/// seed name. The translator registers that path as a GraphStore alias
+/// of this graph (`PipelineConfig::builtin_graphs`); there is no second
+/// body.
+pub fn ll_math_sqrt(x: f64) -> Result<f64, PyError> {
+    if x < 0.0 {
+        return Err(PyError::value_error("math domain error"));
+    }
+    if x.is_finite() {
+        return Ok(sqrt_nonneg(x));
+    }
+    Ok(x)
 }
 
 /// ll_math.py `ll_math_sin` after the finite pin: `W_FloatObject(sin(x))`.
@@ -8242,6 +8255,28 @@ mod tests {
             );
             assert_eq!(_ll_2_int_mod(x, y), x.wrapping_rem(y), "mod {x} {y}");
         }
+    }
+
+    #[test]
+    fn ll_1_int_abs_is_no_branch_wrapping_abs() {
+        assert_eq!(_ll_1_int_abs(0), 0);
+        assert_eq!(_ll_1_int_abs(1), 1);
+        assert_eq!(_ll_1_int_abs(10), 10);
+        assert_eq!(_ll_1_int_abs(-1), 1);
+        assert_eq!(_ll_1_int_abs(-10), 10);
+        assert_eq!(_ll_1_int_abs(i64::MAX), i64::MAX);
+        assert_eq!(_ll_1_int_abs(i64::MIN), i64::MIN);
+    }
+
+    #[test]
+    fn ll_math_sqrt_matches_upstream_control_flow() {
+        assert_eq!(ll_math_sqrt(4.0).unwrap(), 2.0);
+        assert_eq!(ll_math_sqrt(0.0).unwrap(), 0.0);
+        assert_eq!(ll_math_sqrt(f64::INFINITY).unwrap(), f64::INFINITY);
+        assert!(ll_math_sqrt(f64::NAN).unwrap().is_nan());
+        let err = ll_math_sqrt(-1.0).unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        assert_eq!(err.message_text(), "math domain error");
     }
 
     #[test]

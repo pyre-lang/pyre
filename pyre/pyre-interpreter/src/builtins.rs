@@ -26836,26 +26836,6 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
     )))
 }
 
-/// True iff `callable` is the canonical builtin `divmod` function object.
-/// The JIT walker uses the builtin-code identity to recognize a `divmod(a, b)`
-/// residual it can lower to the inline pair shape, and to distinguish it from
-/// an arbitrary replacement stored under the same global name.
-pub fn is_builtin_divmod_function(callable: PyObjectRef) -> bool {
-    unsafe {
-        if callable.is_null() || !crate::is_function(callable) {
-            return false;
-        }
-        let code = crate::function_get_code(callable) as PyObjectRef;
-        if code.is_null() || !crate::gateway::is_builtin_code(code) {
-            return false;
-        }
-        crate::gateway::builtin_code_fn_eq(
-            crate::gateway::builtin_code_get(code),
-            __majit_wrap_builtin_divmod as crate::gateway::BuiltinCodeFn,
-        )
-    }
-}
-
 /// Manual interp2app gateway for operation.py `divmod(space, w_x, w_y)`,
 /// which returns `space.divmod(w_x, w_y)`.  The Signature binds the keyword
 /// form at the call site, so `args` is positional only.

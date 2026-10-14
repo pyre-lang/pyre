@@ -156,7 +156,7 @@ fn classify_call(
         "shadow_stack_len" => Leaf::Len,
         "shadow_stack_get" => Leaf::Get,
         "shadow_stack_set" => Leaf::Set,
-        "reload_top_root" => Leaf::ReloadTop,
+        "reload_top_root" | "reload_top_root_at" => Leaf::ReloadTop,
         "shadow_stack_copy_range" | "shadow_stack_copy_range_into_vec" => Leaf::CopyRange,
         "mark_prebuilt_roots_dirty"
         | "prebuilt_roots_dirty"

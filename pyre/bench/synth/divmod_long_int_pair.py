@@ -1,5 +1,5 @@
-# pyre-check: spec-folds=builtin_divmod_descent
-# `divmod(long, int)` at a traced call site. The call descends `space.divmod`
+# `divmod(long, int)` at a traced call site. The builtin gateway
+# (`__majit_wrap_builtin_divmod`) is walked; it calls `space.divmod`
 # into `_int_divmod`, which keeps the divisor unwrapped and calls
 # `rbigint.int_divmod`; its rtyped return is a two-item `GcStruct`, so the
 # trace holds one elidable call plus two `getfield_gc_r`, then boxes both
@@ -7,10 +7,8 @@
 # allocations per iteration, all inside the loop — an operand varies at every
 # site so the elidable cannot be hoisted out, and the halves stay live across
 # the following iteration's allocations.
-# Two hot loops cover the siblings: `builtin_divmod_descent` on exact ints and
-# `binary_op_descent` for bigint `//` and `%` by a machine int.  The fold
-# census verifies the divmod row directly, so the loops need only compile and
-# check their results.
+# Two hot loops cover the siblings: gateway descent of `divmod` on exact ints
+# and `binary_op_descent` for bigint `//` and `%` by a machine int.
 
 
 try:
@@ -121,8 +119,7 @@ def side_exit_contracts(n):
     assert divmod(Override(9), 4) == ("override", 4)
 
 
-# Both loops remain far beyond the tracing threshold; the fold census, rather
-# than low-resolution wall-clock subtraction, proves that each arm fired.
+# Both loops remain far beyond the tracing threshold.
 print(hot_divmod_int(100000))
 print(hot_long_int_floordiv_mod(100000))
 side_exit_contracts(N)

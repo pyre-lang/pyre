@@ -1959,10 +1959,9 @@ fn jit_str_search_bounds(
 /// `str(i)` over an unboxed integer: `ll_int2dec` + `newutf8`.
 /// The argument is a raw machine integer (the `'i'` argcode operand).
 ///
-/// `jtransform` still records this fused residual for graph-level
-/// `UnaryOp { op: "str" }` over an Int operand.  The Python-level
-/// `str(i)` walker splits the same pair so the wrap is a fresh
-/// `W_UnicodeObject` (`descr_repr`).
+/// Graph-level `UnaryOp { op: "str" }` over an Int is `jit_ll_int2dec`
+/// (`rint.py IntegerRepr.ll_str`).  This fused helper remains for
+/// callers that need a `W_UnicodeObject` wrap of that payload.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_str(v: i64) -> PyObjectRef {
     let payload = crate::lowlevel_string::jit_ll_int2dec(v);

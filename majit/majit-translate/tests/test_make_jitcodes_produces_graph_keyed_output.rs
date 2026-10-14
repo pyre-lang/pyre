@@ -30,6 +30,7 @@
 
 use majit_translate::{
     CallPath, HostStaticAddrs,
+    codewriter::call::access_directly_origin_path,
     flowspace::model::ConstValue,
     front::{
         mir::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths,
@@ -294,11 +295,21 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
             .expect("the exact configured eval::eval_loop_jit portal must be compiled");
         assert!(portal.jitdriver_sd().is_some());
 
+        // PyPy's portal `dispatch` hints the frame `access_directly=True`
+        // (`interp_jit.py dispatch`). `specialize.py default_specialize`
+        // then compiles callees reached with that frame as the
+        // `(AccessDirect, key)` graph; `cachedgraph` registers it under
+        // alt_name `{name}__AccessDirect_None`. The regular graph is only
+        // in the closure when an unflagged frame also calls it.
         for required_leaf in ["execute_opcode_step", "execute_pop_top"] {
             assert!(
-                reg.by_path
-                    .keys()
-                    .any(|path| path.last_segment() == Some(required_leaf)),
+                reg.by_path.keys().any(|path| {
+                    access_directly_origin_path(path)
+                        .as_ref()
+                        .unwrap_or(path)
+                        .last_segment()
+                        == Some(required_leaf)
+                }),
                 "ordinary portal closure must contain `{required_leaf}`",
             );
         }

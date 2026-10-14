@@ -5191,10 +5191,6 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             "pyre_interpreter::objspace::descroperation::_float_abs",
             "float_abs",
         ),
-        (
-            "pyre_interpreter::objspace::descroperation::_float_sqrt",
-            "",
-        ),
         ("pyre_interpreter::objspace::descroperation::_float_sin", ""),
         ("pyre_interpreter::objspace::descroperation::_float_cos", ""),
         ("pyre_interpreter::objspace::descroperation::_float_tan", ""),
@@ -12337,14 +12333,22 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     );
     let captured_exc = wc.last_exc_value();
     let captured_concrete = wc.last_exc_value_concrete();
+    let class_of_last_exc_is_const = wc.fbw_mode.class_of_last_exc_is_const;
     drop(wc);
+    // `execute_ll_raised(..., constant=False)` writes `last_exc_value`
+    // (the concrete) and the flag.  `last_exc_box` is the
+    // `GUARD_EXCEPTION` result `handle_possible_exception` assigns.
     assert!(
-        captured_exc.is_some(),
-        "a raising may-force call must transcribe the exception to last_exc_value",
+        captured_exc.is_none(),
+        "execute_ll_raised does not plant last_exc_box",
     );
     assert!(
         matches!(captured_concrete, ConcreteValue::Ref(_)),
         "last_exc_value_concrete must carry the raised exception pointer",
+    );
+    assert!(
+        !class_of_last_exc_is_const,
+        "a residual exception has not had its class proven by a guard yet",
     );
     assert_eq!(
         tc.box_value(recorded),

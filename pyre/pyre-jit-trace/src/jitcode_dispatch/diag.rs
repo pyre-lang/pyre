@@ -373,7 +373,6 @@ spec_folds! {
     SysGetframe          => ("sys_getframe",             "residual_call", "-"),
     SysExcInfo           => ("sys_exc_info",             "residual_call", "-"),
     MathFrexp            => ("math_frexp",               "residual_call", "-"),
-    BuiltinDivmodDescent => ("builtin_divmod_descent",   "residual_call", "-"),
     ExceptionReduce      => ("exception_reduce",         "residual_call", "-"),
     SetAddMethod         => ("set_add_method",           "residual_call", "-"),
     StoreAttrDirect      => ("store_attr_direct",        "residual_call", "-"),

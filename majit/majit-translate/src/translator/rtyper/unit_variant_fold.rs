@@ -189,8 +189,14 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
     // allocates no register for it and `jtransform` drops it from call
     // arguments. Do this before the ref-constant folds so a fieldless
     // struct never becomes a `ConstRefNull` register.
+    //
+    // `erase_zero_sized_ctors` already strips the ctor results it
+    // classified. A second pass over every Void-typed call actual
+    // (`call.py getcalldescr` still sees those on the flow graph and
+    // skips them by concretetype) would drop a Skip-arm `s_None`
+    // projection of a declared-Int residual (the one-word guard
+    // release) before residual rewrite can stamp `FUNC.ARGS`.
     erase_zero_sized_ctors(graph);
-    strip_void_typed_call_args(graph);
     // Interning a prebuilt instance needs the session bookkeeper
     // (`rtyper.annotator.bookkeeper` / `getuniqueclassdef(value.__class__)`).
     // Without one, skip the ctor-to-constant rewrite rather than minting
@@ -428,30 +434,6 @@ fn strip_void_call_operands(
     }
 }
 
-fn strip_void_typed_call_args(graph: &mut FunctionGraph) {
-    use crate::model::{ConcreteType, FunctionGraph};
-    for block in &mut graph.blocks {
-        for op in &mut block.operations {
-            if call_keeps_void_receiver(&op.kind) {
-                continue;
-            }
-            match &mut op.kind {
-                OpKind::Call { args, .. } => {
-                    args.retain(|arg| {
-                        arg.as_variable()
-                            .map(|var| FunctionGraph::concretetype_of(var) != ConcreteType::Void)
-                            .unwrap_or(true)
-                    });
-                }
-                OpKind::IndirectCall { args, .. } => {
-                    args.retain(|var| FunctionGraph::concretetype_of(var) != ConcreteType::Void);
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +639,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Skip-arm `legacy_resolve` can leave a declared-Int residual actual
+    /// as Void. `call.py getcalldescr` still sees that Variable on the
+    /// flow graph; dropping it here makes residual rewrite pass `[]`.
+    #[test]
+    fn fold_keeps_a_void_actual_of_a_non_zst_residual() {
+        use crate::model::{ConcreteType, FunctionGraph, SpaceOperation, ValueType, call_args};
+
+        let mut graph = FunctionGraph::new("release");
+        let depth = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&depth, ConcreteType::Void);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_interpreter",
+                        "eval",
+                        "frame_anchor_release",
+                    ]),
+                    args: call_args(vec![depth.clone()]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        fold_unit_variant_ctors(&mut graph, None);
+        let OpKind::Call { args, .. } = &graph.block(graph.startblock).operations[0].kind else {
+            panic!("expected the residual Call");
+        };
+        assert_eq!(
+            args.len(),
+            1,
+            "getcalldescr still sees the Void actual so residual rewrite can stamp FUNC.ARGS"
+        );
+        assert_eq!(args[0].as_variable(), Some(&depth));
     }
 }

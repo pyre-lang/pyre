@@ -6148,11 +6148,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // consumed value into TLS as well.  An
             // uncaught raise is carried by the trace's exception FINISH; an
             // aborted walk re-executes the live opcode.
-            let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
-            ctx.set_last_exc_value(
-                bh_exc_box,
-                ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
-            );
+            //
+            // `execute_ll_raised(llexception, constant=False)` writes only
+            // `last_exc_value` (the concrete) and the flag.  `last_exc_box` is
+            // the `GUARD_EXCEPTION` result `handle_possible_exception` assigns
+            // when the class is not already const — never `ConstPtr` of this
+            // recording-time object.
+            ctx.set_last_exc_value_concrete(ConcreteValue::Ref(
+                bh_exc as usize as pyre_object::PyObjectRef,
+            ));
             // `execute_raised(..., constant=False)`:
             // a residual exception has not had its class proven by a guard yet.
             ctx.fbw_mode.class_of_last_exc_is_const = false;
@@ -8868,20 +8872,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    // `divmod(a, b)` descends `space.divmod` instead of the opaque
-    // `bh_call_fn(divmod, NULL, a, b)` residual. `SubRaise` from that
-    // body (a zero divisor) propagates; any other shape falls through
-    // to the generic residual.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        if let Some(outcome) = spec_gate(SpecFold::BuiltinDivmodDescent, || {
-            try_walker_orthodox_builtin_divmod(ctx, code, op, &r_args, dst)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
-    }
 
     // A `raise Type(args)` of a canonical
     // builtin exception class arrives as two residuals — a `CallFn` that
@@ -11297,11 +11287,12 @@ fn cond_record_handle_exception<Sym: WalkSym>(
         v
     });
     if bh_exc != 0 {
-        let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
-        ctx.set_last_exc_value(
-            bh_exc_box,
-            ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
-        );
+        // `execute_ll_raised(..., constant=False)`: concrete + flag only.
+        // `handle_possible_exception` then sets `last_exc_box` to the
+        // `GUARD_EXCEPTION` result.
+        ctx.set_last_exc_value_concrete(ConcreteValue::Ref(
+            bh_exc as usize as pyre_object::PyObjectRef,
+        ));
         ctx.fbw_mode.class_of_last_exc_is_const = false;
         if let Some(cb) = crate::callbacks::try_get() {
             (cb.drain_backend_jit_exc)();
