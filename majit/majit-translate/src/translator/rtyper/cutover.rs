@@ -3585,11 +3585,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         LowLevelType::Float,
     ),
     (
-        &["std", "f64", "<Impl>", "fract"],
-        &["self"],
-        LowLevelType::Float,
-    ),
-    (
         &["std", "f64", "<Impl>", "ceil"],
         &["self"],
         LowLevelType::Float,
