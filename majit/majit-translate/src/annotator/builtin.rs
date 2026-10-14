@@ -1781,7 +1781,13 @@ fn cast_instance_intrinsic(
     };
     let with_nullability = |mut projected: SomeValue| {
         if let SomeValue::String(str_) = &mut projected {
-            str_.inner.can_be_none = operand_can_be_none;
+            // `project_struct_field_type("Option<String>")` already
+            // `noneify`s (`union(s_str0, s_None)`). A residual host
+            // call shells as a classdef-less instance with
+            // `can_be_none=false`; copying that onto the projection
+            // would undo the Option's nullability and make `s is None`
+            // (`pairtype(SomeObject, SomeObject).is_`) a constant false.
+            str_.inner.can_be_none = operand_can_be_none || str_.inner.can_be_none;
         }
         projected
     };

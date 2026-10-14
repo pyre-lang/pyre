@@ -23609,8 +23609,22 @@ impl<'a> Lowering<'a> {
                 // Option enum class, even when `tyref_to_value_type` names
                 // a split-eligible instantiation. Prefer the payload class
                 // the niche arm below already uses.
+                //
+                // A string/list niche has no instance ClassDef
+                // (`option_niche_payload_class_root` is `None`); keep the
+                // split `Option<String>` / `Option<Vec<_>>` spelling so
+                // `project_struct_field_type` unions the payload with
+                // `s_None` (`Bookkeeper.project_struct_field_type` Option
+                // arm, `model.py` `noneify`). Dropping the cast left a
+                // residual host call as a classdef-less instance, and
+                // `if let Some(s)` then could not return a `SomeString`.
                 if self.tyref_is_niche_option_ptr(dest_class_ty) {
                     self.option_niche_payload_class_root(dest_class_ty)
+                        .or_else(|| {
+                            self.option_niche_null_cast(dest_class_ty)
+                                .is_some()
+                                .then(|| root.clone())
+                        })
                 } else {
                     Some(root.clone())
                 }
@@ -38303,8 +38317,9 @@ impl<'a> Lowering<'a> {
     /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
     /// thin nominal ADT. It also includes the exact Rust container spellings
     /// that translate to one RPython GC pointer: `Option<Vec<T>>` becomes a
-    /// nullable `SomeList`, and `Option<&str>` becomes a nullable
-    /// `SomeString`.
+    /// nullable `SomeList`, and `Option<&str>` / `Option<String>` (and the
+    /// other string-family payloads [`node_is_string_value`] already
+    /// projects) become a nullable `SomeString`.
     /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
     /// the non-null payload pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -38533,6 +38548,16 @@ impl<'a> Lowering<'a> {
         let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
             return false;
         };
+        // The same projection as `Option<Vec<T>>` below applies to the
+        // string family: `String` / `Wtf8Buf` / `BytesBlock` / builtin
+        // `str` are already [`node_is_string_value`] (`SomeString`).
+        // `Option<String>` is the nullable form (`s is None` /
+        // `s is not None`; `pairtype(SomeObject, SomeObject).is_`,
+        // `rtype_is_` / `ptr_iszero`), and `Some` is the string itself —
+        // there is no `__discriminant` / `__pos_0` field.
+        if node_is_string_value(payload, self.llbc) {
+            return true;
+        }
         let Some(def_id) = adt_node_def_id(payload) else {
             return false;
         };
@@ -96100,24 +96125,32 @@ mod tests {
     /// arm, so the resulting graph directly exposes whether the classifier
     /// chose aggregate construction or the nullable-pointer identities.
     fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-        lower_option_source_retyped(payload, false, false)
+        lower_option_fn_retyped("option_source", payload, false, false, false)
     }
 
     fn lower_option_source_with_payload_ext(
         payload: serde_json::Value,
         inject_layoutless_nominal: bool,
     ) -> FunctionGraph {
-        lower_option_source_retyped(payload, false, inject_layoutless_nominal)
+        lower_option_fn_retyped(
+            "option_source",
+            payload,
+            false,
+            inject_layoutless_nominal,
+            false,
+        )
     }
 
     fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
-        lower_option_source_retyped(payload, true, false)
+        lower_option_fn_retyped("option_source", payload, true, false, false)
     }
 
-    fn lower_option_source_retyped(
+    fn lower_option_fn_retyped(
+        fn_name: &str,
         mut payload: serde_json::Value,
         through_alias: bool,
         inject_layoutless_nominal: bool,
+        inject_string: bool,
     ) -> FunctionGraph {
         fn replace_dedup(
             value: &mut serde_json::Value,
@@ -96275,6 +96308,46 @@ mod tests {
             }
             retarget(&mut payload, hole as u64);
         }
+        if inject_string {
+            let decls = translated
+                .get_mut("type_decls")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("corpus type_decls");
+            let hole = decls
+                .iter()
+                .position(serde_json::Value::is_null)
+                .expect("corpus type_decls has a null hole");
+            // `SomeRawStruct` is a sized nominal struct; rename the copy to
+            // `alloc::string::String` so [`node_is_string_value`] admits it.
+            let mut copy = decls
+                .iter()
+                .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(5))
+                .expect("sized nominal def-id 5")
+                .clone();
+            copy["def_id"] = serde_json::json!(hole);
+            if let Some(meta) = copy.get_mut("item_meta").and_then(|m| m.as_object_mut()) {
+                meta.insert(
+                    "name".to_string(),
+                    serde_json::json!([
+                        {"Ident": ["alloc", 0]},
+                        {"Ident": ["string", 0]},
+                        {"Ident": ["String", 0]}
+                    ]),
+                );
+            }
+            decls[hole] = copy;
+            payload = serde_json::json!({
+                "Adt": {
+                    "id": hole,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            });
+        }
 
         let fun = translated
             .get_mut("fun_decls")
@@ -96288,26 +96361,26 @@ mod tests {
                         .and_then(|seg| seg.get("Ident"))
                         .and_then(|ident| ident.get(0))
                         .and_then(serde_json::Value::as_str)
-                        == Some("option_source")
+                        == Some(fn_name)
                 })
             })
-            .expect("option_source declaration in corpus");
+            .unwrap_or_else(|| panic!("{fn_name} declaration in corpus"));
         let signature = fun
             .get("signature")
             .and_then(serde_json::Value::as_object)
-            .expect("option_source signature");
+            .unwrap_or_else(|| panic!("{fn_name} signature"));
         let payload_id = signature
             .get("inputs")
             .and_then(serde_json::Value::as_array)
             .and_then(|inputs| inputs.get(1))
             .and_then(|ty| ty.get("Deduplicated"))
             .and_then(serde_json::Value::as_u64)
-            .expect("option_source payload dedup id");
+            .unwrap_or_else(|| panic!("{fn_name} payload dedup id"));
         let output_id = signature
             .get("output")
             .and_then(|ty| ty.get("Deduplicated"))
             .and_then(serde_json::Value::as_u64)
-            .expect("option_source output dedup id");
+            .unwrap_or_else(|| panic!("{fn_name} output dedup id"));
         let option_ty = serde_json::json!({
             "Adt": {
                 "id": option_def_id ,
@@ -96322,7 +96395,8 @@ mod tests {
         replace_dedup(fun, payload_id, output_id, &payload, &option_ty);
 
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-        super::lower_function(&llbc, "option_source").expect("lower retyped option_source")
+        super::lower_function(&llbc, fn_name)
+            .unwrap_or_else(|e| panic!("lower retyped {fn_name}: {e}"))
     }
 
     fn niche_ctor_shape(graph: &FunctionGraph) -> (usize, usize) {
@@ -97196,6 +97270,73 @@ mod tests {
             assert_eq!(null_muts, 0, "case {name}: {none_msg}");
             assert!(transparent_ctors >= 2, "case {name}: {agg_msg}");
         }
+    }
+
+    /// `Option<String>` match is RPython's nullable `SomeString`:
+    /// `s is None` (`pairtype(SomeObject, SomeObject).is_`, rtyped by
+    /// `rtype_is_` / `ptr_iszero`), and the `Some` payload is the string
+    /// itself. The corpus `option_question_mark` `?` is a `Try::branch`
+    /// match; injecting `alloc::string::String` as the Option payload
+    /// pins that the front does not emit `getattr('__discriminant')`.
+    #[test]
+    fn niche_option_string_match_is_none_identity() {
+        use crate::model::OpKind;
+        let graph = lower_option_fn_retyped(
+            "option_question_mark",
+            serde_json::Value::Null,
+            false,
+            false,
+            true,
+        );
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert!(
+            null_muts >= 1,
+            "Option<String> None must lower to a null string pointer, got {null_muts}"
+        );
+        assert_eq!(
+            transparent_ctors, 0,
+            "Option<String> Some must be the string identity, with no Option aggregate"
+        );
+        let discriminant_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+            })
+            .count();
+        assert_eq!(
+            discriminant_reads, 0,
+            "Option<String> match must not read an aggregate __discriminant"
+        );
+        let some_payload_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "__pos_0"
+                            && field.owner_root.as_deref().is_some_and(|owner| {
+                                owner.contains("Option") && owner.ends_with("::Some")
+                            })
+                )
+            })
+            .count();
+        assert_eq!(
+            some_payload_reads, 0,
+            "Option<String> Some payload must be the string itself"
+        );
+        let has_is = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"));
+        assert!(
+            has_is,
+            "Option<String> match must contain an identity null-test"
+        );
     }
 
     /// `gettypeobject` (`gettypefor(..).map_or(PY_NULL, |p| p.as_ptr())`)

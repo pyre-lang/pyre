@@ -279,21 +279,17 @@ fn rewire_one_unwrap_site(
             },
         });
     } else if site.niche {
-        // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
-        // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
-        // `ptr_ne` with an `Int` result matching the aggregate read.  The null
-        // is a repr-adaptive `null_mut()` call, not a fixed-GCREF
-        // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(disc.clone()),
-            kind: OpKind::BinOp {
-                op: "ne".to_string(),
-                lhs: recv.clone().into_variable(),
-                rhs: nullc,
-                result_ty: ValueType::Int,
-            },
-        });
+        // Niche `Option`: the discriminant is `not (opt is None)`
+        // (`None` = null = 0, `Some` = non-null = 1).  `ne` on a
+        // `StringRepr` / `ListRepr` payload is value inequality
+        // (`rstr.py` / `rlist.py` `rtype_ne`), not this null test.
+        graph.push_niche_is_some(
+            a_id,
+            recv.clone().into_variable(),
+            false,
+            site.niche_null_cast.as_ref(),
+            disc.clone(),
+        );
     } else {
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),

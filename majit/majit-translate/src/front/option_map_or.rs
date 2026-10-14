@@ -365,21 +365,17 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     }
     let disc = graph.alloc_value_var();
     if site.niche {
-        // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
-        // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
-        // `ptr_ne` with an `Int` result matching the aggregate read.  The null
-        // is a repr-adaptive `null_mut()` call, not a fixed-GCREF
-        // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(disc.clone()),
-            kind: OpKind::BinOp {
-                op: "ne".to_string(),
-                lhs: opt.clone().into_variable(),
-                rhs: nullc,
-                result_ty: ValueType::Int,
-            },
-        });
+        // Niche `Option`: the discriminant is `not (opt is None)`
+        // (`None` = null = 0, `Some` = non-null = 1).  `ne` on a
+        // `StringRepr` / `ListRepr` payload is value inequality
+        // (`rstr.py` / `rlist.py` `rtype_ne`), not this null test.
+        graph.push_niche_is_some(
+            a_id,
+            opt.clone().into_variable(),
+            false,
+            site.niche_null_cast.as_ref(),
+            disc.clone(),
+        );
     } else if site.scalar_niche {
         // `Option<NonZero<_>>`: `None` is 0, `Some` is the integer itself.
         let zero = graph.alloc_value_var();

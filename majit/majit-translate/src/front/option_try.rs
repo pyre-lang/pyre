@@ -403,22 +403,17 @@ fn rewire_one_option_try_site(
             },
         });
     } else if site.niche {
-        // Niche `Option<NonNull>`: the switch value is the pointer null-test
-        // `opt != null` (`None` = null = 0, `Some` = non-null = 1) — a `ne` on
-        // two `Ref` operands lowers to `ptr_ne` with an `Int` result, feeding
-        // the `{1 => Some, 0 => None}` switch exactly as the aggregate read.
-        // The null is a repr-adaptive `null_mut()` call, not a fixed-GCREF
-        // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(opt_disc.clone()),
-            kind: OpKind::BinOp {
-                op: "ne".to_string(),
-                lhs: opt_a.clone(),
-                rhs: nullc,
-                result_ty: ValueType::Int,
-            },
-        });
+        // Niche `Option`: the switch value is `not (opt is None)`
+        // (`None` = null = 0, `Some` = non-null = 1).  `ne` on a
+        // `StringRepr` / `ListRepr` payload is value inequality
+        // (`rstr.py` / `rlist.py` `rtype_ne`), not this null test.
+        graph.push_niche_is_some(
+            a_id,
+            opt_a.clone(),
+            false,
+            site.niche_null_cast.as_ref(),
+            opt_disc.clone(),
+        );
     } else {
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(opt_disc.clone()),
