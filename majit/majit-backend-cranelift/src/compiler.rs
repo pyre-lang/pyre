@@ -6277,6 +6277,15 @@ fn nonref_demoted_positions(
     out
 }
 
+/// The raw position of a REF box among a LABEL's arguments.
+fn label_ref_arg_raw(arg: &majit_ir::operand::Operand) -> Option<u32> {
+    if arg.is_none() || arg.is_constant() {
+        return None;
+    }
+    let opref = arg.to_opref();
+    (opref.ty() == Some(Type::Ref)).then(|| opref.raw())
+}
+
 fn build_ref_root_slots(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -6367,6 +6376,20 @@ fn build_ref_root_slots(
     }
 
     for (op_idx, op) in ops.iter().enumerate() {
+        // `regalloc.py prepare_op_label` gives every LABEL argument a
+        // location, and a REF one is in the gcmap like any other box. A
+        // merged family member's first LABEL defines its arguments: no op
+        // in this function produces them.
+        if op.opcode == OpCode::Label {
+            for arg in op.getarglist() {
+                if let Some(raw) = label_ref_arg_raw(&arg)
+                    && !force_tokens.contains(&raw)
+                    && seen.insert(raw)
+                {
+                    slots.push((raw, slots.len()));
+                }
+            }
+        }
         if op.result_type() == Type::Ref {
             let vi = op_var_index(op, op_idx, inputargs.len()) as u32;
             if !force_tokens.contains(&vi) && seen.insert(vi) {
@@ -9374,26 +9397,6 @@ fn constptr_stays_inline(opcode: OpCode) -> bool {
     matches!(opcode, OpCode::DebugMergePoint | OpCode::JitDebug)
 }
 
-fn operand_is_live_constptr(arg: &majit_ir::operand::Operand) -> bool {
-    match arg.const_value() {
-        Some(majit_ir::Value::Ref(gcref)) => !gcref.is_null(),
-        _ => false,
-    }
-}
-
-/// `DebugMergePoint` / `JitDebug` carry a ConstPtr that `rewrite.rewrite`
-/// and `emit_op` never enter in the gc table. `refresh_retained_constptrs`
-/// would refuse the merge. Skipping those ops lets it proceed.
-fn has_inline_constptr(ops: &[Op]) -> bool {
-    ops.iter().any(|op| {
-        constptr_stays_inline(op.opcode)
-            && ((0..op.num_args()).any(|i| operand_is_live_constptr(&op.arg(i)))
-                || op
-                    .getfailargs()
-                    .is_some_and(|fail_args| fail_args.iter().any(operand_is_live_constptr)))
-    })
-}
-
 /// Re-read every non-null reference constant of `ops` from `table`, the
 /// `GcTable` the compile of these ops filled: `remove_constptr` and the
 /// fail-arg `_gcref_index` put each such constant there, keyed by the address
@@ -9596,7 +9599,6 @@ fn collect_merged_bridges(
     let owner_has_noexc = owner_ops
         .iter()
         .any(|op| op.opcode == OpCode::GuardNoException);
-    let owner_has_inline_constptr = has_inline_constptr(owner_ops);
     let mut pieces = Vec::new();
     for (op_idx, op) in owner_ops.iter().enumerate() {
         if !op.opcode.is_guard() {
@@ -9627,19 +9629,13 @@ fn collect_merged_bridges(
         // `_store_and_reset_exception`, so `prepare_resume_from_failure`
         // still sees the pending cell. A `GuardNoException` source always
         // stays on that entry. Any other source whose owner or bridge body
-        // contains `GuardNoException` stays there too. A trace whose
-        // `DebugMergePoint` / `JitDebug` ConstPtr is absent from the gc
-        // table used to fail `refresh_retained_constptrs`; splicing any
-        // bridge but `GuardNoOverflow` there resumes on a NULL object.
-        // `GuardNoOverflow` is the overflow edge and still splices.
+        // contains `GuardNoException` stays there too; `GuardNoOverflow` is
+        // the overflow edge and still splices.
         let bridge_has_noexc = bridge_src
             .ops
             .iter()
             .any(|bridge_op| bridge_op.opcode == OpCode::GuardNoException);
-        let only_overflow = owner_has_noexc
-            || bridge_has_noexc
-            || owner_has_inline_constptr
-            || has_inline_constptr(&bridge_src.ops);
+        let only_overflow = owner_has_noexc || bridge_has_noexc;
         if op.opcode == OpCode::GuardNoException {
             continue;
         }
@@ -12169,15 +12165,34 @@ impl CraneliftBackend {
             let recovery = self.failure_recovery[usize::from(info.must_save_exception)]
                 .expect("failure-recovery helper compiled");
             if info.can_have_bridge {
+                let fd = fail_descrs.get(i).and_then(|d| d.as_fail_descr());
+                // A merged recompile re-emits guards that an older function
+                // already holds. A descr has one `adr_jump_offset`, so every
+                // copy exits through that one trampoline and
+                // `patch_jump_for_descr` redirects all of them at once.
+                if let Some(addr) = fd.map(|fd| fd.adr_jump_offset()).filter(|&a| a != 0) {
+                    info.stub_addr = addr;
+                    continue;
+                }
                 let block = self
                     .asm_memory_handle
                     .allocate_executable(crate::stub::STUB_SIZE)
                     .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
                 let addr = block.ptr() as usize;
-                crate::stub::emit_recovery_stub(addr, recovery);
                 info.stub_addr = addr;
-                if let Some(fd) = fail_descrs.get(i).and_then(|d| d.as_fail_descr()) {
-                    fd.set_adr_jump_offset(addr);
+                // Once `patch_jump_for_descr` ran, `adr_jump_offset` is
+                // cleared; a re-emitted copy gets a trampoline that starts
+                // patched, jumping to that bridge body, and stays cleared.
+                match fd.and_then(fail_descr_bridge_ref) {
+                    Some(bridge) => {
+                        crate::stub::write_redirect_branch(addr, bridge.body_ptr as usize);
+                    }
+                    None => {
+                        crate::stub::emit_recovery_stub(addr, recovery);
+                        if let Some(fd) = fd {
+                            fd.set_adr_jump_offset(addr);
+                        }
+                    }
                 }
                 stub_blocks.push(block);
             } else {
@@ -13648,6 +13663,16 @@ impl CraneliftBackend {
                         builder.ins().jump(*label_block, &args);
                     }
                     builder.switch_to_block(*label_block);
+                    // A LABEL binds its REF arguments (`build_ref_root_slots`):
+                    // each is a live box from here on, holding the value the
+                    // incoming edge passed.
+                    for arg in ops[op_idx].getarglist() {
+                        if let Some(raw) = label_ref_arg_raw(&arg)
+                            && !force_tokens.contains(&raw)
+                        {
+                            defined_ref_vars.insert(raw);
+                        }
+                    }
                     // regalloc.py prepare_op_label: a LABEL argument keeps
                     // only the location its JUMP writes (`_arm_arglocs`), and
                     // one that arrives elsewhere is `mark_as_free`d. No JUMP
@@ -20057,10 +20082,10 @@ impl CraneliftBackend {
         // the closing-jump reallocate at the source before the tail-call
         // rather than relying solely on that destination check.
         let target_frame_depth = max_output_slots + reserved_tail;
-        // `publish_merged_entry` keeps each anchor LABEL's existing
-        // `label_block_id` and retargets the code pointer. Stamping here
-        // would write this body onto every LABEL in the family, including
-        // member loops and bridges. Merge mode only records the id.
+        // `publish_merged_entry` retargets each LABEL to this body with the
+        // id recorded here. Stamping here would write this body onto every
+        // LABEL in the family before the anchor and member checks run.
+        // Merge mode only records the id.
         let mut merged_label_targets = Vec::new();
         {
             let mut label_block_id: u32 = 0;
@@ -20388,9 +20413,20 @@ fn collect_guards(
         };
 
         // The counter slot sits past the whole value area, so reserving it
-        // widens the frame for the trace, not for this one exit.
+        // widens the frame for the trace, not for this one exit. A merged
+        // recompile keeps the slot `make_a_counter_per_value` already put in
+        // the descr's status: `must_compile` reads the operand from there.
+        let recorded_counter_slot = if preserve_descrs {
+            op.getdescr().and_then(|descr| {
+                descr
+                    .as_fail_descr()
+                    .and_then(majit_backend::guard_value_counter_slot)
+            })
+        } else {
+            None
+        };
         let counter_value_spill = counter_value_spill(op, &fail_arg_refs)
-            .zip(counter_slot)
+            .zip(recorded_counter_slot.or(counter_slot))
             .inspect(|&(_, slot)| *max_output_slots = (*max_output_slots).max(slot + 1));
         let fail_loc_base = usize::from(op.opcode == OpCode::GuardNotForced2);
         let mut fail_locs: Vec<usize> = (0..fail_arg_refs.len())
@@ -21289,7 +21325,8 @@ impl CraneliftBackend {
     /// writes `ll_loop_code` last): `CompiledLoopToken.frame_info` depth (the
     /// same `update_frame_depth` call `compile_bridge` makes), then each
     /// `LoopTargetDescr` in `token.target_tokens` whose `ll_loop_code` is the
-    /// anchor's current body — keeping that descr's `label_block_id` — then
+    /// anchor's current body — with the block id this function assigned,
+    /// since that body may be another anchor's family function — then
     /// `set_ll_function_addr` (Tail body), `ca_dispatch_slot` (host wrapper),
     /// the call-assembler registry, then `entry_body_ptr` and
     /// `entry_code_ptr` (Release).
@@ -21348,7 +21385,17 @@ impl CraneliftBackend {
             if target.ll_loop_code() != cur_body {
                 continue;
             }
-            let block_id = target.label_block_id();
+            // The block id this function assigned. `label_block_id()` names
+            // a block of the function the cell points at now, which is a
+            // family function owned by another anchor once this loop was
+            // merged there as a member.
+            let id = majit_ir::descr_identity(descr);
+            let Some(&(_, block_id)) = label_targets
+                .iter()
+                .find(|(label, _)| majit_ir::descr_identity(label) == id)
+            else {
+                continue;
+            };
             let depth = target.target_frame_depth().max(frame_depth);
             target.set_dispatch_target(body_ptr, block_id, depth);
             repointed.push(descr.clone());
@@ -21433,6 +21480,13 @@ impl CraneliftBackend {
         ) else {
             return;
         };
+        // `x86/assembler.py gcreftracers.append(tracer)` +
+        // `gcreftracer.py llop.gc_writebarrier(tr)`, as `compile_loop` and
+        // `compile_bridge` do: the new table may hold young references, so
+        // the next minor has to forward it.
+        if let Some(table) = merged.gc_table.clone() {
+            self.register_gc_table(token, table);
+        }
         let depth = merged.max_output_slots + merged.num_ref_roots;
         let code_ptr = merged.code_ptr as usize;
         let body_ptr = merged.body_ptr as usize;
@@ -26015,7 +26069,8 @@ mod tests {
                 gc_table: None,
                 cpu_attachments: None,
             }),
-            &[],
+            // B's only LABEL is block 0 of B's function.
+            &[(label_a.clone(), 0)],
             &[],
             &family_entry,
         );
@@ -26861,6 +26916,251 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 11);
     }
 
+    /// A merged recompile re-emits a guard without a bridge through the
+    /// trampoline its descr already names, so one `patch_jump_for_descr`
+    /// redirects every copy. A re-emitted guard whose own bridge is already
+    /// attached gets a trampoline that starts patched to that bridge, and
+    /// `adr_jump_offset` stays cleared.
+    #[test]
+    fn merged_recompile_keeps_attached_bridge_patched() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(14);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let bridge_guard_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(100)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr.clone(),
+            ),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::const_int(1)], 3),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(3),
+                OpRef::int_op(1),
+                11,
+                odd_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9202);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let exit_stub = as_fd(&exit_descr).adr_jump_offset();
+        assert_ne!(exit_stub, 0);
+        let finish_plus = |n: i64| {
+            vec![
+                mk_op(
+                    OpCode::IntAdd,
+                    &[OpRef::input_arg_int(0), OpRef::const_int(n)],
+                    1,
+                ),
+                mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            ]
+        };
+        let odd_bridge = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
+                1,
+            ),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(1),
+                OpRef::int_op(1),
+                4,
+                bridge_guard_descr.clone(),
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&odd_descr),
+                &[InputArg::new_int_rc(0)],
+                &odd_bridge,
+                &token,
+                None,
+            )
+            .unwrap();
+        assert_eq!(as_fd(&exit_descr).adr_jump_offset(), exit_stub);
+        // Attached to a guard of the spliced bridge: not itself spliced.
+        backend
+            .compile_bridge(
+                as_fd(&bridge_guard_descr),
+                &[InputArg::new_int_rc(0)],
+                &finish_plus(100),
+                &token,
+                None,
+            )
+            .unwrap();
+        assert_eq!(as_fd(&bridge_guard_descr).adr_jump_offset(), 0);
+        // Another loop bridge re-emits the odd bridge in a new generation.
+        backend
+            .compile_bridge(
+                as_fd(&exit_descr),
+                &[InputArg::new_int_rc(0)],
+                &finish_plus(1000),
+                &token,
+                None,
+            )
+            .unwrap();
+        assert_eq!(as_fd(&bridge_guard_descr).adr_jump_offset(), 0);
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 111);
+    }
+
+    /// A merged recompile does not stamp `make_a_counter_per_value` again, so
+    /// a GUARD_VALUE parks its operand in the slot the original compile put
+    /// in the status, even when a spliced bridge widens the value area.
+    #[test]
+    fn merged_guard_value_parks_its_operand_in_the_stamped_slot() {
+        let mut backend = CraneliftBackend::new();
+        let label = make_label_descr(15);
+        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let value_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let wide_descr = mk_test_resume_guard_descr(0, vec![Type::Int; 3]);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let value_guard = Op::with_descr(
+            OpCode::GuardValue,
+            &[rb(OpRef::int_op(4)), rb(OpRef::const_int(1000))],
+            value_descr.clone(),
+        );
+        value_guard.pos().set(OpRef::void_op(12));
+        value_guard.set_fail_arg_types(vec![Type::Int]);
+        value_guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(100)], 2),
+            guard_op(
+                OpCode::GuardTrue,
+                OpRef::int_op(2),
+                OpRef::int_op(1),
+                10,
+                exit_descr,
+            ),
+            mk_op(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::const_int(1)], 3),
+            guard_op(
+                OpCode::GuardFalse,
+                OpRef::int_op(3),
+                OpRef::int_op(1),
+                11,
+                odd_descr.clone(),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::const_int(7)], 4),
+            OpRc::new(value_guard),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+        ];
+        let token = JitCellToken::new(9203);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        // The bridge's three fail args widen the merged value area past the
+        // loop's own counter slot.
+        let wide_guard = Op::with_descr(
+            OpCode::GuardFalse,
+            &[rb(OpRef::int_op(2))],
+            wide_descr.clone(),
+        );
+        wide_guard.pos().set(OpRef::void_op(3));
+        wide_guard.set_fail_arg_types(vec![Type::Int; 3]);
+        wide_guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::int_op(1)),
+            rb(OpRef::input_arg_int(0)),
+        ]);
+        let odd_bridge = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::int_op(1), OpRef::const_int(1000)],
+                2,
+            ),
+            OpRc::new(wide_guard),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label,
+            ),
+        ];
+        let entry_before = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        backend
+            .compile_bridge(
+                as_fd(&odd_descr),
+                &[InputArg::new_int_rc(0)],
+                &odd_bridge,
+                &token,
+                None,
+            )
+            .unwrap();
+        let entry_after = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap()
+            .entry_code_ptr
+            .load(Ordering::Acquire);
+        assert_ne!(entry_before, entry_after, "the bridge is spliced");
+        // 0 -> 1 is odd and takes the bridge, which jumps back with 1. Then
+        // 1 -> 2 reaches the GUARD_VALUE with 2 + 7.
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(Arc::ptr_eq(
+            &backend.get_latest_descr_arc(&frame),
+            &value_descr
+        ));
+        let slot = majit_backend::guard_value_counter_slot(as_fd(&value_descr))
+            .expect("the GUARD_VALUE stamped a counter slot");
+        assert_eq!(backend.get_value_direct(&frame, slot), 9);
+    }
+
     #[test]
     fn merged_exit_honours_redirected_rd_locs() {
         // The carried ref is deopt-only, so `compute_loop_phi_keep` demotes
@@ -27466,11 +27766,11 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 11);
     }
 
-    /// A `DebugMergePoint` ConstPtr is absent from the gc table, so a
-    /// non-overflow bridge stays on `emit_guard_exit`. The separate bridge
-    /// still runs.
+    /// A `DebugMergePoint` ConstPtr is absent from the gc table and stays
+    /// inline, so it does not keep a non-overflow bridge out of the merged
+    /// recompile.
     #[test]
-    fn debug_merge_point_keeps_non_overflow_bridge_separate() {
+    fn debug_merge_point_does_not_keep_bridge_separate() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(23);
         let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
@@ -27554,7 +27854,7 @@ mod tests {
             .unwrap()
             .entry_code_ptr
             .load(Ordering::Acquire);
-        assert_eq!(entry_before, entry_after);
+        assert_ne!(entry_before, entry_after);
         assert!(fail_descr_bridge_ref(as_fd(&hot_descr)).is_some());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert!(Arc::ptr_eq(
