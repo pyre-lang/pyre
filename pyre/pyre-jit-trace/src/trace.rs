@@ -7043,7 +7043,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::InplaceContainerMutationUnsupported { .. } => TraceAction::AbortPermanent,
                 DE::AbortPermanentMarkerReached { .. } => TraceAction::AbortPermanent,
                 DE::GuardSnapshotVableUntyped { .. }
-                | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 // Listed with its sibling kept-stack decline rather than left
                 // to the catch-all: the mirror shape and recovery set behind it
@@ -7314,7 +7313,7 @@ mod tests {
         use crate::jitcode_dispatch::DispatchError;
 
         assert!(super::blackhole_terminal_error(
-            &DispatchError::MayForceNullRefArgUnsupported { pc: 17 }
+            &DispatchError::UnfoldableListAppendResidualUnsupported { pc: 17 }
         ));
         assert!(super::blackhole_terminal_error(
             &DispatchError::VableEscapedDuringResidualCall { pc: 17 }

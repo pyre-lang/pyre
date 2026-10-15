@@ -5712,8 +5712,8 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         return 0;
     }
     // Diagnostic (`PYRE_BH_NULL_ARG`): only `null_or_self` carries a checked
-    // `PY_NULL` sentinel here (`walker_abort_if_mayforce_null_ref_arg` exempts
-    // exactly that index).  A NULL in a real argument slot means the operand
+    // `PY_NULL` sentinel here (`bh_call_fn_impl` prepends it as arg0 only when
+    // non-null).  A NULL in a real argument slot means the operand
     // stack the blackhole read was never published, so the callee dereferences
     // it — report the Python coordinate before that happens instead of leaving
     // a SIGSEGV inside the callee as the only evidence.
