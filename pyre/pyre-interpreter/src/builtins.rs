@@ -13912,7 +13912,7 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         pyre_object::py_type_check(obj, &pyre_object::INT_TYPE)
             && pyre_object::is_exact_builtin_instance(obj)
     } {
-        return Ok(unsafe { pyre_object::descr_str(obj) });
+        return crate::runtime_ops::obj_or_memory_error(unsafe { pyre_object::descr_str(obj) });
     }
     let w = unsafe { crate::py_str_wtf8(obj)? };
     // `StdObjSpace.str` returns the ordinary movable `space.newtext` result.

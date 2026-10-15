@@ -344,6 +344,9 @@ pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
 pub unsafe fn descr_str(obj: PyObjectRef) -> PyObjectRef {
     let v = unsafe { w_int_get_value(obj) };
     let payload = crate::lowlevel_string::jit_ll_int2dec(v);
+    if payload.is_null() {
+        return crate::PY_NULL;
+    }
     // `len(res)` (`descr_repr`): `LLHelpers.ll_strlen` on the `ll_int2dec`
     // STR.  Keep the payload a `Ptr(STR)` so the rtyper emits STRLEN
     // rather than a Signed residual of `bh_lowlevel_string_len`.
@@ -382,6 +385,9 @@ pub unsafe fn format_int_decimal(
     forced_sign: *mut crate::unicodeobject::Utf8Str,
 ) -> PyObjectRef {
     let payload = crate::lowlevel_string::jit_ll_int2dec(value);
+    if payload.is_null() {
+        return crate::PY_NULL;
+    }
     let length = unsafe { (*payload).length } as i64;
     let mut digits = payload;
     let mut n_digits = length;
@@ -390,6 +396,9 @@ pub unsafe fn format_int_decimal(
     if value < 0 {
         sign = crate::lowlevel_string::ll_stringslice_startstop(payload, 0, 1);
         digits = crate::lowlevel_string::ll_stringslice_startstop(payload, 1, length);
+        if sign.is_null() || digits.is_null() {
+            return crate::PY_NULL;
+        }
         n_digits = length - 1;
         sign_len = 1;
     } else if !forced_sign.is_null() {
@@ -401,31 +410,58 @@ pub unsafe fn format_int_decimal(
     let n_padding = width - (sign_len + n_digits);
     if n_padding > 0 {
         let pad = crate::lowlevel_string::jit_ll_str_mul(fill, n_padding);
+        if pad.is_null() {
+            return crate::PY_NULL;
+        }
         if align == FORMAT_INT_ALIGN_LEFT {
             if sign_len > 0 {
                 storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+                if storage.is_null() {
+                    return crate::PY_NULL;
+                }
                 out_len += sign_len;
             }
             storage = crate::lowlevel_string::jit_ll_strconcat(storage, pad);
+            if storage.is_null() {
+                return crate::PY_NULL;
+            }
             out_len += n_padding;
         } else if align == FORMAT_INT_ALIGN_SIGN {
             storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            if storage.is_null() {
+                return crate::PY_NULL;
+            }
             out_len += n_padding;
             if sign_len > 0 {
                 storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+                if storage.is_null() {
+                    return crate::PY_NULL;
+                }
                 out_len += sign_len;
             }
         } else if sign_len > 0 {
             storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+            if storage.is_null() {
+                return crate::PY_NULL;
+            }
             out_len += sign_len;
             storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            if storage.is_null() {
+                return crate::PY_NULL;
+            }
             out_len += n_padding;
         } else {
             storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            if storage.is_null() {
+                return crate::PY_NULL;
+            }
             out_len += n_padding;
         }
     } else if sign_len > 0 {
         storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+        if storage.is_null() {
+            return crate::PY_NULL;
+        }
         out_len += sign_len;
     }
     crate::unicodeobject::w_str_from_storage_and_length(storage, out_len as usize)

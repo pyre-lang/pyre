@@ -481,6 +481,9 @@ pub unsafe fn w_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     let sa = unsafe { w_str_storage(a) };
     let sb = unsafe { w_str_storage(b) };
     let payload = crate::lowlevel_string::jit_ll_strconcat(sa, sb);
+    if payload.is_null() {
+        return crate::PY_NULL;
+    }
     // `W_UnicodeObject(self._utf8 + w_other._utf8, self._len() + w_other._len())`
     let length =
         unsafe { (*(a as *const W_UnicodeObject)).len + (*(b as *const W_UnicodeObject)).len };
@@ -1965,6 +1968,9 @@ fn jit_str_search_bounds(
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_str(v: i64) -> PyObjectRef {
     let payload = crate::lowlevel_string::jit_ll_int2dec(v);
+    if payload.is_null() {
+        return crate::PY_NULL;
+    }
     let length = crate::lowlevel_string::bh_lowlevel_string_len(payload as i64);
     w_str_from_storage_and_length(payload, length)
 }

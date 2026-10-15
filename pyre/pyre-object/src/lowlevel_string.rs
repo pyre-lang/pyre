@@ -266,21 +266,21 @@ fn shrink_lowlevel_array(buf: i64, new_len: i64, base_size: usize, item_size: us
     new_buf
 }
 
-/// `rgc.ll_shrink_array(buf, new_len)` — the non-virtual residual target of the
-/// StringBuilder / UnicodeBuilder `build` tree's `ll_shrink_final`.
-///
-/// Selects the STR / UNICODE width from `buf`'s GC type id
-/// ([`shrink_array_width`]) so a single residual target serves both builder
-/// widths; the jtransform retarget names this one symbol for either. Only the
-/// non-virtual buffer reaches here — a virtual buffer is folded by
-/// `opt_call_shrink_array`.
-///
-/// `extern "C"` so the JIT residual call reaches it through the fnaddr registry.
+/// Publish MemoryError and return a null STR, matching `mallocstr` /
+/// `ovfcheck` in `rstr.py LLHelpers.ll_strconcat` / `ll_str_mul` and
+/// `ll_str.py ll_int2dec`.
+fn raise_ll_memory_error() -> *mut crate::unicodeobject::Utf8Str {
+    crate::interp_exceptions::publish_memory_error();
+    std::ptr::null_mut()
+}
+
 /// `rstr.py LLHelpers.ll_strconcat` — join two rstr `STR` payloads.
 ///
 /// `@jit.elidable` + `@jit.oopspec('stroruni.concat')`.  The result is a
 /// fresh `STR` (`{ hash, len, chars }`), not a `W_UnicodeObject`.
 /// `descr_add` wraps that payload afterwards (`space.newutf8`).
+/// Length overflow (`len1 + len2`) and `mallocstr` failure raise MemoryError
+/// and return null.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_strconcat(
     s1: *mut crate::unicodeobject::Utf8Str,
@@ -294,23 +294,19 @@ pub extern "C" fn jit_ll_strconcat(
     let n1 = bh_lowlevel_string_len(s1);
     let n2 = bh_lowlevel_string_len(s2);
     // "a single '+' like this is allowed to overflow: it gets a negative
-    // result, and the gc will complain" -- MemoryError upstream.  A null
-    // payload handed back instead would be wrapped into a `str` whose `len`
-    // disagrees with its storage; abort loudly as `rbuilder` does until
-    // MemoryError propagation is ported.
-    let total = n1
-        .checked_add(n2)
-        .expect("ll_strconcat length overflow; MemoryError propagation is not ported yet");
+    // result, and the gc will complain" — MemoryError from mallocstr.
+    let Some(total) = n1.checked_add(n2) else {
+        return raise_ll_memory_error();
+    };
     // `malloc_varsize` / `external_malloc` can collect. Pin the operands
     // (`push_roots` / `pin_roots`) and reload them after the allocation,
     // matching the GC transform around `LLHelpers.ll_strconcat`.
     let roots = crate::gc_roots::push_roots();
     let base = roots.pin_roots(&[s1 as crate::PyObjectRef, s2 as crate::PyObjectRef]);
     let out = bh_alloc_lowlevel_string(total, LOWLEVEL_STR_BASE_SIZE, 1);
-    assert!(
-        out != 0,
-        "ll_strconcat failed to allocate {total} bytes; MemoryError propagation is not ported yet"
-    );
+    if out == 0 {
+        return raise_ll_memory_error();
+    }
     let s1 = roots.get(base) as i64;
     let s2 = roots.get(base + 1) as i64;
     unsafe {
@@ -490,9 +486,10 @@ pub extern "C" fn jit_ll_strcmp(
 
 /// `rstr.py LLHelpers.ll_str_mul` — `@jit.elidable` on the STR payload.
 ///
-/// `times < 0` clamps to 0 (`'0' * -1 == ''`).  `ovfcheck(len * times)` is
-/// MemoryError upstream; abort until that propagation is ported.  The
-/// doubling copy is `ll_str_mul`'s `copy_contents` loop.
+/// `times < 0` clamps to 0 (`'0' * -1 == ''`).  `ovfcheck(len * times)`
+/// turns OverflowError into MemoryError; `mallocstr` failure is the same.
+/// Both publish MemoryError and return null.  The doubling copy is
+/// `ll_str_mul`'s `copy_contents` loop.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_mul(
     s: *mut crate::unicodeobject::Utf8Str,
@@ -506,17 +503,19 @@ pub extern "C" fn jit_ll_str_mul(
         times = 0;
     }
     let n = bh_lowlevel_string_len(s);
-    let size = n
-        .checked_mul(times as usize)
-        .expect("ll_str_mul length overflow; MemoryError propagation is not ported yet");
+    let Ok(times_us) = usize::try_from(times) else {
+        return raise_ll_memory_error();
+    };
+    let Some(size) = n.checked_mul(times_us) else {
+        return raise_ll_memory_error();
+    };
     let roots = crate::gc_roots::push_roots();
     let s_slot = roots.base();
     let _ = roots.pin_root(s as crate::PyObjectRef);
     let out = bh_alloc_lowlevel_string(size, LOWLEVEL_STR_BASE_SIZE, 1);
-    assert!(
-        out != 0,
-        "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
-    );
+    if out == 0 {
+        return raise_ll_memory_error();
+    }
     let s = roots.get(s_slot) as i64;
     if size == 0 || n == 0 {
         return out as *mut crate::unicodeobject::Utf8Str;
@@ -638,7 +637,8 @@ pub extern "C" fn jit_ll_str_from_rust_string(
 /// `ll_str.py ll_int2dec` — `@jit.elidable` decimal render of a Signed
 /// into a fresh rstr `STR`, returned as the `Ptr(STR)` it is.
 /// `descr_repr` (intobject.py) wraps the result with
-/// `space.newutf8(res, len(res))`.
+/// `space.newutf8(res, len(res))`. `mallocstr` failure raises MemoryError
+/// and returns null.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str {
     let sign = usize::from(val < 0);
@@ -656,11 +656,9 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str
     }
     let total_len = sign + len + usize::from(is_zero);
     let out = bh_alloc_lowlevel_string(total_len, LOWLEVEL_STR_BASE_SIZE, 1);
-    // `descr_str` wraps the payload unchecked, as `ll_strconcat`'s callers do.
-    assert!(
-        out != 0,
-        "ll_int2dec failed to allocate; MemoryError propagation is not ported yet"
-    );
+    if out == 0 {
+        return raise_ll_memory_error();
+    }
     unsafe {
         let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         let first = if sign != 0 {
@@ -683,6 +681,16 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str
     out as *mut crate::unicodeobject::Utf8Str
 }
 
+/// `rgc.ll_shrink_array(buf, new_len)` — the non-virtual residual target of the
+/// StringBuilder / UnicodeBuilder `build` tree's `ll_shrink_final`.
+///
+/// Selects the STR / UNICODE width from `buf`'s GC type id
+/// ([`shrink_array_width`]) so a single residual target serves both builder
+/// widths; the jtransform retarget names this one symbol for either. Only the
+/// non-virtual buffer reaches here — a virtual buffer is folded by
+/// `opt_call_shrink_array`.
+///
+/// `extern "C"` so the JIT residual call reaches it through the fnaddr registry.
 pub extern "C" fn jit_ll_shrink_array(buf: crate::PyObjectRef, new_len: i64) -> crate::PyObjectRef {
     // Width discovery reads the GC type header, so it needs the same entry
     // livevar normalization as the shrink itself rather than dereferencing the
@@ -841,6 +849,53 @@ mod tests {
         bh_free_lowlevel_string(four as i64, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(also_empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
+
+    fn write_ll_len(s: *mut crate::unicodeobject::Utf8Str, len: usize) {
+        unsafe {
+            ((s as *mut u8).add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(len);
+        }
+    }
+
+    #[test]
+    fn jit_ll_str_mul_overflow_returns_null() {
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
+        // `"100"` is three chars; `3 * i64::MAX` overflows `usize` without a
+        // huge allocation (`LLHelpers.ll_str_mul` `ovfcheck`).
+        let three = jit_ll_int2dec(100);
+        assert_eq!(bh_lowlevel_string_len(three as i64), 3);
+        let out = jit_ll_str_mul(three, i64::MAX);
+        let pending = majit_ir::eval_breaker_word::take_memory_error();
+        assert!(out.is_null());
+        assert!(
+            !pending,
+            "ll_str_mul overflow must not arm the eval-breaker MemoryError bit"
+        );
+        bh_free_lowlevel_string(three as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
+
+    #[test]
+    fn jit_ll_strconcat_overflow_returns_null() {
+        let _ = majit_ir::eval_breaker_word::take_memory_error();
+        let s1 = jit_ll_int2dec(1);
+        let s2 = jit_ll_int2dec(2);
+        let orig1 = bh_lowlevel_string_len(s1 as i64);
+        let orig2 = bh_lowlevel_string_len(s2 as i64);
+        // `len1 + len2` overflow without allocating: each length is just
+        // over half of `usize::MAX`.
+        write_ll_len(s1, usize::MAX / 2 + 1);
+        write_ll_len(s2, usize::MAX / 2 + 1);
+        let out = jit_ll_strconcat(s1, s2);
+        let pending = majit_ir::eval_breaker_word::take_memory_error();
+        write_ll_len(s1, orig1);
+        write_ll_len(s2, orig2);
+        assert!(out.is_null());
+        assert!(
+            !pending,
+            "ll_strconcat overflow must not arm the eval-breaker MemoryError bit"
+        );
+        bh_free_lowlevel_string(s1 as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(s2 as i64, LOWLEVEL_STR_BASE_SIZE, 1);
     }
 
     #[test]

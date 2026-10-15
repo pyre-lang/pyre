@@ -225,6 +225,16 @@ static JIT_EXC_RAISER: OnceLock<JitExcRaiser> = OnceLock::new();
 
 pub fn register_jit_exc_raiser(raiser: JitExcRaiser) {
     let _ = JIT_EXC_RAISER.set(raiser);
+    pyre_object::interp_exceptions::register_residual_exc_publisher(object_residual_raise);
+}
+
+/// Dual-write the residual-call exception pair so pyre-object helpers can
+/// raise MemoryError the same way `jit_publish_residual_error` does.
+extern "C" fn object_residual_raise(value: i64) {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(value));
+    if let Some(raiser) = JIT_EXC_RAISER.get() {
+        raiser(value);
+    }
 }
 
 type JitExcClearer = extern "C" fn();
@@ -286,6 +296,30 @@ pub fn jit_publish_residual_error(mut error: PyError) -> i64 {
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(exc_obj as i64));
     jit_publish_exception(exc_obj);
     0
+}
+
+/// A null object from a pyre-object helper that already published MemoryError.
+///
+/// `rstr.py` `LLHelpers.ll_strconcat` / `ll_str_mul` and `ll_str.py`
+/// `ll_int2dec` raise MemoryError (`mallocstr` / `ovfcheck`). The helper
+/// here returns null after `interp_exceptions::publish_memory_error`, so
+/// this branch is the interpreter-visible conversion: the same
+/// `PyFrame.handle_bytecode` `except MemoryError:
+/// handle_asynchronous_error(ec, space.w_MemoryError)` turn into an
+/// OperationError.
+///
+/// Clearing the ll exception cells is not in this graph.
+/// `exceptiontransform.py` `rpyexc_fetch_exception` / `rpyexc_clear` run
+/// on catch, and a residual call's raise is taken by
+/// `pyjitpl.py` `handle_possible_exception` (`GUARD_NO_EXCEPTION` /
+/// `GUARD_EXCEPTION`). Interpreter catch is
+/// `handle_exception_with_context`.
+#[inline]
+pub(crate) fn obj_or_memory_error(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() {
+        return Err(crate::PyError::memory_error(""));
+    }
+    Ok(obj)
 }
 
 /// [`jit_publish_residual_error`] for a residual whose result is an object:
@@ -861,7 +895,7 @@ pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate
         pyre_object::py_type_check(value, &pyre_object::INT_TYPE)
             && pyre_object::is_exact_builtin_instance(value)
     } {
-        return Ok(unsafe { pyre_object::descr_str(value) });
+        return obj_or_memory_error(unsafe { pyre_object::descr_str(value) });
     }
     convert_value_slow(value, conv)
 }
@@ -2340,6 +2374,19 @@ mod tests {
     use super::*;
     use crate::PyExecutionContext;
     use pyre_object::{w_int_get_value, w_int_new};
+
+    #[test]
+    fn obj_or_memory_error_converts_null_to_memory_error() {
+        let err = obj_or_memory_error(PY_NULL).expect_err("null is MemoryError");
+        assert!(matches!(err.kind, crate::PyErrorKind::MemoryError));
+    }
+
+    #[test]
+    fn obj_or_memory_error_passes_through_a_live_object() {
+        let obj = w_int_new(1);
+        let out = obj_or_memory_error(obj).expect("non-null is Ok");
+        assert_eq!(out, obj);
+    }
 
     #[test]
     fn test_classify_callable_names_the_builtin_arm() {
