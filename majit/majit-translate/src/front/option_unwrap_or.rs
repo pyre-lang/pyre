@@ -81,8 +81,8 @@ pub(crate) struct UnwrapOrSite {
     /// `tyref_is_niche_option_ptr`).  Always an `Option` (never a `Result`)
     /// when set, so `payload_on_disc_true` is `true`.
     pub niche: bool,
-    /// The niche receiver is `Option<fn>`: its null test compares against
-    /// `null_fn` (int bank).
+    /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
+    /// `null_fn` (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,

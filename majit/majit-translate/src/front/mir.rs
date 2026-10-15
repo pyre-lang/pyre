@@ -36570,7 +36570,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
-            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
+            fn_ptr: self.option_niche_is_int_bank(recv_ty),
             niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
         })
@@ -36609,7 +36609,7 @@ impl<'a> Lowering<'a> {
             is_some,
             niche,
             niche_null_cast: self.option_niche_null_cast(&pointee),
-            fn_ptr: self.option_payload_is_fn_ptr(&pointee),
+            fn_ptr: self.option_niche_is_int_bank(&pointee),
             scalar_niche,
         })
     }
@@ -36666,7 +36666,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
-            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
+            fn_ptr: self.option_niche_is_int_bank(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -36708,7 +36708,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
-            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
+            fn_ptr: self.option_niche_is_int_bank(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -37178,7 +37178,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
-            fn_ptr: self.option_payload_is_fn_ptr(&recv_ty_owned),
+            fn_ptr: self.option_niche_is_int_bank(&recv_ty_owned),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(&recv_ty_owned),
         })
@@ -37500,6 +37500,7 @@ impl<'a> Lowering<'a> {
             recv_niche: false,
             result_niche: false,
             niche_null_cast: None,
+            fn_ptr: false,
         };
 
         if is_option {
@@ -37511,6 +37512,7 @@ impl<'a> Lowering<'a> {
             site.payload1_class = self.option_payload_instance_class_root(&recv_ty);
             site.recv_niche = self.tyref_is_niche_option_ptr(&recv_ty);
             site.niche_null_cast = self.option_niche_null_cast(&recv_ty);
+            site.fn_ptr = self.option_niche_is_int_bank(&recv_ty);
         } else {
             let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
                 self.resolve_result_owners(&recv_ty)?;
@@ -37754,7 +37756,7 @@ impl<'a> Lowering<'a> {
             result_ty,
             args_tuple_suffix,
             niche,
-            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
+            fn_ptr: self.option_niche_is_int_bank(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -38219,7 +38221,7 @@ impl<'a> Lowering<'a> {
             result_some_owner,
             result_niche,
             result_fn_ptr: matches!(kind, ClosureCombinator::Map | ClosureCombinator::AndThen)
-                && tyref_option_payload_is_fn_ptr(dest_ty, self.llbc),
+                && self.option_niche_is_int_bank(dest_ty),
             result_fn_ptr_spelling: match kind {
                 ClosureCombinator::Map | ClosureCombinator::AndThen => {
                     tyref_fn_ptr_spelling(dest_ty, self.llbc)
@@ -38236,7 +38238,7 @@ impl<'a> Lowering<'a> {
             call_result_ty,
             args_tuple_suffix,
             niche,
-            fn_ptr: self.option_payload_is_fn_ptr(&recv_ty),
+            fn_ptr: self.option_niche_is_int_bank(&recv_ty),
             niche_null_cast,
             fieldless_none_tag,
             call_once_result_exc,
@@ -38295,24 +38297,27 @@ impl<'a> Lowering<'a> {
             .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
-    /// `Option<fn>` payload — the null arm is `null_fn` (`SomePtr`), not
-    /// `null_mut` (`SomeInstance`).
-    fn option_payload_is_fn_ptr(&self, option_ty: &TyRef) -> bool {
-        if !crate::front::result_exc::tyref_is_option(option_ty, self.llbc) {
+    /// Niche `Option` whose remaining word is an int-bank address.
+    ///
+    /// `rnone.py` `rtype_is_None` compares an operand against a null of its
+    /// own lltype (`Ptr` → `ptr_iszero`, Address / non-GC funcptr →
+    /// `int_is_zero`); `rmodel.py` `rtype_is_` never mixes a GC pointer with
+    /// an Address. [`tyref_to_value_type_with`] already puts `Option<fn>` and
+    /// a raw-address niche ([`ty_is_raw_address`], e.g. `Option<&RawEnum>`)
+    /// in `Int`; a GC pointer / `SomeString` niche stays `Ref`.
+    fn option_niche_is_int_bank(&self, option_ty: &TyRef) -> bool {
+        if !self.tyref_is_niche_option_ptr(option_ty) {
             return false;
         }
-        let Some(payload) = tyref_node(option_ty, self.llbc)
-            .and_then(|node| node.as_object())
-            .and_then(|m| m.get("Adt"))
-            .and_then(|a| a.as_object())
-            .and_then(|a| type_decl_ref_generics(a, self.llbc))
-            .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-            .and_then(|t| t.first())
-        else {
-            return false;
-        };
-        type_node_is_fn_ptr(payload, self.llbc)
+        matches!(
+            tyref_to_value_type_with(
+                option_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+            ),
+            ValueType::Int | ValueType::Unsigned
+        )
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option` in
@@ -38697,11 +38702,13 @@ impl<'a> Lowering<'a> {
     /// one repr-adaptive source.
     fn push_niche_null_ptr(&mut self, mir_bb: usize, option_ty: &TyRef) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
-        // `Option<fn>` is a null function pointer (`SomePtr(FuncType)`),
-        // not a nullable GC instance. `null_mut()` annotates as
-        // classdef-less `SomeInstance` and then cannot union with the
-        // `fn` field read (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
-        if self.option_payload_is_fn_ptr(option_ty) {
+        // Int-banked niche (`Option<fn>` / raw Address): `rnone.py`
+        // `rtype_is_None` compares against a null of the operand's own
+        // lltype (`int_is_zero` / `adr_eq`). `null_mut()` is a GC ref and
+        // would emit `is_` on mixed `ir` operands. Spelling is the FUNC
+        // type when the payload is `fn`; a raw Address keeps the coarse
+        // empty `FuncType` (still the int bank).
+        if self.option_niche_is_int_bank(option_ty) {
             return self.graph.push_null_fn_ptr_with_spelling(
                 bb_id,
                 tyref_fn_ptr_spelling(option_ty, self.llbc).as_deref(),
@@ -68400,6 +68407,9 @@ struct DiscCombinatorSite {
     /// `None` narrowed to the payload class, when the null must share it
     /// (`option_niche_null_cast`).
     niche_null_cast: Option<(String, ValueType)>,
+    /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
+    /// `null_fn` (`rnone.py` `rtype_is_None`).
+    fn_ptr: bool,
 }
 
 #[derive(Clone)]
@@ -68989,7 +68999,7 @@ fn rewire_option_filter_diamond(
     // A niche result is the pointer or null. An aggregate `None` would make
     // the caller's null test read a live object.
     let none = if site.result_niche {
-        emit_niche_null(graph, none_bb, &site.niche_null_cast)
+        emit_niche_null(graph, none_bb, site.fn_ptr, &site.niche_null_cast)
     } else {
         emit_option_variant(graph, none_bb, &site.result_owner, 0, None)
     };
@@ -69056,7 +69066,7 @@ fn rewire_option_filter_diamond(
         )
     };
     let drop_none = if site.result_niche {
-        emit_niche_null(graph, drop_bb, &site.niche_null_cast)
+        emit_niche_null(graph, drop_bb, site.fn_ptr, &site.niche_null_cast)
     } else {
         emit_option_variant(graph, drop_bb, &site.result_owner, 0, None)
     };
@@ -69105,7 +69115,7 @@ fn rewire_option_filter_diamond(
     // Niche tag is `ptr` is not null (`Some` = 1). A `__discriminant`
     // field read loads the object header.
     let disc = if site.recv_niche {
-        emit_niche_some_tag(graph, a_id, recv, &site.niche_null_cast)
+        emit_niche_some_tag(graph, a_id, recv, site.fn_ptr, &site.niche_null_cast)
     } else {
         emit_enum_disc_read(graph, a_id, recv, &site.recv_owner)
     };
@@ -69879,57 +69889,31 @@ fn drop_rebuilt_receiver_shell(
 ///
 /// `is_` is the null test. `ne` compares string and list values, so it is
 /// not a discriminant. The `None` null shares the payload class when
-/// `null_cast` is set (`push_niche_null_ptr`).
+/// `null_cast` is set (`push_niche_null_ptr`). `fn_ptr` selects the
+/// int-bank null (`rnone.py` `rtype_is_None`).
 fn emit_niche_some_tag(
     graph: &mut FunctionGraph,
     block: BlockId,
     recv: Variable,
+    fn_ptr: bool,
     null_cast: &Option<(String, ValueType)>,
 ) -> Variable {
-    let null = emit_niche_null(graph, block, null_cast);
-    let is_none = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(is_none.clone()),
-        kind: OpKind::BinOp {
-            op: "is_".to_string(),
-            lhs: recv,
-            rhs: null,
-            result_ty: ValueType::Int,
-        },
-    });
-    let false_var = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(false_var.clone()),
-        kind: OpKind::ConstBool(false),
-    });
     let disc = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(disc.clone()),
-        kind: OpKind::BinOp {
-            op: "eq".to_string(),
-            lhs: is_none,
-            rhs: false_var,
-            result_ty: ValueType::Int,
-        },
-    });
+    graph.push_niche_is_some(block, recv, fn_ptr, null_cast.as_ref(), disc.clone());
     disc
 }
 
 fn emit_niche_null(
     graph: &mut FunctionGraph,
     block: BlockId,
+    fn_ptr: bool,
     null_cast: &Option<(String, ValueType)>,
 ) -> Variable {
-    let null = graph.push_null_mut_ptr(block);
-    let Some((root, ty)) = null_cast else {
-        return null;
-    };
-    let narrowed = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(narrowed.clone()),
-        kind: crate::model::cast_instance_call_result(root.clone(), null, ty.clone()),
-    });
-    narrowed
+    if fn_ptr {
+        graph.push_null_fn_ptr_with_spelling(block, None)
+    } else {
+        graph.push_niche_null(block, null_cast.as_ref())
+    }
 }
 
 fn emit_enum_disc_read(
@@ -77005,6 +76989,7 @@ mod tests {
             recv_niche: false,
             result_niche: false,
             niche_null_cast: None,
+            fn_ptr: false,
         };
         let live_before: std::collections::HashSet<_> =
             graph.blocks.iter().map(|block| block.id).collect();
@@ -96449,11 +96434,16 @@ mod tests {
 
     fn niche_ctor_shape(graph: &FunctionGraph) -> (usize, usize) {
         let ops = graph.blocks.iter().flat_map(|block| &block.operations);
-        let null_muts = ops
+        // `rnone.py` `rtype_is_None`: a GC Ptr None is `null_mut` (ref
+        // bank); an Address / non-GC funcptr None is `null_fn` (int bank).
+        let nulls = ops
             .clone()
             .filter(|op| {
                 matches!(&op.kind, OpKind::Call { target, .. }
-                    if target.to_string() == "core::ptr::null_mut")
+                if matches!(
+                    target.to_string().as_str(),
+                    "core::ptr::null_mut" | "core::ptr::null_fn"
+                ))
             })
             .count();
         let transparent_ctors = ops
@@ -96467,7 +96457,7 @@ mod tests {
                 )
             })
             .count();
-        (null_muts, transparent_ctors)
+        (nulls, transparent_ctors)
     }
 
     #[test]
@@ -103979,6 +103969,7 @@ mod tests {
             recv_niche: false,
             result_niche: false,
             niche_null_cast: None,
+            fn_ptr: false,
         }
     }
 

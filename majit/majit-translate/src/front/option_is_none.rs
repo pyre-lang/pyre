@@ -43,9 +43,9 @@ pub(crate) struct IsNoneSite {
     /// container projected to an RPython string/list repr. The null operand
     /// must enter that same repr before comparison.
     pub niche_null_cast: Option<(String, ValueType)>,
-    /// `Option<fn>`: the null arm is `core.ptr.null_fn` (`ValueType::Int`),
-    /// the same bank as the function pointer. `null_mut` is a GC ref and
-    /// would emit `is_` on mixed `ir` operands.
+    /// Int-banked niche (`Option<fn>` / raw Address): the null arm is
+    /// `core.ptr.null_fn` (`ValueType::Int`). `null_mut` is a GC ref and
+    /// would emit `is_` on mixed `ir` operands (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
     /// `Option<NonZero<_>>`: the word itself is the tag. `None` is 0, so
     /// the predicate compares that integer and does not read `__discriminant`.

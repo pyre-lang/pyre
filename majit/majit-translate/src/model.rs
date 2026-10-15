@@ -8463,7 +8463,9 @@ impl FunctionGraph {
     /// `not (opt is None)`, spelled `eq(is_(opt, None), False)`.  A `ne` would
     /// be value inequality on a `StringRepr` / `ListRepr` payload
     /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `fn_ptr` selects
-    /// `null_fn` (`ll_ptrtype`); every other niche uses [`Self::push_niche_null`].
+    /// `null_fn` (`ll_ptrtype`) for an int-banked niche (`Option<fn>` or a
+    /// raw Address; `rnone.py` `rtype_is_None`); every other niche uses
+    /// [`Self::push_niche_null`].
     pub fn push_niche_is_some(
         &mut self,
         block: BlockId,

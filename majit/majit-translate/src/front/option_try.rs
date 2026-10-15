@@ -63,8 +63,8 @@ pub(crate) struct OptionTrySite {
     /// tag switch is then a pointer null-test (`opt != null`) and the `Some`-arm
     /// payload is the base pointer itself (identity).
     pub niche: bool,
-    /// The niche receiver is `Option<fn>`: its null test compares against
-    /// `null_fn` (int bank).
+    /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
+    /// `null_fn` (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
     /// `Option<NonZero<_>>`: `None` is 0 and `Some` is the word.
     pub scalar_niche: bool,

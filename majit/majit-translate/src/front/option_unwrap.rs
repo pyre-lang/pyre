@@ -70,8 +70,8 @@ pub(crate) struct UnwrapSite {
     /// discriminant is then `opt != null` and the payload is the base pointer
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
-    /// The niche receiver is `Option<fn>`: its null test compares against
-    /// `null_fn` (int bank).
+    /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
+    /// `null_fn` (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
     /// `Option<NonZero<_>>`: `None` is the integer 0 and `Some` is the word
     /// itself. No aggregate `__discriminant` / `__pos_0`.

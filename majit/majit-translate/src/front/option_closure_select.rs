@@ -93,8 +93,9 @@ pub(crate) struct ClosureSelectSite {
     /// True when the BUILT result is a niche `Option` — `Some(x)` is then `x`
     /// itself and `None` is null, the produce-side mirror of `niche`.
     pub result_niche: bool,
-    /// The built niche is `Option<fn>`. `None` is `null_fn` (int bank),
-    /// not `null_mut` (ref bank). Set from `tyref_option_payload_is_fn_ptr`.
+    /// The built niche is int-banked (`Option<fn>` / raw Address). `None`
+    /// is `null_fn` (int bank), not `null_mut` (ref bank)
+    /// (`rnone.py` `rtype_is_None`).
     pub result_fn_ptr: bool,
     /// `fn(inputs) -> output` spelling of the built `Option<fn(...)>` so
     /// `None` is `nullptr` of that `FuncType`. Empty when the result is
@@ -144,8 +145,8 @@ pub(crate) struct ClosureSelectSite {
     /// itself (identity), not a `__pos_0` field read.  (The closure `Args`
     /// tuple `__pos_0` write is unaffected — that is a real `Tuple` field.)
     pub niche: bool,
-    /// The receiver niche is `Option<fn>`: its null test compares against
-    /// `null_fn` (int bank).
+    /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
+    /// `null_fn` (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
