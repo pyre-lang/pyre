@@ -1,6 +1,7 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=wide
 # pyre-check: spec-folds=builtin_locals
+# pyre-check: trace-shape=wide:present=Jump
 # `locals()` on the PORTAL frame of a loop whose frame is wider than the
 # expansion's old ceiling.
 #

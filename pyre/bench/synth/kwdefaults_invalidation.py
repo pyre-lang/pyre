@@ -1,6 +1,7 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=argument_shapes,hot,missing_window
 # pyre-check: spec-folds=kwonly_defaults_inline
+# pyre-check: trace-shape=argument_shapes:max=CallMayForceR:12
 # Self-checking guard for the pins under an inlined callee's keyword-only
 # defaults.
 #

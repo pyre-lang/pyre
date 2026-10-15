@@ -1,5 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=hot_object,hot_int,hot_float,hot_ascii,hot_nested,hot_break_resume,hot_append_during,hot_truncate_during,hot_strategy_change,hot_exhausted_retained,hot_setstate_sentinel,hot_subclass,hot_empty
+# pyre-check: trace-shape=hot_int:absent=CallMayForceR
 # `for x in <list>` drives a `list_iterator`. The step is
 # `W_FastListIterObject.descr_next` (`list_iter_descr_next`): it re-reads the
 # live length, so an append or a truncation under the cursor is observed, and

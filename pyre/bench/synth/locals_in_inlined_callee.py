@@ -1,4 +1,5 @@
 # pyre-check: spec-folds=builtin_locals
+# pyre-check: trace-shape=probe_direct:present=Jump
 # `locals()` called from a function the tracer inlines must report the CALLEE's
 # own fastlocals, not the caller's.
 #

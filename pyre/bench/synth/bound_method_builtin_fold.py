@@ -1,4 +1,5 @@
 # pyre-check: spec-folds=load_bound_method_attr
+# pyre-check: trace-shape=escaping_bound_method:absent=CallMayForceR
 # `lst.append(x)` on a builtin receiver: the name resolves to a builtin-code
 # function on the type, so LOAD_ATTR's method fast path declines (it only
 # pushes `[descr, self]` for `flag_method_descriptor` types) and `getattr`

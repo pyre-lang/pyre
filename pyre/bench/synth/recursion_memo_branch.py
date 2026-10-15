@@ -1,4 +1,5 @@
 # pyre-check: spec-folds=binary_op_descent,compare_op_descent
+# pyre-check: trace-shape=entry-bridge:rec_plain:absent=CallMayForceR,absent=CallMayForceI,entry-bridge:rec_memo:present=GuardNonnullClass
 # These three carry most of the corpus's fold traffic, and nothing
 # declared any of them, so switching one off was a silent change. This fixture
 # fires all three repeatedly, the widest margin of any fixture doing so.

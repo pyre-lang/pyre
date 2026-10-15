@@ -1,6 +1,7 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: spec-folds=bare_super_virtual,load_attr_on_super
 # pyre-check: skip-cpython
+# pyre-check: trace-shape=loop:absent=CallMayForceR
 # The apparent-class twin of `zero_arg_name_bound_super_attr.py`: `type(self)`
 # is unrelated to `Child`, while the ordinary class attribute
 # `self.__class__` names it.  This reaches PyPy's third `_super_check` arm.

@@ -1,6 +1,7 @@
 # pyre-check: spec-folds=setslice,newlist
 # pyre-check: max-pypy-ratio=1.0
 # pyre-check: skip-cpython
+# pyre-check: trace-shape=main:absent=CallMayForceN,absent=CallMayForceR
 # Integer list setslice (per-strategy ops).  Exercises W_ListObject slice
 # assignment: lst[a:b] = [...] stays in Integer strategy when the new items are
 # plain ints, rather than falling back to Object.  guard_class on

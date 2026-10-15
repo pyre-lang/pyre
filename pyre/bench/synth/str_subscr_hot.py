@@ -1,4 +1,5 @@
 # pyre-check: spec-folds=subscr
+# pyre-check: trace-shape=hot_index:absent=CallMayForceR
 # Hot-loop `s[i]` on an exact `str`. The subscript reaches the walker as the
 # `BinaryOp` helper's `Subscr` tag; an exact `str` receiver with an exact
 # `int` index descends `baseobjspace::getitem_str` (`descr_getitem`'s scalar

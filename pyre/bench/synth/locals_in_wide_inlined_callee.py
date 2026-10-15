@@ -1,6 +1,7 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=probe
 # pyre-check: spec-folds=builtin_locals
+# pyre-check: trace-shape=probe:present=Jump
 # `locals()` in an inlined callee whose frame is WIDER than the modelled
 # expansion's old ceiling.
 #

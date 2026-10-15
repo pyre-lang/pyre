@@ -1,6 +1,7 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=probe_callee_extra,probe_plain
 # pyre-check: spec-folds=builtin_locals
+# pyre-check: trace-shape=probe_plain:present=Jump
 # A key written through `frame.f_locals` that names no writable fast local must
 # survive into the mapping `locals()` / `vars()` / `dir()` hand back, including
 # when the trace folds those builtins.

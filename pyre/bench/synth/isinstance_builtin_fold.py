@@ -1,6 +1,7 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=hot_hit,hot_miss,hot_subclasses,hot_polymorphic,hot_bases,hot_late_base
 # pyre-check: spec-folds=builtin_isinstance
+# pyre-check: trace-shape=hot_hit:absent=CallMayForceR
 # Self-checking guard for `isinstance(obj, cls)` answered out of the trace.
 #
 # `issubtype` (typeobject.py) promotes both types and keys an elidable answer

@@ -1,6 +1,7 @@
 # pyre-check: max-pypy-ratio=1.8
 # pyre-check: requires-modules=math
 # pyre-check: skip-cpython
+# pyre-check: trace-shape=run_round_to_int:absent=CallMayForceR,run_fabs:absent=CallMayForceR,run_unary:absent=CallMayForceR,run_binary:absent=CallMayForceR,run_isclose:absent=CallMayForceR,run_log_trig:absent=CallMayForceR,run_sqrt:absent=CallMayForceR
 # This fixture carried a wasm allowance of 13, fitted to a darwin-arm64
 # reading of 8.1-9.0x.  Most of that was the host crossing: `isclose`, `frexp`
 # and `ldexp` lower to helpers with mixed `f64`/word signatures, which the

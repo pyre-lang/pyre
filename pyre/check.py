@@ -511,7 +511,7 @@ def last_run_peak_rss_mb():
 
 
 
-def _run_timed_unix(args, timeout_s, env=None):
+def _run_timed_unix(args, timeout_s, env=None, keep_output=False):
     # `os.wait4` rather than `getrusage(RUSAGE_CHILDREN)` around
     # `subprocess.run`: `ru_maxrss` on RUSAGE_CHILDREN is a running maximum
     # over every reaped child, not a counter, so a before/after difference
@@ -549,7 +549,7 @@ def _run_timed_unix(args, timeout_s, env=None):
         # finalizer neither waits nor warns.
         proc.returncode = -(status & 0x7F) if status & 0x7F else (status >> 8)
 
-        if timed_out:
+        if timed_out and not keep_output:
             _LAST_RUN_MAXRSS_MB[0] = None
             return "", 0.0, 124, ""
 
@@ -557,6 +557,14 @@ def _run_timed_unix(args, timeout_s, env=None):
         err_f.seek(0)
         stdout_bytes = out_f.read()
         stderr_bytes = err_f.read()
+        if timed_out:
+            _LAST_RUN_MAXRSS_MB[0] = None
+            return (
+                stdout_bytes.decode("utf-8", errors="replace"),
+                0.0,
+                124,
+                stderr_bytes.decode("utf-8", errors="replace"),
+            )
 
     # ru_maxrss is kilobytes on Linux and bytes on macOS/BSD.
     scale = 1024 * 1024 if sys.platform == "darwin" else 1024
@@ -569,7 +577,7 @@ def _run_timed_unix(args, timeout_s, env=None):
     )
 
 
-def _run_timed_win32(args, timeout_s, env=None):
+def _run_timed_win32(args, timeout_s, env=None, keep_output=False):
     import ctypes
     from ctypes import wintypes
 
@@ -616,9 +624,16 @@ def _run_timed_win32(args, timeout_s, env=None):
         stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.communicate()
+        stdout_bytes, stderr_bytes = proc.communicate()
         kernel32.CloseHandle(job)
-        return "", 0.0, 124, ""
+        if not keep_output:
+            return "", 0.0, 124, ""
+        return (
+            (stdout_bytes or b"").decode("utf-8", errors="replace"),
+            0.0,
+            124,
+            (stderr_bytes or b"").decode("utf-8", errors="replace"),
+        )
 
     utime = 0.0
     JobObjectBasicAndIoAccountingInformation = 8
@@ -651,19 +666,28 @@ def _run_timed_win32(args, timeout_s, env=None):
     )
 
 
-def run_timed(args, timeout_s=None, env=None):
+def run_timed(args, timeout_s=None, env=None, keep_output_on_timeout=False):
     """Run *args*, return (stdout_str, user_cpu_seconds, returncode, stderr_str).
 
     returncode 124 = timeout (matching coreutils convention). *env* (when
     given) replaces the child environment (pass a full os.environ copy plus
     extras).
+
+    `keep_output_on_timeout` still returns whatever the child wrote before it
+    was killed. The default discards it: a timed-out benchmark has no output
+    to compare. The trace-shape gate keeps it, because the optimized trace is
+    dumped at compile time, long before a log-heavy run spends its budget.
     """
     if sys.platform == "win32":
         # No wait4 counterpart; the memory gate reads None and stays inert.
         _LAST_RUN_MAXRSS_MB[0] = None
-        out, t, rc, err = _run_timed_win32(args, timeout_s, env)
+        out, t, rc, err = _run_timed_win32(
+            args, timeout_s, env, keep_output=keep_output_on_timeout,
+        )
     else:
-        out, t, rc, err = _run_timed_unix(args, timeout_s, env)
+        out, t, rc, err = _run_timed_unix(
+            args, timeout_s, env, keep_output=keep_output_on_timeout,
+        )
     # PyPy/CPython on Windows emit CRLF in stdout text mode; Rust's println!
     # emits LF on all platforms. Normalize so output comparisons aren't
     # platform-sensitive (and snapshots stay portable).
@@ -2556,6 +2580,41 @@ def synth_spec_folds(path):
     return names
 
 
+def synth_trace_shapes(path):
+    """Read the optimized-trace shape a fixture's named loop must have:
+        # pyre-check: trace-shape=main:absent=CallMayForceR,present=IntAdd
+        # pyre-check: trace-shape=entry-bridge:leaf:max=GuardTrue:2
+
+    The loop label is the code-object name `selfcheck-compiles` already uses:
+    the first field of a `[loop-census] <arm> <name>` line. A bare name means
+    the `loop` arm. `entry-bridge:<name>:...` (and the other census arms)
+    select that compile.
+
+    The body is the `jit-log-opt-loop` section `MAJIT_LOG` dumps for that
+    compile — the last such section before the census line, which is the
+    optimized trace rather than the peeled assembly dumped ahead of it.
+    `PYRE_LOOP_CENSUS` names the compile. Both variables already exist.
+
+    An assertion is `absent=<token>`, `present=<token>` or `max=<token>:<N>`.
+    A token is an opcode spelled the way the dump prints it (`IntAdd`,
+    `CallMayForceR`) or any other text on that operation line (a residual
+    helper, an oopspec, a callee path). Every compiled trace of the label
+    has to satisfy every assertion. A missing trace, a trace with no
+    operations, or a trace dumped as an op-count table because it was too
+    long to print, fails: each of those is indistinguishable from a trace
+    that truly lacks the operation.
+    """
+    found = _header_directive(path, "# pyre-check: trace-shape=")
+    if found is None:
+        return ()
+    raw, line = found
+    try:
+        groups = _parse_trace_shape(raw)
+    except ValueError as e:
+        raise ValueError(f"invalid trace-shape in {path}: {line.strip()} ({e})") from e
+    return groups
+
+
 def synth_fixture_headers(path):
     """Every directive `path` owes, read in one pass.
 
@@ -2570,6 +2629,7 @@ def synth_fixture_headers(path):
         "requires_modules": synth_requires_modules(path),
         "skip_platforms": synth_skip_platforms(path),
         "spec_folds": synth_spec_folds(path),
+        "trace_shapes": synth_trace_shapes(path),
     }
     if selfcheck:
         interpreted = synth_selfcheck_interpreted(path)
@@ -2650,11 +2710,14 @@ def check_synthetic_headers(pattern):
     broken = _expected_reader_selftest()
     for case, detail in broken:
         print(f"{red('ERROR')}: the `# Expected` reader mis-reads {case}: {detail}")
+    broken_shape = _trace_shape_reader_selftest()
+    for case, detail in broken_shape:
+        print(f"{red('ERROR')}: the trace-shape reader mis-reads {case}: {detail}")
     empty = [(path, line) for path in paths
              for claim, line in _expected_claims(path) if not claim.strip()]
     for path, line in empty:
         print(f"{red('ERROR')}: {path} states an expectation with nothing in it: {line.strip()}")
-    if broken or empty:
+    if broken or broken_shape or empty:
         return 1
     claims = sum(len(_expected_claims(path)) for path in paths)
     print(
@@ -2698,6 +2761,371 @@ def _expected_reader_selftest():
                     label,
                     "objected" if objected else "stayed silent",
                 ))
+    return broken
+
+
+# `absent=<token>` / `present=<token>` / `max=<token>:<N>`. `\S+` stops at
+# whitespace; the trailing `:digits` of `max` is split off by backtracking so
+# a callee path may itself contain colons.
+_TRACE_SHAPE_ASSERTION_RE = re.compile(
+    r"^(absent|present)=(\S+)$|^(max)=(\S+):(\d+)$"
+)
+_TRACE_SHAPE_OP_LINE_RE = re.compile(
+    r"^\s+(?:v\d+ = )?([A-Za-z_][A-Za-z0-9_]*)\("
+)
+_TRACE_SHAPE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# debug.rs wire format: `[<hex ts>] {<category>` … `[<hex ts>] <category>}`.
+_TRACE_SECTION_OPEN_RE = re.compile(r"^\[[0-9a-fA-F]+\] \{(\S+)\s*$")
+_TRACE_SECTION_CLOSE_RE = re.compile(r"^\[[0-9a-fA-F]+\] (\S+)\}\s*$")
+_TRACE_LOOP_CENSUS_RE = re.compile(r"^\[loop-census\] (\S+) (\S+)")
+# pyjitpl.rs refuses to print an optimized trace past this and emits an
+# op-count table instead. A count of zero over that table is not "the op is
+# absent".
+_TRACE_TRUNCATED_MARK = "[trace too large for full dump, showing op counts]"
+
+
+def _split_trace_loop_spec(prefix):
+    """`(arm, name)` for a loop label. A bare name is the `loop` arm."""
+    if ":" in prefix:
+        arm, name = prefix.split(":", 1)
+        if arm not in SELFCHECK_COMPILE_ARMS:
+            raise ValueError(f"unknown compile arm {arm!r}")
+        if not name or ":" in name:
+            raise ValueError(f"loop name {name!r} is not a single code-object name")
+        return arm, name
+    if not prefix:
+        raise ValueError("missing loop name")
+    return "loop", prefix
+
+
+def _parse_trace_shape_assertion(text):
+    """`(kind, token, limit)` — limit is None except for `max`."""
+    match = _TRACE_SHAPE_ASSERTION_RE.fullmatch(text)
+    if match is None:
+        raise ValueError(f"bad assertion {text!r}")
+    if match.group(1):
+        kind, token = match.group(1), match.group(2)
+        return kind, token, None
+    return match.group(3), match.group(4), int(match.group(5))
+
+
+def _parse_trace_shape(raw):
+    """`(arm, name, assertions)` groups from one directive value.
+
+    Each comma-separated piece is either `<loop>:<assertion>`, which starts a
+    group, or a bare assertion, which continues the group just opened. The
+    loop label may itself contain one colon (`<arm>:<name>`).
+    """
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise ValueError("empty trace-shape")
+    groups = []
+    current = None
+    for part in parts:
+        found = None
+        for kind in ("absent=", "present=", "max="):
+            at = part.find(kind)
+            if at != -1 and (found is None or at < found[0]):
+                found = (at, kind)
+        if found is None:
+            raise ValueError(f"no assertion in {part!r}")
+        at, _kind = found
+        prefix = part[:at].rstrip(":")
+        assertion = _parse_trace_shape_assertion(part[at:])
+        if prefix:
+            arm, name = _split_trace_loop_spec(prefix)
+            current = [arm, name, [assertion]]
+            groups.append(current)
+        elif current is None:
+            raise ValueError(f"assertion before its loop: {part!r}")
+        else:
+            current[2].append(assertion)
+    return tuple(
+        (arm, name, tuple(assertions))
+        for arm, name, assertions in groups
+    )
+
+
+def _trace_token_hits(body, token):
+    """How many operation lines name `token` as their opcode or on the line."""
+    if _TRACE_SHAPE_IDENT_RE.fullmatch(token):
+        bound = re.compile(
+            r"(?<![A-Za-z0-9_])" + re.escape(token) + r"(?![A-Za-z0-9_])"
+        )
+        def on_line(line):
+            return bound.search(line) is not None
+    else:
+        def on_line(line):
+            return token in line
+    hits = 0
+    for line in body.splitlines():
+        match = _TRACE_SHAPE_OP_LINE_RE.match(line)
+        if match is None:
+            continue
+        if match.group(1) == token or on_line(line):
+            hits += 1
+    return hits
+
+
+def _trace_op_lines(body):
+    return sum(
+        1 for line in body.splitlines() if _TRACE_SHAPE_OP_LINE_RE.match(line)
+    )
+
+
+def optimized_loop_traces(stderr):
+    """`(arm, name) -> [body, ...]` for every compile the op log names.
+
+    A compile dumps `jit-log-opt-loop` at least once (the peeled assembly,
+    then the optimized trace) and afterwards prints one `[loop-census]` line.
+    That line is inside the enclosing `jit-tracing` section, so it is not a
+    top-level event. It takes the `jit-log-opt-loop` section that closed most
+    recently, which is the optimized trace rather than the peeled assembly
+    ahead of it. A census with no such section waiting is not a trace, and a
+    census printed from inside the dump itself is not one either.
+    """
+    stack = []
+    pending = None
+    traces = {}
+    for line in (stderr or "").splitlines():
+        opened = _TRACE_SECTION_OPEN_RE.match(line)
+        if opened:
+            stack.append((opened.group(1), []))
+            continue
+        closed = _TRACE_SECTION_CLOSE_RE.match(line)
+        if closed and stack and stack[-1][0] == closed.group(1):
+            category, body = stack.pop()
+            if category == "jit-log-opt-loop":
+                pending = "\n".join(body)
+            continue
+        census = _TRACE_LOOP_CENSUS_RE.match(line)
+        if (
+            census
+            and pending is not None
+            and all(category != "jit-log-opt-loop" for category, _body in stack)
+        ):
+            key = (census.group(1), census.group(2))
+            traces.setdefault(key, []).append(pending)
+            pending = None
+        if stack:
+            stack[-1][1].append(line)
+    return traces
+
+
+def trace_shape_failures(stderr, groups):
+    """The assertions in `groups` that the optimized traces do not meet."""
+    traces = optimized_loop_traces(stderr)
+    failures = []
+    for arm, name, assertions in groups:
+        bodies = traces.get((arm, name), [])
+        label = name if arm == "loop" else f"{arm}:{name}"
+        if not bodies:
+            failures.append(f"trace-shape {label}: no optimized trace")
+            continue
+        for index, body in enumerate(bodies):
+            where = label if len(bodies) == 1 else f"{label}#{index + 1}"
+            if _TRACE_TRUNCATED_MARK in body:
+                failures.append(f"trace-shape {where}: optimized trace truncated")
+                continue
+            if _trace_op_lines(body) == 0:
+                failures.append(f"trace-shape {where}: optimized trace has no operations")
+                continue
+            for kind, token, limit in assertions:
+                hits = _trace_token_hits(body, token)
+                if kind == "absent" and hits:
+                    failures.append(
+                        f"trace-shape {where}: absent {token} (saw {hits})"
+                    )
+                elif kind == "present" and not hits:
+                    failures.append(
+                        f"trace-shape {where}: present {token} (saw 0)"
+                    )
+                elif kind == "max" and hits > limit:
+                    failures.append(
+                        f"trace-shape {where}: max {token}:{limit} (saw {hits})"
+                    )
+    return failures
+
+
+def _trace_shape_reader_selftest():
+    """Cases the trace-shape parser or the op-log reader gets wrong."""
+    broken = []
+
+    def check(label, cond):
+        if not cond:
+            broken.append((label, "mismatch"))
+
+    try:
+        parsed = _parse_trace_shape(
+            "main:absent=CallMayForceR,present=IntAdd,max=GuardTrue:2"
+        )
+    except ValueError as e:
+        parsed = e
+    check(
+        "one loop, three assertions",
+        parsed == ((
+            "loop", "main", (
+                ("absent", "CallMayForceR", None),
+                ("present", "IntAdd", None),
+                ("max", "GuardTrue", 2),
+            ),
+        ),),
+    )
+    try:
+        armed = _parse_trace_shape("entry-bridge:leaf:absent=foo::bar,max=GuardTrue:0")
+    except ValueError as e:
+        armed = e
+    check(
+        "an arm-qualified loop and a callee path",
+        armed == ((
+            "entry-bridge", "leaf", (
+                ("absent", "foo::bar", None),
+                ("max", "GuardTrue", 0),
+            ),
+        ),),
+    )
+    try:
+        two = _parse_trace_shape("hot:absent=CallR,inner:present=IntAdd")
+    except ValueError as e:
+        two = e
+    check(
+        "two loops on one line",
+        two == (
+            ("loop", "hot", (("absent", "CallR", None),)),
+            ("loop", "inner", (("present", "IntAdd", None),)),
+        ),
+    )
+    for label, text in (
+        ("empty", ""),
+        ("no assertion", "main"),
+        ("unknown arm", "not-an-arm:leaf:absent=CallR"),
+        ("assertion before its loop", "absent=CallR"),
+        ("max without a count", "main:max=GuardTrue"),
+    ):
+        try:
+            _parse_trace_shape(text)
+        except ValueError:
+            continue
+        broken.append((label, "accepted"))
+
+    log = "\n".join([
+        "[1] {jit-log-opt-loop",
+        "--- peeled trace (assembled) ---",
+        "  v1 = CallR(1) descr=<runtime_helper: BinaryOp>",
+        "[2] jit-log-opt-loop}",
+        "[3] {jit-log-opt-loop",
+        "--- trace (after opt) --- [3 ops]",
+        "  v2 = IntAdd(1, 2)",
+        "  GuardTrue(v2)",
+        "  Jump()",
+        "[4] jit-log-opt-loop}",
+        "[loop-census] loop main #14 FOR_ITER",
+        "[5] {jit-log-opt-loop",
+        "# Loop 2 : entry bridge with 1 ops",
+        "  v0 = CallR(9) descr=<foo::bar>",
+        "[6] jit-log-opt-loop}",
+        "[loop-census] entry-bridge leaf #0 LOAD_FAST",
+        "[9] {jit-tracing",
+        "[a] {jit-log-opt-loop",
+        "--- peeled trace (assembled) ---",
+        "  v1 = CallR(1) descr=<runtime_helper: BinaryOp>",
+        "[b] jit-log-opt-loop}",
+        "[c] {jit-log-opt-loop",
+        "--- trace (after opt) --- [1 ops]",
+        "  v9 = GuardClass(v0)",
+        "[d] jit-log-opt-loop}",
+        "[loop-census] loop nested #4 LOAD_FAST",
+        "[e] jit-tracing}",
+    ])
+    groups = (
+        ("loop", "main", (
+            ("absent", "CallR", None),
+            ("absent", "BinaryOp", None),
+            ("present", "IntAdd", None),
+            ("max", "GuardTrue", 1),
+        )),
+        ("entry-bridge", "leaf", (
+            ("present", "foo::bar", None),
+            ("absent", "IntAdd", None),
+        )),
+    )
+    check("fold-shaped trace passes", trace_shape_failures(log, groups) == [])
+    # The peeled section named CallR and BinaryOp. Binding it would fail
+    # `absent`, so a pass here is the proof the census took the later section.
+    check(
+        "Call is not CallR",
+        trace_shape_failures(log, (
+            ("loop", "main", (("absent", "Call", None), ("present", "CallR", None))),
+        )) == ["trace-shape main: present CallR (saw 0)"],
+    )
+    check(
+        "a max the trace exceeds",
+        trace_shape_failures(log, (
+            ("loop", "main", (("max", "GuardTrue", 0),)),
+        )) == ["trace-shape main: max GuardTrue:0 (saw 1)"],
+    )
+    check(
+        "a loop the census did not name",
+        trace_shape_failures(log, (
+            ("loop", "other", (("present", "IntAdd", None),)),
+        )) == ["trace-shape other: no optimized trace"],
+    )
+    check(
+        "a census nested in jit-tracing binds the optimized trace",
+        trace_shape_failures(log, (
+            ("loop", "nested", (
+                ("present", "GuardClass", None),
+                ("absent", "CallR", None),
+                ("absent", "BinaryOp", None),
+            )),
+        )) == [],
+    )
+    truncated = "\n".join([
+        "[1] {jit-log-opt-loop",
+        "--- trace (after opt) --- [10001 ops]",
+        _TRACE_TRUNCATED_MARK,
+        "  IntAdd: 10",
+        "[2] jit-log-opt-loop}",
+        "[loop-census] loop main #4 LOAD_FAST",
+    ])
+    check(
+        "a truncated dump is not an absent op",
+        trace_shape_failures(truncated, (
+            ("loop", "main", (("absent", "IntAdd", None),)),
+        )) == ["trace-shape main: optimized trace truncated"],
+    )
+    empty_body = "\n".join([
+        "[1] {jit-log-opt-loop",
+        "--- trace (after opt) --- [0 ops]",
+        "[2] jit-log-opt-loop}",
+        "[loop-census] loop main #4 LOAD_FAST",
+    ])
+    check(
+        "a banner with no operations is not an absent op",
+        trace_shape_failures(empty_body, (
+            ("loop", "main", (("absent", "IntAdd", None),)),
+        )) == ["trace-shape main: optimized trace has no operations"],
+    )
+
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = Path(directory) / "fixture.py"
+        fixture.write_text(
+            "# pyre-check: trace-shape=hot:absent=CallMayForceR,present=IntAdd\n",
+            encoding="utf-8",
+        )
+        check(
+            "a header line",
+            synth_trace_shapes(fixture) == ((
+                "loop", "hot", (
+                    ("absent", "CallMayForceR", None),
+                    ("present", "IntAdd", None),
+                ),
+            ),),
+        )
+        buried = ["# a comment\n"] * HEADER_SCAN_LINES
+        buried.append("# pyre-check: trace-shape=hot:absent=CallR\n")
+        fixture.write_text("".join(buried), encoding="utf-8")
+        check("a directive past the scan window", synth_trace_shapes(fixture) == ())
     return broken
 
 
@@ -5225,7 +5653,8 @@ class Check:
     # ── self-checking regression guard ──
 
     def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=None,
-                      require_jit=True, spec_folds=(), want_compiles=()):
+                      require_jit=True, spec_folds=(), trace_shapes=(),
+                      want_compiles=()):
         """Run a self-checking regression script on each enabled backend.
 
         The script asserts its own invariant (exit 0 AND prints *expect*);
@@ -5261,9 +5690,17 @@ class Check:
         fold asserts the ANSWER, and the residual answers identically -- so
         without the census the fixture passes just as well with the fold gone,
         which is the one failure it exists to catch.
+
+        *trace_shapes* is the `# pyre-check: trace-shape=` list. It asks the
+        same question of the optimized trace instead of the fold counter: the
+        named loop's compiled operations have to match every assertion.
         """
         skip_backends = skip_backends or {}
         print(f"  {name}")
+        if trace_shapes and not self._check_trace_shapes(
+            name, script, trace_shapes, timeout, "-", "-",
+        ):
+            return
         if spec_folds and not self._check_spec_folds(
             name, script, spec_folds, timeout, "-", "-", skip_backends,
         ):
@@ -5484,6 +5921,65 @@ class Check:
                 self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
         return False
 
+    def _check_trace_shapes(self, name, path, trace_shapes, timeout, t_cpython, t_pypy):
+        """True if every declared trace shape holds; else record and report.
+
+        One native run, the same choice `_check_spec_folds` makes: the
+        optimized trace is produced before a backend lowers it, so a second
+        backend would re-read the same operations. The run sets `MAJIT_LOG`
+        and `PYRE_LOOP_CENSUS`, which already exist; the loop name in the
+        census is what selects the `jit-log-opt-loop` section.
+        """
+        sys.stdout.write(f"    {'shape':<10s}")
+        sys.stdout.flush()
+        backend = next(
+            (b for b in ALL_BACKENDS if self.enabled(b) and b != "wasm"), None
+        )
+        if backend is None:
+            detail = "trace-shape needs a native backend (no optimized-trace log on wasm)"
+            print(f"{red('FAIL')}  {detail}")
+            for b in ALL_BACKENDS:
+                if self.enabled(b):
+                    self._record(b, False, name, detail)
+                    self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
+            return False
+        env = pyre_env()
+        env["MAJIT_LOG"] = "1"
+        env["PYRE_LOOP_CENSUS"] = "1"
+        _, _, code, err = run_timed(
+            [self._pyre(backend), path],
+            timeout_s=scaled_timeout(timeout, self._timeout_scale(backend)),
+            env=env,
+            keep_output_on_timeout=True,
+        )
+        failures = trace_shape_failures(err, trace_shapes) if err else [
+            "trace-shape: no optimized trace",
+        ]
+        # A killed run can still have compiled the loop: the dump happens at
+        # compile time, and the log of the iterations after it is what spends
+        # the budget. A trace that meets every assertion is the gate's answer.
+        # Any other non-zero status is the program failing, which this check
+        # does not excuse — a trace that happens to match is not a pass.
+        if not failures and code in (0, 124):
+            print(f"{dim('done')}  {len(trace_shapes)} loop(s)")
+            return True
+        if failures:
+            detail = "; ".join(failures)
+        else:
+            # The trace met every assertion and the process still failed.
+            # The shape is not what went wrong.
+            detail = f"trace-shape run failed (exit {code})"
+            if err:
+                tail = "\n".join(err.rstrip().splitlines()[-40:])
+                print("\n─── trace-shape stderr (tail) ───")
+                print(tail)
+        print(f"{red('FAIL')}  {detail}")
+        for b in ALL_BACKENDS:
+            if self.enabled(b):
+                self._record(b, False, name, detail)
+                self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
+        return False
+
     def run_synthetic_bench(self, path, timeout, headers):
         self.maybe_refresh_startups()
         name = f"synth/{Path(path).stem}"
@@ -5494,6 +5990,7 @@ class Check:
         skip_cpython = headers["skip_cpython"]
         no_cpython = headers["no_cpython"]
         spec_folds = headers["spec_folds"]
+        trace_shapes = headers["trace_shapes"]
 
         print(f"  {name}")
         # `# pyre-check: skip-platforms=` — the oracle cannot run on this host.
@@ -5584,6 +6081,11 @@ class Check:
                     )
             return
 
+        if trace_shapes and not self._check_trace_shapes(
+            name, path, trace_shapes, timeout, t_cpython, t_pypy,
+        ):
+            return
+
         if spec_folds and not self._check_spec_folds(
             name, path, spec_folds, timeout, t_cpython, t_pypy, skip_backends,
         ):
@@ -5641,6 +6143,7 @@ class Check:
                     skip_backends=self._fixture_skips(header),
                     require_jit=not header["interpreted"],
                     spec_folds=header["spec_folds"],
+                    trace_shapes=header["trace_shapes"],
                     want_compiles=header["want_compiles"],
                 )
             else:
