@@ -9506,6 +9506,10 @@ impl<'a> Lowering<'a> {
         {
             let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            // `_handle_list_call` reads `args[0].concretetype`
+            // (`jtransform.py` `LIST = deref(args[0].concretetype)`).
+            // A one-word `Vec` parameter is `RustVecRepr.lowleveltype`.
+            stamp_rust_vec_header(&var, &local.ty, llbc);
             // Register a stable name so canonical comparison can spot
             // arg-renames.  Names live on the value via `name_value_var`
             // (mirrors the `parse.rs` arg-binding path).
@@ -9865,6 +9869,12 @@ impl<'a> Lowering<'a> {
                     continue;
                 }
                 let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // Loop-header inputargs are these variables
+                // (`lower_framestate` Pass 0). `list.getitem` /
+                // `list.setitem` read `args[0].concretetype`.
+                if let Some(local) = body.locals.locals.get(local_idx) {
+                    stamp_rust_vec_header(&var, &local.ty, llbc);
+                }
                 graph.push_inputarg_var(bid, var.clone());
                 block_entry_local_var[row].set(local_idx, var);
             }
@@ -25681,9 +25691,33 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     };
+                    // `ll_setitem_fast` stores without reading the old item.
+                    // A write-only `index_mut` (`arr[i] = v`) still reaches
+                    // this arm. Emitting `list.getitem` first leaves an
+                    // unused load. On a virtual raw buffer that load misses
+                    // (`InvalidRawOperation`); `optimize_GETARRAYITEM_RAW_I`
+                    // then emits it and `force_box` materialises the buffer.
+                    // The placeholder is unread (`read_derefs == 0`).
+                    let write_only = rust_vec_header.is_some()
+                        && add_dest_used_only_as_single_write_deref(
+                            self.llbc, self.body, dest_local,
+                        );
+                    let placeholder = if write_only {
+                        match &item_ty {
+                            ValueType::Int => Some(OpKind::ConstInt(0)),
+                            ValueType::Unsigned => Some(OpKind::ConstUInt(0)),
+                            ValueType::Bool => Some(OpKind::ConstBool(false)),
+                            ValueType::Float => Some(OpKind::ConstFloat(0)),
+                            ValueType::Ref(_) => Some(OpKind::ConstRefNull),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let kind = placeholder.unwrap_or(read);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: read,
+                        kind,
                     });
                     self.index_elem_alias.insert(
                         dest_local,
@@ -30112,6 +30146,15 @@ impl<'a> Lowering<'a> {
             result_var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
                 TO: PtrTarget::Struct(block),
             }))));
+        }
+        // `newlist_clear` forks on `op.result.concretetype`
+        // (`jtransform.py` `LIST = deref(op.result.concretetype)`).
+        // A `Vec` result is `RustVecRepr.lowleveltype`
+        // (`rrustvec.rs rust_vec_lltype`), kind `int`. Without that
+        // pointer the arm emits GC `new_array_clear`, whose result
+        // bank is `ref`.
+        if result_var.concretetype().is_none() {
+            stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
         }
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
@@ -46189,6 +46232,15 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
 fn add_dest_used_only_as_single_deref(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
     let census = dest_deref_census(llbc, body, dest);
     census.defs == 1 && census.read_derefs + census.write_derefs == 1 && census.other == 0
+}
+
+/// `*dest = v` with no load of `*dest` and no escaping use.
+///
+/// `ll_setitem_fast` does not read the old item. The `index_mut` arm
+/// otherwise emits that read (`list.getitem`) before the store.
+fn add_dest_used_only_as_single_write_deref(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
+    let census = dest_deref_census(llbc, body, dest);
+    census.defs == 1 && census.write_derefs == 1 && census.read_derefs == 0 && census.other == 0
 }
 
 /// `*p` read of an `.add` result, with no store and no escaping use.
@@ -72576,6 +72628,38 @@ fn tyref_ptr_pointee_is_vec(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_node_def_id(pointee)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
+}
+
+/// `Ptr(Struct(raw) "RustVec")` for `kind` (`rrustvec.rs rust_vec_lltype`).
+fn rust_vec_header_lltype(
+    kind: majit_ir::rvec::VecItemKind,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+    let item = match kind {
+        majit_ir::rvec::VecItemKind::Int => LowLevelType::Signed,
+        majit_ir::rvec::VecItemKind::Float => LowLevelType::Float,
+        majit_ir::rvec::VecItemKind::Ref => {
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+        }
+    };
+    rust_vec_lltype(&item)
+}
+
+/// Stamp `rust_vec_lltype` on `var` when `ty` is a one-word `Vec`.
+///
+/// The lowering's `setconcretetype`: `tyref_rust_vec_item_kind` reads the
+/// LLBC `Vec` and the lltype is `RustVecRepr.lowleveltype`. The rtyper
+/// overwrites it from the annotation when the graph is specialized. A
+/// graph that skips specialization keeps this stamp.
+fn stamp_rust_vec_header(var: &crate::flowspace::model::Variable, ty: &TyRef, llbc: &Llbc) {
+    let Some(kind) = tyref_rust_vec_item_kind(ty, llbc) else {
+        return;
+    };
+    if var.concretetype().is_some() {
+        return;
+    }
+    var.set_concretetype(Some(rust_vec_header_lltype(kind)));
 }
 
 /// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,

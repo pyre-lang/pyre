@@ -2338,6 +2338,9 @@ fn install_source_graph(
     if entry.function_desc.borrow().is_memo() {
         return;
     }
+    // Looked-inside `pycall` reads this. Residual stubs already declare
+    // the same `SomeRustVec` through `declared_return_annotation`.
+    entry.function_desc.borrow_mut().return_container_root = graph.return_container_root.clone();
     let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
         || graph.hints.iter().any(|h| h == "elidable");
     if residualize {

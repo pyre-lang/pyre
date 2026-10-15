@@ -1052,6 +1052,11 @@ pub struct FunctionDesc {
     /// [`Self::annsignature`]. `Some(sig)` means an `@enforceargs(...)`
     /// decoration was applied and `normalize_args` should invoke it.
     pub annenforceargs: Option<Rc<super::signature::Sig>>,
+    /// LLBC return spelling of a one-word `Vec<T>` (`*mut Vec<…>`), the
+    /// container `Bookkeeper::project_rust_vec` turns into `SomeRustVec`.
+    /// The body's token stays `i64` (`history.getkind` of the raw header
+    /// is int). Empty for every other callable.
+    pub(crate) return_container_root: Option<String>,
 }
 
 /// Upstream `_signature_` tuple (params_s, result_s) attached to
@@ -1110,6 +1115,7 @@ impl FunctionDesc {
             source_graph: RefCell::new(None),
             annsignature: None,
             annenforceargs: None,
+            return_container_root: None,
         }
     }
 
@@ -2374,6 +2380,21 @@ impl FunctionDesc {
 
         // upstream: `result = annotator.recursivecall(graph, whence, inputcells)`.
         let mut result = annotator.recursivecall(&graph.graph, whence, &inputcells);
+
+        // The body of a one-word `Vec` return is the `i64` header token, so
+        // `recursivecall` reports `SomeInteger` (or `SomeImpossibleValue`
+        // before the return var is bound). `return_container_root` is the
+        // LLBC `Vec` spelling. Publishing `SomeRustVec` here is what
+        // `RPythonTyper.setconcretetype` reads: `bindingrepr(v).lowleveltype()`
+        // becomes `RustVecRepr.lowleveltype` on the call result, phis
+        // included. The callee return var is left alone — `getkind` of the
+        // header and of `Signed` both are int, so no cast is inserted.
+        if let Some(spelling) = self.return_container_root.as_deref()
+            && let Some(s_vec) = self.base.bookkeeper.project_rust_vec(spelling)
+            && matches!(result, SomeValue::Integer(_) | SomeValue::Impossible)
+        {
+            result = s_vec;
+        }
 
         // upstream: `signature = getattr(self.pyobj, '_signature_', None)`
         //   `if signature: sigresult = enforce_signature_return(...)`.
