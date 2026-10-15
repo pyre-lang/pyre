@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::super::flowspace::model::{
-    BlockKey, BlockRef, GraphKey, GraphRef, Hlvalue, LinkKey, LinkRef, Variable, checkgraph,
+    Block, BlockKey, BlockRef, GraphKey, GraphRef, Hlvalue, LinkKey, LinkRef, Variable, checkgraph,
 };
 use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::classdesc::{ClassAttrJournal, ClassDef};
@@ -354,10 +354,36 @@ impl<'a> Drop for PolicyGuard<'a> {
     }
 }
 
+/// Variables `setbinding` writes on `block`.
+///
+/// `bindinputargs` / `flowin` bind `inputargs` and op results.
+/// `follow_raise_link` binds `Link.last_exception` / `last_exc_value`
+/// (`Link.getextravars`); those cells live on the source block's
+/// exits and are not defined vars. `follow_link` only `setbinding`s
+/// the *target* block's inputargs.
+fn visit_block_bound_variables(block: &Block, mut visit: impl FnMut(&Variable)) {
+    for v in block
+        .inputargs
+        .iter()
+        .chain(block.operations.iter().map(|op| &op.result))
+        .chain(block.exitswitch.iter())
+    {
+        if let Hlvalue::Variable(var) = v {
+            visit(var);
+        }
+    }
+    for link in &block.exits {
+        let Ok(l) = link.try_borrow() else { continue };
+        for extra in l.getextravars() {
+            visit(&extra);
+        }
+    }
+}
+
 /// Revert an evicted block to a pristine "never annotated" state by
-/// clearing the annotation on every Variable it DEFINES (inputargs +
-/// operation results).  Both dual-gate eviction paths
-/// ([`AddedBlocksGuard::drop`] and
+/// clearing the annotation on every Variable the annotator bound
+/// (`inputargs`, op results, `exitswitch`, and raise-link extravars).
+/// Both dual-gate eviction paths ([`AddedBlocksGuard::drop`] and
 /// [`RPythonAnnotator::raise_if_subject_blocked`]) must pair every
 /// `annotated.shift_remove` with this reset: dropping a block from
 /// `annotated` while its Variables retain annotations leaves a
@@ -366,26 +392,21 @@ impl<'a> Drop for PolicyGuard<'a> {
 /// `bindinputargs` initial-seed path, and calls `setbinding` with the
 /// caller's (possibly narrower) cell over the retained annotation —
 /// tripping the monotonicity assert `setbinding: new value does not
-/// contain old` (e.g. two callers of one helper passing different
-/// constant static addresses).
+/// contain old` (e.g. two TypeOf last_exception cells, or two callers
+/// of one helper passing different constant static addresses).
 ///
 /// Best-effort under `try_borrow`: a panic that unwinds while a cell
 /// is borrowed degrades to a leak rather than an abort-during-unwind
 /// double-borrow.
 fn clear_block_bindings(block: &BlockRef) {
-    if let Ok(blk) = block.try_borrow() {
-        let vars = blk
-            .inputargs
-            .iter()
-            .chain(blk.operations.iter().map(|op| &op.result));
-        for v in vars {
-            if let Hlvalue::Variable(var) = v
-                && let Ok(mut slot) = var.annotation.try_borrow_mut()
-            {
-                *slot = None;
-            }
+    let Ok(blk) = block.try_borrow() else {
+        return;
+    };
+    visit_block_bound_variables(&blk, |var| {
+        if let Ok(mut slot) = var.annotation.try_borrow_mut() {
+            *slot = None;
         }
-    }
+    });
 }
 
 struct BlockAnnotationSnapshot {
@@ -1648,16 +1669,12 @@ impl RPythonAnnotator {
             return;
         };
         let definitions = {
-            let block = block.borrow();
-            block
-                .inputargs
-                .iter()
-                .chain(block.operations.iter().map(|op| &op.result))
-                .filter_map(|value| match value {
-                    Hlvalue::Variable(var) => Some((var.clone(), var.annotation.borrow().clone())),
-                    _ => None,
-                })
-                .collect()
+            let blk = block.borrow();
+            let mut definitions = Vec::new();
+            visit_block_bound_variables(&blk, |var| {
+                definitions.push((var.clone(), var.annotation.borrow().clone()));
+            });
+            definitions
         };
         self.subject_annotation_snapshots
             .borrow_mut()
@@ -3846,6 +3863,80 @@ mod tests {
                 .contains_key(&LinkKey::of(&link)),
             "uncommitted reflow must not leave links_followed set"
         );
+    }
+
+    /// Uncommit must restore a raising graph to a never-annotated
+    /// state, including `Link.last_exception` / `last_exc_value`
+    /// (`follow_raise_link` binds those; they are not defined vars).
+    #[test]
+    fn uncommitted_scope_clears_raise_link_extravars() {
+        use super::super::super::flowspace::model::{BlockRef, BlockRefExt, Link};
+        use std::collections::HashSet;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("raising", 1);
+        let startblock = graph.borrow().startblock.clone();
+        let exceptblock = graph.borrow().exceptblock.clone();
+        let exc_type = Variable::named("last_exception");
+        let exc_value = Variable::named("last_exc_value");
+        let mut raise_link = Link::new(
+            vec![
+                Hlvalue::Variable(exc_type.clone()),
+                Hlvalue::Variable(exc_value.clone()),
+            ],
+            Some(exceptblock),
+            None,
+        );
+        raise_link.extravars(
+            Some(Hlvalue::Variable(exc_type.clone())),
+            Some(Hlvalue::Variable(exc_value.clone())),
+        );
+        let raise_link = raise_link.into_ref();
+        startblock.closeblock(vec![raise_link.clone()]);
+        {
+            let _guard = ann.enter_added_blocks_scope();
+            ann.addpendinggraph(&graph, &[Some(SomeValue::Integer(SomeInteger::default()))]);
+            ann.follow_raise_link(
+                &graph,
+                &raise_link,
+                SomeValue::Integer(SomeInteger::default()),
+            );
+            assert!(
+                exc_type.annotation.borrow().is_some(),
+                "follow_raise_link must bind last_exception before uncommit"
+            );
+            assert!(
+                exc_value.annotation.borrow().is_some(),
+                "follow_raise_link must bind last_exc_value before uncommit"
+            );
+        }
+        let mut seen = HashSet::new();
+        let mut assert_unbound = |var: &Variable| {
+            if seen.insert(var.id()) {
+                assert!(
+                    var.annotation.borrow().is_none(),
+                    "uncommit must clear annotation on {}",
+                    var.name()
+                );
+            }
+        };
+        let g = graph.borrow();
+        let mut seen_blocks = HashSet::new();
+        let mut walk = |block: &BlockRef| {
+            if !seen_blocks.insert(BlockKey::of(block)) {
+                return;
+            }
+            visit_block_bound_variables(&block.borrow(), &mut assert_unbound);
+            for link in &block.borrow().exits {
+                for extra in link.borrow().getextravars() {
+                    assert_unbound(&extra);
+                }
+            }
+        };
+        for block in g.iterblocks() {
+            walk(&block);
+        }
+        walk(&g.returnblock);
+        walk(&g.exceptblock);
     }
 
     fn list_item_state(listdef: &super::super::listdef::ListDef) -> (bool, bool, bool) {

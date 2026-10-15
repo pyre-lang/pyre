@@ -2347,6 +2347,22 @@ impl StoreCore {
         self.slot_declaration(&slot)
     }
 
+    /// Header of the funcobj `path` names, without building its body:
+    /// `pygraph.py PyGraph.__init__` reads the code object. Includes a
+    /// graphless external (`rffi.llexternal`): the header still carries
+    /// `_jit_*_` and `source_identity`.
+    pub(crate) fn funcobj_header(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {
+        let slot = self.slot_for(path)?;
+        if let Some(header) = self.slot_declaration(&slot) {
+            return Some(header);
+        }
+        let source = slot.source.as_ref()?;
+        let mut header = FunctionGraph::clone(source.graph.header());
+        source.transform.apply(&mut header);
+        slot.attrs.apply(&mut header);
+        Some(std::rc::Rc::new(header))
+    }
+
     /// `GraphKey` of the funcobj `path` names. Alias spellings of one
     /// source graph share this key; a path with no registration has none.
     pub(crate) fn key_for(&self, path: &CallPath) -> Option<GraphKey> {
