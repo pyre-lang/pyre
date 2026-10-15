@@ -3927,6 +3927,23 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         let outcome = self.meta.compile_loop(jump_args, meta);
+        // pyjitpl.py `reached_loop_header`: `compile_loop` returning None
+        // either keeps tracing (history still owned) or raises
+        // `SwitchToBlackhole(ABORT_BAD_LOOP)`. After `tracing.take()` the
+        // history is spent, so a leftover `Cancelled` is that raise.
+        let outcome = match outcome {
+            crate::CompileOutcome::Cancelled if !self.meta.is_tracing() => {
+                if let Some(gk) = loop_green_key {
+                    if self.cell_is_tracing(gk) {
+                        self.meta.abort_tracing_on_compiling_driver(gk, false);
+                    }
+                }
+                crate::CompileOutcome::SwitchToBlackhole {
+                    reason: crate::pyjitpl::counters::ABORT_BAD_LOOP,
+                }
+            }
+            other => other,
+        };
         if crate::closedbg_enabled() {
             eprintln!(
                 "@@@CLOSE LOOP-COMPILE outcome={:?}",
@@ -4809,15 +4826,10 @@ impl<S: JitState> JitDriver<S> {
                                 // compile_loop already drained tracing+session.
                             }
                             crate::CompileOutcome::Cancelled => {
-                                // pyjitpl.py:3018-3032 parity: cancel_count is
-                                // incremented inside compile_loop and tracing
-                                // continues unless `cancelled_too_many_times`
-                                // escalates to Aborted. The wrapper restored
-                                // session↔tracing alignment so no extra cleanup
-                                // is required here — either the early-Cancelled
-                                // path kept both live (tracing continues) or a
-                                // late-Cancelled path drained both (next bound
-                                // reaches begins a fresh session).
+                                // pyjitpl.py `reached_loop_header`: early
+                                // cancel keeps `self.history` and tracing
+                                // continues. Post-take cancel is remapped to
+                                // SwitchToBlackhole in `compile_and_record_loop`.
                             }
                             crate::CompileOutcome::Aborted => {
                                 self.meta.abort_trace(false);
@@ -5045,10 +5057,10 @@ impl<S: JitState> JitDriver<S> {
                                 );
                             }
                             crate::CompileOutcome::Cancelled => {
-                                // pyjitpl.py:3018-3032 parity: no explicit abort,
-                                // tracing continues (or is already drained inside
-                                // compile_loop for late-cancel cases). The wrapper
-                                // maintains the session↔tracing invariant.
+                                // pyjitpl.py `reached_loop_header`: early
+                                // cancel keeps tracing. Post-take cancel is
+                                // remapped to SwitchToBlackhole in
+                                // `compile_and_record_loop`.
                             }
                             crate::CompileOutcome::Aborted => {
                                 self.meta.abort_trace(false);
@@ -13691,6 +13703,65 @@ mod tests {
             "CloseLoopWithArgs must consume the latch"
         );
         assert!(driver.meta.trace_ctx().unwrap().take_merge_point_resumed());
+    }
+
+    /// A root-loop HEADER-CLOSE that cancels after `tracing.take()` must
+    /// leave the cell without `JC_TRACING`. `pyjitpl.py reached_loop_header`
+    /// either keeps the same history or raises `SwitchToBlackhole(ABORT_BAD_LOOP)`;
+    /// discarding the tracer while leaving the cell tracing swallows every
+    /// later back-edge in `JitDriver::try_empty_chain_tick`.
+    #[test]
+    fn close_loop_cancel_after_take_clears_tracing() {
+        let mut driver = JitDriver::<AcceptCloseState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        // Force the simple-loop retry so `normalize_root_loop_entry_contract`
+        // sees LABEL(inputargs) against a longer JUMP.
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_param_enable_opts("intbounds:heap");
+        let mut state = AcceptCloseState::default();
+        let key = 42u64;
+        driver.force_start_tracing(key, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(
+            driver.cell_is_tracing(key),
+            "force_start_tracing marks JC_TRACING"
+        );
+        {
+            let ctx = driver.meta.trace_ctx().expect("tracing");
+            let i0 = OpRef::input_arg_int(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+        driver.merge_point(|_meta, _sym| TraceAction::CloseLoopWithArgs {
+            // One recorded inputarg; two JUMP args fail the LABEL/JUMP contract
+            // after `tracing.take()`.
+            jump_args: vec![OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            loop_header_pc: None,
+        });
+        assert!(
+            !driver.has_compiled_loop(key),
+            "the arity mismatch must cancel the compile"
+        );
+        assert!(
+            !driver.is_tracing(),
+            "the session must be drained after a post-take cancel"
+        );
+        assert!(
+            !driver.cell_is_tracing(key),
+            "WarmEnterState.abort_tracing must clear JC_TRACING"
+        );
+        assert!(!driver.meta.take_keep_tracing_after_close());
+        driver.force_start_tracing(key, 0, &mut state, &());
+        assert!(
+            driver.is_tracing(),
+            "a later trace must be able to start on the same key"
+        );
+        assert!(driver.cell_is_tracing(key));
     }
 
     /// Regression: the whole-circuit single-pass CloseLoop arm captures the
