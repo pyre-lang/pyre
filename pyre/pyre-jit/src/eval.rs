@@ -10694,7 +10694,7 @@ fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
     else {
         return false;
     };
-    lasti && frame.valuestackdepth < frame.nlocals() + frame.ncells() + depth as usize
+    lasti && frame.valuestackdepth < frame.stack_base() + depth as usize
 }
 
 /// Whether `PYRE_EXIT_FRAME_DIAG` is set.
@@ -10719,7 +10719,7 @@ fn report_exit_frame_delivery(site: &str, frame: &PyFrame, refused: bool) {
         "[exit-frame] site={site} last_instr={} vsd={} floor={} refused={refused}",
         frame.last_instr,
         frame.valuestackdepth,
-        frame.nlocals() + frame.ncells(),
+        frame.stack_base(),
     );
 }
 

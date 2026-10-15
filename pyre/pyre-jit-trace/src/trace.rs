@@ -804,7 +804,7 @@ fn try_commit_midbody_abort_inner(
         return Err(MidBodyDecline::BeforeRun("null execution context"));
     }
     let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
-    let outer_stack_base = outer.nlocals() + outer.ncells();
+    let outer_stack_base = outer.stack_base();
     let outer_code = unsafe { &*pyre_interpreter::pyframe_get_pycode(outer) };
     let outer_handler = pyre_interpreter::pycode::lookup_exceptiontable(
         &outer_code.exceptiontable,

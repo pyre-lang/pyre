@@ -464,7 +464,7 @@ pub unsafe fn w_pytraceback_for_frame(
             last_instruction
         } else {
             crate::pyopcode::owning_instruction(
-                &(*crate::pyframe::pyframe_get_pycode(&*frame)).instructions,
+                &(*frame).code().instructions,
                 last_instruction as usize,
             ) as i64
                 * 2

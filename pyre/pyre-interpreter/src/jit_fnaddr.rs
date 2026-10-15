@@ -2353,7 +2353,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // missing entry would fall back to a symbolic hash that SEGVs at
     // trace time.  `shadow_stack_len` carries a JIT-representable
     // `-> int` signature and binds its Rust `fn` directly (the
-    // `PyFrame::nlocals` / `get_current_exception` precedent);
+    // `get_current_exception` precedent);
     // `w_type_set_uses_object_setattr` rides a C-ABI bridge that
     // normalises its `bool` argument.
     pa0!(
@@ -5182,35 +5182,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         crate::stack_check::stack_almost_full,
     );
 
-    // `@jit.elidable`-decorated inherent methods that show up as
-    // `residual_call_*` in the codewriter (`call.py:181-187
-    // getfunctionptr(graph)` parity).  Without an entry here
-    // `direct_funcptr_value` (`jtransform.rs`) falls back to
-    // `symbolic_fnaddr_for_path`, which is a deterministic hash but NOT
-    // a valid function address — invoking it at the walker's
-    // `execute_residual_call` (`executor.rs`) is an
-    // immediate SEGV.  Path shape matches
-    // `target_to_path` for inherent method calls
-    // (`parse.rs`'s `CallPath::for_impl_method(impl_type_joined,
-    // method)`): the `register_macro_helper_trace_fnaddr` string-strip
-    // drops the leading crate segment, leaving `[module, Type, method]`
-    // which is the exact 3-segment shape `for_impl_method` produces.
-    //
-    // PyFrame::nlocals — invoked by `eval.rs`'s `pop_value` and is the
-    // funcptr the walker reaches when dispatching `PopTop`'s nested
-    // `pop_value` sub-jitcode.  Same dual-shape binding as
-    // `PyFrame::pop` below: the bare `self.nlocals()` spelling inside
-    // the MIR-lowered `pop_value` graph resolves through
-    // `impl_method_owner` to the 2-segment `["PyFrame", "nlocals"]`,
-    // while the module-qualified form is the 3-segment
-    // `["pyframe", "PyFrame", "nlocals"]` — register both.
-    pa1!(
-        &mut entries,
-        "pyre_interpreter::pyframe::PyFrame::nlocals",
-        "pyre_interpreter::PyFrame::nlocals",
-        crate::pyframe::PyFrame::nlocals,
-    );
-
     // `PyFrame::pop` — invoked by `<PyFrame as SharedOpcodeHandler>::pop_value`
     // at its `Ok(self.pop())` tail (`eval.rs`).  Two CallPath shapes need binding:
     //
@@ -5393,27 +5364,23 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         crate::stack_check::drain_jit_pending_exception_jit_abi,
     );
 
-    // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
-    // carry `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
+    // `ncells` / `npure_cellvars` take a `CodeObject` and carry
+    // `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`
     // only honours the assertion when `function_fnaddrs.contains_key(p)`,
     // so without a registration the descr falls back to
-    // `EF_ELIDABLE_CAN_RAISE`.
+    // `EF_ELIDABLE_CAN_RAISE`. Frame-taking `pyframe_get_pycode` /
+    // `PyFrame::nlocals` / `PyFrame::ncells` are look-inside through
+    // `getcode()` / `self.pycode`, so they are no longer residual
+    // elidable targets.
     //
     // These free functions are also called unqualified inside `pyframe.rs`
-    // itself (`pyframe_get_pycode(self)` / `ncells(code)` / `npure_cellvars(code)`).
+    // itself (`ncells(code)` / `npure_cellvars(code)`).
     // `target_to_path` for a `FunctionPath` returns the segments verbatim,
     // so an in-module bare call resolves to a 1-segment CallPath
     // `["<name>"]` while a cross-module qualified call resolves to
     // `["pyframe", "<name>"]`.  Register both shapes as an alias pair, via
     // the strip-one-segment rule in
     // `register_macro_helper_trace_fnaddr`.
-    upa1!(
-        &mut entries,
-        "pyre_interpreter::pyframe::pyframe_get_pycode",
-        "pyre_interpreter::pyframe_get_pycode",
-        crate::pyframe::pyframe_get_pycode,
-    );
-
     pa1!(
         &mut entries,
         "pyre_interpreter::pyframe::report_stack_underflow",
@@ -5433,12 +5400,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pyframe::npure_cellvars",
         "pyre_interpreter::npure_cellvars",
         crate::pyframe::npure_cellvars,
-    );
-
-    p1!(
-        &mut entries,
-        "pyre_interpreter::pyframe::PyFrame::ncells",
-        crate::pyframe::PyFrame::ncells,
     );
 
     // LoadFast/LoadFastBorrow/LoadFastCheck arm folding helpers.  Both
@@ -8297,14 +8258,6 @@ mod tests {
     fn jit_trace_fnaddrs_covers_pop_value_and_exception_tls_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
 
-        let nlocals: fn(&crate::pyframe::PyFrame) -> usize = crate::pyframe::PyFrame::nlocals;
-        let nlocals = nlocals as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::pyframe::PyFrame::nlocals"],
-            nlocals
-        );
-        assert_eq!(bindings["pyre_interpreter::PyFrame::nlocals"], nlocals);
-
         let clear_references: fn(&mut crate::pyframe::PyFrame) =
             crate::pyframe::PyFrame::clear_references;
         let clear_references = clear_references as *const () as usize as i64;
@@ -8518,15 +8471,13 @@ mod tests {
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the
     /// codewriter bakes for `PyFrame::pop` — the `pop_value` sub-jitcode
     /// residual the full-body walk must not concretely execute against the
-    /// paused outer frame — and must NOT flag `PyFrame::nlocals`, a registered
-    /// `PyFrame` method that is a constant read, safe to fold during a walk.
+    /// paused outer frame — and must NOT flag `PyFrame::clear_references`, a
+    /// registered `PyFrame` method that is not an operand-stack accessor.
     #[test]
     fn is_pyframe_operand_stack_accessor_matches_registered_pop() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         let pop = bindings["pyre_interpreter::pyframe::PyFrame::pop"];
         assert!(is_pyframe_operand_stack_accessor(pop as usize));
-        let nlocals = bindings["pyre_interpreter::pyframe::PyFrame::nlocals"];
-        assert!(!is_pyframe_operand_stack_accessor(nlocals as usize));
         let clear_references = bindings["pyre_interpreter::pyframe::PyFrame::clear_references"];
         assert!(!is_pyframe_operand_stack_accessor(
             clear_references as usize
@@ -8539,8 +8490,8 @@ mod tests {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         let barrier = bindings["pyre_object::listobject::list_write_barrier"];
         assert!(is_list_write_barrier(barrier as usize));
-        let nlocals = bindings["pyre_interpreter::pyframe::PyFrame::nlocals"];
-        assert!(!is_list_write_barrier(nlocals as usize));
+        let clear_references = bindings["pyre_interpreter::pyframe::PyFrame::clear_references"];
+        assert!(!is_list_write_barrier(clear_references as usize));
         assert!(!is_list_write_barrier(0));
     }
 

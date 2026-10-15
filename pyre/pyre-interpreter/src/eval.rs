@@ -2365,10 +2365,10 @@ pub fn handle_exception_with_context(
 
     // `pypy/interpreter/pyopcode.py` exception-table dispatch.
     if let Some((target_bytes, depth, lasti)) = lookup_result {
-        // `pyopcode.py:155-156` — depth is relative (0 = empty value
-        // stack); convert to absolute by adding the frame's locals+cells
-        // base, then drop the stack to that depth.
-        let target_depth = frame.nlocals() + frame.ncells() + depth as usize;
+        // `pyopcode.py handle_operation_error`: depth is relative
+        // (0 = empty value stack); convert to absolute as
+        // `self._stack_start() + depth`.
+        let target_depth = frame.stack_base() + depth as usize;
         // `pyopcode.py handle_operation_error` → `dropvaluesuntil`.
         frame.dropvaluesuntil(target_depth);
         err.reload(&_exc_roots, err_slot);
@@ -2808,7 +2808,13 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
     } else {
         install_current_frame_tls_only(frame)
     };
-    let code = unsafe { &*crate::pyframe_get_pycode(frame) };
+    // `pyframe.py execute_frame` passes `self.pycode` into `dispatch`;
+    // this loop fuses that field with `co_code = pycode.co_code`.
+    // `getcode` is `hint(self.pycode, promote=True)` so the instruction
+    // stream is green, the way the portal takes `pycode` as a green.
+    // The compiler `CodeObject` is not a GC object; take a pointer so
+    // the borrow does not keep `frame` frozen across the dispatch loop.
+    let code = unsafe { &*(frame.getcode() as *const crate::CodeObject) };
     let mut next_instr = frame.next_instr();
 
     loop {
@@ -3085,7 +3091,8 @@ impl LocalOpcodeHandler for PyFrame {
             // Name resolution stays on the failure path only
             // (pyopcode.py LOAD_FAST -> _load_fast_failed), keeping the
             // varnames read out of the non-raising path.
-            let code = unsafe { &*crate::pyframe_get_pycode(self) };
+            // `pyopcode.py getlocalvarname`: `self.getcode().co_varnames[index]`.
+            let code = self.getcode();
             let name = if idx < code.varnames.len() {
                 code.varnames[idx].as_str()
             } else {
@@ -5116,7 +5123,9 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn delete_fast(&mut self, idx: usize) -> Result<(), PyError> {
         if locals_w!(self)[idx].is_null() {
-            let code = unsafe { &*crate::pyframe_get_pycode(self) };
+            // `pyopcode.py DELETE_FAST` → `getlocalvarname` →
+            // `self.getcode().co_varnames[index]`.
+            let code = self.getcode();
             let name = if idx < code.varnames.len() {
                 code.varnames[idx].as_str()
             } else {
@@ -5402,14 +5411,10 @@ impl OpcodeStepExecutor for PyFrame {
                 // is NULL; a non-object bit pattern is the address itself.
                 let depth = self.valuestackdepth;
                 let stack_base = self.stack_base();
-                let code_ptr = unsafe { crate::pyframe::pyframe_get_pycode(self) };
-                let code_name = if code_ptr.is_null() {
-                    "?"
-                } else {
-                    unsafe { (*code_ptr).obj_name.as_str() }
-                };
+                let code = self.code();
+                let code_name = code.obj_name.as_str();
                 let opcode = if self.last_instr >= 0 {
-                    crate::pyopcode::decode_instruction_at(self.code(), self.last_instr as usize)
+                    crate::pyopcode::decode_instruction_at(code, self.last_instr as usize)
                         .map(|(instruction, _)| u8::from(instruction).to_string())
                         .unwrap_or_else(|| "?".to_string())
                 } else {

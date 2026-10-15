@@ -4276,6 +4276,18 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Replace(ops)
             }
+            // Leftover `str` of a Float. `FloatRepr.ll_str` (`rfloat.py`)
+            // is `formatd` (`floatobject.py` `float_repr` / `float2string`),
+            // not `int_str`; this port residualizes that through
+            // `rfloat_call::repr_residual_path`. A unary `str` over `'f'`
+            // would assemble as the unwired `int_str/f>r`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "str" && self.get_value_kind_var(operand) == 'f' => {
+                self.abort_unwired_ref_result(op.result.clone())
+            }
             // Leftover `str` of a Ref that is not rstr `STR`. A rust-heap
             // `String` copies into `STR` (`Repr.rtype_str` of a non-STR
             // layout); any other leftover Ref would assemble as the
@@ -18930,6 +18942,50 @@ mod tests {
         assert!(
             ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. })),
             "leftover ref add aborts: {ops:?}",
+        );
+    }
+
+    /// `str` of a Float must not assemble as `int_str/f>r`.
+    /// `FloatRepr.ll_str` (`rfloat.py`) is `formatd`, residualized through
+    /// `rfloat_call::repr_residual_path`; leftover unary `str` aborts.
+    #[test]
+    fn a_float_str_is_not_int_str() {
+        let mut graph = FunctionGraph::new("float_str");
+        let operand = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Float,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "str".into(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(&operand, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op: name, .. } if name == "str")),
+            "leftover float str must not stay UnaryOp (int_str/f>r): {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. })),
+            "leftover float str aborts: {ops:?}",
         );
     }
 
