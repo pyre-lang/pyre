@@ -4888,7 +4888,30 @@ where
                 dst_reg,
             ))
         }
-        "build_map_from_array" | "build_map_from_empty_array" => {
+        "build_map_from_empty_array" => {
+            if op.args.len() != 1 {
+                return None;
+            }
+            let array_operand =
+                flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+            let dst_reg = match &op.result {
+                Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+                _ => return None,
+            };
+            // `pyopcode.py BUILD_MAP` with itemcount 0 is `space.newdict()`
+            // and an empty unroll — `allocate_and_init_instance` hashes
+            // nothing, cannot raise, cannot force.  `PlainCannotRaise` is
+            // that analyzer result (`EF_CANNOT_RAISE`, can_collect); the
+            // tag lets the walker descend `newdict_empty` (`newfloat` twin).
+            Some(build_residual_call_r_r_insn_from_operands(
+                ctx.build_map_from_array_fn_idx,
+                vec![array_operand],
+                CallFlavor::PlainCannotRaise,
+                majit_ir::RuntimeHelperKind::NewEmptyDict,
+                dst_reg,
+            ))
+        }
+        "build_map_from_array" => {
             if op.args.len() != 1 {
                 return None;
             }
@@ -4905,13 +4928,7 @@ where
                 ctx.build_map_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::MayForce,
-                // The flavor is the helper's binding and stays; the tag
-                // records that an empty array leaves nothing to hash.
-                if op.opname == "build_map_from_empty_array" {
-                    majit_ir::RuntimeHelperKind::NewEmptyDict
-                } else {
-                    majit_ir::RuntimeHelperKind::None
-                },
+                majit_ir::RuntimeHelperKind::None,
                 dst_reg,
             ))
         }
@@ -12690,6 +12707,73 @@ mod tests {
                         );
                     }
                     other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(
+                    result,
+                    Some(Register {
+                        kind: Kind::Ref,
+                        index: 102
+                    }),
+                );
+            }
+            _ => panic!("expected Insn::Op, got {insn:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_build_map_from_empty_array_emits_newemptydict_without_mayforce() {
+        // `build_map_from_empty_array(array)` → PlainCannotRaise + NewEmptyDict
+        // (`pyopcode.py BUILD_MAP` itemcount 0 is `space.newdict()`).
+        let array_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let op = super::super::flow::SpaceOperation::new(
+            "build_map_from_empty_array",
+            vec![array_var.into()],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_tuple_build_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("build_map_from_empty_array lowering must succeed");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                match &args[2] {
+                    Operand::Descr(rc) => match &**rc {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(
+                                stub.effect_info.runtime_helper,
+                                majit_ir::RuntimeHelperKind::NewEmptyDict
+                            );
+                            assert!(
+                                !stub.effect_info.check_forces_virtual_or_virtualizable(),
+                                "empty dict must not MayForce"
+                            );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Operand::Descr, got {other:?}"),
                 }
                 assert_eq!(
                     result,

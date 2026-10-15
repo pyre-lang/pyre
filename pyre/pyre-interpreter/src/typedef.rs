@@ -34268,7 +34268,11 @@ fn init_memory_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1)
+            make_builtin_function_with_arity(
+                "__iter__",
+                crate::baseobjspace::seqiter_iter_method,
+                1,
+            )
         )
     };
     unsafe {
@@ -34297,7 +34301,11 @@ fn init_array_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1)
+            make_builtin_function_with_arity(
+                "__iter__",
+                crate::baseobjspace::seqiter_iter_method,
+                1,
+            )
         )
     };
     unsafe {
@@ -34704,7 +34712,11 @@ fn init_list_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1)
+            make_builtin_function_with_arity(
+                "__iter__",
+                crate::baseobjspace::seqiter_iter_method,
+                1,
+            )
         )
     };
     unsafe {
@@ -34768,7 +34780,11 @@ fn init_tuple_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1)
+            make_builtin_function_with_arity(
+                "__iter__",
+                crate::baseobjspace::seqiter_iter_method,
+                1,
+            )
         )
     };
     unsafe {

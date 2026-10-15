@@ -2238,7 +2238,9 @@ pub fn translate_op(
             }
             if field.vec_part == Some(crate::model::VecFieldPart::FatLen) {
                 // Slice / `Box<[T]>` FatLen is `len(getattr(owner, field))`
-                // (`ListRepr.rtype_len`).
+                // (`ListRepr.rtype_len`). Dyn FatLen already returned above
+                // as `getitem` of `two_word_fat_struct` (`rtuple.py`
+                // `rtype_getitem`).
                 let list = Hlvalue::Variable(Variable::new());
                 return Ok(vec![
                     FlowspaceOp::new(
@@ -4049,11 +4051,12 @@ pub fn translate_op(
             fmt_op_result(op),
         ))),
 
-        // `(lo..=hi).contains(&x)` lowered by `front::range_contains`.
-        // `int_between(n, m, p)` is the llop `n <= m < p`.  It is not a
-        // flowspace operator, so it is carried through under its llop
-        // name; `flowin` binds the bool result and `translate_operation`
-        // emits the same llop.
+        // `(lo..hi).contains(&x)` / `(lo..=hi).contains(&x)` lowered by
+        // `front::range_contains`.  `int_between(n, m, p)` is the llop
+        // `n <= m < p`.  It is not a flowspace operator, so it is carried
+        // through under its llop name; `flowin` binds the bool result and
+        // `translate_operation` emits the same llop.  Float ranges emit
+        // `le`/`lt`/`ge` BinOps instead, rewritten to `float_*` later.
         OpKind::LoweredBlackholeOp { opname, args }
             if opname == "int_between" && args.len() == 3 =>
         {

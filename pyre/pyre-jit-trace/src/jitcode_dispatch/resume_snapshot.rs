@@ -210,6 +210,24 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     inline_snapshot_has_complete_parent_chain(n_parents, session.inline_depth())
 }
 
+/// Flatten the walk framestack's parent images, outermost first.
+///
+/// `skip_helper_levels` drops `w_code == 0` dummy helper frames
+/// (`HelperEntry::Callee`); the helper resume-section path then appends
+/// the dest-nulled after-call parent instead.
+fn framestack_parent_images<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    skip_helper_levels: bool,
+) -> Vec<InlineParentFrame> {
+    let session = ctx.session.borrow();
+    session
+        .framestack
+        .iter()
+        .filter(|frame| !skip_helper_levels || frame.w_code != 0)
+        .flat_map(|frame| frame.parents.iter().cloned())
+        .collect()
+}
+
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -246,51 +264,20 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py generate_guard` + `capture_resumedata`):
     //
-    // RPython treats helper jitcodes (pop_value, nlocals, etc.) as
-    // separate `MIFrame`s on `metainterp.framestack`, capturing one
-    // snapshot frame per `MIFrame` plus a vable_array / vref_array
-    // prefix on the top frame (`opencoder.py create_top_snapshot`).
-    // At resume, RPython's blackhole interpreter re-enters each frame's
-    // jitcode and replays from the saved pc.
+    // RPython treats helper jitcodes as separate `MIFrame`s on
+    // `metainterp.framestack`, capturing one snapshot frame per `MIFrame`
+    // plus a vable_array / vref_array prefix on the top frame
+    // (`opencoder.py create_top_snapshot`). Blackhole re-enters each
+    // frame's jitcode from the saved pc.
     //
-    // Pyre's blackhole interpreter only knows how to run *pyjitcode*
-    // bytecode (Python bytecode), not helper jitcodes — pyre's
-    // per-opcode arm jitcodes and sub-jitcode helpers are walker-only
-    // structures with no blackhole entry point.  The structural
-    // consequence: any walker-emitted guard, regardless of how deep
-    // the sub-walk nesting is, must resume to the *outer* Python
-    // opcode boundary (`sym.jitcode` at `entry_py_pc`) — that is the
-    // only resume point pyre's blackhole can re-enter.  The
-    // framestack-collapse is a deliberate adaptation, not a parity
-    // miss; the walker context carries the outer Python frame only.
-    // Inline-traced Python frames from the retired inline-frame builder are
-    // not reachable from this entry point because the production
-    // walker allow-list does not yet enable opcodes that drive inline
-    // tracing — when that expands, `WalkContext` must grow a parent-
-    // Python-frame chain (analogous to `MIFrame.parent_frames`) and
-    // this helper switches to
-    // `capture_snapshot_for_last_guard_multi_frame_with_vable_vref`.
-    //
-    // The snapshot is therefore a single Python frame at the outer
-    // pyjitcode coordinates.  `ctx.outer_jitcode_index` +
-    // `ctx.entry_py_pc` track those coordinates; `outer_active_boxes`
-    // carries the `PyFrame` state at the Python opcode boundary
-    // (snapshotted once at walk entry — the retired per-opcode arm
-    // entry, or the inline CALL-site capture — from
-    // `sym.registers_r ∪ sym.registers_i.opref ∪ sym.registers_f.opref`
-    // via `collect_outer_active_boxes` / `frame_liveness_reg_indices_
-    // by_bank_at`).
-    //
-    // `opencoder.py create_top_snapshot` writes vable_array +
-    // vref_array on the top snapshot.  The walker-emitted guard IS
-    // a top snapshot for pyre (helper frames don't resume), so feed
-    // the trace-time vable/vref shadow through.  Empty when no
-    // virtualizable / virtualref is live, matching the upstream
-    // 0-length-array shape.  The build is deferred until after the
-    // resume py_pc is resolved and the `last_instr` vable scalar is
-    // published, so the snapshot carries this guard's coordinate (the
-    // walker never crosses `set_orgpc`, so the scalar is otherwise
-    // stale at the loop-header pc — see the publish below).
+    // An orthodox helper subwalk that owns a resume section encodes that
+    // helper as the innermost snapshot (`walker_try_capture_helper_resume_section`),
+    // with the dest-nulled after-call parent from the session. Inlined
+    // Python callees take the multi-frame path below. A helper that
+    // cannot own a section keeps the opcode-start parents already on
+    // `framestack` so resume re-executes the Python opcode without
+    // dropping inlined callers. Nested `EnclosingHelper` walks do not
+    // claim a section.
 
     // Full-body walk (Phase 7): `op_pc` is an offset into the body being
     // walked (`recording_jitcode_index` / inlined callee), which is the
@@ -318,14 +305,39 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // populates the chain; straight-line callees keep the empty chain + the
     // single-frame collapse below.
     if inline_subwalk {
-        let parent_frames = {
-            let session = ctx.session.borrow();
-            session
-                .framestack
-                .iter()
-                .flat_map(|frame| frame.parents.iter().cloned())
-                .collect::<Vec<_>>()
-        };
+        let parent_frames = framestack_parent_images(ctx, false);
+        // A guard inside a helper that owns its resume section is the helper
+        // `MIFrame` (`create_top_snapshot`). `helper_section_parent` is the
+        // after-call image of the frame that executed the helper CALL
+        // (`pyjitpl.py` `framestack[-2]` after `newframe` of the helper).
+        // `HelperEntry::Callee` pushes that frame's opcode-start image as
+        // the last parent of a `w_code == 0` dummy level — helpers are not
+        // Python `MIFrame`s — so those levels are dropped and the after-call
+        // parent is appended. `HelperEntry::Root` pushes no such level, so
+        // the opcode-start image is never in `parent_frames`. Recursion
+        // shares a jitcode index across distinct frames; this is that
+        // structural fact, not an index compare. Ineligible (nested
+        // `EnclosingHelper`, abort, no `-live-`) takes the parent-only
+        // snapshot of `parent_frames`. Dest-nulled after-call is not on the
+        // stack, so that path cannot resume FOR_ITER fallthrough with dest
+        // nulled.
+        if ctx.fbw_mode.transparent_helper_subwalk
+            && ctx.fbw_mode.transparent_helper_owns_resume_section
+        {
+            let mut section_parents = framestack_parent_images(ctx, true);
+            if let Some(after_call) = ctx.session.borrow().helper_section_parent.clone() {
+                section_parents.push(after_call);
+            }
+            if walker_try_capture_helper_resume_section(
+                ctx,
+                op_pc,
+                after_residual_call,
+                &section_parents,
+                scope.guard_stamp,
+            )? {
+                return Ok(());
+            }
+        }
         // Fire the multi-frame snapshot only when the paused-caller chain
         // covers the FULL current inline depth. A nested straight-line callee
         // inlined under a multiframe ancestor (e.g. `add3` inside a multiframe
@@ -3234,6 +3246,117 @@ fn boxes_matching_resume_liveness(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }
     Ok(frame.boxes.clone())
+}
+
+/// Encode the helper jitcode as the innermost resume section, with the
+/// paused Python CALL(s) as parents (`opencoder.py` `create_top_snapshot`
+/// on `framestack[-1]`).
+///
+/// `false` means the helper cannot be a blackhole target (still contains
+/// `abort`, no decodable `-live-`, no parent, boxes unavailable). The
+/// caller then takes the opcode-start parent-only snapshot of
+/// `framestack`, not dest-nulled after-call.
+fn walker_try_capture_helper_resume_section<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    after_residual_call: bool,
+    parent_frames: &[InlineParentFrame],
+    guard_stamp: GuardStampTarget,
+) -> Result<bool, DispatchError> {
+    if parent_frames.is_empty() || !ctx.trace_ctx.vable_snapshot_buildable() {
+        return Ok(false);
+    }
+    let Some(helper_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
+        return Ok(false);
+    };
+    let Some(helper_pjc) = crate::state::pyjitcode_for_jitcode_index(helper_index as i32) else {
+        return Ok(false);
+    };
+    // `has_abort_opcode` is baked at helper install (`from_core_degenerate`)
+    // to include `abort/>r` / `abort/>i` as well as `assembler.abort()`.
+    // A body that still contains any abort variant is not a resume target;
+    // fall through to CALL-site collapse (`hr1` slice 1 gate).
+    if helper_pjc.has_abort_opcode() {
+        return Ok(false);
+    }
+    let helper_jitcode_pc: i32 = if after_residual_call {
+        after_residual_guard_marker(&helper_pjc, op_pc, None)
+            .or_else(|| {
+                (ctx.live_after_jit_pc != usize::MAX
+                    && helper_pjc
+                        .jitcode
+                        .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
+                .then_some(ctx.live_after_jit_pc)
+            })
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC)
+    } else {
+        preceding_live_marker(&helper_pjc, op_pc)
+            .or_else(|| helper_pjc.resume_marker_for_jitcode_pc(op_pc))
+            .map(|m| m as i32)
+            .unwrap_or(op_pc as i32)
+    };
+    if helper_jitcode_pc < 0
+        || !helper_pjc
+            .jitcode
+            .can_decode_live_vars(helper_jitcode_pc as usize, crate::state::op_live())
+    {
+        return Ok(false);
+    }
+    let Ok(helper_boxes) = collect_callee_active_boxes(
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        helper_index as u32,
+        op_pc,
+        helper_jitcode_pc,
+    ) else {
+        return Ok(false);
+    };
+    let saved_vable = publish_outermost_parent_vable_scalars(ctx, parent_frames, op_pc)?;
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved_vable);
+    let helper_pc_word = helper_jitcode_pc as u32;
+    let helper_py_pc = forward_snapshot_py_pc(helper_index as u32, helper_pc_word)?;
+    let mut captured: Vec<(u32, u32, u32, Vec<OpRef>)> =
+        Vec::with_capacity(parent_frames.len() + 1);
+    for frame in parent_frames {
+        let word = frame
+            .resume_marker_jit_pc
+            .map(|marker| marker as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+        let pc_word = crate::state::pyjitcode_for_jitcode_index(frame.jitcode_index as i32)
+            .and_then(|payload| {
+                payload.resolve_resume_pc_with_jitcode_pc(word, crate::state::op_live())
+            })
+            .map(|offset| offset as u32)
+            .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
+        let py_pc = forward_snapshot_py_pc(frame.jitcode_index, pc_word)?;
+        let boxes = boxes_matching_resume_liveness(frame, pc_word, op_pc)?;
+        captured.push((frame.jitcode_index, pc_word, py_pc, boxes));
+    }
+    captured.push((
+        helper_index as u32,
+        helper_pc_word,
+        helper_py_pc,
+        helper_boxes,
+    ));
+    let frames: Vec<(u32, u32, u32, &[OpRef])> = captured
+        .iter()
+        .map(|(jitcode_index, pc_word, py_pc, boxes)| {
+            (*jitcode_index, *pc_word, *py_pc, boxes.as_slice())
+        })
+        .collect();
+    match guard_stamp {
+        GuardStampTarget::LastOp => ctx
+            .trace_ctx
+            .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
+                &frames,
+                &vable_boxes,
+                &vref_boxes,
+            ),
+    }
+    Ok(true)
 }
 
 /// A guard inside a canonical helper body, whose descent pushes no Python

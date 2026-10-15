@@ -45,24 +45,15 @@ pub fn spelling_is_dyn_fat_ptr(s: &str) -> bool {
         return false;
     }
     if let Some(inner) = wrapper_inner(s, &["Box"]) {
-        return spelling_is_dyn_trait_pointee(inner);
+        return is_dyn_pointee(inner);
     }
-    if pointer_pointee(s).is_some_and(spelling_is_dyn_trait_pointee) {
+    if pointer_pointee(s).is_some_and(is_dyn_pointee) {
         return true;
     }
     // Layout rows may spell a `&dyn Trait` field as the pointee after
     // `charon_dyn_trait_to_ast_string` (`dyn DictStrategy`): the field is
     // still the two-word fat pointer.
-    spelling_is_dyn_trait_pointee(s)
-}
-
-/// Pointee of a fat `&dyn Trait`. Charon's DynTrait fallback
-/// (`charon_dyn_trait_to_ast_string`) emits `"dyn"` when the trait id is
-/// unresolved; `tyref_to_field_layout_string` then keeps the `&` as
-/// `"&dyn"`. Both are `two_word_fat_struct`.
-fn spelling_is_dyn_trait_pointee(s: &str) -> bool {
-    let t = s.trim();
-    t == "dyn" || t.starts_with("dyn ")
+    is_dyn_pointee(s)
 }
 
 /// A pointer to an unsized pointee (`dyn Trait`, `[T]`, `str`) is two
@@ -121,9 +112,14 @@ fn pointer_pointee(s: &str) -> Option<&str> {
     wrapper_inner(s, &["Box", "NonNull"])
 }
 
+fn is_dyn_pointee(inner: &str) -> bool {
+    let inner = inner.trim();
+    inner == "dyn" || inner.starts_with("dyn ") || inner.starts_with("(dyn ")
+}
+
 fn is_unsized_pointee(inner: &str) -> bool {
     let inner = inner.trim();
-    if inner == "str" || inner.ends_with("::str") || spelling_is_dyn_trait_pointee(inner) {
+    if inner == "str" || inner.ends_with("::str") || is_dyn_pointee(inner) {
         return true;
     }
     inner
@@ -183,6 +179,7 @@ mod tests {
 
     #[test]
     fn dyn_trait_spellings_are_fat() {
+        assert!(super::spelling_is_dyn_fat_ptr("&dyn"));
         assert!(super::spelling_is_dyn_fat_ptr("&dyn Storage"));
         assert!(super::spelling_is_dyn_fat_ptr("&mut dyn Storage"));
         assert!(super::spelling_is_dyn_fat_ptr("Box<dyn Storage>"));
@@ -206,6 +203,7 @@ mod tests {
         assert!(super::spelling_is_fat_ptr("*const [u8]"));
         assert!(super::spelling_is_fat_ptr("&[String]"));
         assert!(super::spelling_is_fat_ptr("Box<[u8]>"));
+        assert!(super::spelling_is_fat_ptr("&dyn"));
         assert!(super::spelling_is_fat_ptr("*mut dyn Storage"));
         assert!(super::spelling_is_fat_ptr(
             "Option<*mut dyn AsyncActionOps>"

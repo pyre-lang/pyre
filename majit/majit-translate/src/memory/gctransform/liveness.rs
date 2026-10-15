@@ -816,7 +816,7 @@ fn address_bearing_locals(blocks: &[BasicBlock], forward: &[bool]) -> HashSet<u6
             continue;
         }
         for st in &blk.statements {
-            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind_ref() else {
                 continue;
             };
             let Some(dest) = bare_local(&place) else {
@@ -973,7 +973,7 @@ fn operand_address_roots(
 /// successors, so the call's own arguments are the pre-call word.
 fn pyerror_stale_after_collect(
     blocks: &[BasicBlock],
-    terms: &[Option<TermKind>],
+    terms: &[Option<&TermKind>],
     names: &HashMap<u64, String>,
     mut_borrow_of: &HashMap<u64, u64>,
     defs: &HashMap<u64, PinSrc>,
@@ -1003,7 +1003,7 @@ fn pyerror_stale_after_collect(
         queued[block] = false;
         let mut stale = stale_in[block].clone();
         for st in &blocks[block].statements {
-            let Ok(kind) = st.stmt_kind() else {
+            let Ok(kind) = st.stmt_kind_ref() else {
                 continue;
             };
             note_stmt_loads(
@@ -1371,7 +1371,7 @@ struct PinAssignIndex {
 /// not given a [`PinSrc`]: the value came from the callee.
 fn index_pin_assigns(
     blocks: &[BasicBlock],
-    terms: &[Option<TermKind>],
+    terms: &[Option<&TermKind>],
     forward: &[bool],
 ) -> PinAssignIndex {
     let mut defs: HashMap<u64, PinSrc> = HashMap::new();
@@ -1386,7 +1386,7 @@ fn index_pin_assigns(
             continue;
         }
         for st in &blk.statements {
-            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind_ref() else {
                 continue;
             };
             let Some(d) = bare_local(&place) else {
@@ -1901,7 +1901,11 @@ fn helper_body_fact(
     names: &HashMap<u64, String>,
 ) -> Option<HelperBodyFact> {
     let forward = crate::front::mir::forward_reachable_mask(llbc, body);
-    let terms: Vec<Option<TermKind>> = body.body.iter().map(|blk| blk.term(llbc).ok()).collect();
+    let terms: Vec<Option<&TermKind>> = body
+        .body
+        .iter()
+        .map(|blk| blk.term_ref(llbc).ok())
+        .collect();
     // A terminator this reader cannot classify may be the `push_roots` that
     // disqualifies the helper, or the only pin. Either misread is worse than
     // leaving the caller unread. Cleanup reached only through `on_unwind`
@@ -2231,7 +2235,8 @@ pub fn scan(
         // Cleanup reached only through `on_unwind` is outside the flow
         // graph. One mask per body; walks below reuse it.
         let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
-        let terms: Vec<Option<TermKind>> = body.body.iter().map(|b| b.term(llbc).ok()).collect();
+        let terms: Vec<Option<&TermKind>> =
+            body.body.iter().map(|b| b.term_ref(llbc).ok()).collect();
         let unparsed_terms = terms.iter().enumerate().any(|(b, t)| {
             is_forward(&forward, b) && (t.is_none() || matches!(t, Some(TermKind::Unknown)))
         });
@@ -2246,7 +2251,7 @@ pub fn scan(
                 && blk
                     .statements
                     .iter()
-                    .any(|st| matches!(st.stmt_kind(), Err(_) | Ok(StmtKind::Unknown)))
+                    .any(|st| matches!(st.stmt_kind_ref(), Err(_) | Ok(StmtKind::Unknown)))
         });
         if unparsed_stmts {
             // `transfer_stmt` reads no uses out of either shape, so the live
@@ -2656,7 +2661,7 @@ pub fn scan(
                 continue;
             }
             for st in &blk.statements {
-                match st.stmt_kind() {
+                match st.stmt_kind_ref() {
                     Ok(StmtKind::Assign(place, rvalue)) => {
                         if let Some(d) = bare_local(&place) {
                             if let Some(src) = pin_copy_src(&rvalue) {
@@ -2667,7 +2672,7 @@ pub fn scan(
                         }
                     }
                     Ok(StmtKind::StorageLive(i)) | Ok(StmtKind::StorageDead(i)) => {
-                        stmt_xfers[b].push(RawPinXfer::Kill(i));
+                        stmt_xfers[b].push(RawPinXfer::Kill(*i));
                     }
                     _ => {}
                 }
@@ -2943,7 +2948,7 @@ pub fn scan(
                     &mut drop_memo,
                 );
                 for st in body.body[b].statements.iter().rev() {
-                    if let Ok(k) = st.stmt_kind() {
+                    if let Ok(k) = st.stmt_kind_ref() {
                         transfer_stmt(&k, &mut live, &gc_locals);
                     }
                 }
@@ -2964,7 +2969,7 @@ pub fn scan(
             if !is_forward(&forward, b) {
                 continue;
             }
-            let Ok(TermKind::Call { call: c2, .. }) = other.term(llbc) else {
+            let Ok(TermKind::Call { call: c2, .. }) = other.term_ref(llbc) else {
                 continue;
             };
             let CallFunc::Regular(r2) = &c2.func else {
@@ -3718,8 +3723,8 @@ mod tests {
             3,
             pin_src(&Rvalue::Ref {
                 place: local(2),
-                kind: serde_json::Value::Null,
-                ptr_metadata: serde_json::Value::Null,
+                kind: serde_json::Value::Null.into(),
+                ptr_metadata: serde_json::Value::Null.into(),
             })
             .expect("a borrow is a followable alias"),
         );
@@ -3735,7 +3740,7 @@ mod tests {
         defs.insert(3, PinSrc::Alias(2));
         defs.insert(
             4,
-            pin_src(&Rvalue::Cast(serde_json::Value::Null, mv(3), ty()))
+            pin_src(&Rvalue::Cast(serde_json::Value::Null.into(), mv(3), ty()))
                 .expect("a cast is a followable alias"),
         );
         assert_eq!(chased(4, &defs), vec![2, 3, 4, 10]);
@@ -3749,7 +3754,8 @@ mod tests {
         let mut defs = HashMap::new();
         defs.insert(
             1,
-            pin_src(&Rvalue::Use(mv(0), serde_json::Value::Null)).expect("a use is an alias"),
+            pin_src(&Rvalue::Use(mv(0), serde_json::Value::Null.into()))
+                .expect("a use is an alias"),
         );
         assert_eq!(chased(1, &defs), vec![0, 1]);
     }
@@ -3784,7 +3790,7 @@ mod tests {
         Place {
             kind: PlaceKind::Projection(
                 Box::new(local(i)),
-                ProjectionElem::Tagged(serde_json::json!({"Field": [null, 0]})),
+                ProjectionElem::Tagged(serde_json::json!({"Field": [null, 0]}).into()),
             ),
             ty: ty(),
         }
@@ -3794,24 +3800,24 @@ mod tests {
     #[test]
     fn only_a_bare_local_copy_or_cast_transfers_a_pin() {
         assert_eq!(
-            pin_copy_src(&Rvalue::Use(mv(2), serde_json::Value::Null)),
+            pin_copy_src(&Rvalue::Use(mv(2), serde_json::Value::Null.into())),
             Some(2)
         );
         assert_eq!(
-            pin_copy_src(&Rvalue::Cast(serde_json::Value::Null, mv(2), ty())),
+            pin_copy_src(&Rvalue::Cast(serde_json::Value::Null.into(), mv(2), ty())),
             Some(2)
         );
         assert_eq!(
             pin_copy_src(&Rvalue::Use(
                 Operand::Copy(field_of(2)),
-                serde_json::Value::Null
+                serde_json::Value::Null.into()
             )),
             None
         );
         assert_eq!(
             pin_src(&Rvalue::Use(
                 Operand::Copy(field_of(2)),
-                serde_json::Value::Null
+                serde_json::Value::Null.into()
             )),
             Some(PinSrc::Alias(2))
         );

@@ -1952,63 +1952,42 @@ fn analyze_pipeline_from_module_paths(
     // classification, immutability rank, and size stay as the provider
     // computed them; only the byte offsets and the struct size are corrected.
     prof.mark("  call_control setup");
-    for struct_name in program.struct_fields.fields.keys() {
-        // Resolve the (possibly multi-spelled) field-registry key to its
-        // identity token; an unresolved / ambiguous bare leaf has no
-        // identity to key a layout on, so skip it.
-        let Some(sid) = majit_ir::descr::struct_id_for_name(struct_name) else {
-            continue;
-        };
-        // `exact_layouts` originates on Charon's defining TypeDecl. Concrete
-        // generic identities are derived later from use-site type arguments,
-        // so inherit the declaration's exact offsets when it has no concrete
-        // entry (notably the explicit translated `Result` shell).
-        let exact = program.exact_layouts.get(&sid).or_else(|| {
-            majit_ir::descr::struct_template_id_for_name(struct_name)
-                .and_then(|template| program.exact_layouts.get(&template))
-        });
-        // An opaque/shadow declaration can share the runtime identity of its
-        // defining type (e.g. pyre-interpreter's zero-field GetSetProperty
-        // marker versus pyre-object's real definition).  If Charon's exact
-        // definition carries fields but this spelling has no rows, it is an
-        // alias consumer, not a layout producer; letting it write would erase
-        // the real field layout according to HashMap iteration order.
-        let incomplete_shadow = exact.is_some_and(|layout| !layout.field_offsets.is_empty())
-            && program
-                .struct_fields
-                .fields
-                .get(struct_name)
-                .is_some_and(Vec::is_empty);
-        if incomplete_shadow {
-            continue;
+    // `descr.py` `get_field_descr(STRUCT, fieldname)` keys on the lltype
+    // STRUCT object. Exact Charon layouts are installed by that identity
+    // first, including monomorphizations whose name spelling the merge
+    // withdrew. Remaining names (templates, instantiations without a
+    // Charon row) keep a heuristic layout so size/offset queries do not
+    // fall through to the C-order accumulator.
+    for entry in crate::layout::program_struct_layouts(
+        &program.struct_fields,
+        &program.exact_layouts,
+        provider,
+    ) {
+        let crate::layout::ProgramStructLayout {
+            spelling: struct_name,
+            sid,
+            exact,
+            mut layout,
+        } = entry;
+        if let Some(host) = exact.as_ref().and_then(|item| item.host.clone()) {
+            layout.host = Some(host);
         }
-        let layout = match exact {
-            Some(exact) => {
-                provider.get_struct_layout_exact(struct_name, &exact.field_offsets, exact.size)
-            }
-            None => provider.get_struct_layout(struct_name),
+        layout.gckind = if declared_gc.contains(&sid) {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+        } else {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
         };
-        if let Some(mut layout) = layout {
-            if let Some(host) = exact.and_then(|item| item.host.clone()) {
-                layout.host = Some(host);
-            }
-            layout.gckind = if declared_gc.contains(&sid) {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+        if census_struct_layouts {
+            let variants = struct_layout_variants.entry(sid).or_default();
+            if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
+                observed.size == layout.size && observed.fields == layout.fields
+            }) {
+                spellings.push(struct_name.clone());
             } else {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
-            };
-            if census_struct_layouts {
-                let variants = struct_layout_variants.entry(sid).or_default();
-                if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
-                    observed.size == layout.size && observed.fields == layout.fields
-                }) {
-                    spellings.push(struct_name.clone());
-                } else {
-                    variants.push((layout.clone(), vec![struct_name.clone()]));
-                }
+                variants.push((layout.clone(), vec![struct_name.clone()]));
             }
-            call_control.set_struct_layout(sid, layout);
         }
+        call_control.set_struct_layout(sid, layout);
     }
     if census_struct_layouts {
         let struct_id_count = struct_layout_variants.len();

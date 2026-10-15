@@ -1,8 +1,8 @@
-# pyre-check: spec-folds=builtin_range
 # pyre-check: trace-shape=entry-bridge:main:absent=CallMayForceR
 # Pins virtual range construction for one-, two-, and three-bound calls while
 # retaining correct residual behavior for exceptional, subclass, index, and
-# escaping-object shapes.
+# escaping-object shapes. `range(...)` records `W_Range.descr_new`
+# (`RANGE_NEW_*_DESCENT`); not a spec-fold row.
 #
 # The `try: range(0, 3, 0)` below puts an out-of-line handler after the
 # trailing comprehension. A loop region that gates the back edge by spanning

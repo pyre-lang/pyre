@@ -309,6 +309,10 @@ pub struct SubJitCodeBody {
     pub constants_r: &'static [majit_jitcode::codewriter::jitcode::ConstSlotR],
     /// Callee's Float-bank constant pool (`JitCode.constants_f`).
     pub constants_f: &'static [i64],
+    /// `MetaInterpStaticData.jitcodes` index of this body, when the lookup
+    /// that produced it knew the index (`sub_jitcode_body_by_index`). `None`
+    /// for fixture bodies that are not in that table.
+    pub jitcode_index: Option<usize>,
 }
 
 /// Caller-provided sub-jitcode lookup. RPython equivalent: descr
@@ -341,6 +345,7 @@ pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
         constants_i: jc.constants_i.as_slice(),
         constants_r: jc.constants_r.as_slice(),
         constants_f: jc.constants_f.as_slice(),
+        jitcode_index: Some(idx),
     })
 }
 
@@ -715,6 +720,13 @@ pub struct WalkSession {
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
     /// when the callee sub-walk returns.
     pub framestack: Vec<InlineFrame>,
+    /// Dest-nulled after-call parent for an orthodox helper that owns a
+    /// resume section. Not on `framestack`: putting it there makes
+    /// `walker_inline_guard_resumes_in_callee` true for a portal helper and
+    /// parent-only capture resumes FOR_ITER fallthrough with dest nulled.
+    /// Helper-section capture reads this; every other snapshot uses the
+    /// opcode-start parents already on `framestack`.
+    pub(crate) helper_section_parent: Option<InlineParentFrame>,
     /// `MetaInterp.current_call_id`: the root portal owns id 0 and each
     /// subsequently entered Python portal frame consumes the next id.
     pub next_call_id: u64,
@@ -870,6 +882,7 @@ impl Default for WalkSession {
 
             helper_live: Vec::new(),
             framestack: Vec::new(),
+            helper_section_parent: None,
             next_call_id: 1,
             open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
@@ -1058,9 +1071,18 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     // skipped at the `SubRaise` catch site instead, matching
     // `pyopcode.py handle_bytecode` routing that exception around
     // `record_context`.
+    //
     // The hook chains through `chain_context`, so calling it here both applies
     // the effect to this authoritative walk's concrete exception and reaches
-    // the value the compiled iterations will store.
+    // the value the compiled iterations will store. A recording-time skip
+    // when `sys_exc_info` is None would bake that into the trace; compiled
+    // iterations that later run under a live handler would leave
+    // `__context__` unset. PyPy traces `executioncontext.py sys_exc_info`
+    // as jitcode (`guard_isnull` on `sys_exc_operror` and
+    // `current_gen_or_coroutine`) and compiles a bridge when a guard fails.
+    // Those guards synthesized here resume at the inlined CALL whose
+    // valuestack was already consumed. Residual-call the hook instead
+    // (`resolve_exception_context` reads `get_sys_exception` at run time).
     majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
     let hook = majit_metainterp::resolve_exception_context_hook_address();
     if !hook.is_null() && !exc.is_none() {
@@ -1966,6 +1988,12 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// Absolute build-time `MetaInterpStaticData.jitcodes` index of that
     /// helper. `None` outside a translated helper sub-walk.
     pub transparent_helper_jitcode_index: Option<usize>,
+    /// This sub-walk's helper jitcode is the innermost resume section a guard
+    /// inside it should name (`opencoder.py` `create_top_snapshot` on the
+    /// helper `MIFrame`). Nested `EnclosingHelper` walks inherit the outer
+    /// helper's index and must not claim a section of their own: their `op_pc`
+    /// is not a coordinate in that outer body.
+    pub transparent_helper_owns_resume_section: bool,
     /// Set only while walking the generated `write_cell` helper.  Inner
     /// ops are `helper=None` Void writes the StoreName loop-var exemption
     /// cannot see; the caller journals them (`FBW_CELL_STORE_JOURNAL`).
@@ -2081,6 +2109,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             immediate_inline_caller_py_pc: None,
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
+            transparent_helper_owns_resume_section: false,
             cell_store_helper_subwalk: false,
             carrier_resume: false,
             current_exception_seed_from_walk_store: false,
@@ -8251,22 +8280,29 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
     if let ConcreteValue::Ref(value) = &mut session.tmpreg_r_concrete {
         walk_ptr(value, visitor);
     }
-    for frame in session.framestack.iter_mut() {
-        for parent in frame.parents.iter_mut() {
-            // history.py ConstPtr.value remains reachable through each
-            // paused frame's active boxes, including constructor tails.
-            for value in &mut parent.boxes {
-                value.walk_const_ptr_refs_mut(visitor);
-            }
-            for (_, value) in &mut parent.call_stack_overrides {
+    let walk_parent = |parent: &mut InlineParentFrame,
+                       visitor: &mut dyn FnMut(&mut majit_ir::GcRef)| {
+        // history.py ConstPtr.value remains reachable through each
+        // paused frame's active boxes, including constructor tails.
+        for value in &mut parent.boxes {
+            value.walk_const_ptr_refs_mut(visitor);
+        }
+        for (_, value) in &mut parent.call_stack_overrides {
+            walk_ptr(value, visitor);
+        }
+        if let Some(blackhole) = parent.blackhole.as_mut() {
+            for (_, value) in &mut blackhole.ref_values {
                 walk_ptr(value, visitor);
             }
-            if let Some(blackhole) = parent.blackhole.as_mut() {
-                for (_, value) in &mut blackhole.ref_values {
-                    walk_ptr(value, visitor);
-                }
-            }
         }
+    };
+    for frame in session.framestack.iter_mut() {
+        for parent in frame.parents.iter_mut() {
+            walk_parent(parent, visitor);
+        }
+    }
+    if let Some(parent) = session.helper_section_parent.as_mut() {
+        walk_parent(parent, visitor);
     }
 }
 

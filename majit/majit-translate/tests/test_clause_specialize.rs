@@ -1196,3 +1196,63 @@ fn graph_calls_object_key_eq(graph: &majit_translate::model::FunctionGraph) -> b
             _ => false,
         })
 }
+
+/// `ll_slice_getitem_fast_i` returns the unsigned helper word. A signed
+/// i64 item retypes through `rarithmetic.intmask` before it is passed to
+/// `int_or_float_encode_int` (`IntegerRepr.convert_from_to`).
+#[test]
+fn integer_to_int_or_float_passes_intmask_of_slice_getitem_to_encode_int() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let graph =
+        lower_function(&llbc, "integer_to_int_or_float").expect("lower integer_to_int_or_float");
+    let mut encode_arg = None;
+    let mut by_result = std::collections::HashMap::new();
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        if let Some(result) = op.result.as_ref() {
+            by_result.insert(result.id(), op);
+        }
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+            && segments.last().map(String::as_str) == Some("int_or_float_encode_int")
+        {
+            encode_arg = args[0].as_variable().cloned();
+        }
+    }
+    let arg = encode_arg.expect("calls encode_int");
+    let producer = *by_result
+        .get(&arg.id())
+        .expect("encode_int argument has a producer");
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    } = &producer.kind
+    else {
+        panic!("encode_int argument producer is not a call");
+    };
+    assert_eq!(
+        segments.last().map(String::as_str),
+        Some("intmask"),
+        "signed i64 slice item must retype through intmask"
+    );
+    let getitem = args[0]
+        .as_variable()
+        .expect("intmask argument is a variable");
+    let getitem_op = *by_result
+        .get(&getitem.id())
+        .expect("intmask argument has a producer");
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = &getitem_op.kind
+    else {
+        panic!("intmask argument producer is not a call");
+    };
+    assert_eq!(
+        segments.last().map(String::as_str),
+        Some("ll_slice_getitem_fast_i")
+    );
+}

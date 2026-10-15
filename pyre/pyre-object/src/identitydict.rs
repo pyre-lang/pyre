@@ -79,6 +79,18 @@ unsafe fn identity_storage<'a>(obj: PyObjectRef) -> &'a IdentityDictStorage {
     &*(dict.dstorage as *const IdentityDictStorage)
 }
 
+/// `dictmultiobject.py AbstractTypedStrategy.length` —
+/// `len(self.unerase(w_dict.dstorage))`. `rordereddict.py ll_dict_len`
+/// / `OrderedDictRepr.rtype_len` is `getfield num_live_items`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
+#[inline]
+pub unsafe fn w_dict_length_identity_strategy(obj: PyObjectRef) -> usize {
+    let dict = &*(obj as *const crate::dictmultiobject::W_DictObject);
+    (*(dict.dstorage as *const IdentityDictStorage)).num_live_items
+}
+
 /// Internal helper: `IdentityDictStrategy::getitem` body.  Caller must have
 /// already verified `is_correct_type(w_key)`.
 ///
@@ -338,8 +350,11 @@ impl DictStrategy for IdentityDictStrategy {
         crate::dictmultiobject::w_dict_delitem(w_dict, w_key)
     }
 
+    /// `dictmultiobject.py AbstractTypedStrategy.length` —
+    /// `len(self.unerase(w_dict.dstorage))`. `rordereddict.py ll_dict_len`
+    /// / `rtype_len` is `getfield num_live_items`.
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
-        identity_storage(w_dict).len()
+        w_dict_length_identity_strategy(w_dict)
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {

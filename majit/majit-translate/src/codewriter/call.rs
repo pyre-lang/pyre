@@ -3264,7 +3264,7 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Box<")
         || type_name.starts_with("Arc<")
         || type_name.starts_with("Rc<")
-        || type_name.starts_with("Vec<")
+        || crate::vec_layout::field_layout_is_inline_vec(type_name)
         || type_name.starts_with("Option<")
         || type_name == "String"
         || atomic_wrapper_leaf(type_name).is_some()
@@ -3927,6 +3927,17 @@ impl CallControl {
     pub fn struct_layout_for(&self, name: &str) -> Option<std::rc::Rc<StructLayout>> {
         let sid = majit_ir::descr::struct_id_for_name(name)?;
         self.layout_of(sid, name)
+    }
+
+    /// The layout stored under `sid`. No template fallback and no
+    /// positional synthesis: a missing instance is missing, matching
+    /// `descr.py` `get_field_descr(STRUCT, fieldname)` keyed on that
+    /// STRUCT object.
+    pub fn struct_layout_for_id(
+        &self,
+        sid: majit_ir::descr::StructId,
+    ) -> Option<std::rc::Rc<StructLayout>> {
+        self.struct_layouts.borrow().get(&sid).cloned()
     }
 
     /// The layout stored under `sid`, whose spelling is `name`. A
@@ -4664,7 +4675,12 @@ impl CallControl {
             })
         };
         let concrete_offset = owner_id.and_then(offset_of);
-        let template_offset = if concrete_offset.is_none() {
+        // `get_field_descr(STRUCT, fieldname)` does not reuse another
+        // STRUCT's token. A distinct `owner_id` is its own STRUCT; the
+        // template spelling's offset is that other type.
+        let template_offset = if concrete_offset.is_none()
+            && owner_id.is_none_or(|id| registry_struct_id == Some(id))
+        {
             registry_struct_id.and_then(offset_of)
         } else {
             None
@@ -12114,7 +12130,7 @@ pub(crate) fn get_type_flag(
         // `{cap, ptr, len}`. The field is the three-word value, so
         // `&mut vec_field` is the address of that value. A one-word
         // pointer load reads `cap`.
-        s if s.starts_with("Vec<") => (
+        s if crate::vec_layout::field_layout_is_inline_vec(s) => (
             ArrayFlag::Struct,
             majit_ir::value::Type::Ref,
             3 * crate::layout::target_word_size(),

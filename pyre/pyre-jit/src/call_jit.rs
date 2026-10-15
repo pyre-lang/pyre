@@ -2634,6 +2634,37 @@ pub(crate) fn propagate_portal_frame_escape(frame: *mut PyFrame, got_exception: 
     }
 }
 
+/// `resume.py` `blackhole_from_resumedata` `jitcodes[jitcode_pos]` lookup.
+/// A helper jitcode has no CodeObject (`code_ptr` null) and is still a
+/// valid blackhole target. A body that still contains any abort variant
+/// is not: `has_abort_opcode` already includes helper `abort/>r` /
+/// `abort/>i` (`PyJitCode::from_core_degenerate` on a null `code_ptr`).
+/// Python (code-keyed) jitcodes still report `assembler.abort()` only.
+pub(crate) fn resolve_jitcode_for_blackhole(
+    jitcode_index: i32,
+    pc: i32,
+) -> Option<majit_metainterp::resume::ResolvedJitCode> {
+    if pc < 0 {
+        return None;
+    }
+    let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
+    let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+    if pyjitcode.has_abort_opcode() {
+        return None;
+    }
+    // A published resume frame carries a decodable JitCode `-live-`
+    // coordinate. An unrepresentable frame declines this blackhole path.
+    let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
+        pc as usize
+    } else {
+        return None;
+    };
+    Some(
+        majit_metainterp::resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
+            .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
+    )
+}
+
 /// resume.py blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
@@ -2691,27 +2722,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // the list `blackhole.py` `resume_in_blackhole` passes
     // (`MetaInterpStaticData.jitcodes` from `CodeWriter.make_jitcodes`).
     // `novable` only means this stream has no vable section.
-    let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
-        if pc < 0 {
-            return None;
-        }
-        let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
-        let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-        if pyjitcode.has_abort_opcode() {
-            return None;
-        }
-        // A published resume frame carries a decodable JitCode `-live-`
-        // coordinate. An unrepresentable frame declines this blackhole path.
-        let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
-            pc as usize
-        } else {
-            return None;
-        };
-        Some(
-            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
-                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
-        )
-    };
+    let resolve_jitcode = resolve_jitcode_for_blackhole;
 
     // resume.py `cpu.get_int_value(deadframe, i)`: values stay in
     // `jf_frame[]`. `jitframe_trace` walks the Ref slots. A host copy
@@ -2948,6 +2959,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                         frame.registers_r,
                     );
                 }
+                // A helper jitcode has `jitdriver_sd is None` and no portal
+                // reds (`portal_red_regs_at` → `u16::MAX`). Leave
+                // `virtualizable_ptr` unset: helpers do not run vable opcodes
+                // (`blackhole.py` / `resume.py` `blackhole_from_resumedata`).
                 if frame_reg != u16::MAX {
                     if let Some(&frame_ptr) = frame.registers_r.get(frame_reg as usize) {
                         if frame_ptr != 0 {
@@ -3149,7 +3164,15 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             };
         }
         if !bh.got_exception && bh.aborted {
-            if bh.abort_permanent_bail {
+            // A helper jitcode can still contain `abort/>r` on a cold arm
+            // the walker never recorded (`has_abort_opcode` misses it).
+            // Panicking here cannot unwind through `bh_call_fn`. Bail to
+            // the interpreter the way `abort_permanent` already does
+            // (`blackhole.py` `_resume_mainloop`).
+            let helper_body = bh.jitcode.try_index().is_some_and(|index| {
+                pyre_jit_trace::state::raw_code_for_jitcode_index(index as i32).is_none()
+            });
+            if bh.abort_permanent_bail || helper_body {
                 release_bh_rd(bh);
                 return BlackholeResult::BailToInterpreter;
             }
@@ -3634,6 +3657,47 @@ pub(crate) fn compiled_meta_for_bridge_source<M: Clone>(
         .cloned()
 }
 
+/// The exception-table byte offset a `next_instr`-style resume coordinate
+/// maps to, mirroring the live-frame form `frame.last_instr * 2` (where
+/// `last_instr` is `next_instr - 1`).
+fn exc_table_offset(py_pc: usize) -> u32 {
+    (py_pc.saturating_sub(1) as u32) * 2
+}
+
+/// Index of the resumed frame that catches, searched INNERMOST-first by
+/// asking each frame's own exception table about its own resume pc.
+/// `coords` is outermost-first, so `Some(0)` means the raise unwinds clear
+/// out of every inlined callee into the live frame; `None` means it
+/// escapes them all.
+///
+/// A helper jitcode has no `CodeObject` (`w_code == 0`). Skip it so a
+/// helper sitting innermost does not kill catch routing for the Python
+/// frames below (`resume.py` blackhole runs that section).
+pub(crate) fn resumed_catch_level(coords: &[(usize, usize)]) -> Option<usize> {
+    for (level, &(w_code, py_pc)) in coords.iter().enumerate().rev() {
+        if w_code == 0 {
+            continue;
+        }
+        let raw = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
+        };
+        if raw.is_null() {
+            continue;
+        }
+        let code = unsafe { &*raw };
+        if pyre_interpreter::pycode::lookup_exceptiontable(
+            &code.exceptiontable,
+            exc_table_offset(py_pc),
+        )
+        .is_some()
+        {
+            return Some(level);
+        }
+    }
+    None
+}
+
 /// compile.py (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
@@ -3961,43 +4025,6 @@ pub fn trace_and_compile_from_bridge(
     // lookup.  Route any catching frame — live or inlined — onto that
     // handler.  An uncaught raise still blackholes this failure
     // (`compile_exit_frame_with_exception` is the remaining close).
-    /// The exception-table byte offset a `next_instr`-style resume coordinate
-    /// maps to, mirroring the live-frame form `frame.last_instr * 2` (where
-    /// `last_instr` is `next_instr - 1`).
-    fn exc_table_offset(py_pc: usize) -> u32 {
-        (py_pc.saturating_sub(1) as u32) * 2
-    }
-
-    /// Index of the resumed frame that catches, searched INNERMOST-first by
-    /// asking each frame's own exception table about its own resume pc.
-    /// `coords` is outermost-first, so `Some(0)` means the raise unwinds clear
-    /// out of every inlined callee into the live frame; `None` means it
-    /// escapes them all.
-    fn resumed_catch_level(coords: &[(usize, usize)]) -> Option<usize> {
-        for (level, &(w_code, py_pc)) in coords.iter().enumerate().rev() {
-            if w_code == 0 {
-                return None;
-            }
-            let raw = unsafe {
-                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
-            };
-            if raw.is_null() {
-                return None;
-            }
-            let code = unsafe { &*raw };
-            if pyre_interpreter::pycode::lookup_exceptiontable(
-                &code.exceptiontable,
-                exc_table_offset(py_pc),
-            )
-            .is_some()
-            {
-                return Some(level);
-            }
-        }
-        None
-    }
-
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
             // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
@@ -7995,5 +8022,140 @@ mod tests_bh_normalize_raise {
     #[test]
     fn record_caught_blackhole_traceback_ignores_null_operands() {
         record_caught_blackhole_traceback(0, 0, 0, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_helper_resume_consumers {
+    use super::*;
+    use majit_metainterp::jitcode::insns::{BC_ABORT_RESULT_R, BC_LIVE};
+    use pyre_interpreter::compile_exec;
+
+    fn live_only_runtime(extra: &[u8]) -> std::sync::Arc<majit_metainterp::jitcode::JitCode> {
+        let live_off =
+            pyre_jit_trace::state::intern_liveness(&[], &[], &[]).expect("empty liveness intern");
+        let mut runtime = majit_metainterp::jitcode::JitCodeBuilder::default().finish();
+        let mut code = vec![BC_LIVE, (live_off & 0xff) as u8, (live_off >> 8) as u8];
+        code.extend_from_slice(extra);
+        runtime.body_mut().code = code;
+        runtime.body_mut().startpoints = Some(if extra.is_empty() {
+            [0usize].into_iter().collect()
+        } else {
+            [0usize, 3].into_iter().collect()
+        });
+        std::sync::Arc::new(runtime)
+    }
+
+    fn live_only_pyjitcode(
+        code_ptr: *const pyre_interpreter::CodeObject,
+        has_abort: bool,
+        extra: &[u8],
+    ) -> std::sync::Arc<pyre_jit_trace::PyJitCode> {
+        std::sync::Arc::new(pyre_jit_trace::PyJitCode::from_core_degenerate(
+            live_only_runtime(extra),
+            code_ptr,
+            has_abort,
+        ))
+    }
+
+    fn two_section_numbering(portal_index: i32, helper_index: i32) -> Vec<u8> {
+        let mut writer = majit_ir::resumecode::Writer::new(8);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.append_int(portal_index as i64);
+        writer.append_int(0);
+        writer.append_int(helper_index as i64);
+        writer.append_int(0);
+        writer.patch_current_size(0);
+        writer.create_numbering()
+    }
+
+    #[test]
+    fn helper_resume_section_is_skipped_by_catch_and_accepted_by_resolve_jitcode() {
+        crate::eval::driver_pair();
+
+        let source = "try:\n    x = 1\nexcept Exception:\n    pass\n";
+        let code = compile_exec(source).expect("try/except module should compile");
+        assert!(
+            !code.exceptiontable.is_empty(),
+            "try/except must emit an exception table"
+        );
+        let mut catch_pc = None;
+        for py_pc in 1..=code.instructions.len() {
+            if pyre_interpreter::pycode::lookup_exceptiontable(
+                &code.exceptiontable,
+                (py_pc as u32 - 1) * 2,
+            )
+            .is_some()
+            {
+                catch_pc = Some(py_pc);
+                break;
+            }
+        }
+        let catch_pc = catch_pc.expect("try body should be covered by the exception table");
+        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::from_ref(&code).cast());
+        assert!(!w_code.is_null());
+
+        let portal = live_only_pyjitcode(
+            unsafe {
+                pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+            },
+            false,
+            &[],
+        );
+        pyre_jit_trace::state::install_jitcode_for(w_code.cast(), portal);
+        let portal_index =
+            pyre_jit_trace::state::ensure_jitcode_index(w_code.cast()).expect("portal index");
+
+        let helper = live_only_pyjitcode(std::ptr::null(), false, &[]);
+        let helper_index = pyre_jit_trace::state::install_codeless_jitcode(helper);
+
+        let abort_helper = live_only_pyjitcode(std::ptr::null(), false, &[BC_ABORT_RESULT_R, 0]);
+        let abort_index = pyre_jit_trace::state::install_codeless_jitcode(abort_helper);
+
+        let flagged_abort = live_only_pyjitcode(std::ptr::null(), true, &[]);
+        let flagged_index = pyre_jit_trace::state::install_codeless_jitcode(flagged_abort);
+
+        let rd_numb = two_section_numbering(portal_index, helper_index);
+        let count = |_jitcode_index: i32, _pc: i32| 0usize;
+        let (_n, _vable, _vref, frames) =
+            majit_ir::resumedata::rebuild_from_numbering(&rd_numb, &[], &[], Some(&count), 0);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].jitcode_index, portal_index);
+        assert_eq!(frames[1].jitcode_index, helper_index);
+        assert!(
+            pyre_jit_trace::state::raw_code_for_jitcode_index(portal_index).is_some(),
+            "portal section has a CodeObject"
+        );
+        assert!(
+            pyre_jit_trace::state::raw_code_for_jitcode_index(helper_index).is_none(),
+            "helper section has a null code_ptr"
+        );
+
+        let coords = [(w_code as usize, catch_pc), (0, 0)];
+        assert_eq!(
+            resumed_catch_level(&coords),
+            Some(0),
+            "helper level must be skipped so the Python frame still catches"
+        );
+
+        assert!(
+            resolve_jitcode_for_blackhole(helper_index, 0).is_some(),
+            "helper section with null code_ptr is a blackhole target"
+        );
+        assert!(
+            resolve_jitcode_for_blackhole(abort_index, 0).is_none(),
+            "abort/>r helper is not a blackhole target"
+        );
+        assert!(
+            resolve_jitcode_for_blackhole(flagged_index, 0).is_none(),
+            "has_abort_opcode helper is not a blackhole target"
+        );
+        assert!(
+            resolve_jitcode_for_blackhole(portal_index, 0).is_some(),
+            "portal section is a blackhole target"
+        );
     }
 }

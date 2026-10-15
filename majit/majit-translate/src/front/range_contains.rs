@@ -1,34 +1,58 @@
-//! `(a..=b).contains(&x)` → `int_between(a, x, b + 1)`;
-//! `(a..b).contains(&x)` → `int_between(a, x, b)`.
+//! Std `Range` / `RangeInclusive` membership → compare ops.
 //!
-//! ## Positioning
+//! `(a..b).contains(&x)` is `a <= x && x < b`; `(a..=b).contains(&x)` is
+//! `a <= x && x <= b`.  Clippy rewrote the interpreter's hand-written
+//! inequalities into those idioms; this pass is the rtyper lowering of
+//! the idiom, not a walker fold.
 //!
-//! `RangeInclusive::new(a, b)` has an Opaque body in the LLBC, so the
-//! front emits a residual `FunctionPath` call whose owner-qualified
-//! segments end `["range", "RangeInclusive", "new"]` — an unregistered
-//! callee the rtyper census Skips, dropping the enclosing graph to the
-//! legacy walker.  `RangeInclusive::contains(&self, &x)` routes as an
-//! owner-qualified `FunctionPath` too (the opaque foreign receiver has no
-//! extracted body to route a `CallTarget::Method` through), ending
-//! `["range", "RangeInclusive", "contains"]` with `args[0]` the
-//! `&RangeInclusive` receiver and `args[1]` the `&x` value.  `new` is the
-//! wall: it is emitted before `contains`, so the translation loop's
-//! failure surfaces on `new` first.
+//! ## Why not extract `core::ops::range`
 //!
-//! Exclusive `Range` (`a..b`) is a struct aggregate, not a `new` call:
-//! `Rvalue::Aggregate(Adt(core::ops::range::Range), [a, b])` lowers as a
-//! `SyntheticTransparentCtor` plus `FieldWrite("start")` / `FieldWrite("end")`.
-//! `Range::contains(&self, &x)` has a struct receiver, so `first_is_self`
-//! routes it as a 2-arg `CallTarget::Method { name: "contains" }`
-//! (receiver `args[0]`, value `args[1]`).  Inclusive `RangeInclusive` is
-//! an opaque foreign ADT, so its `contains` stays the owner-qualified
-//! `FunctionPath` tail `["range", "RangeInclusive", "contains"]`.
+//! Charon leaves `core` Foreign (`front::slice_get` and the other
+//! opaque-std rewrites cite the same wall).  `--include core::ops::range::_`
+//! would make `Range::contains` Transparent, but the body is the generic
+//! `RangeBounds::contains` default that matches on `Bound` and calls
+//! `PartialOrd::{le,lt}`.  Those impls live in `core::cmp`, Charon does
+//! not monomorphize, and the residual would still be an unpublished
+//! `PartialOrd` fnaddr — the same subwalk abort, one call deeper.  The
+//! cascade (iterators, `Bound`, `PartialOrd`) is the explosion that
+//! retires route (a).
 //!
-//! `int_between(n, m, p)` is the predicate `n <= m < p` and assumes
-//! `n <= p`.  `RangeInclusive` is `a <= x <= b`, so the exclusive upper
-//! bound is `b + 1`.  The fold emits `int_between(a, x, b + 1)` only when
-//! both bounds are constants, `a <= b`, and `b != i64::MAX` (then `b + 1`
-//! exists and `a <= b + 1`):
+//! ## Upstream analogue
+//!
+//! RPython has no std `Range` type; `x in c` is `rtyper.py`
+//! [`translate_op_contains`] dispatching to the container repr's
+//! `rtype_contains`.  The inequalities the idiom replaced lower through
+//! `rint.py` [`IntegerRepr::rtype_le`] / `rfloat.py`
+//! [`FloatRepr::rtype_le`] (`_rtype_compare_template` → `int_le` /
+//! `float_le`).  This pass is that dispatch for the std range ADT:
+//! recognize the receiver structurally, emit the same compares.
+//!
+//! [`translate_op_contains`]: rpython/rtyper/rtyper.py
+//! [`IntegerRepr::rtype_le`]: rpython/rtyper/rint.py
+//! [`FloatRepr::rtype_le`]: rpython/rtyper/rfloat.py
+//!
+//! ## Producers
+//!
+//! `RangeInclusive` has private fields, so rustc emits
+//! `RangeInclusive::new(a, b)` — an Opaque FunctionPath the rtyper
+//! census Skips.  Exclusive `Range` has public fields, so `a..b` is an
+//! `Rvalue::Aggregate` the front already emits as
+//! `SyntheticTransparentCtor` + `FieldWrite("start")` / `FieldWrite("end")`
+//! (the same shell `front::range_iter` diverts for `for _ in a..b`).
+//! `contains` is a 2-arg call (`args[0]` the receiver, `args[1]` the
+//! `&x` value).  Exclusive `Range` is a transparent ADT, so
+//! `first_is_self` routes it as `CallTarget::Method` (`receiver_root`
+//! `"Range"`, the same dual as `front::slice_get::is_result_expect_call_target`).
+//! Inclusive `RangeInclusive` stays an owner-qualified FunctionPath
+//! because the foreign ADT has no extracted body.
+//!
+//! ## Compare shape
+//!
+//! `int_between(n, m, p)` is `n <= m < p` and assumes `n <= p`.
+//! Exclusive int with constant bounds and `a <= b` is already that
+//! predicate, so the fold emits `int_between(a, x, b)`.  Inclusive int
+//! needs the successor `b + 1`, and only when both bounds are constants,
+//! `a <= b`, and `b != i64::MAX` (then `b + 1` exists and `a <= b + 1`):
 //!
 //! ```text
 //!     r = RangeInclusive::new(a, b)          // residual `new` call (block N)
@@ -39,64 +63,56 @@
 //!     t     = int_between(a, x, upper)      // a <= x < b + 1
 //! ```
 //!
-//! Exclusive `Range` is already `a <= x < b`, so the same op is
-//! `int_between(a, x, b)` with no successor:
-//!
-//! ```text
-//!     r = Range { start: a, end: b }         // ctor + FieldWrite(start/end)
-//!     ...
-//!     t = r.contains(&x)                     // residual `contains` call
-//! becomes
-//!     t = int_between(a, x, b)               // a <= x < b
-//! ```
-//!
-//! Every other inclusive shape keeps `bitand(le(a, x), ge(b, x))`.  A
-//! non-constant bound cannot prove `a <= b + 1`.  `b == i64::MAX` has no
-//! representable successor, so `b + 1` wraps.  `a > b` is an empty range,
-//! and the wrapping expansion of `int_between` answers true for some `x`
-//! there.  Exclusive shapes that cannot prove `a <= b` keep
-//! `bitand(le(a, x), gt(b, x))` (`a <= x && x < b`).
+//! Every other signed-int shape keeps the two comparisons.  A
+//! non-constant bound cannot prove `a <= b` (exclusive) / `a <= b + 1`
+//! (inclusive).  `b == i64::MAX` has no representable successor on the
+//! inclusive path.  `a > b` is an empty range, and the wrapping
+//! expansion of `int_between` answers true for some `x` there.  Float
+//! ranges always keep `bitand(le, lt|ge)`: there is no float
+//! `int_between`, and `jtransform` rewrites the bare `le`/`lt`/`ge`
+//! leaves to `float_*` from the operand bank.
 //!
 //! ## Cross-block shape
 //!
-//! Each `TermKind::Call` closes its block with a `set_goto`, so `new`
-//! (block N) and `contains` (block C) sit in adjacent blocks, C the
-//! single successor of N's Call edge.  The `new` result rides N → C on a
-//! goto link arg; the front's liveness-forwarding keeps the same
-//! `Variable` identity across the edge (and onward toward the value's
-//! drop), so the `contains` receiver may be that same Variable or a
-//! fresh C inputarg fed positionally from it (framestate SSA).  The fold
-//! traces the receiver back through the single-predecessor link-arg
-//! chain to its `new` site, then threads the bounds `a` / `b` into block
-//! C via [`FunctionGraph::ensure_variable_at_block`] (the same
+//! Each `TermKind::Call` closes its block with a `set_goto`, so a
+//! `new` / aggregate (block N) and `contains` (block C) sit in adjacent
+//! blocks, C the single successor of N's Call (or goto) edge.  The range
+//! result rides N → C on a goto link arg; the front's liveness-forwarding
+//! keeps the same `Variable` identity across the edge (and onward toward
+//! the value's drop), so the `contains` receiver may be that same
+//! Variable or a fresh C inputarg fed positionally from it (framestate
+//! SSA).  The fold traces the receiver back through the single-predecessor
+//! link-arg chain to its producer, then threads the bounds `a` / `b` into
+//! block C via [`FunctionGraph::ensure_variable_at_block`] (the same
 //! single-predecessor carry-through) before splicing the compares.
+//! Exclusive `Range` stores the bounds on the live `FieldWrite` chain
+//! (re-read after `simplify_lowered_graph`, matching `front::range_iter`).
 //!
-//! ## Why `new` must be removed explicitly
+//! ## Why the producer must be removed explicitly
 //!
 //! No sweep reclaims a dead `OpKind::Call { FunctionPath }`: `is_pure_op`
 //! returns `false` for `Call`, so `prune_dead_phis` never removes it, and
 //! `remove_dead_aggregates` only handles `SyntheticTransparentCtor` +
 //! `Box::new_uninit`.  A fold that emits the compares at `contains` and
-//! lets `new` "die" is UNSAFE — the orphaned `new` still walls the graph.
-//! So the fold removes the `new` call op itself; the now-dead threaded
-//! range value / link args are reclaimed by `prune_dead_phis` (the caller
-//! runs it after any rewrite).
+//! lets inclusive `new` "die" is UNSAFE — the orphaned `new` still walls
+//! the graph.  Exclusive `Range` is a `SyntheticTransparentCtor`, which
+//! that sweep *would* reclaim, but the construction `FieldWrite`s still
+//! read the shell; they are removed with the ctor so a later consumer
+//! cannot observe a half-deleted range.  The now-dead threaded range
+//! value / link args are reclaimed by `prune_dead_phis` (the caller runs
+//! it after any rewrite).
 //!
 //! ## Scope + fail-safe
 //!
-//! Int-only (word-sized signed: `I64` / `Isize`, the same element gate as
-//! the `RangeInclusive` capture).  Float ranges (`complex_pow`, the
-//! asin/acos `(-1.0..=1.0)` pins) and the pyre `W_Range` Python object
-//! are out of scope.  Iteration-form ranges (`for i in a..=b` /
-//! `for i in a..b`) are excluded by the consumer-shape gate: an iterator
-//! reads the range a second time (its stateful `exhausted` field, or
-//! `next` on an exclusive `Range`) as an OP operand, so a range value
-//! read by any op other than the single `contains` being folded declines.
-//! Construction `FieldWrite`s of `start`/`end` on an exclusive aggregate
-//! are the ctor, not a second consumer.  Link-arg threading of the range
-//! value is liveness forwarding, not consumption, so it does not count.
-//! Every mismatch declines (leaves BOTH residual calls / the ctor chain,
-//! census Skip) — no regression.
+//! Signed word (`I64` / `Isize`) and `F64` element types.  The pyre
+//! `W_Range` Python object is out of scope.  Iteration-form ranges
+//! (`for i in a..b`) are excluded by the consumer-shape gate: an
+//! iterator reads the range a second time as an OP operand, so a range
+//! value read by any op other than the single `contains` being folded
+//! (and the exclusive-`Range` construction `FieldWrite`s) declines.
+//! Link-arg threading of the range value is liveness forwarding, not
+//! consumption, so it does not count.  Every mismatch declines (leaves
+//! BOTH residual calls / the ctor chain, census Skip) — no regression.
 
 use std::collections::HashSet;
 
@@ -105,58 +121,73 @@ use crate::model::{
     BlockId, CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
-/// A recognized range construction captured during body lowering
-/// (`front::mir`).  Inclusive sites are `RangeInclusive::new(lo, hi)`;
-/// exclusive sites are the `Range { start, end }` aggregate.  Carries the
-/// result var (the range) and the two int bounds so the fold can thread
-/// them into the `contains` block.
-#[derive(Clone)]
-pub(crate) struct RangeInclusiveNewSite {
-    /// The construction result (the range value) — locates the producer
-    /// op and matches the `contains` receiver.
-    pub result_var: Variable,
-    /// Lower bound `a` — `int_between`'s first operand.
-    pub lo: Variable,
-    /// Upper bound `b`.  Inclusive: the op's exclusive limit is `b + 1`.
-    /// Exclusive: `b` is already the exclusive limit.
-    pub hi: Variable,
-    /// `true` for exclusive `Range { start, end }` (`a..b`); `false` for
-    /// inclusive `RangeInclusive::new` (`a..=b`).
-    pub exclusive: bool,
+/// Element bank of a std range the fold can lower.  Signed word matches
+/// `int_between` / `int_le`; `F64` matches `float_le` after jtransform
+/// prefixes the bare compare leaves from the operand bank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RangeElemKind {
+    SignedInt,
+    Float,
 }
 
-/// A recognized `RangeInclusive::contains` (FunctionPath) /
-/// `Range::contains` (Method, or FunctionPath) call site captured during
-/// body lowering (`front::mir`).  Carries the result var (the membership
-/// bool) — the fold reuses it for `int_between`.
+/// A recognized `RangeInclusive::new(lo, hi)` call site captured during
+/// body lowering (`front::mir`).  Carries the result var (the range) and
+/// the two bounds so the fold can thread them into the `contains`
+/// block.
+#[derive(Clone)]
+pub(crate) struct RangeInclusiveNewSite {
+    /// The `new` call result (the `RangeInclusive` value) — locates the
+    /// producer op and matches the `contains` receiver.
+    pub result_var: Variable,
+    /// Lower bound `a` — `int_between`'s first operand, or `le`'s lhs.
+    pub lo: Variable,
+    /// Inclusive upper bound `b`.  The signed-int op's exclusive limit is
+    /// `b + 1`.
+    pub hi: Variable,
+    /// Element bank captured from the destination `RangeInclusive<T>`.
+    pub elem: RangeElemKind,
+}
+
+/// A recognized exclusive `Range { start, end }` aggregate captured
+/// during body lowering (`front::mir`).  Bounds are re-read from the
+/// live `FieldWrite` chain at rewrite time, matching `front::range_iter`.
+#[derive(Clone)]
+pub(crate) struct RangeExclusiveNewSite {
+    /// The `SyntheticTransparentCtor` result (the `Range` value).
+    pub result_var: Variable,
+    /// Element bank captured from the aggregate head's `T`.
+    pub elem: RangeElemKind,
+}
+
+/// A recognized `Range` / `RangeInclusive` `contains(&self, &x)` call
+/// site captured during body lowering (`front::mir`).  Carries the result
+/// var (the membership bool) — the fold reuses it for `int_between` or
+/// the compare pair.
 #[derive(Clone)]
 pub(crate) struct RangeContainsSite {
     /// The `contains` call result (the membership `bool`) — locates the
-    /// producer op; reused as the `bitand` result.
+    /// producer op; reused as the `bitand` / `int_between` result.
     pub result_var: Variable,
 }
 
-/// Rewrite every recorded `(a..=b).contains(&x)` / `(a..b).contains(&x)`
-/// call site into a bounds check.  Inclusive: `int_between(a, x, b + 1)`
-/// when both bounds are constants with `a <= b` and `b != i64::MAX`,
-/// otherwise the two comparisons.  Exclusive: `int_between(a, x, b)` when
-/// both bounds are constants with `a <= b`, otherwise
-/// `bitand(le(a, x), gt(b, x))`.  Fail-safe: a site that does not match
-/// the expected construction → `contains` shape is left untouched (both
-/// residual calls / the ctor chain survive, census Skip).  Returns the
-/// number of sites rewritten.
+/// Rewrite every recorded `(a..b).contains(&x)` / `(a..=b).contains(&x)`
+/// call site into a bounds check.  Fail-safe: a site that does not match
+/// the expected producer → `contains` shape is left untouched (residual
+/// calls / the ctor chain survive, census Skip).  Returns the number of
+/// sites rewritten.
 pub(crate) fn rewire_range_contains_call_sites(
     graph: &mut FunctionGraph,
     new_sites: &[RangeInclusiveNewSite],
+    exclusive_sites: &[RangeExclusiveNewSite],
     contains_sites: &[RangeContainsSite],
 ) -> usize {
     let mut rewritten = 0;
     for site in contains_sites {
-        match rewire_one_range_contains_site(graph, site, new_sites) {
+        match rewire_one_range_contains_site(graph, site, new_sites, exclusive_sites) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
-                // Leave both residual calls; the unregistered `new`
-                // callee keeps the rtyper census Skip for this graph.
+                // Leave both residual calls / the ctor chain; the
+                // unregistered callee keeps the rtyper census Skip.
             }
         }
     }
@@ -167,6 +198,7 @@ fn rewire_one_range_contains_site(
     graph: &mut FunctionGraph,
     site: &RangeContainsSite,
     new_sites: &[RangeInclusiveNewSite],
+    exclusive_sites: &[RangeExclusiveNewSite],
 ) -> Result<(), String> {
     let name = graph.name.clone();
 
@@ -184,33 +216,16 @@ fn rewire_one_range_contains_site(
         .ok_or_else(|| format!("{name}: range contains result var has no producer op"))?;
 
     // 2. The producer must be the 2-arg `contains` call: `args[0]` the
-    //    range receiver, `args[1]` the `&x` value.  Inclusive
-    //    `RangeInclusive` is opaque, so `contains` is an owner-qualified
-    //    `FunctionPath` ending `["range", "RangeInclusive", "contains"]`.
-    //    Exclusive `Range` is a struct, so `first_is_self` routes
-    //    `contains` as `CallTarget::Method`; a FunctionPath spelling
-    //    ending `["range", "Range", "contains"]` is accepted too.
-    let (range_v, x, exclusive_contains) = match &graph.blocks[c_idx].operations[call_idx].kind {
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } if args.len() == 2 => {
-            if segments_end_with(segments, &["range", "RangeInclusive", "contains"]) {
-                (args[0].clone(), args[1].clone(), false)
-            } else if segments_end_with(segments, &["range", "Range", "contains"]) {
-                (args[0].clone(), args[1].clone(), true)
-            } else {
-                return Err(format!(
-                    "{name}: range contains producer op is not the 2-arg `contains` FunctionPath: {segments:?}"
-                ));
-            }
+    //    receiver, `args[1]` the `&x` value.  Transparent `Range` arrives
+    //    as `CallTarget::Method`; opaque `RangeInclusive` as an
+    //    owner-qualified FunctionPath.  Exclusive vs inclusive is read
+    //    from the receiver's producer, not from a helper-name table.
+    let (range_v, x) = match &graph.blocks[c_idx].operations[call_idx].kind {
+        OpKind::Call { target, args, .. }
+            if is_range_contains_call_target(target) && args.len() == 2 =>
+        {
+            (args[0].clone(), args[1].clone())
         }
-        OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } if args.len() == 2 && name == "contains" => (args[0].clone(), args[1].clone(), true),
         other => {
             return Err(format!(
                 "{name}: range contains producer op is not the 2-arg `contains` call: {other:?}"
@@ -218,69 +233,44 @@ fn rewire_one_range_contains_site(
         }
     };
 
-    // 3. Match the construction site whose `result_var` threads to
-    //    block C, with the same inclusive/exclusive polarity as the
-    //    `contains` path.  Inclusive `new` is in block N (a single
-    //    predecessor of C) and its result rides a goto link-arg that
-    //    becomes a C inputarg, so `range_v` (the C-local receiver) is a
-    //    distinct Variable.  Exclusive construction is the same
-    //    threading of the aggregate result.  A site matches when its
-    //    `result_var` is defined in a block reachable from C through
-    //    single-predecessor edges only AND the receiver `range_v` is
-    //    either that same Variable (rare, when identity is preserved) or
-    //    a C inputarg fed exclusively from that definition.  The
-    //    single-consumer gate below is what makes this sound; here we
-    //    only need to pick the producing site.
+    // 3. Match the producer whose `result_var` threads to block C.
+    //    Inclusive `new` and exclusive `Range { start, end }` both ride
+    //    a goto link-arg that becomes a C inputarg, so `range_v` (the
+    //    C-local receiver) is often a distinct Variable.  A site matches
+    //    when its `result_var` is defined in a block reachable from C
+    //    through single-predecessor edges only AND the receiver `range_v`
+    //    is either that same Variable (identity preserved, including
+    //    same-block aggregate + contains) or a C inputarg fed exclusively
+    //    from that definition.
     let c_block = graph.blocks[c_idx].id;
-    let new_site = new_sites
-        .iter()
-        .find(|s| {
-            s.exclusive == exclusive_contains
-                && range_matches_new_site(graph, c_block, &range_v, &s.result_var)
-        })
+    let producer = match_range_producer(graph, c_block, &range_v, new_sites, exclusive_sites)
         .ok_or_else(|| {
-            format!("{name}: range contains receiver traces to no matching construction site")
+            format!("{name}: range contains receiver traces to no Range / RangeInclusive producer")
         })?;
-
-    // Exclusive `Range { start, end }` bounds are re-read from the live
-    // FieldWrite chain: `simplify_lowered_graph` can replace a bound
-    // Variable while updating its consumers, so the captured `lo`/`hi`
-    // may be stale.  Inclusive `new` args stay the captured Variables.
-    let (lo, hi) = if new_site.exclusive {
-        live_range_bounds(graph, &new_site.result_var).ok_or_else(|| {
-            format!(
-                "{name}: exclusive Range construction has no unique live start/end FieldWrite pair"
-            )
-        })?
-    } else {
-        (new_site.lo.clone(), new_site.hi.clone())
-    };
 
     // 4. Consumer-shape gate (excludes iteration-form ranges, whose
     //    range carries a stateful `exhausted` field read a second time by
     //    an iterator's `into_iter` / `next`).  The range value must be
-    //    read as an OP operand by exactly the `contains` op being folded;
-    //    construction FieldWrites of `start`/`end` on an exclusive
-    //    aggregate are the ctor, not a second consumer.  Dead framestate
-    //    `Link.args` forwarding past the `contains` block is reclaimed by
-    //    `prune_dead_phis` and does not count.
-    if !range_value_single_op_consumer(
-        graph,
-        &new_site.result_var,
-        &site.result_var,
-        new_site.exclusive.then_some((&lo, &hi)),
-    ) {
+    //    read as an OP operand by exactly the `contains` op being folded
+    //    (plus exclusive-`Range` construction `FieldWrite`s).  Dead
+    //    framestate `Link.args` forwarding past the `contains` block is
+    //    reclaimed by `prune_dead_phis` and does not count.
+    if !range_value_single_op_consumer(graph, producer.result_var(), &site.result_var) {
         return Err(format!(
             "{name}: range value has a second consumer — declining (iteration form?)"
         ));
     }
+
+    let (lo, hi) = producer
+        .bounds(graph)
+        .ok_or_else(|| format!("{name}: range construction has no unique live start/end bounds"))?;
 
     // 5. Thread `lo` / `hi` into block C as inputargs (single-pred carry-
     //    through).  Decline if either cannot be threaded (orphan / multi-
     //    predecessor block) rather than panicking.
     if !can_thread_to_block(graph, c_block, &lo) || !can_thread_to_block(graph, c_block, &hi) {
         return Err(format!(
-            "{name}: range construction bounds cannot thread to the contains block"
+            "{name}: range bounds cannot thread to the contains block"
         ));
     }
     let Some(lo_in_c) = graph.ensure_variable_at_block_local(c_block, &lo) else {
@@ -302,7 +292,8 @@ fn rewire_one_range_contains_site(
         lo_in_c,
         hi_in_c,
         x.into_variable(),
-        new_site.exclusive,
+        producer.exclusive(),
+        producer.elem(),
     );
     let ops = &mut graph.blocks[c_idx].operations;
     ops.remove(call_idx);
@@ -310,17 +301,104 @@ fn rewire_one_range_contains_site(
         ops.insert(call_idx + offset, op);
     }
 
-    // 7. Remove the now-unread construction.  Inclusive: the residual
-    //    `new` call.  Exclusive: the `start`/`end` FieldWrites then the
-    //    aggregate ctor.  After removal `lo` / `hi` stay live (threaded
-    //    to C); the dead threaded range inputarg / link args are
-    //    reclaimed by `prune_dead_phis`.
-    if new_site.exclusive {
-        remove_range_field_writes(graph, &new_site.result_var);
+    // 7. Remove the now-unread producer.  After removal `lo` / `hi` stay
+    //    live (threaded to C); the dead threaded range inputarg / link
+    //    args are reclaimed by `prune_dead_phis`.
+    let producer_result = producer.result_var().clone();
+    if producer.exclusive() {
+        remove_range_field_writes(graph, &producer_result);
     }
-    remove_op_by_result(graph, &new_site.result_var);
+    remove_op_by_result(graph, &producer_result);
 
     Ok(())
+}
+
+/// Inclusive `new` vs exclusive `Range { start, end }` producer matched
+/// against the `contains` receiver.
+enum RangeProducer<'a> {
+    Inclusive(&'a RangeInclusiveNewSite),
+    Exclusive(&'a RangeExclusiveNewSite),
+}
+
+impl RangeProducer<'_> {
+    fn result_var(&self) -> &Variable {
+        match self {
+            Self::Inclusive(s) => &s.result_var,
+            Self::Exclusive(s) => &s.result_var,
+        }
+    }
+
+    fn elem(&self) -> RangeElemKind {
+        match self {
+            Self::Inclusive(s) => s.elem,
+            Self::Exclusive(s) => s.elem,
+        }
+    }
+
+    fn exclusive(&self) -> bool {
+        matches!(self, Self::Exclusive(_))
+    }
+
+    fn bounds(&self, graph: &FunctionGraph) -> Option<(Variable, Variable)> {
+        match self {
+            Self::Inclusive(s) => Some((s.lo.clone(), s.hi.clone())),
+            Self::Exclusive(s) => crate::front::range_iter::live_range_bounds(graph, &s.result_var),
+        }
+    }
+}
+
+fn match_range_producer<'a>(
+    graph: &FunctionGraph,
+    c_block: BlockId,
+    range_v: &Variable,
+    new_sites: &'a [RangeInclusiveNewSite],
+    exclusive_sites: &'a [RangeExclusiveNewSite],
+) -> Option<RangeProducer<'a>> {
+    if let Some(site) = new_sites
+        .iter()
+        .find(|s| range_matches_new_site(graph, c_block, range_v, &s.result_var))
+    {
+        return Some(RangeProducer::Inclusive(site));
+    }
+    exclusive_sites
+        .iter()
+        .find(|s| range_matches_new_site(graph, c_block, range_v, &s.result_var))
+        .map(RangeProducer::Exclusive)
+}
+
+fn is_contains_leaf(segments: &[String]) -> bool {
+    segments
+        .last()
+        .is_some_and(|leaf| crate::front::clause_spec::unspecialized_leaf(leaf) == "contains")
+}
+
+/// `Range` / `RangeInclusive` `contains(&self, &x)` — the dual
+/// `CallTarget::Method` / `FunctionPath` shape `front::slice_get::is_result_expect_call_target`
+/// uses for `Result::expect`.  Transparent `Range` is Method with
+/// `receiver_root == "Range"`; opaque `RangeInclusive` is a FunctionPath
+/// whose leaf is `contains` (`<Impl>::contains` after Charon's owner
+/// resolution).
+pub(crate) fn is_range_contains_call_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => {
+            name == "contains"
+                && matches!(receiver_root.as_deref(), Some("Range" | "RangeInclusive"))
+        }
+        CallTarget::FunctionPath { segments, .. } => is_contains_leaf(segments),
+        _ => false,
+    }
+}
+
+fn remove_range_field_writes(graph: &mut FunctionGraph, range_result: &Variable) {
+    for block in &mut graph.blocks {
+        block.operations.retain(
+            |op| !matches!(&op.kind, OpKind::FieldWrite { base, .. } if base == range_result),
+        );
+    }
 }
 
 /// `true` when the block-C receiver `range_v` is fed exactly by the
@@ -452,7 +530,6 @@ fn range_value_single_op_consumer(
     graph: &FunctionGraph,
     new_result: &Variable,
     contains_result: &Variable,
-    exclusive_bounds: Option<(&Variable, &Variable)>,
 ) -> bool {
     use std::collections::HashSet;
     // Forward alias closure: every Variable the `new` result reaches
@@ -493,17 +570,15 @@ fn range_value_single_op_consumer(
                 .iter()
                 .any(is_range_value);
             if reads_range && op.result.as_ref() != Some(contains_result) {
-                // Exclusive `Range { start, end }` construction writes
-                // the captured bounds into the aggregate; those
-                // FieldWrites are the ctor, not a second consumer.
-                if exclusive_bounds
-                    .is_some_and(|(lo, hi)| is_ctor_bound_field_write(&op.kind, new_result, lo, hi))
-                {
-                    continue;
+                // Exclusive `Range { start, end }` construction writes the
+                // shell's fields; those ops are removed with the ctor.
+                // Anything else is a genuine second consumer (iteration
+                // form?).
+                let is_construction_write =
+                    matches!(&op.kind, OpKind::FieldWrite { base, .. } if is_range_value(base));
+                if !is_construction_write {
+                    return false;
                 }
-                // Some op other than the `contains` being folded reads
-                // the range value — a second consumer (iteration form?).
-                return false;
             }
         }
         match &block.exitswitch {
@@ -532,95 +607,6 @@ fn range_value_single_op_consumer(
         }
     }
     true
-}
-
-/// Match a `FunctionPath`'s trailing segments against `tail` so a
-/// crate-qualified spelling and the crate-stripped front-end spelling
-/// both resolve — the same contract as `front::mir::fmt_path_ends_with`.
-fn segments_end_with(segments: &[String], tail: &[&str]) -> bool {
-    segments.len() >= tail.len()
-        && segments[segments.len() - tail.len()..]
-            .iter()
-            .zip(tail)
-            .enumerate()
-            .all(|(i, (s, t))| {
-                if i + 1 == tail.len() {
-                    crate::front::clause_spec::unspecialized_leaf(s) == *t
-                } else {
-                    s.as_str() == *t
-                }
-            })
-}
-
-/// `true` when `kind` is a `start`/`end` FieldWrite of the exclusive
-/// `Range` aggregate `range` storing the captured bound.
-fn is_ctor_bound_field_write(
-    kind: &OpKind,
-    range: &Variable,
-    lo: &Variable,
-    hi: &Variable,
-) -> bool {
-    match kind {
-        OpKind::FieldWrite {
-            base,
-            field,
-            value: LinkArg::Value(v),
-            ..
-        } if base == range => {
-            (field.name == "start" && v == lo) || (field.name == "end" && v == hi)
-        }
-        _ => false,
-    }
-}
-
-/// The unique post-simplification `start` / `end` values written into one
-/// exclusive `Range` shell.  A duplicate, missing, or non-variable field
-/// value declines: the rewrite is valid only for the exact two-field Rust
-/// `Range { start, end }` construction shape.
-fn live_range_bounds(
-    graph: &FunctionGraph,
-    range_result: &Variable,
-) -> Option<(Variable, Variable)> {
-    let mut start = None;
-    let mut end = None;
-    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
-        let OpKind::FieldWrite {
-            base,
-            field,
-            value: LinkArg::Value(value),
-            ..
-        } = &op.kind
-        else {
-            continue;
-        };
-        if base != range_result {
-            continue;
-        }
-        let slot = match field.name.as_str() {
-            "start" => &mut start,
-            "end" => &mut end,
-            _ => continue,
-        };
-        if slot.replace(value.clone()).is_some() {
-            return None;
-        }
-    }
-    Some((start?, end?))
-}
-
-/// Drop every `start` / `end` FieldWrite whose base is the exclusive
-/// `Range` aggregate — after the fold the range value is unread, and a
-/// surviving `setattr("start")` would wall on the removed ctor.
-fn remove_range_field_writes(graph: &mut FunctionGraph, range_result: &Variable) {
-    for block in &mut graph.blocks {
-        block.operations.retain(|op| {
-            !matches!(
-                &op.kind,
-                OpKind::FieldWrite { base, field, .. }
-                    if base == range_result && (field.name == "start" || field.name == "end")
-            )
-        });
-    }
 }
 
 /// Remove the (single) op in the graph whose result is `result_var`.
@@ -720,9 +706,10 @@ fn int_between_op(
     }
 }
 
-/// Inclusive `lo <= x <= hi` as `bitand(le(lo, x), ge(hi, x))`; exclusive
-/// `lo <= x < hi` as `bitand(le(lo, x), gt(hi, x))`.
+/// `bitand` of two ordered compares, bound to `result_var`.
 ///
+/// Inclusive membership is `le(lo, x) && ge(hi, x)` (`lo <= x <= hi`).
+/// Exclusive membership is `le(lo, x) && lt(x, hi)` (`lo <= x && x < hi`).
 /// Exact for every pair of bounds, including an empty range (`lo > hi`)
 /// and `hi == i64::MAX`.
 fn build_range_contains_compare_pair(
@@ -735,14 +722,18 @@ fn build_range_contains_compare_pair(
 ) -> Vec<SpaceOperation> {
     let lo_le = graph.alloc_value_var();
     let hi_cmp = graph.alloc_value_var();
-    let hi_op = if exclusive { "gt" } else { "ge" };
+    let (hi_op, hi_lhs, hi_rhs) = if exclusive {
+        ("lt", x.clone(), hi)
+    } else {
+        ("ge", hi, x.clone())
+    };
     vec![
         SpaceOperation {
             result: Some(lo_le.clone()),
             kind: OpKind::BinOp {
                 op: "le".to_string(),
                 lhs: lo,
-                rhs: x.clone(),
+                rhs: x,
                 result_ty: ValueType::Int,
             },
         },
@@ -750,8 +741,8 @@ fn build_range_contains_compare_pair(
             result: Some(hi_cmp.clone()),
             kind: OpKind::BinOp {
                 op: hi_op.to_string(),
-                lhs: hi,
-                rhs: x,
+                lhs: hi_lhs,
+                rhs: hi_rhs,
                 result_ty: ValueType::Int,
             },
         },
@@ -770,13 +761,13 @@ fn build_range_contains_compare_pair(
 /// Replace `contains` with `int_between` when that op's contract holds,
 /// and with the compare pair otherwise.
 ///
-/// `int_between(n, m, p)` is `n <= m < p` and requires `n <= p`.  Inclusive
-/// `hi` therefore needs a successor `upper = hi + 1`, and the requirement
-/// is `lo <= upper`.  Both hold for constants precisely when `lo <= hi`
-/// and `hi + 1` does not wrap.  That successor is materialised as
-/// `ConstInt(hi + 1)`.  Exclusive `hi` is already the exclusive limit, so
-/// the op is `int_between(lo, x, hi)` when both bounds are constants and
-/// `lo <= hi`.
+/// `int_between(n, m, p)` is `n <= m < p` and requires `n <= p`.
+/// Exclusive signed-int membership is already that predicate (`p = hi`).
+/// Inclusive signed-int membership needs a successor `upper = hi + 1`.
+/// Both hold for constants precisely when `lo <= hi` and, on the
+/// inclusive path, `hi + 1` does not wrap.  Float ranges have no
+/// `int_between`; they always keep the two comparisons (`float_le` /
+/// `float_lt` after jtransform prefixes the bare leaves).
 fn build_range_contains_compares(
     graph: &mut FunctionGraph,
     result_var: &Variable,
@@ -784,41 +775,41 @@ fn build_range_contains_compares(
     hi: Variable,
     x: Variable,
     exclusive: bool,
+    elem: RangeElemKind,
 ) -> Vec<SpaceOperation> {
-    let exclusive_upper = match (const_int_of(graph, &lo), const_int_of(graph, &hi)) {
-        (Some(lo_value), Some(hi_value)) if lo_value <= hi_value => {
-            if exclusive {
-                Some(hi_value)
-            } else {
-                // Inclusive: `int_between` only when `hi + 1` fits.
-                // `checked_add` is `None` exactly for `hi == i64::MAX`.
-                hi_value.checked_add(1)
-            }
-        }
+    if elem == RangeElemKind::Float {
+        return build_range_contains_compare_pair(graph, result_var, lo, hi, x, exclusive);
+    }
+    let const_bounds = match (const_int_of(graph, &lo), const_int_of(graph, &hi)) {
+        (Some(lo_value), Some(hi_value)) if lo_value <= hi_value => Some(hi_value),
         _ => None,
     };
-    match exclusive_upper {
-        Some(upper) => {
-            let upper_v = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-            vec![
-                SpaceOperation {
-                    result: Some(upper_v.clone()),
-                    kind: OpKind::ConstInt(upper),
-                },
-                int_between_op(result_var, lo, x, upper_v),
-            ]
-        }
+    match (exclusive, const_bounds) {
+        (true, Some(_)) => vec![int_between_op(result_var, lo, x, hi)],
+        (false, Some(hi_value)) => match hi_value.checked_add(1) {
+            Some(upper) => {
+                let upper_v = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                vec![
+                    SpaceOperation {
+                        result: Some(upper_v.clone()),
+                        kind: OpKind::ConstInt(upper),
+                    },
+                    int_between_op(result_var, lo, x, upper_v),
+                ]
+            }
+            None => build_range_contains_compare_pair(graph, result_var, lo, hi, x, false),
+        },
         // Keep the compare pair for every shape that cannot prove
         // `lo <= upper`: a non-constant `lo`, a non-constant `hi`,
         // `lo > hi`, and inclusive `hi == i64::MAX`.  `int_between`
-        // requires `lo <= upper`.  A non-constant bound cannot establish
-        // it, and `lo > hi` is an empty range — the wrapping `int_sub` +
-        // `uint_lt` expansion answers true for some `x` (for example
-        // `(10..=5)` against `10`).  Inclusive `hi == i64::MAX` has no
-        // representable successor, so `hi + 1` wraps.  The two
-        // comparisons are exact for every one of these shapes, including
-        // an empty range.
-        None => build_range_contains_compare_pair(graph, result_var, lo, hi, x, exclusive),
+        // requires `lo <= upper`.  A non-constant bound cannot
+        // establish it, and `lo > hi` is an empty range — the wrapping
+        // `int_sub` + `uint_lt` expansion answers true for some `x`
+        // (for example `(10..=5)` against `10`).  Inclusive
+        // `hi == i64::MAX` has no representable successor, so `hi + 1`
+        // wraps.  The two comparisons are exact for every one of these
+        // shapes, including an empty range.
+        _ => build_range_contains_compare_pair(graph, result_var, lo, hi, x, exclusive),
     }
 }
 
@@ -846,52 +837,20 @@ mod tests {
         }
     }
 
-    fn exclusive_ctor_target() -> CallTarget {
+    fn exclusive_contains_target() -> CallTarget {
+        // Live exclusive `Range` is a transparent ADT, so `first_is_self`
+        // emits `CallTarget::Method` (`__majit_wrap_math_isqrt`).
+        CallTarget::method("contains", Some("Range".into()))
+    }
+
+    fn range_ctor_target() -> CallTarget {
         CallTarget::synthetic_transparent_ctor_with_owner(
             vec!["core".to_string(), "ops".to_string(), "range".to_string()],
             "Range".to_string(),
         )
     }
 
-    fn exclusive_contains_target() -> CallTarget {
-        // Real exclusive `Range::contains` is `CallTarget::Method` because
-        // the receiver is a struct ADT (`first_is_self`).
-        CallTarget::Method {
-            name: "contains".to_string(),
-            receiver_root: Some("Range".into()),
-            resolved_path: None,
-            fun_decl_id: None,
-            branch_payloads: None,
-        }
-    }
-
-    fn exclusive_contains_functionpath_target() -> CallTarget {
-        CallTarget::FunctionPath {
-            segments: ["core", "ops", "range", "Range", "contains"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            fun_decl_id: None,
-        }
-    }
-
-    fn count_contains_methods(g: &FunctionGraph) -> usize {
-        g.blocks
-            .iter()
-            .flat_map(|blk| &blk.operations)
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::Method { name, .. },
-                        ..
-                    } if name == "contains"
-                )
-            })
-            .count()
-    }
-
-    fn exclusive_field_write(base: &Variable, name: &str, value: &Variable) -> OpKind {
+    fn field_write(base: &Variable, name: &str, value: &Variable) -> OpKind {
         OpKind::FieldWrite {
             base: base.clone(),
             field: crate::model::FieldDescriptor {
@@ -911,76 +870,44 @@ mod tests {
         }
     }
 
-    fn count_range_ctors(g: &FunctionGraph) -> usize {
+    fn rewrite_inc(
+        g: &mut FunctionGraph,
+        new_sites: &[RangeInclusiveNewSite],
+        contains_sites: &[RangeContainsSite],
+    ) -> usize {
+        rewire_range_contains_call_sites(g, new_sites, &[], contains_sites)
+    }
+
+    /// Match a `FunctionPath`'s trailing segments against `tail` so a
+    /// crate-qualified spelling and the crate-stripped front-end spelling
+    /// both resolve — the same contract as `front::mir::fmt_path_ends_with`.
+    fn segments_end_with(segments: &[String], tail: &[&str]) -> bool {
+        segments.len() >= tail.len()
+            && segments[segments.len() - tail.len()..]
+                .iter()
+                .zip(tail)
+                .enumerate()
+                .all(|(i, (s, t))| {
+                    if i + 1 == tail.len() {
+                        crate::front::clause_spec::unspecialized_leaf(s) == *t
+                    } else {
+                        s.as_str() == *t
+                    }
+                })
+    }
+
+    fn contains_calls(g: &FunctionGraph) -> usize {
         g.blocks
             .iter()
             .flat_map(|blk| &blk.operations)
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor { .. },
-                        ..
-                    }
+                    OpKind::Call { target, args, .. }
+                        if args.len() == 2 && is_range_contains_call_target(target)
                 )
             })
             .count()
-    }
-
-    /// Exclusive `Range { start, end }` in block N, `contains` in block C.
-    fn exclusive_new_contains_graph(
-        name: &str,
-        lo: i64,
-        hi: i64,
-        x_val: i64,
-    ) -> (
-        FunctionGraph,
-        Variable,
-        Variable,
-        Variable,
-        Variable,
-        Variable,
-    ) {
-        let mut g = FunctionGraph::new(name);
-        let n = g.startblock;
-        let a = g.push_op_var(n, OpKind::ConstInt(lo), true).unwrap();
-        let b = g.push_op_var(n, OpKind::ConstInt(hi), true).unwrap();
-        let range = g
-            .push_op_var(
-                n,
-                OpKind::Call {
-                    target: exclusive_ctor_target(),
-                    args: Vec::new(),
-                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
-                },
-                true,
-            )
-            .unwrap();
-        g.block_mut(n).operations.push(SpaceOperation {
-            result: None,
-            kind: exclusive_field_write(&range, "start", &a),
-        });
-        g.block_mut(n).operations.push(SpaceOperation {
-            result: None,
-            kind: exclusive_field_write(&range, "end", &b),
-        });
-        let (c, c_args) = g.create_block_with_arg_vars(1);
-        let range_in_c = c_args[0].clone();
-        let x = g.push_op_var(c, OpKind::ConstInt(x_val), true).unwrap();
-        let contains = g
-            .push_op_var(
-                c,
-                OpKind::Call {
-                    target: exclusive_contains_target(),
-                    args: crate::model::call_args(vec![range_in_c, x.clone()]),
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        g.set_return(c, Some(contains.clone()));
-        g.set_goto(n, c, vec![range.clone()]);
-        (g, range, a, b, x, contains)
     }
 
     /// Count `FunctionPath` calls whose segments end with `tail`.
@@ -1143,13 +1070,13 @@ mod tests {
         g.set_return(c, Some(contains.clone()));
         g.set_goto(n, c, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range.clone(),
                 lo: a.clone(),
                 hi: b.clone(),
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains.clone(),
@@ -1217,13 +1144,13 @@ mod tests {
         g.set_return(c, Some(contains.clone()));
         g.set_goto(n, c, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range.clone(),
                 lo: a,
                 hi: b,
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains,
@@ -1298,13 +1225,13 @@ mod tests {
         g.set_goto(m, s, vec![range_in_m]);
         g.set_goto(n, m, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range,
                 lo: a,
                 hi: b,
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains,
@@ -1359,13 +1286,13 @@ mod tests {
         g.set_return(c, Some(result.clone()));
         g.set_goto(n, c, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range,
                 lo: a,
                 hi: b,
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite { result_var: result }],
         );
@@ -1444,13 +1371,13 @@ mod tests {
         g.set_goto(c, s, vec![range_in_c.clone(), contains.clone()]);
         g.set_goto(n, c, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range,
                 lo: a.clone(),
                 hi: b,
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains.clone(),
@@ -1509,13 +1436,13 @@ mod tests {
         g.set_return(c, Some(contains.clone()));
         g.set_goto(n, c, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range,
                 lo: a,
                 hi: b,
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains.clone(),
@@ -1578,13 +1505,13 @@ mod tests {
         g.set_return(c, Some(contains.clone()));
         g.set_goto(n, c, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range,
                 lo: a.clone(),
                 hi: b.clone(),
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains.clone(),
@@ -1637,13 +1564,13 @@ mod tests {
         g.set_return(c, Some(contains.clone()));
         g.set_goto(n, c, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range,
                 lo: a.clone(),
                 hi: b.clone(),
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains.clone(),
@@ -1707,13 +1634,13 @@ mod tests {
         g.set_return(c, Some(contains.clone()));
         g.set_goto(n, c, vec![range.clone()]);
 
-        let rewritten = rewire_range_contains_call_sites(
+        let rewritten = rewrite_inc(
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range,
                 lo: a.clone(),
                 hi: b.clone(),
-                exclusive: false,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains.clone(),
@@ -1730,20 +1657,81 @@ mod tests {
         let _ = (a, b, x);
     }
 
-    /// `(1..1<<53).contains(&n)` — the isqrt gateway shape — folds to
-    /// `int_between(1, n, 1<<53)` and drops the ctor + FieldWrites +
-    /// residual `Range::contains`.
+    fn count_range_ctors(g: &FunctionGraph) -> usize {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { .. },
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    fn count_field_writes(g: &FunctionGraph) -> usize {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| matches!(&op.kind, OpKind::FieldWrite { .. }))
+            .count()
+    }
+
+    /// Exclusive `(0..10).contains(&x)` is already `0 <= x < 10`, so the
+    /// fold emits `int_between(lo, x, hi)` (no `hi + 1`) and drops the
+    /// `Range { start, end }` ctor + FieldWrites.
     #[test]
-    fn rewrite_folds_exclusive_range_contains_to_int_between() {
-        let (mut g, range, a, b, x, contains) =
-            exclusive_new_contains_graph("test_exclusive_range_contains", 1, 1 << 53, 42);
+    fn rewrite_folds_exclusive_int_range_to_int_between() {
+        let mut g = FunctionGraph::new("test_range_contains_exclusive");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: range_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "start", &a),
+        });
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "end", &b),
+        });
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let range_in_c = c_args[0].clone();
+        let x = g.push_op_var(c, OpKind::ConstInt(4), true).unwrap();
+        let contains = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: exclusive_contains_target(),
+                    args: crate::model::call_args(vec![range_in_c, x.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(c, Some(contains.clone()));
+        g.set_goto(n, c, vec![range.clone()]);
+
         let rewritten = rewire_range_contains_call_sites(
             &mut g,
-            &[RangeInclusiveNewSite {
+            &[],
+            &[RangeExclusiveNewSite {
                 result_var: range,
-                lo: a.clone(),
-                hi: b.clone(),
-                exclusive: true,
+                elem: RangeElemKind::SignedInt,
             }],
             &[RangeContainsSite {
                 result_var: contains.clone(),
@@ -1753,99 +1741,46 @@ mod tests {
             rewritten, 1,
             "the exclusive contains site must be rewritten"
         );
-        assert_eq!(count_range_ctors(&g), 0, "exclusive Range ctor removed");
-        assert_eq!(
-            count_contains_methods(&g),
-            0,
-            "residual exclusive contains removed",
-        );
-        assert_int_between(&g, &contains, &a, &x, 1 << 53);
-        let _ = b;
+        assert_eq!(count_range_ctors(&g), 0, "Range ctor removed");
+        assert_eq!(count_field_writes(&g), 0, "start/end FieldWrites removed");
+        assert_eq!(contains_calls(&g), 0, "residual contains removed");
+        assert_int_between(&g, &contains, &a, &x, 10);
     }
 
-    /// FunctionPath `["range", "Range", "contains"]` is the same exclusive
-    /// fold as `CallTarget::Method` — accepted when a site residualises
-    /// without the Method hint.
+    /// Inclusive float `(-1.0..=1.0).contains(&x)` has no `int_between`;
+    /// it keeps `bitand(le, ge)` so jtransform can prefix `float_le` /
+    /// `float_ge` from the operand bank.
     #[test]
-    fn rewrite_folds_exclusive_functionpath_contains() {
-        let (mut g, range, a, b, x, contains) =
-            exclusive_new_contains_graph("test_exclusive_functionpath_contains", 1, 1 << 53, 42);
-        // Replace the Method contains the helper emitted with the
-        // FunctionPath spelling.
-        for block in &mut g.blocks {
-            for op in &mut block.operations {
-                if let OpKind::Call { target, .. } = &mut op.kind
-                    && matches!(target, CallTarget::Method { name, .. } if name == "contains")
-                {
-                    *target = exclusive_contains_functionpath_target();
-                }
-            }
-        }
-        let rewritten = rewire_range_contains_call_sites(
-            &mut g,
-            &[RangeInclusiveNewSite {
-                result_var: range,
-                lo: a.clone(),
-                hi: b.clone(),
-                exclusive: true,
-            }],
-            &[RangeContainsSite {
-                result_var: contains.clone(),
-            }],
-        );
-        assert_eq!(rewritten, 1);
-        assert_eq!(
-            functionpath_calls_ending(&g, &["range", "Range", "contains"]),
-            0
-        );
-        assert_int_between(&g, &contains, &a, &x, 1 << 53);
-        let _ = b;
-    }
-
-    /// A second consumer of the exclusive range result declines the fold
-    /// and leaves the ctor + contains residuals.
-    #[test]
-    fn rewrite_declines_exclusive_when_range_has_second_consumer() {
-        let mut g = FunctionGraph::new("test_exclusive_range_second_consumer");
+    fn rewrite_folds_inclusive_float_range_to_compares() {
+        let mut g = FunctionGraph::new("test_range_contains_float");
         let n = g.startblock;
-        let a = g.push_op_var(n, OpKind::ConstInt(1), true).unwrap();
-        let b = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let a = g
+            .push_op_var(n, OpKind::ConstFloat((-1.0f64).to_bits()), true)
+            .unwrap();
+        let b = g
+            .push_op_var(n, OpKind::ConstFloat(1.0f64.to_bits()), true)
+            .unwrap();
         let range = g
             .push_op_var(
                 n,
                 OpKind::Call {
-                    target: exclusive_ctor_target(),
-                    args: Vec::new(),
-                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
+                    target: new_target(),
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
+                    result_ty: ValueType::Ref(Some("RangeInclusive".into())),
                 },
                 true,
             )
             .unwrap();
-        g.block_mut(n).operations.push(SpaceOperation {
-            result: None,
-            kind: exclusive_field_write(&range, "start", &a),
-        });
-        g.block_mut(n).operations.push(SpaceOperation {
-            result: None,
-            kind: exclusive_field_write(&range, "end", &b),
-        });
-        let _second = g.push_op_var(
-            n,
-            OpKind::UnaryOp {
-                op: "invert".to_string(),
-                operand: range.clone(),
-                result_ty: ValueType::Ref(None),
-            },
-            true,
-        );
         let (c, c_args) = g.create_block_with_arg_vars(1);
         let range_in_c = c_args[0].clone();
-        let x = g.push_op_var(c, OpKind::ConstInt(42), true).unwrap();
+        let x = g
+            .push_op_var(c, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
         let contains = g
             .push_op_var(
                 c,
                 OpKind::Call {
-                    target: exclusive_contains_target(),
+                    target: contains_target(),
                     args: crate::model::call_args(vec![range_in_c, x]),
                     result_ty: ValueType::Int,
                 },
@@ -1861,100 +1796,30 @@ mod tests {
                 result_var: range,
                 lo: a,
                 hi: b,
-                exclusive: true,
+                elem: RangeElemKind::Float,
             }],
-            &[RangeContainsSite {
-                result_var: contains,
-            }],
-        );
-        assert_eq!(rewritten, 0, "a second range consumer declines the fold");
-        assert_eq!(count_range_ctors(&g), 1, "exclusive Range ctor survives");
-        assert_eq!(
-            count_contains_methods(&g),
-            1,
-            "residual exclusive contains survives",
-        );
-    }
-
-    /// Constant exclusive bounds with `lo > hi` (`10..5`) are an empty
-    /// range.  `int_between` assumes `lo <= upper`; keep `le` + `gt`.
-    #[test]
-    fn rewrite_keeps_compares_when_exclusive_lo_exceeds_hi() {
-        let (mut g, range, a, b, x, contains) =
-            exclusive_new_contains_graph("test_exclusive_range_empty", 10, 5, 10);
-        let rewritten = rewire_range_contains_call_sites(
-            &mut g,
-            &[RangeInclusiveNewSite {
-                result_var: range,
-                lo: a,
-                hi: b,
-                exclusive: true,
-            }],
+            &[],
             &[RangeContainsSite {
                 result_var: contains.clone(),
             }],
         );
-        assert_eq!(rewritten, 1, "an empty exclusive range still folds");
+        assert_eq!(rewritten, 1, "the float contains site must be rewritten");
+        assert_eq!(
+            functionpath_calls_ending(&g, &["range", "RangeInclusive", "new"]),
+            0,
+            "residual new removed",
+        );
+        assert_eq!(
+            functionpath_calls_ending(&g, &["range", "RangeInclusive", "contains"]),
+            0,
+            "residual contains removed",
+        );
         assert!(
             int_between_ops(&g).is_empty(),
-            "lo > hi must not become int_between"
+            "float range must not become int_between"
         );
         assert_eq!(binop_results(&g, "le").len(), 1);
-        assert_eq!(binop_results(&g, "gt").len(), 1);
+        assert_eq!(binop_results(&g, "ge").len(), 1);
         assert_eq!(binop_results(&g, "bitand"), vec![contains]);
-        let _ = x;
-    }
-
-    /// Exclusive `contains` with only an inclusive `new` site declines
-    /// (polarity mismatch) — the float-range capture gate never records
-    /// an exclusive site, so a leftover `Range::contains` stays residual.
-    #[test]
-    fn rewrite_declines_exclusive_contains_without_exclusive_ctor() {
-        let (mut g, range, a, b, _x, contains) =
-            exclusive_new_contains_graph("test_exclusive_float_decline", 0, 1, 0);
-        let rewritten = rewire_range_contains_call_sites(
-            &mut g,
-            &[RangeInclusiveNewSite {
-                result_var: range,
-                lo: a,
-                hi: b,
-                exclusive: false,
-            }],
-            &[RangeContainsSite {
-                result_var: contains,
-            }],
-        );
-        assert_eq!(
-            rewritten, 0,
-            "exclusive contains does not pair with an inclusive new site"
-        );
-        assert_eq!(count_range_ctors(&g), 1, "exclusive Range ctor survives");
-        assert_eq!(
-            count_contains_methods(&g),
-            1,
-            "residual exclusive contains survives",
-        );
-    }
-
-    /// Exclusive `hi == i64::MAX` is already the exclusive limit, so
-    /// `int_between(lo, x, MAX)` is well-defined (no successor).
-    #[test]
-    fn rewrite_exclusive_i64_max_hi_uses_int_between() {
-        let (mut g, range, a, b, x, contains) =
-            exclusive_new_contains_graph("test_exclusive_range_max", 0, i64::MAX, 42);
-        let rewritten = rewire_range_contains_call_sites(
-            &mut g,
-            &[RangeInclusiveNewSite {
-                result_var: range,
-                lo: a.clone(),
-                hi: b,
-                exclusive: true,
-            }],
-            &[RangeContainsSite {
-                result_var: contains.clone(),
-            }],
-        );
-        assert_eq!(rewritten, 1);
-        assert_int_between(&g, &contains, &a, &x, i64::MAX);
     }
 }
