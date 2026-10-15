@@ -5857,6 +5857,8 @@ mod pack_varargs_tests {
         // Hides the nursery hook and the collector singleton's alloc path
         // from every other test thread for the whole body.
         let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _signal_lock =
+            crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         let code = star_code();
         assert!(code.flags.contains(crate::CodeFlags::VARARGS));
         assert!(!code.flags.contains(crate::CodeFlags::VARKEYWORDS));
@@ -5909,6 +5911,8 @@ mod pack_varargs_tests {
         // Same installer lock as the nursery-hook test. The string type id
         // and the stable hook stay invisible to every other thread.
         let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _signal_lock =
+            crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         let module = crate::compile_exec("def f(a, *, b=1, c=2):\n    pass\n")
             .expect("kwonly function should compile");
         let code = module
@@ -6019,6 +6023,8 @@ mod pack_varargs_tests {
     #[test]
     fn resolve_kwargs_moves_the_young_kwargs_dict_across_empty_storage_alloc() {
         let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _signal_lock =
+            crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         let module =
             crate::compile_exec("def f(**kw):\n    pass\n").expect("varkw function should compile");
         let code = module

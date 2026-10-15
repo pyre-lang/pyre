@@ -64,6 +64,41 @@ struct HeapDumpWriter {
 // value for those cases so every heap-dump failure still carries an error code.
 pub const HEAP_DUMP_EIO: i32 = 5;
 
+/// Test-only lock serializing intern / young-drain / sweep of the process-wide
+/// `const_ptr_table` against a per-test MiniMarkGC. Production has one GC per
+/// process; the harness runs MiniMark tests in parallel, so a rewrite test's
+/// interned sentinel can land in another test's young-root walk or be swept
+/// by another test's major. A collection takes this lock for the step that
+/// drains, traces, or sweeps the table; a test that interned a ConstPtr takes
+/// it for its whole body. Reentrant so a test that already holds it can still
+/// collect. Compiled out in production: intern vs collection is serialized by
+/// the collection-step exclusion (`gc_op` / GIL).
+#[cfg(test)]
+static CONST_PTR_TABLE_TEST_LOCK: parking_lot::ReentrantMutex<()> =
+    parking_lot::ReentrantMutex::new(());
+
+/// Hold [`CONST_PTR_TABLE_TEST_LOCK`] for a test that interns a ConstPtr.
+/// Drop drains the young list with a no-op visitor so this test's fake
+/// addresses never reach a later collection as young roots.
+#[cfg(test)]
+pub(crate) fn const_ptr_table_test_guard() -> ConstPtrTableTestGuard {
+    ConstPtrTableTestGuard {
+        _lock: CONST_PTR_TABLE_TEST_LOCK.lock(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ConstPtrTableTestGuard {
+    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ConstPtrTableTestGuard {
+    fn drop(&mut self) {
+        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |_| {});
+    }
+}
+
 impl HeapDumpWriter {
     const BUFSIZE: usize = 8192;
 
@@ -3386,6 +3421,11 @@ impl MiniMarkGC {
     /// or rawrefcount callback refills the nursery after the first collection,
     /// upstream performs one more bare `_minor_collection()` before retrying.
     fn minor_collection_body(&mut self) {
+        // In test builds, hold the intern-table lock across this MiniMark's
+        // young-const-ptr drain and the debug walk that traces it. Compiles
+        // out in production.
+        #[cfg(test)]
+        let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
         let start = GcClock::start();
         let walk_all_mutators = crate::gc_sync::mutators_quiesced();
         if crate::majit_log_enabled() {
@@ -6087,6 +6127,10 @@ impl MiniMarkGC {
     /// walker that produced it, so a root carrying a freed address can be
     /// attributed to its source rather than to the marking loop that pops it.
     fn enumerate_labeled_root_walker_values(&self) -> Vec<(GcRef, &'static str)> {
+        // In test builds, serialize the young-const-ptr trace against intern
+        // tests. Compiles out in production.
+        #[cfg(test)]
+        let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
         // incminimark.py collect_roots: root_walker.walk_roots()
         // walks the same root sets as minor collection.
         let mut result = Vec::with_capacity(self.root_snapshot_capacity.get());
@@ -6150,6 +6194,11 @@ impl MiniMarkGC {
     }
 
     fn seed_major_roots(&mut self) {
+        // In test builds, hold the intern-table lock across this MiniMark's
+        // major-live generation and the young-const-ptr seed. Compiles out
+        // in production.
+        #[cfg(test)]
+        let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
         // `history.py` `ConstPtr` dies with its last holder. Open a
         // live generation so `trace_index` stamps the slots extra-root
         // walkers still hold; `finish_incremental_marking` frees the rest.
@@ -6845,6 +6894,10 @@ impl MiniMarkGC {
             crate::shadow_stack::walk_extra_roots(|gcref| {
                 self.seed_major_extra_root(*gcref, "rescan_extra_root");
             });
+            // In test builds, serialize the rescan young-const-ptr trace
+            // against intern tests. Compiles out in production.
+            #[cfg(test)]
+            let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
             majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
                 self.seed_major_extra_root(*gcref, "rescan_young_const_ptrs");
             });
@@ -8467,6 +8520,11 @@ impl MiniMarkGC {
         // Drain intern-during-mark first so those slots stamp `live` and
         // forward; a slot no holder marked is then dead, matching
         // `history.py` dropping the box when no trace, descr, or op holds it.
+        // In test builds, hold the intern-table lock across this drain and
+        // sweep so a rewrite test's slot is not freed mid-use. Compiles out
+        // in production.
+        #[cfg(test)]
+        let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
         majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
             self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
         });

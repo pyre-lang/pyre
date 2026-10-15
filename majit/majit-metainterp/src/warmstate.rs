@@ -1739,9 +1739,13 @@ impl WarmEnterState {
     /// decision -- nothing may route on it.
     #[cfg(feature = "__yield-stage-probe")]
     pub fn probe_cell_token_upgrades(&self, cell_key: u64) -> bool {
-        self.cell_by_key(cell_key)
-            .and_then(|cell| cell.loop_token.borrow().as_ref())
-            .is_some_and(|weak| weak.upgrade().is_some())
+        self.cell_by_key(cell_key).is_some_and(|cell| {
+            cell.loop_token
+                .borrow()
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .is_some()
+        })
     }
 
     /// `warmstate.py` — resolve the cell by `comparekey`, then read its

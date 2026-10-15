@@ -4772,8 +4772,8 @@ mod tests {
     #[test]
     fn walking_the_memo_forwards_its_ref_consts_and_rekeys_the_cache() {
         let mut memo = super::ResumeDataLoopMemo::new();
-        let before = 0x1000i64;
-        let after = 0x2000i64;
+        let before = 0x9B_0000_1000i64;
+        let after = 0x9B_0000_2000i64;
         let tagged = memo.getconst_ref(before).expect("pool the ref const");
         assert_eq!(
             memo.getconst_ref(before).unwrap(),
@@ -7267,14 +7267,47 @@ impl<'a> ResumeDataDirectReader<'a> {
                 pf.value_tagged,
                 descr,
             );
-            // resume.py: struct = self.decode_ref(num)
-            let struct_ptr = self.decode_ref(pf.target_tagged);
-
+            // Decode the value first so materializing a virtual value can
+            // collect before we capture the target pointer. resume.py
+            // ResumeDataDirectReader._prepare_pendingfields does
+            // `struct = self.decode_ref(num)` then `setfield`/`setarrayitem`;
+            // every ref is GC-tracked so ordering does not matter. Re-read
+            // the target from its rooted slot (`virtuals_cache.get_ptr` /
+            // TAGBOX deadframe) after the value is resolved — the same
+            // re-read `abstract_virtual_struct_info_setfields` does after
+            // `decode_field_source`. `setfield`/`setarrayitem` then
+            // decode the value again from that rooted slot.
             if pf.item_index < 0 {
                 let _ = field_info; // setfield dispatcher reads descr directly.
+                let fd = descr.as_field_descr().expect(
+                    "resume.py `_prepare_pendingfields`: setfield pending field \
+                     must carry a FieldDescr",
+                );
+                if fd.field_type() == majit_ir::Type::Ref {
+                    let _ = self.decode_ref(pf.value_tagged);
+                } else if fd.is_float_field() {
+                    let _ = self.decode_float(pf.value_tagged);
+                } else {
+                    let _ = self.decode_int(pf.value_tagged);
+                }
+                // resume.py: struct = self.decode_ref(num)
+                let struct_ptr = self.decode_ref(pf.target_tagged);
                 // resume.py: self.setfield(struct, fieldnum, descr)
                 self.setfield(struct_ptr, pf.value_tagged, descr);
             } else {
+                let ad = descr.as_array_descr().expect(
+                    "resume.py `_prepare_pendingfields`: setarrayitem pending \
+                     field must carry an ArrayDescr",
+                );
+                if ad.is_array_of_pointers() {
+                    let _ = self.decode_ref(pf.value_tagged);
+                } else if ad.is_array_of_floats() {
+                    let _ = self.decode_float(pf.value_tagged);
+                } else {
+                    let _ = self.decode_int(pf.value_tagged);
+                }
+                // resume.py: struct = self.decode_ref(num)
+                let struct_ptr = self.decode_ref(pf.target_tagged);
                 // resume.py: self.setarrayitem(struct, itemindex,
                 //                  fieldnum, descr).
                 let index = pf.item_index as usize;
@@ -8710,6 +8743,172 @@ mod setfields_tests {
         vinfo.allocate(&mut reader, 0, &alloc);
         assert_eq!(*alloc.refs.borrow(), vec![0x7777]);
         assert_eq!(*alloc.ints.borrow(), vec![13]);
+    }
+}
+
+#[cfg(test)]
+mod pendingfields_tests {
+    use super::*;
+    use majit_backend::FailArgSource;
+    use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+    use majit_ir::{FieldDescrInfo, Type};
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
+    const FROM_SPACE: i64 = 0x1000;
+    const TO_SPACE: i64 = 0x2000;
+    const FIRST_ALLOC: i64 = 0x3000;
+
+    /// Allocates a new object and simulates a minor collection that
+    /// forwards `FROM_SPACE` to `TO_SPACE` on every resume ref root.
+    struct MovingAllocator {
+        next: Cell<i64>,
+        stores: RefCell<Vec<(i64, i64)>>,
+    }
+
+    impl Default for MovingAllocator {
+        fn default() -> Self {
+            Self {
+                next: Cell::new(FIRST_ALLOC),
+                stores: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BlackholeAllocator for MovingAllocator {
+        fn allocate_with_vtable(&self, _descr: &majit_ir::DescrRef, _vtable: usize) -> i64 {
+            majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
+                if root.0 == FROM_SPACE as usize {
+                    root.0 = TO_SPACE as usize;
+                }
+            });
+            let ptr = self.next.get();
+            self.next.set(ptr + 0x10);
+            ptr
+        }
+        fn bh_new(&self, descr: &majit_ir::DescrRef) -> i64 {
+            self.allocate_with_vtable(descr, 0)
+        }
+        fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, _descr_info: &FieldDescrInfo) {
+            self.stores.borrow_mut().push((struct_ptr, value));
+        }
+    }
+
+    fn empty_virtual_obj(descr: majit_ir::DescrRef) -> VirtualInfo {
+        VirtualInfo::VirtualObj {
+            descr: Some(descr),
+            type_id: 1,
+            known_class: None,
+            fields: Vec::new(),
+            fielddescrs: Vec::new(),
+            descr_size: 16,
+        }
+    }
+
+    fn ref_field_descr() -> majit_ir::DescrRef {
+        Arc::new(SimpleFieldDescr::new(1, 0, 8, Type::Ref, false))
+    }
+
+    fn pending_entry(target_tagged: i16, value_tagged: i16) -> majit_ir::GuardPendingFieldEntry {
+        majit_ir::GuardPendingFieldEntry {
+            descr: Some(ref_field_descr()),
+            item_index: -1,
+            target: majit_ir::OpRef::input_arg_ref(0),
+            value: majit_ir::OpRef::input_arg_ref(1),
+            target_tagged,
+            value_tagged,
+        }
+    }
+
+    fn size_descr() -> majit_ir::DescrRef {
+        Arc::new(SimpleSizeDescr::new(0x3000_00aa, 16, 1)) as majit_ir::DescrRef
+    }
+
+    /// `resume.py _prepare_pendingfields` decodes the target then the value;
+    /// every ref is GC-tracked. A virtual value's allocate can collect and
+    /// move a virtual target already in `virtuals_cache`. Re-read
+    /// `virtuals_cache.get_ptr` after the value is resolved.
+    #[test]
+    fn prepare_guard_pendingfields_rereads_virtual_target_after_value_alloc() {
+        let alloc = MovingAllocator::default();
+        let virtuals = [
+            empty_virtual_obj(size_descr()),
+            empty_virtual_obj(size_descr()),
+        ];
+        let pending = [pending_entry(
+            tag(0, TAGVIRTUAL).unwrap(),
+            tag(1, TAGVIRTUAL).unwrap(),
+        )];
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &[],
+            &[],
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            &alloc,
+        );
+        reader.prepare_virtuals(Some(&virtuals));
+        reader.virtuals_cache.set_ptr(0, FROM_SPACE);
+        let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(
+                &mut reader.virtuals_cache.virtuals_ptr_cache,
+            );
+        }
+        reader.prepare_guard_pendingfields(&pending);
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
+
+        let live_target = reader.virtuals_cache.get_ptr(0);
+        assert_eq!(
+            *alloc.stores.borrow(),
+            vec![(live_target, reader.virtuals_cache.get_ptr(1))],
+            "store must use the forwarded virtual target, not the pre-value-alloc pointer"
+        );
+        assert_ne!(
+            live_target, FROM_SPACE,
+            "value materialization must have collected the pre-seeded target"
+        );
+    }
+
+    /// TAGBOX pending-field targets live in the deadframe. Re-read that
+    /// rooted slot after the value's allocate, matching
+    /// `decode_ref` TAGBOX (`cpu.get_ref_value`).
+    #[test]
+    fn prepare_guard_pendingfields_rereads_tagbox_target_after_value_alloc() {
+        let alloc = MovingAllocator::default();
+        let virtuals = [empty_virtual_obj(size_descr())];
+        let pending = [pending_entry(
+            tag(0, TAGBOX).unwrap(),
+            tag(0, TAGVIRTUAL).unwrap(),
+        )];
+        let mut deadframe = [FROM_SPACE];
+        let _dead = unsafe { DeadFrameRefRoots::enter(&mut deadframe, |_| true) };
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &[],
+            &[],
+            FailArgSource::Slice(&deadframe),
+            Some(&[Type::Ref]),
+            None,
+            &alloc,
+        );
+        reader.prepare_virtuals(Some(&virtuals));
+        let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(
+                &mut reader.virtuals_cache.virtuals_ptr_cache,
+            );
+        }
+        reader.prepare_guard_pendingfields(&pending);
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
+
+        assert_eq!(deadframe[0], TO_SPACE);
+        assert_eq!(
+            *alloc.stores.borrow(),
+            vec![(TO_SPACE, reader.virtuals_cache.get_ptr(0))],
+            "store must use the forwarded TAGBOX deadframe slot"
+        );
     }
 }
 

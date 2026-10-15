@@ -356,8 +356,10 @@ impl<'a> BridgeVirtualCache<'a> {
 
 fn emit_stroruni_oopspec_call(
     ctx: &mut crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
     oopspec: majit_ir::effectinfo::OopSpecIndex,
     args: &[OpRef],
+    vidx: usize,
 ) -> OpRef {
     let cic = ctx
         .callinfocollection
@@ -374,12 +376,36 @@ fn emit_stroruni_oopspec_call(
     let mut call_args = Vec::with_capacity(1 + args.len());
     call_args.push(func_const);
     call_args.extend_from_slice(args);
-    // resume.py concat_strings `execute_and_record_varargs(CALL_R, ...)`.
+    // resume.py ResumeDataBoxReader.concat_strings / slice_string:
+    //   execute_and_record_varargs(CALL_R, [ConstInt(func), ...], calldescr)
+    // Applying: `executor.execute_varargs` runs the helper so the recorded
+    // box carries `getref_base()`. Recording-only: ResumeDataDirectReader
+    // already ran that helper; a second call allocates a different object
+    // than the interpreter holds. Stamp the seeded `get_concrete_ptr`.
+    let value = if cache.allocator().is_some() {
+        calldescr
+            .as_call_descr()
+            .and_then(|cd| {
+                let mut bits = Vec::with_capacity(args.len());
+                for &a in args {
+                    bits.push(operand_concrete(ctx, cache, a)?.as_raw_i64());
+                }
+                Some(crate::executor::do_call_positional(cd, func as i64, &bits))
+            })
+            .map(|p| majit_ir::Value::Ref(majit_ir::GcRef(p as usize)))
+    } else {
+        cache.get_concrete_ptr(vidx).map(majit_ir::Value::Ref)
+    };
     ctx.profiler()
         .count_ops(majit_ir::OpCode::CallR, crate::counters::OPS);
     ctx.profiler()
         .count_ops(majit_ir::OpCode::CallR, crate::counters::RECORDED_OPS);
-    ctx.record_op_with_descr(majit_ir::OpCode::CallR, &call_args, calldescr.clone())
+    ctx.record_op_with_descr_value(
+        majit_ir::OpCode::CallR,
+        &call_args,
+        calldescr.clone(),
+        value,
+    )
 }
 
 /// resume.py decode_box parity for fieldnums (i16 tagged): decode one
@@ -1379,9 +1405,14 @@ pub fn materialize_bridge_virtual(
             } else {
                 majit_ir::effectinfo::OopSpecIndex::StrConcat
             };
-            let string = emit_stroruni_oopspec_call(ctx, oopspec, &[left, right]);
+            let string = emit_stroruni_oopspec_call(ctx, cache, oopspec, &[left, right], vidx);
             cache.set_ptr(vidx, string);
             ctx.remember_bridge_virtual_op(vidx, string);
+            if cache.allocator().is_some()
+                && let Some(majit_ir::Value::Ref(r)) = ctx.box_value(string)
+            {
+                cache.set_concrete_root(vidx, r.as_usize() as i64);
+            }
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} V{}ConcatInfo → OpRef::from_raw({})",
@@ -1441,9 +1472,15 @@ pub fn materialize_bridge_virtual(
             } else {
                 majit_ir::effectinfo::OopSpecIndex::StrSlice
             };
-            let string = emit_stroruni_oopspec_call(ctx, oopspec, &[largerstr, start, stop]);
+            let string =
+                emit_stroruni_oopspec_call(ctx, cache, oopspec, &[largerstr, start, stop], vidx);
             cache.set_ptr(vidx, string);
             ctx.remember_bridge_virtual_op(vidx, string);
+            if cache.allocator().is_some()
+                && let Some(majit_ir::Value::Ref(r)) = ctx.box_value(string)
+            {
+                cache.set_concrete_root(vidx, r.as_usize() as i64);
+            }
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} V{}SliceInfo → OpRef::from_raw({})",
@@ -2176,5 +2213,148 @@ mod tests {
                 "reset_token_gcref must leave TOKEN_NONE"
             );
         }
+    }
+
+    /// resume.py `ResumeDataBoxReader.concat_strings`
+    /// `execute_and_record_varargs(CALL_R, ...)`: the applying reader runs the
+    /// helper once and the recorded box carries `getref_base()`.
+    #[test]
+    fn concat_strings_execute_and_record_stamps_concrete_ref() {
+        use majit_ir::{Const, GcRef, OopSpecIndex, Value};
+        use std::sync::Arc;
+
+        extern "C" fn dummy_ll_strconcat(_s1: i64, _s2: i64) -> i64 {
+            0xC0FFEE
+        }
+
+        struct DummyAlloc;
+        impl crate::resume::BlackholeAllocator for DummyAlloc {}
+
+        let descr = crate::make_call_descr_with_effect(
+            &[Type::Ref, Type::Ref],
+            Type::Ref,
+            crate::str_concat_effect_info(),
+        );
+        let mut cic = majit_ir::CallInfoCollection::new();
+        cic.add(
+            OopSpecIndex::StrConcat,
+            descr,
+            dummy_ll_strconcat as *const () as u64,
+        );
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        ctx.callinfocollection = Some(Arc::new(cic));
+
+        let tag0 = ((0 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
+        let tag1 = ((1 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
+        let storage = crate::resume::new_resume_storage(
+            Vec::new(),
+            vec![
+                Const::from_gcref(GcRef(0x1111)),
+                Const::from_gcref(GcRef(0x2222)),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        let resume_data = crate::jit_state::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_boxes: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: Some(storage),
+            num_failargs: 0,
+            fail_arg_types: Vec::new(),
+        };
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VStrConcatInfo {
+            fieldnums: vec![tag0, tag1],
+        })];
+        let alloc = DummyAlloc;
+        let mut cache =
+            BridgeVirtualCache::executing(1, default_bridge_array_descr, &alloc, &[], &[]);
+        let result =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        assert!(!result.is_none(), "concat virtual must materialize");
+        assert_eq!(
+            ctx.box_value(result),
+            Some(Value::Ref(GcRef(0xC0FFEE))),
+            "execute_and_record must stamp getref_base on the CALL_R box"
+        );
+        assert_eq!(
+            cache.get_concrete_ptr(0),
+            Some(GcRef(0xC0FFEE)),
+            "virtuals_cache must hold the executed concat result"
+        );
+    }
+
+    /// Recording-only: `ResumeDataDirectReader.concat_strings` already
+    /// produced the object. A second helper call would allocate a different
+    /// string than the interpreter holds; stamp the seeded `get_concrete_ptr`.
+    #[test]
+    fn concat_strings_recording_only_keeps_seeded_concrete_ref() {
+        use majit_ir::{Const, GcRef, OopSpecIndex, Value};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn counting_ll_strconcat(_s1: i64, _s2: i64) -> i64 {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            0xC0FFEE
+        }
+
+        let descr = crate::make_call_descr_with_effect(
+            &[Type::Ref, Type::Ref],
+            Type::Ref,
+            crate::str_concat_effect_info(),
+        );
+        let mut cic = majit_ir::CallInfoCollection::new();
+        cic.add(
+            OopSpecIndex::StrConcat,
+            descr,
+            counting_ll_strconcat as *const () as u64,
+        );
+        let mut ctx = crate::TraceCtx::for_test_types(&[]);
+        ctx.callinfocollection = Some(Arc::new(cic));
+
+        let tag0 = ((0 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
+        let tag1 = ((1 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
+        let storage = crate::resume::new_resume_storage(
+            Vec::new(),
+            vec![
+                Const::from_gcref(GcRef(0x1111)),
+                Const::from_gcref(GcRef(0x2222)),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        let resume_data = crate::jit_state::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_boxes: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: Some(storage),
+            num_failargs: 0,
+            fail_arg_types: Vec::new(),
+        };
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VStrConcatInfo {
+            fieldnums: vec![tag0, tag1],
+        })];
+        let seed = GcRef(0xFEED);
+        let mut cache = BridgeVirtualCache::recording(1, default_bridge_array_descr, &[Some(seed)]);
+        CALLS.store(0, Ordering::SeqCst);
+        let result =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        assert!(!result.is_none(), "concat virtual must materialize");
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            0,
+            "recording-only must not call the concat helper"
+        );
+        assert_eq!(
+            ctx.box_value(result),
+            Some(Value::Ref(seed)),
+            "CALL_R must name the DirectReader seed, not a second allocation"
+        );
+        assert_eq!(
+            cache.get_concrete_ptr(0),
+            Some(seed),
+            "virtuals_cache must keep the DirectReader seed"
+        );
     }
 }

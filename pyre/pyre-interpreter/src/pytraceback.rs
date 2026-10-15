@@ -318,10 +318,7 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 /// frame edge is unconditional.
 ///
 /// The resolved line is NOT written back to the slot.  Upstream memoizes
-/// (`self.lineno = offset2lineno(...)`); `tb_lineno_get` re-reads instead, and
-/// re-reading is what keeps the slot single-writer for the JIT fold
-/// `walker_specialize_traceback_walk_field`, which folds the raw slot against
-/// a guard that it is not the sentinel.
+/// (`self.lineno = offset2lineno(...)`); `tb_lineno_get` re-reads instead.
 ///
 /// `record_application_traceback` leaves the sentinel, so a recorded node
 /// reaches the resolution below on every read; a `tb_lasti` that names no line
@@ -349,6 +346,63 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> Option<i64> {
         Some(lineno as i64)
     }
 }
+
+/// `pytraceback.py descr_get_tb_lineno`: box the line `get_lineno` answers.
+///
+/// Flattened to a `PyObjectRef` so the walker can descend this graph the
+/// way PyPy traces the interp2app getter.  `Option` stays on
+/// [`w_pytraceback_get_lineno`] for interpreter callers; the leaf inlines
+/// the same arms so the jitcode never carries that ABI.
+///
+/// A stamped slot boxes with `space.newint`.  A sentinel slot calls
+/// `offset2lineno` (`w_code_addr2line`) and boxes the resolved line, or
+/// answers `None` when the offset names no line — `tb_lineno_get`'s
+/// `Py_RETURN_NONE` arm, which upstream cannot take because it always
+/// `space.newint`s.  No writeback: see [`w_pytraceback_get_lineno`].
+///
+/// `location.py _offset2lineno` is a loop, so `look_inside_graph` refuses
+/// it and `offset2lineno` stays a residual call.  `w_code_addr2line` is
+/// the same residual here (`#[dont_look_inside]` on that helper).
+#[inline(never)]
+pub fn descr_get_tb_lineno(tb: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let raw = w_pytraceback_get_lineno_raw(tb);
+        if raw != LINENO_NOT_COMPUTED {
+            return pyre_object::w_int_new(raw);
+        }
+        let w_code = w_pytraceback_get_w_code(tb);
+        if w_code.is_null() {
+            return pyre_object::w_none();
+        }
+        let lineno = crate::pycode::w_code_addr2line(w_code, w_pytraceback_get_lasti(tb));
+        if lineno < 0 {
+            return pyre_object::w_none();
+        }
+        pyre_object::w_int_new(lineno as i64)
+    }
+}
+
+/// `typedef.py _make_descr_typecheck_wrapper` around [`descr_get_tb_lineno`].
+///
+/// `GetSetProperty` binds this as its `fget` for `tb_lineno`.  The
+/// `args[1]` receiver is the traceback instance, matching the frame
+/// getset wrappers.  Seeding it into the builtin-wrapper family puts
+/// [`descr_get_tb_lineno`] on a discovered jitcode the walker can
+/// descend.
+pub fn __majit_wrap_descr_get_tb_lineno(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let tb = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if tb.is_null() {
+        return Ok(pyre_object::w_none());
+    }
+    Ok(descr_get_tb_lineno(tb))
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_descr_get_tb_lineno,
+    __majit_wrap_descr_get_tb_lineno
+);
 
 /// The side effect shared by `error.py OperationError.get_traceback`
 /// and `interp_exceptions.py descr_gettraceback`: a traceback that
@@ -573,6 +627,18 @@ mod tests {
 
             let zero = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, 0, PY_NULL);
             assert_eq!(w_pytraceback_get_lineno(zero), Some(0));
+
+            assert!(pyre_object::is_none(descr_get_tb_lineno(unresolvable)));
+            let boxed = descr_get_tb_lineno(stamped);
+            assert!(pyre_object::is_int(boxed));
+            assert_eq!(pyre_object::w_int_get_value(boxed), 7);
+            assert!(pyre_object::is_int(descr_get_tb_lineno(negative)));
+            assert_eq!(
+                pyre_object::w_int_get_value(descr_get_tb_lineno(negative)),
+                -2
+            );
+            assert!(pyre_object::is_int(descr_get_tb_lineno(zero)));
+            assert_eq!(pyre_object::w_int_get_value(descr_get_tb_lineno(zero)), 0);
         }
     }
 

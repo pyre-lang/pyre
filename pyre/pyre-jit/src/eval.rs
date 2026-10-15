@@ -3005,9 +3005,10 @@ fn build_gc() -> Box<MiniMarkGC> {
             w_dict_view_tid,
         );
         pytype_to_tid.insert(tp as *const _ as usize, w_dict_view_tid);
-        // `W_DictViewObject` is `malloc_typed`-immortal and not a
-        // `#[pyre_class]`, so register its `w_dict` back-pointer offset for the
-        // interpreter's generic immortal-root walker.
+        // `W_DictViewObject` is allocated with `malloc_typed_managed`
+        // (`w_dict_keys_new` / values / items) and is not a `#[pyre_class]`;
+        // register its `w_dict` back-pointer offset for the interpreter's
+        // generic root walker.
         pyre_object::gc_hook::register_pyre_class_offsets(
             tp as *const _ as usize,
             &pyre_object::dictmultiobject::W_DICT_VIEW_GC_PTR_OFFSETS,
@@ -13556,6 +13557,134 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     ptr as usize
 }
 
+/// `resume.py virtuals_cache` — a dense list of materialized virtuals,
+/// indexed by virtual number. RPython's list is a GC-traced object; a
+/// `HashMap` of `GcRef` integers is not. Root the ref half on the resume
+/// shadow stack (`prepare_resume_heap_with_roots` /
+/// `push_resume_ref_roots`) and re-read it after each allocating
+/// materialization (`getvirtual_ptr` returns the cache slot, not the
+/// raw `allocate` result, because a minor collection forwards the slot
+/// in place).
+struct DirectVirtualsCache {
+    values: Vec<Option<Value>>,
+    concrete_roots: Vec<i64>,
+    roots_depth: usize,
+}
+
+impl DirectVirtualsCache {
+    fn new(n: usize) -> Self {
+        let mut cache = Self {
+            values: vec![None; n],
+            concrete_roots: vec![0i64; n],
+            roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
+        };
+        if n > 0 {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
+            }
+        }
+        cache
+    }
+
+    fn get(&self, vidx: usize) -> Option<Value> {
+        let stored = self.values.get(vidx)?.clone()?;
+        match stored {
+            Value::Ref(_) => {
+                let addr = *self.concrete_roots.get(vidx)?;
+                Some(Value::Ref(majit_ir::GcRef(addr as usize)))
+            }
+            other => Some(other),
+        }
+    }
+
+    fn insert(&mut self, vidx: usize, value: Value) {
+        assert!(
+            vidx < self.values.len(),
+            "virtuals_cache index {vidx} >= {}",
+            self.values.len()
+        );
+        self.concrete_roots[vidx] = match value {
+            Value::Ref(r) => r.as_usize() as i64,
+            _ => 0,
+        };
+        self.values[vidx] = Some(value);
+    }
+
+    fn as_direct_virtuals(&self) -> Vec<Option<majit_ir::GcRef>> {
+        self.values
+            .iter()
+            .zip(self.concrete_roots.iter())
+            .map(|(slot, &addr)| match slot {
+                Some(Value::Ref(_)) => Some(majit_ir::GcRef(addr as usize)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `getvirtual_ptr` after `allocate`: the cache slot, not the raw
+    /// allocate result. A nested virtual's allocate can collect and
+    /// forward this slot in place; the caller's `Value::Ref` integer is
+    /// not a GC root (`resume.py` `v == cache` holds because `v` is a
+    /// traced stack local).
+    fn live_ptr(&self, vidx: usize) -> usize {
+        match self.get(vidx) {
+            Some(Value::Ref(r)) => r.as_usize(),
+            _ => 0,
+        }
+    }
+
+    fn live_ref_value(&self, vidx: usize) -> Value {
+        self.get(vidx).unwrap_or(Value::Ref(majit_ir::GcRef::NULL))
+    }
+}
+
+impl Drop for DirectVirtualsCache {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.roots_depth);
+    }
+}
+
+/// Scope that pops resume-construction roots back to the depth captured
+/// at construction. Pair with `push_decoded_value` / `root_decoded_value_slice`
+/// so decoded `Value::Ref` payloads stay forwarded across allocate.
+/// `ResumeDataDirectReader` keeps those refs on GC-traced `registers_r`
+/// and stack GCREFs; a host `Vec<Value>` is a copy.
+fn guard_decoded_value_refs() -> majit_metainterp::resume::DeadFrameRefRoots {
+    // `enter` on an empty buffer captures the depth; later
+    // `push_resume_ref_root` registrations unwind with this guard.
+    unsafe { majit_metainterp::resume::DeadFrameRefRoots::enter(&mut [], |_| false) }
+}
+
+/// Register every `Value::Ref` payload in `values`. The slice must stay
+/// at a fixed address until the matching `guard_decoded_value_refs` drops.
+unsafe fn root_decoded_value_slice(values: &mut [Value]) {
+    for value in values.iter_mut() {
+        if let Value::Ref(r) = value {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_root(r);
+            }
+        }
+    }
+}
+
+/// Append `value` and, when it is a Ref, register its payload. `values`
+/// must have spare capacity so earlier Ref interiors stay at the addresses
+/// already registered (`push_resume_ref_root` contract).
+fn push_decoded_value(values: &mut Vec<Value>, value: Value) {
+    let capacity = values.capacity();
+    values.push(value);
+    debug_assert_eq!(
+        values.capacity(),
+        capacity,
+        "decoded Value vec reallocated while Ref payloads were resume-rooted"
+    );
+    if let Some(Value::Ref(r)) = values.last_mut() {
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_root(r);
+        }
+    }
+}
+
 /// resume.py getvirtual_ptr parity.
 ///
 /// Lazily materializes a virtual from rd_virtuals[vidx].
@@ -13568,11 +13697,11 @@ fn materialize_virtual_from_rd(
     num_failargs: i32,
     rd_consts: &[majit_ir::Const],
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut DirectVirtualsCache,
 ) -> Value {
     // resume.py: v = self.virtuals_cache.get_ptr(index)
-    if let Some(cached) = virtuals_cache.get(&vidx) {
-        return cached.clone();
+    if let Some(cached) = virtuals_cache.get(vidx) {
+        return cached;
     }
     // resume.py:953: assert self.rd_virtuals is not None
     let virtuals = rd_virtuals.expect("resume.py:953 getvirtual_ptr: rd_virtuals is not None");
@@ -13587,7 +13716,7 @@ fn materialize_virtual_from_rd(
         num_failargs: i32,
         rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut DirectVirtualsCache,
     ) -> Option<Value> {
         if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
             return None;
@@ -13650,7 +13779,7 @@ fn materialize_virtual_from_rd(
         num_failargs: i32,
         rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut DirectVirtualsCache,
     ) -> i64 {
         match decode_tagged_fieldnum(
             tagged,
@@ -13675,7 +13804,7 @@ fn materialize_virtual_from_rd(
         num_failargs: i32,
         rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut DirectVirtualsCache,
     ) -> f64 {
         match decode_tagged_fieldnum(
             tagged,
@@ -13725,8 +13854,7 @@ fn materialize_virtual_from_rd(
             let array = bh_new_array_from_descr(fieldnums.len(), arraydescr, clear);
             // resume.py:654: cache BEFORE filling — recursive/shared virtuals
             // may reference this vidx during element decoding.
-            let result = Value::Ref(majit_ir::GcRef(array as usize));
-            virtuals_cache.insert(vidx, result.clone());
+            virtuals_cache.insert(vidx, Value::Ref(majit_ir::GcRef(array as usize)));
             // resume.py: element kind dispatch + UNINITIALIZED skip.
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -13747,6 +13875,9 @@ fn materialize_virtual_from_rd(
                         Some(other) => box_opt_value(&Some(other)) as i64,
                         None => 0,
                     };
+                    // `resume.py` `bh_setarrayitem_gc_*`: re-read
+                    // `virtuals_cache` after decode (`getvirtual_ptr`).
+                    let array = virtuals_cache.live_ptr(vidx) as i64;
                     bh_setarrayitem_ref_from_descr(array, i, value, arraydescr);
                 } else if ad.is_array_of_floats() {
                     let value = decode_tagged_fieldnum_float(
@@ -13758,6 +13889,7 @@ fn materialize_virtual_from_rd(
                         virtuals_cache,
                     )
                     .to_bits() as i64;
+                    let array = virtuals_cache.live_ptr(vidx) as i64;
                     bh_setarrayitem_float_from_descr(array, i, value, arraydescr);
                 } else {
                     let value = decode_tagged_fieldnum_int(
@@ -13768,10 +13900,11 @@ fn materialize_virtual_from_rd(
                         rd_virtuals,
                         virtuals_cache,
                     );
+                    let array = virtuals_cache.live_ptr(vidx) as i64;
                     bh_setarrayitem_int_from_descr(array, i, value, arraydescr);
                 }
             }
-            return result;
+            return virtuals_cache.live_ref_value(vidx);
         }
         majit_ir::RdVirtualInfo::VArrayStructInfo {
             arraydescr,
@@ -13810,8 +13943,7 @@ fn materialize_virtual_from_rd(
                 .unwrap_or(0);
             let array = pyre_object::allocate_array_struct_at_typed(*size, is, items_base, tid);
             // resume.py: decoder.virtuals_cache.set_ptr(index, array)
-            let result = Value::Ref(majit_ir::GcRef(array as usize));
-            virtuals_cache.insert(vidx, result.clone());
+            virtuals_cache.insert(vidx, Value::Ref(majit_ir::GcRef(array as usize)));
             // resume.py:752-759:
             //   p = 0
             //   for i in range(self.size):
@@ -13849,11 +13981,12 @@ fn materialize_virtual_from_rd(
                             Value::Void => 0,
                         };
                         let (fo, fs, ft) = extract_interior_field_info(&fielddescrs[j]);
+                        let array = virtuals_cache.live_ptr(vidx) as *mut pyre_object::GcTypedArray;
                         pyre_object::setinteriorfield(array, items_base, i, fo, fs, is, ft, raw);
                     }
                 }
             }
-            return result;
+            return virtuals_cache.live_ref_value(vidx);
         }
         majit_ir::RdVirtualInfo::VRawBufferInfo {
             func,
@@ -13992,8 +14125,7 @@ fn materialize_virtual_from_rd(
                 backend.bh_newstr(length)
             };
             // resume.py/820 virtuals_cache.set_ptr BEFORE filling.
-            let result = Value::Ref(majit_ir::GcRef(string as usize));
-            virtuals_cache.insert(vidx, result.clone());
+            virtuals_cache.insert(vidx, Value::Ref(majit_ir::GcRef(string as usize)));
             // resume.py/824-827 per-char string_setitem loop.
             for (i, &fnum) in fieldnums.iter().enumerate() {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -14007,6 +14139,7 @@ fn materialize_virtual_from_rd(
                     rd_virtuals,
                     virtuals_cache,
                 );
+                let string = virtuals_cache.live_ptr(vidx) as i64;
                 if is_unicode {
                     driver
                         .meta_interp()
@@ -14019,7 +14152,7 @@ fn materialize_virtual_from_rd(
                         .bh_strsetitem(string, i as i64, char_val);
                 }
             }
-            return result;
+            return virtuals_cache.live_ref_value(vidx);
         }
         // resume.py VStrConcatInfo.allocate /
         // resume.py VUniConcatInfo.allocate —
@@ -14081,8 +14214,8 @@ fn materialize_virtual_from_rd(
                 &bh_calldescr,
             );
             let value = Value::Ref(majit_ir::GcRef(result.0));
-            virtuals_cache.insert(vidx, value.clone());
-            return value;
+            virtuals_cache.insert(vidx, value);
+            return virtuals_cache.live_ref_value(vidx);
         }
         // resume.py VStrSliceInfo.allocate /
         // resume.py VUniSliceInfo.allocate —
@@ -14156,8 +14289,8 @@ fn materialize_virtual_from_rd(
                 &bh_calldescr,
             );
             let value = Value::Ref(majit_ir::GcRef(result.0));
-            virtuals_cache.insert(vidx, value.clone());
-            return value;
+            virtuals_cache.insert(vidx, value);
+            return virtuals_cache.live_ref_value(vidx);
         }
         _ => {} // Instance/Struct: fall through
     }
@@ -14276,8 +14409,7 @@ fn materialize_virtual_from_rd(
 
     // Phase 2: cache REAL object pointer BEFORE setting fields.
     // resume.py: decoder.virtuals_cache.set_ptr(index, struct)
-    let obj_ref = Value::Ref(majit_ir::GcRef(obj_ptr));
-    virtuals_cache.insert(vidx, obj_ref.clone());
+    virtuals_cache.insert(vidx, Value::Ref(majit_ir::GcRef(obj_ptr)));
 
     // Phase 3: setfields — decode each field and write to object.
     // resume.py: for each fielddescr, decoder.setfield(struct, num, descr)
@@ -14308,6 +14440,7 @@ fn materialize_virtual_from_rd(
                     },
                     _ => 0,
                 };
+                let obj_ptr = virtuals_cache.live_ptr(vidx);
                 unsafe {
                     (*(obj_ptr as *mut pyre_object::intobject::W_IntObject)).intval = intval;
                 }
@@ -14335,6 +14468,7 @@ fn materialize_virtual_from_rd(
                     Value::Int(bits) => f64::from_bits(bits as u64),
                     _ => 0.0,
                 };
+                let obj_ptr = virtuals_cache.live_ptr(vidx);
                 unsafe {
                     (*(obj_ptr as *mut pyre_object::floatobject::W_FloatObject)).floatval =
                         floatval;
@@ -14372,6 +14506,9 @@ fn materialize_virtual_from_rd(
                 if descr.offset == 0 && is_instance {
                     continue;
                 }
+                // `resume.py` `setfields`: re-read `virtuals_cache` after
+                // decode (`getvirtual_ptr` / `abstract_virtual_struct_info_setfields`).
+                let obj_ptr = virtuals_cache.live_ptr(vidx);
                 unsafe {
                     let addr = (obj_ptr as *mut u8).add(descr.offset);
                     match descr.field_type {
@@ -14424,7 +14561,7 @@ fn materialize_virtual_from_rd(
             }
         }
     }
-    obj_ref
+    virtuals_cache.live_ref_value(vidx)
 }
 
 /// resume.py ResumeDataDirectReader decode_int/decode_ref parity.
@@ -14438,7 +14575,7 @@ fn decode_tagged_value(
     num_failargs: i32,
     rd_consts: &[majit_ir::Const],
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut DirectVirtualsCache,
 ) -> Value {
     let (val, tagbits) = majit_metainterp::resume::untag(tagged);
     match tagbits {
@@ -14495,20 +14632,6 @@ fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) ->
         .collect()
 }
 
-/// The objects the direct reader allocated for this guard's virtuals, by
-/// virtual number: the `all_virtuals` the recording reader that follows is
-/// constructed with (`BridgeVirtualCache::recording`).
-fn direct_virtual_objects(cache: &HashMap<usize, Value>) -> Vec<Option<majit_ir::GcRef>> {
-    let n = cache.keys().copied().max().map(|m| m + 1).unwrap_or(0);
-    let mut slots = vec![None; n];
-    for (&vidx, value) in cache {
-        if let Value::Ref(gcref) = *value {
-            slots[vidx] = Some(gcref);
-        }
-    }
-    slots
-}
-
 /// What the direct reader of a guard failure decoded, for the bridge entry
 /// that follows it.
 pub(crate) struct DecodedGuardFailure {
@@ -14517,8 +14640,15 @@ pub(crate) struct DecodedGuardFailure {
     pub resume_pc: usize,
     pub num_resume_frames: usize,
     pub coords: Vec<(usize, usize)>,
-    /// `ResumeDataDirectReader.virtuals_cache` objects by virtual number.
-    pub direct_virtuals: Vec<Option<majit_ir::GcRef>>,
+    /// `ResumeDataDirectReader.virtuals_cache` — kept alive (and rooted)
+    /// until `start_bridge_tracing` seeds `BridgeVirtualCache`.
+    virtuals_cache: DirectVirtualsCache,
+}
+
+impl DecodedGuardFailure {
+    pub(crate) fn all_virtuals(&self) -> Vec<Option<majit_ir::GcRef>> {
+        self.virtuals_cache.as_direct_virtuals()
+    }
 }
 
 /// Phase A: decode rd_numb + materialize virtuals + restore frame state.
@@ -14563,18 +14693,26 @@ pub(crate) fn decode_and_restore_guard_failure(
     // resume.py rebuild_from_resumedata: decode rd_numb into typed values.
     // compile.py `ResumeGuardDescr` storage — borrow rd_numb / rd_consts
     // from the guard-owned shared Arc instead of a per-guard Vec copy.
-    let (typed, mut pending_virtuals_cache) = {
+    //
+    // `_typed_roots` / `_dead_frame_keep` must outlive every allocate below
+    // (`build_resumed_frames`, `restore_guard_failure_values`): decoded
+    // `Value::Ref` copies are otherwise from-space after a minor collection.
+    let (typed, mut pending_virtuals_cache, _dead_frame_keep, _typed_roots) = {
         let storage = exit_layout.storage.as_deref();
         let rd_numb = storage
             .map(|s| s.rd_numb().expect("rd_numb"))
             .unwrap_or(&[]);
         let rd_consts: &[majit_ir::Const] = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
         if rd_numb.is_empty() {
-            (dead_frame_typed.clone(), HashMap::new())
+            let mut t = dead_frame_typed.clone();
+            let cache = DirectVirtualsCache::new(0);
+            let roots = guard_decoded_value_refs();
+            unsafe {
+                root_decoded_value_slice(&mut t);
+            }
+            (t, cache, Vec::new(), roots)
         } else {
-            let (t, virtuals_cache) =
-                rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout);
-            (t, virtuals_cache)
+            rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
         }
     };
     if majit_metainterp::majit_log_enabled() {
@@ -14633,7 +14771,6 @@ pub(crate) fn decode_and_restore_guard_failure(
             &mut pending_virtuals_cache,
         )
     };
-    let direct_virtuals = direct_virtual_objects(&pending_virtuals_cache);
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
@@ -14730,7 +14867,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             resume_pc,
             num_resume_frames: resumed_frames.len(),
             coords,
-            direct_virtuals,
+            virtuals_cache: pending_virtuals_cache,
         })
     } else {
         None
@@ -14748,7 +14885,12 @@ fn rebuild_typed_from_rd_numb(
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],
     exit_layout: &CompiledExitLayout,
-) -> (Vec<Value>, HashMap<usize, Value>) {
+) -> (
+    Vec<Value>,
+    DirectVirtualsCache,
+    Vec<Value>,
+    majit_metainterp::resume::DeadFrameRefRoots,
+) {
     use majit_ir::resumedata::rebuild_from_numbering;
 
     // resume.py:1049-1055 parity: bound each frame's box section by jitcode
@@ -14783,8 +14925,16 @@ fn rebuild_typed_from_rd_numb(
         );
     }
 
-    let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
-    let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
+    let mut dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+    let mut virtuals_cache = DirectVirtualsCache::new(num_virtuals);
+    // Root TAGBOX copies (`cpu.get_ref_value`) and the decoded `typed`
+    // vector (`registers_r`) for the whole window until the caller drops
+    // `_typed_roots`. Keep `dead_frame_typed` alive with that guard so its
+    // registered interiors are not dangling.
+    let typed_roots = guard_decoded_value_refs();
+    unsafe {
+        root_decoded_value_slice(&mut dead_frame_typed);
+    }
 
     // resume.py consume_virtualizable_boxes + pyjitpl.py:3400-3428 parity:  allow-line-citation
     // Decode vable_values into typed prefix [frame_ptr, ni, code, vsd, ns, locals..., stack...].
@@ -14794,7 +14944,7 @@ fn rebuild_typed_from_rd_numb(
         rv: &majit_ir::resumedata::RebuiltValue,
         dead_frame_typed: &[Value],
         exit_layout: &CompiledExitLayout,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut DirectVirtualsCache,
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
@@ -14842,29 +14992,38 @@ fn rebuild_typed_from_rd_numb(
     let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
     let num_extra_reds = pyre_jit_trace::virtualizable_gen::NUM_EXTRA_REDS;
     let heap_scalar_count = 1 + pyre_jit_trace::virtualizable_gen::NUM_VABLE_SCALARS;
-    let header: Vec<Value> = if vable_values.len() >= heap_scalar_count {
-        let mut h = Vec::with_capacity(num_scalars);
-        h.push(decode_rv(
-            &vable_values[0],
-            &dead_frame_typed,
-            exit_layout,
-            &mut virtuals_cache,
-        ));
-        for _ in 0..num_extra_reds {
-            h.push(Value::Void);
-        }
-        for i in 1..heap_scalar_count {
-            h.push(decode_rv(
-                &vable_values[i],
+    let section_len = frames.first().map(|f| f.values.len()).unwrap_or(0);
+    let header_len = if vable_values.len() >= heap_scalar_count {
+        num_scalars
+    } else {
+        0
+    };
+    let mut typed = Vec::with_capacity(header_len + section_len);
+    if vable_values.len() >= heap_scalar_count {
+        push_decoded_value(
+            &mut typed,
+            decode_rv(
+                &vable_values[0],
                 &dead_frame_typed,
                 exit_layout,
                 &mut virtuals_cache,
-            ));
+            ),
+        );
+        for _ in 0..num_extra_reds {
+            push_decoded_value(&mut typed, Value::Void);
         }
-        h
-    } else {
-        Vec::new()
-    };
+        for i in 1..heap_scalar_count {
+            push_decoded_value(
+                &mut typed,
+                decode_rv(
+                    &vable_values[i],
+                    &dead_frame_typed,
+                    exit_layout,
+                    &mut virtuals_cache,
+                ),
+            );
+        }
+    }
 
     // resume.py: rebuild_from_resumedata iterates all frames
     // via newframe()+consume_boxes(). For guard-failure restore into the
@@ -14876,7 +15035,6 @@ fn rebuild_typed_from_rd_numb(
     // `trace_opcode.rs::build_framestack_snapshot`) `frames[0]` is the
     // outermost (caller / JIT-driver) frame, so `frames.first()` is the
     // restoration target for both single- and multi-frame guards.
-    let mut typed = header;
     if let Some(outermost) = frames.first() {
         _prepare_next_section(
             outermost,
@@ -14884,6 +15042,7 @@ fn rebuild_typed_from_rd_numb(
             exit_layout,
             &mut typed,
             &mut virtuals_cache,
+            true,
         );
     }
 
@@ -14895,7 +15054,7 @@ fn rebuild_typed_from_rd_numb(
         );
     }
 
-    (typed, virtuals_cache)
+    (typed, virtuals_cache, dead_frame_typed, typed_roots)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14997,30 +15156,54 @@ fn sync_virtualizable_after_guard_failure(
         );
     }
 
-    let mut boxes: Vec<i64> = Vec::with_capacity(expected_total_without_identity + 1);
+    let box_count = expected_total_without_identity + 1;
+    let mut boxes: Vec<i64> = vec![0; box_count];
+    let mut ref_slots = vec![false; box_count];
+    let mut out = 0;
+    for field in vinfo.static_fields.iter() {
+        ref_slots[out] = field.field_type == Type::Ref;
+        out += 1;
+    }
+    for (array_index, array_field) in vinfo.array_fields.iter().enumerate() {
+        for _ in 0..array_lengths[array_index] {
+            ref_slots[out] = array_field.item_type == Type::Ref;
+            out += 1;
+        }
+    }
+    debug_assert_eq!(out, box_count - 1);
+    ref_slots[box_count - 1] = true;
+    // `w_int_new` / `w_float_new` below allocate. Root only Ref slots so
+    // an Int whose bits happen to match a nursery object is not forwarded
+    // (`DeadFrameRefRoots` gcmap precision). write_boxes itself does not
+    // allocate, so this batch stays live without `write_from_resume_data_partial`.
+    let _box_roots = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(&mut boxes, |index| ref_slots[index])
+    };
+
     let mut cursor = 1;
+    out = 0;
     for (field_index, field) in vinfo.static_fields.iter().enumerate() {
-        boxes.push(value_to_static_vable_bits(
-            &resolved_vable[cursor],
-            field.field_type,
-            field_index,
-        ));
+        boxes[out] =
+            value_to_static_vable_bits(&resolved_vable[cursor], field.field_type, field_index);
+        out += 1;
         cursor += 1;
     }
     for (array_index, array_field) in vinfo.array_fields.iter().enumerate() {
-        let array_len = unsafe { vinfo.get_array_length(frame_u8.cast_const(), array_index) };
-        for item_index in 0..array_len {
-            boxes.push(value_to_vable_array_item_bits(
+        for item_index in 0..array_lengths[array_index] {
+            boxes[out] = value_to_vable_array_item_bits(
                 &resolved_vable[cursor],
                 array_field.item_type,
                 array_index,
                 item_index,
-            ));
+            );
+            out += 1;
             cursor += 1;
         }
     }
     debug_assert_eq!(cursor, resolved_vable.len());
-    boxes.push(value_to_vable_identity_bits(&resolved_vable[0]));
+    // Identity and the write target: re-read after boxing allocates.
+    boxes[out] = value_to_vable_identity_bits(&resolved_vable[0]);
+    let frame_u8 = boxes[out] as *mut u8;
 
     unsafe {
         vinfo.write_boxes(frame_u8, &boxes);
@@ -15041,7 +15224,7 @@ fn build_resumed_frames(
     vable_mode: ResumeVableMode,
     // resume.py `virtuals_cache`: shared with the typed rebuild that ran
     // before this walk, so a virtual both consume is one object.
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut DirectVirtualsCache,
 ) -> Vec<crate::call_jit::ResumedFrame> {
     use majit_ir::resumedata::rebuild_from_numbering;
 
@@ -15062,7 +15245,14 @@ fn build_resumed_frames(
         num_virtuals,
     );
 
-    let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+    let mut dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+    // TAGBOX copies live in this vec; root them before materialize
+    // allocates. Drop `_section_roots` explicitly before returning so
+    // registered interiors are unregistered while the vecs are still alive.
+    let mut section_roots = Some(guard_decoded_value_refs());
+    unsafe {
+        root_decoded_value_slice(&mut dead_frame_typed);
+    }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][resume] exit_types={:?} dead_frame={:?} vable={} frames={}",
@@ -15078,7 +15268,7 @@ fn build_resumed_frames(
         rv: &majit_ir::resumedata::RebuiltValue,
         dead_frame_typed: &[Value],
         exit_layout: &CompiledExitLayout,
-        virtuals_cache: &mut HashMap<usize, Value>,
+        virtuals_cache: &mut DirectVirtualsCache,
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
         match rv {
@@ -15128,6 +15318,7 @@ fn build_resumed_frames(
             exit_layout,
             &mut values,
             virtuals_cache,
+            false,
         );
         all_values.push(values);
     }
@@ -15163,16 +15354,18 @@ fn build_resumed_frames(
     // vable_values = [frame_ptr(0), last_instr(1), pycode(2),
     //                  valuestackdepth(3), debugdata(4), array...]
     // RPython reader.load_next_value_of_type reads ALL values sequentially.
-    let resolved_vable: Vec<Value> = (0..vable_values.len())
-        .map(|i| {
+    let mut resolved_vable = Vec::with_capacity(vable_values.len());
+    for i in 0..vable_values.len() {
+        push_decoded_value(
+            &mut resolved_vable,
             resolve_rebuilt_value(
                 &vable_values[i],
                 &dead_frame_typed,
                 exit_layout,
                 virtuals_cache,
-            )
-        })
-        .collect();
+            ),
+        );
+    }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][resume][vable-values] rebuilt={:?} resolved={:?}",
@@ -15180,14 +15373,29 @@ fn build_resumed_frames(
         );
     }
 
-    let vable_frame_ptr = resolved_vable
-        .first()
-        .map(|v| match v {
-            Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
-            Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
-            _ => std::ptr::null_mut(),
-        })
-        .unwrap_or(std::ptr::null_mut());
+    fn vable_frame_from_resolved(
+        resolved_vable: &[Value],
+    ) -> *mut pyre_interpreter::pyframe::PyFrame {
+        resolved_vable
+            .first()
+            .map(|v| match v {
+                Value::Ref(r) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+                Value::Int(v) => *v as *mut pyre_interpreter::pyframe::PyFrame,
+                _ => std::ptr::null_mut(),
+            })
+            .unwrap_or(std::ptr::null_mut())
+    }
+    fn vable_pycode_from_resolved(resolved_vable: &[Value], code_idx: usize) -> *const () {
+        resolved_vable
+            .get(code_idx)
+            .map(|v| match v {
+                Value::Ref(r) => r.as_usize() as *const (),
+                Value::Int(v) => *v as *const (),
+                _ => std::ptr::null(),
+            })
+            .unwrap_or(std::ptr::null())
+    }
+
     let vable_ni = resolved_vable
         .get(ni_idx)
         .map(|v| match v {
@@ -15204,16 +15412,6 @@ fn build_resumed_frames(
         })
         .unwrap_or(0);
 
-    // virtualizable.py read_boxes: ALL static fields in declared order.
-    let vable_pycode: *const () = resolved_vable
-        .get(code_idx)
-        .map(|v| match v {
-            Value::Ref(r) => r.as_usize() as *const (),
-            Value::Int(v) => *v as *const (),
-            _ => std::ptr::null(),
-        })
-        .unwrap_or(std::ptr::null());
-
     // pyjitpl.py `synchronize_virtualizable` on guard-failure
     // bridge entry: stores `self.virtualizable_boxes`, resets the token,
     // then calls `self.synchronize_virtualizable()` which ends at
@@ -15223,8 +15421,9 @@ fn build_resumed_frames(
     // resume-data values, not the pre-guard heap. (The blackhole resume
     // path performs its own consume_vable_info write inside
     // `blackhole_resume_via_rd_numb` (resume.py).)
-    if !vable_frame_ptr.is_null() {
-        let frame_u8 = vable_frame_ptr as *mut u8;
+    let vable_frame_before = vable_frame_from_resolved(&resolved_vable);
+    if !vable_frame_before.is_null() {
+        let frame_u8 = vable_frame_before as *mut u8;
         // resume.py blackhole_from_resumedata parity:
         //     vinfo = self.jitdriver_sd.virtualizable_info
         // Use the JIT driver's cached `Arc<VirtualizableInfo>` set once by
@@ -15237,25 +15436,27 @@ fn build_resumed_frames(
                 sync_virtualizable_after_guard_failure(&resolved_vable, frame_u8, &vinfo);
             }
         }
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][resume][vable-sync] mode={vable_mode:?} frame {:?}",
-                vable_frame_ptr
-            );
-            if !vable_frame_ptr.is_null() {
-                let f = unsafe { &*vable_frame_ptr };
-                eprintln!(
-                    "[jit][resume][vable-sync] frame after write: ni={} vsd={} code={:?} ns={:?} debugdata={:?} vable_token={} array_len={}",
-                    f.next_instr(),
-                    f.valuestackdepth,
-                    f.pycode,
-                    f.get_w_globals(),
-                    f.debugdata,
-                    f.vable_token,
-                    locals_w!(f).len(),
-                );
-            }
-        }
+    }
+    // Boxing inside the write-back can collect; re-read Refs from the
+    // rooted `resolved_vable` rather than the pre-sync copies.
+    let vable_frame_ptr = vable_frame_from_resolved(&resolved_vable);
+    let vable_pycode = vable_pycode_from_resolved(&resolved_vable, code_idx);
+    if majit_metainterp::majit_log_enabled() && !vable_frame_ptr.is_null() {
+        eprintln!(
+            "[jit][resume][vable-sync] mode={vable_mode:?} frame {:?}",
+            vable_frame_ptr
+        );
+        let f = unsafe { &*vable_frame_ptr };
+        eprintln!(
+            "[jit][resume][vable-sync] frame after write: ni={} vsd={} code={:?} ns={:?} debugdata={:?} vable_token={} array_len={}",
+            f.next_instr(),
+            f.valuestackdepth,
+            f.pycode,
+            f.get_w_globals(),
+            f.debugdata,
+            f.vable_token,
+            locals_w!(f).len(),
+        );
     }
 
     let mut result = Vec::with_capacity(frames.len());
@@ -15368,6 +15569,8 @@ fn build_resumed_frames(
         );
     }
 
+    // Unregister while `dead_frame_typed` / `resolved_vable` are still alive.
+    drop(section_roots.take());
     result
 }
 
@@ -15378,7 +15581,8 @@ fn _prepare_next_section(
     dead_frame_typed: &[Value],
     exit_layout: &CompiledExitLayout,
     typed: &mut Vec<Value>,
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut DirectVirtualsCache,
+    root_refs: bool,
 ) {
     use majit_ir::resumedata::RebuiltValue;
     let storage = exit_layout.storage.as_deref();
@@ -15386,7 +15590,7 @@ fn _prepare_next_section(
     let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
     let num_failargs = exit_layout.exit_types.len() as i32;
     for val in &frame.values {
-        typed.push(match val {
+        let decoded = match val {
             RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
             }
@@ -15404,7 +15608,12 @@ fn _prepare_next_section(
             // resume.py UNINITIALIZED parity: dead/uninitialized slots
             // stay at default. In pyre, PY_NULL via Value::Void.
             RebuiltValue::Unassigned => Value::Void,
-        });
+        };
+        if root_refs {
+            push_decoded_value(typed, decoded);
+        } else {
+            typed.push(decoded);
+        }
     }
 }
 
@@ -15414,10 +15623,69 @@ fn _prepare_next_section(
 // remain expressible in the translator's RPython subset, which the
 // downcast-driven on-demand decode implementation is not).
 
-/// virtual's slot to NONE and appends field values (ob_type, intval).
-/// On guard failure, we detect contiguous null Ref slots at the end
-/// of the locals/stack region and pair them with trailing Int fields.
-///
+fn pending_source_raw_bits(value: Value) -> i64 {
+    match value {
+        Value::Int(i) => i,
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Ref(r) => r.0 as i64,
+        Value::Void => 0,
+    }
+}
+
+/// Materialize a pending-field source. Virtuals go through
+/// `materialize_virtual_from_rd` (`resume.py getvirtual_ptr`).
+fn materialize_pending_source(
+    src: &majit_backend::ExitValueSourceLayout,
+    dead_frame_typed: &[Value],
+    num_failargs: i32,
+    rd_consts: &[majit_ir::Const],
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    virtuals_cache: &mut DirectVirtualsCache,
+) -> Option<i64> {
+    match src {
+        majit_backend::ExitValueSourceLayout::ExitValue(idx) => dead_frame_typed
+            .get(*idx)
+            .cloned()
+            .map(pending_source_raw_bits),
+        majit_backend::ExitValueSourceLayout::Constant(c, _) => Some(*c),
+        majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
+            Some(pending_source_raw_bits(materialize_virtual_from_rd(
+                *vidx,
+                dead_frame_typed,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            )))
+        }
+        majit_backend::ExitValueSourceLayout::Uninitialized
+        | majit_backend::ExitValueSourceLayout::Unavailable => None,
+    }
+}
+
+/// Re-read a pending-field source from its rooted slot after any allocation.
+/// Virtuals: `virtuals_cache.live_ptr`. TAGBOX fail-args: `failarg_refs`,
+/// forwarded in place by the resume shadow stack.
+fn live_pending_source(
+    src: &majit_backend::ExitValueSourceLayout,
+    dead_frame_typed: &[Value],
+    failarg_refs: &[i64],
+    virtuals_cache: &DirectVirtualsCache,
+) -> Option<i64> {
+    match src {
+        majit_backend::ExitValueSourceLayout::ExitValue(idx) => match dead_frame_typed.get(*idx) {
+            Some(Value::Ref(_)) => failarg_refs.get(*idx).copied(),
+            other => other.cloned().map(pending_source_raw_bits),
+        },
+        majit_backend::ExitValueSourceLayout::Constant(c, _) => Some(*c),
+        majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
+            Some(virtuals_cache.live_ptr(*vidx) as i64)
+        }
+        majit_backend::ExitValueSourceLayout::Uninitialized
+        | majit_backend::ExitValueSourceLayout::Unavailable => None,
+    }
+}
+
 /// resume.py _prepare_pendingfields: replay deferred field writes.
 ///
 /// After virtual materialization, pending SETFIELD_GC/SETARRAYITEM_GC
@@ -15427,7 +15695,7 @@ fn _prepare_next_section(
 fn replay_pending_fields(
     dead_frame_typed: &[Value],
     exit_layout: &CompiledExitLayout,
-    virtuals_cache: &mut HashMap<usize, Value>,
+    virtuals_cache: &mut DirectVirtualsCache,
 ) {
     let num_failargs = exit_layout.exit_types.len() as i32;
     // `resume.py _prepare_pendingfields` reads the list off the guard's
@@ -15448,38 +15716,62 @@ fn replay_pending_fields(
         .and_then(|s| s.rd_consts())
         .unwrap_or(&[]);
     let rd_virtuals = exit_layout.storage.as_deref().and_then(|s| s.rd_virtuals());
-    let value_to_raw_bits = |value: Value| match value {
-        Value::Int(i) => i,
-        Value::Float(f) => f.to_bits() as i64,
-        Value::Ref(r) => r.0 as i64,
-        Value::Void => 0,
-    };
-    let mut resolve_value = |src: &majit_backend::ExitValueSourceLayout| -> Option<i64> {
-        match src {
-            majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
-                dead_frame_typed.get(*idx).cloned().map(value_to_raw_bits)
-            }
-            majit_backend::ExitValueSourceLayout::Constant(c, _) => Some(*c),
-            majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
-                Some(value_to_raw_bits(materialize_virtual_from_rd(
-                    *vidx,
-                    dead_frame_typed,
-                    num_failargs,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                )))
-            }
-            majit_backend::ExitValueSourceLayout::Uninitialized
-            | majit_backend::ExitValueSourceLayout::Unavailable => None,
-        }
+
+    // TAGBOX fail-arg refs are a host copy of the deadframe; root them so a
+    // collection while materializing a virtual value forwards the slot in
+    // place. Virtual targets live in `virtuals_cache.concrete_roots`.
+    let mut failarg_refs: Vec<i64> = dead_frame_typed
+        .iter()
+        .map(|v| match v {
+            Value::Ref(r) => r.0 as i64,
+            _ => 0,
+        })
+        .collect();
+    let _failarg_roots = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(&mut failarg_refs, |index| {
+            matches!(dead_frame_typed.get(index), Some(Value::Ref(_)))
+        })
     };
 
     for pf in pending.iter() {
-        let Some(target_ptr) = resolve_value(&pf.target) else {
+        // Materialize the value first. resume.py
+        // ResumeDataDirectReader._prepare_pendingfields does
+        // `struct = self.decode_ref(num)` then `setfield` (which decodes
+        // the value); every ref is GC-tracked so ordering does not matter.
+        // A virtual value's allocate can collect and move the target.
+        if materialize_pending_source(
+            &pf.value,
+            dead_frame_typed,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+        )
+        .is_none()
+        {
+            continue;
+        }
+        if materialize_pending_source(
+            &pf.target,
+            dead_frame_typed,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+        )
+        .is_none()
+        {
+            continue;
+        }
+        // Re-read both from rooted slots. Neither accessor allocates.
+        let Some(target_ptr) =
+            live_pending_source(&pf.target, dead_frame_typed, &failarg_refs, virtuals_cache)
+        else {
             continue;
         };
-        let Some(value_raw) = resolve_value(&pf.value) else {
+        let Some(value_raw) =
+            live_pending_source(&pf.value, dead_frame_typed, &failarg_refs, virtuals_cache)
+        else {
             continue;
         };
         if target_ptr == 0 {
@@ -16020,6 +16312,71 @@ mod tests {
         assert_eq!(visits, 1, "a known null remains distinct from unknown");
     }
 
+    /// `resume.py virtuals_cache` is a GC-traced list. A HashMap of raw
+    /// `GcRef` integers is not: a minor collection during a later
+    /// `getvirtual_ptr` allocate forwards the rooted slot and leaves the
+    /// map holding from-space. Re-read `concrete_roots` after the walk.
+    #[test]
+    fn direct_virtuals_cache_rereads_concrete_roots_after_collect() {
+        let mut cache = DirectVirtualsCache::new(1);
+        cache.insert(0, Value::Ref(majit_ir::GcRef(0x1000)));
+        assert_eq!(cache.get(0), Some(Value::Ref(majit_ir::GcRef(0x1000))));
+        majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
+            if root.0 == 0x1000 {
+                root.0 = 0x2000;
+            }
+        });
+        assert_eq!(cache.get(0), Some(Value::Ref(majit_ir::GcRef(0x2000))));
+        assert_eq!(cache.live_ptr(0), 0x2000);
+        assert_eq!(cache.live_ref_value(0), Value::Ref(majit_ir::GcRef(0x2000)));
+        assert_eq!(
+            cache.as_direct_virtuals(),
+            vec![Some(majit_ir::GcRef(0x2000))]
+        );
+    }
+
+    /// Guard-failure `typed` / `resolved_vable` are host `Vec<Value>` copies.
+    /// `ResumeDataDirectReader` keeps decoded GCREFs on GC-traced
+    /// `registers_r`; root the Ref interiors so a later allocate's minor
+    /// collection forwards `typed[0]` (the frame) in place.
+    #[test]
+    fn decoded_value_refs_forward_across_simulated_minor() {
+        const FROM_SPACE: usize = 0x1000;
+        const TO_SPACE: usize = 0x2000;
+        let mut typed = Vec::with_capacity(2);
+        let _roots = guard_decoded_value_refs();
+        push_decoded_value(&mut typed, Value::Ref(majit_ir::GcRef(FROM_SPACE)));
+        push_decoded_value(&mut typed, Value::Int(7));
+        majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
+            if root.0 == FROM_SPACE {
+                root.0 = TO_SPACE;
+            }
+        });
+        assert_eq!(typed[0], Value::Ref(majit_ir::GcRef(TO_SPACE)));
+        assert_eq!(typed[1], Value::Int(7));
+    }
+
+    /// TAGBOX fail-arg copies in `dead_frame_typed` are rooted the same way
+    /// so a later `getvirtual_ptr` allocate forwards them before the next
+    /// `cpu.get_ref_value` clone.
+    #[test]
+    fn dead_frame_typed_refs_forward_across_simulated_minor() {
+        const FROM_SPACE: usize = 0x1000;
+        const TO_SPACE: usize = 0x2000;
+        let mut dead_frame = vec![Value::Ref(majit_ir::GcRef(FROM_SPACE)), Value::Int(3)];
+        let _roots = guard_decoded_value_refs();
+        unsafe {
+            root_decoded_value_slice(&mut dead_frame);
+        }
+        majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
+            if root.0 == FROM_SPACE {
+                root.0 = TO_SPACE;
+            }
+        });
+        assert_eq!(dead_frame[0], Value::Ref(majit_ir::GcRef(TO_SPACE)));
+        assert_eq!(dead_frame[1], Value::Int(3));
+    }
+
     #[test]
     fn bridge_descr_storage_replays_pending_field_and_array_writes() {
         #[repr(C)]
@@ -16083,10 +16440,74 @@ mod tests {
             Value::Int(42),
         ];
 
-        replay_pending_fields(&values, &layout, &mut HashMap::new());
+        replay_pending_fields(&values, &layout, &mut DirectVirtualsCache::new(0));
 
         assert_eq!(field_target.value, 41);
         assert_eq!(array_target, [2, 42]);
+    }
+
+    /// Virtual pending-field targets are re-read from `live_ptr` after the
+    /// value is resolved. resume.py ResumeDataDirectReader._prepare_pendingfields
+    /// tracks every ref; pyre must not keep a raw pointer across the value's
+    /// materialize (`getvirtual_ptr` / `abstract_virtual_struct_info_setfields`).
+    #[test]
+    fn replay_pending_fields_rereads_virtual_target_via_live_ptr() {
+        #[repr(C)]
+        struct FieldTarget {
+            value: i64,
+        }
+
+        let mut field_target = FieldTarget { value: 1 };
+        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(1, 0, 8, Type::Int, false),
+        );
+        let tagged_virtual = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGVIRTUAL)
+                .expect("small virtual index is taggable")
+        };
+        let tagged_box = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGBOX)
+                .expect("small fail-argument index is taggable")
+        };
+        let pending = vec![majit_ir::GuardPendingFieldEntry {
+            descr: Some(field_descr),
+            item_index: -1,
+            target: majit_ir::OpRef::input_arg_ref(0),
+            value: majit_ir::OpRef::input_arg_int(0),
+            target_tagged: tagged_virtual(0),
+            value_tagged: tagged_box(0),
+        }];
+        let layout = CompiledExitLayout {
+            rd_loop_token: 1,
+            trace_id: 2,
+            fail_index: 3,
+            source_op_index: None,
+            exit_types: [Type::Int].into_iter().collect(),
+            is_finish: false,
+            is_exception_exit: false,
+            storage: Some(majit_metainterp::resume::new_resume_storage(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                pending,
+            )),
+        };
+        let values = [Value::Int(41)];
+        let mut cache = DirectVirtualsCache::new(1);
+        cache.insert(
+            0,
+            Value::Ref(majit_ir::GcRef(
+                (&mut field_target as *mut FieldTarget) as usize,
+            )),
+        );
+
+        replay_pending_fields(&values, &layout, &mut cache);
+
+        assert_eq!(field_target.value, 41);
+        assert_eq!(
+            cache.live_ptr(0),
+            (&mut field_target as *mut FieldTarget) as usize
+        );
     }
 
     /// `interp_jit.PyPyJitDriver.greens` carries the PyCode object, not the

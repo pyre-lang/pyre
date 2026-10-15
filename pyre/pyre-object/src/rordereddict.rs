@@ -319,6 +319,14 @@ impl<Q: ?Sized + Eq, K: ?Sized + Borrow<Q>> Equivalent<K> for Q {
 }
 
 /// See the module docs.
+///
+/// `dicttable` (`rordereddict.py` `get_ll_dict`) is a `GcStruct` whose field
+/// order is fixed: `num_live_items` sits at a stable offset, and extra eq/hash
+/// state (`fnkeyeq` / `fnkeyhash`) is appended. `repr(C)` keeps that contract
+/// across hasher instantiations — without it `RandomState` (identity-strategy
+/// `RDict<IdentityKey, …>`) is laid out first and `num_live_items` moves,
+/// so a shared `RDict.num_live_items` getfield reads a hasher word.
+#[repr(C)]
 pub struct RDict<K, V, S = RandomState> {
     /// `d.indexes`. Null before the first insert (`ll_newdict` /
     /// `ll_dict_create_initial_index`). Afterwards a power-of-two
@@ -334,8 +342,8 @@ pub struct RDict<K, V, S = RandomState> {
     /// `d.num_live_items`.
     ///
     /// Public so `AbstractTypedStrategy.length` can read the header the way
-    /// `rordereddict.rtype_len` emits `getfield(d, "num_live_items")` when the
-    /// table has no custom eq/hash. A getter call would residualize.
+    /// `rordereddict.rtype_len` emits `getfield(d, "num_live_items")`.
+    /// A getter call would residualize.
     pub num_live_items: usize,
     /// `d.num_ever_used_items`.
     num_ever_used_items: usize,
@@ -417,16 +425,15 @@ impl<K, V, S> RDict<K, V, S> {
 
     /// `d.num_live_items` — the number of pairs, not the number of slots.
     ///
-    /// `rordereddict.rtype_len` emits `getfield(d, "num_live_items")` when the
-    /// table has no custom eq/hash. `ll_dict_len` (`look_inside_iff(isvirtual(d))`)
-    /// residualizes to `ll_dict_len_trampoline` (`dont_look_inside`) otherwise,
-    /// so traced `AbstractTypedStrategy.length` reads this field directly.
+    /// `rordereddict.rtype_len` / `ll_dict_len` is `getfield(d, "num_live_items")`.
     #[inline]
     pub fn num_live_items(&self) -> usize {
         self.num_live_items
     }
 
     /// `d.num_live_items` — the number of pairs, not the number of slots.
+    ///
+    /// `OrderedDictRepr.rtype_len` is `hop.gendirectcall(ll_dict_len, v_dict)`.
     #[inline]
     pub fn len(&self) -> usize {
         ll_dict_len(self)
@@ -1010,8 +1017,7 @@ fn rdict_del_iff<K, V, S>(d: &mut RDict<K, V, S>, _hash: u64, i: usize) -> bool 
     majit_rlib::jit::isvirtual(d) && majit_rlib::jit::isconstant(&i)
 }
 
-/// `ll_dict_grow` / `ll_dict_len` / `_ll_dictnext` `look_inside_iff`:
-/// `jit.isvirtual(d)`.
+/// `ll_dict_grow` / `_ll_dictnext` `look_inside_iff`: `jit.isvirtual(d)`.
 fn rdict_isvirtual<K, V, S>(d: &RDict<K, V, S>) -> bool {
     majit_rlib::jit::isvirtual(d)
 }
@@ -1092,18 +1098,11 @@ where
     }
 }
 
-/// `ll_dict_len` — `d.num_live_items`. look_inside_iff(isvirtual(d)).
+/// `ll_dict_len` (`rordereddict.py`): `return d.num_live_items`.
+///
+/// `OrderedDictRepr.rtype_len` is `hop.gendirectcall(ll_dict_len, v_dict)`.
+/// `AbstractTypedStrategy.length` records this field.
 pub fn ll_dict_len<K, V, S>(d: &RDict<K, V, S>) -> usize {
-    if !majit_rlib::jit::we_are_jitted() || rdict_isvirtual(d) {
-        d.num_live_items
-    } else {
-        ll_dict_len_trampoline(d)
-    }
-}
-
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-pub fn ll_dict_len_trampoline<K, V, S>(d: &RDict<K, V, S>) -> usize {
     d.num_live_items
 }
 
@@ -2318,6 +2317,46 @@ mod tests {
             assert_eq!(d.remove(&key), Some(key));
         }
         check_invariants(&d);
+    }
+
+    #[test]
+    fn ll_dict_len_returns_num_live_items() {
+        let mut d: RDict<u64, u64> = RDict::new();
+        assert_eq!(ll_dict_len(&d), 0);
+        d.insert(1, 2);
+        d.insert(3, 4);
+        assert_eq!(ll_dict_len(&d), 2);
+        assert_eq!(ll_dict_len(&d), d.num_live_items);
+        assert_eq!(d.remove(&1), Some(2));
+        assert_eq!(ll_dict_len(&d), 1);
+    }
+
+    #[test]
+    fn num_live_items_offset_is_stable_across_hasher_instantiations() {
+        use std::hash::BuildHasherDefault;
+        use std::mem::offset_of;
+
+        type Zst = BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+        let zst = offset_of!(RDict<u64, u64, Zst>, num_live_items);
+        let random = offset_of!(RDict<u64, u64, RandomState>, num_live_items);
+        assert_eq!(zst, random);
+        assert_eq!(zst, offset_of!(RDict<u64, u64>, num_live_items));
+        assert_eq!(
+            zst,
+            offset_of!(crate::dictmultiobject::ObjectDictStorage, num_live_items)
+        );
+        assert_eq!(
+            zst,
+            offset_of!(crate::dictmultiobject::IntDictStorage, num_live_items)
+        );
+        assert_eq!(
+            zst,
+            offset_of!(crate::dictmultiobject::BytesDictStorage, num_live_items)
+        );
+        assert_eq!(
+            zst,
+            offset_of!(crate::identitydict::IdentityDictStorage, num_live_items)
+        );
     }
 
     // a reference model: insertion-ordered Vec + linear lookup

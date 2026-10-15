@@ -10041,6 +10041,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+                // `pytraceback.py descr_get_tb_lineno`: getfield + residual
+                // `offset2lineno`. Descend that getter here.
+                if let Some(attr_name) = attr_name.as_deref()
+                    && try_walker_orthodox_traceback_lineno(
+                        ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
+                    )?
+                    .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
                 // A name binding splits `super()` from the later LOAD_ATTR,
                 // but PyPy still traces through the selected property's
                 // getter.  Give that Python descriptor its inline path before

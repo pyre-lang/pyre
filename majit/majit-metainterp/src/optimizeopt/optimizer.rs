@@ -7935,6 +7935,74 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_raw_load_i_force_boxes_virtual_buffer_arg() {
+        // virtualize.py optimize_RAW_LOAD_I: not a stored virtual-raw item.
+        // `return self.emit(op)` then optimizer.py `_emit_operation`
+        // `force_box`es arg0, so a virtual kwargs-storage header is
+        // allocated before the load rather than compiled as a dangling
+        // Unique.
+        use crate::optimizeopt::info::{PtrInfo, RawBufferPtrInfo};
+
+        let malloc_descr = majit_ir::descr::make_call_descr(
+            vec![Type::Int, Type::Int],
+            Type::Int,
+            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::RawMallocVarsizeChar),
+        );
+        let array_descr = majit_ir::descr::make_array_descr(0, 8, Type::Int);
+        let mut ctx = OptContext::with_inputarg_types(16, &[Type::Int, Type::Int]);
+        let call_rc = OpRc::new(Op::with_descr(
+            OpCode::CallI,
+            &[
+                Operand::const_from_value(majit_ir::Value::Int(0x2000)),
+                Operand::const_from_value(majit_ir::Value::Int(24)),
+            ],
+            malloc_descr,
+        ));
+        call_rc.pos().set(OpRef::int_op(10));
+        ctx.register_extra_producer(&call_rc);
+        let b10 = ctx.materialize_operand_at(OpRef::int_op(10));
+        ctx.set_ptr_info(
+            &b10,
+            PtrInfo::VirtualRawBuffer(RawBufferPtrInfo::new(0x2000, 24, call_rc.getdescr())),
+        );
+
+        let mut opt = Optimizer::new();
+        let op = Op::with_descr(
+            OpCode::RawLoadI,
+            &[
+                ctx.materialize_operand_at(OpRef::int_op(10)),
+                Operand::const_from_value(majit_ir::Value::Int(16)),
+            ],
+            array_descr,
+        );
+        let (mut seeded_ops, snapshots) =
+            super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
+        ctx.snapshot_boxes = snapshots;
+        let op = seeded_ops.pop().unwrap();
+        let prior = OpRc::new(op.clone());
+        let _ = opt.emit_operation(op, &prior, &mut ctx, false);
+
+        let opcodes: Vec<OpCode> = ctx.new_operations.iter().map(|op| op.opcode).collect();
+        assert!(
+            opcodes.contains(&OpCode::CallI),
+            "optimizer.py _emit_operation force_boxes a virtual raw buffer before RAW_LOAD; got {opcodes:?}"
+        );
+        assert!(
+            opcodes.contains(&OpCode::RawLoadI),
+            "RAW_LOAD of the forced header remains; got {opcodes:?}"
+        );
+        let call_at = opcodes.iter().position(|&op| op == OpCode::CallI).unwrap();
+        let load_at = opcodes
+            .iter()
+            .position(|&op| op == OpCode::RawLoadI)
+            .unwrap();
+        assert!(
+            call_at < load_at,
+            "force_box emits the header CALL_I before RAW_LOAD; {opcodes:?}"
+        );
+    }
+
+    #[test]
     fn test_emit_operation_forces_imported_short_guard_args() {
         let mut opt = Optimizer::new();
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);

@@ -10331,20 +10331,12 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         )
     };
 
-    // pytraceback.py descr_get_tb_lineno.
+    // pytraceback.py descr_get_tb_lineno.  The named wrapper is the
+    // interp2app fget: its leaf `descr_get_tb_lineno` is the graph the
+    // walker descends on `LOAD_ATTR tb_lineno`.
     let lineno_getter = make_builtin_function_with_arity(
         "tb_lineno",
-        |args| {
-            let tb = args[1];
-            if tb.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            // `tb_lineno_get` answers `None` when the offset names no line.
-            match unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) } {
-                Some(n) => Ok(pyre_object::w_int_new(n)),
-                None => Ok(pyre_object::w_none()),
-            }
-        },
+        crate::pytraceback::__majit_wrap_descr_get_tb_lineno,
         2,
     );
     let lineno_getter_slot = pyre_object::gc_roots::shadow_stack_len();

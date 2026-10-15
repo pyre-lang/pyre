@@ -430,8 +430,6 @@ struct RanFrame {
 
 /// Frame allocated the same way [`alloc_entry_jitframe`] allocates the
 /// entry (`llmodel.py` `realloc_frame`: `jitframe.JITFRAME.allocate`).
-/// `free_jitframe_chain` frees every `jf_forward` node as a host block, so
-/// a realloc must not put a nursery object on a host chain.
 fn malloc_jitframe_like_entry(size_bytes: usize) -> *mut JitFrame {
     if !majit_gc::collector_installed() {
         malloc_host_jitframe(size_bytes)

@@ -3836,20 +3836,22 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::collector::const_ptr_table_test_guard;
     use majit_ir::descr::{ArrayDescr, Descr, DescrRef, SizeDescr};
     use majit_ir::value::{InputArg, Type};
 
     #[test]
     fn remove_ref_constants_interns_forwarded_inputarg_on_label() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         // Compact remap leaves a virtual InputArg at a dead index whose
         // `_forwarded` is Const(Ref). `to_opref` still spells InputArgRef(99);
         // rewrite.py `remove_constptr` sees the Const after get_box_replacement.
         let ia = InputArg::new_ref_rc(99);
         let operand = Operand::from_bound_inputarg(&ia);
-        operand.set_forwarded_const(Const::from_gcref(GcRef(0x1000)));
+        operand.set_forwarded_const(Const::from_gcref(GcRef(0x9C_0000_1100)));
         let label = Op::new(OpCode::Label, &[operand]);
         let (out, gcrefs) = remove_ref_constants(&[label], 0);
-        assert_eq!(gcrefs, vec![GcRef(0x1000)]);
+        assert_eq!(gcrefs, vec![GcRef(0x9C_0000_1100)]);
         assert_eq!(out[0].opcode, OpCode::LoadFromGcTable);
         assert_eq!(out[1].opcode, OpCode::Label);
         assert_eq!(out[1].arg(0).to_opref(), OpRef::ref_op(0));
@@ -4885,6 +4887,7 @@ mod tests {
     /// not re-zero the slot.
     #[test]
     fn test_consider_setfield_gc_drops_overwritten_offset() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
         let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
@@ -4970,6 +4973,7 @@ mod tests {
     /// headerless NEW, so the flush does not re-zero a field the caller wrote.
     #[test]
     fn test_headerless_consider_setfield_gc_drops_overwritten_offset() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
         let gc_fields = vec![ref_field_descr_at(0), ref_field_descr_at(8)];
@@ -5398,6 +5402,7 @@ mod tests {
 
     #[test]
     fn segmented_rewrite_does_not_carry_write_barrier_state() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         // Segment 1 allocates. Segment 2 stores through that result the way
         // a spliced fail arg names it. `GcRewriterAssembler.rewrite` runs
         // once per bridge, so the store still gets a barrier. One trace
@@ -5488,6 +5493,7 @@ mod tests {
 
     #[test]
     fn test_new_with_vtable_initializes_w_class_without_vtable_store() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let mut rw = make_rewriter();
         rw.fielddescr_vtable = None;
         rw.malloc_zero_filled = false;
@@ -5528,6 +5534,7 @@ mod tests {
 
     #[test]
     fn test_new_with_vtable_eagerly_initializes_w_class_without_trace_store() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let mut rw = make_rewriter();
         rw.fielddescr_vtable = None;
         let w_class = 0xD00D;
@@ -5557,6 +5564,7 @@ mod tests {
 
     #[test]
     fn test_new_initializes_w_class_after_clear_gc_fields() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let mut rw = make_rewriter();
         rw.fielddescr_vtable = None;
         rw.malloc_zero_filled = false;
@@ -6956,6 +6964,7 @@ mod tests {
 
     #[test]
     fn test_remove_constptr_emits_load_and_collects_gcref() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let rw = make_rewriter();
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![Op::new(
@@ -6978,6 +6987,7 @@ mod tests {
 
     #[test]
     fn test_remove_constptr_dedup_and_block_cse() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let rw = make_rewriter();
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![
@@ -7014,6 +7024,7 @@ mod tests {
 
     #[test]
     fn test_remove_constptr_distinct_refs() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let rw = make_rewriter();
         let r0 = majit_ir::GcRef(0x4000);
         let r1 = majit_ir::GcRef(0x5000);
@@ -7045,6 +7056,7 @@ mod tests {
 
     #[test]
     fn test_remove_constptr_null_stays_inline() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let rw = make_rewriter();
         let null = majit_ir::GcRef(0);
         let ops = vec![Op::new(
@@ -7066,6 +7078,7 @@ mod tests {
 
     #[test]
     fn test_remove_constptr_cse_resets_at_label() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let rw = make_rewriter();
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![
@@ -7094,6 +7107,7 @@ mod tests {
 
     #[test]
     fn test_jit_debug_keeps_constptr_inline() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         let rw = make_rewriter();
         let r = majit_ir::GcRef(0x4000);
         let ops = vec![Op::new(
@@ -7202,15 +7216,17 @@ mod tests {
 
     #[test]
     fn remove_ref_constants_does_not_load_failarg_constptr_on_the_hot_path() {
+        let _const_ptr_table = const_ptr_table_test_guard();
         // rewrite.py emit_op intern's only op args. A ConstPtr failarg
         // stays a constant; the table still records it so deopt can
         // rematerialize a forwarded address.
         let cond = Op::new(OpCode::IntLt, &[ro(OpRef::int_op(1)), ro(OpRef::int_op(2))]);
         cond.pos().set(OpRef::int_op(3));
         let guard = Op::new(OpCode::GuardTrue, &[ro(OpRef::int_op(3))]);
-        guard.setfailargs(vec![Operand::const_from_value(Value::Ref(GcRef(0x1000)))].into());
+        guard
+            .setfailargs(vec![Operand::const_from_value(Value::Ref(GcRef(0x9C_0000_1000)))].into());
         let (out, gcrefs) = remove_ref_constants(&[cond, guard], 4);
-        assert_eq!(gcrefs, vec![GcRef(0x1000)]);
+        assert_eq!(gcrefs, vec![GcRef(0x9C_0000_1000)]);
         assert!(
             out.iter().all(|op| op.opcode != OpCode::LoadFromGcTable),
             "failarg ConstPtr must not emit a LoadFromGcTable in the stream"
@@ -7224,7 +7240,7 @@ mod tests {
         assert_eq!(fail_args.len(), 1);
         assert_eq!(
             fail_args[0].const_value(),
-            Some(Value::Ref(GcRef(0x1000))),
+            Some(Value::Ref(GcRef(0x9C_0000_1000))),
             "failarg stays a ConstPtr for deopt rematerialize"
         );
     }

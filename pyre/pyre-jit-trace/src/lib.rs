@@ -169,6 +169,32 @@ pub(crate) fn trace_ctx_for_test(num_inputs: usize) -> majit_metainterp::TraceCt
     majit_metainterp::TraceCtx::for_test(num_inputs)
 }
 
+/// Put the original address back. `intern` finds a slot by the address
+/// currently stored there, so a forwarded slot would mint a second index.
+#[cfg(test)]
+pub(crate) struct RestoreConstPtr {
+    pub index: u32,
+    pub addr: majit_ir::GcRef,
+}
+
+#[cfg(test)]
+impl RestoreConstPtr {
+    pub fn intern(addr: usize) -> Self {
+        let addr = majit_ir::GcRef(addr);
+        Self {
+            index: majit_ir::const_ptr_table::intern(addr),
+            addr,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RestoreConstPtr {
+    fn drop(&mut self) {
+        majit_ir::const_ptr_table::set_slot(self.index, self.addr);
+    }
+}
+
 // pyre-jit-trace local invariant: PyFrame's `_virtualizable_` declares
 // exactly one extra red (ec, see `virtualizable_gen.rs`'s `extra_reds` and
 // `pypy/module/pypyjit/interp_jit.py reds = ['frame', 'ec']`).

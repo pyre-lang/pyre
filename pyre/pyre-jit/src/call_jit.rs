@@ -3810,16 +3810,15 @@ pub fn trace_and_compile_from_bridge(
     if bridge_bail_stage() == 2 {
         return BridgeResolution::ResumeBlackhole;
     }
-    let Some(crate::eval::DecodedGuardFailure {
-        resume_pc,
-        num_resume_frames,
-        coords: resume_coords,
-        direct_virtuals,
-        ..
-    }) = decoded_resume
-    else {
+    let Some(decoded_resume) = decoded_resume else {
         return BridgeResolution::ResumeBlackhole;
     };
+    // Keep `virtuals_cache` rooted across the rest of this function:
+    // `start_bridge_tracing` calls `ensure_type_registry_closed` before
+    // `BridgeVirtualCache::recording` takes the seed (`getvirtual_ptr`).
+    let resume_pc = decoded_resume.resume_pc;
+    let num_resume_frames = decoded_resume.num_resume_frames;
+    let resume_coords = &decoded_resume.coords;
     let is_multiframe_resume = num_resume_frames > 1;
     // `resume_pc` addresses the INNERMOST resumed section, so for a
     // multi-frame guard it is a pc in an inlined callee's own code object.
@@ -3883,7 +3882,7 @@ pub fn trace_and_compile_from_bridge(
             // the virtualizable — so the replay owes recording only, seeded
             // with the objects that reader allocated.
             false,
-            &direct_virtuals,
+            &decoded_resume.all_virtuals(),
         )
     };
     if !started {

@@ -30014,7 +30014,7 @@ mod tests {
         let op = mk_op(
             OpCode::PtrEq,
             &[
-                OpRef::const_ptr(GcRef(0x4000)),
+                OpRef::const_ptr(GcRef(0x97_0000_4000)),
                 OpRef::const_ptr(GcRef::NULL),
             ],
             10,
@@ -30025,12 +30025,15 @@ mod tests {
         });
 
         meta.walk_partial_trace_refs(|slot| match slot.0 {
-            0x4000 => slot.0 = 0x5000,
+            0x97_0000_4000 => slot.0 = 0x97_0000_5000,
             _ => {}
         });
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
-        assert_eq!(ops[0].arg(0).to_opref().as_const_ptr(), Some(GcRef(0x5000)));
+        assert_eq!(
+            ops[0].arg(0).to_opref().as_const_ptr(),
+            Some(GcRef(0x97_0000_5000))
+        );
         // `opencoder.py Trace._refs[0]` reserves null and never registers it
         // with the GC root tracer. `Operand::NullRef` carries that immutable
         // sentinel inline, so only the non-null ConstPtr above is forwarded.
@@ -30067,6 +30070,19 @@ mod tests {
         assert_eq!(fail_args[1].to_opref(), OpRef::const_int(123));
     }
 
+    /// Put the original address back. `intern` finds a slot by the address
+    /// currently stored there, so a forwarded slot would mint a second index.
+    struct RestoreConstPtr {
+        index: u32,
+        addr: GcRef,
+    }
+
+    impl Drop for RestoreConstPtr {
+        fn drop(&mut self) {
+            majit_ir::const_ptr_table::set_slot(self.index, self.addr);
+        }
+    }
+
     #[test]
     fn walk_active_trace_refs_forwards_inline_const_ptr() {
         // history.py `ConstPtr.value` parity for the in-progress
@@ -30075,22 +30091,28 @@ mod tests {
         // `Trace::ops` Vec.
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        let addr = GcRef(0x92_0000_A000);
+        let index = majit_ir::const_ptr_table::intern(addr);
+        let _restore = RestoreConstPtr { index, addr };
         trace_ctx.recorder.push_op_for_test(mk_op(
             OpCode::PtrEq,
-            &[OpRef::const_ptr(GcRef(0xA000)), OpRef::input_arg_int(0)],
+            &[OpRef::const_ptr(addr), OpRef::input_arg_int(0)],
             5,
         ));
         meta.tracing = Some(trace_ctx);
 
         meta.walk_active_trace_refs(|slot| {
-            if slot.0 == 0xA000 {
-                slot.0 = 0xB000;
+            if slot.0 == 0x92_0000_A000 {
+                slot.0 = 0x92_0000_B000;
             }
         });
 
         meta.tracing.as_mut().unwrap().ensure_ops_materialized();
         let ops = meta.tracing.as_ref().unwrap().recorder.ops();
-        assert_eq!(ops[0].arg(0).to_opref().as_const_ptr(), Some(GcRef(0xB000)));
+        assert_eq!(
+            ops[0].arg(0).to_opref().as_const_ptr(),
+            Some(GcRef(0x92_0000_B000))
+        );
     }
 
     #[test]
@@ -30183,19 +30205,6 @@ mod tests {
         ));
     }
 
-    /// Put the original address back. `intern` finds a slot by the address
-    /// currently stored there, so a forwarded slot would mint a second index.
-    struct RestoreConstPtr {
-        index: u32,
-        addr: GcRef,
-    }
-
-    impl Drop for RestoreConstPtr {
-        fn drop(&mut self) {
-            majit_ir::const_ptr_table::set_slot(self.index, self.addr);
-        }
-    }
-
     #[test]
     fn walk_active_trace_refs_forwards_snapshot_const_ptr() {
         // `get_list_of_active_snapshot_boxes` copies a constant ref register's
@@ -30268,7 +30277,10 @@ mod tests {
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
         let input = trace_ctx.recorder.inputargs()[0].opref();
         trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
-        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (OpRef::const_ptr(GcRef(0xA000)), 0)];
+        let addr = GcRef(0x93_0000_A000);
+        let index = majit_ir::const_ptr_table::intern(addr);
+        let _restore = RestoreConstPtr { index, addr };
+        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (OpRef::const_ptr(addr), 0)];
         meta.tracing = Some(trace_ctx);
 
         meta.walk_active_trace_refs(|slot| {
@@ -30278,15 +30290,15 @@ mod tests {
             if slot.0 == 0x9000 {
                 slot.0 = 0x9100;
             }
-            if slot.0 == 0xA000 {
-                slot.0 = 0xB000;
+            if slot.0 == 0x93_0000_A000 {
+                slot.0 = 0x93_0000_B000;
             }
         });
 
         assert_eq!(meta.tracing.as_ref().unwrap().box_bits(input), Some(0x8000));
         let boxes = &meta.tracing.as_ref().unwrap().virtualref_boxes;
         assert_eq!(boxes[0].1, 0x9100);
-        assert_eq!(boxes[1].0, OpRef::const_ptr(GcRef(0xB000)));
+        assert_eq!(boxes[1].0, OpRef::const_ptr(GcRef(0x93_0000_B000)));
     }
 
     #[test]
@@ -30493,7 +30505,9 @@ mod tests {
         descr
             .as_fail_descr()
             .expect("resume guard")
-            .set_rd_consts(Some(vec![majit_ir::Const::from_gcref(GcRef(0x1000))]));
+            .set_rd_consts(Some(vec![majit_ir::Const::from_gcref(GcRef(
+                0x96_0000_1000,
+            ))]));
         let mut exit_layouts = crate::FxIndexMap::default();
         exit_layouts.insert(
             0,
@@ -30548,8 +30562,8 @@ mod tests {
         meta.remember_compiled_graph_write();
         meta.walk_rd_consts_refs(|slot| {
             seen += 1;
-            if slot.0 == 0x1000 {
-                *slot = GcRef(0x2000);
+            if slot.0 == 0x96_0000_1000 {
+                *slot = GcRef(0x96_0000_2000);
             }
         });
         assert_eq!(seen, 1, "a dirty pool traces its Const::Ref slot");
@@ -30561,7 +30575,7 @@ mod tests {
                 .expect("pool")[0],
             stored
         );
-        assert_eq!(stored.getref_base(), GcRef(0x2000));
+        assert_eq!(stored.getref_base(), GcRef(0x96_0000_2000));
         meta.walk_rd_consts_refs(|_| seen += 1);
         assert_eq!(seen, 1, "the publication barrier is consumed once");
 
@@ -30582,7 +30596,7 @@ mod tests {
         let pred_tt = crate::history::TargetToken::new_loop(11);
         let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
         sp.constants
-            .insert(0, majit_ir::Const::from_gcref(GcRef(0x3000)));
+            .insert(0, majit_ir::Const::from_gcref(GcRef(0x95_0000_3000)));
         pred_tt.attrs().short_preamble = Some(sp);
 
         let pred = std::sync::Arc::new(JitCellToken::new(11));
@@ -30609,7 +30623,7 @@ mod tests {
         meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
         assert_eq!(
             seen,
-            vec![0x3000],
+            vec![0x95_0000_3000],
             "a predecessor JCT's TargetToken.short_preamble is a root \
              the same way the live token's descr pools are"
         );
@@ -30626,7 +30640,7 @@ mod tests {
         let kept_tt = crate::history::TargetToken::new_loop(12);
         let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
         sp.constants
-            .insert(0, majit_ir::Const::from_gcref(GcRef(0x4000)));
+            .insert(0, majit_ir::Const::from_gcref(GcRef(0x94_0000_4000)));
         kept_tt.attrs().short_preamble = Some(sp);
 
         let kept = std::sync::Arc::new(JitCellToken::new(12));
@@ -30656,7 +30670,7 @@ mod tests {
         meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
         assert_eq!(
             seen,
-            vec![0x4000],
+            vec![0x94_0000_4000],
             "a JUMP target kept only through keepalive_tokens is a root \
              the same way a previous_tokens predecessor is"
         );
@@ -32177,8 +32191,10 @@ mod tests {
         let ctx = meta.trace_ctx().expect("expected active trace context");
         ctx.ensure_ops_materialized();
         assert_eq!(
-            ctx.initial_inputarg_consts.first().copied(),
-            Some(OpRef::const_ptr(majit_ir::GcRef(forwarded)))
+            ctx.initial_inputarg_consts
+                .first()
+                .and_then(|op| op.as_const_ptr()),
+            Some(majit_ir::GcRef(forwarded))
         );
         assert_eq!(
             ctx.virtualizable_entry_at(0),

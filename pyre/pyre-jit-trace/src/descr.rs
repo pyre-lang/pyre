@@ -2509,6 +2509,57 @@ static W_DICT_STRATEGY_WORD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     )
 });
 
+/// `W_DictViewObject` — `w_dict` back-pointer plus the Keys/Values/Items
+/// kind tag.  Three Python-visible types share this layout
+/// (`DICT_KEYS_TYPE` / `DICT_VALUES_TYPE` / `DICT_ITEMS_TYPE`); the size
+/// descr names the keys type, and `fuse_boxing_alloc` captures the
+/// constructor's actual `ob_type` into `NewWithVtable.vtable`.
+/// `W_DictViewKeysObject.__init__` (`dictmultiobject.py`) is a two-field
+/// store; without this group `malloc_typed_managed` stays an un-lowered
+/// helper and a traced `d.keys()` declines descent.
+static W_DICT_VIEW_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::dictmultiobject::{
+        DICT_KEYS_TYPE, DICT_VIEW_KIND_OFFSET, DICT_VIEW_W_DICT_OFFSET, W_DICT_VIEW_GC_TYPE_ID,
+        W_DICT_VIEW_OBJECT_SIZE,
+    };
+    build_object_descr_group_with_def_path(
+        W_DICT_VIEW_OBJECT_SIZE,
+        W_DICT_VIEW_GC_TYPE_ID,
+        &DICT_KEYS_TYPE as *const _ as usize,
+        &[
+            (
+                "kind",
+                DICT_VIEW_KIND_OFFSET,
+                std::mem::size_of::<pyre_object::dictmultiobject::DictViewKind>(),
+                Type::Int,
+                false,
+                true,
+                false,
+            ),
+            (
+                "w_dict",
+                DICT_VIEW_W_DICT_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_DictViewObject",
+        "dictmultiobject::W_DictViewObject",
+    )
+});
+
 /// `Method` field layout — `w_function`, `w_self`, `w_class`, `w_module`,
 /// `lifeline`. All five are Ref slots; the JIT only consumes `w_function` (for guarding
 /// which method) and `w_self` (for recovering the receiver `OpRef` discarded
@@ -11377,6 +11428,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
         LazyLock::force(&W_DICT_DESCR_GROUP);
         LazyLock::force(&W_DICT_LOOKUP_NS_DESCR);
         LazyLock::force(&W_DICT_STRATEGY_WORD_DESCR);
+    }),
+    ("dictmultiobject::W_DictViewObject", || {
+        LazyLock::force(&W_DICT_VIEW_DESCR_GROUP);
     }),
     ("celldict::ObjectMutableCell", || {
         LazyLock::force(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP);

@@ -2163,28 +2163,31 @@ mod tests {
     fn const_ptr_operands_share_the_trace_ref_pool_and_rekey_after_gc() {
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Ref);
-        let old = OpRef::const_ptr(GcRef(0x1000));
+        let old = OpRef::const_ptr(GcRef(0x98_0000_1000));
         rec.record_op(OpCode::SameAsR, &[old]);
         rec.record_op(OpCode::SameAsR, &[old]);
         {
             let trb = rec.trb.as_ref().expect("byte buffer");
             assert_eq!(trb._refs_dict.len(), 1, "same address interned once");
-            assert_eq!(trb._refs.iter().filter(|&&a| a == 0x1000).count(), 1);
+            assert_eq!(
+                trb._refs.iter().filter(|&&a| a == 0x98_0000_1000).count(),
+                1
+            );
         }
 
         rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
         let trb = rec.trb.as_ref().expect("byte buffer");
-        assert!(trb._refs.iter().any(|&a| a == 0x2000));
-        assert!(!trb._refs.iter().any(|&a| a == 0x1000));
-        assert_eq!(trb._refs_dict.get(&0x2000).copied(), Some(1));
+        assert!(trb._refs.iter().any(|&a| a == 0x98_0000_2000));
+        assert!(!trb._refs.iter().any(|&a| a == 0x98_0000_1000));
+        assert_eq!(trb._refs_dict.get(&0x98_0000_2000).copied(), Some(1));
     }
 
     #[test]
     fn ref_pool_gc_visits_each_box_once_and_rekeys_overlapping_addresses() {
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Ref);
-        let constants: Vec<_> = (1..=4)
-            .map(|i| OpRef::const_ptr(GcRef(i * 0x1000)))
+        let constants: Vec<_> = (1usize..=4)
+            .map(|i| OpRef::const_ptr(GcRef(0x99_0000_0000 + i * 0x1000)))
             .collect();
         for &constant in &constants {
             rec.record_op(OpCode::SameAsR, &[constant]);
@@ -2196,11 +2199,19 @@ mod tests {
             reference.0 += 0x1000;
         });
         visited.sort_unstable();
-        assert_eq!(visited, vec![0x1000, 0x2000, 0x3000, 0x4000]);
+        assert_eq!(
+            visited,
+            vec![
+                0x99_0000_1000,
+                0x99_0000_2000,
+                0x99_0000_3000,
+                0x99_0000_4000
+            ]
+        );
         let trb = rec.trb.as_ref().expect("byte buffer");
         assert_eq!(trb._refs_dict.len(), 4);
-        for i in 1..=4 {
-            let address = ((i + 1) * 0x1000) as u64;
+        for i in 1usize..=4 {
+            let address = (0x99_0000_0000 + (i + 1) * 0x1000) as u64;
             assert!(
                 trb._refs.iter().any(|&a| a == address),
                 "forwarded {address:#x} missing from _refs"
@@ -2651,14 +2662,14 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Ref);
         rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
-        let cptr = OpRef::const_ptr(GcRef(0x1000));
+        let cptr = OpRef::const_ptr(GcRef(0x9A_0000_1000));
         rec.record_op(OpCode::GetfieldGcR, &[cptr]);
         rec.record_guard(OpCode::GuardTrue, &[i0], None);
         rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
         rec.materialize_into_ops();
         assert_eq!(
             rec.ops()[0].arg(0).to_opref(),
-            OpRef::const_ptr(GcRef(0x2000))
+            OpRef::const_ptr(GcRef(0x9A_0000_2000))
         );
         assert!(rec.ops()[1].guard_fail_args().is_none());
     }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::RestoreConstPtr;
 use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
 use majit_ir::Type;
 use majit_metainterp::{
@@ -10,6 +11,13 @@ static STATIC_REFUSAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
 
 #[test]
 fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
+    const BASE: usize = 0x95_0000_0000;
+    let _restore = [
+        RestoreConstPtr::intern(BASE + 0x1020),
+        RestoreConstPtr::intern(BASE + 0x2020),
+        RestoreConstPtr::intern(BASE + 0x3020),
+        RestoreConstPtr::intern(BASE + 0x4000),
+    ];
     let _runtime = crate::trace_ctx_for_test(0);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
     let outer = std::cell::RefCell::new(WalkSession::default());
@@ -37,14 +45,14 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
         result_slot: CallResultSlot::Unknown,
     };
     let frames = vec![
-        InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x1000)]),
-        InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x2000)]),
+        InlineFrameGuard::enter(&outer, 0, false, vec![parent(BASE + 0x1000)]),
+        InlineFrameGuard::enter(&outer, 0, false, vec![parent(BASE + 0x2000)]),
     ];
-    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, vec![parent(0x3000)]);
+    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, vec![parent(BASE + 0x3000)]);
     let forward = || {
         let mut seen = Vec::new();
         majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-            if (0x1000..0x5000).contains(&root.0) {
+            if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
                 seen.push(root.0);
                 root.0 += 0x80;
             }
@@ -55,21 +63,39 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     assert_eq!(
         forward(),
         [
-            0x1000, 0x1010, 0x1020, 0x2000, 0x2010, 0x2020, 0x3000, 0x3010, 0x3020
+            BASE + 0x1000,
+            BASE + 0x1010,
+            BASE + 0x1020,
+            BASE + 0x2000,
+            BASE + 0x2010,
+            BASE + 0x2020,
+            BASE + 0x3000,
+            BASE + 0x3010,
+            BASE + 0x3020
         ]
     );
     drop(inner_frame);
     drop(inner_roots);
-    assert_eq!(forward(), [0x1080, 0x1090, 0x10a0, 0x2080, 0x2090, 0x20a0]);
+    assert_eq!(
+        forward(),
+        [
+            BASE + 0x1080,
+            BASE + 0x1090,
+            BASE + 0x10a0,
+            BASE + 0x2080,
+            BASE + 0x2090,
+            BASE + 0x20a0
+        ]
+    );
     // Bridge reconstruction stores frame guards in a Vec; their drop order
     // must not control the session owner's root registration lifetime.
     drop(frames);
     assert!(outer.borrow().at_portal());
-    outer.borrow_mut().tmpreg_r = OpRef::const_ptr(majit_ir::GcRef(0x4000));
-    assert_eq!(forward(), [0x4000]);
+    outer.borrow_mut().tmpreg_r = OpRef::const_ptr(majit_ir::GcRef(BASE + 0x4000));
+    assert_eq!(forward(), [BASE + 0x4000]);
     assert_eq!(
         outer.borrow().tmpreg_r,
-        OpRef::const_ptr(majit_ir::GcRef(0x4080))
+        OpRef::const_ptr(majit_ir::GcRef(BASE + 0x4080))
     );
     drop(outer_roots);
     assert!(forward().is_empty());
@@ -77,6 +103,8 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
 
 #[test]
 fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
+    const BASE: usize = 0x96_0000_0000;
+    let _restore = RestoreConstPtr::intern(BASE + 0x1020);
     let _runtime = crate::trace_ctx_for_test(0);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -101,29 +129,38 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
         caller_py_pc: None,
         result_slot: CallResultSlot::Unknown,
     };
-    let pre_call = parent(0x1000);
+    let pre_call = parent(BASE + 0x1000);
     let stale = pre_call.clone();
     let frame = InlineFrameGuard::enter(&session, 0, false, vec![pre_call]);
     majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-        if (0x1000..0x2000).contains(&root.0) {
+        if (BASE + 0x1000..BASE + 0x2000).contains(&root.0) {
             root.0 += 0x80;
         }
     });
-    assert_eq!(stale.call_stack_overrides[0].1 as usize, 0x1000);
+    assert_eq!(stale.call_stack_overrides[0].1 as usize, BASE + 0x1000);
     assert_eq!(
         stale.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
-        0x1010
+        BASE + 0x1010
     );
-    assert_eq!(stale.boxes[0], OpRef::const_ptr(majit_ir::GcRef(0x1020)));
     let live = frame
         .rooted_immediate_caller()
         .expect("the level stores the immediate caller");
-    assert_eq!(live.call_stack_overrides[0].1 as usize, 0x1080);
+    // ConstPtr is a table index. The clone and the live frame share one
+    // slot, so the collector's in-place write is visible through both.
+    assert_eq!(stale.boxes[0], live.boxes[0]);
+    assert_eq!(
+        stale.boxes[0].as_const_ptr(),
+        Some(majit_ir::GcRef(BASE + 0x10a0))
+    );
+    assert_eq!(live.call_stack_overrides[0].1 as usize, BASE + 0x1080);
     assert_eq!(
         live.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
-        0x1090
+        BASE + 0x1090
     );
-    assert_eq!(live.boxes[0], OpRef::const_ptr(majit_ir::GcRef(0x10a0)));
+    assert_eq!(
+        live.boxes[0],
+        OpRef::const_ptr(majit_ir::GcRef(BASE + 0x10a0))
+    );
     drop(frame);
     drop(roots);
 }
@@ -156,22 +193,24 @@ fn finish_payload_of(outcome: &DispatchOutcome) -> Option<(OpRef, Type)> {
 
 #[test]
 fn finish_payload_root_walker_writes_back_forwarded_const_ptr() {
+    const BASE: usize = 0x97_0000_0000;
+    let _restore = RestoreConstPtr::intern(BASE + 0x1000);
     let _runtime = crate::trace_ctx_for_test(0);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
     let session = std::cell::RefCell::new(WalkSession {
-        finish_payload: Some((OpRef::const_ptr(majit_ir::GcRef(0x1000)), Type::Ref)),
+        finish_payload: Some((OpRef::const_ptr(majit_ir::GcRef(BASE + 0x1000)), Type::Ref)),
         ..WalkSession::default()
     });
     let _roots = WalkSessionRoots::new(&session);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
     majit_gc::shadow_stack::walk_my_extra_areas(|gcref| {
-        if gcref.0 == 0x1000 {
-            gcref.0 = 0x2000;
+        if gcref.0 == BASE + 0x1000 {
+            gcref.0 = BASE + 0x2000;
         }
     });
     assert_eq!(
         session.borrow().finish_payload,
-        Some((OpRef::const_ptr(majit_ir::GcRef(0x2000)), Type::Ref))
+        Some((OpRef::const_ptr(majit_ir::GcRef(BASE + 0x2000)), Type::Ref))
     );
 }
 
@@ -4871,6 +4910,39 @@ fn newcomplex_and_lane_getters_are_the_pypy_leaf() {
             "{path} must carry assembled bytecode"
         );
     }
+}
+
+#[test]
+fn descr_get_tb_lineno_is_the_pypy_leaf() {
+    // pytraceback.py `descr_get_tb_lineno` / `get_lineno`: getfield the
+    // slot, then residual `offset2lineno` (`location.py _offset2lineno`
+    // is a loop `look_inside_graph` refuses). LOAD_ATTR of `tb_lineno`
+    // descends this graph instead of residualising `bh_load_attr_fn`.
+    let path = "pyre_interpreter::pytraceback::descr_get_tb_lineno";
+    let getter = crate::jitcode_runtime::pathed_jitcode(path)
+        .expect("descr_get_tb_lineno must be a discovered jitcode");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&getter.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        !getter.code.is_empty(),
+        "{path} must carry assembled bytecode; ops={ops:?}"
+    );
+    // Slot reads lower as `inline_call` of the `#[inline]` accessors
+    // (`w_pytraceback_get_lineno_raw` / `get_w_code` / `get_lasti`).
+    assert!(
+        ops.iter().any(|op| *op == "inline_call_r_i"),
+        "{path} must read the integer slots; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| *op == "residual_call_ir_i"),
+        "{path} must residualise offset2lineno; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| op.contains("call_may_force") || op.contains("getattr")),
+        "{path} must not force through getattr; ops={ops:?}"
+    );
 }
 
 #[test]

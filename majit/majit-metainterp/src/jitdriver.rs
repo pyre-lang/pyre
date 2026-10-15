@@ -10843,6 +10843,32 @@ impl<S: JitState> JitDriver<S> {
         // `all_virtuals`). Empty for an applying entry.
         all_virtuals: &[Option<majit_ir::GcRef>],
     ) -> bool {
+        // `resume.py virtuals_cache` lives on the DirectReader through
+        // `rebuild_from_resumedata` and into the BoxReader that follows.
+        // The seed slice is a copy of those GC pointers; root it before
+        // `ensure_type_registry_closed` (and the rest of this setup) can
+        // collect, then re-read when `BridgeVirtualCache::recording` takes
+        // over (`getvirtual_ptr` returns the cache slot).
+        let mut seed_roots: Vec<i64> = all_virtuals
+            .iter()
+            .map(|slot| slot.map(|r| r.as_usize() as i64).unwrap_or(0))
+            .collect();
+        let seed_present: Vec<bool> = all_virtuals.iter().map(Option::is_some).collect();
+        let seed_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        if !seed_roots.is_empty() {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut seed_roots);
+            }
+        }
+        struct SeedRootsGuard {
+            depth: usize,
+        }
+        impl Drop for SeedRootsGuard {
+            fn drop(&mut self) {
+                majit_gc::shadow_stack::pop_resume_ref_roots_to(self.depth);
+            }
+        }
+        let _seed_roots_guard = SeedRootsGuard { depth: seed_depth };
         // Same close as `force_start_tracing`: bridge codegen reads
         // `type_info_group` (`gctypelayout.py encode_type_shapes_now`).
         majit_gc::ensure_type_registry_closed();
@@ -11282,11 +11308,18 @@ impl<S: JitState> JitDriver<S> {
                     frontend_fail_values,
                     &retrace.fail_types,
                 ),
-                None => crate::BridgeVirtualCache::recording(
-                    virtual_count,
-                    S::mint_bridge_array_descr,
-                    all_virtuals,
-                ),
+                None => {
+                    let all_virtuals: Vec<Option<majit_ir::GcRef>> = seed_present
+                        .iter()
+                        .zip(seed_roots.iter())
+                        .map(|(&present, &addr)| present.then_some(majit_ir::GcRef(addr as usize)))
+                        .collect();
+                    crate::BridgeVirtualCache::recording(
+                        virtual_count,
+                        S::mint_bridge_array_descr,
+                        &all_virtuals,
+                    )
+                }
             };
             {
                 let ctx = self

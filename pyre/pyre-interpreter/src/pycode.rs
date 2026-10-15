@@ -4062,6 +4062,14 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 ///
 /// # Safety
 /// `w_code` must be a live `PyCode`.
+///
+/// `location.py _offset2lineno` walks the linetable in a loop, so
+/// `look_inside_graph` refuses it and `offset2lineno` is a residual call
+/// from `pytraceback.py get_lineno`.  The memo plus `code_addr2line` here
+/// is that helper; `#[dont_look_inside]` keeps the same residual so the
+/// `descr_get_tb_lineno` descent records getfield + this call, not the
+/// table walk.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
     unsafe {
         let code = w_code_get_ptr(w_code) as *const crate::CodeObject;

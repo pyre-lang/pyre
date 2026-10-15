@@ -6096,6 +6096,11 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
 /// `__len__` descriptor and return its still-wrapped result.  The public
 /// [`len`] and [`len_w`] operations below perform the mandatory index,
 /// nonnegative, and machine-word checks around this primitive.
+///
+/// Inlined into [`len_w`] so `__majit_wrap_builtin_len` records `len_slot`
+/// rather than a nested CALL whose `symbolic_fnaddr` aborts
+/// `BuiltinLenDescent` with `OrthodoxSubWalkTraceUnsupported`.
+#[inline]
 fn _len(obj: PyObjectRef) -> PyResult {
     // descroperation.py `_len` — a builtin subclass overriding
     // `__len__` dispatches the override (bound via `get_and_call_function`);
@@ -6177,6 +6182,12 @@ pub fn len(obj: PyObjectRef) -> PyResult {
 /// subclasses, and bound directly as the `list`/`str` `__len__` slot so a
 /// subclass override's `super().__len__` resolves to the inherited builtin
 /// length instead of re-entering override dispatch (which would recurse).
+///
+/// Inlined with [`_len`] / [`len_w`] so `BuiltinLenDescent` records the
+/// layout arms (`is_dict`, `is_dict_view`, `w_list_len`, …) inside
+/// `__majit_wrap_builtin_len`.  A nested CALL to this function is the same
+/// `symbolic_fnaddr` abort as `len_w`.
+#[inline]
 pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
     // `pypy/objspace/std/dictproxyobject.py descr_len` →
     // `space.len(self.w_mapping)`.
@@ -17495,6 +17506,13 @@ fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
 /// `space.index` (descroperation.py `_index` + line 622 `index`)
 /// before `_check_len_result` so `__index__` is consulted but `__int__`
 /// is NOT — matching PyPy's stricter contract.
+///
+/// Inlined into `__majit_wrap_builtin_len` (`newint(len_w(obj))`).  Left as
+/// its own CALL, the codewriter emits a `symbolic_fnaddr` and the nested
+/// walk of that wrapper aborts `OrthodoxSubWalkTraceUnsupported`.
+/// [`len`] stays `inline(never)` because `flatten.rs` `LEN` needs a named
+/// graph for GET_LEN.
+#[inline]
 pub fn len_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
     len_result_tail(_len(w_obj)?)
 }

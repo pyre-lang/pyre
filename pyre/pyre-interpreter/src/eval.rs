@@ -7222,6 +7222,8 @@ result = (
         use std::sync::atomic::Ordering;
 
         let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _signal_lock =
+            crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         // A collector requesting STW must hold the GIL.
         crate::module::thread::ensure_runtime_thread();
         let _restore = restore_declaration_test_state();
@@ -7278,6 +7280,8 @@ result = (
         use std::sync::atomic::Ordering;
 
         let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _signal_lock =
+            crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
         // A collector requesting STW must hold the GIL.
         crate::module::thread::ensure_runtime_thread();
         let _restore = restore_declaration_test_state();

@@ -2817,7 +2817,7 @@ fn register_call_assembler_target(
     // — the assembler body. The host-ABI wrapper stays on `entry_code_ptr`
     // for `execute_token`; in-code CALL_ASSEMBLER loads this slot.
     token.set_ll_function_addr(entry_body as usize);
-    let depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
+    let depth = compiled.frame_depth as i64;
     let base_ofs = JF_FRAME_ITEM0_OFS as i64;
     // Preserve an existing registered CLT Arc when this token number is
     // re-registered, so metadata pointers already baked into callers remain
@@ -9914,6 +9914,11 @@ struct CompiledLoop {
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
+    /// `assembler.py assemble_loop` / `jitframeinfo_update_depth`:
+    /// `max(own, baked JUMP target)` (`guaranteed_frame_depth`).
+    /// `make_execute_token` sizes the entry from `clt.frame_info`, which
+    /// this value is published as.
+    frame_depth: usize,
     /// `compile.py setattr(cpu, name, descr)` — heap-stable clone of
     /// the owning `CraneliftBackend`'s per-cpu descr attachments.  The
     /// JIT-emitted CALL_ASSEMBLER slow path bakes this Arc's address as
@@ -20139,6 +20144,7 @@ impl CraneliftBackend {
             num_inputs: inputargs.len(),
             num_ref_roots: reserved_tail,
             max_output_slots,
+            frame_depth: guaranteed_frame_depth as usize,
             cpu_attachments: self.cpu_handle(),
             gc_table,
             gcmap_allocs,
@@ -21490,7 +21496,7 @@ impl CraneliftBackend {
         if let Some(table) = merged.gc_table.clone() {
             self.register_gc_table(token, table);
         }
-        let depth = merged.max_output_slots + merged.num_ref_roots;
+        let depth = merged.frame_depth;
         let code_ptr = merged.code_ptr as usize;
         let body_ptr = merged.body_ptr as usize;
         let family_entry = LoopTargetEntry {
@@ -21546,8 +21552,17 @@ impl CraneliftBackend {
         compiled: &CompiledLoop,
         args: &[i64],
     ) -> (*mut JitFrame, *mut JitFrame, usize, usize) {
-        let depth = compiled.max_output_slots.max(args.len()).max(1);
-        let num_slots = depth + compiled.num_ref_roots;
+        // `llmodel.py` `AbstractLLCPU.make_execute_token`:
+        // `frame = self.gc_ll_descr.malloc_jitframe(clt.frame_info)`.
+        // Dynasm `run_done_raw_entry` reads `frame_info.depth()` the same
+        // way. Own `max_output_slots + num_ref_roots` is below the
+        // prologue `_check_frame_depth` when a baked JUMP target is
+        // wider (`guaranteed_frame_depth`); that miss is
+        // `cranelift_realloc_frame` on every call.
+        let clt = unsafe { &*token.compiled_loop_token_ptr() };
+        let fi_depth = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
+        let own = compiled.max_output_slots.max(args.len()).max(1) + compiled.num_ref_roots;
+        let num_slots = fi_depth.max(own);
         let facts = self.jitframe_facts;
         let jf_ptr = unsafe { prepare_done_raw_entry_frame(token, args, 0, num_slots, facts) };
         let code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
@@ -21976,7 +21991,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // CALL_ASSEMBLER callee frames.  The GC rewriter reads the
         // CompiledLoopToken.frame_info pointer at runtime, so update the
         // original token in place just like RPython's update_frame_depth.
-        let bridge_frame_depth = (compiled.max_output_slots + compiled.num_ref_roots) as i64;
+        let bridge_frame_depth = compiled.frame_depth as i64;
         let baseofs = JF_FRAME_ITEM0_OFS as i64 + GcHeader::SIZE as i64;
         if let Some(clt) = original_token.compiled_loop_token() {
             clt.frame_info
@@ -24358,6 +24373,7 @@ mod tests {
 
     #[test]
     fn loop_invariant_deopt_ref_with_preamble_use_survives_nursery_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24406,6 +24422,7 @@ mod tests {
     /// address. A later LABEL's fall-through must therefore not re-store it.
     #[test]
     fn a_later_labels_fallthrough_keeps_an_already_demoted_refs_forwarded_home() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24477,6 +24494,7 @@ mod tests {
     /// Int as a reference from the second iteration on.
     #[test]
     fn a_loop_labels_first_call_does_not_trace_a_word_the_back_edge_left_an_int_in() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24571,6 +24589,7 @@ mod tests {
 
     #[test]
     fn loop_invariant_deopt_ref_survives_backedge_after_nursery_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24621,6 +24640,7 @@ mod tests {
 
     #[test]
     fn earlier_label_deopt_ref_survives_nursery_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24674,6 +24694,7 @@ mod tests {
 
     #[test]
     fn demoted_ref_reloads_before_kept_local_jump_arg() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -24835,6 +24856,7 @@ mod tests {
 
     #[test]
     fn register_carried_bridge_entry_roots_ref_before_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let (backend, token, root) = register_carried_bridge_fixture(0xD30F_00B1, 1_500_410);
         let in_code = backend.execute_token(
             &token,
@@ -24949,6 +24971,7 @@ mod tests {
 
     #[test]
     fn register_carried_overflow_failargs_stay_in_frame() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let (backend, token, root) = overflow_failarg_bridge_fixture(0xD30F_00C1, 1_500_420);
         let values = [
             Value::Int(10),
@@ -24999,6 +25022,7 @@ mod tests {
     /// entry; a collecting op after the LABEL must still see the Ref.
     #[test]
     fn jump_into_bridge_label_preserves_ref_failargs() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -25307,6 +25331,7 @@ mod tests {
     /// bridge call and is handed back to the loop at its forwarded address.
     #[test]
     fn merged_bridge_preserves_ref_input_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -26067,7 +26092,7 @@ mod tests {
             (
                 compiled_b.code_ptr as usize,
                 compiled_b.body_ptr as usize,
-                compiled_b.max_output_slots + compiled_b.num_ref_roots,
+                compiled_b.frame_depth,
                 family_entry,
             )
         };
@@ -27177,6 +27202,7 @@ mod tests {
 
     #[test]
     fn merged_exit_honours_redirected_rd_locs() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         // The carried ref is deopt-only, so `compute_loop_phi_keep` demotes
         // it and `apply_resident_failarg_locs` points `rd_locs` at that home.
         // A nursery allocation before the guard forwards the home. The merged
@@ -27705,6 +27731,7 @@ mod tests {
     /// `IntAddOvf` sits immediately before the guard so `last_ovf_flag` is set.
     #[test]
     fn guard_no_overflow_bridge_merges_when_bridge_has_no_exception() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(19);
         let ovf_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
@@ -27785,6 +27812,7 @@ mod tests {
     /// recompile.
     #[test]
     fn debug_merge_point_does_not_keep_bridge_separate() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(23);
         let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
@@ -28020,6 +28048,7 @@ mod tests {
 
     #[test]
     fn debug_merge_point_constptr_does_not_refuse_refresh() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let ptr = majit_ir::GcRef(0x3e5d_f0dc);
         let dbg = Op::new(
             OpCode::DebugMergePoint,
@@ -28048,6 +28077,7 @@ mod tests {
 
     #[test]
     fn refresh_matches_forwarded_gc_table_slot() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -29668,6 +29698,7 @@ mod tests {
 
     #[test]
     fn test_deadframe_exception_ref_survives_collection_after_execute_token() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let _exception_guard = exception_test_guard();
         jit_exc_clear();
 
@@ -34178,6 +34209,7 @@ mod tests {
     /// the nursery for jitframe + 2 user allocs (third overflows).
     #[test]
     fn test_gc_collecting_alloc_preserves_live_ref_inputs() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let payload_size: usize = 16;
         let alloc_size = majit_gc::header::GcHeader::SIZE + payload_size; // 24
 
@@ -34262,6 +34294,7 @@ mod tests {
 
     #[test]
     fn test_gc_collecting_alloc_preserves_live_ref_results() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34318,6 +34351,7 @@ mod tests {
 
     #[test]
     fn test_setfield_gc_from_old_object_keeps_young_ref_alive_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34623,6 +34657,7 @@ mod tests {
 
     #[test]
     fn test_call_i_preserves_live_ref_inputs_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34684,6 +34719,7 @@ mod tests {
     /// which may still name the corpse. Slot 0 is the moved input ref.
     #[test]
     fn test_raw_done_ref_returns_moved_object_after_minor_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34738,6 +34774,7 @@ mod tests {
 
     #[test]
     fn test_cond_call_n_preserves_live_ref_inputs_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34793,6 +34830,7 @@ mod tests {
 
     #[test]
     fn test_deadframe_ref_survives_collection_after_execute_token() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -34852,6 +34890,7 @@ mod tests {
     /// nothing, which is exactly what the old-gen fixture next door does.
     #[test]
     fn test_deadframe_nursery_jitframe_moves_across_collection() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
             large_object_threshold: 1 << 20,
@@ -34930,6 +34969,7 @@ mod tests {
     /// makes the holder's address irrelevant.
     #[test]
     fn test_moved_deadframe_still_reads_the_moved_jitframe() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
             large_object_threshold: 1 << 20,
