@@ -13,7 +13,9 @@
 //! `CallRet::Aggregate`; a pointer-typed `restype` wraps the returned address
 //! in a fresh instance.
 
-use super::callproc::{self, CTypeLayout, CallArg, CallError, CallOptions, CallRet, CallValue};
+use super::callproc::{
+    self, CTypeLayout, CallArg, CallError, CallOptions, CallRet, CallValue, PreparedFuncPtr,
+};
 use super::cdata::{self, TypeCode};
 use super::stginfo::{self, ParamFunc};
 use pyre_object::PyObjectRef;
@@ -42,6 +44,8 @@ const PARAMFLAGS_KEY: &str = "_paramflags";
 /// Reserved instance-dict key holding what the declarations have settled about
 /// this function's calls — see [`Settled`].
 const PLAN_KEY: &str = "_plan";
+/// Reserved instance-dict key holding the prepared `RawFuncPtr` (`W_FuncPtr.func`).
+const FUNC_KEY: &str = "_func";
 #[cfg(windows)]
 const INDEX_KEY: &str = "_index";
 #[cfg(windows)]
@@ -196,6 +200,7 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
 fn cfuncptr_del(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if let Some(&obj) = args.first() {
         super::callbacks::free_thunk(obj);
+        free_prepared(obj);
     }
     Ok(pyre_object::w_none())
 }
@@ -431,6 +436,110 @@ pub(super) fn clear_thunk_ptr(obj: PyObjectRef) {
     unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, "_thunk") };
 }
 
+/// Native owner of the prepared `RawFuncPtr` (`interp_funcptr.py W_FuncPtr.func`).
+/// Stored as an integer in the instance dict, the same way `_thunk` is.
+struct NativeFuncState {
+    prepared: Option<PreparedFuncPtr>,
+}
+
+fn native_func_state_ptr(dict: PyObjectRef) -> Option<*mut NativeFuncState> {
+    let stored = unsafe { pyre_object::w_dict_getitem_str(dict, FUNC_KEY) }?;
+    if !unsafe { pyre_object::is_int(stored) } {
+        return None;
+    }
+    let ptr = unsafe { pyre_object::w_int_get_value(stored) } as usize;
+    (ptr != 0).then_some(ptr as *mut NativeFuncState)
+}
+
+/// `function.py CFuncPtr._setargtypes` / `_setrestype` — drop the kept cif.
+fn clear_prepared_in_dict(dict: PyObjectRef) {
+    if let Some(ptr) = native_func_state_ptr(dict) {
+        unsafe { (*ptr).prepared = None };
+    }
+}
+
+fn free_prepared(obj: PyObjectRef) {
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return;
+    }
+    let Some(ptr) = native_func_state_ptr(d) else {
+        return;
+    };
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, FUNC_KEY) };
+    unsafe { drop(Box::from_raw(ptr)) };
+}
+
+fn store_native_func_state(obj: PyObjectRef, ptr: usize) -> Result<(), pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let w_ptr = pyre_object::w_int_new(ptr as i64);
+    let ptr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_ptr);
+    let d = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    );
+    if d.is_null() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "CFuncPtr instance has no instance dict",
+        ));
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            d,
+            FUNC_KEY,
+            pyre_object::gc_roots::shadow_stack_get(ptr_slot),
+        )
+    };
+    Ok(())
+}
+
+/// Take the kept cif out of the instance (`function.py CFuncPtr._ptr` lives in
+/// the caller's frame for the duration of the call).
+fn take_prepared(obj: PyObjectRef) -> Result<Option<PreparedFuncPtr>, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let current = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let d = pyre_interpreter::baseobjspace::getdict_native(current());
+    if d.is_null() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "CFuncPtr instance has no instance dict",
+        ));
+    }
+    let ptr = match native_func_state_ptr(d) {
+        Some(ptr) => ptr,
+        None => {
+            let ptr = Box::into_raw(Box::new(NativeFuncState { prepared: None }));
+            if let Err(err) = store_native_func_state(current(), ptr as usize) {
+                unsafe { drop(Box::from_raw(ptr)) };
+                return Err(err);
+            }
+            pyre_interpreter::executioncontext::register_finalizer(current());
+            ptr
+        }
+    };
+    Ok(unsafe { (*ptr).prepared.take() })
+}
+
+/// Store the kept cif back through a fresh dict lookup: `__del__` may have
+/// dropped the box during the call (`function.py CFuncPtr._ptr`).
+fn put_prepared(obj: PyObjectRef, prepared: Option<PreparedFuncPtr>) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    );
+    if d.is_null() {
+        return;
+    }
+    if let Some(ptr) = native_func_state_ptr(d) {
+        unsafe { (*ptr).prepared = prepared };
+    }
+}
+
 /// `(name, dll)` → resolved symbol address.  `dll._handle` is the integer
 /// library handle; `name` is the symbol string/bytes.
 fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
@@ -510,6 +619,8 @@ fn instance_set(obj: PyObjectRef, key: &str, mut value: PyObjectRef) {
             pyre_object::gc_roots::shadow_stack_get(value_slot),
         );
         drop_settled(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        // `function.py CFuncPtr._setargtypes` / `_setrestype` drop `self._ptr`.
+        clear_prepared_in_dict(pyre_object::gc_roots::shadow_stack_get(dict_slot));
     }
 }
 
@@ -862,6 +973,7 @@ fn instance_del(obj: PyObjectRef, key: &str) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_delitem_str(d, key);
         drop_settled(d);
+        clear_prepared_in_dict(d);
     }
 }
 
@@ -1486,7 +1598,14 @@ fn cfuncptr_call_from(
     let ret = resolve_restype(pyre_object::gc_roots::shadow_stack_get(self_slot))?;
     let flags = funcptr_flags(pyre_object::gc_roots::shadow_stack_get(self_slot));
     let argtypecount = argtypes.as_ref().map(|a| a.len()).unwrap_or(0);
-    let result = invoke(call_address(addr, com), &owned, ret, flags, argtypecount)?;
+    let result = invoke(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        call_address(addr, com),
+        &owned,
+        ret,
+        flags,
+        argtypecount,
+    )?;
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
     // A COM method constructed with an interface id answers the plain status,
@@ -1598,6 +1717,7 @@ fn plan_of_call(
 /// Hand the marshalled arguments to the foreign function and answer its raw
 /// result.
 fn invoke(
+    self_obj: PyObjectRef,
     addr: usize,
     owned: &[OwnedArg],
     ret: Ret,
@@ -1647,11 +1767,21 @@ fn invoke(
     // Being arbitrary foreign code is also why the call goes inside
     // `seh::guard`, which is what stands between a faulting callee and the
     // process.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let local = take_prepared(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
     let result = {
         let _blocked = pyre_interpreter::module::thread::before_external_block();
-        super::seh::guard(|| callproc::call(addr, host_args, restype, options))
+        super::seh::guard(|| callproc::call_with_prepared(addr, host_args, restype, options, local))
     };
-    result?.map_err(call_error)
+    match result {
+        Ok((call_result, returned)) => {
+            put_prepared(pyre_object::gc_roots::shadow_stack_get(obj_slot), returned);
+            call_result.map_err(call_error)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// `__call__` for a function whose declarations have already settled into a
@@ -1701,7 +1831,14 @@ fn call_settled(
             None => marshal_default_arg(arg, &mut keepalive)?,
         });
     }
-    let result = invoke(plan.addr, &owned, plan.ret, plan.flags, kinds.len())?;
+    let result = invoke(
+        self_obj,
+        plan.addr,
+        &owned,
+        plan.ret,
+        plan.flags,
+        kinds.len(),
+    )?;
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
     build_return_value(plan.ret, result).map(Some)

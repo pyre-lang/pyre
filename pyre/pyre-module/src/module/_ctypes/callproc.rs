@@ -5,7 +5,8 @@
 //! capture the register image. Type-code → `ffi_type *` is the
 //! `_ctypes_get_fielddesc(...)->pffi_type` table (`cfield.c`). Aggregate
 //! records are `FFI_TYPE_STRUCT` with a null-terminated `elements` array;
-//! they live as long as the cif that points at them.
+//! they live as long as the cif that points at them. Ordinary `_CFuncPtr`
+//! calls keep that cif on the function object (`function.py CFuncPtr._ptr`).
 
 use majit_rlib::clibffi::{
     self, CallbackFuncPtr, FFI_TYPE_P, FfiStruct, LibFFIError, RawFuncPtr, UserCallback,
@@ -297,6 +298,22 @@ impl Clone for FfiType {
         }
     }
 }
+
+impl PartialEq for FfiType {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.owned, &other.owned) {
+            (None, None) => self.ptr == other.ptr,
+            (Some(left), Some(right)) => {
+                left.size() == right.size()
+                    && left.alignment() == right.alignment()
+                    && self.children == other.children
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FfiType {}
 
 /// `_ctypes_get_fielddesc(...)->pffi_type` (`cfield.c`).
 pub fn ffi_type_from_code(ty: &str) -> Option<FfiType> {
@@ -596,12 +613,68 @@ fn arg_cell_ptr(cell: &ArgCell<'_>) -> VOIDP {
     }
 }
 
+/// Prepared `RawFuncPtr` plus the aggregate `ffi_type`s the cif points at
+/// (`function.py CFuncPtr._ptr`, `interp_funcptr.py W_FuncPtr.func`).
+///
+/// `raw` is declared first so it drops before `_arg_types` / `_res_type`:
+/// `AbstractFuncPtr.__del__` frees the cif while those records still live.
+pub struct PreparedFuncPtr {
+    raw: RawFuncPtr,
+    arg_types: Vec<FfiType>,
+    res_type: FfiType,
+    flags: INT,
+    variadic_args: usize,
+}
+
+impl PreparedFuncPtr {
+    fn matches(
+        &self,
+        arg_types: &[FfiType],
+        res_type: &FfiType,
+        flags: INT,
+        variadic_args: usize,
+    ) -> bool {
+        self.flags == flags
+            && self.variadic_args == variadic_args
+            && self.res_type == *res_type
+            && self.arg_types == arg_types
+    }
+}
+
 /// `_call_function_pointer` / `_ctypes_callproc`.
 pub fn call(
     addr: usize,
     args: &[CallArg<'_>],
     ret: CallRet<'_>,
     options: CallOptions,
+) -> Result<CallValue, CallError> {
+    call_with_prepared(addr, args, ret, options, None).0
+}
+
+/// `_call_function_pointer` reusing a kept `RawFuncPtr` (`W_FuncPtr.call`).
+///
+/// `prepared` is taken by value for the duration of the foreign call and
+/// returned with the result (`function.py CFuncPtr._ptr` lives in the
+/// caller's frame).  Replaced when the lowered argument `ffi_type`s, the
+/// restype, the calling-convention flags, or the variadic tail differ
+/// (`function.py CFuncPtr._getfuncptr`).
+pub fn call_with_prepared(
+    addr: usize,
+    args: &[CallArg<'_>],
+    ret: CallRet<'_>,
+    options: CallOptions,
+    mut prepared: Option<PreparedFuncPtr>,
+) -> (Result<CallValue, CallError>, Option<PreparedFuncPtr>) {
+    let result = call_with_prepared_inner(addr, args, ret, options, &mut prepared);
+    (result, prepared)
+}
+
+fn call_with_prepared_inner(
+    addr: usize,
+    args: &[CallArg<'_>],
+    ret: CallRet<'_>,
+    options: CallOptions,
+    prepared: &mut Option<PreparedFuncPtr>,
 ) -> Result<CallValue, CallError> {
     if addr == 0 {
         return Err(CallError::NullFunctionPointer);
@@ -659,25 +732,41 @@ pub fn call(
         CallRet::Aggregate(layout) => layout.to_ffi_type()?,
     };
 
-    let atypes: Vec<FFI_TYPE_P> = arg_types.iter().map(FfiType::as_ptr).collect();
-    let argcount = atypes.len();
+    let argcount = arg_types.len();
     let variadic_args = if options.argtypecount != 0 && argcount > options.argtypecount {
         argcount - options.argtypecount
     } else {
         0
     };
+    let flags = options.flags as INT;
 
-    let raw = RawFuncPtr::new(
-        "",
-        &atypes,
-        ffi_return_type.as_ptr(),
-        addr as VOIDP,
-        options.flags as INT,
-        variadic_args,
-    )
-    .map_err(CallError::LibFFI)?;
+    let cached = match prepared.take() {
+        Some(mut cached) if cached.matches(&arg_types, &ffi_return_type, flags, variadic_args) => {
+            cached.raw.set_funcsym(addr as VOIDP);
+            cached
+        }
+        _ => {
+            let atypes: Vec<FFI_TYPE_P> = arg_types.iter().map(FfiType::as_ptr).collect();
+            let raw = RawFuncPtr::new(
+                "",
+                &atypes,
+                ffi_return_type.as_ptr(),
+                addr as VOIDP,
+                flags,
+                variadic_args,
+            )
+            .map_err(CallError::LibFFI)?;
+            PreparedFuncPtr {
+                raw,
+                arg_types,
+                res_type: ffi_return_type,
+                flags,
+                variadic_args,
+            }
+        }
+    };
 
-    let ret_size = unsafe { (*ffi_return_type.as_ptr()).size };
+    let ret_size = unsafe { (*cached.res_type.as_ptr()).size };
     let ret_buf_size =
         clibffi::adjust_return_size(ret_size.max(std::mem::size_of::<clibffi::ffi_arg>()));
     let mut ret_buf = vec![0u8; ret_buf_size.max(1)];
@@ -692,7 +781,7 @@ pub fn call(
         swap_saved_alt_lasterror();
     }
 
-    unsafe { raw.call(&avalues, ret_buf.as_mut_ptr().cast()) };
+    unsafe { cached.raw.call(&avalues, ret_buf.as_mut_ptr().cast()) };
 
     #[cfg(windows)]
     if options.use_last_error {
@@ -717,7 +806,7 @@ pub fn call(
         tmp[..n].copy_from_slice(&ret_buf[..n]);
         CallValue::Pointer(usize::from_ne_bytes(tmp))
     };
-    Ok(match ret {
+    let value = match ret {
         CallRet::Void => CallValue::Void,
         CallRet::Pointer => pointer_value,
         CallRet::Code(_) if is_pointer => pointer_value,
@@ -737,7 +826,9 @@ pub fn call(
             let size = layout.size().min(ret_buf.len());
             CallValue::Aggregate(ret_buf[..size].to_vec())
         }
-    })
+    };
+    *prepared = Some(cached);
+    Ok(value)
 }
 
 /// `CThunkObject` / `_ctypes_alloc_callback` (`callbacks.c`) wrapping

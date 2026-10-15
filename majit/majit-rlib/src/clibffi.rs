@@ -617,6 +617,11 @@ impl RawFuncPtr {
         })
     }
 
+    /// `RawFuncPtr.funcsym` — the address `RawFuncPtr.call` passes to `c_ffi_call`.
+    pub fn set_funcsym(&mut self, funcsym: VOIDP) {
+        self.funcsym = funcsym;
+    }
+
     /// `RawFuncPtr.call`.
     ///
     /// # Safety
