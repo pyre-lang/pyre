@@ -950,8 +950,11 @@ jobs:
   codspeed-benchmarks:
     name: CodSpeed benchmarks (ubuntu-24.04)
     runs-on: ubuntu-24.04
-    needs: prepare-charon-llbc-linux
-    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
+    # Starts only after the ubuntu cargo test job has finished green, so the
+    # benchmark build does not compete with it for the runner pool; a red
+    # cargo test cancels the run, which this job then never starts in.
+    needs: [prepare-charon-llbc-linux, cargo-test-linux]
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' && needs.cargo-test-linux.result == 'success' }}
     # The benchmark binary is the interpreter + JIT, so it needs the same
     # extracted LLBC every other build here does. That is why this job lives
     # in this workflow rather than one of its own: `prepare-charon-llbc-linux`
