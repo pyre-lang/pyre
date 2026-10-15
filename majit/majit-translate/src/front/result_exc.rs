@@ -91,10 +91,10 @@
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
-use crate::flowspace::model::{ConstValue, Variable};
+use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::model::{
-    BlockId, CallFuncPtr, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link,
-    LinkArg, OpKind, SpaceOperation, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ConcreteType, ExitCase, ExitSwitch, FieldDescriptor,
+    FunctionGraph, Link, LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -421,6 +421,63 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
         "Err" => Some(true),
         _ => None,
     }
+}
+
+/// `return Ok` / `return Err` that already forwards to `returnblock`.
+/// [`lower_result_exc_returns`] owns those.
+fn leave_result_ctor_for_callee_rule(
+    graph: &FunctionGraph,
+    block: usize,
+    shell: &Variable,
+    target: &CallTarget,
+) -> bool {
+    result_ctor_kind(target).is_some() && forwards_to_returnblock(graph, block, shell).is_ok()
+}
+
+/// `return Err` at a merged continue. `exceptiontransform.py`
+/// `transform_completely` raises; the continue phi is `T`. Projecting
+/// `Err.__pos_0` puts `E` (a GC ref) next to the payload, and
+/// `unionof` colours the return `GcRef` so `graph_result_kind` reads
+/// `r` against `FUNC.RESULT=i` (`call.py` `get_jitcode_calldescr`).
+/// The callee rule cannot see the shell after the payload phi is
+/// installed, so the merge rewrite raises here.
+fn raise_err_ctor_at_merged_continue(target: &CallTarget) -> bool {
+    result_ctor_kind(target) == Some(true)
+}
+
+/// Payload written into `shell`'s `__pos_0` in `block`.
+fn err_ctor_payload(graph: &FunctionGraph, block: usize, shell: &Variable) -> Option<Variable> {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                base, field, value, ..
+            } if base == shell && field.name == "__pos_0" => value.as_variable().cloned(),
+            _ => None,
+        })
+}
+
+/// Raise a merged-continue `return Err`. Replay RootScope closes, then
+/// `flowcontext.py` `exc_from_raise`.
+fn raise_merged_err_ctor(
+    graph: &mut FunctionGraph,
+    block: usize,
+    shell: &Variable,
+    name: &str,
+) -> Result<(), String> {
+    let payload = err_ctor_payload(graph, block, shell).ok_or_else(|| {
+        format!("{name}: merged continue Err ctor in block {block} has no __pos_0 payload")
+    })?;
+    let closes = root_scope_closes_to_returnblock(graph, block, shell).map_err(|e| {
+        format!("{name}: merged continue Err in block {block} cannot replay closes ({e})")
+    })?;
+    let block_id = BlockId(block);
+    for close in closes {
+        graph.push_op_var(block_id, close, true);
+    }
+    crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, payload);
+    Ok(())
 }
 
 /// Callee rule.  Rewrites every `Result::Ok` / `Result::Err` shell
@@ -860,12 +917,10 @@ fn lower_result_exc_returns_inner(
         // `?`-diamond into a direct forward of the callee's `Result` to
         // `returnblock`, leaving no `Ok`/`Err` shell to rewrite, so
         // `tail_forwarded_returns` is 0.
-        // This is the same disposition as a scoped tail-forward
-        // (`SiteOutcome::TailForward`): the residual-call ABI erases the
-        // shell (`Ok` → value, `Err` → `BH_LAST_EXC_VALUE`) and the
-        // codewriter re-derives `guard_no_exception` op-locally, so the
-        // forward already carries `T` and the raise propagates
-        // implicitly — no rewrite is needed.
+        // This is a scoped callee whose only Result is an *unscoped*
+        // callee's return forwarded as a value.  The caller rule never
+        // saw that site (it only records scoped `Result<T, PyError>`
+        // callees), so there is no exception edge to install here.
         if has_tail_forwarded_call_result(graph) {
             return Ok(0);
         }
@@ -4236,6 +4291,11 @@ fn rewire_one_call_site(
     // with a single forwarding exit.
     let a = producer_block_index(graph, r)
         .ok_or_else(|| format!("{name}: scoped call result var has no producer block"))?;
+    // A sibling remint at a merged continue already installed
+    // `c_last_exception` on this producer (`rewire_merged_target`).
+    if matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)) {
+        return Ok(SiteOutcome::TailForward);
+    }
     // Tail forward: the callee's Result flows straight to returnblock, or
     // through blocks that only close brackets.  Those closes also run when
     // the callee raises, so the call gains an exception edge that re-emits
@@ -4259,8 +4319,14 @@ fn rewire_one_call_site(
                  switches would read garbage"
             ));
         }
-        // The forward needs no CFG rewrite — but it does need the same
-        // retyping the diamond arm performs, and for the same reason.
+        // The forward still needs the exception edge the diamond arm
+        // installs: after the callee raises, `Err` no longer flows as a
+        // Result value on the returnblock link (`exceptiontransform.py`
+        // `create_exception_handling`, `jtransform.py`
+        // `rewrite_op_direct_call`).  An empty close list is the
+        // `return f(...)` form — `raise_link_through_closes` then points
+        // straight at `exceptblock`.  It also needs the same retyping
+        // the diamond arm performs, and for the same reason.
         // `front::mir` types every aggregate `Ref`, so the call declares
         // the `Result` shell; once the callee is transformed it hands
         // back `T` and the raise travels the exception edge, so the value
@@ -4303,15 +4369,13 @@ fn rewire_one_call_site(
         }
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
-        if !tail_closes.is_empty() {
-            let exc_link = raise_link_through_closes(graph, tail_closes, &name)?;
-            let normal = graph.blocks[a].exits[0].clone();
-            graph.set_control_flow_metadata(
-                BlockId(a),
-                Some(ExitSwitch::LastException),
-                vec![normal, exc_link],
-            );
-        }
+        let exc_link = raise_link_through_closes(graph, tail_closes, &name)?;
+        let normal = graph.blocks[a].exits[0].clone();
+        graph.set_control_flow_metadata(
+            BlockId(a),
+            Some(ExitSwitch::LastException),
+            vec![normal, exc_link],
+        );
         separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
         return Ok(SiteOutcome::TailForward);
     }
@@ -4665,6 +4729,30 @@ fn break_arm_closes(
         .collect()
 }
 
+/// Bind a `Call.args` Constant to a Variable (`emit_constant`).
+///
+/// Upstream `SpaceOperation.args` hold `Constant`s (`flowspace/model.py`).
+/// Our Call.args are Variables, so a recast's class-root ByteStr is a
+/// `ConstStr` on the block that uses it.
+fn materialize_call_arg_constant(graph: &mut FunctionGraph, bb: BlockId, c: &Constant) -> Variable {
+    let (kind, ty) = match &c.value {
+        ConstValue::Int(n) => (OpKind::ConstInt(*n), ConcreteType::Signed),
+        ConstValue::Bool(b) => (OpKind::ConstBool(*b), ConcreteType::Signed),
+        ConstValue::ByteStr(s) => (OpKind::ConstStr(s.clone()), ConcreteType::GcRef),
+        ConstValue::Float(bits) => (OpKind::ConstFloat(*bits), ConcreteType::Float),
+        ConstValue::None => (OpKind::ConstNone, ConcreteType::GcRef),
+        other => panic!(
+            "Call.args Constant {other:?} has no SSA materialisation \
+             (`emit_constant`; flowspace SpaceOperation.args hold Constants)"
+        ),
+    };
+    let var = graph
+        .push_op_var(bb, kind, true)
+        .expect("constant materialisation produces a result");
+    FunctionGraph::set_concretetype_of_inline(&var, ty);
+    var
+}
+
 /// The exception link of a call whose raise must first run `closes`, the
 /// bracket closes (in the call block's namespace) its normal return runs.
 /// Without closes the link goes straight to `exceptblock`; with them it goes
@@ -4691,10 +4779,14 @@ fn raise_link_through_closes(
             let OpKind::Call { args, .. } = close else {
                 return Err(format!("{name}: a bracket close is not a call"));
             };
+            // Link.args carry Variables. A recast close keeps the
+            // class root as `LinkArg::Const` (`cast_instance_call`);
+            // rematerialise it on the raise block (`emit_constant`).
             for arg in args {
-                let arg = arg.clone().into_variable();
-                if !close_vars.contains(&arg) {
-                    close_vars.push(arg);
+                if let Some(var) = arg.as_variable()
+                    && !close_vars.contains(var)
+                {
+                    close_vars.push(var.clone());
                 }
             }
         }
@@ -4713,12 +4805,15 @@ fn raise_link_through_closes(
             };
             let args: Vec<Variable> = args
                 .iter()
-                .map(|arg| {
-                    let pos = close_vars
-                        .iter()
-                        .position(|v| *v == arg.clone().into_variable())
-                        .expect("collected above");
-                    r_inputs[pos].clone()
+                .map(|arg| match arg {
+                    LinkArg::Value(v) => {
+                        let pos = close_vars
+                            .iter()
+                            .position(|x| x == v)
+                            .expect("collected above");
+                        r_inputs[pos].clone()
+                    }
+                    LinkArg::Const(c) => materialize_call_arg_constant(graph, r_id, c),
                 })
                 .collect();
             graph.push_op_var(
@@ -4953,16 +5048,9 @@ fn catch_and_rewrap(
         let payload_dead = err_payload_is_dead(graph, &orig, r);
         if payload_dead {
             // Nothing reads a dead payload, so the shell is the discriminant
-            // ctor alone — the same shape `Ok(())` already collapses. A
-            // match consumer (`Err(_)` / `except ValueError:` without
-            // `as e`, `interp_math.py math1`) still has to drop that
-            // switch (`flowcontext.py` `FlowContext.guessexception`).
-            // `let _ = f()` has no match; leave the ctor and skip collapse.
+            // ctor alone and the collapse below does not run.
             let shell = push_shell_ctor(graph, e_id, "Err", suffix);
-            let dummy = match_discriminant(graph, orig.target.0)
-                .ok()
-                .map(|_| e_exc_value_in.clone());
-            (Some(shell), dummy)
+            (Some(shell), None)
         } else {
             let v_err = e_exc_value_in;
             let shell = build_shell(
@@ -5212,7 +5300,7 @@ fn arm_shell_vars_from_args(
 /// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
 /// match they feed only reads `__pos_0` and forwards that payload.
 /// An arm that does not receive the shell is a discarded payload
-/// (`Ok(_)` / `Err(_)`); there is no `__pos_0` to collapse on that edge.
+/// (`Ok(_)`); there is no `__pos_0` to collapse on that edge.
 ///
 /// `getindex_w` is `try: int_w(...) except OperationError`. The rebuilt
 /// shell plus the discriminant switch is that `try` spelled as a `Result`.
@@ -5381,16 +5469,7 @@ fn collapse_rebuilt_shell_match(
     let ok_payload_is_void = ok_payload.concretetype()
         == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void);
     let ok_build = shell_build_ops(graph, normal, ok_shell, ok_payload_is_void)?;
-    // `Err(_)` rebuilds the discriminant ctor and stores nothing, matching
-    // a Void payload (`shell_build_ops` `payload_is_void`).
-    let err_payload_is_void = !graph.blocks[handler].operations.iter().any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::FieldWrite { base, field, .. }
-                if base == err_shell && field.name == "__pos_0"
-        )
-    });
-    let err_build = shell_build_ops(graph, handler, err_shell, err_payload_is_void)?;
+    let err_build = shell_build_ops(graph, handler, err_shell, false)?;
     // Every check has run. The edits below do not fail.
     apply_remove_identical_inputargs(graph, m, &merge);
     let n_exit = single_exit(graph, normal).expect("normal still has one exit");
@@ -6998,12 +7077,13 @@ fn try_fuse_drain_match(
             unreachable!("validated RootScope close is a call")
         };
         for arg in args {
-            let arg = arg.clone().into_variable();
-            if !close_vars_a.contains(&arg) {
-                close_vars_a.push(arg.clone());
-            }
-            if !forwarded.contains(&arg) {
-                forwarded.push(arg);
+            if let Some(var) = arg.as_variable() {
+                if !close_vars_a.contains(var) {
+                    close_vars_a.push(var.clone());
+                }
+                if !forwarded.contains(var) {
+                    forwarded.push(var.clone());
+                }
             }
         }
     }
@@ -7124,12 +7204,13 @@ fn try_fuse_drain_match(
         };
         let args = args
             .iter()
-            .map(|arg| {
-                close_vars_a
+            .map(|arg| match arg {
+                LinkArg::Value(v) => close_vars_a
                     .iter()
-                    .position(|v| v == arg)
+                    .position(|x| x == v)
                     .map(|i| r_inputs[i + 1].clone())
-                    .ok_or_else(|| format!("{name}: drain reraise close lost an argument"))
+                    .ok_or_else(|| format!("{name}: drain reraise close lost an argument")),
+                LinkArg::Const(c) => Ok(materialize_call_arg_constant(graph, r_id, c)),
             })
             .collect::<Result<Vec<_>, _>>()?;
         graph.push_op_var(
@@ -8577,6 +8658,9 @@ enum SlotAction {
     Project(SlotProjection),
     /// `return Ok` / `return Err`. [`lower_result_exc_returns`] owns it.
     LeaveCtor,
+    /// `return Err` at a merged continue. Raise here: see
+    /// [`raise_err_ctor_at_merged_continue`].
+    Raise,
 }
 
 fn classify_slot_value(
@@ -8629,13 +8713,16 @@ fn classify_slot_value(
         .position(|op| op.result.as_ref() == Some(var))
     {
         let kind = &graph.blocks[source].operations[op_idx].kind;
-        if let OpKind::Call { target, .. } = kind
-            && (result_ctor_kind(target).is_some() || is_control_flow_ctor(target))
-        {
-            if result_ctor_kind(target).is_some()
-                && forwards_to_returnblock(graph, source, var).is_ok()
-            {
-                return Ok(SlotAction::LeaveCtor);
+        if let OpKind::Call { target, .. } = kind {
+            if result_ctor_kind(target).is_some() || is_control_flow_ctor(target) {
+                if leave_result_ctor_for_callee_rule(graph, source, var, target) {
+                    return Ok(SlotAction::LeaveCtor);
+                }
+                if raise_err_ctor_at_merged_continue(target) {
+                    return Ok(SlotAction::Raise);
+                }
+                let field = shell_field_write(graph, source, var);
+                return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
             }
             let field = shell_field_write(graph, source, var);
             return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
@@ -9013,11 +9100,12 @@ fn project_sibling_ctor_shells(
                 let OpKind::Call { target: ctor, .. } = &op.kind else {
                     continue;
                 };
-                let result_ctor = result_ctor_kind(ctor).is_some();
-                if !result_ctor && !is_control_flow_ctor(ctor) {
+                if leave_result_ctor_for_callee_rule(graph, bi, value, ctor)
+                    || raise_err_ctor_at_merged_continue(ctor)
+                {
                     continue;
                 }
-                if result_ctor && forwards_to_returnblock(graph, bi, value).is_ok() {
+                if result_ctor_kind(ctor).is_none() && !is_control_flow_ctor(ctor) {
                     continue;
                 }
                 projections.push(SlotProjection {
@@ -9104,6 +9192,7 @@ fn rewire_merged_target(
     let mut diamonds = Vec::new();
     let mut adjusts = Vec::new();
     let mut leave_ctor_slots = Vec::new();
+    let mut raises: Vec<(usize, Variable)> = Vec::new();
     for (source, exit_index) in &incoming {
         if let Some((disc_block, disc_exit)) = disc_switch_behind(graph, *source, *exit_index) {
             if !looks_like_disc_switch(&graph.blocks[*source])
@@ -9237,6 +9326,13 @@ fn rewire_merged_target(
                             }
                             projections.push(projection);
                         }
+                        SlotAction::Raise => {
+                            if !raises.iter().any(|(source_block, raised)| {
+                                source_block == source && raised == value
+                            }) {
+                                raises.push((*source, value.clone()));
+                            }
+                        }
                     }
                 }
             }
@@ -9275,8 +9371,34 @@ fn rewire_merged_target(
         if let Some((call_block, result, payload_ty)) = &plan.remint
             && !reminted.contains(result)
         {
+            let from_residual = producing_op(graph, result).is_some_and(is_from_residual_call);
             let payload = remint_call_as_payload(graph, *call_block, result, payload_ty.clone());
             replace_exit_value(graph, *call_block, result, &payload);
+            // A call that can raise gets `c_last_exception` exits
+            // (`flowspace/flowcontext.py`, `jtransform.py`
+            // `handle_residual_call`). The non-merged tail-forward
+            // arm already installs them; siblings at a match-arm
+            // merge must too, or a later pass sees the reminted
+            // producer as absent and never stamps the edge.
+            // `from_residual` is the raise itself
+            // (`raise_returned_from_residual`); giving it a normal
+            // payload edge plus LastException leaves
+            // `break_arm_closes` on a two-exit block.
+            if !from_residual
+                && graph.blocks[*call_block].exits.len() == 1
+                && !matches!(
+                    graph.blocks[*call_block].exitswitch,
+                    Some(ExitSwitch::LastException)
+                )
+            {
+                let exc_link = raise_link_through_closes(graph, Vec::new(), name)?;
+                let normal = graph.blocks[*call_block].exits[0].clone();
+                graph.set_control_flow_metadata(
+                    BlockId(*call_block),
+                    Some(ExitSwitch::LastException),
+                    vec![normal, exc_link],
+                );
+            }
             payloads.push(payload);
             reminted.push(result.clone());
         }
@@ -9285,6 +9407,9 @@ fn rewire_merged_target(
         if !plan.projections.is_empty() {
             split_link_project(graph, plan.block, plan.exit_index, &plan.projections)?;
         }
+    }
+    for (source, shell) in &raises {
+        raise_merged_err_ctor(graph, *source, shell, name)?;
     }
     crate::model::clear_unreachable_blocks(graph);
     for pos in collapse_slots {
@@ -11473,6 +11598,50 @@ mod tail_forward_close_tests {
         );
         assert_eq!(raise.exits[0].target, graph.exceptblock);
     }
+
+    /// `return f()` with no bracket closes: the call still needs
+    /// `LastException` so flatten emits `catch_exception` rather than
+    /// dropping the exception exit (`flatten.py insert_exits` when the
+    /// last op is not `-live-`).
+    #[test]
+    fn a_direct_tail_forward_gets_an_exception_edge() {
+        let mut graph = FunctionGraph::new("tail_direct");
+        let start = graph.startblock;
+        let r = graph
+            .push_op_var(
+                start,
+                OpKind::Call {
+                    target: CallTarget::function_path(["m", "f"]),
+                    args: crate::model::call_args(Vec::new()),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call result");
+        graph.set_goto(start, graph.returnblock, vec![r.clone()]);
+
+        let outcome = rewire_one_call_site(
+            &mut graph,
+            &r,
+            "",
+            &ValueType::Int,
+            true,
+            true,
+            &[(r.clone(), None, ValueType::Int)],
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("tail forward");
+        assert!(matches!(outcome, SiteOutcome::TailForward));
+        let a = &graph.blocks[start.0];
+        assert!(matches!(a.exitswitch, Some(ExitSwitch::LastException)));
+        let [normal, exc] = a.exits.as_slice() else {
+            panic!("normal and exception exits");
+        };
+        assert_eq!(normal.target, graph.returnblock);
+        assert_eq!(exc.target, graph.exceptblock);
+        assert!(exc.last_exception.is_some());
+        assert!(exc.last_exc_value.is_some());
+    }
 }
 
 #[cfg(test)]
@@ -11821,35 +11990,6 @@ mod rebuilt_shell_collapse_tests {
         assert!(
             matches!(&exit.args[0], LinkArg::Value(v) if *v == fix.ok_payload),
             "the normal edge carries the unwrapped payload"
-        );
-    }
-
-    /// `Err(_)` / `except ValueError:` without `as e`: the handler rebuilds
-    /// the discriminant ctor and stores nothing. Collapse still splices
-    /// the match onto the exception link.
-    #[test]
-    fn discarded_err_arm_drops_the_rebuilt_shells() {
-        let mut fix = fixture();
-        fix.graph.blocks[fix.handler].operations.retain(
-            |op| !matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "__pos_0"),
-        );
-        let err_arm = fix.err_arm;
-        fix.graph.blocks[err_arm].operations.clear();
-        fix.graph.blocks[err_arm].inputargs.clear();
-        fix.graph.set_return(BlockId(err_arm), None);
-        let match_id = fix.graph.blocks[fix.normal].exits[0].target.0;
-        for exit in &mut fix.graph.blocks[match_id].exits {
-            if exit.target.0 == err_arm {
-                exit.args.clear();
-            }
-        }
-        collapse(&mut fix).expect("Err(_) match collapses");
-        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
-        let exit = &fix.graph.blocks[fix.normal].exits[0];
-        assert_eq!(exit.target.0, fix.ok_arm);
-        assert_eq!(
-            fix.graph.blocks[fix.handler].exits[0].target.0, fix.err_arm,
-            "the exception edge is the handler as written"
         );
     }
 
@@ -14694,6 +14834,204 @@ mod merged_continue_tests {
                 .iter()
                 .all(|arg| !matches!(arg, LinkArg::Value(value) if value == &ctor))
         }));
+    }
+
+    /// A scoped call and a literal `Err` share the continue block that
+    /// closes the root bracket and returns. Projecting `Err.__pos_0` into
+    /// that phi puts a GC ref next to the call's `i64` payload, so the
+    /// CFG return kind is `r` against `FUNC.RESULT=i`.
+    fn merged_call_and_literal_err() -> (FunctionGraph, Vec<(Variable, Option<String>, ValueType)>)
+    {
+        let mut graph = FunctionGraph::new("merged_call_and_err");
+        let (merge, merge_args) = graph.create_block_with_arg_vars(2);
+        graph.push_op_var(
+            merge,
+            OpKind::Call {
+                target: CallTarget::function_path(["pyre_object", "gc_roots", "root_scope_close"]),
+                args: crate::model::call_args(vec![merge_args[1].clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(merge, Some(merge_args[0].clone()));
+
+        let (call, call_args) = graph.create_block_with_arg_vars(1);
+        let result = graph
+            .push_op_var(
+                call,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        graph.set_goto(call, merge, vec![result.clone(), call_args[0].clone()]);
+
+        let (err, err_args) = graph.create_block_with_arg_vars(1);
+        let err_payload = graph.alloc_value_var();
+        let shell = graph
+            .push_op_var(
+                err,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,PyError>".into()],
+                        "Err",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("err ctor");
+        graph.push_op_var(
+            err,
+            OpKind::FieldWrite {
+                base: shell.clone(),
+                field: FieldDescriptor::new(
+                    "__pos_0",
+                    Some("core::result::Result<i64,PyError>::Err".into()),
+                ),
+                value: LinkArg::Value(err_payload),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_goto(err, merge, vec![shell, err_args[0].clone()]);
+
+        let start = graph.startblock;
+        let scope = graph
+            .push_op_var(start, OpKind::ConstRefNull, true)
+            .expect("scope");
+        let cond = graph
+            .push_op_var(start, OpKind::ConstInt(0), true)
+            .expect("cond");
+        graph.block_mut(start).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.block_mut(start).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(scope.clone())],
+                call,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(scope)],
+                err,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        (graph, vec![(result, None, ValueType::Int)])
+    }
+
+    fn result_err_pos0_reaches_return(graph: &FunctionGraph) -> bool {
+        graph.blocks.iter().any(|block| {
+            block.exits.iter().any(|link| {
+                if link.target != graph.returnblock {
+                    return false;
+                }
+                link.args.iter().any(|arg| {
+                    let LinkArg::Value(var) = arg else {
+                        return false;
+                    };
+                    graph.blocks.iter().any(|src| {
+                        src.operations.iter().any(|op| {
+                            op.result.as_ref() == Some(var)
+                                && matches!(
+                                    &op.kind,
+                                    OpKind::FieldRead { field, .. }
+                                        if field.name == "__pos_0"
+                                            && field.owner_root.as_deref().is_some_and(|owner| {
+                                                owner.contains("Result") && owner.ends_with("::Err")
+                                            })
+                                )
+                        })
+                    })
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn merged_continue_raises_literal_err_instead_of_projecting_e() {
+        let (mut graph, results) = merged_call_and_literal_err();
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &results,
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("merged continue rewires");
+        assert_eq!(outcome.tail_forwards, 1);
+        assert!(
+            !result_err_pos0_reaches_return(&graph),
+            "Projecting Err.__pos_0 into the continue phi is the kind disagreement"
+        );
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { name, .. },
+                            ..
+                        } if name == "Err"
+                    )
+                }) && block
+                    .exits
+                    .iter()
+                    .any(|link| link.target == graph.exceptblock)
+            }),
+            "literal Err must raise at the merged continue, not return"
+        );
+
+        lower_result_exc_returns(
+            &mut graph,
+            outcome.tail_forwards,
+            crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                ..Default::default()
+            },
+        )
+        .expect("callee rule raises Err");
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { name, .. },
+                            ..
+                        } if name == "Err"
+                    )
+                }) && block
+                    .exits
+                    .iter()
+                    .any(|link| link.target == graph.exceptblock)
+            }),
+            "literal Err must raise, not return"
+        );
+        assert!(
+            !result_err_pos0_reaches_return(&graph),
+            "Err payload must not reach returnblock"
+        );
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != graph.returnblock {
+                    continue;
+                }
+                for arg in &link.args {
+                    let LinkArg::Value(var) = arg else {
+                        continue;
+                    };
+                    let kind = FunctionGraph::concretetype_of(var);
+                    assert_ne!(
+                        kind,
+                        crate::model::ConcreteType::GcRef,
+                        "CFG return kind must stay the i64 payload, not the Err ref"
+                    );
+                }
+            }
+        }
     }
 
     fn call_leaf(op: &SpaceOperation, leaf: &str) -> bool {

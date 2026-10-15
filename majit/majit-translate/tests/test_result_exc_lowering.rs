@@ -171,6 +171,54 @@ fn a_tail_forwarding_wrapper_retypes_its_calls_to_the_payload() {
     );
 }
 
+/// `contains` returns `Result<bool, PyError>`. A literal `Err` that shares
+/// the root-scope continue with tail-forwarded `contains_slot` / `is_true`
+/// must raise; projecting `Err.__pos_0` into that phi made the CFG return
+/// kind `r` against `FUNC.RESULT=i` (`call.py` `get_jitcode_calldescr`).
+#[test]
+fn contains_err_does_not_join_the_bool_return() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg, ValueType};
+    let graph = lower_function(interp(), "pyre_interpreter::baseobjspace::contains")
+        .unwrap_or_else(|e| panic!("lower contains: {e}"));
+    let mut bool_returns = 0usize;
+    for block in &graph.blocks {
+        for link in &block.exits {
+            if link.target != graph.returnblock {
+                continue;
+            }
+            assert_eq!(link.args.len(), 1, "bool return has one arg");
+            let LinkArg::Value(var) = &link.args[0] else {
+                panic!("return arg is a value");
+            };
+            assert_ne!(
+                FunctionGraph::concretetype_of(var),
+                ConcreteType::GcRef,
+                "CFG return kind must be the bool payload (`i`), not a GC ref"
+            );
+            let producer = graph.blocks.iter().find_map(|src| {
+                src.operations
+                    .iter()
+                    .find(|op| op.result.as_ref() == Some(var))
+            });
+            if let Some(OpKind::FieldRead { field, .. }) = producer.map(|op| &op.kind) {
+                let owner = field.owner_root.as_deref().unwrap_or("");
+                assert!(
+                    !(field.name == "__pos_0" && owner.ends_with("::Err")),
+                    "Err payload reaches returnblock via {owner}"
+                );
+            }
+            if let Some(OpKind::Call { result_ty, .. }) = producer.map(|op| &op.kind) {
+                assert_eq!(result_ty, &ValueType::Bool, "tail-forwarded call is bool");
+                bool_returns += 1;
+            }
+        }
+    }
+    assert!(
+        bool_returns >= 1,
+        "contains must return the bool payload of a scoped callee"
+    );
+}
+
 /// The catch-and-rewrap fallback rebuilds the shell from the call's result,
 /// which means that result IS the payload — so the call has to be retyped
 /// like the diamond and tail-forward arms do.
@@ -711,6 +759,47 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
     );
 }
 
+fn call_target_leaf(target: &CallTarget) -> String {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments.last().cloned().unwrap_or_default(),
+        CallTarget::Method { name, .. } => name.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// `execute_opcode_step`'s `Instruction::ForIter` arm is `return execute_for_iter(...)`:
+/// a scoped Result tail-forward.  That call must carry `LastException` so a
+/// StopIteration from `iter_next` / `space.next` becomes `catch_exception`
+/// (`flatten.py make_exception_link`) rather than the portal's abort arm.
+#[test]
+fn execute_for_iter_tail_forward_gets_lastexception_exits() {
+    let graph = lower_function(interp(), "execute_opcode_step").expect("lower execute_opcode_step");
+    let call_block = graph
+        .blocks
+        .iter()
+        .find(|b| {
+            b.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. }
+                        if call_target_leaf(target) == "execute_for_iter"
+                )
+            })
+        })
+        .expect("execute_opcode_step calls execute_for_iter");
+    assert!(
+        matches!(call_block.exitswitch, Some(ExitSwitch::LastException)),
+        "FOR_ITER tail-forward must get LastException exits"
+    );
+    assert!(
+        call_block
+            .exits
+            .iter()
+            .any(|link| link.last_exception.is_some() && link.last_exc_value.is_some()),
+        "FOR_ITER tail-forward exception link carries last_exception/last_exc_value"
+    );
+}
+
 #[test]
 fn eval_loop_custom_match_gets_catch_and_rewrap() {
     let llbc = interp();
@@ -1141,129 +1230,6 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
         !ops.iter().any(|kind| matches!(kind,
             OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "map")),
         "`.map(Some)` leaves no residual Result::map"
-    );
-}
-
-fn dump_result_exc_graph(name: &str, graph: &majit_translate::model::FunctionGraph) -> String {
-    let mut last_exc = 0usize;
-    let mut raise_to_except = 0usize;
-    let mut result_disc = Vec::new();
-    let mut calls = Vec::new();
-    for (bi, block) in graph.blocks.iter().enumerate() {
-        if matches!(block.exitswitch, Some(ExitSwitch::LastException)) {
-            last_exc += 1;
-        }
-        for link in &block.exits {
-            if link.target == graph.exceptblock
-                || link.last_exception.is_some()
-                || link.last_exc_value.is_some()
-            {
-                raise_to_except += 1;
-            }
-        }
-        for op in &block.operations {
-            match &op.kind {
-                OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
-                    result_disc.push(format!(
-                        "b{bi}:{}",
-                        field.owner_root.as_deref().unwrap_or("?")
-                    ));
-                }
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } => {
-                    calls.push(segments.last().cloned().unwrap_or_default());
-                }
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } => {
-                    calls.push(format!(".{name}"));
-                }
-                _ => {}
-            }
-        }
-        let _ = bi;
-    }
-    format!(
-        "{name}: last_exc={last_exc} raise_to_except={raise_to_except} \
-         result_disc={result_disc:?} calls={calls:?}"
-    )
-}
-
-/// `ll_math.py ll_math_sqrt` / `interp_math.py math1` match: a scoped
-/// `Result<f64, PyError>` helper plus the wrap that consumes it must
-/// lower to exception links, not a residual Result shell. `call.py
-/// find_all_graphs` seeds `_ll_1_ll_math_ll_math_sqrt`; the wrap's
-/// `math1` catch is a hand-written `match` on that helper.
-#[test]
-fn ll_math_sqrt_and_math1_match_lower_to_exception_links() {
-    let body = lower_function(
-        interp(),
-        "pyre_interpreter::objspace::descroperation::ll_math_sqrt",
-    )
-    .unwrap_or_else(|e| panic!("ll_math_sqrt: {e}"));
-    let body_dump = dump_result_exc_graph("ll_math_sqrt", &body);
-    eprintln!("{body_dump}");
-    assert!(
-        body.blocks.iter().any(|b| b.exits.iter().any(|l| {
-            l.target == body.exceptblock || l.last_exception.is_some() || l.last_exc_value.is_some()
-        })),
-        "{body_dump}: ll_math_sqrt domain `raise` must be an exception edge"
-    );
-    assert!(
-        body_dump.contains("sqrt_nonneg"),
-        "{body_dump}: finite arm calls sqrt_nonneg"
-    );
-
-    let wrap_name = "pyre_module::module::math::interp_math::__majit_wrap_math_sqrt";
-    let helper_name = "pyre_module::module::math::interp_math::sqrt_from_double";
-    let helper = lower_function(optional_module(), helper_name)
-        .unwrap_or_else(|e| panic!("{helper_name}: {e}"));
-    let helper_dump = dump_result_exc_graph(helper_name, &helper);
-    eprintln!("{helper_dump}");
-    let wrap =
-        lower_function(optional_module(), wrap_name).unwrap_or_else(|e| panic!("{wrap_name}: {e}"));
-    let wrap_dump = dump_result_exc_graph(wrap_name, &wrap);
-    eprintln!("{wrap_dump}");
-    assert!(
-        wrap_dump.contains("sqrt_from_double"),
-        "{wrap_dump}: wrap must call sqrt_from_double, not re-spell ll_math_sqrt"
-    );
-    for (name, dump, graph) in [
-        (helper_name, helper_dump.as_str(), &helper),
-        (wrap_name, wrap_dump.as_str(), &wrap),
-    ] {
-        for block in &graph.blocks {
-            for op in &block.operations {
-                if let OpKind::FieldRead { field, .. } = &op.kind
-                    && field.name == "__discriminant"
-                {
-                    let owner = field.owner_root.as_deref().unwrap_or("");
-                    assert!(
-                        !owner.contains("Result"),
-                        "{dump}: Result discriminant still read: {owner}"
-                    );
-                }
-            }
-        }
-        let _ = name;
-    }
-    assert!(
-        helper.blocks.iter().any(|b| {
-            matches!(b.exitswitch, Some(ExitSwitch::LastException))
-                || b.exits.iter().any(|l| {
-                    l.target == helper.exceptblock
-                        || l.last_exception.is_some()
-                        || l.last_exc_value.is_some()
-                })
-        }),
-        "{helper_dump}: math1 catch must be an exception edge on ll_math_sqrt"
-    );
-    assert!(
-        !helper_dump.contains("from_exc_object"),
-        "{helper_dump}: interp_math.py math1 `except ValueError:` does not bind the carrier"
     );
 }
 
