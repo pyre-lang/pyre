@@ -7442,6 +7442,7 @@ pub fn residual_call(
 /// env lever (the translation-time `--jit STR` option's analog) so both
 /// parse identically. `Err(())` signals a malformed string (rlib/jit.py
 /// ValueError).
+#[allow(dead_code)]
 fn apply_jit_param_string(
     ws: &mut majit_metainterp::warmstate::WarmEnterState,
     text: &str,

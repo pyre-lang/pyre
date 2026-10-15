@@ -27463,6 +27463,7 @@ fn complex_from_real_and_imag(
 /// No arguments, or one positional and no keywords, convert a string or a
 /// number. An exact complex is returned unchanged. A second argument or any
 /// keyword builds the sum of the components.
+#[cfg(test)]
 pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     builtin_complex_bound(args, None)
 }

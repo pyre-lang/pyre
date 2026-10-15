@@ -77,28 +77,6 @@ fn method_qualname(args: &[PyObjectRef], name: &str) -> String {
     }
 }
 
-/// The builtin type a method reached through `receiver` is declared on — the
-/// first non-heap type in the receiver's MRO.  Whether a name is filled by a
-/// `wrapper_descriptor` or a `method_descriptor` is a property of the
-/// declaring type, not of the subclass the call came in on, so the wording
-/// split reads this while the qualified name reads the receiver's own type.
-fn declaring_builtin_type_name(receiver: PyObjectRef) -> String {
-    unsafe {
-        let Some(w_type) = crate::typedef::r#type(receiver) else {
-            return String::new();
-        };
-        let mro = pyre_object::w_type_get_mro(w_type.as_ptr());
-        if !mro.is_null() {
-            for &entry in (*mro).as_slice() {
-                if !pyre_object::typeobject::w_type_is_heaptype(entry) {
-                    return pyre_object::w_type_get_name(entry).to_string();
-                }
-            }
-        }
-        pyre_object::w_type_get_name(w_type.as_ptr()).to_string()
-    }
-}
-
 /// TypeError for a keyword handed to a builtin method that takes a fixed
 /// number of positional arguments.
 ///

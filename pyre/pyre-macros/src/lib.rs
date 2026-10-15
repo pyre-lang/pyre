@@ -3013,6 +3013,7 @@ fn expand_pyre_methods(
                 let descr = if has_varargs {
                     let args_name = format_ident!("__pyre_passthrough1_{}", mname);
                     wrappers.push(quote! {
+                        #[allow(non_snake_case)]
                         pub fn #args_name(
                             w_type: ::pyre_object::PyObjectRef,
                             args: &::pyre_interpreter::argument::Arguments,

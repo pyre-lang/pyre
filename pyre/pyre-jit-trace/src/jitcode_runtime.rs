@@ -1203,6 +1203,7 @@ fn descr_layout_at(index: usize) -> std::sync::Arc<majit_jitcode::jitcode::BhSiz
 /// `finish_setup_descrs` on the rows it built. Walking this table publishes
 /// those rows. [`descr_layout_at`] stays for a later Field slot that still
 /// needs one parent; kind-0 startup does not call it.
+#[cfg(test)]
 fn for_each_packed_parent_layout(mut visit: impl FnMut(majit_jitcode::jitcode::BhSizeSpec)) {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
     let mut rest = BYTES;
@@ -1225,7 +1226,7 @@ fn publish_packed_parent_layouts() {
     // Rows `get_size_descr` already returned. Later records of the same
     // layout compare this table instead of locking `GcCache` again.
     let mut known = crate::descr::kind0_vtable_field_counts();
-    // Same answer as `kind0_struct_absent`, without a lock per record.
+    // STRUCTs `GcCache` already holds, taken once instead of per record.
     // A publish below inserts the id so a later record of that STRUCT
     // takes `publish_kind0_parent_layout`, matching the cache after the mint.
     let mut present = crate::descr::kind0_present_struct_ids();

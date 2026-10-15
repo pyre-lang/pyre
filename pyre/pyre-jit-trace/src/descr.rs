@@ -5740,6 +5740,7 @@ struct ModuleUserLayoutGroup {
     /// `ob_type` of a `typedef.py` `_getusercls` instance.
     pytype: usize,
     /// Crate-stripped `struct_path`, the `DECLARED_GROUPS` def-path spelling.
+    #[cfg(test)]
     def_path: &'static str,
     group: PyreObjectDescrGroup,
 }
@@ -5786,6 +5787,7 @@ static MODULE_USER_LAYOUT_DESCR_GROUPS: LazyLock<Vec<ModuleUserLayoutGroup>> =
                 );
                 ModuleUserLayoutGroup {
                     pytype: descr.pytype_ptr as usize,
+                    #[cfg(test)]
                     def_path,
                     group,
                 }
@@ -11884,25 +11886,12 @@ pub(crate) fn kind0_layout_already_published(type_id: u64, nfields: u32) -> bool
     majit_ir::descr::SizeDescr::all_fielddescrs(size.as_ref()).len() == nfields as usize
 }
 
-/// `descr.py` `get_size_descr` has no row for this STRUCT yet.
-pub(crate) fn kind0_struct_absent(type_id: u64) -> bool {
-    if type_id == 0 {
-        return false;
-    }
-    let key = majit_ir::descr::LLType::Struct(type_id);
-    let gc = majit_ir::descr::gc_cache().lock();
-    !gc._cache_size.contains_key(&key)
-        && gc
-            ._cache_field
-            .get(&key)
-            .is_none_or(|fields| fields.is_empty())
-}
-
-/// STRUCT keys `kind0_struct_absent` would see, taken in one `GcCache` lock.
+/// STRUCT keys `GcCache` already holds a size or field row for, taken in one
+/// lock.
 ///
 /// `descr.py` `get_size_descr` consults the cache once per STRUCT.
 /// `finish_setup_descrs` does not lock again for every parentless slot.
-/// A nonempty `_cache_field` row counts: `kind0_struct_absent` treats that
+/// A nonempty `_cache_field` row counts: that STRUCT is treated
 /// as already published even when `_cache_size` has no entry.
 pub(crate) fn kind0_present_struct_ids() -> Vec<u64> {
     let gc = majit_ir::descr::gc_cache().lock();
