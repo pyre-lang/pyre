@@ -394,15 +394,7 @@ fn release_arguments(w_fargs: PyObjectRef, cif: usize, buffer: usize, mustfree_m
 
 // ── the CIF_DESCRIPTION block ───────────────────────────────────────────
 
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 pub(crate) mod cif {
     use super::super::jit_libffi::{CifDescription, SIZE_OF_FFI_ARG, exchange_args, header};
     use super::{PyError, PyObjectRef, W_CType, ctypeobj};
@@ -765,15 +757,7 @@ pub(crate) mod cif {
     }
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) mod cif {
     use super::{PyError, PyObjectRef};
 

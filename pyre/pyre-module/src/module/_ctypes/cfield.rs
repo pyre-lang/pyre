@@ -16,24 +16,6 @@ type WChar = libc::wchar_t;
 #[cfg(not(any(unix, windows, target_os = "wasi")))]
 type WChar = u32;
 
-#[cfg(all(
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(target_os = "windows")
-))]
-const LONG_DOUBLE_SIZE: usize = core::mem::size_of::<u128>();
-
-#[cfg(target_os = "windows")]
-const LONG_DOUBLE_SIZE: usize = core::mem::size_of::<c_double>();
-
-#[cfg(not(any(
-    all(
-        any(target_arch = "x86_64", target_arch = "aarch64"),
-        not(target_os = "windows")
-    ),
-    target_os = "windows"
-)))]
-const LONG_DOUBLE_SIZE: usize = core::mem::size_of::<c_double>();
-
 const WCHAR_SIZE: usize = core::mem::size_of::<WChar>();
 const POINTER_SIZE: usize = core::mem::size_of::<usize>();
 
@@ -53,7 +35,7 @@ pub(super) fn simple_type_size(ty: &str) -> Option<usize> {
         "Q" => Some(core::mem::size_of::<c_ulonglong>()),
         "f" => Some(core::mem::size_of::<c_float>()),
         "d" => Some(core::mem::size_of::<c_double>()),
-        "g" => Some(LONG_DOUBLE_SIZE),
+        "g" => Some(majit_rlib::clibffi::longdouble_size()),
         "z" | "Z" | "P" | "X" | "O" => Some(core::mem::size_of::<usize>()),
         "void" => Some(0),
         _ => None,
@@ -76,22 +58,7 @@ pub(super) fn simple_type_align(ty: &str) -> Option<usize> {
         "Q" => Some(core::mem::align_of::<c_ulonglong>()),
         "f" => Some(core::mem::align_of::<c_float>()),
         "d" => Some(core::mem::align_of::<c_double>()),
-        "g" => {
-            #[cfg(all(
-                any(target_arch = "x86_64", target_arch = "aarch64"),
-                not(target_os = "windows")
-            ))]
-            {
-                Some(core::mem::align_of::<u128>())
-            }
-            #[cfg(not(all(
-                any(target_arch = "x86_64", target_arch = "aarch64"),
-                not(target_os = "windows")
-            )))]
-            {
-                Some(core::mem::align_of::<c_double>())
-            }
-        }
+        "g" => Some(majit_rlib::clibffi::longdouble_align()),
         "z" | "Z" | "P" | "X" | "O" => Some(core::mem::align_of::<usize>()),
         "void" => Some(0),
         _ => None,
@@ -247,6 +214,10 @@ pub(super) enum DecodedValue {
 
 pub(super) fn pointer_size() -> usize {
     POINTER_SIZE
+}
+
+pub(super) fn pointer_align() -> usize {
+    core::mem::align_of::<usize>()
 }
 
 fn null_pointer_bytes() -> Vec<u8> {
@@ -467,12 +438,10 @@ pub(super) fn simple_storage_value_to_bytes_endian(
                 SimpleStorageValue::Float(value) => value,
                 _ => 0.0,
             };
-            let mut result =
-                float_to_sized_bytes_endian(value, 8, swapped).expect("f64 size is fixed");
-            result.resize(
-                simple_type_size("g").expect("invalid ctypes simple type"),
-                0,
-            );
+            let mut result = majit_rlib::clibffi::f64_to_longdouble_bytes(value);
+            if swapped {
+                result.reverse();
+            }
             result
         }
         "?" => match value {
@@ -486,7 +455,7 @@ pub(super) fn simple_storage_value_to_bytes_endian(
             }
             _ => vec![0; 2],
         },
-        "P" | "z" | "Z" => match value {
+        "P" | "z" | "Z" | "X" => match value {
             SimpleStorageValue::Pointer(value) => {
                 uint_to_sized_bytes_endian(value as u64, pointer_size(), swapped)
             }
@@ -617,7 +586,7 @@ pub(super) fn decode_type_code(type_code: &str, bytes: &[u8]) -> DecodedValue {
                 0.0
             })
         }
-        "d" | "g" => {
+        "d" => {
             const SIZE: usize = core::mem::size_of::<c_double>();
             DecodedValue::Float(if bytes.len() >= SIZE {
                 c_double::from_ne_bytes(bytes[..SIZE].try_into().expect("size checked"))
@@ -625,6 +594,7 @@ pub(super) fn decode_type_code(type_code: &str, bytes: &[u8]) -> DecodedValue {
                 0.0
             })
         }
+        "g" => DecodedValue::Float(majit_rlib::clibffi::longdouble_bytes_to_f64(bytes)),
         "?" => DecodedValue::Bool(!bytes.is_empty() && bytes[0] != 0),
         "v" => {
             const SIZE: usize = core::mem::size_of::<c_short>();
@@ -647,7 +617,7 @@ pub(super) fn decode_type_code(type_code: &str, bytes: &[u8]) -> DecodedValue {
                 None => DecodedValue::None,
             }
         },
-        "P" => DecodedValue::Pointer(read_pointer_from_buffer(bytes)),
+        "P" | "X" => DecodedValue::Pointer(read_pointer_from_buffer(bytes)),
         "u" => {
             let val = if bytes.len() >= core::mem::size_of::<WChar>() {
                 let wc = if core::mem::size_of::<WChar>() == 2 {
@@ -705,6 +675,21 @@ pub(super) unsafe fn callback_arg_value(
         Some("Q") => DecodedValue::Unsigned(unsafe { *(ptr as *const c_ulonglong) }),
         Some("f") => DecodedValue::Float(unsafe { *(ptr as *const f32) as f64 }),
         Some("d") => DecodedValue::Float(unsafe { *(ptr as *const f64) }),
+        Some("g") => {
+            let n = majit_rlib::clibffi::longdouble_size();
+            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, n) };
+            DecodedValue::Float(majit_rlib::clibffi::longdouble_bytes_to_f64(bytes))
+        }
+        Some("v") => DecodedValue::Bool(unsafe { *(ptr as *const i16) } != 0),
+        Some("u") => {
+            let wc = if WCHAR_SIZE == 2 {
+                unsafe { *(ptr as *const u16) as u32 }
+            } else {
+                unsafe { *(ptr as *const u32) }
+            };
+            DecodedValue::String(char::from_u32(wc).unwrap_or('\0').to_string())
+        }
+        Some("X") => DecodedValue::Pointer(unsafe { *(ptr as *const usize) }),
         Some("z") => {
             let cstr_ptr = unsafe { *(ptr as *const *const c_char) };
             if cstr_ptr.is_null() {

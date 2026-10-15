@@ -2,50 +2,42 @@
 
 use pyre_object::PyObjectRef;
 
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
 mod imp {
     use super::PyObjectRef;
     use crate::module::_ctypes::callproc::{CTypeLayout, CallbackThunk, FfiType};
     use crate::module::_ctypes::{callproc, cdata, cfield, funcptr};
     use core::ffi::c_void;
-    use majit_rlib::clibffi::{CALLBACK_TP, FFI_CIFP, VOIDPP};
-    use majit_rlib::rffi::VOIDP;
-    use parking_lot::Mutex;
+    use majit_rlib::clibffi::{self, LibFFIError, LibFFIErrorKind, UserCallback, UserData, VOIDPP};
+    use majit_rlib::rffi::{INT, VOIDP};
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::LazyLock;
+
+    const THUNK_KEY: &str = "_thunk";
 
     struct ThunkUserdata {
-        /// Address of the GC-rooted slot holding the `CFuncPtr` instance: the
-        /// slot, not the instance. A minor collection moves the instance and
-        /// rewrites the slot, so the live pointer is read through it at call
-        /// time.
+        /// GC-rooted slot holding `*mut Weakref` to the owning `CFuncPtr`.
         slot: *mut usize,
-        /// Size of the libffi result slot the callback CIF returns through —
-        /// one `ffi_arg` word for an integral result narrower than that.  Kept
-        /// here so the outer panic boundary can initialize the whole slot
-        /// before any Python/runtime work is attempted.
         result_width: usize,
     }
 
     struct StoredThunk {
         #[allow(dead_code)]
-        slot: Box<usize>,
+        thunk: CallbackThunk,
         #[allow(dead_code)]
-        thunk: CallbackThunk<ThunkUserdata>,
+        userdata: Box<ThunkUserdata>,
+        slot: Box<usize>,
+        rooted: bool,
     }
 
-    unsafe impl Send for StoredThunk {}
-
-    static CALLBACK_THUNKS: LazyLock<Mutex<Vec<StoredThunk>>> =
-        LazyLock::new(|| Mutex::new(Vec::new()));
+    impl Drop for StoredThunk {
+        fn drop(&mut self) {
+            if self.rooted {
+                let slot_ptr =
+                    std::ptr::from_mut(&mut *self.slot).cast::<pyre_object::gc_hook::GCREF>();
+                pyre_object::gc_hook::try_gc_remove_root(slot_ptr);
+                self.rooted = false;
+            }
+        }
+    }
 
     pub(super) fn build_thunk(
         obj: PyObjectRef,
@@ -55,9 +47,6 @@ mod imp {
         let _ = pyre_object::gc_roots::pin_root(obj);
         let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let argtypes = funcptr::resolve_argtypes(current_obj()).unwrap_or_default();
-        // The whole livevar set is published before the first forwarding query:
-        // `pin_root` in a loop queries after the first write, and that query is
-        // a safepoint at which the entries still only in the `Vec` can move.
         let argtypes_slot = pyre_object::gc_roots::pin_roots(&argtypes);
         let ffi_arg_types = (0..argtypes.len())
             .map(|i| ffi_type_for_arg(pyre_object::gc_roots::shadow_stack_get(argtypes_slot + i)))
@@ -66,28 +55,96 @@ mod imp {
             funcptr::resolve_restype(current_obj()).map_err(|_| invalid_callback_result_type())?;
         let ffi_res_type = ffi_type_for_ret(&restype)?;
         let result_width = ffi_result_slot_width(&restype);
+        let flags = funcptr::funcptr_flags(current_obj()) as INT;
 
-        let mut slot = Box::new(current_obj() as usize);
-        let slot_ptr = (&mut *slot) as *mut usize;
-        let root_slot = slot_ptr as *mut pyre_object::gc_hook::GCREF;
-        unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
+        let wref = unsafe { pyre_object::weakref::w_weakref_new(current_obj()) };
+        let mut slot = Box::new(wref as usize);
+        let slot_ptr = std::ptr::from_mut(&mut *slot).cast::<usize>();
+        let rooted = unsafe {
+            pyre_object::gc_hook::try_gc_add_root(slot_ptr.cast::<pyre_object::gc_hook::GCREF>())
+        };
 
+        let userdata = Box::new(ThunkUserdata {
+            slot: slot_ptr,
+            result_width,
+        });
+        let additional_arg = std::ptr::from_ref(&*userdata) as isize;
         let thunk = CallbackThunk::new(
             ffi_arg_types,
             ffi_res_type,
-            Box::new(ThunkUserdata {
-                slot: slot_ptr,
-                result_width,
-            }),
-            thunk_callback,
-        );
+            thunk_user_callback,
+            additional_arg,
+            flags,
+        )
+        .map_err(map_libffi_error)?;
         let code = thunk.code_ptr();
 
-        // A foreign caller may retain a callback pointer indefinitely; pyre has
-        // no proof point for unregistering it, so the rooted slot and closure
-        // intentionally live for the process lifetime.
-        CALLBACK_THUNKS.lock().push(StoredThunk { slot, thunk });
+        let stored = Box::new(StoredThunk {
+            thunk,
+            userdata,
+            slot,
+            rooted,
+        });
+        let stored_ptr = Box::into_raw(stored) as usize;
+        store_thunk_ptr(current_obj(), stored_ptr)?;
+        pyre_interpreter::executioncontext::register_finalizer(current_obj());
         Ok(Some(code))
+    }
+
+    pub(super) fn free_thunk(obj: PyObjectRef) {
+        let Some(stored) = funcptr::instance_get(obj, THUNK_KEY) else {
+            return;
+        };
+        if !unsafe { pyre_object::is_int(stored) } {
+            return;
+        }
+        let ptr = unsafe { pyre_object::w_int_get_value(stored) } as usize;
+        if ptr == 0 {
+            return;
+        }
+        funcptr::clear_thunk_ptr(obj);
+        unsafe { drop(Box::from_raw(ptr as *mut StoredThunk)) };
+    }
+
+    fn store_thunk_ptr(obj: PyObjectRef, ptr: usize) -> Result<(), pyre_interpreter::PyError> {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let w_ptr = pyre_object::w_int_new(ptr as i64);
+        let ptr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_ptr);
+        let d = pyre_interpreter::baseobjspace::getdict_native(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        );
+        if d.is_null() {
+            return Err(pyre_interpreter::PyError::type_error(
+                "CFuncPtr instance has no instance dict",
+            ));
+        }
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                d,
+                THUNK_KEY,
+                pyre_object::gc_roots::shadow_stack_get(ptr_slot),
+            )
+        };
+        Ok(())
+    }
+
+    fn map_libffi_error(err: LibFFIError) -> pyre_interpreter::PyError {
+        match err.kind {
+            LibFFIErrorKind::ClosureAlloc => pyre_interpreter::PyError::memory_error(""),
+            LibFFIErrorKind::PrepClosure => pyre_interpreter::PyError::runtime_error(format!(
+                "ffi_prep_closure failed with {}",
+                err.status
+            )),
+            LibFFIErrorKind::PrepCif | LibFFIErrorKind::PrepCifVar => {
+                pyre_interpreter::PyError::runtime_error(format!(
+                    "ffi_prep_cif failed with {}",
+                    err.status
+                ))
+            }
+        }
     }
 
     fn ffi_type_for_arg(at: PyObjectRef) -> Result<FfiType, pyre_interpreter::PyError> {
@@ -102,61 +159,31 @@ mod imp {
         ffi_type_for_layout(&funcptr::build_layout(at)?)
     }
 
-    /// Lower the same recursive layout foreign calls use to the callback CIF.
-    /// Struct field kinds determine register classification on every major
-    /// ABI; a byte-struct of the same size is not equivalent.
     fn ffi_type_for_layout(layout: &CTypeLayout) -> Result<FfiType, pyre_interpreter::PyError> {
-        match layout {
-            CTypeLayout::Simple(code) => {
-                let mut buf = [0u8; 4];
-                callproc::ffi_type_from_code(code.encode_utf8(&mut buf)).ok_or_else(|| {
-                    pyre_interpreter::PyError::type_error("unknown callback argument type")
-                })
+        layout.to_ffi_type().map_err(|e| match e {
+            callproc::CallError::UnknownTypeCode(_) => {
+                pyre_interpreter::PyError::type_error("unknown callback argument type")
             }
-            CTypeLayout::Pointer => Ok(callproc::ffi_pointer_type()),
-            CTypeLayout::Struct { fields, .. } => fields
-                .iter()
-                .map(ffi_type_for_layout)
-                .collect::<Result<Vec<_>, _>>()
-                .map(FfiType::structure),
-            CTypeLayout::Array {
-                element, length, ..
-            } => Ok(callproc::ffi_repeat_type(
-                ffi_type_for_layout(element)?,
-                *length,
-            )),
-            CTypeLayout::Union { size, .. } | CTypeLayout::Opaque { size } => {
-                Ok(callproc::ffi_byte_struct(*size))
-            }
-        }
+            other => funcptr::call_error_to_py(other),
+        })
     }
 
     fn ffi_result_width(ret: &funcptr::Ret) -> usize {
         match ret {
             funcptr::Ret::Void => 0,
-            // ctypes long double (`g`) is declared to libffi as `double`, so
-            // use the CIF width rather than its 16-byte cdata storage size
-            // on Unix.
-            funcptr::Ret::Code(code) if code == "g" => 8,
+            funcptr::Ret::Code(code) if code == "g" => clibffi::longdouble_size(),
             funcptr::Ret::Code(code) => cfield::simple_type_size(code).unwrap_or(0),
             funcptr::Ret::Pointer(_) => cfield::pointer_size(),
             funcptr::Ret::Aggregate(_) => 0,
         }
     }
 
-    /// Width of `ffi_arg`, the word a libffi closure reserves for an integral
-    /// return however narrow the declared result is.
-    const FFI_ARG_SIZE: usize = std::mem::size_of::<usize>();
+    const FFI_ARG_SIZE: usize = std::mem::size_of::<clibffi::ffi_arg>();
 
-    /// A floating-point result code, which libffi returns through its own
-    /// register file and never widens to `ffi_arg`.
     fn is_float_code(code: &str) -> bool {
         matches!(code, "f" | "d" | "g")
     }
 
-    /// Bytes of the closure's return slot the result owns.  An integral result
-    /// narrower than `ffi_arg` still owns the whole word, so that is what gets
-    /// cleared and what the value is placed within.
     fn ffi_result_slot_width(ret: &funcptr::Ret) -> usize {
         let width = ffi_result_width(ret);
         match ret {
@@ -165,9 +192,6 @@ mod imp {
         }
     }
 
-    /// Offset of an `n`-byte value inside its `ffi_arg` return slot: a
-    /// big-endian ABI keeps the value at the end of the word
-    /// (`callbacks.c:234-239`).
     fn ffi_result_offset(ret: &funcptr::Ret, n: usize) -> usize {
         if cfg!(target_endian = "big") {
             ffi_result_slot_width(ret).saturating_sub(n)
@@ -192,13 +216,9 @@ mod imp {
         pyre_interpreter::PyError::type_error("invalid result type for callback function")
     }
 
-    unsafe extern "C" fn thunk_callback(
-        _cif: FFI_CIFP,
-        result: VOIDP,
-        args: VOIDPP,
-        userdata: VOIDP,
-    ) {
-        let userdata = unsafe { &*(userdata as *const ThunkUserdata) };
+    unsafe fn thunk_user_callback(args: VOIDPP, result: VOIDP, userdata: *mut UserData) {
+        let addarg = unsafe { (*userdata).addarg };
+        let userdata = unsafe { &*(addarg as *const ThunkUserdata) };
         if userdata.result_width != 0 {
             unsafe { std::ptr::write_bytes(result.cast::<u8>(), 0, userdata.result_width) };
         }
@@ -207,7 +227,7 @@ mod imp {
         }));
     }
 
-    const _: CALLBACK_TP = thunk_callback;
+    const _: UserCallback = thunk_user_callback;
 
     unsafe fn thunk_callback_inner(
         result: VOIDP,
@@ -216,30 +236,35 @@ mod imp {
     ) {
         let _callback =
             pyre_interpreter::module::thread::enter_external_callback_from_foreign_thread();
+        let wref = unsafe { *userdata.slot } as *const pyre_object::weakref::Weakref;
+        let obj = unsafe { pyre_object::weakref::w_weakref_deref(wref) };
+        if obj.is_null() {
+            return;
+        }
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(unsafe { *userdata.slot } as PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let use_errno = funcptr::funcptr_flags(current_obj()) & funcptr::FUNCFLAG_USE_ERRNO != 0;
+        let flags = funcptr::funcptr_flags(current_obj());
+        let use_errno = flags & funcptr::FUNCFLAG_USE_ERRNO != 0;
+        let use_last_error = flags & funcptr::FUNCFLAG_USE_LASTERROR != 0;
         let call_result = match decode_args(current_obj(), args) {
-            Ok(decoded) => callproc::with_callback_errno_preserved(use_errno, || {
-                let callable = funcptr::instance_get(current_obj(), funcptr::CALLABLE_KEY)
-                    .ok_or_else(|| {
-                        pyre_interpreter::PyError::type_error("callback has no callable")
-                    })?;
-                let _ = pyre_object::gc_roots::pin_root(callable);
-                let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                pyre_interpreter::call::call_function_impl_result(
-                    pyre_object::gc_roots::shadow_stack_get(callable_slot),
-                    &decoded,
-                )
-            }),
+            Ok(decoded) => {
+                callproc::with_callback_errno_preserved(use_errno, use_last_error, || {
+                    let callable = funcptr::instance_get(current_obj(), funcptr::CALLABLE_KEY)
+                        .ok_or_else(|| {
+                            pyre_interpreter::PyError::type_error("callback has no callable")
+                        })?;
+                    let _ = pyre_object::gc_roots::pin_root(callable);
+                    let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    pyre_interpreter::call::call_function_impl_result(
+                        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                        &decoded,
+                    )
+                })
+            }
             Err(error) => Err(error),
         };
-        // A callback has nowhere to raise: the frame above it is foreign.  The
-        // call's own failure was already reported by `callback_result`, which
-        // substitutes a zero result; what is left here is a result the declared
-        // `restype` cannot represent.
         let written = match funcptr::callback_result(current_obj(), call_result) {
             Ok(value) => {
                 let _ = pyre_object::gc_roots::pin_root(value);
@@ -269,14 +294,7 @@ mod imp {
         args: *const *const c_void,
     ) -> Result<Vec<PyObjectRef>, pyre_interpreter::PyError> {
         let argtypes = funcptr::resolve_argtypes(obj).unwrap_or_default();
-        // Published as one set for the reason `pin_roots` documents: pinning
-        // them one at a time makes the first query a safepoint at which the
-        // still-unpinned entries can move.
         let argtypes_slot = pyre_object::gc_roots::pin_roots(&argtypes);
-        // `decode_arg` may itself pin construction intermediates (aggregate
-        // and function-pointer instances), so decoded results are not
-        // necessarily contiguous on the shadow stack.  Record each result's
-        // actual slot instead of deriving `base + index`.
         let mut decoded_slots = Vec::with_capacity(argtypes.len());
         for i in 0..argtypes.len() {
             let at = pyre_object::gc_roots::shadow_stack_get(argtypes_slot + i);
@@ -297,11 +315,6 @@ mod imp {
         at: PyObjectRef,
         p: *const c_void,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        // A `_CFuncPtr` can expose the pointer type code too, but Python must
-        // receive a callable function-pointer instance, not the integer that
-        // the generic simple decoder would produce.  CPython's
-        // `ConvParam`/`PyCFuncPtrType` path likewise resolves this before the
-        // scalar fallback.
         if funcptr::is_funcptr_type(at) {
             let address = unsafe { *(p as *const usize) };
             let inst = pyre_interpreter::call::type_call_instantiate(at, &[])?;
@@ -317,8 +330,6 @@ mod imp {
             && !funcptr::is_simple_subclass(at)
         {
             if tc == "O" {
-                // The word is the container slot, not the object: an address
-                // parked in callback memory would dangle once its target moved.
                 let num = unsafe { *(p as *const usize) };
                 return Ok(cdata::pyobj_container_get(num).unwrap_or_else(pyre_object::w_none));
             }
@@ -348,12 +359,6 @@ mod imp {
             funcptr::Ret::Void => Ok(()),
             funcptr::Ret::Code(c) => {
                 let bytes = cdata::encode_value_into(&c, value, obj, "result")?;
-                // The return slot is one `ffi_arg` word: a narrow value goes
-                // into a word `thunk_callback` already cleared rather than
-                // beside whatever the closure left there, and nothing wider
-                // than the CIF's own type may be written.  `g` is the case that
-                // overruns — it encodes to a long double while
-                // `ffi_type_from_code` maps it to the `f64` the slot holds.
                 let ret = funcptr::Ret::Code(c);
                 let n = bytes.len().min(ffi_result_width(&ret));
                 unsafe {
@@ -372,28 +377,14 @@ mod imp {
     }
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
-mod imp {
-    use super::PyObjectRef;
-
-    pub(super) fn build_thunk(
-        _obj: PyObjectRef,
-    ) -> Result<Option<usize>, pyre_interpreter::PyError> {
-        Ok(None)
-    }
-}
-
 /// Build a C-callable thunk for the callback `CFuncPtr` instance `obj` and
-/// return its code address, or `None` when this platform has no libffi closure
-/// support.
+/// return its code address.
 pub(super) fn build_thunk(obj: PyObjectRef) -> Result<Option<usize>, pyre_interpreter::PyError> {
     imp::build_thunk(obj)
+}
+
+/// `CThunkObject_dealloc` / `W_CallbackPtr.free` — drop the thunk owned by
+/// `obj`.
+pub(super) fn free_thunk(obj: PyObjectRef) {
+    imp::free_thunk(obj)
 }

@@ -77,6 +77,7 @@ pub(super) fn cfuncptr_type() -> PyObjectRef {
         );
         unsafe {
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            pyre_object::w_type_set_weakrefable(tp, true);
             // PyPy `function.py:CFuncPtr.__metaclass__ = CFuncPtrType`.
             (*tp).w_class = super::metaclass::pycfuncptrtype_type();
         }
@@ -185,6 +186,18 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
         "__bool__",
         pyre_interpreter::make_builtin_function("__bool__", cfuncptr_bool)
     );
+    pyre_interpreter::__pyre_store!(
+        ns,
+        "__del__",
+        pyre_interpreter::make_builtin_function("__del__", cfuncptr_del)
+    );
+}
+
+fn cfuncptr_del(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    if let Some(&obj) = args.first() {
+        super::callbacks::free_thunk(obj);
+    }
+    Ok(pyre_object::w_none())
 }
 
 /// A COM method says which vtable slot it is; everything else reports the
@@ -402,7 +415,20 @@ fn call_error(e: CallError) -> pyre_interpreter::PyError {
         CallError::BufferTooSmall { expected, got } => pyre_interpreter::PyError::value_error(
             format!("aggregate argument buffer too small: expected {expected}, got {got}"),
         ),
+        CallError::LibFFI(err) => pyre_interpreter::PyError::runtime_error(err.call_message()),
     }
+}
+
+pub(super) fn call_error_to_py(e: CallError) -> pyre_interpreter::PyError {
+    call_error(e)
+}
+
+pub(super) fn clear_thunk_ptr(obj: PyObjectRef) {
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, "_thunk") };
 }
 
 /// `(name, dll)` → resolved symbol address.  `dll._handle` is the integer
@@ -1459,7 +1485,8 @@ fn cfuncptr_call_from(
 
     let ret = resolve_restype(pyre_object::gc_roots::shadow_stack_get(self_slot))?;
     let flags = funcptr_flags(pyre_object::gc_roots::shadow_stack_get(self_slot));
-    let result = invoke(call_address(addr, com), &owned, ret, flags)?;
+    let argtypecount = argtypes.as_ref().map(|a| a.len()).unwrap_or(0);
+    let result = invoke(call_address(addr, com), &owned, ret, flags, argtypecount)?;
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
     // A COM method constructed with an interface id answers the plain status,
@@ -1575,6 +1602,7 @@ fn invoke(
     owned: &[OwnedArg],
     ret: Ret,
     flags: i64,
+    argtypecount: usize,
 ) -> Result<CallValue, pyre_interpreter::PyError> {
     // Build the aggregate return layout (if any) up front so it outlives the
     // borrowed `CallRet` handed to the call.
@@ -1609,6 +1637,8 @@ fn invoke(
     let options = CallOptions {
         use_errno: flags & FUNCFLAG_USE_ERRNO != 0,
         use_last_error: flags & FUNCFLAG_USE_LASTERROR != 0,
+        flags,
+        argtypecount,
     };
     // `clibffi.py c_ffi_call` declares `ffi_call` with the default
     // `releasegil='auto'`, i.e. released: the callee is arbitrary foreign code
@@ -1671,7 +1701,7 @@ fn call_settled(
             None => marshal_default_arg(arg, &mut keepalive)?,
         });
     }
-    let result = invoke(plan.addr, &owned, plan.ret, plan.flags)?;
+    let result = invoke(plan.addr, &owned, plan.ret, plan.flags, kinds.len())?;
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
     build_return_value(plan.ret, result).map(Some)
@@ -2539,6 +2569,7 @@ pub(super) fn build_layout(mut t: PyObjectRef) -> Result<CTypeLayout, pyre_inter
     let mut info = stginfo::stginfo_of(t)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("type has no ctypes layout info"))?;
     let size = pyre_object::with_roots!(info, t => stginfo::stginfo_size(info));
+    let align = pyre_object::with_roots!(info, t => stginfo::stginfo_align(info));
     let paramfunc = pyre_object::with_roots!(info, t => stginfo::stginfo_paramfunc(info));
     match paramfunc {
         ParamFunc::Simple => {
@@ -2561,6 +2592,7 @@ pub(super) fn build_layout(mut t: PyObjectRef) -> Result<CTypeLayout, pyre_inter
                 element: Box::new(element),
                 length: stginfo::stginfo_length(info),
                 size,
+                align,
             })
         }
         ParamFunc::Struct | ParamFunc::Union => {
@@ -2569,12 +2601,20 @@ pub(super) fn build_layout(mut t: PyObjectRef) -> Result<CTypeLayout, pyre_inter
                 fields.push(build_layout(ft)?);
             }
             if paramfunc == ParamFunc::Union {
-                Ok(CTypeLayout::Union { fields, size })
+                Ok(CTypeLayout::Union {
+                    fields,
+                    size,
+                    align,
+                })
             } else {
-                Ok(CTypeLayout::Struct { fields, size })
+                Ok(CTypeLayout::Struct {
+                    fields,
+                    size,
+                    align,
+                })
             }
         }
-        _ => Ok(CTypeLayout::Opaque { size }),
+        _ => Ok(CTypeLayout::Opaque { size, align }),
     }
 }
 

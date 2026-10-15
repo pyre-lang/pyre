@@ -224,28 +224,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 const MODULE: &str = "_cffi_backend";
 
 /// `clibffi.FFI_DEFAULT_ABI`.
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 pub fn default_abi() -> u32 {
     majit_rlib::clibffi::FFI_DEFAULT_ABI
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
+#[cfg(not(any(unix, windows)))]
 pub fn default_abi() -> u32 {
     // No libffi on this target, so no foreign call can be made at all; the
     // constant still has to exist because cffi's Python half reads it at

@@ -13,20 +13,46 @@ fn main() {
     // naming the absent symbol is a link error. Ask the target's compiler the
     // same question libffi's configure asked.
     println!("cargo:rustc-check-cfg=cfg(clibffi_longdouble)");
-    if matches!(
-        std::env::var("CARGO_CFG_TARGET_OS")
-            .unwrap_or_default()
-            .as_str(),
-        "linux" | "macos" | "windows" | "android"
-    ) && !matches!(
-        std::env::var("CARGO_CFG_TARGET_ENV")
-            .unwrap_or_default()
-            .as_str(),
-        "musl" | "sgx"
-    ) && long_double_is_its_own_type()
-    {
-        println!("cargo:rustc-cfg=clibffi_longdouble");
+    if target_has_clibffi() {
+        compile_longdouble_helpers();
+        if long_double_is_its_own_type() {
+            println!("cargo:rustc-cfg=clibffi_longdouble");
+        }
     }
+}
+
+fn target_has_clibffi() -> bool {
+    std::env::var("CARGO_CFG_UNIX").is_ok() || std::env::var("CARGO_CFG_WINDOWS").is_ok()
+}
+
+/// `cfield.c g_set` / `g_get` — convert through C `long double` so the
+/// buffer width is `sizeof(long double)` on every target.
+fn compile_longdouble_helpers() {
+    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("ld-helpers");
+    if std::fs::create_dir_all(&out).is_err() {
+        return;
+    }
+    let source = out.join("ld.c");
+    let body = r#"
+void clibffi_f64_to_longdouble(double x, void *dst) {
+    long double y = x;
+    __builtin_memcpy(dst, &y, sizeof(y));
+}
+double clibffi_longdouble_to_f64(const void *src) {
+    long double y;
+    __builtin_memcpy(&y, src, sizeof(y));
+    return (double)y;
+}
+"#;
+    if std::fs::write(&source, body).is_err() {
+        return;
+    }
+    cc::Build::new()
+        .file(&source)
+        .out_dir(&out)
+        .warnings(false)
+        .cargo_warnings(false)
+        .compile("clibffi_ld");
 }
 
 /// Whether the target's `long double` is wider than its `double`, which is

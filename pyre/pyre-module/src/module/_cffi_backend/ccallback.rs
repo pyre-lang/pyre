@@ -9,15 +9,7 @@ use super::ctypeobj::{self, W_CType};
 
 /// The libffi surface a callback needs, which is a dependency only where the
 /// crate declares it; `ctypefunc.rs` splits its `cif` module the same way.
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 mod ffi {
     use majit_rlib::clibffi::{self, ffi_arg};
 
@@ -34,15 +26,7 @@ mod ffi {
     }
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
+#[cfg(not(any(unix, windows)))]
 mod ffi {
     /// `ffi_arg` is a machine word on every target libffi defines it for, and
     /// the result encoder below is shared with those targets.
@@ -97,15 +81,7 @@ impl Drop for UnpublishedClosure {
 }
 
 /// `ccallback.py make_callback` and `W_CDataCallback.__init__`.
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 pub fn make_callback(
     w_ctype: PyObjectRef,
     w_callable: PyObjectRef,
@@ -226,15 +202,7 @@ pub fn make_callback(
     Ok(roots.get(callback_slot))
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
+#[cfg(not(any(unix, windows)))]
 pub fn make_callback(
     _w_ctype: PyObjectRef,
     _w_callable: PyObjectRef,
@@ -539,15 +507,7 @@ unsafe fn do_invoke(w_callback: PyObjectRef, ll_res: *mut u8, ll_args: *mut *mut
     }
 }
 
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 unsafe extern "C" fn invoke_callback(
     _ffi_cif: majit_rlib::clibffi::FFI_CIFP,
     ll_res: majit_rlib::rffi::VOIDP,

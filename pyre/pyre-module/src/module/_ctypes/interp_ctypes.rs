@@ -226,11 +226,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         "get_errno",
         pyre_interpreter::make_builtin_function_with_arity(
             "get_errno",
-            |_| {
-                Ok(pyre_object::w_int_new(
-                    super::callproc::get_errno() as i64,
-                ))
-            },
+            |_| { Ok(pyre_object::w_int_new(super::callproc::get_errno() as i64,)) },
             0,
         )
     );
@@ -321,8 +317,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             };
             // The address comes from the caller, so the read faults as
             // readily as any foreign call's does and needs the same fence.
-            let read =
-                super::seh::guard(|| cfield::string_at(ptr, size as isize))?;
+            let read = super::seh::guard(|| cfield::string_at(ptr, size as isize))?;
             let bytes = read.map_err(|e| {
                 use super::cfield::StringAtError as S;
                 let msg = match e {
@@ -708,7 +703,9 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
         "get_last_error",
         pyre_interpreter::make_builtin_function_with_arity(
             "get_last_error",
-            |_| Ok(pyre_object::w_int_new(host_ctypes::get_last_error() as i64)),
+            |_| Ok(pyre_object::w_int_new(
+                super::callproc::get_last_error() as i64
+            )),
             0,
         )
     );
@@ -723,9 +720,9 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
                         "set_last_error() needs value",
                     ));
                 };
-                let previous = host_ctypes::set_last_error(pyre_interpreter::baseobjspace::int_w(
-                    value,
-                )? as u32);
+                let previous = super::callproc::set_last_error(
+                    pyre_interpreter::baseobjspace::int_w(value)? as u32,
+                );
                 Ok(pyre_object::w_int_new(previous as i64))
             },
             1,

@@ -34,15 +34,7 @@
 //! the buffer when they run interpreted, so the store is a no-op there and
 //! the two modes agree.
 
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 mod imp {
     use super::super::misc;
     use majit_rlib::clibffi::{self, FFI_ABI, FFI_TYPE_P, FFI_TYPE_PP, ffi_arg, ffi_cif};
@@ -475,15 +467,7 @@ mod imp {
     }
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
+#[cfg(not(any(unix, windows)))]
 mod imp {
     /// No libffi on this target, so no foreign call can be described.
     #[majit_macros::elidable_cannot_raise]

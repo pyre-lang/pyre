@@ -8,66 +8,104 @@
 //! they live as long as the cif that points at them.
 
 use majit_rlib::clibffi::{
-    self, CALLBACK_TP, FFI_OK, FFI_TYPE_P, FFI_TYPE_STRUCT, ffi_cif, ffi_closure, ffi_type,
+    self, CallbackFuncPtr, FFI_TYPE_P, FfiStruct, LibFFIError, RawFuncPtr, UserCallback,
 };
-use majit_rlib::rffi::{UINT, VOIDP};
+use majit_rlib::rffi::{INT, VOIDP};
 use std::ffi::{c_long, c_ulong, c_void};
 
 use super::cfield;
-#[cfg(windows)]
-use rustpython_host_env::ctypes as host_ctypes;
+
+#[derive(Clone, Copy)]
+struct CtypesErrorState {
+    errno: i32,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    last_error: u32,
+}
 
 std::thread_local! {
-    /// `callproc.c _ctypes_get_errobj` — per-thread ctypes errno, separate
-    /// from the platform errno.
+    /// `callproc.c _ctypes_get_errobj` — per-thread ctypes errno / last-error,
+    /// separate from the platform slots.
     #[allow(clippy::missing_const_for_thread_local)]
-    static CTYPES_LOCAL_ERRNO: core::cell::Cell<i32> = const { core::cell::Cell::new(0) };
+    static CTYPES_LOCAL_ERRNO: core::cell::Cell<CtypesErrorState> = const {
+        core::cell::Cell::new(CtypesErrorState {
+            errno: 0,
+            last_error: 0,
+        })
+    };
 }
 
 /// `callproc.c _ctypes_get_errobj` — the ctypes-local errno.
 pub(super) fn get_errno() -> i32 {
-    CTYPES_LOCAL_ERRNO.with(|e| e.get())
+    CTYPES_LOCAL_ERRNO.with(|e| e.get().errno)
 }
 
 /// `callproc.c _ctypes_get_errobj` — set the ctypes-local errno, return the previous value.
 pub(super) fn set_errno(value: i32) -> i32 {
     CTYPES_LOCAL_ERRNO.with(|e| {
-        let old = e.get();
-        e.set(value);
+        let mut state = e.get();
+        let old = state.errno;
+        state.errno = value;
+        e.set(state);
         old
     })
 }
 
-#[cfg(not(windows))]
-pub(super) fn with_swapped_errno<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let saved_errno = majit_rlib::rposix::_get_errno();
-    let saved_ctypes_errno = CTYPES_LOCAL_ERRNO.with(|e| e.get());
-    majit_rlib::rposix::_set_errno(saved_ctypes_errno);
-
-    let result = f();
-
-    let new_error = majit_rlib::rposix::_get_errno();
-    CTYPES_LOCAL_ERRNO.with(|e| e.set(new_error));
-    majit_rlib::rposix::_set_errno(saved_errno);
-
-    result
+/// `callproc.c _ctypes_get_errobj` space[1] — the ctypes-local last-error.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn get_last_error() -> u32 {
+    CTYPES_LOCAL_ERRNO.with(|e| e.get().last_error)
 }
 
-pub(super) fn with_callback_errno_preserved<F, R>(use_errno: bool, f: F) -> R
+/// `callproc.c _ctypes_get_errobj` space[1] — set last-error, return the previous value.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn set_last_error(value: u32) -> u32 {
+    CTYPES_LOCAL_ERRNO.with(|e| {
+        let mut state = e.get();
+        let old = state.last_error;
+        state.last_error = value;
+        e.set(state);
+        old
+    })
+}
+
+fn swap_saved_alterrno() {
+    let ctypes = get_errno();
+    let alt = majit_rlib::rposix::get_saved_alterrno();
+    majit_rlib::rposix::set_saved_alterrno(ctypes);
+    set_errno(alt);
+}
+
+#[cfg(windows)]
+fn swap_saved_alt_lasterror() {
+    let ctypes = get_last_error();
+    let alt = majit_rlib::rwin32::GetLastError_alt_saved() as u32;
+    majit_rlib::rwin32::SetLastError_alt_saved(ctypes);
+    set_last_error(alt);
+}
+
+/// `callbacks.c _CallPythonObject` space[0]/space[1] swap, via the alt
+/// slots `ll_callback` already moved the platform values into.
+pub(super) fn with_callback_errno_preserved<F, R>(use_errno: bool, use_last_error: bool, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    if !use_errno {
-        return f();
+    if use_errno {
+        swap_saved_alterrno();
     }
-
-    let saved = majit_rlib::rposix::_get_errno();
+    #[cfg(windows)]
+    if use_last_error {
+        swap_saved_alt_lasterror();
+    }
+    #[cfg(not(windows))]
+    let _ = use_last_error;
     let result = f();
-    let _current = majit_rlib::rposix::_get_errno();
-    majit_rlib::rposix::_set_errno(saved);
+    #[cfg(windows)]
+    if use_last_error {
+        swap_saved_alt_lasterror();
+    }
+    if use_errno {
+        swap_saved_alterrno();
+    }
     result
 }
 
@@ -108,20 +146,30 @@ pub enum CTypeLayout {
     Simple(char),
     /// Any pointer-kind field (`POINTER(T)`, `c_void_p`/`z`/`Z`, function pointer).
     Pointer,
-    /// Struct with per-field layouts in declaration order; `size` is the total
-    /// size including trailing padding.
-    Struct { fields: Vec<Self>, size: usize },
-    /// Union, lowered to a size-matched byte struct (libffi has no union kind, so
-    /// register classification of float-only unions is approximate).
-    Union { fields: Vec<Self>, size: usize },
+    /// Struct with per-field layouts in declaration order; `size`/`align` are
+    /// the declared totals (`stginfo.size` / `stginfo.align`).
+    Struct {
+        fields: Vec<Self>,
+        size: usize,
+        align: usize,
+    },
+    /// Union: `PyCStructUnionType_update_stginfo` still builds an
+    /// `FFI_TYPE_STRUCT` whose elements are every member, with the declared
+    /// union size and alignment.
+    Union {
+        fields: Vec<Self>,
+        size: usize,
+        align: usize,
+    },
     /// Fixed-length array; only meaningful nested inside an aggregate.
     Array {
         element: Box<Self>,
         length: usize,
         size: usize,
+        align: usize,
     },
     /// No field information available: a size-matched byte struct fallback.
-    Opaque { size: usize },
+    Opaque { size: usize, align: usize },
 }
 
 impl CTypeLayout {
@@ -136,7 +184,22 @@ impl CTypeLayout {
             Self::Struct { size, .. }
             | Self::Union { size, .. }
             | Self::Array { size, .. }
-            | Self::Opaque { size } => *size,
+            | Self::Opaque { size, .. } => *size,
+        }
+    }
+
+    /// Declared alignment in bytes.
+    pub fn align(&self) -> usize {
+        match self {
+            Self::Simple(code) => {
+                let mut buf = [0u8; 4];
+                cfield::simple_type_align(code.encode_utf8(&mut buf)).unwrap_or(1)
+            }
+            Self::Pointer => cfield::pointer_align(),
+            Self::Struct { align, .. }
+            | Self::Union { align, .. }
+            | Self::Array { align, .. }
+            | Self::Opaque { align, .. } => (*align).max(1),
         }
     }
 
@@ -149,17 +212,44 @@ impl CTypeLayout {
                 ffi_type_from_code(code).ok_or_else(|| CallError::UnknownTypeCode(code.to_string()))
             }
             Self::Pointer => Ok(ffi_pointer_type()),
-            Self::Struct { fields, .. } => {
+            Self::Struct {
+                fields,
+                size,
+                align,
+            } => {
                 let mut ffi_fields = Vec::with_capacity(fields.len());
                 for field in fields {
                     ffi_fields.push(field.to_ffi_type()?);
                 }
-                Ok(FfiType::structure(ffi_fields))
+                Ok(FfiType::structure(ffi_fields, *size, (*align).max(1)))
             }
             Self::Array {
-                element, length, ..
-            } => Ok(ffi_repeat_type(element.to_ffi_type()?, *length)),
-            Self::Union { size, .. } | Self::Opaque { size } => Ok(ffi_byte_struct(*size)),
+                element,
+                length,
+                size,
+                align,
+            } => Ok(ffi_repeat_type(
+                element.to_ffi_type()?,
+                *length,
+                *size,
+                (*align).max(1),
+            )),
+            Self::Union {
+                fields,
+                size,
+                align,
+            } => {
+                let mut ffi_fields = Vec::with_capacity(fields.len());
+                for field in fields {
+                    ffi_fields.push(field.to_ffi_type()?);
+                }
+                if ffi_fields.is_empty() {
+                    Ok(ffi_byte_struct(*size, (*align).max(1)))
+                } else {
+                    Ok(FfiType::structure(ffi_fields, *size, (*align).max(1)))
+                }
+            }
+            Self::Opaque { size, align } => Ok(ffi_byte_struct(*size, (*align).max(1))),
         }
     }
 }
@@ -168,47 +258,33 @@ impl CTypeLayout {
 /// owns. Simple types point at `clibffi` immortals and own nothing.
 pub struct FfiType {
     ptr: FFI_TYPE_P,
-    owned: Option<Box<OwnedStruct>>,
-}
-
-struct OwnedStruct {
-    record: ffi_type,
-    _elements: Box<[FFI_TYPE_P]>,
+    owned: Option<FfiStruct>,
     children: Vec<FfiType>,
 }
 
 impl FfiType {
     fn immortal(ptr: FFI_TYPE_P) -> Self {
-        Self { ptr, owned: None }
+        Self {
+            ptr,
+            owned: None,
+            children: Vec::new(),
+        }
     }
 
     pub fn as_ptr(&self) -> FFI_TYPE_P {
         self.ptr
     }
 
-    /// Null-terminated `FFI_TYPE_STRUCT` whose fields are `fields`.
-    pub fn structure(fields: Vec<FfiType>) -> Self {
-        let mut elems: Vec<FFI_TYPE_P> = Vec::with_capacity(fields.len() + 1);
-        for field in &fields {
-            elems.push(field.ptr);
-        }
-        elems.push(std::ptr::null_mut());
-        let elements = elems.into_boxed_slice();
-        let elements_ptr = elements.as_ptr().cast_mut();
-        let mut owned = Box::new(OwnedStruct {
-            record: ffi_type {
-                size: 0,
-                alignment: 0,
-                type_: FFI_TYPE_STRUCT,
-                elements: elements_ptr,
-            },
-            _elements: elements,
-            children: fields,
-        });
-        let ptr = std::ptr::addr_of_mut!(owned.record);
+    /// `make_struct_ffitype_e` whose fields are `fields`, with the declared
+    /// size and alignment.
+    pub fn structure(fields: Vec<FfiType>, size: usize, align: usize) -> Self {
+        let field_ptrs: Vec<FFI_TYPE_P> = fields.iter().map(|f| f.ptr).collect();
+        let owned = clibffi::make_struct_ffitype_e(size, align, &field_ptrs);
+        let ptr = owned.as_type_ptr();
         Self {
             ptr,
             owned: Some(owned),
+            children: fields,
         }
     }
 }
@@ -217,15 +293,12 @@ impl Clone for FfiType {
     fn clone(&self) -> Self {
         match &self.owned {
             None => Self::immortal(self.ptr),
-            Some(owned) => Self::structure(owned.children.clone()),
+            Some(owned) => Self::structure(self.children.clone(), owned.size(), owned.alignment()),
         }
     }
 }
 
 /// `_ctypes_get_fielddesc(...)->pffi_type` (`cfield.c`).
-///
-/// `g` is ctypes long-double storage, but the CIF type is `double` so a
-/// callback result slot is 8 bytes rather than the 16-byte cdata width.
 pub fn ffi_type_from_code(ty: &str) -> Option<FfiType> {
     Some(FfiType::immortal(match ty {
         "c" => clibffi::ffi_type_uint8(),
@@ -259,19 +332,25 @@ pub fn ffi_type_from_code(ty: &str) -> Option<FfiType> {
         "q" => clibffi::ffi_type_sint64(),
         "Q" => clibffi::ffi_type_uint64(),
         "f" => clibffi::ffi_type_float(),
-        "d" | "g" => clibffi::ffi_type_double(),
+        "d" => clibffi::ffi_type_double(),
+        "g" => clibffi::ffi_type_longdouble(),
         "z" | "Z" | "P" | "X" | "O" => clibffi::ffi_type_pointer(),
         "void" => clibffi::ffi_type_void(),
         _ => return None,
     }))
 }
 
-pub fn ffi_repeat_type(elem_type: FfiType, len: usize) -> FfiType {
-    FfiType::structure(vec![elem_type; len])
+pub fn ffi_repeat_type(elem_type: FfiType, len: usize, size: usize, align: usize) -> FfiType {
+    FfiType::structure(vec![elem_type; len], size, align)
 }
 
-pub fn ffi_byte_struct(size: usize) -> FfiType {
-    ffi_repeat_type(FfiType::immortal(clibffi::ffi_type_uint8()), size)
+pub fn ffi_byte_struct(size: usize, align: usize) -> FfiType {
+    ffi_repeat_type(
+        FfiType::immortal(clibffi::ffi_type_uint8()),
+        size,
+        size,
+        align.max(1),
+    )
 }
 
 pub fn ffi_pointer_type() -> FfiType {
@@ -328,11 +407,16 @@ pub enum CallRet<'a> {
 /// Per-call error-swapping options.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CallOptions {
-    /// Swap the ctypes-local errno around the raw call (unix; ignored on windows).
+    /// Swap the ctypes-local errno with the alt-saved slot around `c_ffi_call`.
     pub use_errno: bool,
-    /// Swap the ctypes-local last error around the raw call (windows; ignored
-    /// elsewhere).
+    /// Swap the ctypes-local last-error with the alt-saved slot around
+    /// `c_ffi_call` (Windows).
     pub use_last_error: bool,
+    /// `CFuncPtr._flags_` — `get_call_conv` reads `FUNCFLAG_CDECL`.
+    pub flags: i64,
+    /// Declared `argtypes` length (`callproc.c _call_function_pointer`
+    /// `argtypecount`). 0 when unset.
+    pub argtypecount: usize,
 }
 
 /// Result of a foreign call.
@@ -359,89 +443,149 @@ pub enum CallError {
         expected: usize,
         got: usize,
     },
+    /// `AbstractFuncPtr` cif prep failed.
+    LibFFI(LibFFIError),
 }
 
-#[derive(Clone, Copy)]
-enum FfiValue {
-    U8(u8),
-    I8(i8),
-    U16(u16),
-    I16(i16),
-    U32(u32),
-    I32(i32),
-    U64(u64),
-    I64(i64),
-    F32(f32),
-    F64(f64),
-    Pointer(usize),
+struct ScalarCell {
+    buf: [u8; 16],
 }
 
 enum ArgCell<'a> {
-    Scalar(FfiValue),
+    Scalar(ScalarCell),
     Aggregate(&'a [u8]),
 }
 
-fn ffi_value_from_type_code(type_code: &str, buffer: &[u8]) -> FfiValue {
+fn read_uint_ne(buffer: &[u8], width: usize) -> u128 {
+    let n = width.min(buffer.len()).min(16);
+    let mut arg = 0u128;
+    if cfg!(target_endian = "little") {
+        for (i, &b) in buffer.iter().take(n).enumerate() {
+            arg |= u128::from(b) << (8 * i);
+        }
+    } else {
+        for &b in buffer.iter().take(n) {
+            arg = (arg << 8) | u128::from(b);
+        }
+    }
+    arg
+}
+
+fn ffi_value_from_type_code(type_code: &str, buffer: &[u8]) -> (u128, usize, bool) {
+    // (integer_bits, width, is_float_or_raw)
     match type_code {
-        "c" | "b" => FfiValue::I8(buffer.first().map_or(0, |&b| b as i8)),
-        "B" => FfiValue::U8(buffer.first().copied().unwrap_or(0)),
-        "h" => FfiValue::I16(buffer.first_chunk().copied().map_or(0, i16::from_ne_bytes)),
-        "H" => FfiValue::U16(buffer.first_chunk().copied().map_or(0, u16::from_ne_bytes)),
-        "i" => FfiValue::I32(buffer.first_chunk().copied().map_or(0, i32::from_ne_bytes)),
-        "I" => FfiValue::U32(buffer.first_chunk().copied().map_or(0, u32::from_ne_bytes)),
-        "l" | "q" => FfiValue::I64(if let Some(&bytes) = buffer.first_chunk::<8>() {
-            i64::from_ne_bytes(bytes)
-        } else if let Some(&bytes) = buffer.first_chunk::<4>() {
-            i32::from_ne_bytes(bytes).into()
-        } else {
-            0
-        }),
-        "L" | "Q" => FfiValue::U64(if let Some(&bytes) = buffer.first_chunk::<8>() {
-            u64::from_ne_bytes(bytes)
-        } else if let Some(&bytes) = buffer.first_chunk::<4>() {
-            u32::from_ne_bytes(bytes).into()
-        } else {
-            0
-        }),
-        "f" => FfiValue::F32(
-            buffer
-                .first_chunk::<4>()
-                .copied()
-                .map_or(0.0, f32::from_ne_bytes),
+        "c" | "b" => (u128::from(buffer.first().copied().unwrap_or(0)), 1, false),
+        "B" | "?" => (u128::from(buffer.first().copied().unwrap_or(0)), 1, false),
+        "v" | "h" => (
+            u128::from(buffer.first_chunk().copied().map_or(0, u16::from_ne_bytes)),
+            2,
+            false,
         ),
-        "d" | "g" => FfiValue::F64(
-            buffer
-                .first_chunk::<8>()
-                .copied()
-                .map_or(0.0, f64::from_ne_bytes),
+        "H" => (
+            u128::from(buffer.first_chunk().copied().map_or(0, u16::from_ne_bytes)),
+            2,
+            false,
         ),
-        "z" | "Z" | "P" | "O" => FfiValue::Pointer(cfield::read_pointer_from_buffer(buffer)),
-        "?" => FfiValue::U8(u8::from(buffer.first().is_some_and(|&b| b != 0))),
-        "u" => FfiValue::U32(buffer.first_chunk().copied().map_or(0, u32::from_ne_bytes)),
-        _ => FfiValue::Pointer(0),
+        "i" => (
+            u128::from(buffer.first_chunk().copied().map_or(0, u32::from_ne_bytes)),
+            4,
+            false,
+        ),
+        "I" => (
+            u128::from(buffer.first_chunk().copied().map_or(0, u32::from_ne_bytes)),
+            4,
+            false,
+        ),
+        "l" => {
+            let w = std::mem::size_of::<c_long>();
+            (read_uint_ne(buffer, w), w, false)
+        }
+        "L" => {
+            let w = std::mem::size_of::<c_ulong>();
+            (read_uint_ne(buffer, w), w, false)
+        }
+        "q" => (read_uint_ne(buffer, 8), 8, false),
+        "Q" => (read_uint_ne(buffer, 8), 8, false),
+        "u" => {
+            let w = std::mem::size_of::<libc::wchar_t>();
+            (read_uint_ne(buffer, w), w, false)
+        }
+        "f" | "d" | "g" => (0, 0, true),
+        "z" | "Z" | "P" | "X" | "O" => (
+            cfield::read_pointer_from_buffer(buffer) as u128,
+            std::mem::size_of::<usize>(),
+            false,
+        ),
+        _ => (0, std::mem::size_of::<usize>(), false),
     }
 }
 
-fn ffi_value_ptr(value: &FfiValue) -> VOIDP {
-    match value {
-        FfiValue::U8(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::I8(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::U16(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::I16(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::U32(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::I32(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::U64(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::I64(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::F32(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::F64(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
-        FfiValue::Pointer(v) => std::ptr::from_ref(v).cast::<c_void>().cast_mut(),
+fn push_typed_cell(ty: &FfiType, type_code: &str, buffer: &[u8]) -> ScalarCell {
+    let ffitp = ty.as_ptr();
+    let mut cell = ScalarCell { buf: [0u8; 16] };
+    let (arg, arg_size, is_raw) = ffi_value_from_type_code(type_code, buffer);
+    unsafe {
+        if is_raw {
+            clibffi::push_arg_as_ffiptr_bytes(
+                ffitp,
+                buffer.as_ptr(),
+                buffer.len(),
+                cell.buf.as_mut_ptr(),
+            );
+        } else {
+            clibffi::push_arg_as_ffiptr(ffitp, arg, arg_size, cell.buf.as_mut_ptr());
+        }
     }
+    cell
+}
+
+fn push_int_cell(ty: &FfiType, value: i32) -> ScalarCell {
+    let ffitp = ty.as_ptr();
+    let mut cell = ScalarCell { buf: [0u8; 16] };
+    unsafe {
+        clibffi::push_arg_as_ffiptr(
+            ffitp,
+            value as u32 as u128,
+            std::mem::size_of::<i32>(),
+            cell.buf.as_mut_ptr(),
+        );
+    }
+    cell
+}
+
+fn push_f64_cell(ty: &FfiType, value: f64) -> ScalarCell {
+    let ffitp = ty.as_ptr();
+    let mut cell = ScalarCell { buf: [0u8; 16] };
+    let bytes = value.to_ne_bytes();
+    unsafe {
+        clibffi::push_arg_as_ffiptr_bytes(
+            ffitp,
+            bytes.as_ptr(),
+            bytes.len(),
+            cell.buf.as_mut_ptr(),
+        );
+    }
+    cell
+}
+
+fn push_pointer_cell(ty: &FfiType, value: usize) -> ScalarCell {
+    let ffitp = ty.as_ptr();
+    let mut cell = ScalarCell { buf: [0u8; 16] };
+    unsafe {
+        clibffi::push_arg_as_ffiptr(
+            ffitp,
+            value as u128,
+            std::mem::size_of::<usize>(),
+            cell.buf.as_mut_ptr(),
+        );
+    }
+    cell
 }
 
 fn arg_cell_ptr(cell: &ArgCell<'_>) -> VOIDP {
     static DUMMY_BYTE: u8 = 0;
     match cell {
-        ArgCell::Scalar(value) => ffi_value_ptr(value),
+        ArgCell::Scalar(value) => std::ptr::from_ref(&value.buf).cast::<c_void>().cast_mut(),
         ArgCell::Aggregate(buffer) => {
             if buffer.is_empty() {
                 std::ptr::from_ref(&DUMMY_BYTE).cast::<c_void>().cast_mut()
@@ -452,23 +596,7 @@ fn arg_cell_ptr(cell: &ArgCell<'_>) -> VOIDP {
     }
 }
 
-/// `c_ffi_call` is declared with `save_err=RFFI_ERR_ALL|RFFI_ALT_ERRNO`, so
-/// `_errno_before` loads the alt slot into the platform errno. Copy the live
-/// platform value into that slot so `_call_function_pointer`'s swap is what
-/// the callee still sees.
-fn sync_alt_errno_from_platform() {
-    majit_rlib::rposix::_errno_after(
-        majit_rlib::rffi::RFFI_SAVE_ERRNO
-            | majit_rlib::rffi::RFFI_SAVE_LASTERROR
-            | majit_rlib::rffi::RFFI_ALT_ERRNO,
-    );
-}
-
 /// `_call_function_pointer` / `_ctypes_callproc`.
-///
-/// The call site hands a single argument vector (declared argtypes plus any
-/// variadic tail) and does not pass the declared count separately, so this
-/// always uses `c_ffi_prep_cif` rather than `c_ffi_prep_cif_var`.
 pub fn call(
     addr: usize,
     args: &[CallArg<'_>],
@@ -486,20 +614,27 @@ pub fn call(
             CallArg::Typed { code, buffer } => {
                 let ty = ffi_type_from_code(code)
                     .ok_or_else(|| CallError::UnknownTypeCode((*code).to_string()))?;
+                let cell = push_typed_cell(&ty, code, buffer);
                 arg_types.push(ty);
-                cells.push(ArgCell::Scalar(ffi_value_from_type_code(code, buffer)));
+                cells.push(ArgCell::Scalar(cell));
             }
             CallArg::Int(value) => {
-                arg_types.push(ffi_i32_type());
-                cells.push(ArgCell::Scalar(FfiValue::I32(*value)));
+                let ty = ffi_i32_type();
+                let cell = push_int_cell(&ty, *value);
+                arg_types.push(ty);
+                cells.push(ArgCell::Scalar(cell));
             }
             CallArg::Double(value) => {
-                arg_types.push(ffi_f64_type());
-                cells.push(ArgCell::Scalar(FfiValue::F64(*value)));
+                let ty = ffi_f64_type();
+                let cell = push_f64_cell(&ty, *value);
+                arg_types.push(ty);
+                cells.push(ArgCell::Scalar(cell));
             }
             CallArg::Pointer(value) => {
-                arg_types.push(ffi_pointer_type());
-                cells.push(ArgCell::Scalar(FfiValue::Pointer(*value)));
+                let ty = ffi_pointer_type();
+                let cell = push_pointer_cell(&ty, *value);
+                arg_types.push(ty);
+                cells.push(ArgCell::Scalar(cell));
             }
             CallArg::Aggregate { layout, buffer } => {
                 let expected = layout.size();
@@ -524,204 +659,120 @@ pub fn call(
         CallRet::Aggregate(layout) => layout.to_ffi_type()?,
     };
 
-    let mut atypes: Vec<FFI_TYPE_P> = arg_types.iter().map(FfiType::as_ptr).collect();
-    let nargs = atypes.len() as UINT;
-    let atypes_ptr = if atypes.is_empty() {
-        std::ptr::null_mut()
+    let atypes: Vec<FFI_TYPE_P> = arg_types.iter().map(FfiType::as_ptr).collect();
+    let argcount = atypes.len();
+    let variadic_args = if options.argtypecount != 0 && argcount > options.argtypecount {
+        argcount - options.argtypecount
     } else {
-        atypes.as_mut_ptr()
-    };
-    let mut cif = ffi_cif::default();
-    let status = unsafe {
-        clibffi::c_ffi_prep_cif(
-            &raw mut cif,
-            clibffi::FFI_DEFAULT_ABI,
-            nargs,
-            ffi_return_type.as_ptr(),
-            atypes_ptr,
-        )
-    };
-    if status != FFI_OK {
-        panic!("ffi_prep_cif failed");
-    }
-
-    // Allocate the aggregate return buffer outside the error-swap window so no
-    // allocation runs between the raw call and the errno/last-error capture.
-    // libffi requires this buffer be at least `ffi_arg`-sized and suitably
-    // aligned; a `u64` slice guarantees both.
-    let mut aggregate_buffer: Vec<u64> = match ret {
-        CallRet::Aggregate(layout) => vec![0u64; core::cmp::max(layout.size(), 8).div_ceil(8)],
-        _ => Vec::new(),
-    };
-    let mut scalar_u64: u64 = 0;
-    let mut pointer_word: usize = 0;
-
-    let mut avalues: Vec<VOIDP> = cells.iter().map(arg_cell_ptr).collect();
-    let avalues_ptr = if avalues.is_empty() {
-        std::ptr::null_mut()
-    } else {
-        avalues.as_mut_ptr()
+        0
     };
 
-    let rvalue: VOIDP = match ret {
-        CallRet::Void => std::ptr::addr_of_mut!(scalar_u64).cast(),
-        CallRet::Code(code) if cfield::simple_type_is_pointer(code) => {
-            std::ptr::addr_of_mut!(pointer_word).cast()
-        }
-        CallRet::Code(_) => std::ptr::addr_of_mut!(scalar_u64).cast(),
-        CallRet::Pointer => std::ptr::addr_of_mut!(pointer_word).cast(),
-        CallRet::Aggregate(_) => aggregate_buffer.as_mut_ptr().cast(),
-    };
+    let raw = RawFuncPtr::new(
+        "",
+        &atypes,
+        ffi_return_type.as_ptr(),
+        addr as VOIDP,
+        options.flags as INT,
+        variadic_args,
+    )
+    .map_err(CallError::LibFFI)?;
 
-    enum RawKind {
-        Void,
-        Pointer,
-        Scalar,
-        Aggregate,
-    }
-    let kind = match ret {
-        CallRet::Void => RawKind::Void,
-        CallRet::Code(code) if cfield::simple_type_is_pointer(code) => RawKind::Pointer,
-        CallRet::Code(_) => RawKind::Scalar,
-        CallRet::Pointer => RawKind::Pointer,
-        CallRet::Aggregate(_) => RawKind::Aggregate,
-    };
+    let ret_size = unsafe { (*ffi_return_type.as_ptr()).size };
+    let ret_buf_size =
+        clibffi::adjust_return_size(ret_size.max(std::mem::size_of::<clibffi::ffi_arg>()));
+    let mut ret_buf = vec![0u8; ret_buf_size.max(1)];
 
-    let mut invoke = || {
-        sync_alt_errno_from_platform();
-        unsafe {
-            clibffi::c_ffi_call(&raw mut cif, addr as VOIDP, rvalue, avalues_ptr);
-        }
-    };
+    let avalues: Vec<VOIDP> = cells.iter().map(arg_cell_ptr).collect();
 
-    #[cfg(not(windows))]
     if options.use_errno {
-        with_swapped_errno(invoke);
-    } else {
-        invoke();
+        swap_saved_alterrno();
     }
+    #[cfg(windows)]
+    if options.use_last_error {
+        swap_saved_alt_lasterror();
+    }
+
+    unsafe { raw.call(&avalues, ret_buf.as_mut_ptr().cast()) };
 
     #[cfg(windows)]
     if options.use_last_error {
-        host_ctypes::with_swapped_last_error(invoke);
-    } else {
-        invoke();
+        swap_saved_alt_lasterror();
+    }
+    if options.use_errno {
+        swap_saved_alterrno();
     }
 
-    Ok(match kind {
-        RawKind::Void => CallValue::Void,
-        RawKind::Pointer => CallValue::Pointer(pointer_word),
-        RawKind::Scalar => CallValue::Scalar(scalar_u64.to_ne_bytes().to_vec()),
-        RawKind::Aggregate => {
-            let size = match ret {
-                CallRet::Aggregate(layout) => layout.size(),
-                _ => 0,
+    let is_pointer = match ret {
+        CallRet::Pointer => true,
+        CallRet::Code(code) => cfield::simple_type_is_pointer(code),
+        _ => false,
+    };
+    let is_integral = match ret {
+        CallRet::Code(code) => !matches!(code, "f" | "d" | "g" | "void") && !is_pointer,
+        _ => false,
+    };
+    let pointer_value = {
+        let mut tmp = 0usize.to_ne_bytes();
+        let n = ret_buf.len().min(tmp.len());
+        tmp[..n].copy_from_slice(&ret_buf[..n]);
+        CallValue::Pointer(usize::from_ne_bytes(tmp))
+    };
+    Ok(match ret {
+        CallRet::Void => CallValue::Void,
+        CallRet::Pointer => pointer_value,
+        CallRet::Code(_) if is_pointer => pointer_value,
+        CallRet::Code(_) => {
+            let offset = if cfg!(target_endian = "big")
+                && is_integral
+                && ret_size < std::mem::size_of::<isize>()
+            {
+                std::mem::size_of::<isize>().saturating_sub(ret_size)
+            } else {
+                0
             };
-            let bytes: Vec<u8> = aggregate_buffer
-                .iter()
-                .flat_map(|word| word.to_ne_bytes())
-                .collect();
-            CallValue::Aggregate(bytes[..size].to_vec())
+            let n = ret_size.min(ret_buf.len().saturating_sub(offset));
+            CallValue::Scalar(ret_buf[offset..offset + n].to_vec())
+        }
+        CallRet::Aggregate(layout) => {
+            let size = layout.size().min(ret_buf.len());
+            CallValue::Aggregate(ret_buf[..size].to_vec())
         }
     })
 }
 
-/// `CThunkObject` / `_ctypes_alloc_callback` (`callbacks.c`).
-pub struct CallbackThunk<U: 'static> {
-    closure: VOIDP,
-    code: VOIDP,
-    _cif: Box<ffi_cif>,
-    _atypes: Box<[FFI_TYPE_P]>,
+/// `CThunkObject` / `_ctypes_alloc_callback` (`callbacks.c`) wrapping
+/// `CallbackFuncPtr`.
+pub struct CallbackThunk {
+    inner: CallbackFuncPtr,
     _arg_types: Vec<FfiType>,
     _res_type: FfiType,
-    userdata_ptr: *mut U,
 }
 
-impl<U: 'static> CallbackThunk<U> {
+impl CallbackThunk {
     pub fn new(
         ffi_arg_types: Vec<FfiType>,
         ffi_res_type: FfiType,
-        userdata: Box<U>,
-        callback: CALLBACK_TP,
-    ) -> Self {
-        let atypes: Box<[FFI_TYPE_P]> = ffi_arg_types.iter().map(FfiType::as_ptr).collect();
-        let nargs = atypes.len() as UINT;
-        let atypes_ptr = if atypes.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            atypes.as_ptr().cast_mut()
-        };
-        let mut cif = Box::new(ffi_cif::default());
-        let status = unsafe {
-            clibffi::c_ffi_prep_cif(
-                &raw mut *cif,
-                clibffi::FFI_DEFAULT_ABI,
-                nargs,
-                ffi_res_type.as_ptr(),
-                atypes_ptr,
-            )
-        };
-        if status != FFI_OK {
-            panic!("ffi_prep_cif failed");
-        }
-
-        let mut code: VOIDP = std::ptr::null_mut();
-        let closure = unsafe {
-            clibffi::c_ffi_closure_alloc(
-                std::mem::size_of::<ffi_closure>(),
-                std::ptr::addr_of_mut!(code),
-            )
-        };
-        if closure.is_null() || code.is_null() {
-            if !closure.is_null() {
-                unsafe { clibffi::c_ffi_closure_free(closure) };
-            }
-            panic!("ffi_closure_alloc failed");
-        }
-
-        let userdata_ptr = Box::into_raw(userdata);
-        let status = unsafe {
-            clibffi::c_ffi_prep_closure_loc(
-                closure.cast(),
-                &raw mut *cif,
-                callback,
-                userdata_ptr.cast(),
-                code,
-            )
-        };
-        if status != FFI_OK {
-            unsafe {
-                clibffi::c_ffi_closure_free(closure);
-                drop(Box::from_raw(userdata_ptr));
-            }
-            panic!("ffi_prep_closure_loc failed");
-        }
-
-        Self {
-            closure,
-            code,
-            _cif: cif,
-            _atypes: atypes,
+        func: UserCallback,
+        additional_arg: isize,
+        flags: INT,
+    ) -> Result<Self, LibFFIError> {
+        let atypes: Vec<FFI_TYPE_P> = ffi_arg_types.iter().map(FfiType::as_ptr).collect();
+        let inner = CallbackFuncPtr::new(
+            &atypes,
+            ffi_res_type.as_ptr(),
+            func,
+            additional_arg,
+            flags,
+            0,
+        )?;
+        Ok(Self {
+            inner,
             _arg_types: ffi_arg_types,
             _res_type: ffi_res_type,
-            userdata_ptr,
-        }
+        })
     }
 
     pub fn code_ptr(&self) -> usize {
-        self.code as usize
-    }
-}
-
-impl<U: 'static> Drop for CallbackThunk<U> {
-    fn drop(&mut self) {
-        if !self.closure.is_null() {
-            unsafe { clibffi::c_ffi_closure_free(self.closure) };
-            self.closure = std::ptr::null_mut();
-        }
-        if !self.userdata_ptr.is_null() {
-            unsafe { drop(Box::from_raw(self.userdata_ptr)) };
-            self.userdata_ptr = std::ptr::null_mut();
-        }
+        self.inner.get_closure() as usize
     }
 }
