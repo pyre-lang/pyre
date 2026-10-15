@@ -36666,6 +36666,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
+            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -36707,6 +36708,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -37176,6 +37178,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            fn_ptr: self.option_payload_is_fn_ptr(&recv_ty_owned),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(&recv_ty_owned),
         })
@@ -37751,6 +37754,7 @@ impl<'a> Lowering<'a> {
             result_ty,
             args_tuple_suffix,
             niche,
+            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })

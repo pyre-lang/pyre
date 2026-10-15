@@ -63,6 +63,9 @@ pub(crate) struct OptionTrySite {
     /// tag switch is then a pointer null-test (`opt != null`) and the `Some`-arm
     /// payload is the base pointer itself (identity).
     pub niche: bool,
+    /// The niche receiver is `Option<fn>`: its null test compares against
+    /// `null_fn` (int bank).
+    pub fn_ptr: bool,
     /// `Option<NonZero<_>>`: `None` is 0 and `Some` is the word.
     pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
@@ -410,7 +413,7 @@ fn rewire_one_option_try_site(
         graph.push_niche_is_some(
             a_id,
             opt_a.clone(),
-            false,
+            site.fn_ptr,
             site.niche_null_cast.as_ref(),
             opt_disc.clone(),
         );
@@ -628,5 +631,127 @@ fn verify_forwards_to_returnblock(
         Err(format!(
             "{name}: None-return forwarding chain did not reach returnblock"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `Option<fn>` receiver is an int-bank address: its null test
+    /// compares against `null_fn`, never the ref-bank `null_mut()`.
+    #[test]
+    fn rewrite_niche_fn_option_tests_against_null_fn() {
+        let mut g = FunctionGraph::new("test_option_try_niche_fn");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+
+        let (b, b_args) = g.create_block_with_arg_vars(1);
+        let cf = g
+            .push_op_var(
+                b,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::ops::Try".into())),
+                    args: crate::model::call_args(vec![b_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_goto(a, b, vec![opt]);
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let cf_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: cf_c.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (cont, _) = g.create_block_with_arg_vars(0);
+        g.set_return(cont, None);
+
+        let (brk, brk_args) = g.create_block_with_arg_vars(1);
+        let residual_payload = g
+            .push_op_var(
+                brk,
+                OpKind::FieldRead {
+                    base: brk_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Break".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        let residual = g
+            .push_op_var(
+                brk,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "from_residual",
+                        Some("core::ops::FromResidual".into()),
+                    ),
+                    args: crate::model::call_args(vec![residual_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(brk, Some(residual));
+
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(Vec::new(), cont, Some(ExitCase::Const(ConstValue::Int(0)))),
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_c)],
+                brk,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        g.set_goto(b, c, vec![cf.clone()]);
+
+        let stats = rewire_option_try_call_sites(
+            &mut g,
+            &[OptionTrySite {
+                branch_result_var: cf,
+                option_owner: "core::option::Option".into(),
+                some_owner: "core::option::Option::Some".into(),
+                payload_ty: ValueType::Int,
+                niche: true,
+                fn_ptr: true,
+                scalar_niche: false,
+                niche_null_cast: None,
+            }],
+            Some("core::option::Option"),
+            false,
+            false,
+            None,
+            None,
+        );
+        assert_eq!(stats.rewritten, 1, "the niche Option `?` site is rewritten");
+
+        let nulls: Vec<String> = g.blocks[a.0]
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } if args.is_empty() => Some(target.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nulls, vec!["core::ptr::null_fn".to_string()]);
     }
 }

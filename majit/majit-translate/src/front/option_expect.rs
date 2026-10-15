@@ -68,6 +68,9 @@ pub(crate) struct ExpectSite {
     /// discriminant is then `opt != null` and the payload is the base pointer
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
+    /// The niche receiver is `Option<fn>`: its null test compares against
+    /// `null_fn` (int bank).
+    pub fn_ptr: bool,
     /// `Option<NonZero<_>>`: `None` is the integer 0 and `Some` is the word.
     pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
@@ -268,7 +271,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
         graph.push_niche_is_some(
             a_id,
             opt.clone().into_variable(),
-            false,
+            site.fn_ptr,
             site.niche_null_cast.as_ref(),
             disc.clone(),
         );
@@ -340,6 +343,7 @@ mod tests {
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
                 niche: false,
+                fn_ptr: false,
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -423,6 +427,7 @@ mod tests {
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Ref(None),
                 niche: true,
+                fn_ptr: false,
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -473,10 +478,60 @@ mod tests {
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
                 niche: false,
+                fn_ptr: false,
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
         );
         assert_eq!(rewritten, 0, "a non-binary producer declines");
+    }
+
+    /// An `Option<fn>` receiver is an int-bank address: its null test
+    /// compares against `null_fn`, never the ref-bank `null_mut()`.
+    #[test]
+    fn rewrite_niche_fn_option_tests_against_null_fn() {
+        let mut g = FunctionGraph::new("test_expect_niche_fn");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let msg = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: expect_target(),
+                    args: crate::model::call_args(vec![opt, msg]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+
+        let rewritten = rewire_expect_call_sites(
+            &mut g,
+            &[ExpectSite {
+                result_var: result,
+                option_owner: "core::option::Option".to_string(),
+                some_owner: "core::option::Option::Some".to_string(),
+                payload_ty: ValueType::Int,
+                niche: true,
+                fn_ptr: true,
+                scalar_niche: false,
+                niche_null_cast: None,
+            }],
+        );
+        assert_eq!(rewritten, 1);
+
+        let nulls: Vec<String> = g.blocks[a.0]
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } if args.is_empty() => Some(target.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nulls, vec!["core::ptr::null_fn".to_string()]);
     }
 }
