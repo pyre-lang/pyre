@@ -15384,14 +15384,7 @@ pub fn __majit_wrap_builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     builtin_iter(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_builtin_iter_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_builtin_iter"),
-        func: __majit_wrap_builtin_iter,
-    };
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_iter_target, __majit_wrap_builtin_iter);
 
 /// `operation.py _CallableIterator.__iter__` — return self. A keyword or a
 /// surplus positional is the positional-only binding's TypeError, not a
@@ -15403,14 +15396,7 @@ pub fn __majit_wrap_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     Ok(args[0])
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_iter_self_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_iter_self"),
-        func: __majit_wrap_iter_self,
-    };
+crate::builtin_wrapper_descriptor!(__majit_wrap_iter_self_target, __majit_wrap_iter_self);
 
 /// `iter(obj)` / `iter(callable, sentinel)` — PyPy:
 /// `module/__builtin__/operation.py` iter
@@ -26868,14 +26854,7 @@ pub fn __majit_wrap_builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     builtin_pow(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_builtin_pow_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_builtin_pow"),
-        func: __majit_wrap_builtin_pow,
-    };
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_pow_target, __majit_wrap_builtin_pow);
 
 /// `pow(base, exp[, mod])` — pypy/interpreter/baseobjspace.py pow row.
 fn builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

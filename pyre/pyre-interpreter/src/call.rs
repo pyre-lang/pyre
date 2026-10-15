@@ -5121,14 +5121,7 @@ fn type_query(w_obj: PyObjectRef) -> PyObjectRef {
     crate::builtins::type_of_object(w_obj)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_type_query_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_type_query"),
-        func: __majit_wrap_type_query,
-    };
+crate::builtin_wrapper_descriptor!(__majit_wrap_type_query_target, __majit_wrap_type_query);
 
 #[majit_macros::dont_look_inside]
 fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
