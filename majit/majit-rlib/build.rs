@@ -34,13 +34,14 @@ fn compile_longdouble_helpers() {
     }
     let source = out.join("ld.c");
     let body = r#"
+#include <string.h>
 void clibffi_f64_to_longdouble(double x, void *dst) {
     long double y = x;
-    __builtin_memcpy(dst, &y, sizeof(y));
+    memcpy(dst, &y, sizeof(y));
 }
 double clibffi_longdouble_to_f64(const void *src) {
     long double y;
-    __builtin_memcpy(&y, src, sizeof(y));
+    memcpy(&y, src, sizeof(y));
     return (double)y;
 }
 "#;
