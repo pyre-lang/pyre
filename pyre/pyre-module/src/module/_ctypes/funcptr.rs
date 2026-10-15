@@ -199,8 +199,10 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
 
 fn cfuncptr_del(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if let Some(&obj) = args.first() {
-        super::callbacks::free_thunk(obj);
-        free_prepared(obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = _roots.pin_roots(&[obj]);
+        super::callbacks::free_thunk(_roots.get(obj_slot));
+        free_prepared(_roots.get(obj_slot));
     }
     Ok(pyre_object::w_none())
 }
@@ -1724,6 +1726,8 @@ fn invoke(
     flags: i64,
     argtypecount: usize,
 ) -> Result<CallValue, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = _roots.pin_roots(&[self_obj]);
     // Build the aggregate return layout (if any) up front so it outlives the
     // borrowed `CallRet` handed to the call.
     let ret_layout = match &ret {
@@ -1767,17 +1771,14 @@ fn invoke(
     // Being arbitrary foreign code is also why the call goes inside
     // `seh::guard`, which is what stands between a faulting callee and the
     // process.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(self_obj);
-    let local = take_prepared(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    let local = take_prepared(_roots.get(obj_slot))?;
     let result = {
         let _blocked = pyre_interpreter::module::thread::before_external_block();
         super::seh::guard(|| callproc::call_with_prepared(addr, host_args, restype, options, local))
     };
     match result {
         Ok((call_result, returned)) => {
-            put_prepared(pyre_object::gc_roots::shadow_stack_get(obj_slot), returned);
+            put_prepared(_roots.get(obj_slot), returned);
             call_result.map_err(call_error)
         }
         Err(err) => Err(err),
@@ -1805,10 +1806,11 @@ fn call_settled(
     // marshalling an argument can collect, so each is read from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
     let inargs_base = _roots.pin_roots(inargs);
+    let self_slot = _roots.pin_roots(&[self_obj]);
     // Only a pointer argtype is still wanted as an object; a simple one is
     // fully described by the code the plan carries.
     let argtypes = if kinds.contains(&ArgKind::Pointer) {
-        let argtypes = resolve_argtypes(self_obj);
+        let argtypes = resolve_argtypes(_roots.get(self_slot));
         if argtypes.as_ref().is_none_or(|at| at.len() < kinds.len()) {
             return Ok(None);
         }
@@ -1832,7 +1834,7 @@ fn call_settled(
         });
     }
     let result = invoke(
-        self_obj,
+        _roots.get(self_slot),
         plan.addr,
         &owned,
         plan.ret,

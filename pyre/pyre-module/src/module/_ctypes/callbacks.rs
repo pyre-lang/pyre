@@ -92,7 +92,9 @@ mod imp {
     }
 
     pub(super) fn free_thunk(obj: PyObjectRef) {
-        let Some(stored) = funcptr::instance_get(obj, THUNK_KEY) else {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = _roots.pin_roots(&[obj]);
+        let Some(stored) = funcptr::instance_get(_roots.get(obj_slot), THUNK_KEY) else {
             return;
         };
         if !unsafe { pyre_object::is_int(stored) } {
@@ -102,7 +104,7 @@ mod imp {
         if ptr == 0 {
             return;
         }
-        funcptr::clear_thunk_ptr(obj);
+        funcptr::clear_thunk_ptr(_roots.get(obj_slot));
         unsafe { drop(Box::from_raw(ptr as *mut StoredThunk)) };
     }
 
