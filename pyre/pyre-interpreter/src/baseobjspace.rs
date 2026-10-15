@@ -7305,6 +7305,11 @@ pub fn getattr_str_impl(
             if suppress {
                 return Ok(pyre_object::PY_NULL);
             }
+            // Object.descr__getattribute__ / `_handle_getattribute` keep
+            // `w_type` live across the `__getattr__` call; shadowstack.py
+            // restores it. Re-read the slot: a heap type lives in the
+            // nursery and the hook can move it.
+            let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_slot);
             return Err(PyError::attribute_error_with_context(
                 format!(
                     "'{}' object has no attribute '{name}'",
