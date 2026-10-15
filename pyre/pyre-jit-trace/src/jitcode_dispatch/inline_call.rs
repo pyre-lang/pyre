@@ -3370,6 +3370,11 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     is_being_profiled: bool,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
+    // The bridge resume captures its after-call guards on the paused callers;
+    // decline before the first recorded op when they cannot take the result.
+    if dst.is_none() && super::resume_snapshot::finished_callee_parent_frames(ctx).is_none() {
+        return Ok(None);
+    }
     // `do_recursive_call`'s funcbox and ABI, resolved before the first
     // recorded op so an unwired driver declines the inline instead of
     // leaving a half-emitted CALL behind.
@@ -3616,9 +3621,18 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     if let Some((dst_bank, dst)) = dst {
         write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)?;
     }
+    // `opimpl_jit_merge_point` pops the frame holding the merge point
+    // (`finishframe(None, leave_portal_frame=False)`) before its caller
+    // records the call, so the guards below capture the callers alone. The
+    // inline route is already in its caller; the bridge resume is still in
+    // the callee and scopes its captures to the callers.
+    let scope = GuardCaptureScope {
+        finished_callee_result: dst.is_none().then_some(ca_result),
+        ..Default::default()
+    };
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
     // Restore before either exception arm leaves the compiled caller.  Put
     // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
     // an emitted call-adjacent operation even when the restore stores fold.
@@ -3626,7 +3640,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     record_activation_release(ctx.trace_ctx, callee_ec, saved_depth, displaced_activation);
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     if exec_raised {
-        walker_record_guard_exception(ctx, pc)?;
+        walker_record_guard_exception_scoped(ctx, pc, scope)?;
         let exc = ctx
             .last_exc_value()
             .expect("exec_raised implies last_exc_value seeded by the Err branch");
@@ -3637,7 +3651,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         }));
     }
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
 
     Ok(Some(WalkerLoopCalleePortalRecord {
         result: ca_result,
@@ -18858,40 +18872,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     }
 }
 
-/// After a looked-inside `list_extend_value` (`LIST_EXTEND` /
-/// `ListStrategy._extend_from_tuple`), apply the extend once when the
-/// concrete list did not grow. The sub-walk records `setarrayitem` against
-/// the `BUILD_LIST` items array (`len.max(1)`); `ArrayPtrInfo._setitem_index`
-/// does not grow a virtual array, so `list_to_tuple` residual /
-/// `CALL_FUNCTION_EX` unpack miss the extra positional. Same contract as
-/// `finish_recorded_list_append`.
-fn sync_recorded_list_extend(
-    roots_base: usize,
-    len_before: usize,
-    allocated_before: isize,
-) -> bool {
-    // The sub-walk and the extend below can both collect; `roots_base` and
-    // `roots_base + 1` are the rooted list and iterable.
-    let list = pyre_object::gc_roots::shadow_stack_get(roots_base);
-    if unsafe { pyre_object::w_list_len(list) } != len_before {
-        return true;
-    }
-    let iterable = pyre_object::gc_roots::shadow_stack_get(roots_base + 1);
-    let extended = pyre_interpreter::opcode_ops::list_extend_value(list, iterable).is_ok();
-    // Journal whatever was appended, a failed extend's partial prefix
-    // included, so a walk that does not commit rewinds it.
-    let list = pyre_object::gc_roots::shadow_stack_get(roots_base);
-    let len_after = unsafe { pyre_object::w_list_len(list) };
-    for i in len_before..len_after {
-        fbw_list_journal_push_append(list, i, allocated_before);
-    }
-    extended
-}
-
-fn list_extend_value_jitcode_matches(name: &str) -> bool {
-    name == "list_extend_value" || name.ends_with("::list_extend_value")
-}
-
 /// Operand layout `dR>X`:
 ///   2B descr index + 1B varlen + N×1B Ref args + 1B `>X` dst.
 ///
@@ -19045,40 +19025,6 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
-    let _list_extend_roots = pyre_object::gc_roots::push_roots();
-    let list_extend_sync = if ctx.is_authoritative_executor
-        && dst_bank == 'v'
-        && args.len() == 2
-        && arg_concretes.len() >= 2
-        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
-            jc.code.as_ptr() == sub_body.code.as_ptr()
-                && list_extend_value_jitcode_matches(&jc.name)
-        }) {
-        match (&arg_concretes[0], &arg_concretes[1]) {
-            (ConcreteValue::Ref(list), ConcreteValue::Ref(iterable))
-                if !list.is_null()
-                    && !iterable.is_null()
-                    && unsafe { pyre_object::is_list(*list) }
-                    // Only the exact list / tuple storage fast paths record
-                    // stores without running them; any other iterable goes
-                    // through `iter()`, whose callbacks the sub-walk already
-                    // ran, so replaying it would run them twice.
-                    && unsafe {
-                        pyre_object::is_exact_list(*iterable)
-                            || pyre_object::is_exact_tuple(*iterable)
-                    } =>
-            {
-                Some((
-                    pyre_object::gc_roots::pin_roots(&[*list, *iterable]),
-                    unsafe { pyre_object::w_list_len(*list) },
-                    unsafe { pyre_object::listobject::w_list_allocated(*list) },
-                ))
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
     let exc_before_subwalk = ctx.last_exc_value();
     let callee_result = run_inline_call_subwalk(
         ctx,
@@ -19137,14 +19083,6 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 if dst_bank == 'v' {
                     // `inline_call_r_v/dR` expects exactly this — callee
                     // exits via `void_return/`, no SubReturn writeback.
-                    if let Some((roots_base, len_before, allocated_before)) = list_extend_sync {
-                        // A failed extend leaves the walk uncommitted: the
-                        // journal rewinds the prefix and the interpreter
-                        // raises from its own `LIST_EXTEND`.
-                        if !sync_recorded_list_extend(roots_base, len_before, allocated_before) {
-                            return Err(DispatchError::callee_inline_unsupported(op.pc));
-                        }
-                    }
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // Same shape contract as `_r_r`: a `_r_<X>` variant promises

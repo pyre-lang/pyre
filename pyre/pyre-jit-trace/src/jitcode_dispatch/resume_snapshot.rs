@@ -300,6 +300,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // the live walk register banks at that pc. `snapshot_sym.jitcode()` is
     // the eval-loop portal and does not own this offset.
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
+    if let Some(result) = scope.finished_callee_result {
+        return walker_capture_finished_callee_snapshot(ctx, op_pc, result);
+    }
     // Inline sub-walk: the guard's `op_pc` is a *callee* coordinate that
     // does not exist in the outer (`full_body_sym`) jitcode's py_pc→jitcode
     // tables.
@@ -2666,6 +2669,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     }
     .attach_live_caller(
         registers_r,
@@ -2928,6 +2932,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     }
     .attach_live_caller(
         ctx.registers_r,
@@ -3113,6 +3118,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     }
     .attach_live_caller(
         ctx.registers_r,
@@ -3239,6 +3245,56 @@ fn boxes_matching_resume_liveness(
 /// reaches here as `[caller, tail, __init__]` without this path inserting
 /// anything. Nothing here may re-position a level relative to the innermost
 /// callee; a helper descent is not that callee's depth.
+/// The framestack a guard captures once `finishframe` popped the callee: the
+/// paused callers, the innermost with `result` in the slot
+/// `make_result_of_lastop` writes (`pyjitpl.py do_residual_call`, which
+/// records `GUARD_NOT_FORCED` after it). A deopt resumes in the caller past
+/// its call instead of re-entering the callee the call already ran.
+fn walker_capture_finished_callee_snapshot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    result: OpRef,
+) -> Result<(), DispatchError> {
+    let mut parent_frames = finished_callee_parent_frames(ctx)
+        .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
+    if let Some(caller) = parent_frames.last_mut()
+        && let CallResultSlot::At(idx) = caller.result_slot
+    {
+        caller.boxes[idx] = result;
+    }
+    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
+}
+
+/// The paused callers [`walker_capture_finished_callee_snapshot`] captures,
+/// or `None` when the innermost one does not say where its call's result
+/// goes.
+pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<Vec<InlineParentFrame>> {
+    let parent_frames = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .flat_map(|frame| frame.parents.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    let caller = parent_frames.last()?;
+    if caller.result_slot == CallResultSlot::Unknown {
+        if super::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-finished-callee] result slot unknown: jitcode={} marker={:?}",
+                caller.jitcode_index, caller.resume_marker_jit_pc
+            );
+        }
+        return None;
+    }
+    if !ctx.trace_ctx.vable_snapshot_buildable() {
+        return None;
+    }
+    Some(parent_frames)
+}
+
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

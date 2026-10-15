@@ -34,6 +34,7 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     };
     let frames = vec![
         InlineFrameGuard::enter(&outer, 0, false, vec![parent(0x1000)]),
@@ -98,6 +99,7 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     };
     let pre_call = parent(0x1000);
     let stale = pre_call.clone();
@@ -362,6 +364,7 @@ fn dummy_operator_tail_caller() -> InlineParentFrame {
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
     }
 }
 
@@ -1410,6 +1413,37 @@ fn portal_may_force_records_the_callee_execution_context() {
     );
 
     let session = std::cell::RefCell::new(WalkSession::default());
+    // The paused caller the after-call guards capture; it discards the
+    // call's result. Its image holds as many boxes as the resume liveness
+    // at its marker numbers.
+    let caller_pc_word = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .and_then(|payload| payload.resolve_resume_pc_with_jitcode_pc(0, crate::state::op_live()))
+        .expect("caller resume pc");
+    let caller_boxes =
+        vec![
+            OpRef::const_ptr(majit_ir::GcRef(0));
+            crate::state::frame_value_count_at(jitcode_index as i32, caller_pc_word as i32)
+        ];
+    let _caller = InlineFrameGuard::enter(
+        &session,
+        0,
+        false,
+        vec![InlineParentFrame {
+            jitcode_index: jitcode_index as u32,
+            call_jitcode_pc: None,
+            call_stack_overrides: Vec::new(),
+            blackhole: None,
+            resume_coord: ParentResumeCoord::Backxlat(0),
+            resume_marker_jit_pc: Some(0),
+            boxes: caller_boxes,
+            registers_r: None,
+            registers_i: None,
+            registers_f: None,
+            frame_state: None,
+            caller_py_pc: None,
+            result_slot: CallResultSlot::Dead,
+        }],
+    );
     let regs_r = Vec::new();
     let regs_i = Vec::new();
     let regs_f = Vec::new();

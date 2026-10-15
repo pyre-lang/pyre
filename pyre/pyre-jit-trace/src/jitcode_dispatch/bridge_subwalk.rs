@@ -907,10 +907,18 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         .bridge_registers_r()
         .map(|regs| regs.to_vec())
         .unwrap_or_else(|| root_sym.registers_r().to_vec());
-    let result_color = unsafe { &(*root_sym.jitcode()).payload }
-        .result_color_trivia_for_jitcode_pc(root_pc)
-        .map(|c| c as usize)
-        .filter(|&c| c != u16::MAX as usize);
+    // The register the returning callee fills is the result operand of the
+    // call that ends at `root_pc`. Only when no call ends there does the
+    // operand stack's top color stand in for it (`u16::MAX`: empty stack).
+    let call_result = super::call_result_register(jitcode_index, root_pc);
+    let result_color = match call_result {
+        super::CallResultRegister::Ref(color) => Some(color),
+        super::CallResultRegister::Void | super::CallResultRegister::NonRef => None,
+        super::CallResultRegister::Unknown => unsafe { &(*root_sym.jitcode()).payload }
+            .result_color_trivia_for_jitcode_pc(root_pc)
+            .map(|c| c as usize)
+            .filter(|&c| c != u16::MAX as usize),
+    };
     if let Some(result_color) = result_color {
         if result_color < regs_r.len() {
             regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
@@ -971,6 +979,19 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         )
     });
 
+    // The NULLed result's position in `boxes`, which lists the live colors
+    // int bank first, then ref, then float.
+    let result_slot =
+        match root_word.map(|pc| super::call_result_slot(jitcode_index, pc, boxes.len())) {
+            Some(CallResultSlot::At(idx))
+                if boxes.get(idx).is_some_and(|&b| opref_is_null_const_ptr(b)) =>
+            {
+                CallResultSlot::At(idx)
+            }
+            Some(CallResultSlot::Dead) => CallResultSlot::Dead,
+            _ => CallResultSlot::Unknown,
+        };
+
     Some(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
@@ -986,6 +1007,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot,
     })
 }
 
@@ -1077,10 +1099,22 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(recipe.jitcode_index);
     let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
     let sentinel = u32::from(u16::MAX);
-    let result_color = pjc
-        .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
-        .map(|c| c as usize)
-        .filter(|&c| c != u16::MAX as usize);
+    // The returning callee fills the result operand of the call that ends at
+    // the resume pc; only when no call ends there does the operand stack's
+    // top color stand in for it (`u16::MAX`: empty stack).
+    let call_result = if recipe.jitcode_pc >= 0 {
+        super::call_result_register(recipe.jitcode_index as u32, recipe.jitcode_pc as usize)
+    } else {
+        super::CallResultRegister::Unknown
+    };
+    let result_color = match call_result {
+        super::CallResultRegister::Ref(color) => Some(color),
+        super::CallResultRegister::Void | super::CallResultRegister::NonRef => None,
+        super::CallResultRegister::Unknown => pjc
+            .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
+            .map(|c| c as usize)
+            .filter(|&c| c != u16::MAX as usize),
+    };
 
     let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
         recipe.jitcode_index,
@@ -1091,6 +1125,13 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         crate::state::bridge_semantic_maps_from_jitcode_pc(recipe.jitcode_index, recipe.jitcode_pc);
     let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
     let mut boxes = Vec::with_capacity(banks.total_len());
+    // A void call, or a result register not live at the resume pc: dead.
+    let mut result_slot = match call_result {
+        super::CallResultRegister::Void | super::CallResultRegister::Ref(_) => CallResultSlot::Dead,
+        super::CallResultRegister::Unknown | super::CallResultRegister::NonRef => {
+            CallResultSlot::Unknown
+        }
+    };
     // Per-color `(color, box)` pairs for the blackhole capture below, collected
     // alongside the liveness-ordered box list the snapshot consumes.
     let mut bh_int = Vec::with_capacity(banks.int.len());
@@ -1116,6 +1157,9 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     for &color in &banks.ref_ {
         let c = color as usize;
         if result_color == Some(c) {
+            if let super::CallResultRegister::Ref(_) = call_result {
+                result_slot = CallResultSlot::At(boxes.len());
+            }
             boxes.push(null_ref);
             continue;
         }
@@ -1197,6 +1241,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
+        result_slot,
     })
 }
 
@@ -1659,6 +1704,11 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 registers_f: None,
                 frame_state: None,
                 caller_py_pc: None,
+                result_slot: super::call_result_slot(
+                    parent_recipe.jitcode_index as u32,
+                    resume_pc,
+                    parent_recipe.registers_r.len(),
+                ),
             });
             continue;
         }
