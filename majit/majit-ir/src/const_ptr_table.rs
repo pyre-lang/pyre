@@ -684,6 +684,25 @@ pub fn sweep_untraced_if(belongs: &mut dyn FnMut(GcRef) -> bool) {
     }
 }
 
+/// Drop intern slots whose live word `belongs` accepts.
+///
+/// `history.py` `ConstPtr` lives in the MiniMark heap that interned it.
+/// The process-global table is the `Copy` stand-in for the box field, so
+/// destroying that heap must drop those slots. A later MiniMark whose
+/// nursery reuses the mapping would otherwise `drag_out` a leftover as
+/// `collect_oldrefs_to_nursery`. Does not bump [`begin_major_live`] and
+/// does not drain [`Table::young`] of other slots.
+pub fn drop_slots_if(belongs: &mut dyn FnMut(GcRef) -> bool) {
+    let mut guard = table();
+    let mut idx = 1usize;
+    while idx < guard.slots.len() {
+        if !guard.slots[idx].is_null() && belongs(guard.slots[idx]) {
+            free_slot(&mut guard, idx);
+        }
+        idx += 1;
+    }
+}
+
 fn free_slot(guard: &mut Table, idx: usize) {
     let hash = guard.hashes[idx];
     remove_pair(&mut guard.by_hash, hash, idx as u32);
@@ -923,6 +942,18 @@ mod tests {
         });
         assert_eq!(intern(to), idx);
         assert_eq!(resolve(idx), to);
+    }
+
+    #[test]
+    fn drop_slots_if_frees_matching_slots_and_leaves_the_rest() {
+        let _serial = TEST_SERIAL.lock();
+        let keep = intern(GcRef(0x6E6D_0000));
+        let drop_me = intern(GcRef(0x6E6D_1000));
+        drop_slots_if(&mut |g| g.0 == 0x6E6D_1000);
+        assert_eq!(resolve(keep), GcRef(0x6E6D_0000));
+        assert!(resolve(drop_me).is_null());
+        intern(GcRef(0x6E6D_1000));
+        drop_slots_if(&mut |g| (0x6E6D_0000..0x6E6D_2000).contains(&g.0));
     }
 
     #[test]

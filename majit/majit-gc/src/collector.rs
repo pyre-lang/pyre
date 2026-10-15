@@ -11383,12 +11383,40 @@ impl GcAllocator for MiniMarkGC {
     }
 }
 
+impl Drop for MiniMarkGC {
+    fn drop(&mut self) {
+        // `history.py` `ConstPtr` lives in this heap. Drop intern slots
+        // this MiniMark still owns before the nursery and oldgen mappings
+        // go away, so a later MiniMark whose nursery reuses the VA does
+        // not `drag_out` a leftover as `collect_oldrefs_to_nursery`.
+        majit_ir::const_ptr_table::drop_slots_if(&mut |gcref| self.owns_const_ptr_referent(gcref));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     static SHADOW_STACK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     static SUPPLIED_ENV_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn interned_const_ptr_slots_die_with_the_minimark() {
+        let idx;
+        let obj;
+        {
+            let mut gc = MiniMarkGC::with_config(GcConfig {
+                nursery_size: 4096,
+                large_object_threshold: 1024,
+                ..GcConfig::default()
+            });
+            gc.register_type(TypeInfo::simple(16));
+            obj = gc.alloc_with_type(0, 16);
+            idx = majit_ir::const_ptr_table::intern(obj);
+            assert_eq!(majit_ir::const_ptr_table::resolve(idx), obj);
+        }
+        assert_ne!(majit_ir::const_ptr_table::resolve(idx), obj);
+    }
 
     /// A supplied environment answers a name the process does not define, and
     /// yields to one it does. The absent name is not in [`GC_ENV_NAMES`], so a
