@@ -23677,7 +23677,7 @@ fn init_int_type(ns: PyObjectRef) {
         // Exact machine int: `intobject.py descr_repr` — `ll_int2dec` +
         // `newutf8`.  Bool and long keep the digit-limit path.
         if unsafe { pyre_object::is_int(obj) && !pyre_object::is_bool(obj) } {
-            return Ok(unsafe { pyre_object::descr_str(obj) });
+            return crate::runtime_ops::obj_or_memory_error(unsafe { pyre_object::descr_str(obj) });
         }
         let text = unsafe { crate::builtins::int_to_decimal_string(obj)? };
         Ok(unsafe { pyre_object::w_str_new_managed_collecting(&text) })

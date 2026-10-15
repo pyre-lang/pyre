@@ -344,6 +344,9 @@ pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
 pub unsafe fn descr_str(obj: PyObjectRef) -> PyObjectRef {
     let v = unsafe { w_int_get_value(obj) };
     let payload = crate::lowlevel_string::jit_ll_int2dec(v);
+    if payload.is_null() {
+        return crate::PY_NULL;
+    }
     // `len(res)` (`descr_repr`): `LLHelpers.ll_strlen` on the `ll_int2dec`
     // STR.  Keep the payload a `Ptr(STR)` so the rtyper emits STRLEN
     // rather than a Signed residual of `bh_lowlevel_string_len`.
@@ -395,18 +398,27 @@ pub unsafe fn format_int_decimal(
     let _ = roots.pin_root(forced_sign as PyObjectRef);
     let _ = roots.pin_root(std::ptr::null_mut());
     let payload = crate::lowlevel_string::jit_ll_int2dec(value);
+    if payload.is_null() {
+        return crate::PY_NULL;
+    }
     let length = unsafe { (*payload).length } as i64;
     roots.set(base + 2, payload as PyObjectRef);
     let mut n_digits = length;
     let mut sign_len = 0i64;
     if value < 0 {
         let sign = crate::lowlevel_string::ll_stringslice_startstop(payload, 0, 1);
+        if sign.is_null() {
+            return crate::PY_NULL;
+        }
         roots.set(base + 1, sign as PyObjectRef);
         let digits = crate::lowlevel_string::ll_stringslice_startstop(
             roots.get(base + 2) as *mut Str,
             1,
             length,
         );
+        if digits.is_null() {
+            return crate::PY_NULL;
+        }
         roots.set(base + 2, digits as PyObjectRef);
         n_digits = length - 1;
         sign_len = 1;
@@ -417,10 +429,9 @@ pub unsafe fn format_int_decimal(
     let n_padding = width - (sign_len + n_digits);
     if n_padding > 0 {
         let pad = crate::lowlevel_string::jit_ll_str_mul(roots.get(base) as *mut Str, n_padding);
-        assert!(
-            !pad.is_null(),
-            "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
-        );
+        if pad.is_null() {
+            return crate::PY_NULL;
+        }
         roots.set(base, pad as PyObjectRef);
         if align == FORMAT_INT_ALIGN_LEFT {
             if sign_len > 0 {
@@ -428,6 +439,9 @@ pub unsafe fn format_int_decimal(
                     roots.get(base + 1) as *mut Str,
                     roots.get(base + 2) as *mut Str,
                 );
+                if joined.is_null() {
+                    return crate::PY_NULL;
+                }
                 roots.set(base + 2, joined as PyObjectRef);
                 out_len += sign_len;
             }
@@ -435,6 +449,9 @@ pub unsafe fn format_int_decimal(
                 roots.get(base + 2) as *mut Str,
                 roots.get(base) as *mut Str,
             );
+            if joined.is_null() {
+                return crate::PY_NULL;
+            }
             roots.set(base + 2, joined as PyObjectRef);
             out_len += n_padding;
         } else if align == FORMAT_INT_ALIGN_SIGN {
@@ -442,6 +459,9 @@ pub unsafe fn format_int_decimal(
                 roots.get(base) as *mut Str,
                 roots.get(base + 2) as *mut Str,
             );
+            if joined.is_null() {
+                return crate::PY_NULL;
+            }
             roots.set(base + 2, joined as PyObjectRef);
             out_len += n_padding;
             if sign_len > 0 {
@@ -449,6 +469,9 @@ pub unsafe fn format_int_decimal(
                     roots.get(base + 1) as *mut Str,
                     roots.get(base + 2) as *mut Str,
                 );
+                if joined.is_null() {
+                    return crate::PY_NULL;
+                }
                 roots.set(base + 2, joined as PyObjectRef);
                 out_len += sign_len;
             }
@@ -457,12 +480,18 @@ pub unsafe fn format_int_decimal(
                 roots.get(base + 1) as *mut Str,
                 roots.get(base + 2) as *mut Str,
             );
+            if joined.is_null() {
+                return crate::PY_NULL;
+            }
             roots.set(base + 2, joined as PyObjectRef);
             out_len += sign_len;
             let joined = crate::lowlevel_string::jit_ll_strconcat(
                 roots.get(base) as *mut Str,
                 roots.get(base + 2) as *mut Str,
             );
+            if joined.is_null() {
+                return crate::PY_NULL;
+            }
             roots.set(base + 2, joined as PyObjectRef);
             out_len += n_padding;
         } else {
@@ -470,6 +499,9 @@ pub unsafe fn format_int_decimal(
                 roots.get(base) as *mut Str,
                 roots.get(base + 2) as *mut Str,
             );
+            if joined.is_null() {
+                return crate::PY_NULL;
+            }
             roots.set(base + 2, joined as PyObjectRef);
             out_len += n_padding;
         }
@@ -478,6 +510,9 @@ pub unsafe fn format_int_decimal(
             roots.get(base + 1) as *mut Str,
             roots.get(base + 2) as *mut Str,
         );
+        if joined.is_null() {
+            return crate::PY_NULL;
+        }
         roots.set(base + 2, joined as PyObjectRef);
         out_len += sign_len;
     }

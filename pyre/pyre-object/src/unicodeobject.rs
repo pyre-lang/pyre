@@ -555,6 +555,9 @@ pub unsafe fn w_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     let sa = unsafe { w_str_storage(a) };
     let sb = unsafe { w_str_storage(b) };
     let payload = crate::lowlevel_string::jit_ll_strconcat(sa, sb);
+    if payload.is_null() {
+        return crate::PY_NULL;
+    }
     w_str_from_storage_and_length(payload, length)
 }
 
@@ -2029,6 +2032,9 @@ fn jit_str_search_bounds(
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_str(v: i64) -> PyObjectRef {
     let payload = crate::lowlevel_string::jit_ll_int2dec(v);
+    if payload.is_null() {
+        return crate::PY_NULL;
+    }
     let length = crate::lowlevel_string::bh_lowlevel_string_len(payload as i64);
     w_str_from_storage_and_length(payload, length)
 }
@@ -2766,6 +2772,9 @@ mod tests {
         static INTERN_TEST_GC: std::cell::Cell<*mut majit_gc::collector::MiniMarkGC> =
             const { std::cell::Cell::new(std::ptr::null_mut()) };
         static WALK_INTERN_TABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static CONCAT_WALK_SHADOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static CONCAT_COLLECT_STR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static CONCAT_STR_TID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     fn intern_test_gc_ptr() -> *mut majit_gc::collector::MiniMarkGC {
@@ -2807,6 +2816,13 @@ mod tests {
             return std::ptr::null_mut();
         }
         unsafe {
+            let str_tid = CONCAT_STR_TID.with(|cell| cell.get());
+            if str_tid != 0
+                && type_id == str_tid
+                && CONCAT_COLLECT_STR.with(|cell| cell.replace(false))
+            {
+                (*gc).do_collect_nursery();
+            }
             (*gc).alloc_with_type_no_collect(type_id, payload_size).0 as crate::gc_hook::GCREF
         }
     }
@@ -3055,5 +3071,157 @@ mod tests {
             "ll_get must miss a dead intern weakref"
         );
         assert!(get_interned_wtf8(second).is_none());
+    }
+
+    fn concat_test_shadow_stack_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !CONCAT_WALK_SHADOW.with(|flag| flag.get()) {
+            return;
+        }
+        crate::gc_roots::walk_shadow_stack(|slot| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        });
+    }
+
+    struct ConcatGcGuard;
+
+    impl Drop for ConcatGcGuard {
+        fn drop(&mut self) {
+            CONCAT_WALK_SHADOW.with(|flag| flag.set(false));
+            CONCAT_COLLECT_STR.with(|flag| flag.set(false));
+            CONCAT_STR_TID.with(|cell| cell.set(0));
+            let gc = INTERN_TEST_GC.with(|cell| cell.replace(std::ptr::null_mut()));
+            if !gc.is_null() {
+                unsafe { drop(Box::from_raw(gc)) };
+            }
+            crate::gc_hook::clear_gc_write_barrier_hook();
+            crate::gc_hook::clear_gc_write_barrier_managed_hook();
+            crate::gc_hook::clear_gc_owns_object_hook();
+            crate::lowlevel_string::clear_lowlevel_str_gc_type_id();
+        }
+    }
+
+    /// Nursery strings plus a collecting STR malloc, with the recycled
+    /// nursery poisoned so a stale wrapper pointer cannot still answer
+    /// `_len`.
+    fn install_concat_test_gc() -> ConcatGcGuard {
+        let mut gc = majit_gc::collector::MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+            nursery_size: 64 * 1024,
+            large_object_threshold: 32 * 1024,
+            gc_nursery_debug: true,
+            ..majit_gc::collector::GcConfig::default()
+        });
+        pad_type_ids_until(&mut gc, W_UNICODE_GC_TYPE_ID);
+        let unicode_tid = gc.register_type(majit_gc::TypeInfo::with_custom_trace(
+            W_UNICODE_OBJECT_SIZE,
+            intern_test_unicode_trace,
+        ));
+        assert_eq!(unicode_tid, W_UNICODE_GC_TYPE_ID);
+        let str_tid = gc.register_type(majit_gc::TypeInfo::varsize(
+            LOWLEVEL_STR_BASE_SIZE,
+            1,
+            LOWLEVEL_STRING_LEN_OFFSET,
+            false,
+            Vec::new(),
+        ));
+        crate::lowlevel_string::set_lowlevel_str_gc_type_id(str_tid);
+        CONCAT_STR_TID.with(|cell| cell.set(str_tid));
+
+        INTERN_TEST_GC.with(|cell| {
+            cell.set(Box::into_raw(Box::new(gc)));
+        });
+        crate::gc_hook::register_gc_alloc_hook(intern_test_gc_alloc);
+        crate::gc_hook::register_gc_alloc_stable_hook(intern_test_gc_alloc);
+        crate::gc_hook::register_gc_write_barrier_hook(intern_test_gc_write_barrier);
+        crate::gc_hook::register_gc_write_barrier_managed_hook(intern_test_gc_write_barrier);
+        crate::gc_hook::register_gc_owns_object_hook(intern_test_gc_owns_object);
+        majit_gc::shadow_stack::register_extra_root_walker(
+            concat_test_shadow_stack_walker,
+            "concat_test_shadow_stack",
+        );
+        CONCAT_WALK_SHADOW.with(|flag| flag.set(true));
+        ConcatGcGuard
+    }
+
+    /// `descr_add` reads `self._len() + w_other._len()` after
+    /// `self._utf8 + w_other._utf8`. A collecting `ll_strconcat` must
+    /// not leave the wrappers' native copies as the length operands.
+    #[test]
+    fn w_str_concat_length_survives_collecting_ll_strconcat() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        assert!(
+            crate::gc_interp::enabled(),
+            "managed str falls back to immortal while gc_interp is off"
+        );
+        let _guard = install_concat_test_gc();
+
+        let a = w_str_from_wtf8_managed(Wtf8Buf::from("hello"));
+        let b = w_str_from_wtf8_managed(Wtf8Buf::from("world"));
+        assert!(crate::gc_hook::try_gc_owns_object(
+            a as crate::gc_hook::GCREF
+        ));
+        assert!(with_intern_test_gc(|gc| gc.is_in_nursery(a as usize)));
+        assert!(with_intern_test_gc(|gc| gc.is_in_nursery(b as usize)));
+        let expected_len = unsafe { w_str_len(a) + w_str_len(b) };
+
+        let mut a_root = majit_ir::GcRef(a as usize);
+        let mut b_root = majit_ir::GcRef(b as usize);
+        with_intern_test_gc(|gc| {
+            unsafe { gc.roots.add(&mut a_root) };
+            unsafe { gc.roots.add(&mut b_root) };
+        });
+        CONCAT_COLLECT_STR.with(|flag| flag.set(true));
+        let result = unsafe { w_str_concat(a, b) };
+        assert!(!result.is_null());
+        assert_ne!(
+            a_root.0, a as usize,
+            "rooted concat operands must move out of the nursery"
+        );
+        assert_ne!(b_root.0, b as usize);
+        unsafe {
+            assert_eq!(w_str_len(result), expected_len);
+            assert_eq!(w_str_get_wtf8(result), "helloworld");
+        }
+        with_intern_test_gc(|gc| {
+            gc.roots.remove(&mut a_root);
+            gc.roots.remove(&mut b_root);
+        });
+    }
+
+    /// `_fill_number` concatenations keep the leftover STR livevars
+    /// across each `ll_strconcat`. `fill` is one of those livevars
+    /// across `ll_int2dec`.
+    #[test]
+    fn format_int_decimal_survives_collecting_ll_int2dec() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        assert!(
+            crate::gc_interp::enabled(),
+            "managed str falls back to immortal while gc_interp is off"
+        );
+        let _guard = install_concat_test_gc();
+
+        let fill_obj = w_str_from_wtf8_managed(Wtf8Buf::from(" "));
+        let fill = unsafe { w_str_storage(fill_obj) };
+        let mut fill_root = majit_ir::GcRef(fill_obj as usize);
+        with_intern_test_gc(|gc| unsafe { gc.roots.add(&mut fill_root) });
+        CONCAT_COLLECT_STR.with(|flag| flag.set(true));
+        let result = unsafe {
+            crate::intobject::format_int_decimal(
+                -42,
+                fill,
+                5,
+                crate::intobject::FORMAT_INT_ALIGN_LEFT,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!result.is_null());
+        assert_ne!(
+            fill_root.0, fill_obj as usize,
+            "rooted fill wrapper must move during ll_int2dec"
+        );
+        unsafe {
+            assert_eq!(w_str_len(result), 5);
+            assert_eq!(w_str_get_wtf8(result), "-42  ");
+        }
+        with_intern_test_gc(|gc| gc.roots.remove(&mut fill_root));
     }
 }

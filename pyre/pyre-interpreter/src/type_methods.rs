@@ -3843,7 +3843,7 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
         } {
             // `format_int_or_long` empty spec is `space.str(w_num)` —
             // `intobject.py descr_str`.
-            return Ok(unsafe { pyre_object::descr_str(val) });
+            return crate::runtime_ops::obj_or_memory_error(unsafe { pyre_object::descr_str(val) });
         }
     }
     format_w_slow(val, w_spec)
@@ -3863,7 +3863,7 @@ pub fn format_simple_w(val: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
         pyre_object::py_type_check(val, &pyre_object::INT_TYPE)
             && pyre_object::is_exact_builtin_instance(val)
     } {
-        return Ok(unsafe { pyre_object::descr_str(val) });
+        return crate::runtime_ops::obj_or_memory_error(unsafe { pyre_object::descr_str(val) });
     }
     format_simple_slow(val)
 }
