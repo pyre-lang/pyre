@@ -17398,7 +17398,17 @@ pub(crate) fn drain_collect_items(items: PyObjectRef) -> Vec<PyObjectRef> {
 /// negative return raises ValueError "__length_hint__() should return
 /// >= 0"; any other exception propagates.
 pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyError> {
-    match pyre_object::with_roots!(w_obj => len_w(w_obj)) {
+    // baseobjspace.py `length_hint`: `w_obj` is a livevar across `len_w`,
+    // `lookup('__length_hint__')`, and `get_and_call_function`. RPython
+    // gctransform roots that local; pin for the whole body and reload
+    // after every collecting call. `pyopcode.py BUILD_LIST_FROM_ARG`
+    // pops the iterator into this argument, so a collect here with a
+    // stale `w_obj` poisons the iterator `FOR_ITER` / `space.next` then
+    // reads.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    match len_w(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
         Ok(n) => return Ok(n),
         Err(e)
             if e.kind == crate::PyErrorKind::TypeError
@@ -17416,24 +17426,49 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
     // `__getattr__` hook, so the lookup stays type-MRO-faithful.  A user-class
     // instance (is_instance) is excluded entirely so its instance dict is
     // never consulted; a type miss there takes the default.
+    w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     let w_descr = if w_type.is_null() {
         None
     } else {
         unsafe { lookup_in_type_where(w_type, "__length_hint__") }
     };
-    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` — a
+    // baseobjspace.py `space.get_and_call_function(w_descr, w_obj)` — a
     // type-MRO descriptor is called with the object as self; the builtin
     // method-table result is already bound and called with no extra args.
+    w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_hint_result = match w_descr {
-        Some(descr) => unsafe { get_and_call_function(descr, w_obj, w_type, &[]) },
+        Some(descr) => {
+            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(descr);
+            let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+            unsafe {
+                get_and_call_function(
+                    pyre_object::gc_roots::shadow_stack_get(descr_slot),
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    w_type,
+                    &[],
+                )
+            }
+        }
         None => {
             if unsafe { is_instance(w_obj) } {
                 return Ok(default);
             }
-            match pyre_object::with_roots!(w_obj => getattr_str_impl(w_obj, "__length_hint__", false, false))
-            {
-                Ok(m) => crate::call::call_function_impl_result(m, &[]),
+            match getattr_str_impl(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                "__length_hint__",
+                false,
+                false,
+            ) {
+                Ok(m) => {
+                    let meth_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(m);
+                    crate::call::call_function_impl_result(
+                        pyre_object::gc_roots::shadow_stack_get(meth_slot),
+                        &[],
+                    )
+                }
                 Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
                 Err(e) => Err(e),
             }
@@ -17450,10 +17485,13 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
             return Err(err);
         }
     };
-    if pyre_object::with_roots!(w_hint => is_w(w_hint, pyre_object::special::w_not_implemented())) {
+    let hint_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_hint);
+    w_hint = pyre_object::gc_roots::shadow_stack_get(hint_slot);
+    if is_w(w_hint, pyre_object::special::w_not_implemented()) {
         return Ok(default);
     }
-    let hint = int_w(w_hint)?;
+    let hint = int_w(pyre_object::gc_roots::shadow_stack_get(hint_slot))?;
     if hint < 0 {
         return Err(crate::PyError::value_error(
             "__length_hint__() should return >= 0",
