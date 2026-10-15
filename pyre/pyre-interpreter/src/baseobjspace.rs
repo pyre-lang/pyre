@@ -12063,9 +12063,10 @@ unsafe fn _cached_lookup_where_name(
 ///
 /// Every cached value is an MRO type's namespace-dict resident (or a
 /// Box-immortal builtin descriptor), so the value *itself* is already kept
-/// reachable by `walk_builtin_type_dicts_gc` or by the owning type's custom
-/// trace forwarding `t.dict`, and an old-gen resident is not relocated by a
-/// collection — so as a *forwarding* pass this one changes no pointer today.
+/// reachable by the owning type's custom trace forwarding `t.dict` (an immortal
+/// builtin type is traced through `prebuilt_root_objects`), and an old-gen
+/// resident is not relocated by a collection — so as a *forwarding* pass this
+/// one changes no pointer today.
 ///
 /// It is not only a forwarding pass. `eval.rs` hands in a closure that also
 /// runs `walk_raw_function_roots` / `walk_raw_getset_roots` /

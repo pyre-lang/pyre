@@ -521,32 +521,6 @@ fn resolve_dict_data_slot(layout: &Layout) -> i32 {
     unsafe { (*layout.base_layout).dict_data_slot }
 }
 
-/// Builtin types (`w_type_new_builtin`) are process-global, so their root
-/// registry must have the same owner.  A TLS registry loses types first made
-/// on a worker and makes a collection on another thread miss their children.
-static BUILTIN_TYPE_NAMESPACE_ROOTS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
-    std::sync::OnceLock::new();
-
-fn builtin_type_namespace_roots() -> &'static parking_lot::Mutex<Vec<usize>> {
-    BUILTIN_TYPE_NAMESPACE_ROOTS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
-}
-
-/// Record an immortal type for the collection-time namespace root walk.
-#[majit_macros::dont_look_inside]
-fn register_builtin_type_roots(addr: usize) {
-    // Record the prebuilt-family store so the next minor collection scans it
-    // (gc_roots.rs prebuilt-root write tracking).
-    crate::gc_roots::mark_prebuilt_roots_dirty();
-    builtin_type_namespace_roots().lock().push(addr);
-}
-
-/// Snapshot the registered immortal-type addresses for the root walker
-/// (`pyre_interpreter::eval::walk_builtin_type_dicts_gc`).
-#[majit_macros::dont_look_inside]
-pub fn snapshot_builtin_type_roots() -> Vec<usize> {
-    builtin_type_namespace_roots().lock().clone()
-}
-
 /// Allocate a new W_TypeObject with `flag_heaptype = true`.
 ///
 /// typeobject.py:174 `__init__(..., is_heaptype=True)`.
@@ -668,8 +642,11 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         unsafe { std::ptr::write(raw as *mut W_TypeObject, value) };
         (raw as PyObjectRef, true)
     } else {
-        // No GC hook yet (pre-init / snapshot tools): fall back to an immortal box.
-        (crate::lltype::malloc_typed(value) as PyObjectRef, false)
+        // No GC hook yet (pre-init / snapshot tools): `init_gc_object_immortal`.
+        (
+            crate::lltype::malloc_typed_immortal(value) as PyObjectRef,
+            false,
+        )
     };
     if gc_managed {
         // A nursery header needs no creation barrier. The collecting
@@ -679,9 +656,10 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
             crate::gc_hook::try_gc_write_barrier(w_type as crate::gc_hook::GCREF);
         }
     } else {
-        // Immortal fallback type (pre-GC): its trace never fires, so root its
-        // namespace the same way builtin types are rooted.
-        register_builtin_type_roots(w_type as usize);
+        // Bulk construction wrote bases / dict / name boxes with no per-store
+        // barrier. One barrier enrolls the prebuilt object
+        // (`incminimark.py` `remember_young_pointer`).
+        crate::gc_hook::try_gc_write_barrier(w_type as crate::gc_hook::GCREF);
     }
     w_type
 }
@@ -750,11 +728,15 @@ pub fn w_type_new_builtin(
 }
 
 /// TypeCache.build's `instantiate(W_TypeObject)`, before descriptor wrapping.
-/// The existing immortal builtin allocation policy is retained. Null reference
-/// slots make this shell safe for the root walker while descriptors are built;
-/// do not expose it to Python operations before w_type_init_builtin.
+///
+/// `init_gc_object_immortal` (`GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`).
+/// Null reference slots make this shell a leaf until `w_type_init_builtin`
+/// (and the type setters) store pointers and issue a write barrier, which
+/// enrolls the type in `prebuilt_root_objects` (`incminimark.py`
+/// `remember_young_pointer`). Do not expose it to Python operations before
+/// `w_type_init_builtin`.
 pub fn w_type_alloc_builtin() -> PyObjectRef {
-    let w_type = crate::lltype::malloc_typed(W_TypeObject {
+    crate::lltype::malloc_typed_immortal(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
@@ -807,13 +789,7 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         w_name_watchers: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
-    }) as PyObjectRef;
-    // A builtin type is Box-immortal, so its namespace values and `bases` are reachable only
-    // through `walk_builtin_type_dicts_gc` (`pyre_interpreter::eval`).
-    // Register it so that walk forwards them; without this a
-    // collection could otherwise reclaim a young namespace value.
-    register_builtin_type_roots(w_type as usize);
-    w_type
+    }) as PyObjectRef
 }
 
 /// W_TypeObject.__init__'s name/bases/dict installation on an allocated shell.
@@ -836,10 +812,11 @@ pub unsafe fn w_type_init_builtin(
         crate::lltype::malloc_raw(name.rsplit('.').next().unwrap_or(name).to_string());
     w_self.bases = bases;
     w_self.dict = dict_ptr;
-    // A collection during descriptor wrapping can clear the dirty bit set
-    // when the shell was registered. These newly installed children must be
-    // visited by the next minor collection as well.
-    crate::gc_roots::mark_prebuilt_roots_dirty();
+    // Construction wrote the pointer fields with no per-store barrier.
+    // One barrier behind the bulk write enrolls the immortal type in
+    // `prebuilt_root_objects` (`incminimark.py` `remember_young_pointer`),
+    // matching `function_new_impl`.
+    crate::gc_hook::try_gc_write_barrier(w_type as crate::gc_hook::GCREF);
 }
 
 /// `dictmultiobject.py` `UNKNOWN` — cache miss; recompute via
@@ -1600,7 +1577,6 @@ pub unsafe fn w_type_get_w_doc(obj: PyObjectRef) -> PyObjectRef {
 /// (`w_None` or a unicode).
 pub unsafe fn w_type_set_w_doc(obj: PyObjectRef, w_doc: PyObjectRef) {
     let t = &mut *(obj as *mut W_TypeObject);
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     type_write_barrier(obj);
     t.w_doc = w_doc;
 }
@@ -1634,9 +1610,24 @@ pub unsafe fn w_type_get_bases(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_bases(obj: PyObjectRef, bases: PyObjectRef) {
     let bases = crate::gc_roots::pin_root(bases);
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     type_write_barrier(obj);
     (*(obj as *mut W_TypeObject)).bases = bases;
+}
+
+/// Store the type's own class (the metatype) through the write barrier.
+///
+/// `baseobjspace.py getclass()` — for a type object the class is the
+/// metatype. Construction stamps it via `store_subclass_tag`; later
+/// overwrites (bootstrap fill of types built before `type` exists,
+/// `_ctypes` metaclasses) take this setter so an immortal type is
+/// enrolled in `prebuilt_root_objects` (`incminimark.py`
+/// `remember_young_pointer`).
+///
+/// # Safety
+/// `obj` must be a live `W_TypeObject`.
+pub unsafe fn w_type_set_w_class(obj: PyObjectRef, w_class: PyObjectRef) {
+    type_write_barrier(obj);
+    (*obj).w_class = w_class;
 }
 
 /// Get the class namespace pointer (`llmemory.GCREF`).
@@ -2315,8 +2306,8 @@ pub fn subclasses_locks_after_fork_child() {
 /// `w_weakref_new` so subclass GC isn't blocked (`:642-650`); each
 /// entry is a `try_gc_alloc` WEAKREF GcStruct, so the off-GC
 /// `weak_subclasses` list is the WEAKREF's only strong root and must
-/// be walked by the collector (`walk_builtin_type_dicts_gc` for builtin
-/// types, the `W_TYPE_GC_TYPE_ID` custom trace for heap types).
+/// be walked by the collector (`W_TYPE_GC_TYPE_ID` custom trace,
+/// reached for an immortal parent through `prebuilt_root_objects`).
 ///
 /// # Safety
 /// `w_parent` must point at a valid `W_TypeObject`.  `w_subclass`
@@ -2374,24 +2365,12 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
 
 /// Record the store of a freshly allocated weakref into `weak_subclasses`.
 ///
-/// The mark covers builtin parents, whose list is off-GC and reachable only
-/// through `walk_builtin_type_dicts_gc`; the write barrier covers GC-managed
-/// heap parents, whose list is forwarded by the `W_TYPE_GC_TYPE_ID` custom
-/// trace.
-///
-/// Order matters for the dirty bit, and neither operation here is a collection
-/// point: host-side allocation cannot collect (`dynasm_alloc_nursery_typed`
-/// routes to `try_alloc_nursery_no_collect_typed` and spills to old-gen on
-/// nursery full), and `try_gc_write_barrier` reaches `gc_sync::gc_op`, which
-/// under the GIL is a bare borrow of the singleton.  The bit is consumable
-/// (`gc_roots::clear_prebuilt_roots_dirty` after each walk) and nothing else
-/// roots the young weakref, so any collection that walks the prebuilt family
-/// with the slot already updated and the bit still clear loses it.  Mark first,
-/// then take the barrier: that puts the mark ahead of every collection point the
-/// caller can reach afterwards, wherever the next one falls.
+/// The write barrier enrolls an immortal parent in `prebuilt_root_objects`
+/// (`incminimark.py` `remember_young_pointer`) and puts a heap parent in
+/// the remembered set so `type_object_custom_trace` forwards the young
+/// WEAKREF on the next collection.
 #[inline]
 unsafe fn note_weak_subclass_store(w_parent: PyObjectRef) {
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     crate::gc_hook::try_gc_write_barrier(w_parent as crate::gc_hook::GCREF);
 }
 
@@ -2544,7 +2523,9 @@ mod tests {
             assert!(before.bases.is_null());
             assert!(before.layout.is_null());
             assert!(before.mro_w.is_null());
-            assert!(snapshot_builtin_type_roots().contains(&(shell as usize)));
+            let header = majit_gc::header::header_of(shell as usize);
+            assert!((*header).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             let _roots = crate::gc_roots::push_roots();
             let ns = crate::gc_roots::pin_root(crate::w_dict_new());
             w_type_init_builtin(

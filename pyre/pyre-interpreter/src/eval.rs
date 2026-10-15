@@ -828,96 +828,6 @@ unsafe fn walk_raw_wrapped_function_roots(
     }
 }
 
-/// Box-immortal builtin types never have their `W_TYPE_GC_TYPE_ID` custom
-/// trace fired, but their namespaces, `bases`, and `weak_subclasses` can hold
-/// young GC objects after startup.  Walk every registered builtin type (and
-/// the rare pre-GC heap-type fallback) as pinned roots so those children stay
-/// live and their slots are forwarded.  GC-managed heap types reach the same
-/// fields through their own `W_TYPE_GC_TYPE_ID` custom trace.
-unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    unsafe {
-        for addr in pyre_object::typeobject::snapshot_builtin_type_roots() {
-            let w_type = addr as PyObjectRef;
-            if w_type.is_null() {
-                continue;
-            }
-            // Positive predicate (see `walk_raw_getset_roots`): `!is_type`
-            // over a cross-crate bool is `UnaryNotUnknownOperand` to the
-            // annotator, so guard with a positive `if`.
-            if pyre_object::is_type(w_type) {
-                if pyre_object::gc_hook::try_gc_owns_object(w_type as pyre_object::gc_hook::GCREF) {
-                    continue;
-                }
-                // `bases` is a movable tuple created at class definition and
-                // held only by the Box-immortal type; forward it in place.
-                let bases_slot =
-                    &mut (*(w_type as *mut pyre_object::typeobject::W_TypeObject)).bases;
-                forward(bases_slot);
-                let t = &mut *(w_type as *mut pyre_object::typeobject::W_TypeObject);
-                // The metatype.  `type_object_custom_trace` forwards it too,
-                // but never runs for the Box-immortal owners this walk stands
-                // in for.  It is the immortal `type` for all but a type built
-                // through `PyType_FromMetaclass`, whose metatype is an
-                // ordinary object with no other root here.
-                forward(&mut t.ob_header.w_class);
-                forward(&mut t.w_name);
-                forward(&mut t.w_qualname);
-                forward(&mut t.w_doc);
-                // Heap and builtin types both hold a managed W_DictObject.
-                // Forward the field itself; the dict's custom trace walks its
-                // keys and values during a major collection. During a minor,
-                // an already-old dict is not recursively rescanned merely
-                // because this root slot is visited, so explicitly descend
-                // through the strategy storage as the translated prebuilt
-                // object's trace function does.
-                let dict_slot = &mut t.dict as *mut pyre_object::gc_hook::GCREF as *mut PyObjectRef;
-                forward(&mut *dict_slot);
-                forward(&mut t.lifeline);
-                pyre_object::dictmultiobject::w_dict_walk_gc_refs(*dict_slot, &mut |slot| {
-                    forward(slot)
-                });
-                // `weak_subclasses` holds `w_weakref_new` (`try_gc_alloc`)
-                // young WEAKREF GcStructs whose only strong root is this
-                // off-GC list; forward each slot in place so the WEAKREF
-                // survives collection (its `weakptr` payload is invalidated
-                // separately by the collector's weakref scan).  Without this,
-                // the first collection reclaims the weakref and the base's
-                // `weak_subclasses[i]` dangles — a UAF on the next
-                // `mutated()` / `w_type_get_subclasses` deref.  The
-                // `W_TYPE_GC_TYPE_ID` custom trace performs the same walk for
-                // a heap type.
-                if t.weak_subclasses.is_null() {
-                    // No subclasses recorded.
-                } else {
-                    let subs = &mut *t.weak_subclasses;
-                    for slot in subs.iter_mut() {
-                        forward(
-                            &mut *(slot as *mut *mut pyre_object::weakref::Weakref
-                                as *mut PyObjectRef),
-                        );
-                    }
-                }
-                // `mro_w` is a stable type-9 GcArray block (`alloc_mro_block_gc`)
-                // whose only strong root is this immortal type. The custom
-                // trace `type_object_custom_trace` never fires for a Box-immortal
-                // owner, so forward the block field slot here: the collector
-                // marks the tid-9 block and its varsize walker forwards
-                // items[0..len]. Omitting this lets the first major collection
-                // sweep the block — a UAF on the next MRO read. Guard on GC
-                // ownership so the `std::alloc` bootstrap fallback (not owned)
-                // is left in place.
-                if !t.mro_w.is_null()
-                    && pyre_object::gc_hook::try_gc_owns_object(
-                        t.mro_w as pyre_object::gc_hook::GCREF,
-                    )
-                {
-                    forward(&mut *(std::ptr::addr_of_mut!(t.mro_w) as *mut PyObjectRef));
-                }
-            }
-        }
-    }
-}
-
 /// Whether `PYRE_INTERP_RETURN_LOG` asks the RETURN_VALUE handler to trace
 /// every returning frame.
 ///
@@ -1244,9 +1154,9 @@ pub unsafe fn walk_pyframe_roots_area(
     // recorded a store into it since the previous minor collection
     // (`old_objects_pointing_to_young`); a major collection always traces
     // `prebuilt_root_objects`.  The Box-immortal structures walked below
-    // (module dicts / cells, heap-type namespace dicts, method caches,
-    // function fields) are pyre's prebuilt family; their mutation helpers
-    // set `mark_prebuilt_roots_dirty`, so a clean bit during a minor
+    // (module dicts / cells, method caches, function fields) are pyre's
+    // prebuilt family; their mutation helpers set
+    // `mark_prebuilt_roots_dirty`, so a clean bit during a minor
     // collection means no young pointer can be inside and the walks are
     // skipped.  Live-frame slots are real stack roots and are always walked.
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
@@ -1729,7 +1639,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         let mut forward = |slot: &mut PyObjectRef| {
             visit_prebuilt_declaration(slot, visitor, false);
         };
-        walk_builtin_type_dicts_gc(&mut forward);
         // interp_posix.ApplevelForkCallbacks is another object-space cache.
         #[cfg(not(target_arch = "wasm32"))]
         crate::module::posix::interp_posix::walk_fork_callback_roots(&mut forward);

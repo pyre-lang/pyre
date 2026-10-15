@@ -657,8 +657,9 @@ assert result == 3430, result
 /// full collections, even when first reached *fresh* after the collections.
 /// Heap type objects (`w_type_new`) are GC-managed, so their
 /// `W_TYPE_GC_TYPE_ID` custom trace reaches the movable values bound in the
-/// type's namespace `DictStorage`. The `BUILTIN_TYPE_NAMESPACE_ROOTS` /
-/// `walk_builtin_type_dicts_gc` walk covers immortal builtin types instead.
+/// type's namespace `DictStorage`. Immortal builtin types reach the same
+/// custom trace through `prebuilt_root_objects` after their construction
+/// write barrier.
 ///
 /// `C`'s namespace dict holds a method (`method`), a class attribute
 /// (`KLASS_ATTR`), and — once `c.__dict__` is first read — the copied

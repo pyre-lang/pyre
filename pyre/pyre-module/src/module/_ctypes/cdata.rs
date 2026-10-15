@@ -597,7 +597,7 @@ pub(super) fn simplecdata_type() -> PyObjectRef {
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
             // PyPy `primitive.py:SimpleType(_CDataMeta)` / CPython 3.14
             // `CREATE_TYPE(... PyCSimpleType_Type ...)`.
-            (*tp).w_class = super::metaclass::pycsimpletype_type();
+            pyre_object::typeobject::w_type_set_w_class(tp, super::metaclass::pycsimpletype_type());
         }
         super::finish_cpython_type(tp, "_ctypes", true)
     })

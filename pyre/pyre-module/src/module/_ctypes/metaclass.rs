@@ -433,7 +433,7 @@ fn structure_setattr(args: &[PyObjectRef]) -> PyResult {
 fn finish_aggregate_base(tp: PyObjectRef, metaclass: PyObjectRef, paramfunc: &'static str) {
     unsafe {
         pyre_object::typeobject::w_type_set_hasdict(tp, true);
-        (*tp).w_class = metaclass;
+        pyre_object::typeobject::w_type_set_w_class(tp, metaclass);
     }
     // Bare Structure/Union are abstract; the first real subtype gets the
     // default zero-sized storage state from its metaclass __init__.
@@ -448,7 +448,7 @@ fn finish_element_base(tp: PyObjectRef, metaclass: PyObjectRef) {
     unsafe {
         pyre_object::typeobject::w_type_set_hasdict(tp, true);
         pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, true);
-        (*tp).w_class = metaclass;
+        pyre_object::typeobject::w_type_set_w_class(tp, metaclass);
     }
 }
 
