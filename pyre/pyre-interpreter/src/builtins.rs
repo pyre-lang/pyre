@@ -22152,9 +22152,16 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// unwrap in `typedef::__majit_wrap_list_descr_sort` is what a traced
 /// CALL_KW descends.
 ///
-/// Strategy sorts that do not call Python: range, unboxed numbers, bytes,
-/// and ascii strings.  `false` means the list is object strategy (or
-/// otherwise unsorted) and [`sort_list_in_place_obj`] still has to run.
+/// Strategy sorts that do not call Python: range, int-or-float storage,
+/// bytes, and ascii strings.  `false` means the list is object strategy
+/// (or otherwise unsorted) and [`sort_list_in_place_obj`] still has to run.
+///
+/// Integer and float strategy sorts stay on [`sort_list_in_place`], which
+/// is `descr_sort`'s `self.sort(reverse)` (`IntegerListStrategy.sort` /
+/// `FloatListStrategy.sort`).  `look_inside_graph` refuses that graph
+/// (TimSort loops), so a traced `sorted` residualizes the whole
+/// `descr_sort` as `call_may_force_n` rather than `GuardTrue` on this
+/// helper's bool.
 ///
 /// The return is `bool`, not `Result`.  A `dont_look_inside` `Result`
 /// helper's effect slot stays the most general one, and that call is
@@ -22217,12 +22224,10 @@ pub fn sort_list_in_place(
                 return Ok(());
             }
             let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-            if let Some((items, len)) = pyre_object::listobject::w_list_int_items_raw(list) {
-                sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
+            if sort_integer_list_storage(list, reverse) {
                 return Ok(());
             }
-            if let Some((items, len)) = pyre_object::listobject::w_list_float_items_raw(list) {
-                sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
+            if sort_float_list_storage(list, reverse) {
                 return Ok(());
             }
             if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
@@ -22288,24 +22293,159 @@ pub fn sort_list_in_place(
     Ok(())
 }
 
-/// `IntegerListStrategy.sort` (`listobject.py`) / `FloatListStrategy.sort`
-/// (`:2067`) on the unwrapped storage.
+/// `IntegerListStrategy.sort` / `IntSort` (`listobject.py`).
+///
+/// `look_inside_graph` refuses the sorter's loops, so a traced `list.sort`
+/// residualizes this helper.  `IntSort` is `IntSort(l, len(l))` over the
+/// unerased storage list `l`; `TimSort` reads `self.list[i]` and writes
+/// `self.list[i] = x` through `list.int_getitem` / `list.int_setitem`.
+#[inline(never)]
+unsafe fn sort_integer_list_storage(list: PyObjectRef, reverse: bool) -> bool {
+    if !pyre_object::listobject::w_list_uses_int_storage(list) {
+        return false;
+    }
+    let mut storage = IntListStorage {
+        list: &mut *(list as *mut pyre_object::listobject::W_ListObject),
+    };
+    // `IntSort.lt` is `a < b` and never raises.
+    sort_scalars_storage(&mut storage, reverse).unwrap_or_else(|_| unreachable!());
+    true
+}
+
+/// `FloatListStrategy.sort` / `FloatSort` (`listobject.py`).  `FloatSort(l,
+/// len(l))` over the unerased float storage, through `list.float_getitem` /
+/// `list.float_setitem`.
+#[inline(never)]
+unsafe fn sort_float_list_storage(list: PyObjectRef, reverse: bool) -> bool {
+    if !pyre_object::listobject::w_list_uses_float_storage(list) {
+        return false;
+    }
+    let mut storage = FloatListStorage {
+        list: &mut *(list as *mut pyre_object::listobject::W_ListObject),
+    };
+    // `FloatSort.lt` is `a < b` and never raises.
+    sort_scalars_storage(&mut storage, reverse).unwrap_or_else(|_| unreachable!());
+    true
+}
+
+/// Unerased Integer-strategy storage `TimSort.list`.
+///
+/// `getitem` / `setitem` / `len` are `ll_list_int_{getitem,setitem}_fast` /
+/// `ll_list_int_length` (`list.int_getitem` / `list.int_setitem` /
+/// `list.int_len`).
+struct IntListStorage<'a> {
+    list: &'a mut pyre_object::listobject::W_ListObject,
+}
+
+impl crate::listsort::SortStorage<i64> for IntListStorage<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        int_list_storage_len(self.list)
+    }
+
+    #[inline(always)]
+    fn getitem(&self, index: usize) -> i64 {
+        int_list_storage_getitem(self.list, index)
+    }
+
+    #[inline(always)]
+    fn setitem(&mut self, index: usize, value: i64) {
+        int_list_storage_setitem(self.list, index, value)
+    }
+}
+
+/// Unerased Float-strategy storage `TimSort.list`, the float twin of
+/// [`IntListStorage`].
+struct FloatListStorage<'a> {
+    list: &'a mut pyre_object::listobject::W_ListObject,
+}
+
+impl crate::listsort::SortStorage<f64> for FloatListStorage<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        float_list_storage_len(self.list)
+    }
+
+    #[inline(always)]
+    fn getitem(&self, index: usize) -> f64 {
+        float_list_storage_getitem(self.list, index)
+    }
+
+    #[inline(always)]
+    fn setitem(&mut self, index: usize, value: f64) {
+        float_list_storage_setitem(self.list, index, value)
+    }
+}
+
+/// `list.int_len` (`ll_list_int_length`).
+#[inline(always)]
+fn int_list_storage_len(list: &pyre_object::listobject::W_ListObject) -> usize {
+    pyre_object::listobject::ll_list_int_length(list)
+}
+
+/// `list.int_getitem` (`ll_list_int_getitem_fast`) — `TimSort`'s
+/// `self.list[i]` on Integer storage.
+#[inline(always)]
+fn int_list_storage_getitem(list: &pyre_object::listobject::W_ListObject, index: usize) -> i64 {
+    pyre_object::listobject::ll_list_int_getitem_fast(list, index)
+}
+
+/// `list.int_setitem` (`ll_list_int_setitem_fast`) — `TimSort`'s
+/// `self.list[i] = x` on Integer storage.
+#[inline(always)]
+fn int_list_storage_setitem(
+    list: &mut pyre_object::listobject::W_ListObject,
+    index: usize,
+    item: i64,
+) {
+    pyre_object::listobject::ll_list_int_setitem_fast(list, index, item);
+}
+
+/// `list.float_len` (`ll_list_float_length`).
+#[inline(always)]
+fn float_list_storage_len(list: &pyre_object::listobject::W_ListObject) -> usize {
+    pyre_object::listobject::ll_list_float_length(list)
+}
+
+/// `list.float_getitem` (`ll_list_float_getitem_fast`) — `TimSort`'s
+/// `self.list[i]` on Float storage.
+#[inline(always)]
+fn float_list_storage_getitem(list: &pyre_object::listobject::W_ListObject, index: usize) -> f64 {
+    pyre_object::listobject::ll_list_float_getitem_fast(list, index)
+}
+
+/// `list.float_setitem` (`ll_list_float_setitem_fast`) — `TimSort`'s
+/// `self.list[i] = x` on Float storage.
+#[inline(always)]
+fn float_list_storage_setitem(
+    list: &mut pyre_object::listobject::W_ListObject,
+    index: usize,
+    item: f64,
+) {
+    pyre_object::listobject::ll_list_float_setitem_fast(list, index, item);
+}
+
+/// `IntegerListStrategy.sort` / `FloatListStrategy.sort` on the unwrapped
+/// storage.
 ///
 /// `descr_sort`'s reverse handling — reverse, stable ascending sort, reverse
 /// again — is kept here rather than the strategies' single trailing
 /// `l.reverse()`: for `float` the difference is observable, since `-0.0` and
 /// `0.0` compare equal but are distinct values whose relative order a stable
 /// sort must preserve.
-fn sort_scalars<T: Copy>(items: &mut [T], reverse: bool) -> Result<(), crate::PyError>
+#[inline(always)]
+fn sort_scalars_storage<T, S>(items: &mut S, reverse: bool) -> Result<(), crate::PyError>
 where
+    T: Copy,
+    S: crate::listsort::SortStorage<T> + ?Sized,
     ScalarLt: crate::listsort::SortLt<T>,
 {
     if reverse {
-        items.reverse();
+        crate::listsort::reverse_storage(items);
     }
-    crate::listsort::sort_with(items, &mut ScalarLt)?;
+    crate::listsort::sort_storage(items, &mut ScalarLt)?;
     if reverse {
-        items.reverse();
+        crate::listsort::reverse_storage(items);
     }
     Ok(())
 }
@@ -22315,12 +22455,14 @@ where
 struct ScalarLt;
 
 impl crate::listsort::SortLt<i64> for ScalarLt {
+    #[inline(always)]
     fn lt(&mut self, a: i64, b: i64) -> Result<bool, crate::PyError> {
         Ok(a < b)
     }
 }
 
 impl crate::listsort::SortLt<f64> for ScalarLt {
+    #[inline(always)]
     fn lt(&mut self, a: f64, b: f64) -> Result<bool, crate::PyError> {
         Ok(a < b)
     }
