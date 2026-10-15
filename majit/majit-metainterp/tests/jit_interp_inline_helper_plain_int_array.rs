@@ -97,8 +97,7 @@ fn interpreter_cells_read_matches_the_seeded_value() {
 }
 
 /// The lowerer inlines a `return state.cells[i]` arm into the dispatch
-/// JitCode (`try_inline_dispatch_arm`), so that body is not a callee of
-/// `copy_identity_slots_from_parent`. This helper is the same emit the
+/// JitCode (`try_inline_dispatch_arm`). This helper is the same emit the
 /// lowerer writes — `getarrayitem_raw_i` off the ptr identity slot — and
 /// the parent passes ptr/len as declared int arguments (`MIFrame.setup_call`,
 /// `bhimpl_inline_call_ir_i`). `inline_call_grouped` requires a positional

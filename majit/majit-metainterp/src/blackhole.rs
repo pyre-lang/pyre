@@ -420,16 +420,15 @@ pub struct BlackholeInterpreter {
     /// `handler_inline_call_nested_ext` through
     /// [`Self::reset_for_inline_reuse`].
     ///
-    /// That reset does NOT restore `Default::default()`, and reading it as if
-    /// it did is how `state_field_layout` came to be missing from
-    /// [`Self::clone_context_from`].  `position` / `last_opcode_position` /
-    /// `entry_position` / `jitcode` survive it and are overwritten by the
-    /// [`Self::setposition`] the take path always runs; `dispatch_table` and
-    /// the vable fields survive it and are overwritten by
-    /// [`Self::clone_context_from`]; `inline_callee_scratch` survives it on
-    /// purpose, which is what makes a grandchild frame free too.  A reused
-    /// frame is indistinguishable from a fresh one because those THREE steps
-    /// together cover every field, not because any one of them does.
+    /// That reset does NOT restore `Default::default()`.  `position` /
+    /// `last_opcode_position` / `entry_position` / `jitcode` survive it and
+    /// are overwritten by the [`Self::setposition`] the take path always
+    /// runs; `dispatch_table` and the vable fields survive it and are
+    /// overwritten by [`Self::clone_context_from`]; `inline_callee_scratch`
+    /// survives it on purpose, which is what makes a grandchild frame free
+    /// too.  A reused frame is indistinguishable from a fresh one because
+    /// those THREE steps together cover every field, not because any one of
+    /// them does.
     pub(crate) inline_callee_scratch: Option<Box<BlackholeInterpreter>>,
     /// Per-kind argument lists for the native arm of `BC_INLINE_CALL`.
     ///
@@ -459,9 +458,9 @@ pub struct BlackholeInterpreter {
     /// `state_field` handlers can map a logical field/array index to the
     /// flat register slot the resume reader seeded.  Empty (no scalars /
     /// arrays) for pyre frames, which never dispatch `state_field` opcodes.
-    /// An inline callee inherits the caller's, because a `split_dispatch`
-    /// sub-jitcode dispatches the SAME machine's state fields — see
-    /// [`Self::clone_context_from`], which used to leave it blanked.
+    /// Inline callees do not emit `load_state_field*` / `store_state_field*`
+    /// (`bhimpl_inline_call_*` copies declared args only), so they do not
+    /// read this layout.
     pub state_field_layout: StateFieldLayout,
     /// Address of this thread's [`BH_LAST_EXC_VALUE`] cell. Residual and
     /// inline-call handlers clear and read that cell once per host call;
@@ -886,20 +885,6 @@ impl BlackholeInterpreter {
         self.jitdrivers_sd = std::sync::Arc::clone(&parent.jitdrivers_sd);
         self.virtualizable_stack_base = parent.virtualizable_stack_base;
         self.record_caught_exception = parent.record_caught_exception;
-        // `state_field_layout` belongs to the same group and was missing from
-        // it. A sub-jitcode's `load_state_field` reads
-        // `state_field_layout.scalar_slot(field_idx)`, and the reused callee
-        // frame arrives with the layout `reset_for_inline_reuse` blanked, so
-        // without this line the slot resolves through an all-zero default:
-        // `int_scalar_base + field_idx` = `0 + field_idx`, which addresses the
-        // sub-jitcode's own ARGUMENT registers. The range check that would
-        // have caught it is on the layout, not here, and it is an `assert!`
-        // only since this line was written.
-        //
-        // The layout describes the machine, not the frame — a sub-jitcode
-        // dispatches the same state fields the portal does — so the parent's
-        // is the right one, exactly as for the vable handles above.
-        self.state_field_layout = parent.state_field_layout.clone();
     }
 
     /// blackhole.py setposition
@@ -7954,60 +7939,8 @@ impl StateFieldLayout {
 
 /// `load_state_field/di` — `registers_i[dest] = registers_i[slot(field_idx)]`.
 /// Encoding: 1× u16 `field_idx` + 1× u8 dest register = 3 bytes.
-fn portal_registers_i(bh: &BlackholeInterpreter) -> &[i64] {
-    let mut root = bh;
-    while let Some(ref parent) = root.nextblackholeinterp {
-        root = parent;
-    }
-    &root.registers_i
-}
-
-fn portal_registers_i_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
-    let mut root: *mut BlackholeInterpreter = bh;
-    unsafe {
-        while let Some(ref mut parent) = (*root).nextblackholeinterp {
-            root = parent.as_mut();
-        }
-        (*root).registers_i.as_mut_slice()
-    }
-}
-
-fn portal_registers_r(bh: &BlackholeInterpreter) -> &[i64] {
-    let mut root = bh;
-    while let Some(ref parent) = root.nextblackholeinterp {
-        root = parent;
-    }
-    &root.registers_r
-}
-
-fn portal_registers_r_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
-    let mut root: *mut BlackholeInterpreter = bh;
-    unsafe {
-        while let Some(ref mut parent) = (*root).nextblackholeinterp {
-            root = parent.as_mut();
-        }
-        (*root).registers_r.as_mut_slice()
-    }
-}
-
-fn portal_registers_f(bh: &BlackholeInterpreter) -> &[i64] {
-    let mut root = bh;
-    while let Some(ref parent) = root.nextblackholeinterp {
-        root = parent;
-    }
-    &root.registers_f
-}
-
-fn portal_registers_f_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
-    let mut root: *mut BlackholeInterpreter = bh;
-    unsafe {
-        while let Some(ref mut parent) = (*root).nextblackholeinterp {
-            root = parent.as_mut();
-        }
-        (*root).registers_f.as_mut_slice()
-    }
-}
-
+/// Only the portal JitCode emits this opcode (`blackhole.py`
+/// `bhimpl_inline_call_*` never inherits caller registers).
 fn handler_load_state_field_di(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -8016,7 +7949,7 @@ fn handler_load_state_field_di(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.scalar_slot(field_idx);
-    let value = portal_registers_i(bh)[slot];
+    let value = bh.registers_i[slot];
     bh.registers_i[dest] = value;
     Ok(position + 3)
 }
@@ -8032,7 +7965,7 @@ fn handler_store_state_field_di(
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.scalar_slot(field_idx);
     let value = bh.registers_i[src];
-    portal_registers_i_mut(bh)[slot] = value;
+    bh.registers_i[slot] = value;
     Ok(position + 3)
 }
 
@@ -8049,7 +7982,7 @@ fn handler_load_state_field_ref_dr(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
-    let value = portal_registers_r(bh)[slot];
+    let value = bh.registers_r[slot];
     bh.registers_r[dest] = value;
     Ok(position + 3)
 }
@@ -8065,7 +7998,7 @@ fn handler_store_state_field_ref_dr(
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
     let value = bh.registers_r[src];
-    portal_registers_r_mut(bh)[slot] = value;
+    bh.registers_r[slot] = value;
     Ok(position + 3)
 }
 
@@ -8079,7 +8012,7 @@ fn handler_load_state_field_float_df(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.float_scalar_slot(field_idx);
-    let value = portal_registers_f(bh)[slot];
+    let value = bh.registers_f[slot];
     bh.registers_f[dest] = value;
     Ok(position + 3)
 }
@@ -8095,7 +8028,7 @@ fn handler_store_state_field_float_df(
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.float_scalar_slot(field_idx);
     let value = bh.registers_f[src];
-    portal_registers_f_mut(bh)[slot] = value;
+    bh.registers_f[slot] = value;
     Ok(position + 3)
 }
 
@@ -13820,49 +13753,7 @@ fn reject_unresolved_inline_call(
 /// already interprets that shape when `fnaddr` is 0. The canonical
 /// handlers must do the same, or `convert_and_run_from_pyjitpl` aborts
 /// mid-opcode and the portal sees `usize::MAX` instead of a merge point.
-/// Copy the portal identity-slot registers into a callee blackhole frame.
 ///
-/// `blackhole.py` `bhimpl_inline_call_*` does not build a callee interpreter.
-/// `resume.py` `rebuild_from_resumedata` writes each live register through
-/// `consume_boxes`. The slots `load_state_field` / `store_state_field` address
-/// are those registers when the parent already holds them. A plain `[int]`
-/// ptr/len is a declared `inline_call_*` argument (`MIFrame.setup_call`,
-/// `bhimpl_inline_call_ir_v`), not an implicit copy.
-fn copy_identity_slots_from_parent(
-    parent: &BlackholeInterpreter,
-    callee: &mut BlackholeInterpreter,
-) {
-    // The callee must already be seated (`setposition`). Only a body that
-    // emitted `load_state_field` / `store_state_field` reads these indices
-    // as identity slots.
-    if !callee.jitcode.reads_identity_slots() {
-        return;
-    }
-    let layout = &parent.state_field_layout;
-    let i_end = layout.int_scalar_base.saturating_add(layout.total_slots());
-    for slot in layout.int_scalar_base..i_end {
-        if slot < parent.registers_i.len() && slot < callee.registers_i.len() {
-            callee.registers_i[slot] = parent.registers_i[slot];
-        }
-    }
-    let r_end = layout
-        .ref_scalar_base
-        .saturating_add(layout.num_ref_scalars);
-    for slot in layout.ref_scalar_base..r_end {
-        if slot < parent.registers_r.len() && slot < callee.registers_r.len() {
-            callee.registers_r[slot] = parent.registers_r[slot];
-        }
-    }
-    let f_end = layout
-        .float_scalar_base
-        .saturating_add(layout.num_float_scalars);
-    for slot in layout.float_scalar_base..f_end {
-        if slot < parent.registers_f.len() && slot < callee.registers_f.len() {
-            callee.registers_f[slot] = parent.registers_f[slot];
-        }
-    }
-}
-
 /// Bytecode-only callee: `JitCodeBuilder` sub-jitcodes and translator
 /// graphs absent from `jit_trace_fnaddrs` have no machine entry, so
 /// `bhimpl_inline_call_*`'s `cpu.bh_call_*(jitcode.fnaddr)` cannot run
@@ -13882,6 +13773,11 @@ fn interpret_unresolved_inline_call(
     let Some(sub_jitcode) = handle.as_callee_jitcode() else {
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     };
+    assert!(
+        !sub_jitcode.reads_identity_slots(),
+        "inline_call callee {:?} emits load/store_state_field*; only the portal JitCode may",
+        sub_jitcode.name()
+    );
     if crate::majit_log_enabled() {
         eprintln!(
             "[bh] inline_call interpreting jitcodes[{jitcode_index}] name={:?} \
@@ -13910,11 +13806,6 @@ fn interpret_unresolved_inline_call(
             callee.registers_f[index] = value;
         }
     }
-    // `resume.py` `rebuild_from_resumedata` fills a callee's registers via
-    // `consume_boxes`. A byte-interpreted arm also reads the portal identity
-    // slots (`load_state_field`), which are not inline-call arguments, so
-    // copy the slots the parent frame already holds.
-    copy_identity_slots_from_parent(bh, &mut callee);
 
     let outcome = 'callee: {
         match callee.run() {
@@ -14348,6 +14239,11 @@ fn handler_inline_call_nested_ext(
                 bh.jitcode.exec.descrs.len()
             )
         });
+    assert!(
+        !sub_jitcode.reads_identity_slots(),
+        "inline_call callee {:?} emits load/store_state_field*; only the portal JitCode may",
+        sub_jitcode.name()
+    );
 
     // The callee frame is seated before the argument triples are decoded so
     // each one can be copied where it is read, with no list in between.  The
@@ -14376,7 +14272,6 @@ fn handler_inline_call_nested_ext(
             }
         }
     }
-    copy_identity_slots_from_parent(bh, &mut callee);
 
     let dest = decode_return_slot_at(code, &mut p);
 

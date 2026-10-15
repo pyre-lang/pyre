@@ -6200,10 +6200,19 @@ impl JitCodeBuilder {
         idx as u16
     }
 
+    fn assert_sub_jitcode_has_no_identity_slots(jitcode: &JitCode) {
+        assert!(
+            !jitcode.reads_identity_slots(),
+            "sub-JitCode {:?} emits load/store_state_field*; only the portal JitCode may",
+            jitcode.name()
+        );
+    }
+
     /// Variant accepting an already-shared `Arc<JitCode>` for callers
     /// that already hold a shared handle (e.g. a re-export from
     /// `MetaInterpStaticData::indirectcalltargets`).
     pub fn add_sub_jitcode_arc(&mut self, jitcode: std::sync::Arc<JitCode>) -> u16 {
+        Self::assert_sub_jitcode_has_no_identity_slots(&jitcode);
         // `assembler.py Assembler._encode_descr` memoises every descr through
         // `_descr_dict`, and upstream's `JitCode` IS an `AbstractDescr`, so a
         // jitcode operand goes through that memo like any other.  This was the
@@ -6231,6 +6240,9 @@ impl JitCodeBuilder {
         match edge {
             crate::jitcode::InlineJitCodeRef::Strong(arc) => self.add_sub_jitcode_arc(arc),
             crate::jitcode::InlineJitCodeRef::BackEdge(weak) => {
+                if let Some(jc) = weak.upgrade() {
+                    Self::assert_sub_jitcode_has_no_identity_slots(&jc);
+                }
                 let target = std::sync::Weak::as_ptr(&weak);
                 if let Some(existing) = self.descrs.iter().position(|entry| {
                     matches!(entry, RuntimeBhDescr::JitCodeBackEdge(seen)

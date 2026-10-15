@@ -556,31 +556,6 @@ pub trait JitState: Sized {
     ) {
     }
 
-    /// The int-register range this state's symbol reserves for identity
-    /// slots, when it reserves one.
-    ///
-    /// A non-root frame's snapshot has that range blanked to `Const(0)`
-    /// placeholders (`get_list_of_active_snapshot_boxes`), and nothing
-    /// re-derives it: `resume.py write_an_int` writes each section's decoded
-    /// values, zeros included, into that frame's own registers, and the only
-    /// root-to-callee propagation deopt performs is on the virtualizable
-    /// FIELDS. A resume that spans more than one frame therefore cannot
-    /// reconstruct those registers, and the root's are not a substitute —
-    /// they hold a different quantity at the same index.
-    ///
-    /// So a bridge across inline frames is refused when this is `Some`. It
-    /// exists as a `JitState` hook rather than a `JitCodeSym` call because
-    /// `Self::Sym` carries no `JitCodeSym` bound, and the split-unaware
-    /// `StateFieldLayout` reports a non-empty range for symbols that reserve
-    /// nothing — gating on that would refuse every multi-frame bridge.
-    ///
-    /// `None` — the default, and every symbol that has not opted in via
-    /// `split_dispatch` — means no register in this state is identity-only,
-    /// so nothing was blanked and the resume is complete.
-    fn reserved_int_identity_range() -> Option<(usize, usize)> {
-        None
-    }
-
     /// Enter the walk at the jitcode position a guard failed on.
     ///
     /// `pyjitpl.py handle_guard_failure` reaches

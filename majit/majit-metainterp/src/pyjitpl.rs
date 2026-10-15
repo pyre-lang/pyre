@@ -19072,7 +19072,6 @@ impl<M: Clone> MetaInterp<M> {
             true,
             &vable,
             &vref,
-            None,
         );
         let ctx = self.tracing.as_mut().expect("trace still active");
         let snapshot_id = ctx.capture_resumedata(snapshot);

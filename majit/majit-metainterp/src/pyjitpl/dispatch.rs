@@ -934,28 +934,6 @@ pub trait JitCodeSym {
         None
     }
 
-    /// One past the last int-bank register the *register allocator*
-    /// reserves for identity slots, i.e. `int_identity_base +
-    /// num_scalars + num_vable_identity_slots`.
-    ///
-    /// `total_slots()` adds every virt array's live `Vec::len()` — a
-    /// runtime quantity the jitcode lowerer cannot see — so the lowering
-    /// floor (`split_identity_reg_ends`) stops after the scalars plus the
-    /// single vable-identity slot. Registers past this end are ordinary
-    /// working registers; only `[base, reserved_end)` is guaranteed to
-    /// hold nothing but identity.
-    ///
-    /// The inline-frame snapshot trim must use THIS end: it blanks the range
-    /// unconditionally, and blanking a working register would drop live data.
-    ///
-    /// The default is the EMPTY range. The snapshot trim is inert unless
-    /// `split_dispatch` raised `split_identity_floor`; a non-split arm
-    /// still *allocates* past the identity range so a temp cannot clobber
-    /// a red, but it does not blank those slots out of the snapshot.
-    fn int_identity_reserved_end(&self) -> usize {
-        self.int_identity_slots_base()
-    }
-
     /// First int-bank register used as a canonical identity slot
     /// (`int_scalar_base`). Identity slots occupy `[base, end)`; the base
     /// keeps the dispatch JitCode's int argument registers (`pc` at i0)
@@ -2071,10 +2049,6 @@ where
                 after_residual_call,
                 &virtualizable_snapshot,
                 &virtualref_snapshot,
-                Some((
-                    sym.int_identity_slots_base(),
-                    sym.int_identity_reserved_end(),
-                )),
             );
             ctx.capture_resumedata(snapshot)
         };
@@ -4271,6 +4245,11 @@ where
             }
             return TraceAction::Abort;
         };
+        assert!(
+            !sub_jitcode.reads_identity_slots(),
+            "inline_call callee {:?} emits load/store_state_field*; only the portal JitCode may",
+            sub_jitcode.name()
+        );
         let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
         sub_frame.inline_frame = true;
 
@@ -4340,7 +4319,9 @@ where
         }
     }
 
-    /// Write an identity-slot red on the portal frame (`MIFrame.setup_call`).
+    /// Write an identity-slot red on the current frame. Only the portal
+    /// JitCode emits `load_state_field*` / `store_state_field*`
+    /// (`pyjitpl.py` `MIFrame.setup_call` copies declared args only).
     fn set_int_identity_slot(
         &mut self,
         ctx: &mut TraceCtx,
@@ -4348,7 +4329,7 @@ where
         opref: Option<OpRef>,
         value: Option<i64>,
     ) {
-        let frame = &mut self.frames.frames[0];
+        let frame = self.frames.current_mut();
         #[cfg(feature = "jit-audits")]
         majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, slot, opref);
         frame.int_regs[slot] = opref;
@@ -4364,7 +4345,7 @@ where
         opref: Option<OpRef>,
         value: Option<i64>,
     ) {
-        let frame = &mut self.frames.frames[0];
+        let frame = self.frames.current_mut();
         frame.ref_regs[slot] = opref;
         if let (Some(op), Some(v)) = (opref, value) {
             let _ = ctx.try_set_opref_concrete(op, Value::Ref(majit_ir::GcRef(v as usize)));
@@ -4378,40 +4359,40 @@ where
         opref: Option<OpRef>,
         value: Option<i64>,
     ) {
-        let frame = &mut self.frames.frames[0];
+        let frame = self.frames.current_mut();
         frame.float_regs[slot] = opref;
         if let (Some(op), Some(v)) = (opref, value) {
             let _ = ctx.try_set_opref_concrete(op, Value::Float(f64::from_bits(v as u64)));
         }
     }
 
-    fn read_int_identity_slot(&self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
-        let frame = &self.frames.frames[0];
-        let opref = frame.int_regs[slot].expect("portal int identity slot uninitialized");
+    fn read_int_identity_slot(&mut self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
+        let frame = self.frames.current_mut();
+        let opref = frame.int_regs[slot].expect("int identity slot uninitialized");
         (
             opref,
             ctx.box_bits(opref)
-                .expect("portal int identity value uninitialized"),
+                .expect("int identity value uninitialized"),
         )
     }
 
-    fn read_ref_identity_slot(&self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
-        let frame = &self.frames.frames[0];
-        let opref = frame.ref_regs[slot].expect("portal ref identity slot uninitialized");
+    fn read_ref_identity_slot(&mut self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
+        let frame = self.frames.current_mut();
+        let opref = frame.ref_regs[slot].expect("ref identity slot uninitialized");
         (
             opref,
             ctx.box_bits(opref)
-                .expect("portal ref identity value uninitialized"),
+                .expect("ref identity value uninitialized"),
         )
     }
 
-    fn read_float_identity_slot(&self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
-        let frame = &self.frames.frames[0];
-        let opref = frame.float_regs[slot].expect("portal float identity slot uninitialized");
+    fn read_float_identity_slot(&mut self, ctx: &TraceCtx, slot: usize) -> (OpRef, i64) {
+        let frame = self.frames.current_mut();
+        let opref = frame.float_regs[slot].expect("float identity slot uninitialized");
         (
             opref,
             ctx.box_bits(opref)
-                .expect("portal float identity value uninitialized"),
+                .expect("float identity value uninitialized"),
         )
     }
 
@@ -6006,7 +5987,6 @@ pub fn build_state_field_snapshot(
     after_residual_call: bool,
     virtualizable_boxes: &[OpRef],
     virtualref_boxes: &[(OpRef, usize)],
-    inline_int_identity: Option<(usize, usize)>,
 ) -> crate::recorder::Snapshot {
     let frame_count = frames.frames.len();
     let mut snapshot_frames = Vec::with_capacity(frame_count);
@@ -6021,18 +6001,12 @@ pub fn build_state_field_snapshot(
         // `after_residual_call` is propagated to the top frame only;
         // parent frames are always "in a call" relative to the top, so
         // pyjitpl.py's residual-call branch only fires once.
-        // Only NON-root (inline) frames trim their reserved identity-slot
-        // prefix to Const(0) placeholders; the root frame's identity slots
-        // are seeded and must be listed for real so the virtualizable is
-        // reconstructed once at the root.
-        let skip_int_identity = if i == 0 { None } else { inline_int_identity };
         let boxes = frame.get_list_of_active_snapshot_boxes(
             !is_top,
             /* clear_result_register */ !is_top,
             op_live,
             all_liveness,
             if is_top { after_residual_call } else { false },
-            skip_int_identity,
         );
         // resume.py/1338 `jitcode = jitcodes[jitcode_pos]` — stamp each
         // frame's own ABSOLUTE global jitcode index (`JitCode::index`, assigned
@@ -6117,7 +6091,6 @@ pub fn implement_guard_value_on_frames(
             false,
             &virtualizable_snapshot,
             &virtualref_snapshot,
-            None,
         );
         ctx.capture_resumedata(snapshot)
     };
@@ -10893,7 +10866,6 @@ mod tests {
             false,
             &[],
             &[],
-            None,
         );
 
         assert_eq!(snapshot.frames.len(), 1);
@@ -10953,7 +10925,6 @@ mod tests {
             false,
             &[],
             &[],
-            None,
         );
 
         let f = &snapshot.frames[0];
@@ -11012,7 +10983,6 @@ mod tests {
             false,
             &[],
             &[],
-            None,
         );
         assert_eq!(snapshot.frames.len(), 2);
         let root_frame = &snapshot.frames[0];
@@ -11072,7 +11042,6 @@ mod tests {
             false,
             &[],
             &[],
-            None,
         );
 
         let f = &snapshot.frames[0];

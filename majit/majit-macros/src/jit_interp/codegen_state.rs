@@ -365,16 +365,6 @@ fn generate_state_fields_jit_state(
     // to the caller.
     let has_vable_identity = state_is_vable_identity;
     let num_vable_identity_slots = usize::from(has_vable_identity);
-    // Int-bank slots the inline-frame snapshot trim may blank. The
-    // alloc_reg floor always skips the identity range; the trim stays
-    // gated on `split_dispatch` so a non-split arm's live identity
-    // slots are not blanked out of the snapshot. See
-    // `int_identity_reserved_end` below.
-    let num_reserved_identity_slots = if config.split_dispatch {
-        num_int_identity
-    } else {
-        0
-    };
     let num_ref_scalars = ref_scalars.len();
     let num_float_scalars = float_scalars.len();
     let portal_greens = super::portal_green_params(config, func);
@@ -2049,22 +2039,6 @@ fn generate_state_fields_jit_state(
                 #int_identity_base
             }
 
-            // Mirrors `split_identity_reg_ends`' int end in
-            // `jitcode_lower/mod.rs`: the working-register floor stops after
-            // the scalars plus the single vable-identity slot, because a virt
-            // array's element count is only known from the live object.
-            //
-            // The snapshot trim keyed on this end blanks the range
-            // unconditionally. `split_identity_floor` now always raises a
-            // sub-JitCode's `alloc_reg()` past the identity range so a temp
-            // cannot clobber a red, but the trim stays gated on
-            // `split_dispatch` (`num_reserved_identity_slots`): blanking a
-            // non-split arm's live identity slots would drop the reds
-            // capture needs. Report an empty range without `split_dispatch`.
-            fn int_identity_reserved_end(&self) -> usize {
-                #int_identity_base + #num_reserved_identity_slots
-            }
-
             fn loop_header_pc(&self) -> usize {
                 self.loop_header_pc
             }
@@ -2257,17 +2231,6 @@ fn generate_state_fields_jit_state(
             // its registers already decoded; nothing here is machine-specific
             // except the `Sym` type, which is why this forwards rather than
             // generating a walk of its own.
-            // Empty unless `split_dispatch` raised the sub-JitCodes' alloc
-            // floor past the range, which is the only case where a non-root
-            // frame's snapshot loses registers to the identity trim.
-            fn reserved_int_identity_range() -> Option<(usize, usize)> {
-                let (base, end) = (
-                    #int_identity_base,
-                    #int_identity_base + #num_reserved_identity_slots,
-                );
-                (end > base).then_some((base, end))
-            }
-
             fn trace_from_guard_resume_position<__R: majit_metainterp::JitCodeRuntime>(
                 ctx: &mut majit_metainterp::TraceCtx,
                 sym: &mut #sym_ty,
@@ -2445,14 +2408,13 @@ fn generate_state_fields_jit_state(
             // Identity slots already hold the reds; this only walks the
             // live framestack.
             fn populate_frame_for_guard(
-                sym: &#sym_ty,
+                _sym: &#sym_ty,
                 frames: &mut majit_metainterp::MIFrameStack,
                 __op_live: u8,
                 __all_liveness: &[u8],
                 __virtualizable_boxes: &[majit_ir::OpRef],
                 __virtualref_boxes: &[(majit_ir::OpRef, usize)],
             ) -> Option<majit_metainterp::recorder::Snapshot> {
-                use majit_metainterp::JitCodeSym as _;
                 if frames.frames.is_empty() {
                     return None;
                 }
@@ -2463,7 +2425,6 @@ fn generate_state_fields_jit_state(
                     false,
                     __virtualizable_boxes,
                     __virtualref_boxes,
-                    Some((sym.int_identity_slots_base(), sym.int_identity_reserved_end())),
                 ))
             }
 
