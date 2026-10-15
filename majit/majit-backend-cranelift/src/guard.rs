@@ -29,6 +29,29 @@ pub struct MergeSource {
     pub trace_id: u64,
     pub inputargs: Vec<InputArgRc>,
     pub ops: Vec<Op>,
+    /// Every reference constant of `ops` that the compile put in its
+    /// `GcTable`, bound to that table slot once the compile returns.
+    /// Nothing traces the `ConstPtr` an op was retained with, so a major
+    /// collection may sweep its intern slot; the table slot is the copy the
+    /// collector keeps forwarded.
+    pub constptrs: Vec<RetainedConstPtr>,
+}
+
+/// Where a reference constant sits in a retained op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstPtrUse {
+    Arg(usize),
+    FailArg(usize),
+}
+
+/// One bound reference constant of `MergeSource::ops`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedConstPtr {
+    /// Index into `MergeSource::ops`.
+    pub op: usize,
+    pub at: ConstPtrUse,
+    /// Slot of the compiled piece's `GcTable`.
+    pub table_index: usize,
 }
 
 // The process-global `FAIL_DESCR_REGISTRY_GLOBAL` Weak HashMap was

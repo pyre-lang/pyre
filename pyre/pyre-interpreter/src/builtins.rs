@@ -3550,7 +3550,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             crate::gateway::make_module_builtin_function_with_arity_and_sig(
                 "getattr",
                 builtin_getattr,
-                crate::HOPELESS,
+                3,
                 crate::gateway::Signature::new(vec!["object", "name", "default"], None, None, 0, 3),
             )
         },
@@ -3652,7 +3652,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             crate::gateway::make_module_builtin_function_with_arity_and_sig(
                 "iter",
                 __majit_wrap_builtin_iter,
-                crate::HOPELESS,
+                2,
                 crate::gateway::Signature::new(vec!["object", "sentinel"], None, None, 0, 2),
             )
         },
@@ -3664,7 +3664,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             crate::gateway::make_module_builtin_function_with_arity_and_sig(
                 "next",
                 builtin_next,
-                crate::HOPELESS,
+                2,
                 crate::gateway::Signature::new(vec!["iterator", "default"], None, None, 0, 2),
             )
         },
@@ -4684,11 +4684,12 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "round",
         || {
             // `operation.round(space, w_number, w_ndigits=None)` — both
-            // positional-or-keyword; Signature bind.
+            // positional-or-keyword; a `BuiltinCode2`, so two positionals call
+            // it directly and any other shape binds the Signature.
             crate::gateway::make_module_builtin_function_with_arity_and_sig(
                 "round",
                 builtin_round,
-                crate::HOPELESS,
+                2,
                 crate::gateway::Signature::new(vec!["number", "ndigits"], None, None, 0, 0),
             )
         },
@@ -4713,11 +4714,13 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "pow",
         || {
             // `operation.pow(space, w_base, w_exp, w_mod)` with omitted
-            // modulus as `WrappedDefault(None)`; Signature bind.
+            // modulus as `WrappedDefault(None)`.  `WrappedDefault` unwraps as
+            // `W_Root`, so `make_fastfunc` makes this a `BuiltinCode3`: three
+            // positionals call it directly, any other shape binds the Signature.
             crate::gateway::make_module_builtin_function_with_arity_and_sig(
                 "pow",
                 __majit_wrap_builtin_pow,
-                crate::HOPELESS,
+                3,
                 crate::gateway::Signature::new(vec!["base", "exp", "mod"], None, None, 0, 0),
             )
         },
@@ -4765,7 +4768,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             crate::gateway::make_module_builtin_function_with_arity_and_sig(
                 "format",
                 builtin_format,
-                crate::HOPELESS,
+                2,
                 crate::gateway::Signature::new(vec!["value", "format_spec"], None, None, 0, 2),
             )
         },

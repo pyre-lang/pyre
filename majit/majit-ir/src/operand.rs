@@ -134,10 +134,14 @@ fn store_wide(value: Value) -> WideStored {
 }
 
 pub(crate) fn fresh_wide(value: Value) -> u64 {
+    fresh_wide_stored(store_wide(value))
+}
+
+fn fresh_wide_stored(stored: WideStored) -> u64 {
     let id = NEXT_WIDE_ID
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
-    wide_slot(id).set(store_wide(value));
+    wide_slot(id).set(stored);
     u64::from(id)
 }
 
@@ -434,9 +438,11 @@ impl Operand {
             OpRef::ConstInt(v) => Self::fresh_const_value(Value::Int(v)),
             OpRef::ConstFloat(v) => Self::fresh_const_value(Value::Float(v)),
             OpRef::ConstPtr(0) => Operand::NullRef,
-            OpRef::ConstPtr(v) => {
-                Self::fresh_const_value(Value::Ref(crate::const_ptr_table::resolve(v)))
-            }
+            // The index already names the slot holding `ConstPtr.value`.
+            // Resolving it and interning the word again would hash that
+            // word through `id_or_identityhash`, which takes only a live
+            // address.
+            OpRef::ConstPtr(v) => Operand::SmallWide(fresh_wide_stored(WideStored::Ref(v))),
             _ => panic!(
                 "from_opref: position-only ref {r:?} has no producer to bind — \
                  every operand source must carry a bound producer or a const (#9)"

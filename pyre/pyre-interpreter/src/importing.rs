@@ -8773,7 +8773,9 @@ where
         }
         // pyopcode.py — `into_locals[name] = getattr(module, name)`.
         let value = pyre_object::with_roots!(module, w_iter, w_name => crate::baseobjspace::getattr_str(module, &name))?;
-        write(&name, value)?;
+        // `module` and `w_iter` are livevars of the loop across the store,
+        // which interns the name and runs `setitem`.
+        pyre_object::with_roots!(module, w_iter => write(&name, value))?;
     }
     Ok(())
 }

@@ -124,7 +124,9 @@ fn majit_dump_enabled() -> bool {
 }
 
 use crate::asm_memory::{CraneliftArenaHandle, CraneliftArenaMemoryProvider};
-use crate::guard::{BridgeData, JitFrameDeadFrame, MergeSource, drop_bridge_payload};
+use crate::guard::{
+    BridgeData, ConstPtrUse, JitFrameDeadFrame, MergeSource, RetainedConstPtr, drop_bridge_payload,
+};
 use majit_backend::deadframe::ExitDescr;
 
 // `compile.py:665-674` `done_with_this_frame` singletons
@@ -8580,12 +8582,17 @@ struct MergePlan {
 }
 
 /// One bridge collected for a merged recompile, still in its owner's op
-/// numbering. `source_guard_op` indexes that owner's ops.
+/// numbering. `source_guard_op` indexes that owner's ops. `source_guard` is
+/// the source descr's `(trace_id, fail_index_per_trace)`. `noexc_above` is
+/// true when the owner or one of the owner's own spliced ancestors contains
+/// `GuardNoException`; the bridges attached to this bridge's guards inherit it.
 struct MergedBridgePiece {
     source_guard_op: usize,
+    source_guard: (u64, u32),
     inputargs: Vec<InputArgRc>,
     ops: Vec<Op>,
     invalidation_flag_ptr: usize,
+    noexc_above: bool,
 }
 
 /// A loop pulled into the anchor's function because some JUMP in the family
@@ -9213,7 +9220,24 @@ fn retained_merge_source(inputargs: &[InputArgRc], ops: &[OpRc]) -> MergeSource 
         trace_id: 0,
         inputargs: snapshot_inputargs(inputargs),
         ops: snapshot_trace_ops(ops),
+        constptrs: Vec::new(),
     }
+}
+
+/// Stamp `source` with the compile's trace id and bind its reference
+/// constants to `gc_table`. `None` when a constant is not in the table,
+/// which leaves the compiled piece without a merge source.
+fn finish_merge_source(
+    source: MergeSource,
+    trace_id: u64,
+    gc_table: Option<&majit_gc::GcTable>,
+) -> Option<MergeSource> {
+    let constptrs = bind_retained_constptrs(&source.ops, gc_table)?;
+    Some(MergeSource {
+        trace_id,
+        constptrs,
+        ..source
+    })
 }
 
 /// A value position a merged bridge op may take. Void results occupy no
@@ -9397,43 +9421,82 @@ fn constptr_stays_inline(opcode: OpCode) -> bool {
     matches!(opcode, OpCode::DebugMergePoint | OpCode::JitDebug)
 }
 
-/// Re-read every non-null reference constant of `ops` from `table`, the
-/// `GcTable` the compile of these ops filled: `remove_constptr` and the
-/// fail-arg `_gcref_index` put each such constant there, keyed by the
-/// address it had at that compile (`compile_key`). `history.py` `ConstPtr`
-/// intern already forwards the intern slot, so `const_value` after a
-/// collection is the current `slot`, not the compile-time key. Match
-/// either. `None` when a constant is not in the table, which refuses the
-/// merge.
-fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> Option<()> {
-    let refresh = |arg: &majit_ir::operand::Operand| -> Option<majit_ir::operand::Operand> {
+/// Bind every non-null reference constant of `ops` to the slot of `table`
+/// holding it. `table` is the `GcTable` the compile of these ops filled:
+/// `remove_constptr` and the fail-arg `_gcref_index` put each such constant
+/// there, keyed by the address it had at that compile (`compile_key`). A
+/// collection during the compile has already forwarded both the intern slot
+/// and the table slot, so match either. `None` when a constant is not in
+/// the table, which refuses the merge.
+fn bind_retained_constptrs(
+    ops: &[Op],
+    table: Option<&majit_gc::GcTable>,
+) -> Option<Vec<RetainedConstPtr>> {
+    let bind = |arg: &majit_ir::operand::Operand| -> Option<Option<usize>> {
         let Some(majit_ir::Value::Ref(gcref)) = arg.const_value() else {
-            return Some(arg.clone());
+            return Some(None);
         };
         if gcref.is_null() {
-            return Some(arg.clone());
+            return Some(None);
         }
         let table = table?;
         let index = (0..table.len())
             .find(|&i| table.compile_key(i) == gcref.0 || table.slot(i).0 == gcref.0)?;
-        Some(majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
-            table.slot(index),
-        )))
+        Some(Some(index))
     };
-    for op in ops {
+    let mut bound = Vec::new();
+    for (op_idx, op) in ops.iter().enumerate() {
         if constptr_stays_inline(op.opcode) {
             continue;
         }
         for i in 0..op.num_args() {
-            let fresh = refresh(&op.arg(i))?;
-            op.args_slice_mut()[i] = fresh;
+            if let Some(table_index) = bind(&op.arg(i))? {
+                bound.push(RetainedConstPtr {
+                    op: op_idx,
+                    at: ConstPtrUse::Arg(i),
+                    table_index,
+                });
+            }
         }
         if let Some(fail_args) = op.getfailargs() {
-            let fresh = fail_args
-                .iter()
-                .map(refresh)
-                .collect::<Option<majit_ir::resoperation::OpArgVec>>()?;
-            op.setfailargs(fresh);
+            for (i, arg) in fail_args.iter().enumerate() {
+                if let Some(table_index) = bind(arg)? {
+                    bound.push(RetainedConstPtr {
+                        op: op_idx,
+                        at: ConstPtrUse::FailArg(i),
+                        table_index,
+                    });
+                }
+            }
+        }
+    }
+    Some(bound)
+}
+
+/// Re-read every bound reference constant of `ops`, a snapshot of the
+/// retained ops from `first_op` on, from its `table` slot. The collector
+/// forwards that slot (`gcreftracer.py`); the intern slot the op was
+/// retained with has no holder once the compile returned.
+fn refresh_retained_constptrs(
+    ops: &[Op],
+    first_op: usize,
+    constptrs: &[RetainedConstPtr],
+    table: Option<&majit_gc::GcTable>,
+) -> Option<()> {
+    for bound in constptrs {
+        let Some(op) = bound.op.checked_sub(first_op).and_then(|i| ops.get(i)) else {
+            continue;
+        };
+        let fresh = majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+            table?.slot(bound.table_index),
+        ));
+        match bound.at {
+            ConstPtrUse::Arg(i) => op.args_slice_mut()[i] = fresh,
+            ConstPtrUse::FailArg(i) => {
+                let mut fail_args = op.getfailargs()?;
+                fail_args[i] = fresh;
+                op.setfailargs(fail_args);
+            }
         }
     }
     Some(())
@@ -9590,18 +9653,21 @@ fn member_entry_args(ops: &[Op]) -> Option<Vec<OpRef>> {
 
 /// Bridges attached to guards of `owner_ops`, same skips as the anchor:
 /// no bridge, a set invalidation flag, or no `merge_source`. `None` when a
-/// kept bridge's reference constants cannot be refreshed.
+/// kept bridge's reference constants cannot be refreshed. `owner_ops` is a
+/// loop or a spliced bridge; `inherited_noexc` is that bridge's `noexc_above`.
 fn collect_merged_bridges(
     owner_ops: &[Op],
     owner: &JitCellToken,
+    inherited_noexc: bool,
 ) -> Option<Vec<MergedBridgePiece>> {
     // `guard_must_save_exception` used to make `merge_source_eligible` and
     // `ops_refuse_merge` drop every trace that contains `GuardNoException`.
     // The overflow bridge stays spliced (`assembler.py patch_jump_for_descr`):
     // its source is `GuardNoOverflow` and its body contains `GuardNoException`.
-    let owner_has_noexc = owner_ops
-        .iter()
-        .any(|op| op.opcode == OpCode::GuardNoException);
+    let owner_has_noexc = inherited_noexc
+        || owner_ops
+            .iter()
+            .any(|op| op.opcode == OpCode::GuardNoException);
     let mut pieces = Vec::new();
     for (op_idx, op) in owner_ops.iter().enumerate() {
         if !op.opcode.is_guard() {
@@ -9646,12 +9712,19 @@ fn collect_merged_bridges(
             continue;
         }
         let bridge_ops = snapshot_ops(&bridge_src.ops);
-        refresh_retained_constptrs(&bridge_ops, bridge.gc_table.as_deref())?;
+        refresh_retained_constptrs(
+            &bridge_ops,
+            0,
+            &bridge_src.constptrs,
+            bridge.gc_table.as_deref(),
+        )?;
         pieces.push(MergedBridgePiece {
             source_guard_op: op_idx,
+            source_guard: (fd.trace_id(), fd.fail_index_per_trace()),
             inputargs: snapshot_inputargs(&bridge_src.inputargs),
             ops: bridge_ops,
             invalidation_flag_ptr: bridge_segment_flag(&bridge, owner),
+            noexc_above: owner_has_noexc,
         });
     }
     Some(pieces)
@@ -9708,14 +9781,19 @@ fn try_accept_family_member(
         let first_label = src.ops.iter().position(|op| op.opcode == OpCode::Label)?;
         ops = snapshot_ops(&src.ops[first_label..]);
         entry_args = member_entry_args(&ops)?;
-        refresh_retained_constptrs(&ops, compiled.gc_table.as_deref())?;
+        refresh_retained_constptrs(
+            &ops,
+            first_label,
+            &src.constptrs,
+            compiled.gc_table.as_deref(),
+        )?;
         if ops_refuse_merge(&ops) {
             return None;
         }
     }
     // `compiled` borrowed `owner`. Bridge collection needs `&owner` again.
     let invalidation_flag_ptr = token_invalidation_flag_ptr(&owner);
-    let bridges = collect_merged_bridges(&ops, &owner)?;
+    let bridges = collect_merged_bridges(&ops, &owner, false)?;
     if bridges
         .iter()
         .any(|bridge| ops_refuse_merge(&bridge.ops) || !bridge_fail_arity_matches(&ops, bridge))
@@ -9756,6 +9834,74 @@ fn append_renumbered_bridge(
     Some(())
 }
 
+/// Largest merged function, in ops, that an attach to a guard inside a
+/// spliced bridge recompiles. Every attach recompiles the whole family, so
+/// a long chain of such attaches costs the family size per bridge.
+const MERGED_NESTED_ATTACH_MAX_OPS: usize = 768;
+
+/// Append `pieces`, attached to guards of the ops starting at `owner_base`,
+/// then the bridges attached to each appended bridge's own guards, breadth
+/// first. `patch_jump_for_descr` patches a guard in a bridge exactly as one
+/// in the loop, so a bridge chain stays one local jump per hop. A nested
+/// bridge that cannot be spliced leaves its guard on `emit_guard_exit`;
+/// only a failing top-level piece refuses the merge. Each spliced source
+/// guard is pushed onto `spliced`.
+fn append_bridge_tree(
+    combined: &mut Vec<Op>,
+    segments: &mut Vec<MergeSegment>,
+    next_raw: &mut u32,
+    owner_base: usize,
+    pieces: &[MergedBridgePiece],
+    owner: &JitCellToken,
+    spliced: &mut Vec<(u64, u32)>,
+) -> Option<()> {
+    let mut appended = Vec::new();
+    for bridge in pieces {
+        let start = combined.len();
+        append_renumbered_bridge(
+            combined,
+            segments,
+            next_raw,
+            owner_base + bridge.source_guard_op,
+            bridge,
+        )?;
+        spliced.push(bridge.source_guard);
+        appended.push((start, combined.len(), bridge.noexc_above));
+    }
+    let mut next = 0;
+    while next < appended.len() {
+        let (start, end, noexc_above) = appended[next];
+        next += 1;
+        let Some(nested) = collect_merged_bridges(&combined[start..end], owner, noexc_above) else {
+            continue;
+        };
+        for bridge in &nested {
+            // Family discovery already ran over the top-level pieces, so a
+            // LABEL here could repeat one the family holds.
+            if ops_refuse_merge(&bridge.ops)
+                || bridge.ops.iter().any(|op| op.opcode == OpCode::Label)
+            {
+                continue;
+            }
+            let nested_start = combined.len();
+            if append_renumbered_bridge(
+                combined,
+                segments,
+                next_raw,
+                start + bridge.source_guard_op,
+                bridge,
+            )
+            .is_none()
+            {
+                continue;
+            }
+            spliced.push(bridge.source_guard);
+            appended.push((nested_start, combined.len(), bridge.noexc_above));
+        }
+    }
+    Some(())
+}
+
 /// Owned inputs for one merged `do_compile`, or `None` when this attach
 /// must keep today's separate bridge function.
 ///
@@ -9773,27 +9919,25 @@ fn prepare_merged_recompile(
     }
     // Snapshot before walking other tokens. `compiled` borrows `token`, and
     // bridge collection needs `&token` for the owner's invalidation flag.
-    let (trace_id, loop_gc_table, loop_inputargs, loop_ops) = {
+    let (trace_id, loop_gc_table, loop_inputargs, loop_ops, loop_constptrs) = {
         let compiled = token
             .compiled
             .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())?;
-        if source_fail_descr.trace_id() != compiled.trace_id {
-            return None;
-        }
         let loop_src = compiled.merge_source.as_ref()?;
         (
             compiled.trace_id,
             compiled.gc_table.clone(),
             snapshot_inputargs(&loop_src.inputargs),
             snapshot_ops(&loop_src.ops),
+            loop_src.constptrs.clone(),
         )
     };
-    let pieces = collect_merged_bridges(&loop_ops, token)?;
+    let pieces = collect_merged_bridges(&loop_ops, token, false)?;
     if pieces.is_empty() {
         return None;
     }
-    refresh_retained_constptrs(&loop_ops, loop_gc_table.as_deref())?;
+    refresh_retained_constptrs(&loop_ops, 0, &loop_constptrs, loop_gc_table.as_deref())?;
     if ops_refuse_merge(&loop_ops) {
         return None;
     }
@@ -9844,15 +9988,16 @@ fn prepare_merged_recompile(
     let mut next_raw = max_opref_raw(&loop_inputargs, &loop_ops).saturating_add(1);
     let mut combined = loop_ops;
     let mut segments = Vec::new();
-    for bridge in &pieces {
-        append_renumbered_bridge(
-            &mut combined,
-            &mut segments,
-            &mut next_raw,
-            bridge.source_guard_op,
-            bridge,
-        )?;
-    }
+    let mut spliced = Vec::new();
+    append_bridge_tree(
+        &mut combined,
+        &mut segments,
+        &mut next_raw,
+        0,
+        &pieces,
+        token,
+        &mut spliced,
+    )?;
     for member in &members {
         let input_map = member_input_map(&member.entry_args, &mut next_raw);
         let (renumbered, next) = renumber_ops(&member.ops, &input_map, next_raw);
@@ -9864,15 +10009,31 @@ fn prepare_merged_recompile(
             source_guard_descr: None,
             invalidation_flag_ptr: member.invalidation_flag_ptr,
         });
-        for bridge in &member.bridges {
-            append_renumbered_bridge(
-                &mut combined,
-                &mut segments,
-                &mut next_raw,
-                member_base + bridge.source_guard_op,
-                bridge,
-            )?;
-        }
+        append_bridge_tree(
+            &mut combined,
+            &mut segments,
+            &mut next_raw,
+            member_base,
+            &member.bridges,
+            &member.token,
+            &mut spliced,
+        )?;
+    }
+    // The recompile exists to splice the bridge just attached. A source
+    // guard none of the segments hang from leaves the entry unchanged.
+    let source_guard = (
+        source_fail_descr.trace_id(),
+        source_fail_descr.fail_index_per_trace(),
+    );
+    if !spliced.contains(&source_guard) {
+        return None;
+    }
+    // A bridge attached below another bridge saves one hop of the chain
+    // but recompiles the whole family. Past `MERGED_NESTED_ATTACH_MAX_OPS`
+    // that attach keeps its trampoline; the next attach to a guard of the
+    // anchor's own ops splices it.
+    if source_guard.0 != trace_id && combined.len() > MERGED_NESTED_ATTACH_MAX_OPS {
+        return None;
     }
     let inputargs = loop_inputargs;
     let member_tokens = members
@@ -21463,7 +21624,8 @@ impl CraneliftBackend {
     }
 
     /// Recompile `token`'s loop together with the bridges attached to its
-    /// own guards and every family member reached by a JUMP
+    /// own guards, the bridges attached to those bridges' guards, and every
+    /// family member reached by a JUMP
     /// (`assembler.py patch_jump_for_descr`) and publish that function. A
     /// refusal or a `do_compile` error returns without changing the current
     /// entry.
@@ -21765,9 +21927,8 @@ impl majit_backend::Backend for CraneliftBackend {
             .then(|| retained_merge_source(inputargs, ops));
         let mut compiled =
             self.do_compile(inputargs, ops, Some(flag_ptr), None, None, None, None)?;
-        compiled.merge_source = merge_source.map(|source| MergeSource {
-            trace_id: compiled.trace_id,
-            ..source
+        compiled.merge_source = merge_source.and_then(|source| {
+            finish_merge_source(source, compiled.trace_id, compiled.gc_table.as_deref())
         });
         compiled.green_key = token.green_key();
         let info = AsmInfo {
@@ -21971,9 +22132,8 @@ impl majit_backend::Backend for CraneliftBackend {
             Some(bridge_source_slots),
         );
         let mut compiled = compiled?;
-        let merge_source = merge_source.map(|source| MergeSource {
-            trace_id: compiled.trace_id,
-            ..source
+        let merge_source = merge_source.and_then(|source| {
+            finish_merge_source(source, compiled.trace_id, compiled.gc_table.as_deref())
         });
         // Same invariant as the loop path above: skipping would free the arena
         // range the bridge was just written into.
@@ -22105,9 +22265,10 @@ impl majit_backend::Backend for CraneliftBackend {
         // the loop. `fail_descr_attach_bridge` overwrites the trampoline
         // (`adr_jump_offset`) with a JMP to the bridge body.
         //
-        // When the source guard lives in the loop's own ops, also recompile
-        // the loop with every currently attached bridge spliced in. Any
-        // refusal or compile error leaves the cell dispatch in place.
+        // When the source guard lives in the loop's own ops or in a bridge
+        // spliced into it, also recompile the loop with every currently
+        // attached bridge spliced in. Any refusal or compile error leaves
+        // the cell dispatch in place.
         self.publish_merged_recompile(original_token, fail_descr);
 
         Ok(info)
@@ -25406,7 +25567,6 @@ mod tests {
     /// forwarded reference constant, just as the already compiled owner does.
     #[test]
     fn owner_preserves_reference_constant_after_collection() {
-        let _guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -25477,7 +25637,6 @@ mod tests {
     /// not the nursery address the ops were retained with.
     #[test]
     fn merged_recompile_reads_forwarded_loop_constant() {
-        let _guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -26953,6 +27112,41 @@ mod tests {
             &bridge_guard_descr
         ));
         assert_eq!(backend.get_int_value(&frame, 0), 11);
+
+        // A bridge attached to the spliced bridge's guard is spliced too:
+        // the attach republishes the loop entry.
+        let entry_code_ptr = || {
+            token
+                .compiled
+                .get()
+                .unwrap()
+                .downcast_ref::<CompiledLoop>()
+                .unwrap()
+                .entry_code_ptr
+                .load(Ordering::Acquire)
+        };
+        let entry_before = entry_code_ptr();
+        let nested_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(100)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&bridge_guard_descr),
+                &[InputArg::new_int_rc(0)],
+                &nested_ops,
+                &token,
+                None,
+            )
+            .unwrap();
+        assert_ne!(entry_before, entry_code_ptr());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 111);
     }
 
     /// A merged recompile re-emits a guard without a bridge through the
@@ -28046,37 +28240,55 @@ mod tests {
         assert!(!merge_source_eligible(false, &[forced]));
     }
 
+    /// A retained reference constant is bound to its `GcTable` slot when the
+    /// compile returns, and a merged recompile reads that slot. The intern
+    /// slot the op was retained with has no holder: a major collection may
+    /// sweep it and a later intern reuse it. Debug ops keep their constant
+    /// inline and bind nothing.
     #[test]
-    fn debug_merge_point_constptr_does_not_refuse_refresh() {
+    fn retained_constptr_reads_its_gc_table_slot() {
         let _const_ptr_guard = const_ptr_gc_test_guard();
-        let ptr = majit_ir::GcRef(0x3e5d_f0dc);
-        let dbg = Op::new(
-            OpCode::DebugMergePoint,
-            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
-                ptr,
-            ))],
-        );
-        assert!(refresh_retained_constptrs(std::slice::from_ref(&dbg), None).is_some());
+        let ptr = majit_ir::GcRef(0x93_0000_A000);
+        let const_op = |opcode| {
+            Op::new(
+                opcode,
+                &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
+                    ptr,
+                ))],
+            )
+        };
+        for opcode in [OpCode::DebugMergePoint, OpCode::JitDebug] {
+            let op = const_op(opcode);
+            assert_eq!(
+                bind_retained_constptrs(std::slice::from_ref(&op), None),
+                Some(Vec::new())
+            );
+        }
+        let used = const_op(OpCode::SameAsR);
+        assert!(bind_retained_constptrs(std::slice::from_ref(&used), None).is_none());
 
-        let jit_debug = Op::new(
-            OpCode::JitDebug,
-            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
-                ptr,
-            ))],
+        let table = majit_gc::GcTable::from_gcrefs(&[ptr]);
+        let bound =
+            bind_retained_constptrs(std::slice::from_ref(&used), Some(table.as_ref())).unwrap();
+        assert_eq!(
+            bound,
+            vec![RetainedConstPtr {
+                op: 0,
+                at: ConstPtrUse::Arg(0),
+                table_index: 0,
+            }]
         );
-        assert!(refresh_retained_constptrs(std::slice::from_ref(&jit_debug), None).is_some());
-
-        let used = Op::new(
-            OpCode::SameAsR,
-            &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
-                ptr,
-            ))],
-        );
-        assert!(refresh_retained_constptrs(std::slice::from_ref(&used), None).is_none());
+        let OpRef::ConstPtr(index) = used.arg(0).to_opref() else {
+            panic!("SameAsR keeps its ConstPtr");
+        };
+        majit_ir::const_ptr_table::set_slot(index, majit_ir::GcRef(0x93_0000_C000));
+        let ops = snapshot_ops(std::slice::from_ref(&used));
+        assert!(refresh_retained_constptrs(&ops, 0, &bound, Some(table.as_ref())).is_some());
+        assert_eq!(ops[0].arg(0).const_value(), Some(majit_ir::Value::Ref(ptr)));
     }
 
     #[test]
-    fn refresh_matches_forwarded_gc_table_slot() {
+    fn bind_matches_forwarded_gc_table_slot() {
         let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
@@ -28097,8 +28309,10 @@ mod tests {
         let moved = table.slot(0);
         assert_ne!(moved, root);
         assert_eq!(used.arg(0).const_value(), Some(majit_ir::Value::Ref(moved)));
-        assert!(
-            refresh_retained_constptrs(std::slice::from_ref(&used), Some(table.as_ref())).is_some()
+        assert_eq!(
+            bind_retained_constptrs(std::slice::from_ref(&used), Some(table.as_ref()))
+                .map(|bound| bound.len()),
+            Some(1)
         );
     }
 

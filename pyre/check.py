@@ -5698,7 +5698,7 @@ class Check:
         skip_backends = skip_backends or {}
         print(f"  {name}")
         if trace_shapes and not self._check_trace_shapes(
-            name, script, trace_shapes, timeout, "-", "-",
+            name, script, trace_shapes, timeout, "-", "-", skip_backends,
         ):
             return
         if spec_folds and not self._check_spec_folds(
@@ -5921,7 +5921,9 @@ class Check:
                 self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
         return False
 
-    def _check_trace_shapes(self, name, path, trace_shapes, timeout, t_cpython, t_pypy):
+    def _check_trace_shapes(
+        self, name, path, trace_shapes, timeout, t_cpython, t_pypy, skip_backends=(),
+    ):
         """True if every declared trace shape holds; else record and report.
 
         One native run, the same choice `_check_spec_folds` makes: the
@@ -5929,17 +5931,30 @@ class Check:
         backend would re-read the same operations. The run sets `MAJIT_LOG`
         and `PYRE_LOOP_CENSUS`, which already exist; the loop name in the
         census is what selects the `jit-log-opt-loop` section.
+
+        *skip_backends* holds the backends `_fixture_skips` opts the fixture
+        out of; the shape run never uses one of them, so a binary built
+        without a `requires-modules=` module does not read as a missing trace.
         """
         sys.stdout.write(f"    {'shape':<10s}")
         sys.stdout.flush()
         backend = next(
-            (b for b in ALL_BACKENDS if self.enabled(b) and b != "wasm"), None
+            (
+                b for b in ALL_BACKENDS
+                if self.enabled(b) and b != "wasm" and b not in skip_backends
+            ),
+            None,
         )
         if backend is None:
+            if not any(
+                self.enabled(b) and b not in skip_backends for b in ALL_BACKENDS
+            ):
+                print(dim("skip (no backend enabled)"))
+                return True
             detail = "trace-shape needs a native backend (no optimized-trace log on wasm)"
             print(f"{red('FAIL')}  {detail}")
             for b in ALL_BACKENDS:
-                if self.enabled(b):
+                if self.enabled(b) and b not in skip_backends:
                     self._record(b, False, name, detail)
                     self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
             return False
@@ -5975,7 +5990,7 @@ class Check:
                 print(tail)
         print(f"{red('FAIL')}  {detail}")
         for b in ALL_BACKENDS:
-            if self.enabled(b):
+            if self.enabled(b) and b not in skip_backends:
                 self._record(b, False, name, detail)
                 self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
         return False
@@ -6082,7 +6097,7 @@ class Check:
             return
 
         if trace_shapes and not self._check_trace_shapes(
-            name, path, trace_shapes, timeout, t_cpython, t_pypy,
+            name, path, trace_shapes, timeout, t_cpython, t_pypy, skip_backends,
         ):
             return
 
