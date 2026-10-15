@@ -9,13 +9,16 @@
 //!   needs both directions — so the sort driver itself has to be the one that
 //!   only ever asks "is a < b".
 //! * The merge steps hold elements in a scratch copy and reinstate them in a
-//!   `finally` (`listsort.py`, `:495`), so a comparison that raises still
-//!   leaves a permutation of the input behind rather than duplicates.
+//!   `finally` (`TimSort.merge_lo` / `merge_hi`), so a comparison that raises
+//!   still leaves a permutation of the input behind rather than duplicates.
 //!
-//! `make_timsort_class`'s `getitem`/`setitem`/`length`/`lt` parameters become
-//! the [`SortLt`] trait plus a `&mut [usize]` permutation: the array being
-//! sorted holds indices into a caller-owned rooted area, so a moving
-//! collection during a comparison cannot invalidate anything the sorter holds.
+//! `make_timsort_class`'s `getitem`/`setitem`/`length` become [`SortStorage`];
+//! `lt` becomes [`SortLt`].  `IntegerListStrategy.sort` / `IntSort` and
+//! `FloatListStrategy.sort` / `FloatSort` pass the unerased storage list so
+//! every `self.list[i] = x` is a `setarrayitem` on the GC array.  Object and
+//! key sorts still permute indices into a caller-owned rooted area
+//! (`descr_sort`'s snapshot), so a moving collection during a comparison
+//! cannot invalidate anything the sorter holds.
 
 use crate::PyError;
 
@@ -24,13 +27,63 @@ use crate::PyError;
 ///
 /// `T` is what `make_timsort_class`'s `lt` receives: the list's element type.
 /// For an object list that is an index into a rooted area; for the unwrapped
-/// strategies (`listobject.py` `IntegerListStrategy.sort`, `:2067`
+/// strategies (`listobject.py` `IntegerListStrategy.sort`,
 /// `FloatListStrategy.sort`) it is the scalar itself.
 pub(crate) trait SortLt<T> {
     fn lt(&mut self, a: T, b: T) -> Result<bool, PyError>;
 
+    #[inline]
     fn le(&mut self, a: T, b: T) -> Result<bool, PyError> {
         Ok(!self.lt(b, a)?)
+    }
+}
+
+/// `make_timsort_class`'s `getitem` / `setitem` / `length`.
+///
+/// `TimSort.list` is the list being sorted.  Integer and float strategy sorts
+/// implement this with `ll_list_int_getitem_fast` / `ll_list_int_setitem_fast`
+/// (and the float twins) so `IntSort` / `FloatSort` write the `GcArray` in
+/// place.  `scratch_list` stays a fresh `Vec`, matching upstream's fresh
+/// RPython list.
+pub(crate) trait SortStorage<T: Copy> {
+    fn len(&self) -> usize;
+    fn getitem(&self, index: usize) -> T;
+    fn setitem(&mut self, index: usize, value: T);
+}
+
+impl<T: Copy> SortStorage<T> for [T] {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        <[T]>::len(self)
+    }
+
+    #[inline(always)]
+    fn getitem(&self, index: usize) -> T {
+        self[index]
+    }
+
+    #[inline(always)]
+    fn setitem(&mut self, index: usize, value: T) {
+        self[index] = value;
+    }
+}
+
+/// `ListSlice.reverse` over the whole list — `IntegerListStrategy.sort`'s
+/// `l.reverse()` / `FloatListStrategy.sort`'s `l.reverse()`.
+pub(crate) fn reverse_storage<T: Copy, S: SortStorage<T> + ?Sized>(list: &mut S) {
+    let n = list.len();
+    if n < 2 {
+        return;
+    }
+    let mut lo = 0;
+    let mut hi = n - 1;
+    while lo < hi {
+        let a = list.getitem(lo);
+        let b = list.getitem(hi);
+        list.setitem(lo, b);
+        list.setitem(hi, a);
+        lo += 1;
+        hi -= 1;
     }
 }
 
@@ -91,12 +144,12 @@ impl ListSlice {
     }
 }
 
-/// `listsort.py:263` — galloping mode is entered after this many consecutive
-/// wins by the same run.
+/// `listsort.py` `MIN_GALLOP` — galloping mode is entered after this many
+/// consecutive wins by the same run.
 const MIN_GALLOP: usize = 7;
 
-struct TimSort<'a, T: Copy, L: SortLt<T>> {
-    list: &'a mut [T],
+struct TimSort<'a, T: Copy, S: SortStorage<T> + ?Sized, L: SortLt<T>> {
+    list: &'a mut S,
     listlength: usize,
     scratch_list: Vec<T>,
     min_gallop: usize,
@@ -104,12 +157,13 @@ struct TimSort<'a, T: Copy, L: SortLt<T>> {
     cmp: &'a mut L,
 }
 
-impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
+impl<T: Copy, S: SortStorage<T> + ?Sized, L: SortLt<T>> TimSort<'_, T, S, L> {
+    #[inline(always)]
     fn slice_get(&self, slice: &ListSlice, index: usize) -> T {
         if slice.scratch {
             self.scratch_list[index]
         } else {
-            self.list[index]
+            self.list.getitem(index)
         }
     }
 
@@ -132,7 +186,10 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         let mut lo = slice.base;
         let mut hi = lo + slice.len - 1;
         while lo < hi {
-            self.list.swap(lo, hi);
+            let a = self.list.getitem(lo);
+            let b = self.list.getitem(hi);
+            self.list.setitem(lo, b);
+            self.list.setitem(hi, a);
             lo += 1;
             hi -= 1;
         }
@@ -157,18 +214,22 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
     fn copyitems(&mut self, slice: &mut ListSlice) {
         debug_assert!(!slice.scratch);
         if slice.len > self.scratch_list.len() {
-            let listlength = self.list.len();
+            let listlength = self.listlength;
             let mut scratchsize = std::cmp::min(listlength.div_ceil(2), 256);
             if slice.len > scratchsize {
                 scratchsize = slice.len;
             }
             let start = slice.base;
             let stop = std::cmp::min(slice.base + scratchsize, listlength);
-            self.scratch_list = self.list[start..stop].to_vec();
+            self.scratch_list.clear();
+            self.scratch_list.reserve(stop - start);
+            for index in start..stop {
+                self.scratch_list.push(self.list.getitem(index));
+            }
         } else {
             let base = slice.base;
             for index in 0..slice.len {
-                self.scratch_list[index] = self.list[base + index];
+                self.scratch_list[index] = self.list.getitem(base + index);
             }
         }
         slice.scratch = true;
@@ -183,11 +244,11 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         for start in (a.base + sorted)..(a.base + a.len) {
             let mut l = abase;
             let mut r = start;
-            let pivot = self.list[r];
+            let pivot = self.list.getitem(r);
             // pivot >= all in [base, l) and pivot < all in [r, start).
             while l < r {
                 let p = l + ((r - l) >> 1);
-                let candidate = self.list[p];
+                let candidate = self.list.getitem(p);
                 if self.cmp.lt(pivot, candidate)? {
                     r = p;
                 } else {
@@ -198,10 +259,11 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
             // makes the insertion stable.  Slide over to make room.
             let mut p = start;
             while p > l {
-                self.list[p] = self.list[p - 1];
+                let prev = self.list.getitem(p - 1);
+                self.list.setitem(p, prev);
                 p -= 1;
             }
-            self.list[l] = pivot;
+            self.list.setitem(l, pivot);
         }
         Ok(())
     }
@@ -331,18 +393,18 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         let mut dest = a.base;
         self.copyitems(a);
         let result = self.merge_lo_inner(a, b, &mut dest);
-        // `listsort.py:388` finally: the last element of `a` belongs at the end
+        // `TimSort.merge_lo` finally: the last element of `a` belongs at the end
         // of the merge, so what remains of `b` is reinstated before what
         // remains of `a` — on the error path too, keeping the array a
         // permutation of its input.
         for p in b.base..(b.base + b.len) {
             let value = self.slice_get(b, p);
-            self.list[dest] = value;
+            self.list.setitem(dest, value);
             dest += 1;
         }
         for p in a.base..(a.base + a.len) {
             let value = self.slice_get(a, p);
-            self.list[dest] = value;
+            self.list.setitem(dest, value);
             dest += 1;
         }
         result
@@ -356,7 +418,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
     ) -> Result<(), PyError> {
         let mut min_gallop = self.min_gallop;
         let value = self.popleft(b);
-        self.list[*dest] = value;
+        self.list.setitem(*dest, value);
         *dest += 1;
         if a.len == 1 || b.len == 0 {
             return Ok(());
@@ -372,7 +434,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                 let ahead = self.slice_get(a, a.base);
                 if self.cmp.lt(bhead, ahead)? {
                     let value = self.popleft(b);
-                    self.list[*dest] = value;
+                    self.list.setitem(*dest, value);
                     *dest += 1;
                     if b.len == 0 {
                         return Ok(());
@@ -384,7 +446,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                     }
                 } else {
                     let value = self.popleft(a);
-                    self.list[*dest] = value;
+                    self.list.setitem(*dest, value);
                     *dest += 1;
                     if a.len == 1 {
                         return Ok(());
@@ -410,7 +472,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                 acount = self.gallop(bhead, a, 0, true)?;
                 for p in a.base..(a.base + acount) {
                     let value = self.slice_get(a, p);
-                    self.list[*dest] = value;
+                    self.list.setitem(*dest, value);
                     *dest += 1;
                 }
                 a.base += acount;
@@ -422,7 +484,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                 }
 
                 let value = self.popleft(b);
-                self.list[*dest] = value;
+                self.list.setitem(*dest, value);
                 *dest += 1;
                 if b.len == 0 {
                     return Ok(());
@@ -432,7 +494,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                 bcount = self.gallop(ahead, b, 0, false)?;
                 for p in b.base..(b.base + bcount) {
                     let value = self.slice_get(b, p);
-                    self.list[*dest] = value;
+                    self.list.setitem(*dest, value);
                     *dest += 1;
                 }
                 b.base += bcount;
@@ -442,7 +504,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                 }
 
                 let value = self.popleft(a);
-                self.list[*dest] = value;
+                self.list.setitem(*dest, value);
                 *dest += 1;
                 if a.len == 1 {
                     return Ok(());
@@ -465,16 +527,16 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         let mut dest = b.base + b.len;
         self.copyitems(b);
         let result = self.merge_hi_inner(a, b, &mut dest);
-        // `listsort.py:495` finally, mirrored: what remains of `a` first.
+        // `TimSort.merge_hi` finally, mirrored: what remains of `a` first.
         for p in (a.base..(a.base + a.len)).rev() {
             let value = self.slice_get(a, p);
             dest -= 1;
-            self.list[dest] = value;
+            self.list.setitem(dest, value);
         }
         for p in (b.base..(b.base + b.len)).rev() {
             let value = self.slice_get(b, p);
             dest -= 1;
-            self.list[dest] = value;
+            self.list.setitem(dest, value);
         }
         result
     }
@@ -488,7 +550,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         let mut min_gallop = self.min_gallop;
         *dest -= 1;
         let value = self.popright(a);
-        self.list[*dest] = value;
+        self.list.setitem(*dest, value);
         if a.len == 0 || b.len == 1 {
             return Ok(());
         }
@@ -500,7 +562,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                 let nextb = self.slice_get(b, b.base + b.len - 1);
                 if self.cmp.lt(nextb, nexta)? {
                     *dest -= 1;
-                    self.list[*dest] = nexta;
+                    self.list.setitem(*dest, nexta);
                     a.len -= 1;
                     if a.len == 0 {
                         return Ok(());
@@ -512,7 +574,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                     }
                 } else {
                     *dest -= 1;
-                    self.list[*dest] = nextb;
+                    self.list.setitem(*dest, nextb);
                     b.len -= 1;
                     if b.len == 1 {
                         return Ok(());
@@ -538,7 +600,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                 for p in ((a.base + k)..(a.base + a.len)).rev() {
                     let value = self.slice_get(a, p);
                     *dest -= 1;
-                    self.list[*dest] = value;
+                    self.list.setitem(*dest, value);
                 }
                 a.len -= acount;
                 if a.len == 0 {
@@ -547,7 +609,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
 
                 *dest -= 1;
                 let value = self.popright(b);
-                self.list[*dest] = value;
+                self.list.setitem(*dest, value);
                 if b.len == 1 {
                     return Ok(());
                 }
@@ -558,7 +620,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
                 for p in ((b.base + k)..(b.base + b.len)).rev() {
                     let value = self.slice_get(b, p);
                     *dest -= 1;
-                    self.list[*dest] = value;
+                    self.list.setitem(*dest, value);
                 }
                 b.len -= bcount;
                 // b.len == 0 is impossible here for a consistent comparison
@@ -569,7 +631,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
 
                 *dest -= 1;
                 let value = self.popright(a);
-                self.list[*dest] = value;
+                self.list.setitem(*dest, value);
                 if a.len == 0 {
                     return Ok(());
                 }
@@ -685,7 +747,12 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
 ///
 /// On a raising comparison the error propagates and `list` is left holding
 /// some permutation of its input (`listsort.py`'s merge `finally` blocks).
-pub(crate) fn sort_with<T: Copy, L: SortLt<T>>(list: &mut [T], cmp: &mut L) -> Result<(), PyError> {
+pub(crate) fn sort_storage<T, S, L>(list: &mut S, cmp: &mut L) -> Result<(), PyError>
+where
+    T: Copy,
+    S: SortStorage<T> + ?Sized,
+    L: SortLt<T>,
+{
     let listlength = list.len();
     let mut sorter = TimSort {
         list,
@@ -696,4 +763,11 @@ pub(crate) fn sort_with<T: Copy, L: SortLt<T>>(list: &mut [T], cmp: &mut L) -> R
         cmp,
     };
     sorter.sort()
+}
+
+/// Sort a contiguous slice.  Object/key `descr_sort` permutes rooted indices
+/// this way; integer and float strategy sorts use [`sort_storage`] over the
+/// unerased GC storage instead.
+pub(crate) fn sort_with<T: Copy, L: SortLt<T>>(list: &mut [T], cmp: &mut L) -> Result<(), PyError> {
+    sort_storage(list, cmp)
 }
