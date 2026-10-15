@@ -41,7 +41,8 @@
 //! Unsigned` value (`ConstInt(0)` and `BinOp("sub")`), which the consumer reads
 //! from the `r` slot.  `Unsigned` carries no width (all operands share the u64
 //! register bank), and saturating never wraps, so lowering a narrow `u16`/`u32`
-//! difference in that bank is width-correct.
+//! difference in that bank is width-correct.  `U128` stays residual: the
+//! rewrite types the difference as `ValueType::Unsigned`.
 //!
 //! ## The rewrite (`rewire_one_saturating_sub_site`)
 //!
@@ -64,8 +65,8 @@ use crate::flowspace::model::Variable;
 use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
-/// A recognized `{uN}::saturating_sub(a, b)` call site captured during body
-/// lowering (`front::mir` `recognize_saturating_sub_site`).
+/// A recognized `{uN}` / `{i64,isize}::saturating_sub(a, b)` call site
+/// captured during body lowering (`front::mir` `recognize_saturating_sub_site`).
 #[derive(Clone)]
 pub(crate) struct SaturatingSubSite {
     /// The `saturating_sub` call result — locates block A.

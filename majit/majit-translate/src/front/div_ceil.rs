@@ -18,7 +18,10 @@
 //! `/` and `%` are the pipeline's unsigned `floordiv` / `mod` (`uint_floordiv`
 //! / `uint_mod` after rtyping).  Those ops already raise on a zero divisor,
 //! so this pass does not emit a separate `/ 0` guard.  Signed `div_ceil` is
-//! a different overflow/sign story and is never recorded.
+//! a different overflow/sign story and is never recorded.  Narrow `uN` is
+//! accepted (`d + 1` cannot wrap).  `U128` stays residual: the rewrite
+//! types quot, rem, and `d + 1` as `ValueType::Unsigned` (`rint.py`
+//! `ll_ulllong_py_div` is a different width).
 //!
 //! `d + 1` cannot wrap: a non-zero remainder means `a` is not a multiple of
 //! `b`, so the floor quotient is strictly less than the unsigned maximum.

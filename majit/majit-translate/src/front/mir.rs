@@ -9085,7 +9085,8 @@ struct Lowering<'a> {
     /// `{uN}::saturating_sub(a, b)` and signed `{i64,isize}::saturating_sub`
     /// call sites recorded for the clamp diamond the
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
-    /// [`crate::front::saturating_sub::SaturatingSubSite`]).
+    /// [`crate::front::saturating_sub::SaturatingSubSite`]).  `U128` stays
+    /// residual.
     saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
     /// Word-sized `{usize,u64}::saturating_add(a, b)` and signed
     /// `{i64,isize}::saturating_add(a, b)` call sites. `int_add` is a
@@ -9099,7 +9100,7 @@ struct Lowering<'a> {
     /// OR `front::is_ascii_whitespace` splices in place.
     is_ascii_whitespace_sites: Vec<crate::front::is_ascii_whitespace::IsAsciiWhitespaceSite>,
     /// Unsigned `{uN,usize}::div_ceil(a, b)` call sites recorded for the
-    /// quot/rem diamond `front::div_ceil` synthesizes.
+    /// quot/rem diamond `front::div_ceil` synthesizes.  `U128` stays residual.
     div_ceil_sites: Vec<crate::front::div_ceil::DivCeilSite>,
     /// `char::from_u32(x)` call sites recorded for the Unicode-scalar
     /// Option diamond `front::char_from_u32` synthesizes.
@@ -30926,7 +30927,9 @@ impl<'a> Lowering<'a> {
         // unregistered callee the rtyper census Skips.  Restricted to unsigned
         // receivers (every observed site is `usize`/`u16`/`u32`): the clamp
         // floors at zero via `a < b`; signed `i64`/`isize` uses `sub_ovf`
-        // + MIN/MAX.  A resolution miss leaves the residual call.
+        // + MIN/MAX.  Narrow `uN` is accepted; `U128` stays residual because
+        // the rewrite types the difference as `ValueType::Unsigned`.  A
+        // resolution miss leaves the residual call.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -31065,8 +31068,11 @@ impl<'a> Lowering<'a> {
             );
         }
         // Capture unsigned `{uN,usize}::div_ceil(a, b)` for the quot/rem
-        // diamond `front::div_ceil` synthesizes.  Signed `div_ceil` stays
-        // residual.
+        // diamond `front::div_ceil` synthesizes.  Narrow `uN` is accepted
+        // (`d + 1` cannot wrap).  `U128` stays residual: the rewrite types
+        // quot, rem, and `d + 1` as `ValueType::Unsigned` (`rint.py`
+        // `ll_ulllong_py_div` is a different width).  Signed `div_ceil`
+        // stays residual.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -31074,7 +31080,9 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && fmt_path_ends_with(segments, &["num", "<Impl>", "div_ceil"])
-            && self.tyref_literal_uint_atom(&call.dest.ty).is_some()
+            && self
+                .tyref_literal_uint_atom(&call.dest.ty)
+                .is_some_and(crate::front::checked_arith_uint::is_non_u128_uint_atom)
         {
             self.div_ceil_sites
                 .push(crate::front::div_ceil::DivCeilSite {
@@ -37376,13 +37384,18 @@ impl<'a> Lowering<'a> {
     /// Resolve a recognized `{uN}` / `{i64,isize}::saturating_sub(a, b)`
     /// call into a [`crate::front::saturating_sub::SaturatingSubSite`].
     /// Unsigned floors at zero via `a < b`; signed `i64`/`isize` uses
-    /// `sub_ovf` + MIN/MAX.  A narrower signed width is left residual.
+    /// `sub_ovf` + MIN/MAX.  Narrow `uN` is accepted; `U128` stays
+    /// residual because the rewrite types the difference as
+    /// `ValueType::Unsigned`.  A narrower signed width is left residual.
     fn recognize_saturating_sub_site(
         &self,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::saturating_sub::SaturatingSubSite> {
-        if self.tyref_literal_uint_atom(dest_ty).is_some() {
+        if self
+            .tyref_literal_uint_atom(dest_ty)
+            .is_some_and(crate::front::checked_arith_uint::is_non_u128_uint_atom)
+        {
             return Some(crate::front::saturating_sub::SaturatingSubSite {
                 result_var: result_var.clone(),
                 signed: false,
@@ -60713,11 +60726,41 @@ fn range_contains_elem_of_ty_node(
     }
     if let Some(f) = obj.get("Float").and_then(serde_json::Value::as_str) {
         return match f {
-            "F32" | "F64" => Some(RangeContainsElem::Float),
+            "F64" => Some(RangeContainsElem::Float),
             _ => None,
         };
     }
     None
+}
+
+#[cfg(test)]
+mod range_contains_elem_tests {
+    use super::range_contains_elem_of_ty_node;
+    use crate::front::range_contains::RangeContainsElem;
+
+    #[test]
+    fn range_contains_elem_declines_f32_and_128bit() {
+        assert_eq!(
+            range_contains_elem_of_ty_node(&serde_json::json!({"Scalar": {"Float": "F32"}})),
+            None
+        );
+        assert_eq!(
+            range_contains_elem_of_ty_node(&serde_json::json!({"Scalar": {"Float": "F64"}})),
+            Some(RangeContainsElem::Float)
+        );
+        assert_eq!(
+            range_contains_elem_of_ty_node(&serde_json::json!({
+                "Scalar": {"Integer": {"Unsigned": "U128"}}
+            })),
+            None
+        );
+        assert_eq!(
+            range_contains_elem_of_ty_node(&serde_json::json!({
+                "Scalar": {"Integer": {"Signed": "I128"}}
+            })),
+            None
+        );
+    }
 }
 
 /// The compare family when `ty` resolves to the foreign opaque

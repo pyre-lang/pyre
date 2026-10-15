@@ -89,11 +89,13 @@
 //! Scalar element types: signed ints (`i8`/`i16`/`i32`/`i64`/`isize`) use
 //! signed compares (`le`/`ge`/`gt`) and may emit `int_between`; unsigned
 //! ints (`u8`/`u16`/`u32`/`u64`/`usize`) use `uint_le`/`uint_ge`/`uint_gt`
-//! and never `int_between`; `f32`/`f64` use float `le`/`ge`/`gt` (NaN is
+//! and never `int_between`; `f64` uses float `le`/`ge`/`gt` (NaN is
 //! false under the two-compare expansion) and never `int_between` or
-//! `+ 1`.  Exclusive Range is `a <= x && x < b`; inclusive is
-//! `a <= x && x <= b`.  The pyre `W_Range` Python object is out of
-//! scope.  Iteration-form ranges (`for i in a..=b` / `for i in a..b`)
+//! `+ 1`.  `f32` stays residual: float `le`/`gt` on a `SingleFloat`
+//! operand needs `cast_primitive` to `Float` first (`rfloat.py`
+//! `SingleFloatRepr.rtype_float`).  Exclusive Range is `a <= x && x < b`;
+//! inclusive is `a <= x && x <= b`.  The pyre `W_Range` Python object is
+//! out of scope.  Iteration-form ranges (`for i in a..=b` / `for i in a..b`)
 //! are excluded by the consumer-shape gate: an iterator reads the range
 //! a second time (its stateful `exhausted` field, or `next` on an
 //! exclusive `Range`) as an OP operand, so a range value read by any op
@@ -115,12 +117,13 @@ use crate::model::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RangeContainsElem {
     /// Signed integer (`i8`/`i16`/`i32`/`i64`/`isize`): `le`/`ge`/`gt`,
-    /// and `int_between` when that op's contract holds.
+    /// and `int_between` when that op's contract holds.  `i128` declines.
     Signed,
     /// Unsigned integer (`u8`/`u16`/`u32`/`u64`/`usize`): `uint_le` /
-    /// `uint_ge`/`uint_gt`.  Never `int_between`.
+    /// `uint_ge`/`uint_gt`.  Never `int_between`.  `u128` declines.
     Unsigned,
-    /// `f32`/`f64`: float `le`/`ge`/`gt`.  Never `int_between`, never `+ 1`.
+    /// `f64`: float `le`/`ge`/`gt`.  Never `int_between`, never `+ 1`.
+    /// `f32` declines (`rfloat.py` `SingleFloatRepr.rtype_float`).
     Float,
 }
 
