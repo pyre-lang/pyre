@@ -23613,6 +23613,15 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock()
     }
 
+    /// `const_ptr_table` is process-global. Two tests that intern a
+    /// nursery ConstPtr and then collect must not walk that table at
+    /// once: the visitor is this thread's MiniMark, and a sibling's
+    /// forwarded nursery word trips `find_shadow`.
+    fn const_ptr_gc_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock()
+    }
+
     thread_local! {
         static TEST_EXCEPTION_VALUE: Cell<i64> = const { Cell::new(0) };
         static TEST_EXCEPTION_CALL_LOG: std::cell::RefCell<Vec<bool>> =
@@ -25372,6 +25381,7 @@ mod tests {
     /// forwarded reference constant, just as the already compiled owner does.
     #[test]
     fn owner_preserves_reference_constant_after_collection() {
+        let _guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -25442,6 +25452,7 @@ mod tests {
     /// not the nursery address the ops were retained with.
     #[test]
     fn merged_recompile_reads_forwarded_loop_constant() {
+        let _guard = const_ptr_gc_test_guard();
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
