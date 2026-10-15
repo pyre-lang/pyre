@@ -738,14 +738,15 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
             continue;
         };
         // Cleanup reached only through `on_unwind` is outside the flow
-        // graph (`forward_reachable_mask`); a drop-glue call there is
-        // not a definition this walk should chase.
+        // graph (`strip_cleanup_blocks`); a drop-glue call there is
+        // not a definition this walk should chase. `forward_reachable_mask`
+        // stops at `Unknown`, so a later non-cleanup block is still walked.
         let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
         let mut defs: HashMap<u64, Rvalue> = HashMap::new();
         let mut from_call: HashMap<u64, String> = HashMap::new();
         let mut projected: HashMap<u64, String> = HashMap::new();
         for (bb_idx, bb) in body.body.iter().enumerate() {
-            if !forward[bb_idx] {
+            if !call_graph_walks_block(bb, forward[bb_idx]) {
                 continue;
             }
             for st in &bb.statements {
@@ -773,7 +774,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
             }
         }
         for (bb_idx, bb) in body.body.iter().enumerate() {
-            if !forward[bb_idx] {
+            if !call_graph_walks_block(bb, forward[bb_idx]) {
                 continue;
             }
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
@@ -854,6 +855,28 @@ fn rvalue_label(r: &majit_charon_reader::ullbc::Rvalue) -> &'static str {
     }
 }
 
+/// Blocks `GraphAnalyzer.analyze_direct_call` walks. Unwind-only
+/// cleanup is outside `strip_cleanup_blocks`; every other block is in
+/// the flow graph. `forward_reachable_mask` stops at `Unknown`, so a
+/// later non-cleanup Call is still walked here.
+fn call_graph_walks_block(bb: &majit_charon_reader::ullbc::BasicBlock, forward: bool) -> bool {
+    forward || !bb.is_cleanup
+}
+
+/// `GraphAnalyzer.analyze` returns `top_result()` when call information
+/// is unavailable (`DelayedPointer`, missing `graph`, `indirect_call`
+/// with `graphs is None`). An unparsed or `Unknown` terminator is that
+/// case for this walk.
+fn call_graph_flow_is_incomplete(
+    llbc: &majit_charon_reader::Llbc,
+    bb: &majit_charon_reader::ullbc::BasicBlock,
+) -> bool {
+    match bb.term_ref(llbc) {
+        Ok(majit_charon_reader::ullbc::TermKind::Unknown) | Err(_) => true,
+        Ok(_) => false,
+    }
+}
+
 /// Build the call graph of one charon artefact.
 ///
 /// Only `Call` terminators contribute edges, and only when charon already
@@ -913,11 +936,16 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
         // A Call that lives only on an `on_unwind` cleanup chain is not a
         // call-graph edge: the flow graph never carries that edge, so
         // `strip_cleanup_blocks` dropped the block. `forward_reachable_mask`
-        // is that set without copying the body.
+        // stops at `Unknown`; a later non-cleanup Call is still an edge,
+        // and that Unknown is `GraphAnalyzer.analyze` `top_result`.
         let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
+        let mut incomplete = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
-            if !forward[bb_idx] {
+            if !call_graph_walks_block(bb, forward[bb_idx]) {
                 continue;
+            }
+            if forward[bb_idx] && call_graph_flow_is_incomplete(llbc, bb) {
+                incomplete = true;
             }
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
@@ -986,6 +1014,9 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
                     opaque.unknown += 1;
                 }
             }
+        }
+        if incomplete {
+            indirect.insert(id);
         }
     }
     for (&caller, cs) in &callees {
@@ -1508,5 +1539,93 @@ mod tests {
                 fd.def_id
             );
         }
+    }
+
+    /// Body whose first terminator is unparsed (`Unknown`) and whose next
+    /// non-cleanup block is a Call. `forward_reachable_mask` stops at
+    /// the Unknown, so the Call is not in the mask.
+    fn llbc_with_unknown_terminator_then_call() -> majit_charon_reader::Llbc {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let gens = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "holder"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span.clone(), "ty": scalar.clone()}
+                ]},
+                "body": [
+                    {"statements": [], "is_cleanup": false, "terminator": {
+                        "span": span.clone(), "kind": "InlineAsm"
+                    }},
+                    {"statements": [], "is_cleanup": false, "terminator": {"span": span.clone(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 1}, "generics": gens.clone()}},
+                            "args": [],
+                            "dest": place(0)
+                        },
+                        "target": 2,
+                        "on_unwind": 2
+                    }}}},
+                    {"statements": [], "is_cleanup": false, "terminator": {
+                        "span": span.clone(), "kind": "Return"
+                    }}
+                ]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["fixture", "downstream_callee"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [holder, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("unknown-then-call fixture parses")
+    }
+
+    /// A parseable Call after an `Unknown` terminator stays an edge, and
+    /// the caller is `indirect` (`GraphAnalyzer.analyze` `top_result`).
+    #[test]
+    fn unknown_terminator_keeps_downstream_call_edge() {
+        let llbc = llbc_with_unknown_terminator_then_call();
+        let fd = llbc.fn_by_id(0).expect("holder decl");
+        let body = fd.unstructured().expect("Unstructured body");
+        let forward = crate::front::mir::forward_reachable_mask(&llbc, &body);
+        assert!(forward[0], "Unknown block is reached");
+        assert!(
+            !forward[1],
+            "mask stops at Unknown; Call block is not forward"
+        );
+
+        let cg = build(&llbc);
+        let holder = cg.callees.get(&0).expect("holder is a local fn");
+        assert!(
+            holder.contains(&1),
+            "Call after Unknown must remain an edge: {holder:?}"
+        );
+        assert!(
+            cg.indirect.contains(&0),
+            "Unknown terminator is GraphAnalyzer.analyze top_result"
+        );
     }
 }

@@ -4,7 +4,7 @@
 //! to model only the semantics needed by majit's translation/codewriter layer.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::flowspace::model::ConstValue;
@@ -5957,19 +5957,10 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
     use crate::flowspace::model::Variable;
     use std::collections::{HashMap, HashSet};
 
-    // target block id → source block ids feeding it. Dead stubs keep a
-    // raise exit (`stub_dead_block`); skip them so they cannot poison
-    // `available_on_every_predecessor_path` the way `SSA_to_SSI` only
-    // walks `graph.iterblocks()`.
-    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for b in &graph.blocks {
-        if b.dead {
-            continue;
-        }
-        for e in &b.exits {
-            preds.entry(e.target).or_default().push(b.id);
-        }
-    }
+    // Same live-predecessor set as `incoming_edges` / `mkentrymap`: skip
+    // dead stubs (`stub_dead_block`) so availability, SSI lookup, and
+    // mutation agree.
+    let entrymap = graph.live_predecessor_map();
 
     // Predecessor walks stay on exact identity (`variable_defined_in_block`).
     // `ssa.py` `SSA_to_SSI` `find_rep` reuse is a per-use lookup below,
@@ -5981,7 +5972,7 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
 
     fn ancestor_has_definition(
         graph: &FunctionGraph,
-        preds: &HashMap<BlockId, Vec<BlockId>>,
+        entrymap: &HashMap<BlockId, Vec<(BlockId, usize)>>,
         block: BlockId,
         var: &Variable,
         seen: &mut HashSet<BlockId>,
@@ -5990,15 +5981,15 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
             return false;
         }
         block_has_value(graph, block, var)
-            || preds.get(&block).is_some_and(|ps| {
+            || entrymap.get(&block).is_some_and(|ps| {
                 ps.iter()
-                    .any(|&pred| ancestor_has_definition(graph, preds, pred, var, seen))
+                    .any(|&(pred, _)| ancestor_has_definition(graph, entrymap, pred, var, seen))
             })
     }
 
     fn available_on_every_predecessor_path(
         graph: &FunctionGraph,
-        preds: &HashMap<BlockId, Vec<BlockId>>,
+        entrymap: &HashMap<BlockId, Vec<(BlockId, usize)>>,
         block: BlockId,
         var: &Variable,
         visiting: &mut HashSet<BlockId>,
@@ -6017,10 +6008,10 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
         if !visiting.insert(block) {
             return true;
         }
-        let available = preds.get(&block).is_some_and(|ps| {
+        let available = entrymap.get(&block).is_some_and(|ps| {
             !ps.is_empty()
-                && ps.iter().all(|&pred| {
-                    available_on_every_predecessor_path(graph, preds, pred, var, visiting, memo)
+                && ps.iter().all(|&(pred, _)| {
+                    available_on_every_predecessor_path(graph, entrymap, pred, var, visiting, memo)
                 })
         });
         visiting.remove(&block);
@@ -6071,10 +6062,10 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
                 continue;
             }
             let has_definition =
-                ancestor_has_definition(graph, &preds, block.id, &var, &mut HashSet::new());
+                ancestor_has_definition(graph, &entrymap, block.id, &var, &mut HashSet::new());
             let available = available_on_every_predecessor_path(
                 graph,
-                &preds,
+                &entrymap,
                 block.id,
                 &var,
                 &mut HashSet::new(),
@@ -6089,7 +6080,10 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
             // does not define the producer identity. One lookup at this
             // use site (`record_used_var(block.exitswitch)`); the
             // predecessor walk above stays exact-identity.
-            if graph.ssi_variable_at_block(block.id, &var).is_some() {
+            if graph
+                .ssi_variable_at_block_from_preds(block.id, &var, &entrymap)
+                .is_some()
+            {
                 work.push((block.id, var));
             }
         }
@@ -9019,9 +9013,16 @@ impl FunctionGraph {
         self.ensure_variable_at_block_with_memo(block, var, &mut memo)
     }
 
+    /// Incoming links from live predecessors.
+    ///
+    /// Dead stubs (`stub_dead_block`) keep a raise exit and are skipped so
+    /// checking (`thread_undefined_op_operands`) and mutation share the
+    /// same predecessor set. `mkentrymap` walks `iterlinks()`; a `dead`
+    /// block is the local analog of a block `iterblocks()` no longer uses.
     fn incoming_edges(&self, block: BlockId) -> Vec<(BlockId, usize)> {
         self.blocks
             .iter()
+            .filter(|b| !b.dead)
             .flat_map(|b| {
                 let bid = b.id;
                 b.exits
@@ -9032,6 +9033,62 @@ impl FunctionGraph {
             .collect()
     }
 
+    /// `mkentrymap`: live source `(block, exit index)` for each target.
+    /// Built once per SSI pass so mixed-phi reachability does not rescan
+    /// every block at every ancestor (`DataFlowFamilyBuilder` uses one
+    /// `entrymap` for the whole graph).
+    fn live_predecessor_map(&self) -> HashMap<BlockId, Vec<(BlockId, usize)>> {
+        let mut preds: HashMap<BlockId, Vec<(BlockId, usize)>> = HashMap::new();
+        for b in &self.blocks {
+            if b.dead {
+                continue;
+            }
+            for (i, exit) in b.exits.iter().enumerate() {
+                preds.entry(exit.target).or_default().push((b.id, i));
+            }
+        }
+        preds
+    }
+
+    /// `true` when `var` is defined in `block` or in an ancestor along
+    /// `live_predecessor_map`. `ssa.py` `DataFlowFamilyBuilder.complete`
+    /// treats a predecessor that cannot supply `var` as outside the family.
+    fn block_can_reach_var(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        preds: &HashMap<BlockId, Vec<(BlockId, usize)>>,
+        memo: &mut HashMap<usize, bool>,
+    ) -> bool {
+        self.block_can_reach_var_inner(block, var, preds, memo, &mut HashSet::new())
+    }
+
+    fn block_can_reach_var_inner(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        preds: &HashMap<BlockId, Vec<(BlockId, usize)>>,
+        memo: &mut HashMap<usize, bool>,
+        seen: &mut HashSet<usize>,
+    ) -> bool {
+        if let Some(&known) = memo.get(&block.0) {
+            return known;
+        }
+        if self.variable_defined_in_block(block, var) {
+            memo.insert(block.0, true);
+            return true;
+        }
+        if !seen.insert(block.0) {
+            return false;
+        }
+        let reached = preds.get(&block).is_some_and(|ps| {
+            ps.iter()
+                .any(|&(pred, _)| self.block_can_reach_var_inner(pred, var, preds, memo, seen))
+        });
+        memo.insert(block.0, reached);
+        reached
+    }
+
     /// The Variable this block defines for `var`'s value: `var` itself
     /// when created here, otherwise the inputarg whose incoming
     /// `Link.args` carry `var` or an SSI copy (`ssa.py` `SSA_to_SSI`).
@@ -9040,11 +9097,23 @@ impl FunctionGraph {
         block: BlockId,
         var: &crate::flowspace::model::Variable,
     ) -> Option<crate::flowspace::model::Variable> {
+        let preds = self.live_predecessor_map();
+        self.ssi_variable_at_block_from_preds(block, var, &preds)
+    }
+
+    fn ssi_variable_at_block_from_preds(
+        &self,
+        block: BlockId,
+        var: &crate::flowspace::model::Variable,
+        preds: &HashMap<BlockId, Vec<(BlockId, usize)>>,
+    ) -> Option<crate::flowspace::model::Variable> {
         self.ssi_variable_at_block_inner(
             block,
             var,
+            preds,
             &mut HashSet::new(),
-            &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
         )
     }
 
@@ -9052,8 +9121,10 @@ impl FunctionGraph {
         &self,
         block: BlockId,
         var: &crate::flowspace::model::Variable,
+        preds: &HashMap<BlockId, Vec<(BlockId, usize)>>,
         visiting: &mut HashSet<usize>,
-        memo: &mut std::collections::HashMap<usize, Option<crate::flowspace::model::Variable>>,
+        memo: &mut HashMap<usize, Option<crate::flowspace::model::Variable>>,
+        reach_memo: &mut HashMap<usize, bool>,
     ) -> Option<crate::flowspace::model::Variable> {
         if let Some(cached) = memo.get(&block.0) {
             return cached.clone();
@@ -9066,29 +9137,48 @@ impl FunctionGraph {
         if !visiting.insert(block.0) {
             return None;
         }
-        let pred_edges = self.incoming_edges(block);
+        let pred_edges = preds.get(&block).cloned().unwrap_or_default();
         let inputargs = self.block(block).inputargs.clone();
         let mut found = None;
         'slots: for (i, local) in inputargs.iter().enumerate() {
+            // `DataFlowFamilyBuilder.complete` unifies only an opportunity
+            // with exactly two distinct family representatives. A phi that
+            // merges unrelated values stays a separate family: reject the
+            // slot when a mismatching incoming comes from a predecessor
+            // that can reach `var`. A predecessor that cannot reach `var`
+            // is disconnected and does not block reuse.
+            let mut saw_match = false;
+            let mut mixed = false;
             for &(pred, idx) in &pred_edges {
-                let Some(LinkArg::Value(incoming)) = self
+                let incoming = self
                     .block(pred)
                     .exits
                     .get(idx)
-                    .and_then(|link| link.args.get(i))
-                else {
-                    continue;
+                    .and_then(|link| link.args.get(i));
+                let matches = match incoming {
+                    Some(LinkArg::Value(incoming)) => {
+                        incoming == var
+                            || self
+                                .ssi_variable_at_block_inner(
+                                    pred, var, preds, visiting, memo, reach_memo,
+                                )
+                                .as_ref()
+                                == Some(incoming)
+                    }
+                    _ => false,
                 };
-                if incoming == var
-                    || self
-                        .ssi_variable_at_block_inner(pred, var, visiting, memo)
-                        .as_ref()
-                        == Some(incoming)
-                {
-                    found = Some(local.clone());
-                    break 'slots;
+                if matches {
+                    saw_match = true;
+                } else if self.block_can_reach_var(pred, var, preds, reach_memo) {
+                    mixed = true;
+                    break;
                 }
             }
+            if mixed || !saw_match {
+                continue;
+            }
+            found = Some(local.clone());
+            break 'slots;
         }
         visiting.remove(&block.0);
         memo.insert(block.0, found.clone());
@@ -9420,10 +9510,9 @@ impl FunctionGraph {
             return true;
         }
         let preds: Vec<BlockId> = self
-            .blocks
-            .iter()
-            .filter(|b| b.exits.iter().any(|exit| exit.target == block))
-            .map(|b| b.id)
+            .incoming_edges(block)
+            .into_iter()
+            .map(|(pred, _)| pred)
             .collect();
         if preds.is_empty() {
             visiting.remove(&block.0);
@@ -16762,6 +16851,230 @@ mod tests {
             "one-arm definition must not be invented at the join",
         );
         assert!(graph.block(right).inputargs.is_empty());
+    }
+
+    /// `DataFlowFamilyBuilder.complete` does not unify a phi that merges
+    /// unrelated values. Entry defines `v` and `u`; the join inputarg `w`
+    /// receives `v` on one arm and `u` on the other. A join use of the
+    /// dominating `v` must not be renamed onto `w`.
+    #[test]
+    fn ssi_variable_at_block_rejects_genuine_phi_merging_unrelated_values() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ssi_genuine_phi");
+        let entry = graph.startblock;
+        let left = graph.create_block();
+        let right = graph.create_block();
+        let (join, join_args) = graph.create_block_with_arg_vars(1);
+        let v = Variable::named("v");
+        let u = Variable::named("u");
+        let w = join_args[0].clone();
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::Input {
+                name: "v".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(u.clone()),
+            kind: OpKind::Input {
+                name: "u".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, left, vec![], right, vec![]);
+        graph.set_goto(left, join, vec![v.clone()]);
+        graph.set_goto(right, join, vec![u.clone()]);
+        graph.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: v.clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+
+        assert!(
+            graph.ssi_variable_at_block(join, &v).is_none(),
+            "a phi of v and u is not an SSI copy of v"
+        );
+        assert!(graph.ensure_variable_at_block(join, &v));
+        assert_eq!(
+            graph.block(join).inputargs.as_slice()[0],
+            w,
+            "the unrelated phi slot is kept"
+        );
+        assert_eq!(
+            graph.block(join).inputargs.len(),
+            2,
+            "dominating v is threaded as a fresh copy"
+        );
+        let local = graph.block(join).inputargs[1].clone();
+        assert_ne!(local.id(), v.id());
+        assert_ne!(local.id(), w.id());
+        match &graph.block(join).operations[0].kind {
+            OpKind::UnaryOp { operand, .. } => {
+                assert_eq!(
+                    operand.id(),
+                    local.id(),
+                    "join use of v is renamed onto the v copy, not the phi"
+                );
+            }
+            other => panic!("expected UnaryOp, got {other:?}"),
+        }
+        match &graph.block(left).exits[0].args[0] {
+            LinkArg::Value(var) => {
+                assert_ne!(var.id(), w.id(), "left does not feed the join use slot");
+                assert!(
+                    graph.variable_defined_in_block(left, var),
+                    "left phi incoming is defined in left"
+                );
+            }
+            other => panic!("expected Value, got {other:?}"),
+        }
+        assert!(
+            matches!(&graph.block(right).exits[0].args[0], LinkArg::Value(var) if var.id() == u.id()),
+            "right still feeds the unrelated phi with u"
+        );
+        assert_eq!(
+            graph.block(left).exits[0].args.len(),
+            graph.block(join).inputargs.len()
+        );
+        assert_eq!(
+            graph.block(right).exits[0].args.len(),
+            graph.block(join).inputargs.len()
+        );
+        assert_unique_variable_definitions(&graph);
+    }
+
+    /// `block_can_reach_var` follows `mkentrymap` ancestors, not only
+    /// the immediate predecessor. Entry defines `v`/`u`; a two-block
+    /// chain carries `v` into the join while the other arm carries `u`.
+    #[test]
+    fn ssi_variable_at_block_rejects_mixed_phi_across_a_predecessor_chain() {
+        use crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("ssi_genuine_phi_chain");
+        let entry = graph.startblock;
+        let mid = graph.create_block();
+        let left = graph.create_block();
+        let right = graph.create_block();
+        let (join, _join_args) = graph.create_block_with_arg_vars(1);
+        let v = Variable::named("v");
+        let u = Variable::named("u");
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::Input {
+                name: "v".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(u.clone()),
+            kind: OpKind::Input {
+                name: "u".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, mid, vec![], right, vec![]);
+        graph.set_goto(mid, left, vec![]);
+        graph.set_goto(left, join, vec![v.clone()]);
+        graph.set_goto(right, join, vec![u.clone()]);
+        graph.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: v.clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+
+        assert!(
+            graph.ssi_variable_at_block(join, &v).is_none(),
+            "a phi of v and u is not an SSI copy of v across a pred chain"
+        );
+        assert!(graph.ensure_variable_at_block(join, &v));
+        assert_eq!(graph.block(join).inputargs.len(), 2);
+        let local = graph.block(join).inputargs[1].clone();
+        match &graph.block(join).operations[0].kind {
+            OpKind::UnaryOp { operand, .. } => {
+                assert_eq!(operand.id(), local.id());
+            }
+            other => panic!("expected UnaryOp, got {other:?}"),
+        }
+        assert_unique_variable_definitions(&graph);
+    }
+
+    /// An unreachable dead predecessor lacking `var` must not be walked
+    /// by `incoming_edges` after the live-pred availability check
+    /// approved threading (`mkentrymap` / `iterlinks`).
+    #[test]
+    fn thread_undefined_ignores_dead_predecessor_lacking_the_definition() {
+        let mut graph = FunctionGraph::new("thread_dead_pred");
+        let entry = graph.startblock;
+        let dead = graph.create_block();
+        let join = graph.create_block();
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "value".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_goto(entry, join, vec![]);
+        graph.set_goto(dead, join, vec![]);
+        graph.block_mut(dead).dead = true;
+        graph.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: value.clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert_eq!(graph.block(join).inputargs.len(), 1);
+        let local = graph.block(join).inputargs[0].clone();
+        assert_ne!(local.id(), value.id());
+        match &graph.block(join).operations[0].kind {
+            OpKind::UnaryOp { operand, .. } => {
+                assert_eq!(operand.id(), local.id());
+            }
+            other => panic!("expected UnaryOp, got {other:?}"),
+        }
+        assert_eq!(graph.block(dead).exits[0].args.len(), 0);
+        assert_unique_variable_definitions(&graph);
     }
 
     /// `framestate.py getvariables` walks `locals + flatten(stack) +

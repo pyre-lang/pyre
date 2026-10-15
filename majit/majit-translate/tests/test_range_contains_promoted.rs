@@ -112,52 +112,112 @@ fn is_primitive_promoted_range_folds_to_int_between() {
         "is_primitive must emit one int_between(KIND_PRIM_CHAR, kind, KIND_PRIM_COMPLEX + 1)"
     );
 
-    let const_int_of = |var: &majit_translate::flowspace::model::Variable| -> Option<i64> {
-        // The ConstInt may live in a predecessor; `SSA_to_SSI` binds a
-        // fresh `Variable.copy()` through `Link.args` at each hop.
-        let mut seen = std::collections::HashSet::new();
-        let mut stack = vec![var.clone()];
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur.id()) {
-                continue;
-            }
-            for block in &graph.blocks {
-                for op in &block.operations {
-                    if let (Some(result), OpKind::ConstInt(value)) = (&op.result, &op.kind)
-                        && result == &cur
-                    {
-                        return Some(*value);
-                    }
-                }
-                for (i, input) in block.inputargs.iter().enumerate() {
-                    if input != &cur {
-                        continue;
-                    }
-                    for pred in &graph.blocks {
-                        for link in &pred.exits {
-                            if link.target != block.id {
-                                continue;
-                            }
-                            if let Some(incoming) = link.args.get(i).and_then(|a| a.as_variable()) {
-                                stack.push(incoming.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
-    };
     let args = int_between[0];
     assert_eq!(args.len(), 3);
     assert_eq!(
-        const_int_of(&args[0]),
+        const_int_of(&graph, &args[0]),
         Some(1),
         "lower bound is KIND_PRIM_CHAR"
     );
     assert_eq!(
-        const_int_of(&args[2]),
+        const_int_of(&graph, &args[2]),
         Some(9),
         "exclusive upper is KIND_PRIM_COMPLEX + 1"
     );
+}
+
+/// The signed constant `var` is produced by. Follows `Variable.copy()`
+/// inputargs (`ssa.py` `SSA_to_SSI`) only when every incoming path
+/// agrees (`DataFlowFamilyBuilder` unifies a single family).
+fn const_int_of(
+    graph: &majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> Option<i64> {
+    const_int_of_inner(graph, var, &mut std::collections::HashSet::new())
+}
+
+fn const_int_of_inner(
+    graph: &majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+    seen: &mut std::collections::HashSet<u64>,
+) -> Option<i64> {
+    use majit_translate::model::{LinkArg, OpKind};
+    if !seen.insert(var.id()) {
+        return None;
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let (Some(result), OpKind::ConstInt(value)) = (&op.result, &op.kind)
+                && result == var
+            {
+                return Some(*value);
+            }
+        }
+    }
+    let mut agreed: Option<i64> = None;
+    let mut saw_incoming = false;
+    for block in graph.iterblocks() {
+        if block.dead {
+            continue;
+        }
+        let Some(slot) = block.inputargs.iter().position(|arg| arg == var) else {
+            continue;
+        };
+        for pred in graph.iterblocks() {
+            if pred.dead {
+                continue;
+            }
+            for link in &pred.exits {
+                if link.target != block.id {
+                    continue;
+                }
+                let value = match link.args.get(slot) {
+                    Some(LinkArg::Value(incoming)) => const_int_of_inner(graph, incoming, seen)?,
+                    Some(LinkArg::Const(constant)) => match constant.value {
+                        majit_translate::flowspace::model::ConstValue::Int(value) => value,
+                        _ => return None,
+                    },
+                    None => return None,
+                };
+                if let Some(prev) = agreed {
+                    if prev != value {
+                        return None;
+                    }
+                } else {
+                    agreed = Some(value);
+                }
+                saw_incoming = true;
+            }
+        }
+    }
+    if saw_incoming { agreed } else { None }
+}
+
+/// A phi merging distinct constants is not itself a constant
+/// (`DataFlowFamilyBuilder.complete`).
+#[test]
+fn const_int_of_rejects_phi_of_distinct_constants() {
+    use majit_translate::model::{FunctionGraph, OpKind, ValueType};
+    let mut graph = FunctionGraph::new("const_int_mixed_phi");
+    let entry = graph.startblock;
+    let left = graph.create_block();
+    let right = graph.create_block();
+    let (join, join_args) = graph.create_block_with_arg_vars(1);
+    let one = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+    let nine = graph.push_op_var(entry, OpKind::ConstInt(9), true).unwrap();
+    let cond = graph
+        .push_op_var(
+            entry,
+            OpKind::Input {
+                name: "cond".into(),
+                ty: ValueType::Bool,
+                class_root: None,
+            },
+            true,
+        )
+        .unwrap();
+    graph.set_branch(entry, cond, left, vec![], right, vec![]);
+    graph.set_goto(left, join, vec![one]);
+    graph.set_goto(right, join, vec![nine]);
+    assert_eq!(const_int_of(&graph, &join_args[0]), None);
 }
