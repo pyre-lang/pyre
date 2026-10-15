@@ -5702,6 +5702,14 @@ fn register_thread_root_areas() {
         register(rd_consts_root_walker_area, jit_driver, "rd_consts");
         register(partial_trace_root_walker_area, jit_driver, "partial_trace");
         register(active_trace_root_walker_area, jit_driver, "active_trace");
+        majit_gc::shadow_stack::register_mutator_young_reconciler(
+            settle_young_active_trace_concrete_refs,
+            jit_driver,
+        );
+        majit_gc::shadow_stack::register_mutator_pruner(
+            settle_active_trace_concrete_refs,
+            jit_driver,
+        );
         register(
             compile_snapshot_root_walker_area,
             jit_driver,
@@ -6453,6 +6461,31 @@ unsafe fn active_trace_root_walker_area(
             unsafe { walk_active_trace_ref(gcref, visitor) };
         };
         pair.0.walk_active_trace_refs(&mut with_immortal_children);
+    }
+}
+
+/// Settle the active recorder's young FrontendOp refs after a minor
+/// collection forwarded the live ones through
+/// [`active_trace_root_walker_area`]. Registered as the minor reconciler.
+unsafe fn settle_young_active_trace_concrete_refs(
+    data: *const (),
+    classify: &mut dyn FnMut(usize) -> Option<usize>,
+    in_nursery: &dyn Fn(usize) -> bool,
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0
+            .settle_young_active_trace_concrete_refs(classify, in_nursery);
+    }
+}
+
+/// Settle every FrontendOp ref of the active recorder before a major
+/// collection sweeps. Registered as the major pruner.
+unsafe fn settle_active_trace_concrete_refs(
+    data: *const (),
+    classify: &mut dyn FnMut(usize) -> Option<usize>,
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.settle_active_trace_concrete_refs(classify);
     }
 }
 

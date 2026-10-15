@@ -3779,6 +3779,17 @@ impl MiniMarkGC {
             }
         };
         crate::shadow_stack::reconcile_young_owner_tables(&mut classify_young_owner);
+        // The same question for young-address tables a single mutator owns in
+        // its own TLS, with the reach rule of the major's mutator prune below.
+        let in_nursery = |addr: usize| nursery.contains(addr);
+        if crate::gc_sync::mutators_quiesced() {
+            crate::shadow_stack::reconcile_all_mutator_young(
+                &mut classify_young_owner,
+                &in_nursery,
+            );
+        } else {
+            crate::shadow_stack::reconcile_my_mutator_young(&mut classify_young_owner, &in_nursery);
+        }
 
         // `IncrementalMiniMarkGC.record_pinned_object_with_shadow`: clear this
         // mapping now that every unpinned nursery object was forwarded (or

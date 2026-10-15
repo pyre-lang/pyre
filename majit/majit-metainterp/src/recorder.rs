@@ -14,7 +14,7 @@
 use crate::opencoder::{Box as OcBox, TraceRecordBuffer};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// Compact stand-in for `history.py FrontendOp` while the live recorder
 /// writes `TraceRecordBuffer` bytes. The 240-byte `Op` is materialized
@@ -47,6 +47,8 @@ struct ValueSlot {
     /// `history.py` `RefFrontendOp._heapc_flags` / `_heapc_deps` and
     /// `FrontendOp.position_and_flags & FO_REPLACED_WITH_CONST`.
     heapc: majit_trace::heapcache::HeapcRecord,
+    /// The slot is on [`Trace::young_ref_slots`].
+    young_listed: Cell<bool>,
 }
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
@@ -255,6 +257,10 @@ pub struct Trace {
     /// FrontendOp heapc records for inputargs at positions `0.._start`
     /// (`warmstate.py` `wrap` builds `RefFrontendOp(position, value)`).
     inputarg_heapc: Vec<majit_trace::heapcache::HeapcRecord>,
+    /// `value_slots` indices stamped with a `Value::Ref` since the last
+    /// minor collection — the `young_objects_with_weakrefs` list of
+    /// `incminimark.py`, which `invalidate_young_weakrefs` drains.
+    young_ref_slots: RefCell<Vec<u32>>,
 }
 
 /// TAGBOX index to the recording `OpRef`, without borrowing the whole
@@ -427,6 +433,7 @@ impl Trace {
             slots: Vec::new(),
             value_slots: Vec::new(),
             inputarg_heapc: Vec::new(),
+            young_ref_slots: RefCell::new(Vec::new()),
         }
     }
 
@@ -969,7 +976,11 @@ impl Trace {
                 concrete: Cell::new(value),
                 opcode,
                 heapc: majit_trace::heapcache::HeapcRecord::default(),
+                young_listed: Cell::new(false),
             });
+            if let Some(v) = value {
+                self.note_concrete_ref(self.value_slots.len() - 1, v);
+            }
             self.box_count += 1;
             OpRef::op_typed(box_index, ty)
         } else {
@@ -1900,6 +1911,7 @@ impl Trace {
             false
         } else if let Some(vs) = self.value_slot(position) {
             vs.concrete.set(Some(value));
+            self.note_concrete_ref((position - self.box_prefix()) as usize, value);
             if let Some(op) = self
                 .ops
                 .iter()
@@ -1932,6 +1944,87 @@ impl Trace {
         };
         visitor(&mut gcref);
         self.set_concrete_at(opref.raw(), Value::Ref(gcref));
+    }
+
+    /// Put a slot just stamped with a `Value::Ref` on
+    /// [`Self::young_ref_slots`], once until the next minor collection.
+    fn note_concrete_ref(&self, slot: usize, value: Value) {
+        let Value::Ref(gcref) = value else {
+            return;
+        };
+        if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
+            return;
+        }
+        let vs = &self.value_slots[slot];
+        if !vs.young_listed.replace(true) {
+            self.young_ref_slots.borrow_mut().push(slot as u32);
+        }
+    }
+
+    /// Settle one slot's `Value::Ref` against a collection: moved to where
+    /// its referent went, cleared if the referent died.
+    fn settle_concrete_ref(vs: &ValueSlot, classify: &mut dyn FnMut(usize) -> Option<usize>) {
+        let Some(Value::Ref(gcref)) = vs.concrete.get() else {
+            return;
+        };
+        if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
+            return;
+        }
+        match classify(gcref.0) {
+            Some(addr) if addr == gcref.0 => {}
+            Some(addr) => vs.concrete.set(Some(Value::Ref(GcRef(addr)))),
+            None => vs.concrete.set(None),
+        }
+    }
+
+    /// Settle the value-slot `Value::Ref`s stamped since the last minor
+    /// collection (`invalidate_young_weakrefs` over
+    /// `young_objects_with_weakrefs`).
+    ///
+    /// history.py `RefFrontendOp._resref` is a field of the FrontendOp
+    /// object, so it dies with a box nothing reaches; the live boxes were
+    /// already forwarded by `forward_concrete_ref`. `value_slots` is the dense
+    /// FrontendOp table and outlives those boxes, so the referent of a dead
+    /// slot is settled the way a weakref target is. A slot left holding a
+    /// freed address would otherwise be interned again by `materialize_ops`.
+    ///
+    /// A referent still `in_nursery` after the collection is a pinned
+    /// survivor, which a later minor collection may move or free, so its slot
+    /// stays on the list. `invalidate_young_weakrefs` clears a weakref to a
+    /// pinned target instead; a slot here may belong to a live box, whose
+    /// value must survive. Any other slot now names an old-generation
+    /// referent, which only a major collection can free.
+    pub(crate) fn settle_young_concrete_refs(
+        &self,
+        classify: &mut dyn FnMut(usize) -> Option<usize>,
+        in_nursery: &dyn Fn(usize) -> bool,
+    ) {
+        let young = std::mem::take(&mut *self.young_ref_slots.borrow_mut());
+        for slot in young {
+            // `Trace::cut` may have truncated `value_slots` past it.
+            let Some(vs) = self.value_slots.get(slot as usize) else {
+                continue;
+            };
+            vs.young_listed.set(false);
+            Self::settle_concrete_ref(vs, classify);
+            if let Some(v) = vs.concrete.get()
+                && let Value::Ref(gcref) = v
+                && in_nursery(gcref.0)
+            {
+                self.note_concrete_ref(slot as usize, v);
+            }
+        }
+    }
+
+    /// Settle every value-slot `Value::Ref` before a major collection sweeps
+    /// (`invalidate_old_weakrefs`). Every slot that survived a minor
+    /// collection is on upstream's `old_objects_with_weakrefs`, so the list
+    /// is `value_slots` itself; a slot still on `young_ref_slots` may name an
+    /// old referent this major frees, so it is settled here too.
+    pub(crate) fn settle_concrete_refs(&self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
+        for vs in &self.value_slots {
+            Self::settle_concrete_ref(vs, classify);
+        }
     }
 
     /// Dense index space for a live-box visited bitset: inputargs plus
