@@ -2164,23 +2164,45 @@ fn jit_hint_access_directly(
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    Ok(hint_virtualizable_flags(args_s, false))
+    Ok(hint_virtualizable_flags(args_s))
 }
 
 /// RPython `rlib/jit.py`, same entry, for the `fresh_virtualizable=True`
 /// spelling.
 ///
-/// Upstream carries both kwargs on one call and asserts against the lone
-/// form — `assert s_access_directly, "lone fresh_virtualizable hint"`. Pyre
-/// splits the call in two, so this helper sets BOTH flags rather than
-/// `fresh_virtualizable` alone; the state upstream asserts against is then
-/// unreachable instead of merely undiagnosed.
+/// Upstream carries both kwargs on one call, asserts
+/// `access_directly` on the kwarg shape, then for a non-`SomeInstance`
+/// or a class whose `classdesc.get_param('_virtualizable_')` is None
+/// returns `s_x` unchanged. Pyre splits that call into nested helpers
+/// `hint_fresh_virtualizable(hint_access_directly(x))`. The inner helper
+/// is the `access_directly=True` kwarg; this helper is the
+/// `fresh_virtualizable=True` kwarg. A virtualizable instance that does
+/// not already carry `access_directly` is the lone-fresh assertion.
 fn jit_hint_fresh_virtualizable(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    Ok(hint_virtualizable_flags(args_s, true))
+    let Some(Some(s_x)) = args_s.first() else {
+        return Ok(s_impossible_value());
+    };
+    let s_x = super::model::not_const(s_x);
+    let SomeValue::Instance(inst) = &s_x else {
+        return Ok(s_x);
+    };
+    if !instance_is_virtualizable(inst) {
+        return Ok(s_x);
+    }
+    if !inst.flags.get("access_directly").copied().unwrap_or(false) {
+        return Err(AnnotatorError::new("lone fresh_virtualizable hint"));
+    }
+    let mut flags = inst.flags.clone();
+    flags.insert("fresh_virtualizable".to_string(), true);
+    Ok(SomeValue::Instance(super::model::SomeInstance::new(
+        inst.classdef.clone(),
+        inst.can_be_none,
+        flags,
+    )))
 }
 
 /// Identity of the reloaded root (`gctransform` insert after annotate).
@@ -2205,13 +2227,16 @@ fn instance_is_virtualizable(inst: &SomeInstance) -> bool {
     })
 }
 
-/// Bind `access_directly` / `fresh_virtualizable` onto a reconstructed
-/// startblock cell the way `annrpython.py bindinputargs` copies the
-/// actual's `SomeInstance.flags`. The recorded formal ids
-/// (`FunctionGraph.access_directly_inputs` /
-/// `fresh_virtualizable_inputs`) are the filter; `unionof` already
-/// intersected them across callers. `fresh_virtualizable=True` sets
-/// both flags (`rlib/jit.py` hint).
+/// Stamp `access_directly` (and `fresh_virtualizable` when `fresh`) on
+/// whatever `SomeInstance` is given. This function filters nothing:
+/// callers pass only the cells of formals recorded in
+/// `FunctionGraph.access_directly_inputs` /
+/// `fresh_virtualizable_inputs`. The production caller is
+/// `derive_subject_inputcells`. Copies the flags the way
+/// `annrpython.py bindinputargs` copies the actual's
+/// `SomeInstance.flags`. `unionof` already intersected the recorded
+/// ids across callers. `fresh_virtualizable=True` sets both flags
+/// (`rlib/jit.py` hint).
 pub(crate) fn stamp_bound_virtualizable_flags(s: &mut SomeValue, fresh: bool) {
     let SomeValue::Instance(inst) = s else {
         return;
@@ -2222,9 +2247,9 @@ pub(crate) fn stamp_bound_virtualizable_flags(s: &mut SomeValue, fresh: bool) {
     }
 }
 
-/// The body both `hint` spellings share — `rlib/jit.py`'s
+/// The body of the `access_directly=True` spelling — `rlib/jit.py`'s
 /// `SomeInstance` branch.
-fn hint_virtualizable_flags(args_s: &[Option<SomeValue>], fresh_virtualizable: bool) -> SomeValue {
+fn hint_virtualizable_flags(args_s: &[Option<SomeValue>]) -> SomeValue {
     let Some(Some(s_x)) = args_s.first() else {
         // `hint` is an identity on its argument; with nothing bound there is
         // nothing to annotate and nothing to flag.
@@ -2239,9 +2264,6 @@ fn hint_virtualizable_flags(args_s: &[Option<SomeValue>], fresh_virtualizable: b
     let mut flags = inst.flags.clone();
     if instance_is_virtualizable(inst) {
         flags.insert("access_directly".to_string(), true);
-        if fresh_virtualizable {
-            flags.insert("fresh_virtualizable".to_string(), true);
-        }
     } else {
         flags.remove("access_directly");
         flags.remove("fresh_virtualizable");
@@ -3324,12 +3346,15 @@ mod tests {
     fn the_hint_mints_access_directly_on_a_virtualizable() {
         let bk = bk();
         let s = instance_of(&bk, "PyFrame", true, &[]);
-        let out = hint_virtualizable_flags(&[Some(s)], false);
+        let out = hint_virtualizable_flags(&[Some(s)]);
         assert_eq!(flags_of(&out), vec!["access_directly".to_string()]);
     }
 
     /// `annrpython.py bindinputargs` copies the actual's flags onto the
-    /// reconstructed cell; the recorded formal ids are the filter.
+    /// reconstructed cell. Callers pass only the cells of formals
+    /// recorded in `FunctionGraph.access_directly_inputs` /
+    /// `fresh_virtualizable_inputs`; this helper stamps whatever
+    /// `SomeInstance` it is given.
     #[test]
     fn stamp_bound_virtualizable_flags_copies_access_directly() {
         let bk = bk();
@@ -3352,13 +3377,35 @@ mod tests {
         );
     }
 
-    /// The `fresh_virtualizable` spelling carries `access_directly` with it,
-    /// so the lone form upstream asserts against is unreachable.
+    /// `rlib/jit.py` `assert access_directly, "lone fresh_virtualizable hint"`:
+    /// a virtualizable instance that does not already carry `access_directly`.
     #[test]
-    fn the_fresh_virtualizable_hint_carries_access_directly_too() {
+    fn lone_fresh_virtualizable_hint_is_an_error() {
         let bk = bk();
         let s = instance_of(&bk, "PyFrame", true, &[]);
-        let out = hint_virtualizable_flags(&[Some(s)], true);
+        let err = jit_hint_fresh_virtualizable(&bk, &[Some(s)], &HashMap::new()).unwrap_err();
+        assert_eq!(err.msg.as_deref(), Some("lone fresh_virtualizable hint"));
+    }
+
+    /// Upstream returns `s_x` unchanged when the class did not declare
+    /// `_virtualizable_`.
+    #[test]
+    fn fresh_virtualizable_on_a_non_virtualizable_leaves_the_annotation() {
+        let bk = bk();
+        let s = instance_of(&bk, "Plain", false, &[]);
+        let out = jit_hint_fresh_virtualizable(&bk, &[Some(s.clone())], &HashMap::new())
+            .expect("non-virtualizable is a passthrough");
+        assert_eq!(out, super::super::model::not_const(&s));
+    }
+
+    /// Nested spelling: the inner helper minted `access_directly`, the
+    /// outer helper adds `fresh_virtualizable`.
+    #[test]
+    fn fresh_virtualizable_on_an_access_directly_instance_adds_the_flag() {
+        let bk = bk();
+        let s = instance_of(&bk, "PyFrame", true, &["access_directly"]);
+        let out = jit_hint_fresh_virtualizable(&bk, &[Some(s)], &HashMap::new())
+            .expect("input already carries access_directly");
         assert_eq!(
             flags_of(&out),
             vec![
@@ -3379,7 +3426,7 @@ mod tests {
             false,
             &["access_directly", "fresh_virtualizable", "other"],
         );
-        let out = hint_virtualizable_flags(&[Some(s)], false);
+        let out = hint_virtualizable_flags(&[Some(s)]);
         assert_eq!(flags_of(&out), vec!["other".to_string()]);
     }
 
@@ -3491,7 +3538,7 @@ mod tests {
     #[test]
     fn the_hint_leaves_a_non_instance_alone() {
         let s = SomeValue::Integer(SomeInteger::default());
-        let out = hint_virtualizable_flags(&[Some(s.clone())], false);
+        let out = hint_virtualizable_flags(&[Some(s.clone())]);
         assert_eq!(out, super::super::model::not_const(&s));
     }
 

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::argument::Signature;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
-use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
+use crate::model::{CallTarget, FlagReturn, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
 use crate::tool::algo::unionfind::UnionFind;
@@ -188,12 +188,66 @@ fn fresh_virtualizable_carry(op: &SpaceOperation) -> Option<Carry> {
     }
 }
 
-/// `pairtype(SomeInstance, SomeInstance).union` keeps a flag only when
-/// every incoming binding has the same value. Seeds never drop.
+/// Input of a `hint_fresh_virtualizable` op (`OpKind::Hint`, or the
+/// residual Call spelling tests still emit).
+fn fresh_virtualizable_source_id(op: &SpaceOperation) -> Option<u64> {
+    match &op.kind {
+        OpKind::Hint {
+            value,
+            kind: crate::hints::HintKind::FreshVirtualizable,
+        } => Some(value.id()),
+        OpKind::Call { target, args, .. } => {
+            if CallControl::call_target_hint_kind(target)
+                != Some(crate::hints::HintKind::FreshVirtualizable)
+            {
+                return None;
+            }
+            args.iter()
+                .find_map(LinkArg::as_variable)
+                .map(|var| var.id())
+        }
+        _ => None,
+    }
+}
+
+/// `rlib/jit.py` `Entry.compute_result_annotation`:
+/// `assert access_directly, "lone fresh_virtualizable hint"`.
+///
+/// Pyre spells that combined hint as
+/// `hint_fresh_virtualizable(hint_access_directly(x))`. The inner helper
+/// seeds `access_directly`; this helper's input must already carry it.
+/// An input still in `unknown` is `s_ImpossibleValue` and is not known
+/// unflagged.
+fn assert_no_lone_fresh_virtualizable(
+    graph: &FunctionGraph,
+    ad_ids: &HashSet<u64>,
+    unknown: &HashSet<u64>,
+) {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(source) = fresh_virtualizable_source_id(op) else {
+                continue;
+            };
+            if unknown.contains(&source) {
+                continue;
+            }
+            if !ad_ids.contains(&source) {
+                panic!("lone fresh_virtualizable hint");
+            }
+        }
+    }
+}
+
+/// `pairtype(SomeInstance, SomeInstance).union` / `annrpython.py`
+/// `mergeinputargs` keep a flag only when every *known* incoming
+/// binding has it. An incoming in `unknown` is `s_ImpossibleValue`
+/// and is the union identity: it does not clear a flagged join that
+/// still has a known predecessor. Seeds never drop.
 fn close_carried_flag_ids(
     graph: &FunctionGraph,
     mut seeds: HashSet<u64>,
     carry: impl Fn(&SpaceOperation) -> Option<Carry>,
+    unknown: &HashSet<u64>,
 ) -> HashSet<u64> {
     let mut incoming: Vec<(u64, Option<u64>)> = Vec::new();
     for block_idx in 0..graph.blocks.len() {
@@ -253,8 +307,14 @@ fn close_carried_flag_ids(
             }
         }
         for &(dest, source) in &incoming {
-            if !source.is_some_and(|id| hinted.contains(&id)) {
+            if unknown.contains(&dest) {
                 drop_ids.push(dest);
+                continue;
+            }
+            match source {
+                Some(id) if unknown.contains(&id) => {}
+                Some(id) if hinted.contains(&id) => {}
+                _ => drop_ids.push(dest),
             }
         }
         let mut changed = false;
@@ -288,6 +348,142 @@ fn merge_bound_input_ids(slot: &mut Option<Vec<u64>>, seeded: Vec<u64>) -> bool 
             old.len() != before
         }
     }
+}
+
+/// `unionof` with `s_ImpossibleValue` as bottom: Unknown yields to a known
+/// annotation; a known unflagged generalizes a flagged one.
+fn union_flag_return(a: FlagReturn, b: FlagReturn) -> FlagReturn {
+    use FlagReturn::*;
+    match (a, b) {
+        (Unknown, x) | (x, Unknown) => x,
+        (Unflagged, _) | (_, Unflagged) => Unflagged,
+        (Flagged, Flagged) => Flagged,
+    }
+}
+
+/// Family union for one call result (`bookkeeper.py pbc_call`).
+///
+/// A member with no graph or no AccessDirect copy is known unflagged.
+/// Any member whose return is still unknown makes the result unknown;
+/// otherwise flagged only if every known member is flagged.
+fn family_flag_return(members: &[FlagReturn]) -> FlagReturn {
+    if members.is_empty() {
+        return FlagReturn::Unflagged;
+    }
+    if members.iter().any(|&member| member == FlagReturn::Unknown) {
+        return FlagReturn::Unknown;
+    }
+    if members.iter().all(|&member| member == FlagReturn::Flagged) {
+        return FlagReturn::Flagged;
+    }
+    FlagReturn::Unflagged
+}
+
+/// `rlib/jit.py` hint `fresh_virtualizable=True` sets both flags. A
+/// flagged-fresh annotation is therefore also access-directly flagged.
+fn imply_fresh_access_directly(ad: FlagReturn, fresh: FlagReturn) -> FlagReturn {
+    if fresh == FlagReturn::Flagged {
+        FlagReturn::Flagged
+    } else {
+        ad
+    }
+}
+
+fn record_flag_family(
+    family: FlagReturn,
+    result_id: u64,
+    flagged_ids: &mut Vec<u64>,
+    unknown: &mut HashSet<u64>,
+) {
+    match family {
+        FlagReturn::Flagged => {
+            if !flagged_ids.contains(&result_id) {
+                flagged_ids.push(result_id);
+            }
+        }
+        FlagReturn::Unknown => {
+            unknown.insert(result_id);
+        }
+        FlagReturn::Unflagged => {}
+    }
+}
+
+fn call_actual_is_unknown(kind: &OpKind, unknown: &HashSet<u64>) -> bool {
+    match kind {
+        OpKind::Call { args, .. } => args
+            .iter()
+            .filter_map(LinkArg::as_variable)
+            .any(|var| unknown.contains(&var.id())),
+        OpKind::IndirectCall { args, .. } => args.iter().any(|var| unknown.contains(&var.id())),
+        _ => false,
+    }
+}
+
+fn propagate_id_set(forwards: &[(u64, u64)], set: &mut HashSet<u64>) {
+    loop {
+        let mut changed = false;
+        for &(source, result) in forwards {
+            if set.contains(&source) && set.insert(result) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Close unknown call results through identity forwards and joins whose
+/// every incoming source is still unknown (`s_ImpossibleValue` as bottom).
+fn close_unknown_ids(graph: &FunctionGraph, mut unknown: HashSet<u64>) -> HashSet<u64> {
+    if unknown.is_empty() {
+        return unknown;
+    }
+    let mut forwards = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(Carry::Forward(source, result)) = identity_forward(op) {
+                forwards.push((source, result));
+            }
+        }
+    }
+    let mut incoming: HashMap<u64, Vec<Option<u64>>> = HashMap::new();
+    for block in &graph.blocks {
+        for exit in &block.exits {
+            let target = exit.target.0;
+            for (arg_idx, arg) in exit.args.iter().enumerate() {
+                let Some(dest) = graph
+                    .blocks
+                    .get(target)
+                    .and_then(|block| block.inputargs.get(arg_idx))
+                    .map(|var| var.id())
+                else {
+                    continue;
+                };
+                incoming
+                    .entry(dest)
+                    .or_default()
+                    .push(arg.as_variable().map(|var| var.id()));
+            }
+        }
+    }
+    loop {
+        let before = unknown.len();
+        propagate_id_set(&forwards, &mut unknown);
+        for (dest, sources) in &incoming {
+            if !sources.is_empty()
+                && sources
+                    .iter()
+                    .all(|source| source.is_some_and(|id| unknown.contains(&id)))
+            {
+                unknown.insert(*dest);
+            }
+        }
+        if unknown.len() == before {
+            break;
+        }
+    }
+    unknown
 }
 
 fn stamp_access_directly_annotation(var: &crate::flowspace::model::Variable, fresh: bool) {
@@ -6401,7 +6597,13 @@ impl CallControl {
     ///
     /// `hint(x, access_directly=True)` sets the flag on its result (or on
     /// `x` when the hint has no result). `hint(x, fresh_virtualizable=True)`
-    /// forwards it. `hint(x, access_directly=False)` does not. A formal
+    /// forwards the flag from its input: pyre spells the combined
+    /// upstream hint as `hint_fresh_virtualizable(hint_access_directly(x))`,
+    /// so the inner helper seeds and the outer forwards. A fresh hint
+    /// whose input is known not to carry the flag is the upstream
+    /// assertion (`rlib/jit.py` `assert access_directly, "lone
+    /// fresh_virtualizable hint"`). `hint(x, access_directly=False)`
+    /// does not set the flag. A formal
     /// listed in `access_directly_inputs` arrived from the caller already
     /// flagged (`default_specialize` binds that actual onto the input of
     /// the AccessDirect copy). `access_directly_call_results` are
@@ -6410,10 +6612,11 @@ impl CallControl {
     /// `binding(graph.getreturnvar())`). Regular graphs have no bound
     /// formals; the AccessDirect copy and the split portal carry the
     /// bound formals. `pairtype(SomeInstance, SomeInstance).union` keeps
-    /// a flag only when every incoming binding has the same value. A
-    /// backedge that still carries the flag does not clear the join. The
-    /// BFS still sees these hint calls; jtransform later drops them as
-    /// identities.
+    /// a flag only when every *known* incoming binding has the same
+    /// value; a still-unknown incoming is `s_ImpossibleValue` and does
+    /// not participate. A backedge that still carries the flag does not
+    /// clear the join. The BFS still sees these hint calls; jtransform
+    /// later drops them as identities.
     ///
     /// Identity ops the codewriter already folds to `same_as`
     /// (`jtransform.py rewrite_op_same_as` / `rewrite_op_cast_pointer` /
@@ -6425,6 +6628,10 @@ impl CallControl {
     /// identity (`FrameView::reload` → `reload_top_root`) flags its
     /// return through that binding, not a second callee-shape walk.
     pub(crate) fn access_directly_result_ids(graph: &FunctionGraph) -> HashSet<u64> {
+        Self::access_directly_hinted_ids(graph, &HashSet::new())
+    }
+
+    fn access_directly_hinted_ids(graph: &FunctionGraph, unknown: &HashSet<u64>) -> HashSet<u64> {
         let mut seeds = HashSet::new();
         for &id in graph.access_directly_inputs.as_deref().unwrap_or(&[]) {
             seeds.insert(id);
@@ -6432,22 +6639,37 @@ impl CallControl {
         for &id in &graph.access_directly_call_results {
             seeds.insert(id);
         }
-        close_carried_flag_ids(graph, seeds, access_directly_carry)
+        let hinted = close_carried_flag_ids(graph, seeds, access_directly_carry, unknown);
+        assert_no_lone_fresh_virtualizable(graph, &hinted, unknown);
+        hinted
     }
 
     /// Variable ids whose annotation carries `fresh_virtualizable`.
     ///
     /// `rlib/jit.py` hint `fresh_virtualizable=True` sets the flag on
-    /// its result (and `access_directly` with it). Identity ops forward
-    /// it. A formal listed in `fresh_virtualizable_inputs` arrived from
-    /// the caller already flagged (`bindinputargs`). `unionof` keeps the
-    /// flag only when every incoming binding still has it.
+    /// its result. Identity ops forward it. A formal listed in
+    /// `fresh_virtualizable_inputs` arrived from the caller already
+    /// flagged (`bindinputargs`).
+    /// `fresh_virtualizable_call_results` are call-result variables whose
+    /// callee return is fresh (`annrpython.py binding(op.result)` after
+    /// `recursivecall` returns `binding(graph.getreturnvar())`). `unionof`
+    /// keeps the flag only when every incoming binding still has it.
     pub(crate) fn fresh_virtualizable_result_ids(graph: &FunctionGraph) -> HashSet<u64> {
+        Self::fresh_virtualizable_hinted_ids(graph, &HashSet::new())
+    }
+
+    fn fresh_virtualizable_hinted_ids(
+        graph: &FunctionGraph,
+        unknown: &HashSet<u64>,
+    ) -> HashSet<u64> {
         let mut seeds = HashSet::new();
         for &id in graph.fresh_virtualizable_inputs.as_deref().unwrap_or(&[]) {
             seeds.insert(id);
         }
-        close_carried_flag_ids(graph, seeds, fresh_virtualizable_carry)
+        for &id in &graph.fresh_virtualizable_call_results {
+            seeds.insert(id);
+        }
+        close_carried_flag_ids(graph, seeds, fresh_virtualizable_carry, unknown)
     }
 
     fn call_target_hint_kind(target: &CallTarget) -> Option<crate::hints::HintKind> {
@@ -6499,7 +6721,9 @@ impl CallControl {
         copy.access_directly_inputs = None;
         copy.fresh_virtualizable_inputs = None;
         copy.access_directly_call_results.clear();
-        copy.access_directly_return = false;
+        copy.access_directly_return = FlagReturn::Unknown;
+        copy.fresh_virtualizable_call_results.clear();
+        copy.fresh_virtualizable_return = FlagReturn::Unknown;
         self.function_graphs.insert(ad_path.clone(), copy);
         for alias in aliases {
             let alias_ad = access_directly_path(&alias);
@@ -6624,12 +6848,47 @@ impl CallControl {
         }
     }
 
-    fn graph_returns_access_directly(graph: &FunctionGraph, hinted: &HashSet<u64>) -> bool {
-        graph
-            .block(graph.returnblock)
-            .inputargs
-            .iter()
-            .any(|var| hinted.contains(&var.id()))
+    /// `annrpython.py recursivecall` / `binding(graph.getreturnvar())`.
+    /// Unknown until returnblock is reached with a known value; unknown
+    /// incoming (`s_ImpossibleValue`) does not participate in the union.
+    /// `hinted` is the set of ids carrying the flag being read
+    /// (`access_directly` or `fresh_virtualizable`).
+    fn graph_flag_return(
+        graph: &FunctionGraph,
+        hinted: &HashSet<u64>,
+        unknown: &HashSet<u64>,
+    ) -> FlagReturn {
+        let mut saw_known = false;
+        let mut all_known_flagged = true;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != graph.returnblock {
+                    continue;
+                }
+                for arg in &link.args {
+                    match arg.as_variable() {
+                        None => {
+                            saw_known = true;
+                            all_known_flagged = false;
+                        }
+                        Some(var) if unknown.contains(&var.id()) => {}
+                        Some(var) => {
+                            saw_known = true;
+                            if !hinted.contains(&var.id()) {
+                                all_known_flagged = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !saw_known {
+            FlagReturn::Unknown
+        } else if all_known_flagged {
+            FlagReturn::Flagged
+        } else {
+            FlagReturn::Unflagged
+        }
     }
 
     /// Formals of `callee` whose actual is in `hinted`.
@@ -6897,18 +7156,24 @@ impl CallControl {
     /// call; `annrpython.py recursivecall` then binds that copy's startblock
     /// (`bindinputargs` / `mergeinputargs` / `unionof`) and returns
     /// `binding(graph.getreturnvar())` so a flagged return flags the
-    /// caller's result. Bindings only ever generalize. The call op is
-    /// retargeted at the copy, so `find_all_graphs` sees two paths.
+    /// caller's result. Both `access_directly` and `fresh_virtualizable`
+    /// ride that one `SomeInstance`; this walk records them together.
+    /// Bindings only ever generalize. The call op is retargeted at the
+    /// copy, so `find_all_graphs` sees two paths.
     ///
     /// One `flowin` pass per graph visit: hinted from the stored binding
     /// plus stored call-result flags, then each call op specializes,
-    /// retargets, bind/merges the callee copy's inputs, and reads the
-    /// callee's stored return flag. A change to this graph's stored
-    /// call-results re-enqueues it; a change to its return flag reflows
-    /// every entered graph whose call op names this graph (`alias_paths`
-    /// of the processed spelling; `annrpython.py RPythonAnnotator.notify`
-    /// attaches to `graph.returnblock`, so every caller of that graph is
-    /// reflowed whatever spelling it used).
+    /// retargets, and reads the callee's stored return flags. Formal
+    /// bind/merge waits until every call result in this graph has been
+    /// classified, and skips a site whose actual is still unknown
+    /// (`consider_op` `BlockedInference` on `s_ImpossibleValue`). A
+    /// change to this graph's stored call-results re-enqueues it; a
+    /// change to either return flag reflows every entered graph whose call
+    /// op names this graph (`alias_paths` of the processed spelling;
+    /// `annrpython.py RPythonAnnotator.notify` attaches to
+    /// `graph.returnblock`, so every caller of that graph is reflowed
+    /// whatever spelling it used). A flagged-fresh return is also
+    /// access-directly flagged (`rlib/jit.py` sets both).
     ///
     /// Phase 1 annotates every graph reachable from the codewriter roots
     /// through calls, regardless of the policy and of `guess_call_kind`,
@@ -6919,179 +7184,276 @@ impl CallControl {
         let builtin_wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
         let mut todo: Vec<CallPath> = roots.to_vec();
         let mut entered: HashSet<CallPath> = todo.iter().cloned().collect();
-        while let Some(path) = todo.pop() {
-            let Some(graph) = self.function_graphs.get(&path) else {
-                continue;
-            };
-            let n_blocks = graph.blocks.len();
-            let hinted = Self::access_directly_result_ids(&graph);
-            let fresh_hinted = Self::fresh_virtualizable_result_ids(&graph);
-            drop(graph);
-            let mut new_call_results = Vec::new();
-            for block_idx in 0..n_blocks {
+        loop {
+            while let Some(path) = todo.pop() {
                 let Some(graph) = self.function_graphs.get(&path) else {
-                    break;
+                    continue;
                 };
-                let n_ops = graph.blocks[block_idx].operations.len();
+                let n_blocks = graph.blocks.len();
+                let hinted = Self::access_directly_result_ids(&graph);
                 drop(graph);
-                for op_idx in 0..n_ops {
+                let mut live_unknown = HashSet::new();
+                let mut new_call_results = Vec::new();
+                let mut new_fresh_call_results = Vec::new();
+                let mut pending_binds: Vec<(CallPath, OpKind)> = Vec::new();
+                for block_idx in 0..n_blocks {
                     let Some(graph) = self.function_graphs.get(&path) else {
-                        continue;
+                        break;
                     };
-                    let op = graph.blocks[block_idx].operations[op_idx].clone();
+                    let n_ops = graph.blocks[block_idx].operations.len();
                     drop(graph);
-                    let callees = self.call_op_callees(
-                        &op,
-                        &path,
-                        block_idx,
-                        op_idx,
-                        false,
-                        &builtin_wrappers,
-                    );
-                    // `bookkeeper.py pbc_call` → `unionof` over the family's
-                    // results; `binaryop.py union(SomeInstance, SomeInstance)`
-                    // keeps only flags present on every description. Empty
-                    // families contribute nothing.
-                    let mut op_returns = Vec::new();
-                    for callee_path in callees {
-                        let Some(callee_graph) = self.function_graphs.get(&callee_path) else {
-                            // `bookkeeper.py pbc_call` still unions this
-                            // description; no graph means no return
-                            // binding, so the member is unflagged
-                            // (`binaryop.py union(SomeInstance, SomeInstance)`).
-                            op_returns.push(false);
+                    for op_idx in 0..n_ops {
+                        let Some(graph) = self.function_graphs.get(&path) else {
                             continue;
                         };
-                        let spec = Self::call_specialization(&op.kind, &hinted, &callee_graph);
-                        let callee_return = match spec {
-                            Specialization::AccessDirect => {
-                                let origin = access_directly_origin_path(&callee_path)
-                                    .unwrap_or_else(|| callee_path.clone());
-                                drop(callee_graph);
-                                let Some(ad_path) = self.ensure_access_directly_copy(&origin)
-                                else {
-                                    op_returns.push(false);
-                                    continue;
-                                };
-                                self.retarget_call_op(&path, block_idx, op_idx, &origin, &ad_path);
-                                // Bind against the copy's formals
-                                // (`cachedgraph` / `copygraph` mint
-                                // fresh Variables). Origin ids do not
-                                // name anything in the copy.
-                                let (seeded, seeded_fresh) = {
-                                    let Some(callee) = self.function_graphs.get(&ad_path) else {
-                                        op_returns.push(false);
-                                        continue;
-                                    };
-                                    (
-                                        Self::access_directly_input_ids(&op.kind, &hinted, &callee),
-                                        Self::access_directly_input_ids(
-                                            &op.kind,
-                                            &fresh_hinted,
-                                            &callee,
-                                        ),
-                                    )
-                                };
-                                let (changed, callee_return) = {
-                                    let Some(callee) = self.function_graphs.get_mut(&ad_path)
+                        let op = graph.blocks[block_idx].operations[op_idx].clone();
+                        drop(graph);
+                        let callees = self.call_op_callees(
+                            &op,
+                            &path,
+                            block_idx,
+                            op_idx,
+                            false,
+                            &builtin_wrappers,
+                        );
+                        // `bookkeeper.py pbc_call` → `unionof` over the family's
+                        // results; `binaryop.py union(SomeInstance, SomeInstance)`
+                        // keeps only flags present on every description. Empty
+                        // families contribute nothing. A still-unknown member
+                        // makes the result unknown (`recursivecall`
+                        // `s_ImpossibleValue`); no graph / no copy is known
+                        // unflagged.
+                        let mut op_returns = Vec::new();
+                        let mut op_fresh_returns = Vec::new();
+                        for callee_path in callees {
+                            let Some(callee_graph) = self.function_graphs.get(&callee_path) else {
+                                // `bookkeeper.py pbc_call` still unions this
+                                // description; no graph means no return
+                                // binding, so the member is unflagged
+                                // (`binaryop.py union(SomeInstance, SomeInstance)`).
+                                op_returns.push(FlagReturn::Unflagged);
+                                op_fresh_returns.push(FlagReturn::Unflagged);
+                                continue;
+                            };
+                            let spec = Self::call_specialization(&op.kind, &hinted, &callee_graph);
+                            let (callee_return, callee_fresh_return) = match spec {
+                                Specialization::AccessDirect => {
+                                    let origin = access_directly_origin_path(&callee_path)
+                                        .unwrap_or_else(|| callee_path.clone());
+                                    drop(callee_graph);
+                                    let Some(ad_path) = self.ensure_access_directly_copy(&origin)
                                     else {
-                                        op_returns.push(false);
+                                        op_returns.push(FlagReturn::Unflagged);
+                                        op_fresh_returns.push(FlagReturn::Unflagged);
                                         continue;
                                     };
-                                    // `annrpython.py bindinputargs` then
-                                    // `mergeinputargs` / `unionof`: the flag
-                                    // stays only on formals every incoming
-                                    // binding still carries.
-                                    let changed_ad = merge_bound_input_ids(
-                                        &mut callee.access_directly_inputs,
-                                        seeded,
-                                    );
-                                    let changed_fresh = merge_bound_input_ids(
-                                        &mut callee.fresh_virtualizable_inputs,
-                                        seeded_fresh,
-                                    );
-                                    (changed_ad || changed_fresh, callee.access_directly_return)
-                                };
-                                if entered.insert(ad_path.clone()) || changed {
-                                    todo.push(ad_path);
-                                }
-                                callee_return
-                            }
-                            Specialization::Regular => {
-                                // `description.py FunctionDesc.pycall`
-                                // reads the return binding of the graph
-                                // `specialize` selected, after an
-                                // AccessDirect target is replaced by its
-                                // origin.
-                                drop(callee_graph);
-                                let target = if let Some(origin) =
-                                    access_directly_origin_path(&callee_path)
-                                {
                                     self.retarget_call_op(
-                                        &path,
-                                        block_idx,
-                                        op_idx,
-                                        &callee_path,
-                                        &origin,
+                                        &path, block_idx, op_idx, &origin, &ad_path,
                                     );
-                                    origin
-                                } else {
-                                    callee_path
-                                };
-                                let callee_return = self
-                                    .function_graphs
-                                    .get(&target)
-                                    .is_some_and(|graph| graph.access_directly_return);
-                                if entered.insert(target.clone()) {
-                                    todo.push(target);
+                                    let (callee_return, callee_fresh_return) = self
+                                        .function_graphs
+                                        .get(&ad_path)
+                                        .map(|graph| {
+                                            (
+                                                graph.access_directly_return,
+                                                graph.fresh_virtualizable_return,
+                                            )
+                                        })
+                                        .unwrap_or((FlagReturn::Unflagged, FlagReturn::Unflagged));
+                                    if entered.insert(ad_path.clone()) {
+                                        todo.push(ad_path.clone());
+                                    }
+                                    pending_binds.push((ad_path, op.kind.clone()));
+                                    (callee_return, callee_fresh_return)
                                 }
-                                callee_return
-                            }
-                        };
-                        op_returns.push(callee_return);
-                    }
-                    if !op_returns.is_empty()
-                        && op_returns.iter().all(|&flagged| flagged)
-                        && let Some(result) = &op.result
-                        && !new_call_results.contains(&result.id())
-                    {
-                        new_call_results.push(result.id());
+                                Specialization::Regular => {
+                                    // `description.py FunctionDesc.pycall`
+                                    // reads the return binding of the graph
+                                    // `specialize` selected, after an
+                                    // AccessDirect target is replaced by its
+                                    // origin.
+                                    drop(callee_graph);
+                                    let target = if let Some(origin) =
+                                        access_directly_origin_path(&callee_path)
+                                    {
+                                        self.retarget_call_op(
+                                            &path,
+                                            block_idx,
+                                            op_idx,
+                                            &callee_path,
+                                            &origin,
+                                        );
+                                        origin
+                                    } else {
+                                        callee_path
+                                    };
+                                    let (callee_return, callee_fresh_return) = self
+                                        .function_graphs
+                                        .get(&target)
+                                        .map(|graph| {
+                                            (
+                                                graph.access_directly_return,
+                                                graph.fresh_virtualizable_return,
+                                            )
+                                        })
+                                        .unwrap_or((FlagReturn::Unflagged, FlagReturn::Unflagged));
+                                    if entered.insert(target.clone()) {
+                                        todo.push(target);
+                                    }
+                                    (callee_return, callee_fresh_return)
+                                }
+                            };
+                            op_returns.push(callee_return);
+                            op_fresh_returns.push(callee_fresh_return);
+                        }
+                        if !op_returns.is_empty()
+                            && let Some(result) = &op.result
+                        {
+                            let fresh_family = family_flag_return(&op_fresh_returns);
+                            let ad_family = imply_fresh_access_directly(
+                                family_flag_return(&op_returns),
+                                fresh_family,
+                            );
+                            record_flag_family(
+                                ad_family,
+                                result.id(),
+                                &mut new_call_results,
+                                &mut live_unknown,
+                            );
+                            record_flag_family(
+                                fresh_family,
+                                result.id(),
+                                &mut new_fresh_call_results,
+                                &mut live_unknown,
+                            );
+                        }
                     }
                 }
-            }
-            let (call_results_changed, return_changed) = {
                 new_call_results.sort_unstable();
+                new_fresh_call_results.sort_unstable();
                 let call_results_changed = {
                     let Some(graph) = self.function_graphs.get_mut(&path) else {
                         continue;
                     };
-                    let changed = graph.access_directly_call_results != new_call_results;
+                    let changed = graph.access_directly_call_results != new_call_results
+                        || graph.fresh_virtualizable_call_results != new_fresh_call_results;
                     if changed {
                         graph.access_directly_call_results = new_call_results;
+                        graph.fresh_virtualizable_call_results = new_fresh_call_results;
                     }
                     changed
                 };
-                let Some(graph) = self.function_graphs.get(&path) else {
-                    continue;
+                let (hinted, unknown, fresh_hinted) = {
+                    let Some(graph) = self.function_graphs.get(&path) else {
+                        continue;
+                    };
+                    let unknown = close_unknown_ids(&graph, live_unknown);
+                    let hinted = Self::access_directly_hinted_ids(&graph, &unknown);
+                    let fresh_hinted = Self::fresh_virtualizable_hinted_ids(&graph, &unknown);
+                    (hinted, unknown, fresh_hinted)
                 };
-                let hinted = Self::access_directly_result_ids(&graph);
-                let new_return = Self::graph_returns_access_directly(&graph, &hinted);
-                drop(graph);
+                // Bind after every call result in this graph is classified.
+                // `consider_op` raises `BlockedInference` when an actual is
+                // `s_ImpossibleValue`; skip that site and wait for the
+                // callee return-change reflow.
+                for (ad_path, kind) in pending_binds {
+                    if call_actual_is_unknown(&kind, &unknown) {
+                        continue;
+                    }
+                    let (seeded, seeded_fresh) = {
+                        let Some(callee) = self.function_graphs.get(&ad_path) else {
+                            continue;
+                        };
+                        (
+                            Self::access_directly_input_ids(&kind, &hinted, &callee),
+                            Self::access_directly_input_ids(&kind, &fresh_hinted, &callee),
+                        )
+                    };
+                    let changed = {
+                        let Some(callee) = self.function_graphs.get_mut(&ad_path) else {
+                            continue;
+                        };
+                        // `annrpython.py bindinputargs` then
+                        // `mergeinputargs` / `unionof`: the flag
+                        // stays only on formals every incoming
+                        // binding still carries.
+                        let changed_ad =
+                            merge_bound_input_ids(&mut callee.access_directly_inputs, seeded);
+                        let changed_fresh = merge_bound_input_ids(
+                            &mut callee.fresh_virtualizable_inputs,
+                            seeded_fresh,
+                        );
+                        changed_ad || changed_fresh
+                    };
+                    if changed {
+                        todo.push(ad_path);
+                    }
+                }
                 let return_changed = {
+                    let Some(graph) = self.function_graphs.get(&path) else {
+                        continue;
+                    };
+                    let computed_ad = Self::graph_flag_return(&graph, &hinted, &unknown);
+                    let computed_fresh = Self::graph_flag_return(&graph, &fresh_hinted, &unknown);
+                    let new_fresh =
+                        union_flag_return(graph.fresh_virtualizable_return, computed_fresh);
+                    let new_ad = imply_fresh_access_directly(
+                        union_flag_return(graph.access_directly_return, computed_ad),
+                        new_fresh,
+                    );
+                    drop(graph);
                     let Some(graph) = self.function_graphs.get_mut(&path) else {
                         continue;
                     };
-                    let changed = graph.access_directly_return != new_return;
-                    graph.access_directly_return = new_return;
+                    let changed = graph.access_directly_return != new_ad
+                        || graph.fresh_virtualizable_return != new_fresh;
+                    graph.access_directly_return = new_ad;
+                    graph.fresh_virtualizable_return = new_fresh;
                     changed
                 };
-                (call_results_changed, return_changed)
-            };
-            if call_results_changed {
-                todo.push(path.clone());
+                if call_results_changed {
+                    todo.push(path.clone());
+                }
+                if return_changed {
+                    let targets = self.function_graphs.alias_paths(&path);
+                    let to_scan: Vec<CallPath> = entered.iter().cloned().collect();
+                    for caller in to_scan {
+                        if self.graph_call_ops_name_target(&caller, &targets) {
+                            todo.push(caller);
+                        }
+                    }
+                }
             }
-            if return_changed {
-                let targets = self.function_graphs.alias_paths(&path);
+            // `recursivecall` of a graph whose returnblock is never
+            // reached stays `s_ImpossibleValue` and carries no flag.
+            let unresolved: Vec<CallPath> = entered
+                .iter()
+                .cloned()
+                .filter(|path| {
+                    self.function_graphs.get(path).is_some_and(|graph| {
+                        graph.access_directly_return == FlagReturn::Unknown
+                            || graph.fresh_virtualizable_return == FlagReturn::Unknown
+                    })
+                })
+                .collect();
+            if unresolved.is_empty() {
+                break;
+            }
+            for path in &unresolved {
+                if let Some(graph) = self.function_graphs.get_mut(path) {
+                    if graph.fresh_virtualizable_return == FlagReturn::Unknown {
+                        graph.fresh_virtualizable_return = FlagReturn::Unflagged;
+                    }
+                    if graph.access_directly_return == FlagReturn::Unknown {
+                        graph.access_directly_return = imply_fresh_access_directly(
+                            FlagReturn::Unflagged,
+                            graph.fresh_virtualizable_return,
+                        );
+                    }
+                }
+            }
+            for path in &unresolved {
+                let targets = self.function_graphs.alias_paths(path);
                 let to_scan: Vec<CallPath> = entered.iter().cloned().collect();
                 for caller in to_scan {
                     if self.graph_call_ops_name_target(&caller, &targets) {
@@ -13021,6 +13383,12 @@ mod tests {
         stored
     }
 
+    fn assert_fresh_virtualizable_inputs(stored: &FunctionGraph, flagged_formals: &[usize]) {
+        let inputs = &stored.block(stored.startblock).inputargs;
+        let expected: Vec<u64> = flagged_formals.iter().map(|&i| inputs[i].id()).collect();
+        assert_eq!(stored.fresh_virtualizable_inputs, Some(expected));
+    }
+
     fn assert_no_access_directly_copy(cc: &CallControl, path: &CallPath) {
         let ad = access_directly_path(path);
         assert!(
@@ -13040,9 +13408,52 @@ mod tests {
         graph
     }
 
-    /// `rlib/jit.py` hint `fresh_virtualizable=True` sets both flags on
-    /// the actual; `bindinputargs` records that formal on the AccessDirect
-    /// copy (`FunctionGraph.fresh_virtualizable_inputs`).
+    fn identity_graph(name: &str) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        let x = graph.alloc_value_var();
+        graph.block_mut(graph.startblock).inputargs.push(x.clone());
+        graph.set_return(graph.startblock, Some(x));
+        graph
+    }
+
+    fn push_hint_access_directly(
+        graph: &mut FunctionGraph,
+        block: BlockId,
+        value: crate::flowspace::model::Variable,
+    ) -> crate::flowspace::model::Variable {
+        let hinted = graph.alloc_value_var();
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([value]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        hinted
+    }
+
+    fn push_hint_fresh_virtualizable(
+        graph: &mut FunctionGraph,
+        block: BlockId,
+        value: crate::flowspace::model::Variable,
+    ) -> crate::flowspace::model::Variable {
+        let fresh = graph.alloc_value_var();
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(fresh.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_fresh_virtualizable"]),
+                args: crate::model::call_args([value]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        fresh
+    }
+
+    /// Nested spelling `hint_fresh_virtualizable(hint_access_directly(v))`
+    /// — pyre's form of `hint(x, access_directly=True, fresh_virtualizable=True)`.
+    /// `bindinputargs` records that formal on the AccessDirect copy in
+    /// both `access_directly_inputs` and `fresh_virtualizable_inputs`.
     #[test]
     fn fresh_virtualizable_actual_records_the_formal_on_the_accessdirect_copy() {
         let mut cc = CallControl::new();
@@ -13395,12 +13806,14 @@ mod tests {
                 .get(&flagged_path)
                 .expect("flagged")
                 .access_directly_return
+                .is_flagged()
         );
         assert!(
             !cc.function_graphs()
                 .get(&plain_path)
                 .expect("plain")
                 .access_directly_return
+                .is_flagged()
         );
         assert_regular_not_access_directly(&cc, &g_path);
         assert_no_access_directly_copy(&cc, &g_path);
@@ -13476,6 +13889,7 @@ mod tests {
                 .get(&flagged_path)
                 .expect("flagged")
                 .access_directly_return
+                .is_flagged()
         );
         assert_regular_not_access_directly(&cc, &g_path);
         assert_no_access_directly_copy(&cc, &g_path);
@@ -13665,9 +14079,12 @@ mod tests {
         drive_parameter_access_directly(false, true);
     }
 
+    /// The regular graph is entered first with an unflagged actual, so
+    /// `hint_fresh_virtualizable` of that formal is the upstream lone-fresh
+    /// assertion.
     #[test]
-    #[should_panic(expected = "inner__AccessDirect_None")]
-    fn unflagged_then_flagged_fresh_virtualizable_seeds_the_formal() {
+    #[should_panic(expected = "lone fresh_virtualizable hint")]
+    fn unflagged_then_flagged_fresh_virtualizable_is_lone_fresh() {
         drive_parameter_access_directly(true, true);
     }
 
@@ -14437,10 +14854,12 @@ mod tests {
         }
     }
 
-    /// A formal that did not arrive flagged does not invent the flag
-    /// when the body hints `fresh_virtualizable` on some other value.
+    /// A `hint_fresh_virtualizable` on a value that does not carry
+    /// `access_directly` is the upstream assertion (`rlib/jit.py`
+    /// `assert access_directly, "lone fresh_virtualizable hint"`).
     #[test]
-    fn fresh_virtualizable_of_an_unhinted_local_does_not_stamp_the_callee() {
+    #[should_panic(expected = "lone fresh_virtualizable hint")]
+    fn fresh_virtualizable_of_an_unhinted_local_is_lone_fresh() {
         let mut cc = CallControl::new();
         let inner_path = CallPath::from_segments(["inner"]);
         cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
@@ -14495,10 +14914,6 @@ mod tests {
 
         let mut policy = crate::policy::DefaultJitPolicy::new();
         cc.find_helper_graphs(&mut policy, &[caller_path]);
-        let stored = cc.function_graphs().get(&inner_path).expect("inner");
-        assert!(!stored.access_directly);
-        assert!(!cc.is_candidate(&inner_path));
-        assert_no_access_directly_copy(&cc, &inner_path);
     }
 
     /// A join copies the flag onto the target block's inputarg.
@@ -14631,12 +15046,12 @@ mod tests {
         assert_loopy_callee_not_stamped(&cc, &inner_path);
     }
 
-    /// `fresh_virtualizable` forwards the joined value. The cleared join
-    /// stays cleared on the forwarded result.
+    /// A one-sided join clears `access_directly`; `hint_fresh_virtualizable`
+    /// of that join is the upstream lone-fresh assertion.
     #[test]
-    fn fresh_virtualizable_of_a_one_sided_join_does_not_keep_the_flag() {
-        let (cc, inner_path) = drive_access_directly_join(hinted_link_arg, plain_link_arg, true);
-        assert_loopy_callee_not_stamped(&cc, &inner_path);
+    #[should_panic(expected = "lone fresh_virtualizable hint")]
+    fn fresh_virtualizable_of_a_one_sided_join_is_lone_fresh() {
+        drive_access_directly_join(hinted_link_arg, plain_link_arg, true);
     }
 
     /// Every predecessor binding has the flag, so the joined input keeps it.
@@ -14987,6 +15402,7 @@ mod tests {
                 .get(&id_a)
                 .expect("id")
                 .access_directly_return
+                .is_flagged()
         );
         assert_regular_not_access_directly(&cc, &g_path);
         assert_access_directly_copy(&cc, &g_path, &[0]);
@@ -15078,6 +15494,7 @@ mod tests {
                     .get(&id_path)
                     .expect("id")
                     .access_directly_return
+                    .is_flagged()
             );
             assert_regular_not_access_directly(&cc, &g_path);
             assert_access_directly_copy(&cc, &g_path, &[0]);
@@ -15310,7 +15727,7 @@ mod tests {
         let ad_path = access_directly_path(&inner_path);
         let mut ad = FunctionGraph::new("inner__AccessDirect_None");
         ad.access_directly = true;
-        ad.access_directly_return = true;
+        ad.access_directly_return = FlagReturn::Flagged;
         let ad_ip = ad.alloc_value_var();
         ad.block_mut(ad.startblock).inputargs.push(ad_ip.clone());
         ad.set_return(ad.startblock, Some(ad_ip));
@@ -15544,18 +15961,21 @@ mod tests {
                 .get(&id_path)
                 .expect("id")
                 .access_directly_return
+                .is_flagged()
         );
         assert!(
             cc.function_graphs()
                 .get(&g_path)
                 .expect("g")
                 .access_directly_return
+                .is_flagged()
         );
         assert!(
             cc.function_graphs()
                 .get(&f_path)
                 .expect("f")
                 .access_directly_return
+                .is_flagged()
         );
         assert_regular_not_access_directly(&cc, &h_path);
         assert_access_directly_copy(&cc, &h_path, &[0]);
@@ -15628,23 +16048,26 @@ mod tests {
         assert_no_access_directly_copy(&cc, &g_path);
     }
 
-    /// A trait call whose implementation receives a flagged frame: after
-    /// `annotate_access_directly` the op names the `__AccessDirect_None`
-    /// implementation and discovery reaches it. The impl is identity so a
-    /// flagged return reflows the caller (`call_op_names_target` on the
-    /// retargeted family) and flags `g`.
+    /// `f(flagged, identity(flagged))` with the caller processed before
+    /// `identity` (`todo` is LIFO) must still flag both of `f`'s formals.
+    ///
+    /// `annrpython.py recursivecall` returns `s_ImpossibleValue` until
+    /// `identity`'s returnblock is reached; `consider_op` then blocks the
+    /// call to `f` rather than binding the second formal unflagged.
+    /// Starting `access_directly_return = false` lets the first bind record
+    /// formal 1 as unflagged, and `merge_bound_input_ids` only intersects.
     #[test]
-    fn trait_call_with_flagged_frame_names_accessdirect_impl() {
+    fn flagged_and_identity_of_flagged_binds_both_formals_when_f_is_processed_first() {
         let mut cc = CallControl::new();
-        let impl_path = CallPath::for_impl_method("A", "run");
-        let mut impl_graph = FunctionGraph::new("A::run");
-        let x = impl_graph.alloc_value_var();
-        impl_graph.block_mut(impl_graph.startblock).inputargs.push(x.clone());
-        impl_graph.set_return(impl_graph.startblock, Some(x));
-        cc.register_trait_method("run", Some("Handler"), "A", impl_graph);
+        let f_path = CallPath::from_segments(["f"]);
+        cc.register_function_graph(f_path.clone(), graph_with_formals("f", 2));
 
-        let g_path = CallPath::from_segments(["g"]);
-        cc.register_function_graph(g_path.clone(), graph_with_formals("g", 1));
+        let id_path = CallPath::from_segments(["identity"]);
+        let mut id = FunctionGraph::new("identity");
+        let x = id.alloc_value_var();
+        id.block_mut(id.startblock).inputargs.push(x.clone());
+        id.set_return(id.startblock, Some(x));
+        cc.register_function_graph(id_path.clone(), id);
 
         let caller_path = CallPath::from_segments(["caller"]);
         let mut caller = FunctionGraph::new("caller");
@@ -15659,6 +16082,441 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         });
+        let id_result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(id_result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(id_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(f_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted, id_result]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        // Seed identity so it is already entered; caller is last so LIFO
+        // processes the call to `f` while identity's return is still unset.
+        cc.annotate_access_directly(&[id_path, caller_path]);
+
+        assert_regular_not_access_directly(&cc, &f_path);
+        assert_access_directly_copy(&cc, &f_path, &[0, 1]);
+    }
+
+    /// A join of `identity(flagged)` (still unknown) and a flagged value
+    /// is flagged (`mergeinputargs` / `unionof` with `s_ImpossibleValue`
+    /// as identity). `f` is processed caller-first so the first bind
+    /// sees that join; `merge_bound_input_ids` only intersects, so
+    /// treating the join as unflagged would stick.
+    #[test]
+    fn join_of_unknown_identity_and_flagged_flags_f_when_caller_is_first() {
+        let mut cc = CallControl::new();
+        let f_path = CallPath::from_segments(["f"]);
+        cc.register_function_graph(f_path.clone(), graph_with_formals("f", 2));
+
+        let id_path = CallPath::from_segments(["identity"]);
+        let mut id = FunctionGraph::new("identity");
+        let x = id.alloc_value_var();
+        id.block_mut(id.startblock).inputargs.push(x.clone());
+        id.set_return(id.startblock, Some(x));
+        cc.register_function_graph(id_path.clone(), id);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let id_result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(id_result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(id_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let cond = caller.alloc_value_var();
+        let (left_block, _) = caller.create_block_with_arg_vars(0);
+        let (right_block, _) = caller.create_block_with_arg_vars(0);
+        let (join, inputs) = caller.create_block_with_arg_vars(1);
+        caller.set_branch(entry, cond, left_block, vec![], right_block, vec![]);
+        caller.set_goto(left_block, join, vec![id_result]);
+        caller.set_goto(right_block, join, vec![hinted.clone()]);
+        caller.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(f_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted, inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[id_path, caller_path]);
+
+        assert_regular_not_access_directly(&cc, &f_path);
+        assert_access_directly_copy(&cc, &f_path, &[0, 1]);
+    }
+
+    /// `fresh = hint(frame, access_directly=True, fresh_virtualizable=True);
+    /// y = identity(fresh); f(y)` — `recursivecall` returns the callee's
+    /// full annotation, so `f`'s AccessDirect copy records formal 0 as
+    /// fresh (`FunctionGraph.fresh_virtualizable_inputs`).
+    #[test]
+    fn identity_of_fresh_records_the_formal_on_the_accessdirect_copy() {
+        let mut cc = CallControl::new();
+        let f_path = CallPath::from_segments(["f"]);
+        cc.register_function_graph(f_path.clone(), graph_with_formals("f", 1));
+
+        let id_path = CallPath::from_segments(["identity"]);
+        cc.register_function_graph(id_path.clone(), identity_graph("identity"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = push_hint_access_directly(&mut caller, entry, frame);
+        let fresh = push_hint_fresh_virtualizable(&mut caller, entry, hinted);
+        let y = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(y.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(id_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([fresh]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(f_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([y]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+
+        assert_regular_not_access_directly(&cc, &f_path);
+        let stored = assert_access_directly_copy(&cc, &f_path, &[0]);
+        assert_fresh_virtualizable_inputs(&stored, &[0]);
+        assert!(
+            cc.function_graphs()
+                .get(&access_directly_path(&id_path))
+                .expect("identity AccessDirect copy")
+                .fresh_virtualizable_return
+                .is_flagged()
+        );
+    }
+
+    /// A join of `identity(fresh)` with a non-fresh flagged value is
+    /// access-directly flagged and not fresh (`binaryop.py union` keeps a
+    /// flag only when both sides carry it).
+    #[test]
+    fn join_of_fresh_return_and_unfresh_flagged_is_not_fresh() {
+        let mut cc = CallControl::new();
+        let f_path = CallPath::from_segments(["f"]);
+        cc.register_function_graph(f_path.clone(), graph_with_formals("f", 1));
+
+        let id_path = CallPath::from_segments(["identity"]);
+        cc.register_function_graph(id_path.clone(), identity_graph("identity"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = push_hint_access_directly(&mut caller, entry, frame);
+        let fresh = push_hint_fresh_virtualizable(&mut caller, entry, hinted.clone());
+        let id_result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(id_result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(id_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([fresh]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let cond = caller.alloc_value_var();
+        let (left_block, _) = caller.create_block_with_arg_vars(0);
+        let (right_block, _) = caller.create_block_with_arg_vars(0);
+        let (join, inputs) = caller.create_block_with_arg_vars(1);
+        caller.set_branch(entry, cond, left_block, vec![], right_block, vec![]);
+        caller.set_goto(left_block, join, vec![id_result]);
+        caller.set_goto(right_block, join, vec![hinted]);
+        caller.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(f_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+
+        assert_regular_not_access_directly(&cc, &f_path);
+        let stored = assert_access_directly_copy(&cc, &f_path, &[0]);
+        assert_fresh_virtualizable_inputs(&stored, &[]);
+    }
+
+    /// `f(fresh, identity(fresh))` with the caller processed before
+    /// `identity` (`todo` is LIFO) must still flag both of `f`'s formals
+    /// as fresh. `recursivecall` returns `s_ImpossibleValue` until
+    /// `identity`'s returnblock is reached; `consider_op` then blocks
+    /// the call to `f` rather than binding the second formal unfresh.
+    #[test]
+    fn fresh_and_identity_of_fresh_binds_both_formals_when_f_is_processed_first() {
+        let mut cc = CallControl::new();
+        let f_path = CallPath::from_segments(["f"]);
+        cc.register_function_graph(f_path.clone(), graph_with_formals("f", 2));
+
+        let id_path = CallPath::from_segments(["identity"]);
+        cc.register_function_graph(id_path.clone(), identity_graph("identity"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = push_hint_access_directly(&mut caller, entry, frame);
+        let fresh = push_hint_fresh_virtualizable(&mut caller, entry, hinted);
+        let id_result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(id_result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(id_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([fresh.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(f_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([fresh, id_result]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[id_path, caller_path]);
+
+        assert_regular_not_access_directly(&cc, &f_path);
+        let stored = assert_access_directly_copy(&cc, &f_path, &[0, 1]);
+        assert_fresh_virtualizable_inputs(&stored, &[0, 1]);
+    }
+
+    /// A join of `identity(fresh)` (still unknown) and a fresh value is
+    /// fresh (`mergeinputargs` / `unionof` with `s_ImpossibleValue` as
+    /// identity). `f` is processed caller-first so the first bind sees
+    /// that join; `merge_bound_input_ids` only intersects, so treating
+    /// the join as unfresh would stick.
+    #[test]
+    fn join_of_unknown_identity_fresh_and_fresh_flags_f_when_caller_is_first() {
+        let mut cc = CallControl::new();
+        let f_path = CallPath::from_segments(["f"]);
+        cc.register_function_graph(f_path.clone(), graph_with_formals("f", 2));
+
+        let id_path = CallPath::from_segments(["identity"]);
+        cc.register_function_graph(id_path.clone(), identity_graph("identity"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = push_hint_access_directly(&mut caller, entry, frame);
+        let fresh = push_hint_fresh_virtualizable(&mut caller, entry, hinted);
+        let id_result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(id_result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(id_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([fresh.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let cond = caller.alloc_value_var();
+        let (left_block, _) = caller.create_block_with_arg_vars(0);
+        let (right_block, _) = caller.create_block_with_arg_vars(0);
+        let (join, inputs) = caller.create_block_with_arg_vars(1);
+        caller.set_branch(entry, cond, left_block, vec![], right_block, vec![]);
+        caller.set_goto(left_block, join, vec![id_result]);
+        caller.set_goto(right_block, join, vec![fresh.clone()]);
+        caller.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(f_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([fresh, inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[id_path, caller_path]);
+
+        assert_regular_not_access_directly(&cc, &f_path);
+        let stored = assert_access_directly_copy(&cc, &f_path, &[0, 1]);
+        assert_fresh_virtualizable_inputs(&stored, &[0, 1]);
+    }
+
+    /// Recursive identity `id(x) = if c { x } else { id(x) }` reached with
+    /// a flagged arg returns flagged.
+    ///
+    /// The recursive call's result is `s_ImpossibleValue` until the
+    /// then-branch reaches returnblock; union with that bottom must not
+    /// treat the recursive result as unflagged and drop the flag.
+    #[test]
+    fn recursive_identity_with_flagged_arg_returns_flagged() {
+        let mut cc = CallControl::new();
+        let id_path = CallPath::from_segments(["id"]);
+        let mut id = FunctionGraph::new("id");
+        let x = id.alloc_value_var();
+        id.block_mut(id.startblock).inputargs.push(x.clone());
+        let cond = id.alloc_value_var();
+        let (then_block, _) = id.create_block_with_arg_vars(0);
+        let (else_block, _) = id.create_block_with_arg_vars(0);
+        id.set_branch(id.startblock, cond, then_block, vec![], else_block, vec![]);
+        id.set_return(then_block, Some(x.clone()));
+        let rec = id.alloc_value_var();
+        id.block_mut(else_block).operations.push(SpaceOperation {
+            result: Some(rec.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(id_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([x]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        id.set_return(else_block, Some(rec));
+        cc.register_function_graph(id_path.clone(), id);
+
+        let g_path = CallPath::from_segments(["g"]);
+        let mut g = FunctionGraph::new("g");
+        let gp = g.alloc_value_var();
+        g.block_mut(g.startblock).inputargs.push(gp);
+        cc.register_function_graph(g_path.clone(), g);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(id_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([result]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path]);
+
+        let ad = cc
+            .function_graphs()
+            .get(&access_directly_path(&id_path))
+            .expect("id AccessDirect copy");
+        assert!(
+            ad.access_directly_return.is_flagged(),
+            "recursive identity reached with a flagged arg must return flagged"
+        );
+        assert_regular_not_access_directly(&cc, &g_path);
+        assert_access_directly_copy(&cc, &g_path, &[0]);
+    }
+
+    /// A callee whose returnblock is never reached ends unflagged
+    /// (`recursivecall` returns `s_ImpossibleValue`; that value carries
+    /// no flag).
+    #[test]
+    fn callee_whose_return_is_never_reached_ends_unflagged() {
+        let mut cc = CallControl::new();
+        let g_path = CallPath::from_segments(["g"]);
+        let mut g = FunctionGraph::new("g");
+        let gp = g.alloc_value_var();
+        g.block_mut(g.startblock).inputargs.push(gp);
+        cc.register_function_graph(g_path.clone(), g);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let arg = caller.alloc_value_var();
+        caller
+            .block_mut(caller.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                    args: crate::model::call_args([arg]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path]);
+
+        assert_eq!(
+            cc.function_graphs()
+                .get(&g_path)
+                .expect("g")
+                .access_directly_return,
+            FlagReturn::Unflagged,
+            "a graph whose returnblock is never reached carries no flag"
+        );
+    }
+
+    /// A trait call whose implementation receives a flagged frame: after
+    /// `annotate_access_directly` the op names the `__AccessDirect_None`
+    /// implementation and discovery reaches it. The impl is identity so a
+    /// flagged return reflows the caller (`call_op_names_target` on the
+    /// retargeted family) and flags `g`.
+    #[test]
+    fn trait_call_with_flagged_frame_names_accessdirect_impl() {
+        let mut cc = CallControl::new();
+        let impl_path = CallPath::for_impl_method("A", "run");
+        cc.register_trait_method("run", Some("Handler"), "A", identity_graph("A::run"));
+
+        let g_path = CallPath::from_segments(["g"]);
+        cc.register_function_graph(g_path.clone(), graph_with_formals("g", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = push_hint_access_directly(&mut caller, entry, frame);
         let result = caller.alloc_value_var();
         caller.block_mut(entry).operations.push(SpaceOperation {
             result: Some(result.clone()),
@@ -15724,15 +16582,7 @@ mod tests {
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
         let frame = caller.alloc_value_var();
-        let hinted = caller.alloc_value_var();
-        caller.block_mut(entry).operations.push(SpaceOperation {
-            result: Some(hinted.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::function_path(["hint_access_directly"]),
-                args: crate::model::call_args([frame]),
-                result_ty: ValueType::Ref(None),
-            },
-        });
+        let hinted = push_hint_access_directly(&mut caller, entry, frame);
         let funcptr = caller.alloc_value_var();
         caller.block_mut(entry).operations.push(SpaceOperation {
             result: None,

@@ -7906,6 +7906,33 @@ impl fmt::Debug for LazyGraph {
     }
 }
 
+/// Binding of one `SomeInstance.flags` key on `graph.getreturnvar()`.
+///
+/// Shared by `access_directly` and `fresh_virtualizable`: the annotator
+/// carries both on one `SomeInstance`, and `annrpython.py recursivecall`
+/// returns that whole annotation (`binding(graph.getreturnvar())`).
+/// `s_ImpossibleValue` until the returnblock has been reached (`KeyError`
+/// on `binding(v)`). That bottom is distinct from an unflagged annotation:
+/// `consider_op` blocks on an impossible value (`BlockedInference`) rather
+/// than binding the caller as unflagged. After the annotator fixpoint, a
+/// graph whose return was never reached still carries no flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlagReturn {
+    /// Returnblock not yet reached with a known value (`s_ImpossibleValue`).
+    #[default]
+    Unknown,
+    /// Returnblock reached; the annotation does not carry the flag.
+    Unflagged,
+    /// Returnblock reached; the annotation carries the flag.
+    Flagged,
+}
+
+impl FlagReturn {
+    pub fn is_flagged(self) -> bool {
+        matches!(self, Self::Flagged)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
@@ -8010,7 +8037,19 @@ pub struct FunctionGraph {
     pub access_directly_call_results: Vec<u64>,
     /// Whether `binding(graph.getreturnvar())` carries `access_directly`.
     /// `annrpython.py recursivecall` reads this to flag the caller's result.
-    pub access_directly_return: bool,
+    /// Starts [`FlagReturn::Unknown`] (`s_ImpossibleValue`) until
+    /// the returnblock is reached with a known value.
+    pub access_directly_return: FlagReturn,
+    /// Call-result Variable ids whose annotation carries `fresh_virtualizable`.
+    /// Same `recursivecall` return binding as
+    /// [`FunctionGraph::access_directly_call_results`]; a subset of those
+    /// results (`rlib/jit.py` hint `fresh_virtualizable=True` sets both
+    /// flags).
+    pub fresh_virtualizable_call_results: Vec<u64>,
+    /// Whether `binding(graph.getreturnvar())` carries `fresh_virtualizable`.
+    /// Same three-state contract as [`FunctionGraph::access_directly_return`].
+    /// A flagged-fresh return is also access-directly flagged.
+    pub fresh_virtualizable_return: FlagReturn,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
     /// (all unset) for `FunctionGraph::new` fixtures; production
@@ -8162,6 +8201,17 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
             })
             .collect(),
         access_directly_return: graph.access_directly_return,
+        fresh_virtualizable_call_results: graph
+            .fresh_virtualizable_call_results
+            .iter()
+            .filter_map(|id| {
+                varmap
+                    .iter()
+                    .find(|(var, _)| var.id() == *id)
+                    .map(|(_, copied)| copied.id())
+            })
+            .collect(),
+        fresh_virtualizable_return: graph.fresh_virtualizable_return,
         func: graph.func.clone(),
     }
 }
@@ -8274,7 +8324,9 @@ impl FunctionGraph {
             access_directly_inputs: None,
             fresh_virtualizable_inputs: None,
             access_directly_call_results: Vec::new(),
-            access_directly_return: false,
+            access_directly_return: FlagReturn::Unknown,
+            fresh_virtualizable_call_results: Vec::new(),
+            fresh_virtualizable_return: FlagReturn::Unknown,
             func: FuncEffects::default(),
         }
     }
