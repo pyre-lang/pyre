@@ -4674,20 +4674,9 @@ pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
 /// `hop.inputargs(lltype.Void, lltype.Signed)` (rbuiltin.py)
 /// — two formal inputs.
 ///
-/// TODO: pyre's frontend emits a 1-arg
-/// `Call { target: FunctionPath { segments: ["rpython", "rtyper",
-/// "lltypesystem", "lltype", "cast_int_to_ptr"], fun_decl_id: None }, args: [operand] }`
-/// because at `Expr::Cast` lowering time the frontend has only
-/// `ValueType::Ref` (the opaque high-level surface type), not the
-/// concrete Ptr lltype.  This typer therefore takes a single `Signed`
-/// inputarg instead of upstream's `(Void, Signed)`.  The result
-/// lltype is recovered from `hop.r_result.lowleveltype`, which the
-/// rtyper assigned when annotating the result variable — the same
-/// concrete Ptr upstream would have read from `PtrT.const`
-/// (lltype.py).  The constant carrier already exists
-/// (`ConstValue::LowLevelType` carries arbitrary `LowLevelType`
-/// including `Ptr`); the blocker is frontend-side access to the
-/// concrete Ptr at lowering time.
+/// `rffi.cast` emits the 2-arg form when the frontend has `CArrayPtr`.
+/// `Int → Ref` casts still emit 1-arg; that path takes a single
+/// `Signed` inputarg and recovers the Ptr from `hop.r_result.lowleveltype`.
 pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
 
@@ -4698,9 +4687,17 @@ pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
         .cloned()
         .ok_or_else(|| TyperError::message("rtype_cast_int_to_ptr: missing r_result"))?;
     let result_lltype = r_result.lowleveltype().clone();
-    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    // Upstream `inputargs(lltype.Void, lltype.Signed)` then genops only
+    // `v_input`. The type marker has no runtime value; take the integer
+    // operand (arg 1 of the 2-arg form, arg 0 of the 1-arg form).
+    let int_arg = if hop.nb_args() == 2 { 1 } else { 0 };
+    let v_input = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), int_arg)?;
     hop.exception_cannot_occur()?;
-    Ok(hop.genop("cast_int_to_ptr", vlist, GenopResult::LLType(result_lltype)))
+    Ok(hop.genop(
+        "cast_int_to_ptr",
+        vec![v_input],
+        GenopResult::LLType(result_lltype),
+    ))
 }
 
 /// Typer for both front-end pointer-cast markers — the

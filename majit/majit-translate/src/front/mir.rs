@@ -3038,6 +3038,15 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
     {
         return ValueType::Int;
     }
+    // `history.py` `getkind` of a raw `Ptr` whose pointee is a non-byte
+    // primitive is `'int'`. `Tuple<*mut usize, …>` intern's `__pos_0` from
+    // this spelling (`rtuple.py` `TupleRepr`); a `Ref` seed makes
+    // `raw_load` see `SomeInstance` (`ann_direct_ptradd` needs a pointer,
+    // `rffi.py` `ptradd`). A byte pointer stays `Ref`: pyre erases a GC
+    // reference to `*mut u8`.
+    if let Some(raw) = spelling_raw_scalar_address_value_type(type_name) {
+        return raw;
+    }
     match type_name {
         "()" => ValueType::Void,
         "f64" => ValueType::Float,
@@ -3063,6 +3072,28 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `[hash, length, chars]`. Keep the layouts distinct.
         "BytesBlock" => ValueType::Ref(Some("BytesBlock".into())),
         _ => ValueType::Ref(None),
+    }
+}
+
+/// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive, keyed
+/// off the rendered spelling [`tuple_field_value_type`] sees.
+///
+/// Same bank [`raw_scalar_address_value_type`] reads off a `TyRef`. A byte
+/// pointer stays `None` (the caller keeps `Ref`): pyre erases a GC
+/// reference to `*mut u8`. A pointer to a pointer or an ADT stays `None`.
+fn spelling_raw_scalar_address_value_type(type_name: &str) -> Option<ValueType> {
+    let type_name = type_name.trim();
+    let pointee = type_name
+        .strip_prefix("*mut ")
+        .or_else(|| type_name.strip_prefix("*const "))?;
+    if pointee.starts_with("*mut ") || pointee.starts_with("*const ") || pointee.starts_with('&') {
+        return None;
+    }
+    match pointee {
+        "u8" | "i8" => None,
+        "bool" | "char" | "i16" | "i32" | "i64" | "isize" | "u16" | "u32" | "u64" | "usize"
+        | "f32" | "f64" => Some(ValueType::Int),
+        _ => None,
     }
 }
 
@@ -14570,8 +14601,22 @@ impl<'a> Lowering<'a> {
                     // in the int bank. `history.py` `getkind` banks a raw
                     // `Ptr` as `int`, including `*mut f64`, so
                     // `usize as *const usize` aliases that word. A `Ref`
-                    // source still reaches [`Self::ptr_cast_marker`], and
-                    // `*mut u8 as *mut i64` keeps the GcArray narrow.
+                    // source still reaches [`Self::ptr_cast_marker`].
+                    // A function that *returns* `*mut i64` (`index_words_ptr`)
+                    // is `rffi.cast` onto `CArrayPtr`; aliasing would keep
+                    // `__cast_address_intrinsic`'s Instance for the caller's
+                    // `direct_ptradd`. An items-base accessor or a store
+                    // through the same spelling keeps the GcArray header.
+                    if matches!(src_kind, Some(ValueType::Ref(_)))
+                        && self.should_emit_rffi_cast_identity_to_raw_scalar(
+                            dest_ty,
+                            operand_tyref(&operand),
+                        )
+                    {
+                        let bb_id = self.block_id[mir_bb];
+                        let raw = self.emit_rffi_cast_to_raw_scalar_ptr(bb_id, arg, dest_ty);
+                        return Ok((None, raw));
+                    }
                     let dst_kind = if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
                         && let Some(raw) = raw_scalar_address_value_type(dest_ty, self.llbc)
                     {
@@ -20471,24 +20516,13 @@ impl<'a> Lowering<'a> {
                     // An unresolved projected type (a closure's `tupled_args`
                     // typed as the trait's `Args` parameter) falls back to
                     // the tuple's own element generics.
-                    let ty = match tyref_to_value_type_with(
+                    let ty = tuple_element_field_value_type(
                         &place_ty,
+                        tyref_tuple_element(&inner.ty, idx, self.llbc),
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
-                    ) {
-                        ValueType::Ref(None) => tyref_tuple_element(&inner.ty, idx, self.llbc)
-                            .map(|ty| {
-                                tyref_enum_payload_value_type(
-                                    &ty,
-                                    self.llbc,
-                                    self.tombstoned_leaves,
-                                    self.gc_struct_ids,
-                                )
-                            })
-                            .unwrap_or(ValueType::Ref(None)),
-                        ty => ty,
-                    };
+                    );
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -20601,24 +20635,13 @@ impl<'a> Lowering<'a> {
                         } else {
                             base
                         };
-                        let ty = match tyref_to_value_type_with(
+                        let ty = tuple_element_field_value_type(
                             &place_ty,
+                            element_ty,
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
-                        ) {
-                            ValueType::Ref(None) => element_ty
-                                .map(|ty| {
-                                    tyref_enum_payload_value_type(
-                                        &ty,
-                                        self.llbc,
-                                        self.tombstoned_leaves,
-                                        self.gc_struct_ids,
-                                    )
-                                })
-                                .unwrap_or(ValueType::Ref(None)),
-                            ty => ty,
-                        };
+                        );
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -26461,6 +26484,28 @@ impl<'a> Lowering<'a> {
                             res
                         };
                         self.local_var[dest_local] = Some(LocalValue::One(res));
+                    } else if self.should_emit_rffi_cast_identity_to_raw_scalar(
+                        &call.dest.ty,
+                        first_arg_ty.as_ref(),
+                    ) {
+                        // `index_words_ptr` is `typed_items_block_items_base
+                        // as *mut i64` and returns that address. The source
+                        // is the `*mut u8` Ref erasure. Aliasing keeps
+                        // `__cast_address_intrinsic`'s Instance, and the
+                        // caller's `direct_ptradd` (`rffi.py` `ptradd`) then
+                        // fails `ann_direct_ptradd`. `rffi.cast` onto the
+                        // raw `CArrayPtr` is `cast_ptr_to_int` then
+                        // `cast_int_to_ptr` (`lltype.py`). An already-int
+                        // raw scalar (`HashStateStorage::as_mut_ptr`) stays
+                        // in the int bank. `IntArray::base` and
+                        // `set_sizehint_state_value` keep the alias
+                        // (GcArray header).
+                        let res = self.emit_rffi_cast_to_raw_scalar_ptr(
+                            bb_id,
+                            args[0].clone(),
+                            &call.dest.ty,
+                        );
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
@@ -31260,9 +31305,10 @@ impl<'a> Lowering<'a> {
         self.spec_body = true;
     }
 
-    /// Specialized path for a direct call whose `generics.trait_refs` name
-    /// impls. The bare path is unchanged when the callee is not generic or
-    /// the call still carries a `Clause`.
+    /// Specialized path for a direct call whose type args are concrete,
+    /// or whose `generics.trait_refs` name impls. The bare path is
+    /// unchanged when the callee is not generic or the call still
+    /// carries a `Clause` / `TypeVar`.
     fn specialized_fun_segments(&self, fd: &FunDecl, reg: &RegularCall) -> Option<Vec<String>> {
         self.enqueue_spec(fd, &reg.generics)
     }
@@ -32441,6 +32487,65 @@ impl<'a> Lowering<'a> {
             kind: crate::model::cast_instance_call(root, raw),
         });
         res
+    }
+
+    /// True when `*mut u8 as *mut i64` (or `*mut f64`) must be `rffi.cast`
+    /// onto `CArrayPtr` rather than an alias of the GC header.
+    ///
+    /// `index_words_ptr` returns that raw address; look-inside of the
+    /// alias would feed `SomeInstance` to the caller's `direct_ptradd`
+    /// (`ann_direct_ptradd`, `rffi.py` `ptradd`). An already-int raw
+    /// scalar (`*const usize as *mut usize`, `HashStateStorage::as_mut_ptr`)
+    /// stays in the int bank. An items-base accessor (`IntArray::base`)
+    /// and a function that stores through the same spelling
+    /// (`set_sizehint_state_value`) keep the header so getarrayitem /
+    /// setarrayitem still fire.
+    fn should_emit_rffi_cast_identity_to_raw_scalar(
+        &self,
+        dest_ty: &TyRef,
+        src_ty: Option<&TyRef>,
+    ) -> bool {
+        if graph_is_items_block_base_accessor(&self.graph.name) {
+            return false;
+        }
+        if raw_scalar_address_value_type(dest_ty, self.llbc).is_none() {
+            return false;
+        }
+        if src_ty.is_some_and(|ty| raw_scalar_address_value_type(ty, self.llbc).is_some()) {
+            return false;
+        }
+        if !src_ty.is_some_and(|ty| {
+            matches!(
+                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+                ValueType::Ref(_)
+            )
+        }) {
+            return false;
+        }
+        self.body
+            .locals
+            .locals
+            .first()
+            .is_some_and(|ret| raw_scalar_address_value_type(&ret.ty, self.llbc).is_some())
+    }
+
+    /// `rffi.cast(CArrayPtr(T), p)` of a GC / erased byte pointer onto a
+    /// raw scalar address (`*mut i64`, `*mut f64`). `__cast_address_intrinsic`
+    /// (`p as *mut u8`) answers classdef-less `SomeInstance`; `ann_direct_ptradd`
+    /// needs `SomePtr` (`lltype.py` `ann_direct_ptradd`, `rffi.py` `ptradd`).
+    /// `cast_ptr_to_int` then `cast_int_to_ptr` is that cast (`lltype.py`).
+    fn emit_rffi_cast_to_raw_scalar_ptr(
+        &mut self,
+        bb_id: BlockId,
+        ptr: Variable,
+        dest_ty: &TyRef,
+    ) -> Variable {
+        let item = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)
+            .or_else(|| tyref_peel_one_ref_node(dest_ty, self.llbc))
+            .and_then(|pointee| json_ty_byte_size(pointee, self.llbc))
+            .map(item_lltype_for_size)
+            .unwrap_or(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed);
+        emit_rffi_cast_to_carray_ptr(&mut self.graph, bb_id, ptr, &item)
     }
 
     /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
@@ -58278,6 +58383,44 @@ fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&Va
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
 }
 
+/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`): `cast_ptr_to_int` then
+/// `cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).
+/// `__cast_address_intrinsic` (`p as *mut u8`) and a classdef-less
+/// `*mut u8` input annotate as `SomeInstance`; `ann_direct_ptradd`
+/// needs `SomePtr`. The 2-arg form supplies `PtrT.const` so the
+/// analyzer returns a raw `CArrayPtr` (`getkind` Signed), not the
+/// 1-arg Gc-Opaque placeholder (GcRef).
+fn emit_rffi_cast_to_carray_ptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    ptr: Variable,
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    let addr = push_cast_ptr_to_int(graph, bb_id, ptr);
+    let ptr_ty = lltype_for_direct_ptradd_pointer(None, item);
+    let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    raw.set_concretetype(Some(ptr_ty.clone()));
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(raw.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_int_to_ptr",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(addr),
+            ],
+            result_ty: ValueType::Int,
+        },
+    });
+    raw
+}
+
 /// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the raw
 /// pointer.  `ann_direct_ptradd` returns `s_p`.  `n` is an unscaled item
 /// count.  `item` is `TO.OF`: a `Char` builds `CCHARP` (byte shift);
@@ -58294,26 +58437,33 @@ fn push_direct_ptradd(
     // `nolength`), and a byte pointer is `CCHARP`. An earlier cast may have
     // stamped `Signed` or a GC pointer; `rewrite_op_direct_ptradd` scales
     // from `TO.OF`, so the operand has to carry the array pointer.
-    // Stamp the array pointer on an int-kind value. A GC-pointer (or
-    // still-unstamped) operand keeps its own concretetype: overwriting
-    // it changes the register bank, and a later result-kind commit puts
-    // the ref back under an `int_add`. `cast_ptr_to_int` yields a fresh
-    // `Signed` that can carry `CArrayPtr` / `CCHARP`.
+    // Stamp the array pointer on an int-kind value. A GC / classdef-less
+    // Instance is not `SomePtr`: peel `__cast_address_intrinsic` and
+    // `rffi.cast` onto `CArrayPtr` (`lltype.py` `ann_direct_ptradd`,
+    // `rffi.py` `ptradd`). `cast_ptr_to_int` alone would make the operand
+    // `Integer`; `cast_int_to_ptr` after it is the pointer.
     let already_int = ptr
         .concretetype()
         .as_ref()
         .is_some_and(|ty| crate::model::getkind(ty) == crate::model::ConcreteType::Signed);
-    let ptr_ty = lltype_for_direct_ptradd_pointer(
-        if already_int {
-            ptr.concretetype()
-        } else {
-            None
-        },
-        item,
-    );
-    let ptr = if already_int && ptr.concretetype().as_ref() == Some(&ptr_ty) {
+    let ptr = if already_int {
         ptr
-    } else if already_int {
+    } else {
+        let peeled = direct_ptradd_pointer_operand(graph, ptr);
+        let peeled_int = peeled
+            .concretetype()
+            .as_ref()
+            .is_some_and(|ty| crate::model::getkind(ty) == crate::model::ConcreteType::Signed);
+        if peeled_int {
+            peeled
+        } else {
+            emit_rffi_cast_to_carray_ptr(graph, bb_id, peeled, item)
+        }
+    };
+    let ptr_ty = lltype_for_direct_ptradd_pointer(ptr.concretetype(), item);
+    let ptr = if ptr.concretetype().as_ref() == Some(&ptr_ty) {
+        ptr
+    } else {
         // `clone` shares the concretetype cell. A fresh `same_as` result
         // carries `TO.OF` without rewriting the caller's variable.
         let fresh = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
@@ -58327,42 +58477,6 @@ fn push_direct_ptradd(
             },
         });
         fresh
-    } else {
-        // `ann_direct_ptradd` requires `SomePtr` and returns that pointer.
-        // `cast_ptr_to_int` here makes the operand `Integer`, which is the
-        // `direct_ptradd of non-pointer` wall on `digits_item`. A
-        // `__cast_address_intrinsic` (`p as *mut u8`) is `SomeInstance`,
-        // also not `SomePtr`; use the pointer it erased.
-        let ptr = direct_ptradd_pointer_operand(graph, ptr);
-        if FunctionGraph::concretetype_of(&count) == crate::model::ConcreteType::Unknown {
-            FunctionGraph::set_concretetype_of_inline(&count, crate::model::ConcreteType::Signed);
-        }
-        // Result stays the raw-pointer int bank (`CArrayPtr` / `CCHARP`).
-        // The operand is the pointer `ann_direct_ptradd` checks, not an
-        // integer retype of it.
-        let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-        result.set_concretetype(Some(ptr_ty.clone()));
-        graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: [
-                        "rpython",
-                        "rtyper",
-                        "lltypesystem",
-                        "lltype",
-                        "direct_ptradd",
-                    ]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![ptr, count]),
-                result_ty: ValueType::Int,
-            },
-        });
-        return result;
     };
     // An unstamped count reads as ref (`Unknown` → `'r'`), and
     // `rewrite_op_direct_ptradd` then refuses the scale. The count is
@@ -58396,8 +58510,9 @@ fn push_direct_ptradd(
 }
 
 /// Operand `direct_ptradd` annotates. `__cast_address_intrinsic` drops the
-/// pointee class and answers `SomeInstance`; the erased pointer is the
-/// `SomePtr` the add has to see.
+/// pointee class and answers `SomeInstance`; peel it so `rffi.cast` sees
+/// the pointer that was erased. A GC header that remains an Instance is
+/// then `rffi.cast` onto `CArrayPtr` in [`push_direct_ptradd`].
 fn direct_ptradd_pointer_operand(graph: &FunctionGraph, ptr: Variable) -> Variable {
     let Some((block_id, idx)) = resolve_to_producer_op(graph, &ptr) else {
         return ptr;
@@ -59266,6 +59381,15 @@ fn adt_field_read_value_type(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> ValueType {
+    // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
+    // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
+    // adapter spells the same `*mut i64` and must stay the GC header
+    // (`typed_array_base_call_stays_ref`).
+    if let Some(raw) = raw_scalar_address_value_type(place_ty, llbc)
+        .or_else(|| raw_scalar_address_value_type(field_ty, llbc))
+    {
+        return raw;
+    }
     let declared = if container_is_enum {
         tyref_enum_payload_value_type(place_ty, llbc, tombstoned, gc_struct_ids)
     } else {
@@ -59290,6 +59414,34 @@ fn adt_field_read_value_type(
             tyref_to_value_type_with(field_ty, llbc, tombstoned, gc_struct_ids)
         }
         resolved => resolved,
+    }
+}
+
+/// Register-bank kind of a tuple `__pos_N` read.
+///
+/// `place_ty` is the post-projection element. A raw pointer to a non-byte
+/// primitive is the address (`history.py` `getkind` of a raw `Ptr`,
+/// [`raw_scalar_address_value_type`]); `Ref(None)` would make `raw_load`
+/// of `slots().0` (`*mut usize`) see `SomeInstance`.
+fn tuple_element_field_value_type(
+    place_ty: &TyRef,
+    element_ty: Option<TyRef>,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> ValueType {
+    if let Some(raw) = raw_scalar_address_value_type(place_ty, llbc).or_else(|| {
+        element_ty
+            .as_ref()
+            .and_then(|ty| raw_scalar_address_value_type(ty, llbc))
+    }) {
+        return raw;
+    }
+    match tyref_to_value_type_with(place_ty, llbc, tombstoned, gc_struct_ids) {
+        ValueType::Ref(None) => element_ty
+            .map(|ty| tyref_enum_payload_value_type(&ty, llbc, tombstoned, gc_struct_ids))
+            .unwrap_or(ValueType::Ref(None)),
+        ty => ty,
     }
 }
 
@@ -60489,6 +60641,16 @@ fn tyref_to_attr_value_type_with(
     }
     if ty_is_raw_address(ty, llbc, gc_struct_ids) {
         return ValueType::Int;
+    }
+    // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
+    // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
+    // adapter spells the same `*mut i64` and must stay the GC header
+    // (`typed_array_base_call_stays_ref`). FORCE of a named `*mut usize`
+    // field (and harvest of a Charon tuple TypeDecl) must match
+    // [`tuple_field_value_type`] so `_init_classdef` does not seed
+    // `Ref(None)` over the positional Int attr.
+    if let Some(raw) = raw_scalar_address_value_type(ty, llbc) {
+        return raw;
     }
     // A fieldless (C-like) enum field is represented by-value as its
     // discriminant integer, matching `tyref_to_value_type` which colors
@@ -69574,11 +69736,7 @@ fn emit_aggregate_ctor_with_pairs(
             }
             None => value.clone(),
         };
-        let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
-            &ctor.result_owner,
-            &field.name,
-            ValueType::Ref(None),
-        );
+        let ty = positional_ctor_field_value_type(&ctor.result_owner, &field.name);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -69635,11 +69793,7 @@ fn emit_aggregate_ctor(
             }
             None => value.clone(),
         };
-        let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
-            &ctor.result_owner,
-            &field.name,
-            ValueType::Ref(None),
-        );
+        let ty = positional_ctor_field_value_type(&ctor.result_owner, &field.name);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -69664,6 +69818,26 @@ fn emit_aggregate_ctor(
         });
     }
     res
+}
+
+/// `TupleRepr` field bank of a positional ctor write (`rtuple.py`).
+///
+/// [`positional_shape_metadata`] intern's `__pos_N` from the shape
+/// spelling; a raw `*mut usize` item is `int` (`history.py` `getkind`).
+/// The write has to use that same bank so setattr and getattr agree.
+fn positional_ctor_field_value_type(result_owner: &str, field_name: &str) -> ValueType {
+    crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+        result_owner,
+        field_name,
+        positional_shape_metadata(result_owner)
+            .and_then(|(_, attrs)| {
+                attrs
+                    .into_iter()
+                    .find(|(name, _)| name == field_name)
+                    .map(|(_, vt)| vt)
+            })
+            .unwrap_or(ValueType::Ref(None)),
+    )
 }
 
 /// Build `shape` in `block` from operand values already in hand — a call of
@@ -75875,6 +76049,18 @@ mod tests {
         );
     }
 
+    /// The unsubstituted generic `entries_item_ptr` has TypeVars and no
+    /// Charon layout. Translation stops rather than guess the items
+    /// offset (`array_field_items_offset`).
+    #[test]
+    fn unsubstituted_entries_item_ptr_stops_without_guessing_offset() {
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let err = super::lower_function(&llbc, "entries_item_ptr")
+            .expect_err("generic entries_item_ptr has no items offset");
+        assert!(err.to_string().contains("direct_arrayitems"), "{err}");
+    }
+
     /// A one-word-item Vec header pointer is int-banked, matching
     /// `descr.py get_type_flag` of a raw Ptr and `rrustvec.rs rust_vec_lltype`.
     #[test]
@@ -75884,6 +76070,27 @@ mod tests {
             assert_eq!(
                 super::tuple_field_value_type(spelling),
                 ValueType::Int,
+                "{spelling}"
+            );
+        }
+    }
+
+    /// `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
+    /// `'int'`. A byte pointer stays `Ref` (GC erasure to `*mut u8`).
+    #[test]
+    fn raw_scalar_pointer_tuple_field_is_int_banked() {
+        use crate::model::ValueType;
+        for spelling in ["*mut usize", "*const usize", "*mut i64", "*mut f64"] {
+            assert_eq!(
+                super::tuple_field_value_type(spelling),
+                ValueType::Int,
+                "{spelling}"
+            );
+        }
+        for spelling in ["*mut u8", "*const u8", "*mut *mut usize"] {
+            assert_eq!(
+                super::tuple_field_value_type(spelling),
+                ValueType::Ref(None),
                 "{spelling}"
             );
         }
@@ -91903,10 +92110,12 @@ mod tests {
         }
     }
 
-    /// A GC pointer fed to `direct_ptradd` stays a pointer. `cast_ptr_to_int`
-    /// would make `ann_direct_ptradd` see `Integer`.
+    /// A GC / classdef-less pointer fed to `direct_ptradd` is `rffi.cast`
+    /// onto `CArrayPtr` (`cast_ptr_to_int` then `cast_int_to_ptr`) so
+    /// `ann_direct_ptradd` sees `SomePtr`. `cast_ptr_to_int` alone would
+    /// make the operand `Integer`.
     #[test]
-    fn push_direct_ptradd_keeps_a_gc_pointer_operand() {
+    fn push_direct_ptradd_rffi_casts_a_gc_pointer_operand() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let ptr = graph
@@ -91922,30 +92131,68 @@ mod tests {
             count,
             &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
         );
-        let call = graph.block(entry).operations.last().unwrap();
+        let ops = &graph.block(entry).operations;
+        let leaves: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            leaves.contains(&"cast_ptr_to_int"),
+            "rffi.cast starts at cast_ptr_to_int, got {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&"cast_int_to_ptr"),
+            "rffi.cast ends at cast_int_to_ptr, got {leaves:?}"
+        );
+        let raw = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("cast_int_to_ptr") => {
+                    assert_eq!(
+                        args.len(),
+                        2,
+                        "rffi.cast emits cast_int_to_ptr(PTRTYPE, int)"
+                    );
+                    assert!(
+                        matches!(
+                            &args[0],
+                            crate::model::LinkArg::Const(c)
+                                if matches!(
+                                    c.value,
+                                    crate::flowspace::model::ConstValue::LowLevelType(_)
+                                )
+                        ),
+                        "PtrT is the CArrayPtr constant, got {:?}",
+                        args[0]
+                    );
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("cast_int_to_ptr result");
+        let call = ops.last().unwrap();
         match &call.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
                 result_ty: ValueType::Int,
             } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
-                assert_eq!(args[0], crate::model::LinkArg::Value(ptr));
+                assert_eq!(args[0], crate::model::LinkArg::Value(raw));
+                assert_ne!(args[0], crate::model::LinkArg::Value(ptr));
                 assert_eq!(call.result.as_ref(), Some(&result));
             }
             other => panic!("expected pointer direct_ptradd, got {other:?}"),
         }
-        assert!(
-            graph.block(entry).operations.iter().all(|op| {
-                !matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments.iter().any(|s| s == "cast_ptr_to_int")
-                )
-            }),
-            "direct_ptradd must not integerize its pointer"
-        );
     }
 
     #[test]

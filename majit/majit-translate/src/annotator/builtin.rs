@@ -2495,38 +2495,40 @@ fn raw_alloc_ptr_somevalue() -> SomeValue {
 ///     return SomePtr(ll_ptrtype=PtrT.const)
 /// ```
 ///
-/// TODO: the Rust frontend's
-/// `Expr::Cast { ValueType::Ref }` carries only the opaque high-level
-/// `Ref` (no concrete Ptr lltype is known at lowering time), so the
-/// frontend lowers `Int → Ref` to a **1-arg** `simple_call(lltype.\
-/// cast_int_to_ptr, v_int)` instead of upstream's 2-arg `simple_call\
-/// (lltype.cast_int_to_ptr, PTRTYPE, oddint)`.  Upstream's
-/// `ann_cast_int_to_ptr` asserts `PtrT.is_constant()` and returns
-/// `SomePtr(ll_ptrtype=PtrT.const)` (lltype.py), reading
-/// the concrete Ptr type from the first argument.  Pyre's analyzer
-/// cannot recover that concrete Ptr from `args_s[0]` because it
-/// isn't there.  We return `SomePtr` with a Gc-Opaque placeholder
-/// Ptr (mirroring the opaque Ref bank); the rtyper-phase
-/// `rtype_cast_int_to_ptr` recovers the caller-side concrete Ptr
-/// from `hop.r_result.lowleveltype()`.  The constant carrier already
-/// exists (`ConstValue::LowLevelType(Box<LowLevelType>)`, flowspace/
-/// model.rs, supports `LowLevelType::Ptr`); the blocker is the
-/// frontend not having the concrete Ptr available at `Expr::Cast`
-/// lowering time.  Graduating to the 2-arg form is blocked on
-/// threading the rtyper-side annotation back to the frontend (or a
-/// deferred 2-arg rewrite in jtransform / annotator once the Ptr is
-/// known).
+/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`) emits the 2-arg
+/// form with `PtrT` a `ConstValue::LowLevelType` of that array
+/// pointer. `getkind` of a raw `Ptr` is Signed (`history.py`
+/// `TYPE.TO._gckind == 'raw'`). The 1-arg `Int → Ref` lowering still
+/// has no concrete Ptr and keeps the Gc-Opaque placeholder; a gc
+/// opaque would kind as GcRef.
 fn lltype_cast_int_to_ptr(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[Option<SomeValue>],
+    args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, SomePtr};
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, OpaqueType, Ptr, SomePtr};
+    if args_s.len() == 2 {
+        let s_ptrt = arg_at(args_s, 0, "lltype.cast_int_to_ptr");
+        if !s_ptrt.is_constant() {
+            return Err(AnnotatorError::new(
+                "ann_cast_int_to_ptr: PtrT is not constant",
+            ));
+        }
+        let Some(ConstValue::LowLevelType(ll)) = s_ptrt.const_() else {
+            return Err(AnnotatorError::new(
+                "ann_cast_int_to_ptr: PtrT.const is not a LowLevelType",
+            ));
+        };
+        let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
+            return Err(AnnotatorError::new(
+                "ann_cast_int_to_ptr: PtrT.const is not a Ptr",
+            ));
+        };
+        return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
+    }
     let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
-    let placeholder_ptr = Ptr::from_container_type(
-        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Opaque(Box::new(opaque)),
-    )
-    .expect("Opaque container yields a valid Ptr");
+    let placeholder_ptr = Ptr::from_container_type(LowLevelType::Opaque(Box::new(opaque)))
+        .expect("Opaque container yields a valid Ptr");
     Ok(SomeValue::Ptr(SomePtr::new(placeholder_ptr)))
 }
 
@@ -4762,6 +4764,36 @@ mod tests {
         let err = lltype_direct_ptradd(&bk(), &[Some(s_inst), Some(s_n)], &no_kwds())
             .expect_err("ann_direct_ptradd asserts SomePtr");
         assert!(err.to_string().contains("non-pointer"), "got {err}");
+    }
+
+    #[test]
+    fn ann_cast_int_to_ptr_two_arg_carrayptr_is_raw_someptr() {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+
+        let ptr_ty = CArrayPtr(LowLevelType::Signed);
+        let mut s_ptrt = SomeValue::Type(super::super::model::SomeType::new());
+        s_ptrt.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            ptr_ty.clone(),
+        ))));
+        assert!(s_ptrt.is_constant());
+        let s_int = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let out = lltype_cast_int_to_ptr(&bk(), &[Some(s_ptrt), Some(s_int)], &no_kwds())
+            .expect("ann_cast_int_to_ptr 2-arg returns SomePtr");
+        let SomeValue::Ptr(ptr) = &out else {
+            panic!("expected SomePtr, got {out:?}");
+        };
+        assert_eq!(
+            crate::model::getkind(&LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone()))),
+            crate::model::ConcreteType::Signed,
+            "CArrayPtr kinds as Signed"
+        );
+        let s_n = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let added = lltype_direct_ptradd(&bk(), &[Some(out.clone()), Some(s_n)], &no_kwds())
+            .expect("ann_direct_ptradd of CArrayPtr");
+        assert_eq!(added, out);
     }
 
     #[test]

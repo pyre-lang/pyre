@@ -41,7 +41,7 @@ use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
     AnnotatorError, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat, SomeInteger, SomeList,
-    SomePBC, SomeString, SomeTuple, SomeUnicodeCodePoint, SomeUnicodeString, SomeValue,
+    SomePBC, SomeString, SomeTuple, SomeType, SomeUnicodeCodePoint, SomeUnicodeString, SomeValue,
     s_impossible_value, s_none, union,
 };
 use super::policy::AnnotatorPolicy;
@@ -3942,24 +3942,44 @@ impl Bookkeeper {
             return s_fn;
         }
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
-        // pointer, not a `T`.  Projecting the pointee is right for an
+        // pointer, not a `T`. Projecting the pointee is right for an
         // aggregate target (`*mut Vec<T>` / `*mut Struct`): the structural
         // shell is already GcRef-kind and downstream element/field access
-        // relies on it.  But for a scalar / unit pointee the pointee shell
-        // (Signed / Void / …) discards the pointer-ness and diverges from
-        // the legacy walker, which folds every raw-pointer field-read to
-        // `Ref` → GcRef (the FieldRead op `ty` is
-        // `tyref_to_value_type(raw ptr) = Ref(None)`).  Mirror that fold —
-        // and the FORCE_ATTRIBUTES `tyref_to_attr_value_type` raw-ptr →
-        // `Ref(None)` projection — by shelling a scalar/unit-pointee raw
-        // pointer as the conservative classdef-less Ref instance
-        // (`getkind = 'ref'`), the GC-safe choice for a field that may
-        // hold a managed pointer.
+        // relies on it.
+        //
+        // `history.py` `getkind` of a raw `Ptr` whose pointee is a
+        // non-byte primitive is `'int'`. `raw_load` (`rtyper.rs`)
+        // `inputargs(Signed, Signed)` reads that address word;
+        // `mapdict.rs` `slots` returns `(*mut usize, *mut *mut ItemsBlock)`
+        // and `_get_mapdict_map` `raw_load`s item 0. A classdef-less
+        // Instance here made `getitem` of that tuple feed `SomeInstance`
+        // into `raw_load`, and `pairtype.rs` has no InstanceRepr→Signed
+        // convert. A byte pointer (`*mut u8` / `*mut i8`) stays the
+        // classdef-less Ref instance: pyre erases a GC reference to
+        // `*mut u8`.
         if let Some(pointee) = t
             .strip_prefix("*const ")
             .or_else(|| t.strip_prefix("*mut "))
         {
-            let s_pointee = self.project_struct_field_type(pointee.trim());
+            let pointee = pointee.trim();
+            if matches!(
+                pointee,
+                "bool"
+                    | "char"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "isize"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "usize"
+                    | "f32"
+                    | "f64"
+            ) {
+                return super::model::s_int();
+            }
+            let s_pointee = self.project_struct_field_type(pointee);
             if matches!(
                 s_pointee,
                 SomeValue::Integer(_)
@@ -5008,9 +5028,16 @@ impl Bookkeeper {
                 let entry = self.getdesc_for_const(x)?;
                 Ok(SomeValue::PBC(SomePBC::new(vec![entry], false)))
             }
+            ConstValue::LowLevelType(_) => {
+                // `LowLevelType._freeze_()` (`lltype.py`). `ann_cast_int_to_ptr`
+                // reads `PtrT.const` (`lltype.py`). SomeType so `is_constant()`
+                // holds and `getrepr` is `get_type_repr` (`rclass.py`).
+                let mut s = SomeType::new();
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::Type(s))
+            }
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
-            | ConstValue::LowLevelType(_)
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder
@@ -11307,6 +11334,41 @@ mod tests {
         assert!(
             matches!(t.items[0], SomeValue::Ptr(_)),
             "tuple item must be SomePtr(GCREF), got {:?}",
+            t.items[0]
+        );
+    }
+
+    #[test]
+    fn raw_scalar_address_pointer_projects_as_integer() {
+        let bk = bk();
+        for spelling in ["*mut usize", "*const usize", "*mut i64", "*mut f64"] {
+            assert!(
+                matches!(
+                    bk.project_struct_field_type(spelling),
+                    SomeValue::Integer(_)
+                ),
+                "{spelling} is the address word (history.getkind of a raw Ptr), got {:?}",
+                bk.project_struct_field_type(spelling)
+            );
+        }
+        for spelling in ["*mut u8", "*const u8", "*mut i8"] {
+            assert!(
+                matches!(
+                    bk.project_struct_field_type(spelling),
+                    SomeValue::Instance(ref inst) if inst.classdef.is_none()
+                ),
+                "{spelling} stays the GC-erasure instance, got {:?}",
+                bk.project_struct_field_type(spelling)
+            );
+        }
+        let s = bk.project_shaped_tuple("Tuple<*mut usize,*mut *mut ItemsBlock>");
+        let SomeValue::Tuple(t) = s else {
+            panic!("mapdict slots() tuple must project as SomeTuple, got {s:?}");
+        };
+        assert_eq!(t.items.len(), 2);
+        assert!(
+            matches!(t.items[0], SomeValue::Integer(_)),
+            "slots().0 is *mut usize, got {:?}",
             t.items[0]
         );
     }

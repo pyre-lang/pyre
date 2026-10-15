@@ -18,6 +18,10 @@ const OBJECT_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-object.ullbc"
 );
+const MODULE_LLBC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/pyre-module.ullbc"
+);
 
 #[test]
 fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
@@ -200,6 +204,198 @@ fn put_unit_spec_graph_drops_the_value_arg() {
         "{} non-void inputs {kinds:?}, ops {:?}",
         puts[0].name,
         op_kinds(&puts[0].graph())
+    );
+}
+
+/// A monomorphic caller of type-only `put<V>` (`&mut V`, no trait clause,
+/// no clause-bearing wrapper) still gets `put__s`. `default_specialize`
+/// / `FunctionDesc.cachedgraph` key one graph per concrete types.
+#[test]
+fn monomorphic_caller_specializes_type_only_generic() {
+    let llbc = Llbc::from_slice(put_fixture_llbc().as_bytes()).expect("parse put fixture");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["fixture"],
+        &["use_put"],
+    )
+    .expect("lower use_put");
+    let puts: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("put__s"))
+        .collect();
+    assert_eq!(
+        puts.len(),
+        1,
+        "expected one specialized put, got {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let use_put = program
+        .functions
+        .iter()
+        .find(|f| f.name == "use_put")
+        .expect("use_put graph");
+    assert!(
+        graph_calls_spec_leaf(&use_put.graph(), "put__s"),
+        "use_put must bind put__spec_, ops {:?}",
+        op_kinds(&use_put.graph())
+    );
+}
+
+/// A monomorphic caller of by-value type-only `id<T>(T) -> T` still
+/// gets `id__s`. `FunctionDesc.cachedgraph` / `default_specialize`
+/// copy every concrete instantiation from any caller.
+#[test]
+fn monomorphic_caller_specializes_by_value_type_only_generic() {
+    let llbc = Llbc::from_slice(put_fixture_llbc().as_bytes()).expect("parse put fixture");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["fixture"],
+        &["use_id"],
+    )
+    .expect("lower use_id");
+    let ids: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("id__s"))
+        .collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected one specialized id, got {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let use_id = program
+        .functions
+        .iter()
+        .find(|f| f.name == "use_id")
+        .expect("use_id graph");
+    assert!(
+        graph_calls_spec_leaf(&use_id.graph(), "id__s"),
+        "use_id must bind id__spec_, ops {:?}",
+        op_kinds(&use_id.graph())
+    );
+}
+
+/// `dict_entries_value_set_at` is monomorphic (`ObjectDictStorage`) and
+/// calls type-only `set_slot_value<K,V,S>`. The call binds a spec copy
+/// so `entries_item_ptr` sees concrete `K, V` and recovers the items
+/// offset (`array_items_base`). The unsubstituted generic
+/// `entries_item_ptr` still LowerErrors (no offset guess).
+#[test]
+fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict", "rordereddict_entries"],
+        &["dict_entries_value_set_at"],
+    )
+    .expect("lower dict_entries_value_set_at");
+
+    let setter = program
+        .functions
+        .iter()
+        .find(|f| f.name == "dict_entries_value_set_at")
+        .expect("dict_entries_value_set_at graph");
+    assert!(
+        graph_calls_spec_leaf(&setter.graph(), "set_slot_value__spec_"),
+        "dict_entries_value_set_at must bind set_slot_value__spec_, ops {:?}",
+        op_kinds(&setter.graph())
+    );
+    assert!(
+        !graph_calls_leaf(&setter.graph(), "set_slot_value"),
+        "dict_entries_value_set_at must not bind unspecialized set_slot_value, ops {:?}",
+        op_kinds(&setter.graph())
+    );
+
+    let item_ptrs: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("entries_item_ptr__spec_"))
+        .collect();
+    assert!(
+        !item_ptrs.is_empty(),
+        "expected entries_item_ptr__spec_ graphs, got {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    for spec in &item_ptrs {
+        assert!(
+            graph_calls_leaf(&spec.graph(), "cast_int_to_ptr"),
+            "{} must emit direct_arrayitems (cast_int_to_ptr), ops {:?}",
+            spec.name,
+            op_kinds(&spec.graph())
+        );
+    }
+}
+
+/// `index_words_ptr` returns `typed_items_block_items_base as *mut i64`.
+/// That is `rffi.cast` onto `CArrayPtr` (`cast_ptr_to_int` then
+/// `cast_int_to_ptr`) so look-inside answers `SomePtr` for the caller's
+/// `direct_ptradd` (`rffi.py` `ptradd`). Aliasing the CAST_ADDRESS
+/// Instance would fail `ann_direct_ptradd`.
+#[test]
+fn index_words_ptr_rffi_casts_items_base_to_carray_ptr() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let graph = lower_function(&llbc, "index_words_ptr").expect("lower index_words_ptr");
+    assert!(
+        graph_calls_leaf(&graph, "cast_ptr_to_int"),
+        "index_words_ptr must rffi.cast via cast_ptr_to_int, ops {:?}",
+        op_kinds(&graph)
+    );
+    assert!(
+        graph_calls_leaf(&graph, "cast_int_to_ptr"),
+        "index_words_ptr must rffi.cast via cast_int_to_ptr, ops {:?}",
+        op_kinds(&graph)
+    );
+}
+
+/// `set_mustfree_flag` is `data.sub(1).write(flag)` on `*mut u8`. The
+/// caller intercepts `sub` as `direct_ptradd`; a type-only spec copy of
+/// `offset<u8>` / `sub<u8>` from this non-spec caller is not minted
+/// (`rffi.py` `ptradd` is the primitive).
+#[test]
+fn set_mustfree_flag_does_not_specialize_ptradd_helpers() {
+    let llbc = Llbc::load(MODULE_LLBC).expect("load pyre-module.ullbc");
+    let graph = lower_function(&llbc, "set_mustfree_flag").expect("lower set_mustfree_flag");
+    assert!(
+        !graph_calls_core_ptr_arith_spec(&graph),
+        "set_mustfree_flag must not bind add/sub/offset spec copies, ops {:?}",
+        op_kinds(&graph)
+    );
+}
+
+/// `IntArray::remove` uses `base().add(index)` as a raw pointer for
+/// `ptr::copy`. `base()` stays the GcArray header; `direct_ptradd` then
+/// `rffi.cast`s that Instance onto `CArrayPtr` so `ann_direct_ptradd`
+/// sees `SomePtr`.
+#[test]
+fn int_array_remove_ptradd_rffi_casts_base() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let graph = lower_function(&llbc, "int_array::<Impl>::remove").expect("lower IntArray::remove");
+    assert!(
+        graph_calls_leaf(&graph, "direct_ptradd"),
+        "remove must emit direct_ptradd of the items pointer, ops {:?}",
+        op_kinds(&graph)
+    );
+    assert!(
+        graph_calls_leaf(&graph, "cast_int_to_ptr"),
+        "remove's direct_ptradd operand must be rffi.cast SomePtr, ops {:?}",
+        op_kinds(&graph)
     );
 }
 
@@ -473,6 +669,60 @@ fn graph_calls_path(graph: &majit_translate::model::FunctionGraph, path: &[&str]
             } => segments.iter().map(String::as_str).eq(path.iter().copied()),
             _ => false,
         })
+}
+
+fn call_path_leaf(op: &majit_translate::model::SpaceOperation) -> Option<&str> {
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().map(String::as_str),
+        _ => None,
+    }
+}
+
+fn graph_calls_leaf(graph: &majit_translate::model::FunctionGraph, leaf: &str) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| call_path_leaf(op) == Some(leaf))
+}
+
+fn graph_calls_spec_leaf(graph: &majit_translate::model::FunctionGraph, prefix: &str) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| call_path_leaf(op).is_some_and(|leaf| leaf.starts_with(prefix)))
+}
+
+fn core_ptr_arith_spec_leaf(leaf: &str) -> bool {
+    let Some((name, _)) = leaf.split_once("__spec") else {
+        return false;
+    };
+    matches!(
+        name,
+        "add"
+            | "sub"
+            | "offset"
+            | "wrapping_add"
+            | "wrapping_sub"
+            | "wrapping_offset"
+            | "byte_add"
+            | "byte_sub"
+            | "wrapping_byte_add"
+            | "wrapping_byte_sub"
+            | "ptradd"
+    )
+}
+
+fn graph_calls_core_ptr_arith_spec(graph: &majit_translate::model::FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| call_path_leaf(op).is_some_and(core_ptr_arith_spec_leaf))
 }
 
 /// A `borrow` call still dispatched through the trait: a `Method` call,
@@ -830,6 +1080,67 @@ fn put_fixture_llbc() -> String {
             ]
         }
     });
+    let use_put_body = json!({
+        "Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 0, "locals": [local(0, None, &unit)]},
+            "body": [
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": []}
+                        }},
+                        "args": [],
+                        "dest": place(0, &unit)
+                    },
+                    "target": 2,
+                    "on_unwind": 1
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+            ]
+        }
+    });
+    let id_sig = json!({
+        "is_unsafe": false,
+        "inputs": [tvar],
+        "output": tvar
+    });
+    let id_body = json!({
+        "Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [local(0, None, &tvar), local(1, Some("v"), &tvar)]
+            },
+            "body": [
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+            ]
+        }
+    });
+    let use_id_body = json!({
+        "Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 0, "locals": [local(0, None, &unit)]},
+            "body": [
+                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 6},
+                            "generics": {"regions": [], "types": [unit], "const_generics": [], "trait_refs": []}
+                        }},
+                        "args": [],
+                        "dest": place(0, &unit)
+                    },
+                    "target": 2,
+                    "on_unwind": 1
+                }}}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+            ]
+        }
+    });
     let file = json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -867,6 +1178,25 @@ fn put_fixture_llbc() -> String {
                     "item_meta": meta(&["fixture", "use_unit"], true),
                     "signature": {"is_unsafe": false, "inputs": [], "output": unit},
                     "body": use_body
+                },
+                {
+                    "def_id": 5,
+                    "item_meta": meta(&["fixture", "use_put"], true),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+                    "body": use_put_body
+                },
+                {
+                    "def_id": 6,
+                    "item_meta": meta(&["fixture", "id"], true),
+                    "signature": id_sig,
+                    "generics": generics(false),
+                    "body": id_body
+                },
+                {
+                    "def_id": 7,
+                    "item_meta": meta(&["fixture", "use_id"], true),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+                    "body": use_id_body
                 }
             ],
             "global_decls": [],

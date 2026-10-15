@@ -216,6 +216,65 @@ fn call_returned_raw_scalar_pointer_is_int() {
     assert_returned_call(&producer, "ticker_addr");
 }
 
+fn mapdict_fns<'a>(llbc: &'a Llbc, leaf: &str) -> Vec<&'a FunDecl> {
+    let suffix = format!("::{leaf}");
+    llbc.iter_local_fns()
+        .filter(|fd| {
+            let path = fd.item_meta.name_path();
+            path.ends_with(&suffix) && path.contains("mapdict")
+        })
+        .collect()
+}
+
+#[test]
+fn mapdict_get_reads_slots_map_pointer_as_int() {
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let context = lower_context_for(llbc);
+    let gets = mapdict_fns(&llbc, "_get_mapdict_map");
+    assert!(
+        !gets.is_empty(),
+        "mapdict _get_mapdict_map is in interpreter LLBC"
+    );
+    let mut saw_pos0 = false;
+    for fd in gets {
+        let graph = lower_fun_decl(&context, fd)
+            .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+        let pos0: Vec<_> = ops(&graph)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == "__pos_0" => Some(ty),
+                _ => None,
+            })
+            .collect();
+        if pos0.is_empty() {
+            continue;
+        }
+        saw_pos0 = true;
+        assert!(
+            pos0.iter().all(|ty| matches!(ty, ValueType::Int)),
+            "{} slots().0 is *mut usize; getkind of a raw Ptr is int, got {pos0:?}",
+            graph.name
+        );
+    }
+    assert!(
+        saw_pos0,
+        "MapdictCarrier::_get_mapdict_map FieldReads slots().0"
+    );
+
+    let slots = mapdict_fns(&llbc, "slots");
+    assert_eq!(slots.len(), 1, "one MapdictCarrier::slots");
+    let slots = lower_fun_decl(&context, slots[0]).expect("lower MapdictCarrier::slots");
+    let writes: Vec<_> = ops(&slots)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_0" => Some(ty),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !writes.is_empty() && writes.iter().all(|ty| matches!(ty, ValueType::Int)),
+        "slots() stores *mut usize as int, got {writes:?}"
+    );
+}
+
 #[test]
 fn typed_array_base_call_stays_ref() {
     let llbc = load_llbc(OBJECT_LLBC);
@@ -261,6 +320,15 @@ fn integer_cast_to_raw_scalar_stays_int() {
     match root_op(&graph, &returned_var(&graph)) {
         Some(OpKind::BinOp { result_ty, .. })
             if matches!(result_ty, ValueType::Int | ValueType::Unsigned) => {}
+        // `rarithmetic.py` `intmask`: usize arithmetic is Unsigned, the
+        // `*const usize` return is the Signed address word
+        // (`history.py` `getkind` of a raw Ptr).
+        Some(OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        }) if segments.last().map(String::as_str) == Some("intmask")
+            && matches!(result_ty, ValueType::Int | ValueType::Unsigned) => {}
         other => panic!(
             "{} must return the aligned integer word, got {other:?}",
             graph.name

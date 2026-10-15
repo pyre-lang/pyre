@@ -8,8 +8,10 @@
 //! `Clause` refs. A call whose `generics.trait_refs` are already
 //! `TraitImpl` ids supplies the binding: the copy substitutes each
 //! depth-0 `Clause` with that ref, and a `ParentClause` of a resolved
-//! impl reads that impl's `implied_trait_refs`. The unspecialized body
-//! is left unchanged.
+//! impl reads that impl's `implied_trait_refs`. Each concrete
+//! instantiation is its own graph (`FunctionDesc.cachedgraph`),
+//! including a look-inside generic whose body names no `Clause`.
+//! The unspecialized body is left unchanged.
 
 use std::collections::{HashMap, VecDeque};
 
