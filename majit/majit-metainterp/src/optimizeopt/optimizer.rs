@@ -819,10 +819,8 @@ impl Optimizer {
                     box_,
                     crate::optimizeopt::info::PtrInfo::VirtualStruct(
                         crate::optimizeopt::info::VirtualStructInfo {
-                            descr: descr.clone(),
                             fields: imported_fields,
-                            last_guard_pos: -1,
-                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                            ..crate::optimizeopt::info::VirtualStructInfo::new(descr.clone())
                         },
                     ),
                 );
@@ -1163,10 +1161,10 @@ impl Optimizer {
                             b,
                             crate::optimizeopt::info::PtrInfo::VirtualStruct(
                                 crate::optimizeopt::info::VirtualStructInfo {
-                                    descr: entry.size_descr,
                                     fields,
-                                    last_guard_pos: -1,
-                                    avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                                    ..crate::optimizeopt::info::VirtualStructInfo::new(
+                                        entry.size_descr,
+                                    )
                                 },
                             ),
                         );
@@ -1337,10 +1335,8 @@ impl Optimizer {
                     &head_box,
                     crate::optimizeopt::info::PtrInfo::VirtualStruct(
                         crate::optimizeopt::info::VirtualStructInfo {
-                            descr: descr.clone(),
                             fields: imported_fields,
-                            last_guard_pos: -1,
-                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                            ..crate::optimizeopt::info::VirtualStructInfo::new(descr.clone())
                         },
                     ),
                 );
@@ -2615,6 +2611,16 @@ impl Optimizer {
                     true
                 }
                 PtrInfo::Virtual(vinfo) => {
+                    vinfo.known_class = Some(class_value);
+                    true
+                }
+                // Residual `new` (`VirtualStruct`) is not `InstancePtrInfo`
+                // upstream; `rewrite_op_malloc` never emits a vtable'd
+                // GcStruct as plain `new`. A typeptr SETFIELD on that
+                // vstruct is the header write `new_with_vtable` would have
+                // done. Overwriting the vstruct with a fresh known-class
+                // Instance would drop its fields and the stashed typeptr.
+                PtrInfo::VirtualStruct(vinfo) => {
                     vinfo.known_class = Some(class_value);
                     true
                 }
@@ -7945,24 +7951,14 @@ mod tests {
         ctx.set_ptr_info(
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr: descr.clone(),
                 fields: vec![(1, b11.clone())].into(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                ..VirtualStructInfo::new(descr.clone())
             }),
         );
         let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
         ctx.make_equal_to(&b11, &b20);
         let b20 = ctx.materialize_operand_at(OpRef::int_op(20));
-        ctx.set_ptr_info(
-            &b20,
-            PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr,
-                fields: Default::default(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-            }),
-        );
+        ctx.set_ptr_info(&b20, PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)));
 
         let mut opt = Optimizer::new();
         let b10 = ctx.get_box_replacement_operand(OpRef::int_op(10));
@@ -8014,10 +8010,8 @@ mod tests {
         ctx.set_ptr_info(
             &b10,
             PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr: descr.clone(),
                 fields: vec![(0, field_value)].into(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                ..VirtualStructInfo::new(descr.clone())
             }),
         );
 
