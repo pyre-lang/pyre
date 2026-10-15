@@ -5079,6 +5079,10 @@ impl MiniMarkGC {
     /// move in mark-sweep).
     pub fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
         if self.is_valid_gc_object(obj_addr) && self.is_in_nursery(obj_addr) {
+            let hdr = unsafe { header_of(obj_addr) };
+            if unsafe { (*hdr).is_forwarded() } {
+                return unsafe { GcHeader::forwarding_address(hdr) };
+            }
             return self.find_shadow(obj_addr);
         }
         obj_addr
@@ -18504,6 +18508,23 @@ cache size\t: 8192 kB\n";
         assert_eq!(root.0, shadow);
         assert_eq!(unsafe { *(shadow as *const u64) }, 0xfeed_face);
         gc.roots.clear();
+    }
+
+    /// After a minor, the nursery original still sits in the nursery
+    /// range with a forwarded header. `id()` on that word is the
+    /// forwarding address, not a new shadow.
+    #[test]
+    fn id_or_identityhash_follows_a_forwarded_nursery_header() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        let nursery_addr = obj.0;
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+        gc.roots.clear();
+        assert_ne!(root.0, nursery_addr);
+        assert_eq!(gc.id_or_identityhash(nursery_addr), root.0);
     }
 
     /// An old-gen object is already where a shadow would put it.
