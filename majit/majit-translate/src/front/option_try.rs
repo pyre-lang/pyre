@@ -64,8 +64,10 @@ pub(crate) struct OptionTrySite {
     /// payload is the base pointer itself (identity).
     pub niche: bool,
     /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// `null_fn` (`rnone.py` `rtype_is_None`).
+    /// the int-bank null (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
+    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
+    pub int_null: crate::model::NicheIntNull,
     /// `Option<NonZero<_>>`: `None` is 0 and `Some` is the word.
     pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
@@ -81,12 +83,13 @@ pub(crate) struct OptionTryStats {
 /// Rewrite every recorded `Option` `Try::branch` site.  `return_option_owner`
 /// is the enclosing function's declared `Option<U>` root; `None` means the
 /// function is not Option-returning, so all sites decline. `return_niche`,
-/// `return_narrow_root`, and `return_niche_null_cast` describe the enclosing
-/// return Option independently of the branched Option: a niche return builds
-/// a narrowed null instead of an enum `Option::None` aggregate. The receiver
-/// null-test uses [`OptionTrySite::niche_null_cast`]; the returned `None`
-/// uses `return_niche_null_cast`, because recording only has the branched
-/// `Option` and the return `Option` is the function signature's output.
+/// `return_narrow_root`, `return_niche_null_cast`, and `return_int_null`
+/// describe the enclosing return Option independently of the branched Option:
+/// a niche return builds a narrowed null instead of an enum `Option::None`
+/// aggregate. The receiver null-test uses [`OptionTrySite::int_null`]; the
+/// returned `None` uses `return_int_null` / `return_niche_null_cast`, because
+/// recording only has the branched `Option` and the return `Option` is the
+/// function signature's output.
 pub(crate) fn rewire_option_try_call_sites(
     graph: &mut FunctionGraph,
     sites: &[OptionTrySite],
@@ -95,6 +98,7 @@ pub(crate) fn rewire_option_try_call_sites(
     return_scalar_niche: bool,
     return_narrow_root: Option<&str>,
     return_niche_null_cast: Option<&(String, ValueType)>,
+    return_int_null: Option<&crate::model::NicheIntNull>,
 ) -> OptionTryStats {
     let mut stats = OptionTryStats::default();
     for site in sites {
@@ -106,6 +110,7 @@ pub(crate) fn rewire_option_try_call_sites(
             return_scalar_niche,
             return_narrow_root,
             return_niche_null_cast,
+            return_int_null,
         ) {
             Ok(()) => stats.rewritten += 1,
             Err(decline) => {
@@ -130,6 +135,7 @@ fn rewire_one_option_try_site(
     return_scalar_niche: bool,
     return_narrow_root: Option<&str>,
     return_niche_null_cast: Option<&(String, ValueType)>,
+    return_int_null: Option<&crate::model::NicheIntNull>,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let Some(return_option_owner) = return_option_owner else {
@@ -372,7 +378,11 @@ fn rewire_one_option_try_site(
             )
             .expect("scalar None produces a value")
     } else if return_niche {
-        let null = graph.push_niche_null(none_bb, return_niche_null_cast);
+        let null = if let Some(int_null) = return_int_null {
+            int_null.push(graph, none_bb)
+        } else {
+            graph.push_niche_null(none_bb, return_niche_null_cast)
+        };
         let narrow_root = return_narrow_root.map(str::to_owned);
         crate::front::option_map_or::emit_narrow(graph, none_bb, null, &narrow_root)
     } else {
@@ -414,6 +424,7 @@ fn rewire_one_option_try_site(
             a_id,
             opt_a.clone(),
             site.fn_ptr,
+            &site.int_null,
             site.niche_null_cast.as_ref(),
             opt_disc.clone(),
         );
@@ -733,12 +744,14 @@ mod tests {
                 payload_ty: ValueType::Int,
                 niche: true,
                 fn_ptr: true,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
             Some("core::option::Option"),
             false,
             false,
+            None,
             None,
             None,
         );

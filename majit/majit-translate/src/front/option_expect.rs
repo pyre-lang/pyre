@@ -69,8 +69,10 @@ pub(crate) struct ExpectSite {
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
     /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// `null_fn` (`rnone.py` `rtype_is_None`).
+    /// the int-bank null (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
+    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
+    pub int_null: crate::model::NicheIntNull,
     /// `Option<NonZero<_>>`: `None` is the integer 0 and `Some` is the word.
     pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
@@ -272,6 +274,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
             a_id,
             opt.clone().into_variable(),
             site.fn_ptr,
+            &site.int_null,
             site.niche_null_cast.as_ref(),
             disc.clone(),
         );
@@ -344,6 +347,7 @@ mod tests {
                 payload_ty: ValueType::Int,
                 niche: false,
                 fn_ptr: false,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -428,6 +432,7 @@ mod tests {
                 payload_ty: ValueType::Ref(None),
                 niche: true,
                 fn_ptr: false,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -479,6 +484,7 @@ mod tests {
                 payload_ty: ValueType::Int,
                 niche: false,
                 fn_ptr: false,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -518,6 +524,7 @@ mod tests {
                 payload_ty: ValueType::Int,
                 niche: true,
                 fn_ptr: true,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],

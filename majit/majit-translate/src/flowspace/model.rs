@@ -2373,6 +2373,13 @@ impl HostEnv {
             "null_fn",
             HostObject::new_builtin_callable("core.ptr.null_fn"),
         );
+        // Null of a raw-address niche — `lltype.nullptr(T)` as
+        // `SomePtr(Ptr(T))` (flavor raw), or `llmemory.NULL` as
+        // `SomeAddress` with no named pointee. See `raw_ptr_null_constant`.
+        core_ptr.module_set(
+            "null_raw",
+            HostObject::new_builtin_callable("core.ptr.null_raw"),
+        );
         // `std::ptr::eq` re-exports `core::ptr::eq`; MIR lowering normalises
         // the call to the canonical `["core", "ptr", "eq"]` FunctionPath
         // (e.g. `py_type_check`'s `std::ptr::eq((*obj).ob_type, …)`).  Bind

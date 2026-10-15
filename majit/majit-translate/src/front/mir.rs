@@ -5520,6 +5520,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 !return_niche && tyref_option_nonzero_scalar(&fd.signature.output, lo.llbc);
             let return_narrow_root = lo.option_niche_payload_class_root(&fd.signature.output);
             let return_niche_null_cast = lo.option_niche_null_cast(&fd.signature.output);
+            let return_int_null = lo
+                .option_niche_is_int_bank(&fd.signature.output)
+                .then(|| lo.option_niche_int_null(&fd.signature.output));
             crate::front::option_try::rewire_option_try_call_sites(
                 &mut lo.graph,
                 &lo.option_try_sites,
@@ -5528,6 +5531,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 return_scalar_niche,
                 return_narrow_root.as_deref(),
                 return_niche_null_cast.as_ref(),
+                return_int_null.as_ref(),
             )
         };
         // Non-carrier `Result` `?` is the same ControlFlow diamond as
@@ -36571,6 +36575,7 @@ impl<'a> Lowering<'a> {
             payload_on_disc_true,
             niche,
             fn_ptr: self.option_niche_is_int_bank(recv_ty),
+            int_null: self.option_niche_int_null(recv_ty),
             niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
         })
@@ -36610,6 +36615,7 @@ impl<'a> Lowering<'a> {
             niche,
             niche_null_cast: self.option_niche_null_cast(&pointee),
             fn_ptr: self.option_niche_is_int_bank(&pointee),
+            int_null: self.option_niche_int_null(&pointee),
             scalar_niche,
         })
     }
@@ -36667,6 +36673,7 @@ impl<'a> Lowering<'a> {
             payload_on_disc_true,
             niche,
             fn_ptr: self.option_niche_is_int_bank(recv_ty),
+            int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -36709,6 +36716,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             niche,
             fn_ptr: self.option_niche_is_int_bank(recv_ty),
+            int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -37179,6 +37187,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             niche,
             fn_ptr: self.option_niche_is_int_bank(&recv_ty_owned),
+            int_null: self.option_niche_int_null(&recv_ty_owned),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(&recv_ty_owned),
         })
@@ -37501,6 +37510,7 @@ impl<'a> Lowering<'a> {
             result_niche: false,
             niche_null_cast: None,
             fn_ptr: false,
+            int_null: crate::model::NicheIntNull::default(),
         };
 
         if is_option {
@@ -37513,6 +37523,7 @@ impl<'a> Lowering<'a> {
             site.recv_niche = self.tyref_is_niche_option_ptr(&recv_ty);
             site.niche_null_cast = self.option_niche_null_cast(&recv_ty);
             site.fn_ptr = self.option_niche_is_int_bank(&recv_ty);
+            site.int_null = self.option_niche_int_null(&recv_ty);
         } else {
             let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
                 self.resolve_result_owners(&recv_ty)?;
@@ -37757,6 +37768,7 @@ impl<'a> Lowering<'a> {
             args_tuple_suffix,
             niche,
             fn_ptr: self.option_niche_is_int_bank(recv_ty),
+            int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -38222,6 +38234,12 @@ impl<'a> Lowering<'a> {
             result_niche,
             result_fn_ptr: matches!(kind, ClosureCombinator::Map | ClosureCombinator::AndThen)
                 && self.option_niche_is_int_bank(dest_ty),
+            result_int_null: match kind {
+                ClosureCombinator::Map | ClosureCombinator::AndThen => {
+                    self.option_niche_int_null(dest_ty)
+                }
+                _ => crate::model::NicheIntNull::default(),
+            },
             result_fn_ptr_spelling: match kind {
                 ClosureCombinator::Map | ClosureCombinator::AndThen => {
                     tyref_fn_ptr_spelling(dest_ty, self.llbc)
@@ -38239,6 +38257,7 @@ impl<'a> Lowering<'a> {
             args_tuple_suffix,
             niche,
             fn_ptr: self.option_niche_is_int_bank(&recv_ty),
+            int_null: self.option_niche_int_null(&recv_ty),
             niche_null_cast,
             fieldless_none_tag,
             call_once_result_exc,
@@ -38318,6 +38337,26 @@ impl<'a> Lowering<'a> {
             ),
             ValueType::Int | ValueType::Unsigned
         )
+    }
+
+    /// Int-bank null of a niche `Option`: `null_fn` with the `fn(..)`
+    /// spelling, or `null_raw` with the raw pointee's class root
+    /// (`lltype.nullptr` / `llmemory.NULL`).
+    fn option_niche_int_null(&self, option_ty: &TyRef) -> crate::model::NicheIntNull {
+        if tyref_option_payload_is_fn_ptr(option_ty, self.llbc)
+            || tyref_node(option_ty, self.llbc)
+                .is_some_and(|node| type_node_is_fn_ptr(node, self.llbc))
+        {
+            return crate::model::NicheIntNull::FnPtr(tyref_fn_ptr_spelling(option_ty, self.llbc));
+        }
+        let seed = crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
+            .unwrap_or_else(|| option_ty.clone());
+        crate::model::NicheIntNull::RawAddress(raw_address_owner_root(
+            &seed,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        ))
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option` in
@@ -38704,15 +38743,14 @@ impl<'a> Lowering<'a> {
         let bb_id = self.emit_bb(mir_bb);
         // Int-banked niche (`Option<fn>` / raw Address): `rnone.py`
         // `rtype_is_None` compares against a null of the operand's own
-        // lltype (`int_is_zero` / `adr_eq`). `null_mut()` is a GC ref and
-        // would emit `is_` on mixed `ir` operands. Spelling is the FUNC
-        // type when the payload is `fn`; a raw Address keeps the coarse
-        // empty `FuncType` (still the int bank).
+        // lltype (`ptr_iszero` / `int_is_zero` / `adr_eq`). `null_mut()`
+        // is a GC ref and would emit `is_` on mixed `ir` operands.
+        // `Option<fn>` keeps `null_fn` with the `fn(..)` spelling; a
+        // raw-address niche uses `null_raw` of the pointee (`lltype.nullptr`)
+        // or `llmemory.NULL` when the payload has no named type.
         if self.option_niche_is_int_bank(option_ty) {
-            return self.graph.push_null_fn_ptr_with_spelling(
-                bb_id,
-                tyref_fn_ptr_spelling(option_ty, self.llbc).as_deref(),
-            );
+            let int_null = self.option_niche_int_null(option_ty);
+            return int_null.push(&mut self.graph, bb_id);
         }
         self.graph
             .push_niche_null(bb_id, self.option_niche_null_cast(option_ty).as_ref())
@@ -68408,8 +68446,10 @@ struct DiscCombinatorSite {
     /// (`option_niche_null_cast`).
     niche_null_cast: Option<(String, ValueType)>,
     /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// `null_fn` (`rnone.py` `rtype_is_None`).
+    /// the int-bank null (`rnone.py` `rtype_is_None`).
     fn_ptr: bool,
+    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
+    int_null: crate::model::NicheIntNull,
 }
 
 #[derive(Clone)]
@@ -68999,7 +69039,13 @@ fn rewire_option_filter_diamond(
     // A niche result is the pointer or null. An aggregate `None` would make
     // the caller's null test read a live object.
     let none = if site.result_niche {
-        emit_niche_null(graph, none_bb, site.fn_ptr, &site.niche_null_cast)
+        emit_niche_null(
+            graph,
+            none_bb,
+            site.fn_ptr,
+            &site.int_null,
+            &site.niche_null_cast,
+        )
     } else {
         emit_option_variant(graph, none_bb, &site.result_owner, 0, None)
     };
@@ -69066,7 +69112,13 @@ fn rewire_option_filter_diamond(
         )
     };
     let drop_none = if site.result_niche {
-        emit_niche_null(graph, drop_bb, site.fn_ptr, &site.niche_null_cast)
+        emit_niche_null(
+            graph,
+            drop_bb,
+            site.fn_ptr,
+            &site.int_null,
+            &site.niche_null_cast,
+        )
     } else {
         emit_option_variant(graph, drop_bb, &site.result_owner, 0, None)
     };
@@ -69115,7 +69167,14 @@ fn rewire_option_filter_diamond(
     // Niche tag is `ptr` is not null (`Some` = 1). A `__discriminant`
     // field read loads the object header.
     let disc = if site.recv_niche {
-        emit_niche_some_tag(graph, a_id, recv, site.fn_ptr, &site.niche_null_cast)
+        emit_niche_some_tag(
+            graph,
+            a_id,
+            recv,
+            site.fn_ptr,
+            &site.int_null,
+            &site.niche_null_cast,
+        )
     } else {
         emit_enum_disc_read(graph, a_id, recv, &site.recv_owner)
     };
@@ -69890,16 +69949,25 @@ fn drop_rebuilt_receiver_shell(
 /// `is_` is the null test. `ne` compares string and list values, so it is
 /// not a discriminant. The `None` null shares the payload class when
 /// `null_cast` is set (`push_niche_null_ptr`). `fn_ptr` selects the
-/// int-bank null (`rnone.py` `rtype_is_None`).
+/// int-bank null (`rnone.py` `rtype_is_None`); `int_null` is that
+/// null's spelling.
 fn emit_niche_some_tag(
     graph: &mut FunctionGraph,
     block: BlockId,
     recv: Variable,
     fn_ptr: bool,
+    int_null: &crate::model::NicheIntNull,
     null_cast: &Option<(String, ValueType)>,
 ) -> Variable {
     let disc = graph.alloc_value_var();
-    graph.push_niche_is_some(block, recv, fn_ptr, null_cast.as_ref(), disc.clone());
+    graph.push_niche_is_some(
+        block,
+        recv,
+        fn_ptr,
+        int_null,
+        null_cast.as_ref(),
+        disc.clone(),
+    );
     disc
 }
 
@@ -69907,10 +69975,11 @@ fn emit_niche_null(
     graph: &mut FunctionGraph,
     block: BlockId,
     fn_ptr: bool,
+    int_null: &crate::model::NicheIntNull,
     null_cast: &Option<(String, ValueType)>,
 ) -> Variable {
     if fn_ptr {
-        graph.push_null_fn_ptr_with_spelling(block, None)
+        int_null.push(graph, block)
     } else {
         graph.push_niche_null(block, null_cast.as_ref())
     }
@@ -76990,6 +77059,7 @@ mod tests {
             result_niche: false,
             niche_null_cast: None,
             fn_ptr: false,
+            int_null: crate::model::NicheIntNull::default(),
         };
         let live_before: std::collections::HashSet<_> =
             graph.blocks.iter().map(|block| block.id).collect();
@@ -96435,14 +96505,15 @@ mod tests {
     fn niche_ctor_shape(graph: &FunctionGraph) -> (usize, usize) {
         let ops = graph.blocks.iter().flat_map(|block| &block.operations);
         // `rnone.py` `rtype_is_None`: a GC Ptr None is `null_mut` (ref
-        // bank); an Address / non-GC funcptr None is `null_fn` (int bank).
+        // bank); `Option<fn>` is `null_fn` and a raw-address niche is
+        // `null_raw` (int bank).
         let nulls = ops
             .clone()
             .filter(|op| {
                 matches!(&op.kind, OpKind::Call { target, .. }
                 if matches!(
                     target.to_string().as_str(),
-                    "core::ptr::null_mut" | "core::ptr::null_fn"
+                    "core::ptr::null_mut" | "core::ptr::null_fn" | "core::ptr::null_raw"
                 ))
             })
             .count();
@@ -103970,6 +104041,7 @@ mod tests {
             result_niche: false,
             niche_null_cast: None,
             fn_ptr: false,
+            int_null: crate::model::NicheIntNull::default(),
         }
     }
 

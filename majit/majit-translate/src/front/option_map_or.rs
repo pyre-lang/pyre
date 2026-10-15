@@ -102,8 +102,10 @@ pub(crate) struct MapOrSite {
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
     /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// `null_fn` (`rnone.py` `rtype_is_None`).
+    /// the int-bank null (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
+    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
+    pub int_null: crate::model::NicheIntNull,
     /// True when the receiver is `Option<NonZero<_>>`. `None` is the integer
     /// 0 the payload excludes, so the discriminant is `opt != 0` and the
     /// payload is that same word.
@@ -376,6 +378,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
             a_id,
             opt.clone().into_variable(),
             site.fn_ptr,
+            &site.int_null,
             site.niche_null_cast.as_ref(),
             disc.clone(),
         );
@@ -458,6 +461,7 @@ mod tests {
             args_tuple_suffix: String::new(),
             niche: false,
             fn_ptr: false,
+            int_null: crate::model::NicheIntNull::default(),
             scalar_niche: false,
             niche_null_cast: None,
         }
@@ -768,6 +772,7 @@ mod tests {
         let mut site = map_or_site(result);
         site.niche = true;
         site.fn_ptr = true;
+        site.int_null = crate::model::NicheIntNull::RawAddress(Some("mmap::MappedObj".into()));
         site.payload_ty = ValueType::Int;
         assert_eq!(rewire_map_or_call_sites(&mut g, &[site]), 1);
 
@@ -828,10 +833,14 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::Call { target, args, .. } if args.is_empty() => Some(target.to_string()),
+                OpKind::Call { target, .. }
+                    if target.to_string().starts_with("core::ptr::null") =>
+                {
+                    Some(target.to_string())
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(nulls, vec!["core::ptr::null_fn".to_string()]);
+        assert_eq!(nulls, vec!["core::ptr::null_raw".to_string()]);
     }
 }

@@ -82,8 +82,10 @@ pub(crate) struct UnwrapOrSite {
     /// when set, so `payload_on_disc_true` is `true`.
     pub niche: bool,
     /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// `null_fn` (`rnone.py` `rtype_is_None`).
+    /// the int-bank null (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
+    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
+    pub int_null: crate::model::NicheIntNull,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
     /// `None`'s scalar tag for `Option<E>` when `E` is a densely numbered
@@ -301,6 +303,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
             a_id,
             opt.clone().into_variable(),
             site.fn_ptr,
+            &site.int_null,
             site.niche_null_cast.as_ref(),
             disc.clone(),
         );
@@ -398,6 +401,7 @@ mod tests {
             payload_on_disc_true: true,
             niche: false,
             fn_ptr: false,
+            int_null: crate::model::NicheIntNull::default(),
             niche_null_cast: None,
             fieldless_none_tag: None,
         }
@@ -423,6 +427,7 @@ mod tests {
             payload_on_disc_true: false,
             niche: false,
             fn_ptr: false,
+            int_null: crate::model::NicheIntNull::default(),
             niche_null_cast: None,
             fieldless_none_tag: None,
         }

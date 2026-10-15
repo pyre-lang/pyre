@@ -71,8 +71,10 @@ pub(crate) struct UnwrapSite {
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
     /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// `null_fn` (`rnone.py` `rtype_is_None`).
+    /// the int-bank null (`rnone.py` `rtype_is_None`).
     pub fn_ptr: bool,
+    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
+    pub int_null: crate::model::NicheIntNull,
     /// `Option<NonZero<_>>`: `None` is the integer 0 and `Some` is the word
     /// itself. No aggregate `__discriminant` / `__pos_0`.
     pub scalar_niche: bool,
@@ -290,6 +292,7 @@ fn rewire_one_unwrap_site(
             a_id,
             recv.clone().into_variable(),
             site.fn_ptr,
+            &site.int_null,
             site.niche_null_cast.as_ref(),
             disc.clone(),
         );
@@ -380,6 +383,7 @@ mod tests {
                 payload_on_disc_true: true,
                 niche: false,
                 fn_ptr: false,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -463,6 +467,7 @@ mod tests {
                 payload_on_disc_true: true,
                 niche: false,
                 fn_ptr: false,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -549,6 +554,7 @@ mod tests {
                 payload_on_disc_true: false,
                 niche: false,
                 fn_ptr: false,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -614,6 +620,7 @@ mod tests {
                 payload_on_disc_true: true,
                 niche: false,
                 fn_ptr: false,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],
@@ -653,6 +660,7 @@ mod tests {
                 payload_on_disc_true: true,
                 niche: true,
                 fn_ptr: true,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],

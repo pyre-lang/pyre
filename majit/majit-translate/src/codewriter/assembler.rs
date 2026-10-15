@@ -11373,6 +11373,7 @@ mod tests {
                 niche: true,
                 niche_null_cast: None,
                 fn_ptr: true,
+                int_null: crate::model::NicheIntNull::default(),
                 scalar_niche: false,
             }],
         );
