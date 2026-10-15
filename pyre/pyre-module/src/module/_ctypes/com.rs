@@ -9,6 +9,7 @@
 //! about it; without one the restype's own `_check_retval_` has the last word.
 
 use super::cdata;
+use super::cfield;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
 
@@ -90,7 +91,7 @@ pub(super) fn call_target(
             "Expected a COM this pointer as first argument",
         ));
     }
-    let this_ptr = host_ctypes::read_pointer_from_buffer(cdata::cdata_bytes(this).unwrap_or(&[]));
+    let this_ptr = cfield::read_pointer_from_buffer(cdata::cdata_bytes(this).unwrap_or(&[]));
     match host_ctypes::resolve_com_vtable_entry(this_ptr, index.max(0) as usize) {
         Ok(entry) => Ok((this_ptr, entry.0 as usize)),
         Err(host_ctypes::ComMethodError::NullComPointer) => Err(

@@ -11,8 +11,93 @@ use majit_rlib::clibffi::{
     self, CALLBACK_TP, FFI_OK, FFI_TYPE_P, FFI_TYPE_STRUCT, ffi_cif, ffi_closure, ffi_type,
 };
 use majit_rlib::rffi::{UINT, VOIDP};
-use rustpython_host_env::ctypes as host_ctypes;
 use std::ffi::{c_long, c_ulong, c_void};
+
+use super::cfield;
+#[cfg(windows)]
+use rustpython_host_env::ctypes as host_ctypes;
+
+std::thread_local! {
+    /// `callproc.c _ctypes_get_errobj` — per-thread ctypes errno, separate
+    /// from the platform errno.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static CTYPES_LOCAL_ERRNO: core::cell::Cell<i32> = const { core::cell::Cell::new(0) };
+}
+
+/// `callproc.c _ctypes_get_errobj` — the ctypes-local errno.
+pub(super) fn get_errno() -> i32 {
+    CTYPES_LOCAL_ERRNO.with(|e| e.get())
+}
+
+/// `callproc.c _ctypes_get_errobj` — set the ctypes-local errno, return the previous value.
+pub(super) fn set_errno(value: i32) -> i32 {
+    CTYPES_LOCAL_ERRNO.with(|e| {
+        let old = e.get();
+        e.set(value);
+        old
+    })
+}
+
+#[cfg(not(windows))]
+pub(super) fn with_swapped_errno<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let saved_errno = majit_rlib::rposix::_get_errno();
+    let saved_ctypes_errno = CTYPES_LOCAL_ERRNO.with(|e| e.get());
+    majit_rlib::rposix::_set_errno(saved_ctypes_errno);
+
+    let result = f();
+
+    let new_error = majit_rlib::rposix::_get_errno();
+    CTYPES_LOCAL_ERRNO.with(|e| e.set(new_error));
+    majit_rlib::rposix::_set_errno(saved_errno);
+
+    result
+}
+
+pub(super) fn with_callback_errno_preserved<F, R>(use_errno: bool, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if !use_errno {
+        return f();
+    }
+
+    let saved = majit_rlib::rposix::_get_errno();
+    let result = f();
+    let _current = majit_rlib::rposix::_get_errno();
+    majit_rlib::rposix::_set_errno(saved);
+    result
+}
+
+/// `callproc.c py_dyld_shared_cache_contains_path`.
+#[cfg(target_os = "macos")]
+mod dyld {
+    use majit_rlib::rffi::CCHARP;
+
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["mach-o/dyld.h"],
+        };
+    }
+
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_dyld_shared_cache_contains_path = "_dyld_shared_cache_contains_path",
+        [CCHARP],
+        bool,
+        compilation_info = ECI
+    );
+}
+
+/// `callproc.c py_dyld_shared_cache_contains_path`.
+#[cfg(target_os = "macos")]
+pub(super) fn dyld_shared_cache_contains_path(path: &str) -> Result<bool, std::ffi::NulError> {
+    let c_path = std::ffi::CString::new(path)?;
+    Ok(unsafe {
+        dyld::c_dyld_shared_cache_contains_path(c_path.as_ptr() as majit_rlib::rffi::CCHARP)
+    })
+}
 
 /// Recursive layout of a ctypes type: memory shape independent of any object
 /// model, used to lower by-value aggregate arguments and aggregate returns for
@@ -45,9 +130,9 @@ impl CTypeLayout {
         match self {
             Self::Simple(code) => {
                 let mut buf = [0u8; 4];
-                host_ctypes::simple_type_size(code.encode_utf8(&mut buf)).unwrap_or(0)
+                cfield::simple_type_size(code.encode_utf8(&mut buf)).unwrap_or(0)
             }
-            Self::Pointer => host_ctypes::pointer_size(),
+            Self::Pointer => cfield::pointer_size(),
             Self::Struct { size, .. }
             | Self::Union { size, .. }
             | Self::Array { size, .. }
@@ -330,7 +415,7 @@ fn ffi_value_from_type_code(type_code: &str, buffer: &[u8]) -> FfiValue {
                 .copied()
                 .map_or(0.0, f64::from_ne_bytes),
         ),
-        "z" | "Z" | "P" | "O" => FfiValue::Pointer(host_ctypes::read_pointer_from_buffer(buffer)),
+        "z" | "Z" | "P" | "O" => FfiValue::Pointer(cfield::read_pointer_from_buffer(buffer)),
         "?" => FfiValue::U8(u8::from(buffer.first().is_some_and(|&b| b != 0))),
         "u" => FfiValue::U32(buffer.first_chunk().copied().map_or(0, u32::from_ne_bytes)),
         _ => FfiValue::Pointer(0),
@@ -480,7 +565,7 @@ pub fn call(
 
     let rvalue: VOIDP = match ret {
         CallRet::Void => std::ptr::addr_of_mut!(scalar_u64).cast(),
-        CallRet::Code(code) if host_ctypes::simple_type_is_pointer(code) => {
+        CallRet::Code(code) if cfield::simple_type_is_pointer(code) => {
             std::ptr::addr_of_mut!(pointer_word).cast()
         }
         CallRet::Code(_) => std::ptr::addr_of_mut!(scalar_u64).cast(),
@@ -496,7 +581,7 @@ pub fn call(
     }
     let kind = match ret {
         CallRet::Void => RawKind::Void,
-        CallRet::Code(code) if host_ctypes::simple_type_is_pointer(code) => RawKind::Pointer,
+        CallRet::Code(code) if cfield::simple_type_is_pointer(code) => RawKind::Pointer,
         CallRet::Code(_) => RawKind::Scalar,
         CallRet::Pointer => RawKind::Pointer,
         CallRet::Aggregate(_) => RawKind::Aggregate,
@@ -511,7 +596,7 @@ pub fn call(
 
     #[cfg(not(windows))]
     if options.use_errno {
-        host_ctypes::with_swapped_errno(invoke);
+        with_swapped_errno(invoke);
     } else {
         invoke();
     }

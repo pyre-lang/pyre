@@ -14,12 +14,11 @@ use pyre_object::PyObjectRef;
 mod imp {
     use super::PyObjectRef;
     use crate::module::_ctypes::callproc::{CTypeLayout, CallbackThunk, FfiType};
-    use crate::module::_ctypes::{callproc, cdata, funcptr};
+    use crate::module::_ctypes::{callproc, cdata, cfield, funcptr};
     use core::ffi::c_void;
     use majit_rlib::clibffi::{CALLBACK_TP, FFI_CIFP, VOIDPP};
     use majit_rlib::rffi::VOIDP;
     use parking_lot::Mutex;
-    use rustpython_host_env::ctypes as host_ctypes;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::LazyLock;
 
@@ -139,8 +138,8 @@ mod imp {
             // use the CIF width rather than its 16-byte cdata storage size
             // on Unix.
             funcptr::Ret::Code(code) if code == "g" => 8,
-            funcptr::Ret::Code(code) => host_ctypes::simple_type_size(code).unwrap_or(0),
-            funcptr::Ret::Pointer(_) => host_ctypes::pointer_size(),
+            funcptr::Ret::Code(code) => cfield::simple_type_size(code).unwrap_or(0),
+            funcptr::Ret::Pointer(_) => cfield::pointer_size(),
             funcptr::Ret::Aggregate(_) => 0,
         }
     }
@@ -223,7 +222,7 @@ mod imp {
         let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let use_errno = funcptr::funcptr_flags(current_obj()) & funcptr::FUNCFLAG_USE_ERRNO != 0;
         let call_result = match decode_args(current_obj(), args) {
-            Ok(decoded) => host_ctypes::with_callback_errno_preserved(use_errno, || {
+            Ok(decoded) => callproc::with_callback_errno_preserved(use_errno, || {
                 let callable = funcptr::instance_get(current_obj(), funcptr::CALLABLE_KEY)
                     .ok_or_else(|| {
                         pyre_interpreter::PyError::type_error("callback has no callable")
@@ -324,14 +323,14 @@ mod imp {
                 return Ok(cdata::pyobj_container_get(num).unwrap_or_else(pyre_object::w_none));
             }
             return Ok(cdata::decoded_to_pyobject(unsafe {
-                host_ctypes::callback_arg_value(Some(&tc), p)
+                cfield::callback_arg_value(Some(&tc), p)
             }));
         }
         if let Some(size) = cdata::ctype_size_of(at) {
             let inst = pyre_interpreter::call::type_call_instantiate(at, &[])?;
             let inst_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(inst);
-            let bytes = unsafe { host_ctypes::borrow_memory(p.cast::<u8>(), size) };
+            let bytes = unsafe { cfield::borrow_memory(p.cast::<u8>(), size) };
             cdata::cdata_write(pyre_object::gc_roots::shadow_stack_get(inst_slot), 0, bytes);
             return Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot));
         }

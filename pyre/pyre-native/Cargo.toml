@@ -25,11 +25,9 @@ lz4_flex = { version = "0.13", default-features = false, features = [
     "safe-decode",
 ], optional = true }
 
-# `wmi` calls `crate::ctypes` with no feature gate, so a Windows build of
-# host_env does not compile unless `ctypes` is on. Native targets enable it.
 # Wasm stays on the base dependency and does not link libffi.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rustpython-host_env = { workspace = true, features = ["rustls", "ctypes"] }
+rustpython-host_env = { workspace = true, features = ["rustls"] }
 rustls = { workspace = true }
 rustls-webpki = { workspace = true }
 rustls-pemfile = { workspace = true }
@@ -38,6 +36,11 @@ pem-rfc7468 = { workspace = true }
 der = { workspace = true }
 pkcs8 = { workspace = true }
 rustls-native-certs = { workspace = true }
+
+# `wmi` calls `crate::ctypes` with no feature gate, so a Windows build of
+# host_env does not compile unless `ctypes` is on.
+[target.'cfg(windows)'.dependencies]
+rustpython-host_env = { workspace = true, features = ["ctypes"] }
 
 [build-dependencies]
 cc = "1.2"

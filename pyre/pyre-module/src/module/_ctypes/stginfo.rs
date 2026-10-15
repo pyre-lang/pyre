@@ -9,16 +9,18 @@
 //! GC-correct with no Rust-side side tables.
 
 use pyre_object::PyObjectRef;
-use rustpython_host_env::ctypes as host_ctypes;
+
+use super::cfield;
+use super::ctypes_h;
 
 /// Reserved key under which the carrier lives in a ctypes type's own dict.
 const STGINFO_KEY: &str = "__stginfo__";
 
 // Storage-flag bits (subset of the full flag set).
-pub(super) const TYPEFLAG_ISPOINTER: i64 = host_ctypes::TYPEFLAG_ISPOINTER as i64;
-pub(super) const TYPEFLAG_HASPOINTER: i64 = host_ctypes::TYPEFLAG_HASPOINTER as i64;
+pub(super) const TYPEFLAG_ISPOINTER: i64 = ctypes_h::TYPEFLAG_ISPOINTER as i64;
+pub(super) const TYPEFLAG_HASPOINTER: i64 = ctypes_h::TYPEFLAG_HASPOINTER as i64;
 pub(super) const TYPEFLAG_HASUNION: i64 = 0x400;
-pub(super) const DICTFLAG_FINAL: i64 = host_ctypes::DICTFLAG_FINAL as i64;
+pub(super) const DICTFLAG_FINAL: i64 = ctypes_h::DICTFLAG_FINAL as i64;
 
 // Carrier field keys.
 const K_SIZE: &str = "size";
@@ -282,7 +284,7 @@ pub(super) fn field_size_of(t: PyObjectRef) -> Option<usize> {
         return Some(stginfo_size(info));
     }
     let tc = super::cdata::type_code_of(t)?;
-    rustpython_host_env::ctypes::simple_type_size(&tc)
+    cfield::simple_type_size(&tc)
 }
 
 /// Alignment of a ctypes type `t`: its `StgInfo` align, else the simple-type
@@ -292,5 +294,5 @@ pub(super) fn field_align_of(t: PyObjectRef) -> Option<usize> {
         return Some(stginfo_align(info));
     }
     let tc = super::cdata::type_code_of(t)?;
-    rustpython_host_env::ctypes::simple_type_align(&tc)
+    cfield::simple_type_align(&tc)
 }

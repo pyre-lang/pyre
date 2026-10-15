@@ -11,8 +11,10 @@
 //! than cached in a per-type `StgInfo`.  Reading `_type_` off the class also
 //! transparently handles user subclasses (`class MyInt(c_int)`).
 
+use super::cfield;
 use super::stginfo::ParamFunc;
 use pyre_object::PyObjectRef;
+#[cfg(windows)]
 use rustpython_host_env::ctypes as host_ctypes;
 
 /// Reserved instance-dict key holding the backing `bytearray` (root storage,
@@ -699,7 +701,7 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
     let tc =
         type_code_of(cls).ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     if tc == "O"
-        && host_ctypes::read_pointer_from_buffer(
+        && cfield::read_pointer_from_buffer(
             pyre_object::with_roots!(cls, obj => cdata_bytes(obj)).unwrap_or(&[]),
         ) == 0
     {
@@ -803,7 +805,7 @@ pub(super) fn new_simplecdata_obj(
     tc: &str,
     value: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let size = host_ctypes::simple_type_size(tc).ok_or_else(invalid_type_code_error)?;
+    let size = cfield::simple_type_size(tc).ok_or_else(invalid_type_code_error)?;
     let has_value = value.is_some();
     let _value_roots = pyre_object::gc_roots::push_roots();
     let value_slot = _value_roots.pin_roots(&[value.unwrap_or(pyre_object::PY_NULL)]);
@@ -884,8 +886,8 @@ pub(super) fn new_cdata_obj_from_bytes(
 pub(super) fn ctype_size_of(cls: PyObjectRef) -> Option<usize> {
     super::stginfo::stginfo_of(cls)
         .map(super::stginfo::stginfo_size)
-        .or_else(|| type_code_of(cls).and_then(|tc| host_ctypes::simple_type_size(&tc)))
-        .or_else(|| super::funcptr::is_funcptr_type(cls).then(host_ctypes::pointer_size))
+        .or_else(|| type_code_of(cls).and_then(|tc| cfield::simple_type_size(&tc)))
+        .or_else(|| super::funcptr::is_funcptr_type(cls).then(cfield::pointer_size))
 }
 
 /// `_SimpleCData.value` getter — `(descr, instance)`.
@@ -1014,7 +1016,7 @@ pub(crate) fn cdata_bytes(mut obj: PyObjectRef) -> Option<&'static [u8]> {
         Some(&data[off..end])
     } else if let Some(addr) = pyre_object::with_roots!(obj => baddr(obj)) {
         let sz = pyre_object::with_roots!(obj => bsz(obj)).unwrap_or(0);
-        Some(unsafe { host_ctypes::borrow_memory((addr + boff(obj)) as *const u8, sz) })
+        Some(unsafe { cfield::borrow_memory((addr + boff(obj)) as *const u8, sz) })
     } else {
         None
     }
@@ -1024,7 +1026,7 @@ pub(crate) fn cdata_bytes(mut obj: PyObjectRef) -> Option<&'static [u8]> {
 /// view.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the
-/// address arm borrows foreign memory through `host_ctypes::borrow_memory`,
+/// address arm borrows foreign memory through `cfield::borrow_memory`,
 /// which has no lifted model, and the `&[u8]` [`cdata_bytes`] hands back is
 /// two words where a residual result is one.  Every caller boxes the slice
 /// immediately, so the box happens inside the boundary and a single
@@ -1087,7 +1089,7 @@ pub fn cdata_buffer_view(
     let obj = pyre_object::gc_roots::shadow_stack_get(slot);
     let is_funcptr = unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, funcptr_cls) };
     let itemsize = if is_funcptr {
-        host_ctypes::pointer_size()
+        cfield::pointer_size()
     } else {
         super::stginfo::field_size_of(pyre_object::gc_roots::shadow_stack_get(leaf_slot))
             .unwrap_or(0)
@@ -1193,7 +1195,7 @@ pub(super) fn ctype_pep3118_format(cls: PyObjectRef, forced_big: Option<bool>) -
             format!(
                 "{}{}",
                 if big { '>' } else { '<' },
-                host_ctypes::simple_type_pep3118_code(code),
+                cfield::simple_type_pep3118_code(code),
             )
         }
     }
@@ -1304,7 +1306,7 @@ pub(super) fn cdata_write(mut obj: PyObjectRef, off: usize, bytes: &[u8]) {
             return;
         }
         let n = bytes.len().min(sz - off);
-        let dst = unsafe { host_ctypes::borrow_memory_mut((addr + off) as *mut u8, n) };
+        let dst = unsafe { cfield::borrow_memory_mut((addr + off) as *mut u8, n) };
         dst.copy_from_slice(&bytes[..n]);
     }
 }
@@ -1498,7 +1500,7 @@ pub(super) fn make_at_address(
 /// other owner.
 pub(super) fn value_for_keep(tc: &str, value: PyObjectRef, stored: &[u8]) -> Option<PyObjectRef> {
     if tc == "O" {
-        let referent = pyobj_container_get(host_ctypes::read_pointer_from_buffer(stored))?;
+        let referent = pyobj_container_get(cfield::read_pointer_from_buffer(stored))?;
         return (!unsafe { pyre_object::is_none(referent) }).then_some(referent);
     }
     is_cdata_instance(value).then_some(value)
@@ -1885,7 +1887,7 @@ pub(super) fn invalid_type_code_error() -> pyre_interpreter::PyError {
     // except AttributeError`) is skipped when the code is unsupported.
     pyre_interpreter::PyError::attribute_error(format!(
         "class must define a '_type_' attribute which must be a single character string containing one of '{}'",
-        rustpython_host_env::ctypes::simple_type_chars(),
+        cfield::simple_type_chars(),
     ))
 }
 
@@ -1898,7 +1900,7 @@ pub(super) fn invalid_type_code_error() -> pyre_interpreter::PyError {
 /// pointer and a zero-length string are the same value here.
 #[cfg(windows)]
 pub(super) fn bstr_to_pyobject(bytes: &[u8]) -> PyObjectRef {
-    let addr = host_ctypes::read_pointer_from_buffer(bytes);
+    let addr = cfield::read_pointer_from_buffer(bytes);
     if addr == 0 {
         return pyre_object::w_none();
     }
@@ -1924,12 +1926,12 @@ pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
     // `O_get` — the buffer holds the container slot, not the object.  An
     // address stored here would dangle the first time the target moved.
     if tc == "O" {
-        return pyobj_container_get(host_ctypes::read_pointer_from_buffer(bytes))
+        return pyobj_container_get(cfield::read_pointer_from_buffer(bytes))
             .unwrap_or_else(pyre_object::w_none);
     }
     // `P_get` reads a null pointer as `None`, the way `z_get` and `Z_get` read
     // a null string as one; the host's table answers the address either way.
-    if tc == "P" && host_ctypes::read_pointer_from_buffer(bytes) == 0 {
+    if tc == "P" && cfield::read_pointer_from_buffer(bytes) == 0 {
         return pyre_object::w_none();
     }
     // Cut to the code's own width first.  A return value arrives as the
@@ -1937,11 +1939,11 @@ pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
     // `c_get` is `PyBytes_FromStringAndSize(ptr, 1)` -- one byte, whatever the
     // register held above it.  Every other code already reads its own width,
     // so this reaches them as the slice they were being handed anyway.
-    let bytes = match host_ctypes::simple_type_size(tc) {
+    let bytes = match cfield::simple_type_size(tc) {
         Some(size) if size < bytes.len() => &bytes[..size],
         _ => bytes,
     };
-    decoded_to_pyobject(host_ctypes::decode_type_code(tc, bytes))
+    decoded_to_pyobject(cfield::decode_type_code(tc, bytes))
 }
 
 /// Release the BSTR a slot holds before something else is written over it.
@@ -2035,7 +2037,7 @@ pub(super) fn encode_value(
     tc: &str,
     obj: PyObjectRef,
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
-    use host_ctypes::SimpleStorageValue as V;
+    use cfield::SimpleStorageValue as V;
     let val = match tc {
         "c" => {
             if unsafe { pyre_object::is_bytes(obj) } {
@@ -2143,9 +2145,7 @@ pub(super) fn encode_value(
         "O" => V::ObjectId(pyobj_container_add(obj)),
         _ => V::Signed(pyre_interpreter::baseobjspace::int_w(obj)? as i128),
     };
-    Ok(host_ctypes::simple_storage_value_to_bytes_endian(
-        tc, val, false,
-    ))
+    Ok(cfield::simple_storage_value_to_bytes_endian(tc, val, false))
 }
 
 /// Encode `value` for storage into slot `key` of `dest`, threading `char*`
@@ -2160,9 +2160,8 @@ pub(super) fn encode_value_into(
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     if tc == "z" && unsafe { pyre_object::is_bytes(value) } {
         let raw = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
-        let copy = pyre_object::bytesobject::w_bytes_from_bytes(
-            &host_ctypes::clone_as_null_terminated(raw),
-        );
+        let copy =
+            pyre_object::bytesobject::w_bytes_from_bytes(&cfield::clone_as_null_terminated(raw));
         // Retain the copy before reading its address, so a GC triggered while
         // inserting the keepalive cannot leave the stored pointer stale.  Until
         // `keep_alive` links it into the root, only this frame holds the copy and
@@ -2173,15 +2172,15 @@ pub(super) fn encode_value_into(
         keep_alive(roots.get(base + 1), key, roots.get(base));
         let addr =
             unsafe { pyre_object::bytesobject::w_bytes_data(roots.get(base)).as_ptr() } as usize;
-        return Ok(host_ctypes::simple_storage_value_to_bytes_endian(
+        return Ok(cfield::simple_storage_value_to_bytes_endian(
             tc,
-            host_ctypes::SimpleStorageValue::Pointer(addr),
+            cfield::SimpleStorageValue::Pointer(addr),
             false,
         ));
     }
     if tc == "Z" && unsafe { pyre_object::is_str(value) } {
         let raw = unsafe { pyre_object::w_str_get_wtf8(value) };
-        let wide = host_ctypes::clone_wchar_null_terminated(raw);
+        let wide = cfield::clone_wchar_null_terminated(raw);
         let copy =
             pyre_object::with_roots!(dest, value => pyre_object::w_bytearray_from_bytes(&wide));
         let roots = pyre_object::gc_roots::push_roots();
@@ -2191,9 +2190,9 @@ pub(super) fn encode_value_into(
         let addr =
             unsafe { pyre_object::bytearrayobject::w_bytearray_data(roots.get(base)).as_ptr() }
                 as usize;
-        return Ok(host_ctypes::simple_storage_value_to_bytes_endian(
+        return Ok(cfield::simple_storage_value_to_bytes_endian(
             tc,
-            host_ctypes::SimpleStorageValue::Pointer(addr),
+            cfield::SimpleStorageValue::Pointer(addr),
             false,
         ));
     }
@@ -2212,8 +2211,8 @@ fn u64_to_pyobject(u: u64) -> PyObjectRef {
 }
 
 /// Turn a decoded scalar into a pyre object.
-pub(super) fn decoded_to_pyobject(d: host_ctypes::DecodedValue) -> PyObjectRef {
-    use host_ctypes::DecodedValue as D;
+pub(super) fn decoded_to_pyobject(d: cfield::DecodedValue) -> PyObjectRef {
+    use cfield::DecodedValue as D;
     match d {
         D::Bytes(b) => pyre_object::bytesobject::w_bytes_from_bytes(&b),
         D::Signed(i) => pyre_object::w_int_new(i),
