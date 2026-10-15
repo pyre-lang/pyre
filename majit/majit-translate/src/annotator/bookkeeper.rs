@@ -4049,12 +4049,27 @@ impl Bookkeeper {
     /// — when its item is one word
     /// (`majit_ir::rvec::rust_vec_item_kind_for_spelling`).  Every other
     /// spelling answers `None`.
+    ///
+    /// Signedness is the item lltype, not the register kind. `usize` and
+    /// `u64` are `SomeInteger(unsigned=True)` (`rint.py` `unsigned_repr`,
+    /// the type `descr.py` `get_type_flag` reads as FLAG_UNSIGNED).
+    /// `isize` and `i64` stay signed. Float and reference items still come
+    /// from `SomeRustVec::for_kind`.
     pub fn project_rust_vec(&self, ty: &str) -> Option<SomeValue> {
+        use majit_ir::rvec::VecItemKind;
         let kind =
             majit_ir::rvec::rust_vec_item_kind_for_spelling(ty, crate::layout::target_word_size())?;
-        Some(SomeValue::RustVec(super::model::SomeRustVec::for_kind(
-            kind,
-        )))
+        let s_vec = match kind {
+            VecItemKind::Int => {
+                let item = majit_ir::rvec::vec_item_spelling(ty)?.trim();
+                let unsigned = matches!(item, "usize" | "u64");
+                super::model::SomeRustVec::new(SomeValue::Integer(super::model::SomeInteger::new(
+                    false, unsigned,
+                )))
+            }
+            VecItemKind::Float | VecItemKind::Ref => super::model::SomeRustVec::for_kind(kind),
+        };
+        Some(SomeValue::RustVec(s_vec))
     }
 
     /// TODO: no upstream equivalent.  Project a Rust type

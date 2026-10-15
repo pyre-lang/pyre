@@ -378,16 +378,43 @@ impl SliceOp {
 pub const RVEC_MODULE: &str = "majit_rlib::lltypesystem::rvec";
 
 /// The raw allocator of a `Vec` header the lowering creates
-/// (`OS_RAW_MALLOC_VARSIZE_CHAR`, so an unescaped header is a virtual raw
-/// buffer).
+/// (`_rewrite_raw_malloc` for a Char array, `OS_RAW_MALLOC_VARSIZE_CHAR`).
+/// An unescaped header is a virtual raw buffer. Item buffers are not this
+/// allocator: [`vec_item_malloc_path`] is a plain residual `(count) -> addr`
+/// with no oopspec (`_rewrite_raw_malloc` non-Char, `rewrite_op_direct_call`).
 pub const VEC_HEADER_MALLOC: &str = "majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char";
 
-/// The opaque item-buffer allocator: `(allocated, itemsize, align)` → buffer
-/// address.
+/// Jitcode item-buffer leaf: `(count) -> addr`, a plain residual call with
+/// no oopspec.
+///
+/// `_rewrite_raw_malloc` keeps the oopspec only for a Char array. A `Vec`
+/// item array is a word or `f64` array, so the call is
+/// `rewrite_op_direct_call` of `_ll_1_raw_malloc_varsize(n)`. The leaf
+/// overflow-checks the byte size. `Int` and `Ref` share the word leaf
+/// (`VecItemKind::size_align` is `(word, word)` and `align_of::<usize>()`
+/// equals `align_of::<*mut u8>()`). `Float` is `(8, 8)`, so it has its own
+/// leaf. `zero` is `newlist_clear`. A zero count is the dangling alignment,
+/// as `RawVec` spells an empty buffer.
+pub fn vec_item_malloc_path(kind: VecItemKind, zero: bool) -> &'static str {
+    match (kind, zero) {
+        (VecItemKind::Int | VecItemKind::Ref, false) => {
+            "majit_rlib::lltypesystem::rvec::vec_item_malloc_word"
+        }
+        (VecItemKind::Int | VecItemKind::Ref, true) => {
+            "majit_rlib::lltypesystem::rvec::vec_item_malloc_word_zero"
+        }
+        (VecItemKind::Float, false) => "majit_rlib::lltypesystem::rvec::vec_item_malloc_f64",
+        (VecItemKind::Float, true) => "majit_rlib::lltypesystem::rvec::vec_item_malloc_f64_zero",
+    }
+}
+
+/// Item-buffer allocator: `(allocated, itemsize, align)` → buffer address.
+/// Same `Layout` as [`vec_item_malloc_path`]. Jitcode constructors call the
+/// one-argument `(count) -> addr` leaf, a plain residual call with no oopspec.
 pub const VEC_BUF_ALLOC: &str = "majit_rlib::lltypesystem::rvec::vec_buf_alloc";
 
-/// The zero-filling item-buffer allocator (`raw_malloc(..., zero=True)`):
-/// `(allocated, itemsize, align)` → buffer address.
+/// Zero-filling item-buffer allocator. Same `Layout` as [`VEC_BUF_ALLOC`];
+/// the jitcode leaf is [`vec_item_malloc_path`] with `zero` set.
 pub const VEC_BUF_ALLOC_CLEAR: &str = "majit_rlib::lltypesystem::rvec::vec_buf_alloc_clear";
 
 /// `(operation, item kind)` → helper path, rows in [`VecOp::ALL`] order and

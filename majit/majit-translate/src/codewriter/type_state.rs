@@ -1182,6 +1182,27 @@ mod tests {
         var
     }
 
+    /// `RPythonTyper.setconcretetype` of a `SomeRustVec` writes
+    /// `RustVecRepr.lowleveltype` (`rrustvec.rs` `rust_vec_lltype`).
+    /// `apply_from_flowspace_variables` copies that lltype.
+    /// `history.getkind` of the raw header stays int.
+    #[test]
+    fn apply_from_flowspace_variables_copies_signed_over_a_rust_vec_stamp() {
+        use crate::model::getkind;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+        let header = rust_vec_lltype(&LowLevelType::Signed);
+        assert_eq!(getkind(&header), ConcreteType::Signed);
+        let legacy = crate::flowspace::model::Variable::new();
+        legacy.set_concretetype(Some(LowLevelType::Signed));
+        let typed = crate::flowspace::model::Variable::new();
+        typed.set_concretetype(Some(header.clone()));
+        let mut map = crate::translator::rtyper::flowspace_adapter::LegacyToTyped::new();
+        map.insert(legacy.clone(), typed);
+        apply_from_flowspace_variables(&map);
+        assert_eq!(legacy.concretetype().as_ref(), Some(&header));
+    }
+
     #[test]
     fn reint_fused_int_lt_casts_a_ref_operand() {
         use crate::model::{ExitCase, ExitSwitch, Link};

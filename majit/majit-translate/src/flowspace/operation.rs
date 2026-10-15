@@ -189,9 +189,10 @@ pub enum OpKind {
     /// Construction of a Rust `Vec<T>` with one-word items — the
     /// `ll_vec_newemptylist_*` / `ll_vec_newlist_hint_*` helpers seen at the
     /// high level, the way `newlist` / `newlist_hint` stand for
-    /// `ll_newemptylist` / `ll_newlist_hint`. Argument 0 is the constant item
-    /// kind letter (`i`, `r`, `f`); an optional argument 1 is the capacity
-    /// hint.
+    /// `ll_newemptylist` / `ll_newlist_hint`. Argument 0 is a constant item
+    /// lowleveltype (`lltype.py` `malloc` / `ann_malloc`: `Signed`,
+    /// `Unsigned`, `Float`, or `GCREF`). An optional argument 1 is the
+    /// capacity hint; arguments 1 and 2 are the fill count and value.
     NewRustVec,
     Pow,
     Iter,
@@ -2706,24 +2707,37 @@ impl HLOperation {
                     OpKind::NewStringBuilder => Ok(Some(SomeValue::StringBuilder(
                         crate::annotator::model::SomeStringBuilder::new(),
                     ))),
-                    // The constant kind letter fixes the item annotation;
-                    // the capacity hint does not refine it.
+                    // `lltype.py` `malloc` / `ann_malloc` takes a constant
+                    // lowleveltype and annotates from it. `llannotation.py`
+                    // `lltype_to_annotation` maps an integer item:
+                    // `Unsigned` → `SomeInteger(unsigned=True)`, `Signed` →
+                    // `SomeInteger()`. Float and reference items stay
+                    // `SomeRustVec::for_kind`. The result concretetype is
+                    // not an annotation input.
                     OpKind::NewRustVec => {
-                        let kind = match self.args.first() {
-                            Some(Hlvalue::Constant(c)) => c
-                                .value
-                                .as_text()
-                                .and_then(|text| text.chars().next())
-                                .and_then(majit_ir::rvec::VecItemKind::from_kind_char),
-                            _ => None,
-                        };
-                        let kind = kind.ok_or_else(|| {
+                        let bad_item = || {
                             AnnotatorError::new(
-                                "newrustvec: argument 0 must be a constant kind letter",
+                                "newrustvec: argument 0 must be a constant item lowleveltype",
                             )
-                        })?;
+                        };
+                        let item = match self.args.first() {
+                            Some(Hlvalue::Constant(c)) => match &c.value {
+                                crate::flowspace::model::ConstValue::LowLevelType(ll) => {
+                                    ll.as_ref().clone()
+                                }
+                                _ => return Err(bad_item()),
+                            },
+                            _ => return Err(bad_item()),
+                        };
+                        let kind = crate::translator::rtyper::rrustvec::vec_item_kind_of(&item)
+                            .ok_or_else(bad_item)?;
+                        let s_item = if kind == majit_ir::rvec::VecItemKind::Int {
+                            crate::translator::rtyper::llannotation::lltype_to_annotation(item)
+                        } else {
+                            *crate::annotator::model::SomeRustVec::for_kind(kind).s_item
+                        };
                         Ok(Some(SomeValue::RustVec(
-                            crate::annotator::model::SomeRustVec::for_kind(kind),
+                            crate::annotator::model::SomeRustVec::new(s_item),
                         )))
                     }
                     // operation.py — NewSlice.consider raises

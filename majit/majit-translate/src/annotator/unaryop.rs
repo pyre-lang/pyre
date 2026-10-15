@@ -6785,17 +6785,37 @@ mod tests {
     #[test]
     fn rust_vec_ops_annotate_from_the_item_kind() {
         use crate::flowspace::model::{Constant, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
         use majit_ir::rvec::VecItemKind;
         let ann = mk_ann();
-        for kind in VecItemKind::ALL {
-            let letter = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                kind.kind_char().to_string(),
-            )));
-            let hl = HLOperation::new(OpKind::NewRustVec, vec![letter]);
+        // `lltype.py` `malloc` / `ann_malloc` annotates from a constant
+        // item lowleveltype. `llannotation.py` `lltype_to_annotation`
+        // maps `Unsigned` to `SomeInteger(unsigned=True)`.
+        let cases = [
+            (LowLevelType::Signed, VecItemKind::Int, false),
+            (LowLevelType::Unsigned, VecItemKind::Int, true),
+            (LowLevelType::Float, VecItemKind::Float, false),
+            (GCREF.clone(), VecItemKind::Ref, false),
+        ];
+        for (item, kind, unsigned) in cases {
+            let item_const =
+                Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item))));
+            let hl = HLOperation::new(OpKind::NewRustVec, vec![item_const]);
             let Some(SomeValue::RustVec(s_vec)) = hl.consider(&ann).unwrap() else {
                 panic!("newrustvec must type as SomeRustVec");
             };
             assert_eq!(s_vec.item_kind(), Some(kind));
+            if kind == VecItemKind::Int {
+                let SomeValue::Integer(s_int) = &*s_vec.s_item else {
+                    panic!("int item must be SomeInteger, got {:?}", s_vec.s_item);
+                };
+                assert_eq!(s_int.unsigned, unsigned);
+            } else {
+                assert_eq!(
+                    s_vec.s_item.as_ref(),
+                    SomeRustVec::for_kind(kind).s_item.as_ref()
+                );
+            }
             let s_self = SomeValue::RustVec(s_vec);
             for (name, analyser) in [
                 ("append", "rustvec_method_append"),
@@ -6816,6 +6836,13 @@ mod tests {
             vec![Hlvalue::Constant(Constant::new(ConstValue::byte_str("x")))],
         );
         assert!(bad.consider(&ann).is_err());
+        let void_item = HLOperation::new(
+            OpKind::NewRustVec,
+            vec![Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(
+                Box::new(LowLevelType::Void),
+            )))],
+        );
+        assert!(void_item.consider(&ann).is_err());
     }
 
     #[test]

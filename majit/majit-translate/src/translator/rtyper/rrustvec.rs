@@ -454,10 +454,15 @@ pub fn pair_rustvec_integer_convert_from_to(
     )
 }
 
-/// `newrustvec(kind)` / `newrustvec(kind, lengthhint)` — `ll_newemptylist` /
+/// `newrustvec(ITEM)` / `newrustvec(ITEM, lengthhint)` — `ll_newemptylist` /
 /// `ll_newlist_hint` for the result repr.
 ///
-/// `newrustvec(kind, count, item)` follows `rtype_alloc_and_set`: the fill
+/// Argument 0 is the constant item lowleveltype (`lltype.py` `malloc` /
+/// `ann_malloc`). The result lowleveltype stays `rust_vec_lltype(ITEM)` on
+/// `hop.r_result`; this does not re-read the constant. `inputarg` starts at
+/// index 1.
+///
+/// `newrustvec(ITEM, count, item)` follows `rtype_alloc_and_set`: the fill
 /// value converts through the result repr's `item_repr`. `ListRepr._setup_repr`
 /// and `FixedSizeListRepr._setup_repr` keep that field from `s_item` when it
 /// is missing; [`RustVecRepr`] stores the same field from `SomeRustVec.s_item`
@@ -479,7 +484,7 @@ pub fn rtype_newrustvec(hop: &HighLevelOp) -> RTypeResult {
     let kind = rust_vec_item_kind(&lltype)
         .ok_or_else(|| TyperError::message("rtype_newrustvec: result is not a RustVec header"))?;
     hop.exception_cannot_occur()?;
-    // `newrustvec(kind, count, item)` — `rlist.py ll_alloc_and_set`.
+    // `newrustvec(ITEM, count, item)` — `rlist.py ll_alloc_and_set`.
     // `hop.inputargs(Signed, r_list.item_repr)`: a GC item has no primitive
     // repr (`rtyper.py getprimitiverepr`), so the fill must convert through
     // the vec's item repr the way `rtype_alloc_and_set` does.
@@ -531,6 +536,7 @@ mod tests {
     fn header_lltype_is_a_raw_int_kind_pointer() {
         for (item, kind) in [
             (LowLevelType::Signed, VecItemKind::Int),
+            (LowLevelType::Unsigned, VecItemKind::Int),
             (LowLevelType::Float, VecItemKind::Float),
         ] {
             let ty = rust_vec_lltype(&item);
@@ -594,6 +600,113 @@ mod tests {
         );
     }
 
+    /// `Vec<usize>` / `Vec<u64>` annotate as an unsigned integer item and
+    /// lower to `Array(Unsigned)` (`rint.py` `unsigned_repr`). `Vec<isize>`
+    /// / `Vec<i64>` stay `Array(Signed)`. Both register kinds are `Int`
+    /// (`getkind` of `Unsigned` is the int kind). The existing
+    /// `SomeInteger` union makes the result unsigned when the signed side
+    /// is nonneg (`binaryop.py` `pairtype(SomeInteger, SomeInteger).union`).
+    #[test]
+    fn vec_usize_annotation_lowers_to_array_unsigned() {
+        use crate::annotator::model::{SomeInteger, SomeRustVec, SomeValue};
+        let (ann, rtyper) = setup_rtyper();
+        let mut cases = vec![
+            ("Vec<usize>", true, LowLevelType::Unsigned),
+            ("*mut Vec<usize>", true, LowLevelType::Unsigned),
+            ("Vec<isize>", false, LowLevelType::Signed),
+            ("*mut Vec<isize>", false, LowLevelType::Signed),
+        ];
+        if crate::layout::target_word_size() == 8 {
+            cases.push(("Vec<u64>", true, LowLevelType::Unsigned));
+            cases.push(("Vec<i64>", false, LowLevelType::Signed));
+        }
+        for (spelling, unsigned, item_ll) in cases {
+            let Some(SomeValue::RustVec(s_vec)) = ann.bookkeeper.project_rust_vec(spelling) else {
+                panic!("{spelling} must project to SomeRustVec");
+            };
+            let SomeValue::Integer(s_int) = &*s_vec.s_item else {
+                panic!(
+                    "{spelling} item must be SomeInteger, got {:?}",
+                    s_vec.s_item
+                );
+            };
+            assert_eq!(s_int.unsigned, unsigned, "{spelling}");
+            assert_eq!(s_vec.item_kind(), Some(VecItemKind::Int), "{spelling}");
+            let repr = rtyper
+                .getrepr(&SomeValue::RustVec(s_vec))
+                .unwrap_or_else(|err| panic!("getrepr {spelling}: {err:?}"));
+            let item = rust_vec_item_lltype(repr.lowleveltype()).expect("header item lltype");
+            assert_eq!(item, &item_ll, "{spelling}");
+            assert_eq!(vec_item_kind_of(item), Some(VecItemKind::Int), "{spelling}");
+        }
+        let unsigned = SomeValue::RustVec(SomeRustVec::new(SomeValue::Integer(SomeInteger::new(
+            false, true,
+        ))));
+        let signed_nonneg = SomeValue::RustVec(SomeRustVec::new(SomeValue::Integer(
+            SomeInteger::new(true, false),
+        )));
+        let SomeValue::RustVec(joined) =
+            crate::annotator::model::union(&unsigned, &signed_nonneg).expect("RustVec union")
+        else {
+            panic!("RustVec ∪ RustVec must stay a RustVec");
+        };
+        let SomeValue::Integer(s_int) = &*joined.s_item else {
+            panic!("joined item must be SomeInteger");
+        };
+        assert!(s_int.unsigned);
+        assert!(s_int.nonneg);
+    }
+
+    /// `newrustvec` annotates from the constant item lowleveltype
+    /// (`lltype.py` `malloc` / `ann_malloc`, `llannotation.py`
+    /// `lltype_to_annotation`). A stamped result header is not an input:
+    /// `Unsigned` stays unsigned even when the result concretetype is a
+    /// signed header.
+    #[test]
+    fn newrustvec_item_lltype_annotates_integer_signedness() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::{Constant, Hlvalue, Variable};
+        use crate::flowspace::operation::{HLOperation, OpKind};
+        let (ann, _rtyper) = setup_rtyper();
+        let item_const = |item: LowLevelType| {
+            Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item))))
+        };
+        let signed_op = HLOperation {
+            kind: OpKind::NewRustVec,
+            args: vec![item_const(LowLevelType::Signed)],
+            result: Variable::new(),
+            offset: -1,
+        };
+        let Some(SomeValue::RustVec(s_vec)) = signed_op.consider(&ann).expect("consider signed")
+        else {
+            panic!("newrustvec must annotate SomeRustVec");
+        };
+        let SomeValue::Integer(s_int) = &*s_vec.s_item else {
+            panic!("item must be SomeInteger");
+        };
+        assert!(!s_int.unsigned);
+        assert_eq!(s_vec.item_kind(), Some(VecItemKind::Int));
+
+        let unsigned_result = Variable::new();
+        unsigned_result.set_concretetype(Some(rust_vec_lltype(&LowLevelType::Signed)));
+        let unsigned_op = HLOperation {
+            kind: OpKind::NewRustVec,
+            args: vec![item_const(LowLevelType::Unsigned)],
+            result: unsigned_result,
+            offset: -1,
+        };
+        let Some(SomeValue::RustVec(s_vec)) =
+            unsigned_op.consider(&ann).expect("consider unsigned")
+        else {
+            panic!("newrustvec must annotate SomeRustVec");
+        };
+        let SomeValue::Integer(s_int) = &*s_vec.s_item else {
+            panic!("item must be SomeInteger");
+        };
+        assert!(s_int.unsigned);
+        assert_eq!(s_vec.item_kind(), Some(VecItemKind::Int));
+    }
+
     /// Every item kind has a repr whose lowleveltype is the int-kind header
     /// and whose helper choice is the `majit_ir::rvec` table's.
     #[test]
@@ -622,7 +735,7 @@ mod tests {
         }
     }
 
-    /// `newrustvec(kind)` and `newrustvec(kind, hint)` go through the
+    /// `newrustvec(ITEM)` and `newrustvec(ITEM, hint)` go through the
     /// rtyper's `translate_operation` to `ll_vec_newemptylist_*` /
     /// `ll_vec_newlist_hint_*`.
     #[test]
@@ -639,10 +752,13 @@ mod tests {
                 )));
                 let v_result = Variable::new();
                 v_result.set_concretetype(Some(r.lowleveltype().clone()));
-                let kind_letter = Hlvalue::Constant(crate::flowspace::model::Constant::new(
-                    ConstValue::byte_str(kind.kind_char().to_string()),
+                let item = rust_vec_item_lltype(r.lowleveltype())
+                    .expect("header item lltype")
+                    .clone();
+                let item_const = Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                    ConstValue::LowLevelType(Box::new(item)),
                 ));
-                let mut args = vec![kind_letter];
+                let mut args = vec![item_const];
                 if with_hint {
                     args.push(crate::translator::rtyper::rtyper::constant_with_lltype(
                         ConstValue::Int(8),
@@ -674,7 +790,7 @@ mod tests {
         }
     }
 
-    /// `newrustvec(kind, count, item)` converts the fill value through the
+    /// `newrustvec(ITEM, count, item)` converts the fill value through the
     /// result `RustVecRepr.item_repr` (`rtype_alloc_and_set`). A classdef-less
     /// `SomeRustVec.s_item` is the root `InstanceRepr`; a concrete instance
     /// argument upcasts with `pair_instance_instance_convert_from_to`. `Int`
@@ -769,7 +885,7 @@ mod tests {
         }
     }
 
-    /// Build `newrustvec(kind, count, item)` and rtype it. `r_item` is the
+    /// Build `newrustvec(ITEM, count, item)` and rtype it. `r_item` is the
     /// source repr of the fill value; the result repr supplies `item_repr`.
     fn rtype_alloc_and_set(
         rtyper: &std::rc::Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
@@ -787,9 +903,11 @@ mod tests {
         )));
         let v_result = Variable::new();
         v_result.set_concretetype(Some(r_vec.lowleveltype().clone()));
-        let kind = rust_vec_item_kind(r_vec.lowleveltype()).expect("RustVec item kind");
-        let kind_letter = Hlvalue::Constant(crate::flowspace::model::Constant::new(
-            ConstValue::byte_str(kind.kind_char().to_string()),
+        let item = rust_vec_item_lltype(r_vec.lowleveltype())
+            .cloned()
+            .expect("header item lltype");
+        let item_const = Hlvalue::Constant(crate::flowspace::model::Constant::new(
+            ConstValue::LowLevelType(Box::new(item)),
         ));
         let v_count = Variable::new();
         v_count.set_concretetype(Some(LowLevelType::Signed));
@@ -801,7 +919,7 @@ mod tests {
             rtyper.clone(),
             SpaceOperation::new(
                 "newrustvec".to_string(),
-                vec![kind_letter.clone(), v_count_h.clone(), v_item_h.clone()],
+                vec![item_const.clone(), v_count_h.clone(), v_item_h.clone()],
                 Hlvalue::Variable(v_result),
             ),
             Vec::new(),
@@ -809,7 +927,7 @@ mod tests {
         );
         hop.args_v
             .borrow_mut()
-            .extend([kind_letter, v_count_h, v_item_h]);
+            .extend([item_const, v_count_h, v_item_h]);
         hop.args_s.borrow_mut().extend([
             SomeValue::Impossible,
             SomeValue::Impossible,
