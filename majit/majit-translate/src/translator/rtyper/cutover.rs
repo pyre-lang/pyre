@@ -3548,15 +3548,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["v"],
         LowLevelType::Signed,
     ),
-    // `usize::saturating_mul(self, rhs) -> usize` clamps the product at the
-    // type max.  The residual computes the clamped product; only the
-    // `Unsigned` scalar result is modeled.  The census uses are all `usize`
-    // capacity/count growth (`IntArray`/`FloatArray::grow`, `deque_repeat`).
-    (
-        &["core", "num", "<Impl>", "saturating_mul"],
-        &["self", "rhs"],
-        LowLevelType::Unsigned,
-    ),
     (
         &["core", "f64", "<Impl>", "is_infinite"],
         &["self"],
@@ -3789,6 +3780,28 @@ pub(crate) fn register_deref_write_external(registry: &CallRegistry) {
     );
 }
 
+/// Residual `core::num::<Impl>::saturating_{add,sub,mul}` stubs keyed by
+/// receiver knowntype (`specialize.py specialize_argtype` /
+/// `SomeInteger(knowntype=...)` / `rarithmetic.r_uint`).  Charon's
+/// `<Impl>` path is shared across integer widths; a single Unsigned
+/// stub would annotate `i64::saturating_mul` as `r_uint`.
+fn register_saturating_arith_externals(registry: &CallRegistry) {
+    use crate::translator::rtyper::call_registry::CORE_NUM_SATURATING_ARITH_LEAVES;
+    for leaf in CORE_NUM_SATURATING_ARITH_LEAVES {
+        for (knowntype, return_lltype) in [
+            ("int", LowLevelType::Signed),
+            ("r_uint", LowLevelType::Unsigned),
+        ] {
+            register_opaque_external(
+                registry,
+                &["core", "num", "<Impl>", knowntype, leaf],
+                &["self", "rhs"],
+                return_lltype,
+            );
+        }
+    }
+}
+
 /// Register the [`FOREIGN_STDLIB_EXTERNALS`] table into `registry`.
 ///
 /// Faithful analog of `extfuncregistry.py`'s `_register` table being
@@ -3807,6 +3820,7 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
         register_opaque_external(registry, segments, argnames, return_lltype.clone());
     }
+    register_saturating_arith_externals(registry);
     // `<[T]>::to_vec` leftover the pair-slice rewrite did not retarget
     // (`front::mir` `is_slice_to_vec` only fires on an enabled pair
     // receiver). Analog of `extfunc.py register_external` returning a
@@ -10438,6 +10452,130 @@ mod tests {
                 .lookup(&FunctionPathKey::from_segments(["cell", "RefCell", "get"]))
                 .is_none(),
             "RefCell::get is not Cell::get"
+        );
+    }
+
+    fn saturating_mul_call_graph(
+        result_ty: ValueType,
+    ) -> (LegacyGraph, crate::flowspace::model::Variable) {
+        let mut graph = LegacyGraph::new("saturating_mul_call");
+        let vars = mint_vars(&mut graph, 4);
+        let result = vars[3].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path([
+                        "core",
+                        "num",
+                        "<Impl>",
+                        "saturating_mul",
+                    ]),
+                    args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![result.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        setbinding(&vars[1], result_ty.clone());
+        setbinding(&vars[2], result_ty);
+        (graph, result)
+    }
+
+    fn saturating_mul_result_is_unsigned(
+        value_to_var: &LegacyToTyped,
+        result: &crate::flowspace::model::Variable,
+    ) -> bool {
+        match value_to_var.get(result).and_then(|typed| {
+            typed
+                .annotation
+                .borrow()
+                .as_ref()
+                .map(|cell| (**cell).clone())
+        }) {
+            Some(crate::annotator::model::SomeValue::Integer(i)) => i.unsigned,
+            other => panic!("saturating_mul result must be SomeInteger, got {other:?}"),
+        }
+    }
+
+    /// `i64::saturating_mul` must not reuse the `usize` residual
+    /// (`specialize.py specialize_argtype` / `SomeInteger(knowntype=...)`
+    /// / `rarithmetic.r_uint`).
+    #[test]
+    fn saturating_mul_signed_result_annotates_signed_usize_stays_unsigned() {
+        let _lock = anchor_lock();
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let keys = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_foreign_stdlib_externals(&keys);
+
+        let shared = FunctionPathKey::from_segments(["core", "num", "<Impl>", "saturating_mul"]);
+        let signed_key =
+            FunctionPathKey::from_segments(["core", "num", "<Impl>", "int", "saturating_mul"]);
+        let unsigned_key =
+            FunctionPathKey::from_segments(["core", "num", "<Impl>", "r_uint", "saturating_mul"]);
+        assert!(
+            keys.lookup(&shared).is_none(),
+            "untyped <Impl> saturating_mul must not mint a shared residual"
+        );
+        let signed_host = keys
+            .lookup(&signed_key)
+            .expect("int saturating_mul stub")
+            .host_object
+            .identity_id();
+        let unsigned_host = keys
+            .lookup(&unsigned_key)
+            .expect("r_uint saturating_mul stub")
+            .host_object
+            .identity_id();
+        assert_ne!(
+            signed_host, unsigned_host,
+            "i64 and usize saturating_mul must be distinct FunctionDescs"
+        );
+
+        let signed_registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_foreign_stdlib_externals(&signed_registry);
+        let (signed_graph, signed_result) = saturating_mul_call_graph(ValueType::Int);
+        let (signed_map, _) = specialize_legacy_graph_with_registry_returning_value_to_var(
+            &signed_graph,
+            &signed_registry,
+        )
+        .expect("i64 saturating_mul annotates");
+        assert!(
+            !saturating_mul_result_is_unsigned(&signed_map, &signed_result),
+            "i64::saturating_mul result annotates signed"
+        );
+
+        let unsigned_registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_foreign_stdlib_externals(&unsigned_registry);
+        let (unsigned_graph, unsigned_result) = saturating_mul_call_graph(ValueType::Unsigned);
+        let (unsigned_map, _) = specialize_legacy_graph_with_registry_returning_value_to_var(
+            &unsigned_graph,
+            &unsigned_registry,
+        )
+        .expect("usize saturating_mul annotates");
+        assert!(
+            saturating_mul_result_is_unsigned(&unsigned_map, &unsigned_result),
+            "usize::saturating_mul result stays unsigned"
         );
     }
 

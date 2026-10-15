@@ -2704,7 +2704,12 @@ pub fn translate_op(
         //   UnsupportedExpr               — frontend coverage gap; fail-loud
         //                                    surfaces the missing
         //                                    `front::mir` arm.
-        OpKind::Call { target, args, .. } => {
+        OpKind::Call {
+            target,
+            args,
+            result_ty,
+            ..
+        } => {
             use crate::model::CallTarget;
             let arg_hls: Result<Vec<_>, _> = args
                 .iter()
@@ -3561,10 +3566,15 @@ pub fn translate_op(
                                 .to_string(),
                         ));
                     }
-                    let key =
+                    let key = crate::translator::rtyper::call_registry::saturating_arith_registry_key(
+                        segments,
+                        result_ty,
+                    )
+                    .unwrap_or_else(|| {
                         crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
-                        );
+                        )
+                    });
                     // Method-routing for a registered dispatch family
                     // (issue #346).  `front::mir`'s `CallKind::Trait` arm
                     // lowers `<Trait>::method(receiver, …)` to a
