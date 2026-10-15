@@ -8317,15 +8317,10 @@ pub fn pyframe_failed_attr_cleanup_descr() -> DescrRef {
 }
 
 /// `PyFrame.vable_token` — the virtualizable token, a GCREF row of this
-/// group (`VirtualizableInstanceRepr._setup_repr_llfields`). Located by
-/// offset like [`pyframe_flags_descr`].
+/// group (`VirtualizableInstanceRepr._setup_repr_llfields`).
+/// `cpu.fielddescrof(VTYPE, 'vable_token')` is keyed by fieldname.
 pub fn pyframe_vable_token_descr() -> DescrRef {
-    let index = PYFRAME_DESCR_GROUP
-        .field_descrs
-        .iter()
-        .position(|d| d.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET)
-        .expect("PyFrame descr group has no vable_token field");
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "vable_token")
 }
 
 #[cfg(test)]
@@ -9483,19 +9478,86 @@ mod tests {
         let descr = pyframe_size_descr();
         let size = descr.as_size_descr().expect("PyFrame SizeDescr");
         assert!(
-            size.all_fielddescrs()
-                .iter()
-                .any(|fd| fd.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET),
+            size.all_fielddescrs().iter().any(|fd| {
+                majit_ir::descr::cache_fieldname(fd.field_key()) == "vable_token"
+                    && fd.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET
+            }),
             "heaptracker.py all_fielddescrs includes vable_token so the \
              codewriter's store resolves through the same Arc"
         );
         assert!(
             size.gc_fielddescrs().iter().any(|fd| {
-                fd.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET
+                majit_ir::descr::cache_fieldname(fd.field_key()) == "vable_token"
+                    && fd.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET
                     && fd.field_type() == Type::Ref
             }),
             "VirtualizableInstanceRepr._setup_repr_llfields types the token \
              GCREF, so it is a gc_fielddescrs row clear_gc_fields zeroes"
+        );
+    }
+
+    /// Every listed PyFrame descr offset is the host `offset_of!`. An LLBC
+    /// row that reused another field's name at a different byte (Windows
+    /// `vable_token` at 16 vs rust 64) fails here on that host.
+    #[test]
+    fn pyframe_listed_descr_offsets_match_host_offset_of() {
+        LazyLock::force(&PYFRAME_DESCR_GROUP);
+        let size = pyframe_size_descr();
+        let sd = size.as_size_descr().expect("PyFrame SizeDescr");
+        let want = [
+            (
+                "locals_cells_stack_w",
+                crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+            ),
+            (
+                "valuestackdepth",
+                crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
+            ),
+            ("last_instr", crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET),
+            ("pycode", crate::frame_layout::PYFRAME_PYCODE_OFFSET),
+            ("debugdata", crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET),
+            (
+                "f_generator_wref",
+                crate::frame_layout::PYFRAME_F_GENERATOR_WREF_OFFSET,
+            ),
+            (
+                "w_yielding_from",
+                crate::frame_layout::PYFRAME_W_YIELDING_FROM_OFFSET,
+            ),
+            ("f_backref", crate::frame_layout::PYFRAME_F_BACKREF_OFFSET),
+            ("w_builtin", crate::frame_layout::PYFRAME_W_BUILTIN_OFFSET),
+            ("flags", crate::frame_layout::PYFRAME_FLAGS_OFFSET),
+            (
+                "failed_attr_cleanup",
+                crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+            ),
+            (
+                "vable_token",
+                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
+            ),
+            ("w_class", pyre_object::pyobject::W_CLASS_OFFSET),
+        ];
+        for (name, offset) in want {
+            let row = sd
+                .all_fielddescrs()
+                .iter()
+                .find(|fd| majit_ir::descr::cache_fieldname(fd.field_key()) == name);
+            let row = row.unwrap_or_else(|| panic!("PyFrame all_fielddescrs has no {name}"));
+            assert_eq!(
+                row.offset(),
+                offset,
+                "listed {name} offset must equal host offset_of!"
+            );
+        }
+        let named = pyframe_vable_token_descr();
+        let named_fd = named.as_field_descr().expect("vable_token FieldDescr");
+        assert_eq!(
+            majit_ir::descr::cache_fieldname(named_fd.field_key()),
+            "vable_token"
+        );
+        assert_eq!(
+            named_fd.offset(),
+            crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET
         );
     }
 

@@ -17,7 +17,10 @@
 use indexmap::IndexMap;
 use std::sync::{Arc, Weak};
 
-use majit_ir::{DescrRef, Type, Value, descr::descr_identity};
+use majit_ir::{
+    DescrRef, Type, Value,
+    descr::{FieldDescr, cache_fieldname, descr_identity},
+};
 
 /// `virtualizable.py TOKEN_TRACING_RESCALL`: the GCREF address of the
 /// prebuilt `JITFRAME_DUMMY` object shared with virtual references.
@@ -322,6 +325,24 @@ impl majit_ir::descr::VinfoMarker for VirtualizableInfo {
     }
 }
 
+/// `descr.py get_field_descr` / `cpu.fielddescrof(VTYPE, name)`: the listed
+/// SizeDescr row whose STRUCT-local name *and* byte offset both match.
+///
+/// Offset-only first-wins is not that lookup. A decoy Ref listed first at
+/// the token's offset (or an LLBC row that reused the token offset for
+/// another name, e.g. Windows `pycode` at 16 vs `vable_token` at 64) would
+/// steal `vable_token_descr`.
+fn listed_struct_field(descr: &DescrRef, field_name: &str, offset: usize) -> Option<DescrRef> {
+    let leaf = cache_fieldname(field_name);
+    descr.as_size_descr().and_then(|sd| {
+        sd.all_fielddescrs()
+            .iter()
+            .find(|fd| cache_fieldname(fd.field_key()) == leaf && fd.offset() == offset)
+            .cloned()
+            .map(|fd| fd as DescrRef)
+    })
+}
+
 impl VirtualizableInfo {
     /// `virtualizable.py VirtualizableInfo.unwrap_virtualizable_box`.
     ///
@@ -473,40 +494,38 @@ impl VirtualizableInfo {
                 )
             })
             .collect();
-        // Parent-struct-layout descrs, looked up by offset from the parent
-        // SizeDescr's canonical `all_fielddescrs()`. Used only when a vable
-        // field op targets a force-materialized inline-callee VIRTUAL frame:
-        // its construction (`NewWithVtable` + `SetfieldGc`) uses the parent
-        // struct descrs, and the optimizer pairs reads/writes on a virtual by
-        // `index_in_parent`, so the vable op must record the struct descr (whose
-        // `index_in_parent` follows struct declaration order) rather than the
-        // vinfo descr (whose `index_in_parent` follows `[token, statics,
-        // arrays]`). When the parent exposes no field at a vinfo field's offset
-        // (e.g. the synthetic test VTYPE, or a layout without `all_fielddescrs`),
-        // fall back to the vinfo descr — for those the two orderings coincide.
-        let struct_descr_at = |offset: usize, fallback: &DescrRef| -> DescrRef {
-            descr
-                .as_size_descr()
-                .and_then(|sd| {
-                    sd.all_fielddescrs()
-                        .iter()
-                        .find(|fd| fd.offset() == offset)
-                        .cloned()
-                })
-                .map(|fd| fd as DescrRef)
-                .unwrap_or_else(|| fallback.clone())
+        // Parent-struct-layout descrs, looked up by (fieldname, offset) from
+        // the parent SizeDescr's canonical `all_fielddescrs()`. Used only when
+        // a vable field op targets a force-materialized inline-callee VIRTUAL
+        // frame: its construction (`NewWithVtable` + `SetfieldGc`) uses the
+        // parent struct descrs, and the optimizer pairs reads/writes on a
+        // virtual by `index_in_parent`, so the vable op must record the struct
+        // descr (whose `index_in_parent` follows struct declaration order)
+        // rather than the vinfo descr (whose `index_in_parent` follows
+        // `[token, statics, arrays]`). When the parent exposes no field of
+        // that name at a vinfo field's offset (e.g. the synthetic test VTYPE,
+        // or a layout without `all_fielddescrs`), fall back to the vinfo
+        // descr — for those the two orderings coincide.
+        //
+        // Offset-only matching is not `cpu.fielddescrof(VTYPE, name)`: the
+        // first listed row at that byte wins, so a Windows PyFrame whose
+        // `pycode` sits at 16 while `token_offset` is 64 still stores the
+        // token, but a same-offset decoy (or an LLBC row that reused the
+        // token's offset for another name) would steal the slot.
+        let struct_descr_at = |name: &str, offset: usize, fallback: &DescrRef| -> DescrRef {
+            listed_struct_field(descr, name, offset).unwrap_or_else(|| fallback.clone())
         };
         self._static_field_struct_descrs = self
             .static_fields
             .iter()
             .enumerate()
-            .map(|(i, f)| struct_descr_at(f.offset, &self._static_field_descrs[i]))
+            .map(|(i, f)| struct_descr_at(&f.name, f.offset, &self._static_field_descrs[i]))
             .collect();
         self._array_field_struct_descrs = self
             .array_fields
             .iter()
             .enumerate()
-            .map(|(j, a)| struct_descr_at(a.field_offset, &self._array_field_descrs[j]))
+            .map(|(j, a)| struct_descr_at(&a.name, a.field_offset, &self._array_field_descrs[j]))
             .collect();
         // virtualizable.py `cpu.fielddescrof(VTYPE, 'vable_token')` is
         // `descr.py get_field_descr`'s cached object, the same row
@@ -517,12 +536,11 @@ impl VirtualizableInfo {
         // then sees a leftover that is not a position in
         // `all_fielddescrs`. Prefer the listed geometry and stamp the
         // vinfo backref onto a clone so `get_vinfo()` still resolves.
-        if let Some(listed) = descr.as_size_descr().and_then(|sd| {
-            sd.all_fielddescrs()
-                .iter()
-                .find(|fd| fd.offset() == self.token_offset)
-                .cloned()
-        }) {
+        // Name and offset must both match: an LLBC row named `vable_token`
+        // at a different byte is not the host `offset_of!` slot, and a
+        // different name at `token_offset` is not `fielddescrof(...,
+        // 'vable_token')`. Either mismatch keeps the minted descr.
+        if let Some(listed) = listed_struct_field(descr, "vable_token", self.token_offset) {
             if let Some(simple) = listed
                 .as_any()
                 .and_then(|any| any.downcast_ref::<majit_ir::SimpleFieldDescr>())
@@ -533,7 +551,7 @@ impl VirtualizableInfo {
                 }
                 self.vable_token_descr = Some(std::sync::Arc::new(token));
             } else {
-                self.vable_token_descr = Some(listed as DescrRef);
+                self.vable_token_descr = Some(listed);
             }
         }
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
@@ -1951,6 +1969,49 @@ mod tests {
                 Arc::as_ptr(&info),
             ));
         }
+    }
+
+    /// Offset-only remap would take the first listed Ref at `token_offset`,
+    /// even when that row is `pycode`. `cpu.fielddescrof(VTYPE, 'vable_token')`
+    /// is name+offset. Fails on any host without the name match, including
+    /// macOS.
+    #[test]
+    fn token_remap_picks_vable_token_name_not_a_same_offset_decoy() {
+        let token_offset = 64;
+        let decoy = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            token_offset,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "pycode".to_string(),
+            "pycode",
+        );
+        let token = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            token_offset,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "vable_token".to_string(),
+            "vable_token",
+        );
+        let sd = majit_ir::descr::SimpleSizeDescr::new(0, 72, 0).with_all_fielddescrs(vec![
+            std::sync::Arc::new(decoy) as std::sync::Arc<dyn FieldDescr>,
+            std::sync::Arc::new(token) as std::sync::Arc<dyn FieldDescr>,
+        ]);
+        let descr: DescrRef = std::sync::Arc::new(sd);
+        let info = VirtualizableInfo::new(token_offset).finalize_arc(descr);
+        let token_descr = info.token_field_descr();
+        let fd = token_descr.as_field_descr().expect("token FieldDescr");
+        assert_eq!(
+            cache_fieldname(fd.field_key()),
+            "vable_token",
+            "offset-first remap would have kept the pycode decoy"
+        );
+        assert_eq!(fd.offset(), token_offset);
     }
 
     #[test]

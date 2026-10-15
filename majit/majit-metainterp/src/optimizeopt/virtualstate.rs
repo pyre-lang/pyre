@@ -3503,10 +3503,8 @@ mod tests {
         ctx.set_ptr_info(
             &struct_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr: test_descr(21),
                 fields: vec![(0, Operand::None), (1, written_box)].into(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                ..VirtualStructInfo::new(test_descr(21))
             }),
         );
 
@@ -3545,15 +3543,7 @@ mod tests {
         // VStruct walker to descend; mirror by attaching a virtual
         // PtrInfo to the corresponding OpRef.
         let b11 = ctx.materialize_operand_at(OpRef::ref_op(11));
-        ctx.set_ptr_info(
-            &b11,
-            PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr,
-                fields: Default::default(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-            }),
-        );
+        ctx.set_ptr_info(&b11, PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let inputargs = state
             .make_inputargs(
@@ -3584,15 +3574,7 @@ mod tests {
 
         let mut ctx = OptContext::new(16);
         let b21 = ctx.materialize_operand_at(OpRef::ref_op(21));
-        ctx.set_ptr_info(
-            &b21,
-            PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr,
-                fields: Default::default(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-            }),
-        );
+        ctx.set_ptr_info(&b21, PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let (inputargs, virtuals) = state
             .make_inputargs_and_virtuals(
@@ -3743,19 +3725,15 @@ mod tests {
         ctx.set_ptr_info(
             &outer_a_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr: descr.clone(),
                 fields: vec![(0, inner_field_op.clone())].into(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                ..VirtualStructInfo::new(descr.clone())
             }),
         );
         ctx.set_ptr_info(
             &outer_b_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr,
                 fields: vec![(0, inner_field_op.clone())].into(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                ..VirtualStructInfo::new(descr)
             }),
         );
 
@@ -3871,10 +3849,8 @@ mod tests {
         ctx.set_ptr_info(
             &virtual_box,
             PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr,
                 fields: vec![(0, Operand::None), (8, field_value_op.clone())].into(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                ..VirtualStructInfo::new(descr)
             }),
         );
 
@@ -3932,12 +3908,7 @@ mod tests {
         let virtual_box = ctx.materialize_operand_at(virtual_ref);
         ctx.set_ptr_info(
             &virtual_box,
-            PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr,
-                fields: Default::default(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-            }),
+            PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
 
@@ -3977,12 +3948,7 @@ mod tests {
         let virtual_box = ctx.materialize_operand_at(virtual_ref);
         ctx.set_ptr_info(
             &virtual_box,
-            PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr,
-                fields: Default::default(),
-                last_guard_pos: -1,
-                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-            }),
+            PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)),
         );
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         ctx.optearlyforce_idx = 5;

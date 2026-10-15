@@ -7,7 +7,7 @@ use majit_ir::operand::Operand;
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Const, Op, OpCode, OpRc, OpRef, Value};
 
-use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
+use crate::optimizeopt::info::{PreambleOp, PtrInfo, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
 
 /// rewrite.py: loop_invariant_results value.
@@ -919,7 +919,12 @@ impl OptRewrite {
     /// `optimize_GUARD_NONNULL_CLASS` (rewrite.py) delegates to
     /// `optimize_GUARD_CLASS` after the null check, so both opcodes go
     /// through the same known-class / strengthening / postprocess logic.
-    fn optimize_guard_class(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_guard_class(
+        &self,
+        op: &Op,
+        _op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // rewrite.py:402: info = self.ensure_ptr_info_arg0(op) — installs
         // an InstancePtrInfo on arg0 when one is missing. Discard the
         // EnsuredPtrInfo borrow; downstream lookups re-acquire via
@@ -942,13 +947,85 @@ impl OptRewrite {
             let expected = ctx.get_constant_int_box(&op.arg(1));
             if let Some(expected) = expected {
                 if known_class == expected {
-                    // rewrite.py:403-404: known class matches — drop the guard.
+                    // `rewrite.py` `optimize_GUARD_CLASS`: known class matches — drop the
+                    // guard. TRACE-level GUARD_CLASS is VOID
+                    // (`resoperation.py` `'GUARD_CLASS/2d/n'`); there is
+                    // no result box to forward.
                     return OptimizationResult::Remove;
                 }
                 // rewrite.py:404-407: known class mismatch is a
                 // proven-fail guard — abort the trace.
                 return raise_invalid_loop("GUARD_CLASS proven to always fail", op, ctx);
             }
+        }
+        // Residual `new` (`PtrInfo::VirtualStruct`) does not stamp a
+        // constant vtable. The typeptr SETFIELD is metadata
+        // (`typeptr_value`); GuardClass is the rewritten typeptr read
+        // (`handle_getfield_typeptr`). `guard_class(obj, C)` is
+        // `getfield(obj, typeptr) == C`; for this vstruct the getfield
+        // folds to `typeptr_value`. Emitting GUARD_CLASS would force
+        // the vstruct. Never drop the guard without a proof
+        // (rewrite.py optimize_GUARD_CLASS known-class arms).
+        if let Some(stored) = ctx
+            .getptrinfo(&op.arg(0).get_box_replacement(false))
+            .and_then(|info| match info {
+                PtrInfo::VirtualStruct(v) => v.typeptr_value,
+                _ => None,
+            })
+            && op.num_args() >= 2
+            && let Some(expected) = ctx.get_constant_int_box(&op.arg(1)).or_else(|| {
+                // pyjitpl records ConstInt (`cls_of_box`); a Ref-typed
+                // class operand (BC_GUARD_CLASS_R dest, ConstRef) is
+                // the same bits. `same_constant` compares either spelling.
+                ctx.get_constant_ptr_box(&op.arg(1)).map(|p| p as i64)
+            })
+        {
+            let stored = ctx.resolve_operand_operand(&stored);
+            let stored_const = ctx.get_constant_box(&stored).and_then(|val| match val {
+                majit_ir::Value::Int(i) => Some(i),
+                majit_ir::Value::Ref(g) => Some(g.0 as i64),
+                _ => None,
+            });
+            if let Some(actual) = stored_const {
+                if actual == expected {
+                    crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                        ctx,
+                        &op.arg(0).get_box_replacement(false),
+                        expected,
+                        /* update_last_guard = */ false,
+                    );
+                    return OptimizationResult::Remove;
+                }
+                return raise_invalid_loop("GUARD_CLASS proven to always fail", op, ctx);
+            }
+            // Runtime typeptr: replace GUARD_CLASS with GUARD_VALUE on
+            // the typeptr box. rewrite.py `replace_old_guard_with_guard_value`
+            // / GuardResOp.copy_and_change keep failargs and
+            // rd_resume_position; descr is reused (None) so the original
+            // resume snapshot stays. The vstruct is not forced: the
+            // guard's argument is the typeptr box, not the virtual.
+            // Original fail args already list obj if it is live — that
+            // is resume virtual encoding, not forcing.
+            //
+            // TRACE-level GUARD_CLASS is VOID (`'GUARD_CLASS/2d/n'`).
+            // GuardValue postprocess (`make_constant`) runs after emit;
+            // do not constant-fold the typeptr box before that (#210).
+            // Never PassOn: emitting GUARD_CLASS would force_box arg0.
+            let gv_arg1 = match stored.type_() {
+                majit_ir::Type::Ref => Operand::const_from_value(majit_ir::Value::Ref(
+                    majit_ir::GcRef(expected as usize),
+                )),
+                _ => Operand::const_from_value(majit_ir::Value::Int(expected)),
+            };
+            let replacement =
+                op.copy_and_change(OpCode::GuardValue, Some(&[stored, gv_arg1]), None);
+            crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                ctx,
+                &op.arg(0).get_box_replacement(false),
+                expected,
+                /* update_last_guard = */ false,
+            );
+            return OptimizationResult::Replace(replacement);
         }
         // rewrite.py:408-427: guard strengthening.
         // If there was a previous GUARD_NONNULL on the same value,
@@ -1825,7 +1902,7 @@ impl Optimization for OptRewrite {
                 // so the null the trace was specialized on was never re-checked.
                 OptimizationResult::PassOn
             }
-            OpCode::GuardClass => self.optimize_guard_class(op, ctx),
+            OpCode::GuardClass => self.optimize_guard_class(op, op_rc, ctx),
             OpCode::GuardNonnullClass => {
                 // rewrite.py optimize_GUARD_NONNULL_CLASS:
                 //     info = getptrinfo(op.getarg(0))
@@ -1841,7 +1918,7 @@ impl Optimization for OptRewrite {
                         ctx,
                     );
                 }
-                self.optimize_guard_class(op, ctx)
+                self.optimize_guard_class(op, op_rc, ctx)
             }
             OpCode::GuardIsObject => {
                 // rewrite.py optimize_GUARD_IS_OBJECT.
