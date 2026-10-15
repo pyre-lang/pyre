@@ -3799,10 +3799,27 @@ pub fn translate_op(
                                 .to_string(),
                         ));
                     }
+                    // A one-word `<[T]>::to_vec` reads the header
+                    // `stamp_rust_vec_header` wrote and selects that
+                    // kind's `project_rust_vec` row (`to_vec_registry_key`).
+                    // Every other call leaves the path unkeyed.
+                    let stamped_to_vec =
+                        if crate::translator::rtyper::call_registry::is_alloc_slice_to_vec(segments)
+                        {
+                            op.result.as_ref().and_then(|var| var.concretetype())
+                        } else {
+                            None
+                        };
                     let key = crate::translator::rtyper::call_registry::saturating_arith_registry_key(
                         segments,
                         result_ty,
                     )
+                    .or_else(|| {
+                        crate::translator::rtyper::call_registry::to_vec_registry_key(
+                            segments,
+                            stamped_to_vec.as_ref(),
+                        )
+                    })
                     .unwrap_or_else(|| {
                         crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),

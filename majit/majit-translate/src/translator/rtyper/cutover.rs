@@ -2898,6 +2898,36 @@ pub(crate) fn lift_callee_to_pygraph(
     )
 }
 
+/// Bind `graph.getreturnvar()` to `Bookkeeper::project_rust_vec` when the
+/// lowered body returns a one-word `Vec`.
+///
+/// `annrpython.py` `RPythonAnnotator.complete` / `complete_helpers` binds
+/// `graph.getreturnvar()` through `setbinding`. `description.py`
+/// `FunctionDesc.pycall` then returns `annotator.recursivecall`'s result
+/// unchanged, so the binding has to be on the variable before that read.
+/// `FunctionGraph.return_container_root` stays a lowering hint; it does not
+/// rewrite `pycall`.
+fn bind_rust_vec_return_annotation(
+    legacy: &LegacyGraph,
+    graph: &crate::flowspace::model::GraphRef,
+    bookkeeper: &crate::annotator::bookkeeper::Bookkeeper,
+) {
+    let Some(spelling) = legacy.return_container_root.as_deref() else {
+        return;
+    };
+    let Some(s_vec) = bookkeeper.project_rust_vec(spelling) else {
+        return;
+    };
+    let Hlvalue::Variable(mut ret) = graph.borrow().getreturnvar() else {
+        return;
+    };
+    if let Some(annotator) = bookkeeper.try_annotator() {
+        annotator.setbinding(&mut ret, s_vec);
+    } else if ret.annotation.borrow().is_none() {
+        *ret.annotation.borrow_mut() = Some(Rc::new(s_vec));
+    }
+}
+
 fn lift_callee_to_pygraph_with_func(
     callee_graph: &LegacyGraph,
     signature: Signature,
@@ -2932,6 +2962,7 @@ fn lift_callee_to_pygraph_with_func(
     // the ordinary dead-op pass removes those while retaining shared reads,
     // effects and raising_op. Do not suppress those reads by trait/name tests.
     crate::translator::simplify::simplify_graph(&graph.borrow(), None);
+    bind_rust_vec_return_annotation(callee_graph, &graph, nested_registry.bookkeeper().as_ref());
     let pygraph = Rc::new(PyGraph {
         graph,
         func,
@@ -3953,14 +3984,65 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     register_saturating_arith_externals(registry);
     // `<[T]>::to_vec` leftover the pair-slice rewrite did not retarget
     // (`front::mir` `is_slice_to_vec` only fires on an enabled pair
-    // receiver). Analog of `extfunc.py register_external` returning a
-    // list: the residual is an owned Vec, a GC pointer.
+    // receiver). A destination that is not a one-word `Vec` is the
+    // `list` builtin when the front retargets it, and otherwise this
+    // `GCREF` row (`extfunc.py register_external` of a GC pointer).
     register_opaque_external(
         registry,
         &["alloc", "slice", "<Impl>", "to_vec"],
         &["self"],
         crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
     );
+    // A one-word destination is `RustVecRepr` (`rrustvec.rs
+    // rust_vec_lltype`). `rtype_bltn_list` / `ll_copy` produce the list
+    // the field holds; the raw header's annotation is
+    // `Bookkeeper::project_rust_vec`. `to_vec_registry_key` picks the
+    // row from the header `stamp_rust_vec_header` wrote.
+    register_one_word_slice_to_vec_externals(registry);
+}
+
+/// One `register_external` row per [`majit_ir::rvec::VecItemKind`].
+///
+/// `project_rust_vec` keeps only the item kind, so each row is declared
+/// from the spelling of that kind (`Vec<usize>`, `Vec<f64>`,
+/// `Vec<*mut u8>`). A call site's own spelling (`Vec<PyObjectRef>`,
+/// `Vec<i64>`, …) projects to the same `SomeRustVec`.
+fn register_one_word_slice_to_vec_externals(registry: &CallRegistry) {
+    use crate::translator::rtyper::call_registry::to_vec_registry_key;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+    use majit_ir::rvec::VecItemKind;
+
+    let bare = ["alloc", "slice", "<Impl>", "to_vec"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for kind in VecItemKind::ALL {
+        let (spelling, item) = match kind {
+            VecItemKind::Int => ("Vec<usize>", LowLevelType::Signed),
+            VecItemKind::Float => ("Vec<f64>", LowLevelType::Float),
+            VecItemKind::Ref => (
+                "Vec<*mut u8>",
+                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+            ),
+        };
+        let header = rust_vec_lltype(&item);
+        let key = to_vec_registry_key(&bare, Some(&header))
+            .expect("a one-word Vec header selects a to_vec registry row");
+        let shell = registry
+            .bookkeeper()
+            .project_rust_vec(spelling)
+            .unwrap_or_else(|| {
+                panic!("one-word Vec spelling {spelling} must project to SomeRustVec")
+            });
+        if registry.lookup(&key).is_some() {
+            continue;
+        }
+        let signature = Signature::new(vec!["self".to_string()], None, None);
+        let stub_pygraph =
+            build_stub_pygraph_with_result_shell("to_vec".to_string(), signature.clone(), shell);
+        registry.register_callee(key, signature, stub_pygraph);
+    }
 }
 
 /// Register every `f64_method_llexternal` name as `["ll_math", name]`.
@@ -4272,6 +4354,10 @@ fn drive_lifted_subject(
     // blocks into the shared annotator; subsequent
     // `specialize_more_blocks` rtype only the newly-added blocks.
     let (annotator, rtyper) = call_registry.ensure_session()?;
+    // Same `getreturnvar` binding as the lifted callee. The subject does
+    // not pass through `FunctionDesc.pycall`; `setconcretetype` still
+    // reads this variable.
+    bind_rust_vec_return_annotation(legacy, &graph, call_registry.bookkeeper().as_ref());
     // Scope an `added_blocks` tracker over this subject's drive of the
     // shared annotator so the post-drain blocked-annotation guard
     // (`raise_if_subject_blocked` below) can see exactly the blocks
@@ -10185,6 +10271,9 @@ mod tests {
     /// (`ll_newlist` / `_ll_list_resize_really` assign `l.length = length`).
     /// The store's result annotation is `s_None`, so `Entry.specialize_call`
     /// must hand `genop` that `Void` lltype rather than a missing result.
+    /// The header concretetype is `RustVecRepr.lowleveltype`
+    /// (`rrustvec.rs` `rust_vec_lltype`); `history.getkind` of that raw
+    /// pointer stays int.
     #[test]
     fn rustvec_length_word_store_rtypes_for_every_item_kind() {
         let _lock = anchor_lock();
@@ -10248,10 +10337,34 @@ mod tests {
 
             let (value_to_var, _) = specialize_legacy_graph(&graph)
                 .unwrap_or_else(|err| panic!("length-word store for {kind:?} must rtype: {err:?}"));
+            let ll = value_to_var
+                .get(&header)
+                .and_then(|var| var.concretetype())
+                .unwrap_or_else(|| panic!("{kind:?} header concretetype missing"));
+            let item = crate::translator::rtyper::rrustvec::rust_vec_item_lltype(&ll)
+                .cloned()
+                .unwrap_or_else(|| panic!("{kind:?} header is not a RustVec lltype"));
             assert_eq!(
-                kind_of_in(&value_to_var, &header),
+                ll,
+                crate::translator::rtyper::rrustvec::rust_vec_lltype(&item),
+                "{kind:?} header concretetype is RustVecRepr.lowleveltype"
+            );
+            assert_eq!(
+                crate::translator::rtyper::rrustvec::rust_vec_item_kind(&ll),
+                Some(kind),
+                "{kind:?} header is a RustVec"
+            );
+            match kind {
+                VecItemKind::Int => assert_eq!(item, LowLevelType::Signed),
+                VecItemKind::Float => assert_eq!(item, LowLevelType::Float),
+                VecItemKind::Ref => {
+                    assert_eq!(crate::model::getkind(&item), ConcreteType::GcRef);
+                }
+            }
+            assert_eq!(
+                crate::model::getkind(&ll),
                 ConcreteType::Signed,
-                "{kind:?} header is an int-kind pointer"
+                "{kind:?} header getkind stays int"
             );
         }
     }
@@ -12438,6 +12551,175 @@ mod tests {
         assert!(
             saturating_mul_result_is_unsigned(&unsigned_map, &unsigned_result),
             "usize::saturating_mul result stays unsigned"
+        );
+    }
+
+    fn slice_to_vec_call_graph(
+        stamp: Option<LowLevelType>,
+        return_container_root: Option<&str>,
+    ) -> (LegacyGraph, crate::flowspace::model::Variable) {
+        let mut graph = LegacyGraph::new("slice_to_vec_call");
+        if let Some(spelling) = return_container_root {
+            graph.return_container_root = Some(spelling.to_string());
+        }
+        let vars = mint_vars(&mut graph, 3);
+        let result = vars[2].clone();
+        if let Some(ll) = stamp {
+            result.set_concretetype(Some(ll));
+        }
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path([
+                        "alloc", "slice", "<Impl>", "to_vec",
+                    ]),
+                    args: crate::model::call_args(vec![vars[1].clone()]),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![result.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        setbinding(&vars[1], ValueType::Ref(None));
+        (graph, result)
+    }
+
+    fn somevalue_of(
+        value_to_var: &LegacyToTyped,
+        result: &crate::flowspace::model::Variable,
+    ) -> crate::annotator::model::SomeValue {
+        value_to_var
+            .get(result)
+            .and_then(|typed| {
+                typed
+                    .annotation
+                    .borrow()
+                    .as_ref()
+                    .map(|cell| (**cell).clone())
+            })
+            .unwrap_or_else(|| panic!("to_vec result has no annotation"))
+    }
+
+    fn stub_link_result(entry: &FunctionEntry) -> crate::annotator::model::SomeValue {
+        let pygraph = entry
+            .function_desc
+            .borrow()
+            .cache
+            .borrow()
+            .values()
+            .next()
+            .cloned()
+            .expect("annotator stub graph");
+        let link = {
+            let graph = pygraph.graph.borrow();
+            let start = graph.startblock.borrow();
+            start.exits[0].clone()
+        };
+        let link = link.borrow();
+        let Some(Hlvalue::Variable(var)) = link.args.first().and_then(|arg| arg.as_ref()) else {
+            panic!("stub return link has no variable");
+        };
+        var.annotation
+            .borrow()
+            .as_ref()
+            .map(|cell| (**cell).clone())
+            .expect("stub return annotation")
+    }
+
+    /// `<[T]>::to_vec` into a one-word `Vec<T>` is born `SomeRustVec`
+    /// (`Bookkeeper::project_rust_vec` / `extfunc.py register_external`).
+    /// A call whose result is not that header keeps the `GCREF` row.
+    #[test]
+    fn slice_to_vec_of_one_word_vec_annotates_rustvec() {
+        let _lock = anchor_lock();
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::to_vec_registry_key;
+        use crate::translator::rtyper::llannotation::lltype_to_annotation;
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+        use majit_ir::rvec::VecItemKind;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_foreign_stdlib_externals(&registry);
+
+        let bare_segs = ["alloc", "slice", "<Impl>", "to_vec"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let bare = FunctionPathKey::from_segments(bare_segs.iter().cloned());
+        let gcref_shell = lltype_to_annotation(GCREF.clone());
+        assert_eq!(
+            stub_link_result(&registry.lookup(&bare).expect("untyped to_vec row")),
+            gcref_shell,
+            "a to_vec that is not a one-word Vec stays the GCREF external"
+        );
+
+        for kind in VecItemKind::ALL {
+            let (spelling, item) = match kind {
+                VecItemKind::Int => ("Vec<usize>", LowLevelType::Signed),
+                VecItemKind::Float => ("Vec<f64>", LowLevelType::Float),
+                VecItemKind::Ref => ("Vec<*mut u8>", GCREF.clone()),
+            };
+            let header = rust_vec_lltype(&item);
+            let key = to_vec_registry_key(&bare_segs, Some(&header)).expect("kind key");
+            let expected = registry
+                .bookkeeper()
+                .project_rust_vec(spelling)
+                .unwrap_or_else(|| panic!("{spelling} projects"));
+            assert_eq!(
+                stub_link_result(&registry.lookup(&key).expect("kind row")),
+                expected,
+                "{spelling}"
+            );
+            assert_ne!(key, bare);
+        }
+
+        let (graph, result) =
+            slice_to_vec_call_graph(Some(rust_vec_lltype(&GCREF.clone())), Some("Vec<*mut u8>"));
+        let (map, _) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                .expect("one-word to_vec annotates");
+        let ann = somevalue_of(&map, &result);
+        let SomeValue::RustVec(vec) = &ann else {
+            panic!("one-word to_vec is SomeRustVec, got {ann:?}");
+        };
+        assert_eq!(vec.item_kind(), Some(VecItemKind::Ref));
+        assert_eq!(
+            ann,
+            registry
+                .bookkeeper()
+                .project_rust_vec("Vec<PyObjectRef>")
+                .expect("Vec<PyObjectRef> is a one-word ref vec")
+        );
+
+        let plain = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_foreign_stdlib_externals(&plain);
+        let (graph, result) = slice_to_vec_call_graph(None, None);
+        let (map, _) = specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &plain)
+            .expect("unstamped to_vec annotates");
+        assert_eq!(
+            somevalue_of(&map, &result),
+            gcref_shell,
+            "no header stamp keeps the GCREF result"
         );
     }
 

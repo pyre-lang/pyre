@@ -2820,8 +2820,8 @@ impl FrameState {
             match h {
                 Hlvalue::Variable(src) => {
                     // `_copy(v) -> Variable(v)` (framestate.py): fresh
-                    // Variable carrying the source's `_name` prefix
-                    // (annotation stays None).
+                    // Variable carrying the source's `_name` prefix.
+                    // Annotation and concretetype stay unset.
                     let mut nv = graph.alloc_value_var();
                     nv.rename_from(src);
                     Hlvalue::Variable(nv)

@@ -1295,6 +1295,12 @@ impl PackedLocalRow {
             Err(at) => self.bound.insert(at, (slot as u32, var)),
         }
     }
+
+    fn unset(&mut self, slot: usize) {
+        if let Ok(at) = self.bound.binary_search_by_key(&(slot as u32), |(i, _)| *i) {
+            self.bound.remove(at);
+        }
+    }
 }
 
 /// One flowspace word, or the two words of a pair slice, held in the MIR
@@ -8769,6 +8775,10 @@ struct IndexElemAlias {
     /// `ll_items` (`block`) for the `{ block, len }` wrapper. The write
     /// repeats that FieldRead off the remapped wrapper (`ll_setitem_fast`).
     items_owner: Option<&'static str>,
+    /// Write-only `index_mut`. `ll_setitem_fast` stores the item and does
+    /// not read the old one, so the local's Variable is not an element
+    /// value and `edge_args` does not pass it.
+    no_element: bool,
 }
 
 /// Header of a `(*p.add(i)).field` access.
@@ -9640,6 +9650,10 @@ impl<'a> Lowering<'a> {
         {
             let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            // `_handle_list_call` reads `args[0].concretetype`
+            // (`jtransform.py` `LIST = deref(args[0].concretetype)`).
+            // A one-word `Vec` parameter is `RustVecRepr.lowleveltype`.
+            stamp_rust_vec_header(&var, &local.ty, llbc);
             // Register a stable name so canonical comparison can spot
             // arg-renames.  Names live on the value via `name_value_var`
             // (mirrors the `parse.rs` arg-binding path).
@@ -10002,6 +10016,12 @@ impl<'a> Lowering<'a> {
                     continue;
                 }
                 let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // Loop-header inputargs are these variables
+                // (`lower_framestate` Pass 0). `list.getitem` /
+                // `list.setitem` read `args[0].concretetype`.
+                if let Some(local) = body.locals.locals.get(local_idx) {
+                    stamp_rust_vec_header(&var, &local.ty, llbc);
+                }
                 graph.push_inputarg_var(bid, var.clone());
                 block_entry_local_var[row].set(local_idx, var);
             }
@@ -10923,6 +10943,11 @@ impl<'a> Lowering<'a> {
         let bb: &BasicBlock = &self.body.body[mir_bb];
         let row = self.block_id.row(mir_bb);
         self.local_var = self.hydrate_words(self.block_entry_local_var[row].unpack());
+        // Framestate scrubs a write-only `index_mut` place (`ll_setitem_fast`
+        // has no loaded item), so the entry row hydrates it as `None`.
+        // Bind a fresh Variable with no element value so `mem_slot` still
+        // answers `MemSlot::Index`.
+        self.bind_unvalued_index_places();
         self.positional_aggregate_locals =
             self.block_entry_positional_aggregate_locals[row].clone();
         self.string_byte_view_locals = self.block_entry_string_byte_view_locals[row]
@@ -11513,6 +11538,7 @@ impl<'a> Lowering<'a> {
                 rust_vec: None,
                 list_root: None,
                 items_owner: None,
+                no_element: false,
             },
         );
         self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -26429,12 +26455,24 @@ impl<'a> Lowering<'a> {
                                 .then(|| "PyObject".to_string())
                         })
                     };
+                    // `ll_setitem_fast` stores the item and does not read the
+                    // old one. A write-only `index_mut` emits no `list.getitem`
+                    // / `ArrayRead` and no element constant. The alias still
+                    // names the base and index for the later
+                    // `ll_vec_setitem_fast`. The fresh Variable keeps
+                    // `local_var` bound so `mem_slot` answers `MemSlot::Index`;
+                    // it is not the loaded item, and `edge_args` does not pass
+                    // it.
+                    let write_only = rust_vec_header.is_some()
+                        && add_dest_used_only_as_single_write_deref(
+                            self.llbc, self.body, dest_local,
+                        );
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     let element_is_pointer_word = string_index_owner.is_none()
                         && self.var_tracks_pointer_word_array(&args[0]);
-                    if element_is_pointer_word || element_is_niche_option {
+                    if !write_only && (element_is_pointer_word || element_is_niche_option) {
                         self.pointer_word_vars.insert(res.clone());
                     }
                     let item_ty = if element_is_pointer_word || element_is_niche_option {
@@ -26463,36 +26501,38 @@ impl<'a> Lowering<'a> {
                         } else {
                             (array_base, item_ty, array_type_id)
                         };
-                    let read = match rust_vec_header {
-                        Some(kind) => OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: rust_vec_helper_segments(
-                                    majit_ir::rvec::VecOp::GetItem,
-                                    kind,
-                                ),
-                                fun_decl_id: None,
+                    if !write_only {
+                        let read = match rust_vec_header {
+                            Some(kind) => OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: rust_vec_helper_segments(
+                                        majit_ir::rvec::VecOp::GetItem,
+                                        kind,
+                                    ),
+                                    fun_decl_id: None,
+                                },
+                                args: crate::model::call_args(vec![
+                                    array_base.clone(),
+                                    args[1].clone(),
+                                ]),
+                                result_ty: item_ty.clone(),
                             },
-                            args: crate::model::call_args(vec![
-                                array_base.clone(),
-                                args[1].clone(),
-                            ]),
-                            result_ty: item_ty.clone(),
-                        },
-                        None => OpKind::ArrayRead {
-                            base: array_base.clone(),
-                            index: args[1].clone(),
-                            item_ty: item_ty.clone(),
-                            array_type_id: array_type_id.clone(),
-                            nolength: crate::front::typestr::nolength_from_array_type_id(
-                                array_type_id.as_deref(),
-                            ),
-                            pure: false,
-                        },
-                    };
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: read,
-                    });
+                            None => OpKind::ArrayRead {
+                                base: array_base.clone(),
+                                index: args[1].clone(),
+                                item_ty: item_ty.clone(),
+                                array_type_id: array_type_id.clone(),
+                                nolength: crate::front::typestr::nolength_from_array_type_id(
+                                    array_type_id.as_deref(),
+                                ),
+                                pure: false,
+                            },
+                        };
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: read,
+                        });
+                    }
                     self.index_elem_alias.insert(
                         dest_local,
                         IndexElemAlias {
@@ -26505,13 +26545,17 @@ impl<'a> Lowering<'a> {
                             rust_vec: rust_vec_header,
                             list_root: None,
                             items_owner: string_index_owner,
+                            no_element: write_only,
                         },
                     );
                     // This intercept returns before the generic call-result
                     // tail below.  Repeat its registered-pointee narrow so
                     // `rlist.py:recast` exposes the concrete W_Root-equivalent
                     // repr after the GCREF-backed getarrayitem.
-                    if let Some(root) = item_narrow_root {
+                    if write_only {
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        self.drop_unvalued_index_local(dest_local);
+                    } else if let Some(root) = item_narrow_root {
                         let narrowed = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -26733,6 +26777,7 @@ impl<'a> Lowering<'a> {
                             rust_vec: None,
                             list_root: None,
                             items_owner: None,
+                            no_element: false,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -26793,6 +26838,7 @@ impl<'a> Lowering<'a> {
                             rust_vec: None,
                             list_root,
                             items_owner: None,
+                            no_element: false,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -26853,6 +26899,7 @@ impl<'a> Lowering<'a> {
                             rust_vec: None,
                             list_root: None,
                             items_owner: None,
+                            no_element: false,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -26913,6 +26960,7 @@ impl<'a> Lowering<'a> {
                             rust_vec: None,
                             list_root: None,
                             items_owner: None,
+                            no_element: false,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -31204,6 +31252,15 @@ impl<'a> Lowering<'a> {
             result_var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
                 TO: PtrTarget::Struct(block),
             }))));
+        }
+        // `newlist_clear` forks on `op.result.concretetype`
+        // (`jtransform.py` `LIST = deref(op.result.concretetype)`).
+        // A `Vec` result is `RustVecRepr.lowleveltype`
+        // (`rrustvec.rs rust_vec_lltype`), kind `int`. Without that
+        // pointer the arm emits GC `new_array_clear`, whose result
+        // bank is `ref`.
+        if result_var.concretetype().is_none() {
+            stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
         }
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
@@ -45315,7 +45372,88 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// A write-only `index_mut` place has no loaded element
+    /// (`ll_setitem_fast`). After framestate scrubs the undefined
+    /// Variable, the block entry hydrates that local as `None`. Bind a
+    /// fresh Variable with no element value so `mem_slot` still answers
+    /// `MemSlot::Index`.
+    fn bind_unvalued_index_places(&mut self) {
+        let locals: Vec<usize> = self
+            .index_elem_alias
+            .iter()
+            .filter(|(_, alias)| alias.no_element)
+            .map(|(local, _)| *local)
+            .collect();
+        for local in locals {
+            if self
+                .local_var
+                .get(local)
+                .and_then(|slot| slot.as_ref())
+                .is_some()
+            {
+                continue;
+            }
+            if local >= self.local_var.len() {
+                continue;
+            }
+            let place = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.local_var[local] = Some(LocalValue::One(place));
+        }
+    }
+
+    /// Drop `local` from not-yet-lowered block inputargs.
+    ///
+    /// `ll_setitem_fast` does not produce an element value, so `edge_args`
+    /// must not pass one. A block that already uses the construction-time
+    /// inputarg keeps it: removing the defining inputarg would leave that
+    /// use undefined.
+    fn drop_unvalued_index_local(&mut self, local: usize) {
+        let targets: Vec<(usize, BlockId)> = self.block_id.iter_lowered().collect();
+        for (mir_bb, bid) in targets {
+            if mir_bb == 0 {
+                continue;
+            }
+            let row = self.block_id.row(mir_bb);
+            let (old_len, pos) = {
+                let Some(live) = self.block_live_in.get(row) else {
+                    continue;
+                };
+                if !live.contains(local) {
+                    continue;
+                }
+                let Some(pos) = live.iter().position(|idx| idx == local) else {
+                    continue;
+                };
+                (live.count(), pos)
+            };
+            let untouched = {
+                let block = self.graph.block(bid);
+                block.operations.is_empty()
+                    && block.exits.is_empty()
+                    && block.exitswitch.is_none()
+                    && block.inputargs.len() == old_len
+            };
+            if !untouched {
+                continue;
+            }
+            self.block_live_in[row].remove(local);
+            self.block_entry_local_var[row].unset(local);
+            self.graph.block_mut(bid).inputargs.remove(pos);
+            for pred in &mut self.graph.blocks {
+                for link in &mut pred.exits {
+                    if link.target == bid && link.args.len() == old_len {
+                        link.args.remove(pos);
+                    }
+                }
+            }
+        }
+    }
+
     fn edge_args(&mut self, from_bb: usize, target_bb: usize) -> Result<Vec<Variable>, LowerError> {
+        // A place `drop_unvalued_index_local` removed from `block_live_in`
+        // is absent here. `ll_setitem_fast` has no loaded item to pass.
         let local_indices = self.target_input_locals(target_bb)?;
         let mut args = Vec::with_capacity(local_indices.len());
         for local_idx in local_indices {
@@ -49415,6 +49553,15 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
 fn add_dest_used_only_as_single_deref(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
     let census = dest_deref_census(llbc, body, dest);
     census.defs == 1 && census.read_derefs + census.write_derefs == 1 && census.other == 0
+}
+
+/// `*dest = v` with no load of `*dest` and no escaping use.
+///
+/// `ll_setitem_fast` does not read the old item. The `index_mut` arm
+/// otherwise emits that read (`list.getitem`) before the store.
+fn add_dest_used_only_as_single_write_deref(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
+    let census = dest_deref_census(llbc, body, dest);
+    census.defs == 1 && census.write_derefs == 1 && census.read_derefs == 0 && census.other == 0
 }
 
 /// `*p` read of an `.add` result, with no store and no escaping use.
@@ -76993,6 +77140,38 @@ fn tyref_ptr_pointee_is_vec(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_node_def_id(pointee)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
+}
+
+/// `Ptr(Struct(raw) "RustVec")` for `kind` (`rrustvec.rs rust_vec_lltype`).
+fn rust_vec_header_lltype(
+    kind: majit_ir::rvec::VecItemKind,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+    let item = match kind {
+        majit_ir::rvec::VecItemKind::Int => LowLevelType::Signed,
+        majit_ir::rvec::VecItemKind::Float => LowLevelType::Float,
+        majit_ir::rvec::VecItemKind::Ref => {
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+        }
+    };
+    rust_vec_lltype(&item)
+}
+
+/// Stamp `rust_vec_lltype` on `var` when `ty` is a one-word `Vec`.
+///
+/// The lowering's `setconcretetype`: `tyref_rust_vec_item_kind` reads the
+/// LLBC `Vec` and the lltype is `RustVecRepr.lowleveltype`. The rtyper
+/// overwrites it from the annotation when the graph is specialized. A
+/// graph that skips specialization keeps this stamp.
+fn stamp_rust_vec_header(var: &crate::flowspace::model::Variable, ty: &TyRef, llbc: &Llbc) {
+    let Some(kind) = tyref_rust_vec_item_kind(ty, llbc) else {
+        return;
+    };
+    if var.concretetype().is_some() {
+        return;
+    }
+    var.set_concretetype(Some(rust_vec_header_lltype(kind)));
 }
 
 /// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,
