@@ -3090,16 +3090,9 @@ impl SharedOpcodeHandler for PyFrame {
         let _roots = pyre_object::gc_roots::push_roots();
         let iter_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(last_val);
-        let hint = match crate::length_hint(pyre_object::gc_roots::shadow_stack_get(iter_slot), 0) {
-            Ok(h) => h,
-            Err(mut e) => {
-                if e.r#async(pyre_object::PY_NULL) {
-                    return Err(e);
-                }
-                0
-            }
-        };
-        let list = w_list_new_with_sizehint(hint);
+        let list = crate::opcode_ops::newlist_from_iter_hint(
+            pyre_object::gc_roots::shadow_stack_get(iter_slot),
+        )?;
         Ok((list, pyre_object::gc_roots::shadow_stack_get(iter_slot)))
     }
 

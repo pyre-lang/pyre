@@ -710,6 +710,30 @@ pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObje
     }
 }
 
+/// pyopcode.py `BUILD_LIST_FROM_ARG`: `space.newlist([], sizehint=length_hint)`.
+///
+/// Shared by the interpreter opcode (`opcode_build_list_from_arg`) and the
+/// JIT residual.  `length_hint` exceptions that are not async are swallowed
+/// and the hint falls back to 0; an async exception propagates.
+///
+/// `#[inline(never)]` keeps one body for both callers.
+#[inline(never)]
+pub fn newlist_from_iter_hint(last_val: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(last_val);
+    let hint = match crate::length_hint(pyre_object::gc_roots::shadow_stack_get(iter_slot), 0) {
+        Ok(h) => h,
+        Err(mut e) => {
+            if e.r#async(pyre_object::PY_NULL) {
+                return Err(e);
+            }
+            0
+        }
+    };
+    Ok(pyre_object::listobject::w_list_new_with_sizehint(hint))
+}
+
 /// LIST_EXTEND — extend `list` in place with the items of `iterable`.
 /// Shared by the interpreter's `list_extend` handler and the JIT residual
 /// `bh_list_extend_fn`.  Mirrors `list.extend`: fast paths for list/tuple
@@ -1305,6 +1329,14 @@ pub extern "C" fn jit_baseobjspace_dict_display_setitem(
     match crate::baseobjspace::dict_display_setitem(obj, key, value) {
         Ok(()) => 0,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_newlist_from_iter_hint(last_val: PyObjectRef) -> PyObjectRef {
+    match newlist_from_iter_hint(last_val) {
+        Ok(result) => result,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 

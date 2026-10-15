@@ -3766,6 +3766,13 @@ pub struct LoweringContext {
     /// args and dispatches (user code → `MayForce`).  A CALL_KW with
     /// nargs > 13 takes the `abort_permanent` branch and records no HLOp.
     pub call_kw_idx_by_nargs: [u16; 14],
+    /// `newlist_from_iter_hint_fn` descrs-pool index.  BUILD_LIST_FROM_ARG
+    /// records `newlist_from_iter_hint(iter)` lowered to
+    /// `residual_call_r_r(ConstInt(fn_idx), ListR([iter]), Descr) → reg`
+    /// via [`lower_newlist_from_iter_hint_hlop_to_insn`];
+    /// `jit_newlist_from_iter_hint` runs `length_hint` then
+    /// `w_list_new_with_sizehint` (user `__length_hint__` → `MayForce`).
+    pub newlist_from_iter_hint_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -5718,6 +5725,11 @@ where
     if let Some(insn) = lower_list_extend_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) =
+        lower_newlist_from_iter_hint_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
+        return Some(insn);
+    }
     if let Some(insn) = lower_accumulator_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -7499,6 +7511,40 @@ where
         CallFlavor::MayForce,
         true,
         majit_ir::RuntimeHelperKind::None,
+    ))
+}
+
+/// Lower the BUILD_LIST_FROM_ARG HLOp `newlist_from_iter_hint(iter)` →
+/// `result: Ref` — the same one-Ref shape as [`lower_get_len_hlop_to_insn`]
+/// — to `residual_call_r_r` of `jit_newlist_from_iter_hint`.  A user
+/// `__length_hint__` may run Python → `MayForce`.
+pub fn lower_newlist_from_iter_hint_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "newlist_from_iter_hint" {
+        return None;
+    }
+    if op.args.len() != 1 {
+        return None;
+    }
+    let iter_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.newlist_from_iter_hint_fn_idx,
+        vec![iter_operand],
+        CallFlavor::MayForce,
+        majit_ir::RuntimeHelperKind::None,
+        dst_reg,
     ))
 }
 

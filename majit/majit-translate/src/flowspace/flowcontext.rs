@@ -2640,10 +2640,18 @@ impl FlowContext {
                     Ok(None)
                 }
                 Instruction::BuildListFromArg => {
-                    let last_val = self.popvalue();
-                    let result = self.record_pure_op("newlist", vec![])?;
+                    // pyopcode.py BUILD_LIST_FROM_ARG: pop the iterator,
+                    // `space.newlist([], sizehint=length_hint)`, push the
+                    // list then the iterator. `length_hint` may raise an
+                    // async exception, so this is not a pure `newlist`.
+                    let last_val = self.pop_hlvalue()?;
+                    let result = self.record_maybe_raise_op(
+                        "newlist_from_iter_hint",
+                        vec![last_val.clone()],
+                        Self::common_exception_cases(),
+                    )?;
                     self.pushvalue(StackElem::Value(result));
-                    self.pushvalue(last_val);
+                    self.pushvalue(StackElem::Value(last_val));
                     Ok(None)
                 }
                 Instruction::BuildSet { .. } => {
