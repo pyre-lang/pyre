@@ -5,7 +5,8 @@
 mod common;
 
 use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc_if_present};
-use majit_charon_reader::Llbc;
+use majit_charon_reader::ullbc::{Operand, Rvalue, StmtKind};
+use majit_charon_reader::{GlobalDecl, Llbc};
 use serde_json::Value;
 
 fn strategy_impl_leaves(llbc: &Llbc) -> Vec<(String, String)> {
@@ -82,43 +83,77 @@ fn ty_adt_leaf(llbc: &Llbc, ty: &Value) -> Option<String> {
     None
 }
 
-fn registered_dyn_impl_globals(llbc: &Llbc) -> Vec<String> {
+fn global_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
+    let value = gd.rest.get("value")?;
+    let body = value
+        .get("Value")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .unwrap_or(value);
+    let lit = body.as_array()?.first()?;
+    lit.pointer("/Call/0/kind/Fun").and_then(Value::as_u64)
+}
+
+fn dyn_impl_trait_leaf(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
+    let init_id = global_init_fun_id(gd)?;
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(_, Rvalue::Aggregate(_, operands))) = stmt.stmt_kind() else {
+                continue;
+            };
+            let Operand::Const(expr) = operands.get(1)? else {
+                continue;
+            };
+            return llbc
+                .const_expr_literal(expr)?
+                .get("Str")?
+                .as_str()
+                .map(str::to_string);
+        }
+    }
+    None
+}
+
+fn registered_dyn_impls(llbc: &Llbc) -> Vec<(String, String)> {
     llbc.iter_global_decls()
-        .map(|gd| gd.item_meta.name_path())
-        .filter(|path| path.contains("DYN_IMPL_"))
+        .filter_map(|gd| {
+            let path = gd.item_meta.name_path();
+            let leaf = path.rsplit("::").next()?;
+            let type_leaf = leaf.strip_prefix("DYN_IMPL_")?;
+            let trait_leaf = dyn_impl_trait_leaf(llbc, gd)?;
+            Some((trait_leaf, type_leaf.to_string()))
+        })
         .collect()
 }
 
-fn impl_is_registered(_trait_leaf: &str, type_leaf: &str, globals: &[String]) -> bool {
-    let marker = format!("DYN_IMPL_{type_leaf}");
-    globals
+fn impl_is_registered(trait_leaf: &str, type_leaf: &str, registered: &[(String, String)]) -> bool {
+    registered
         .iter()
-        .any(|path| path.rsplit("::").next() == Some(marker.as_str()))
+        .any(|(t, ty)| t == trait_leaf && ty == type_leaf)
 }
 
 #[test]
 fn translator_seen_dict_and_set_strategy_impls_are_registered() {
-    let Some(object) = load_llbc_if_present(OBJECT_LLBC) else {
-        eprintln!("skipping: {OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-        return;
-    };
-    let Some(interpreter) = load_llbc_if_present(INTERPRETER_LLBC) else {
-        eprintln!("skipping: {INTERPRETER_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-        return;
-    };
+    let object = load_llbc_if_present(OBJECT_LLBC).unwrap_or_else(|| {
+        panic!("{OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
+    });
+    let interpreter = load_llbc_if_present(INTERPRETER_LLBC).unwrap_or_else(|| {
+        panic!("{INTERPRETER_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
+    });
     let mut impls = strategy_impl_leaves(object);
     impls.extend(strategy_impl_leaves(interpreter));
     impls.sort();
     impls.dedup();
-    let mut globals = registered_dyn_impl_globals(object);
-    globals.extend(registered_dyn_impl_globals(interpreter));
+    let mut registered = registered_dyn_impls(object);
+    registered.extend(registered_dyn_impls(interpreter));
     let missing: Vec<(String, String)> = impls
         .into_iter()
-        .filter(|(trait_leaf, type_leaf)| !impl_is_registered(trait_leaf, type_leaf, &globals))
+        .filter(|(trait_leaf, type_leaf)| !impl_is_registered(trait_leaf, type_leaf, &registered))
         .collect();
     assert!(
         missing.is_empty(),
         "translator-seen DictStrategy/SetStrategy impls with no register_dyn_impl_vtable! \
-         (add the macro at the impl): {missing:?}\nregistered globals: {globals:?}"
+         (add the macro at the impl): {missing:?}\nregistered: {registered:?}"
     );
 }

@@ -369,6 +369,14 @@ pub struct RDict<K, V, S = RandomState> {
     hash_builder: S,
 }
 
+const _: () = {
+    type ZstHasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+    assert!(
+        std::mem::offset_of!(RDict<u8, u8, ZstHasher>, num_live_items)
+            == std::mem::offset_of!(RDict<u8, u8, RandomState>, num_live_items)
+    );
+};
+
 // The entries array is a GC or immortal allocation, not a Rust owner, so the
 // auto traits follow `K`, `V`, and `S` the way the old `Vec<Entry>` did.
 unsafe impl<K: Send, V: Send, S: Send> Send for RDict<K, V, S> {}

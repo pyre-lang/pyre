@@ -34641,7 +34641,8 @@ impl<'a> Lowering<'a> {
 
     /// `core::tuple::<Impl>::default` whose destination is a non-unit
     /// tuple whose every element has a Default the front end already
-    /// lowers (scalar zero, void ZST, empty `Vec`, nested tuple).
+    /// lowers (primitive scalar zero, unit / `PhantomData`, empty `Vec`,
+    /// nested tuple).
     fn is_tuple_default(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -34671,22 +34672,24 @@ impl<'a> Lowering<'a> {
                 idx += 1;
             }
         }
-        tyref_is_void_zst(ty, self.llbc)
-            || tyref_is_zero_sized(ty, self.llbc)
-            || tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc)
+        // A primitive scalar's default is zero. A thin pointer is not
+        // accepted: `Box<T>::default` allocates a `T::default()`, not null.
+        tyref_default_is_unit(ty, self.llbc)
+            || tyref_is_primitive_scalar(ty, self.llbc)
             || tyref_is_vec_value(ty, self.llbc)
     }
 
-    /// Default of `ty`: scalar zero, unit, empty `Vec` (`vec::Vec::new`
-    /// → `newlist` / `ll_newemptylist`), or `TupleRepr.newtuple` of those.
+    /// Default of `ty`: primitive scalar zero, unit / `PhantomData`,
+    /// empty `Vec` (`vec::Vec::new` → `newlist` / `ll_newemptylist`), or
+    /// `TupleRepr.newtuple` of those.
     fn emit_default_of_ty(&mut self, bb_id: BlockId, ty: &TyRef) -> Option<Variable> {
         if tyref_is_tuple(ty, self.llbc) {
             return self.emit_tuple_of_element_defaults(bb_id, ty);
         }
-        if tyref_is_void_zst(ty, self.llbc) || tyref_is_zero_sized(ty, self.llbc) {
+        if tyref_default_is_unit(ty, self.llbc) {
             return Some(self.emit_unit(bb_id));
         }
-        if tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
+        if tyref_is_primitive_scalar(ty, self.llbc) {
             return self.emit_zero_constant_of_ty(bb_id, ty);
         }
         if tyref_is_vec_value(ty, self.llbc) {
@@ -35306,6 +35309,12 @@ impl<'a> Lowering<'a> {
     /// virtualizable array and a `__len` call would pass that array as a
     /// call argument. `Vec::len` is included: `rlist.ll_length` reads
     /// `l.length`, and a field named `"len"` is not that attribute.
+    ///
+    /// The FunDecl path is the container (`alloc::vec::<Impl>::len` /
+    /// `IntArray` / `FloatArray`). `rordereddict::RDict::len` is a
+    /// different declaration, so it cannot take this arm;
+    /// `rordereddict.rtype_len` / `ll_dict_len` records
+    /// `d.num_live_items` from its own body.
     fn is_container_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -64022,6 +64031,15 @@ fn tyref_checked_binop_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> 
     }
     let value_ty = strip_ty_wrappers(&types[0], llbc)?;
     Some(tyref_to_value_type(&TyRef::Other(value_ty.clone()), llbc))
+}
+
+/// Default of `ty` is the unit value without running a `Default` body:
+/// `()` (`is_unit_type`) or `core::marker::PhantomData`. Any other ZST,
+/// a user type named `PhantomData` included, may have a custom
+/// `Default` (`tyref_is_zero_sized` is not this).
+fn tyref_default_is_unit(ty: &TyRef, llbc: &Llbc) -> bool {
+    is_unit_type(ty, llbc)
+        || adt_path_of_tyref(ty, llbc).as_deref() == Some("core::marker::PhantomData")
 }
 
 /// True when `ty` is Charon's unit type `()`.
