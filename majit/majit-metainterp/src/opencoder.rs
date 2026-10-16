@@ -51,7 +51,8 @@ pub fn register_trace_ops_gc_type(gc: &mut dyn majit_gc::GcAllocator) -> u32 {
     id
 }
 
-fn numbering_gc_type_id() -> u32 {
+/// The tid `register_trace_ops_gc_type` assigned to `resumecode.py` `NUMBERING`.
+pub fn numbering_gc_type_id() -> u32 {
     let id = NUMBERING_GC_TYPE_ID.load(Ordering::Acquire);
     assert!(
         id != u32::MAX,
