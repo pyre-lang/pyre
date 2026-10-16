@@ -454,6 +454,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_writebarrier_before_copy(Some(
         gc_writebarrier_before_copy_via_active_runtime,
     ));
+    majit_gc::set_active_write_barrier_managed(Some(gc_write_barrier_managed_via_active_runtime));
     majit_gc::set_active_finalizer_hooks(
         Some(register_finalizer_via_active_runtime),
         Some(finalizer_next_dead_via_active_runtime),
@@ -2032,6 +2033,15 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
     } else if majit_gc::gc_sync::is_initialized() {
         // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
         majit_gc::gc_sync::gc_op(|gc| gc.write_barrier(obj));
+    }
+}
+
+fn gc_write_barrier_managed_via_active_runtime(obj: GcRef) {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.write_barrier_managed(obj));
+    } else if majit_gc::gc_sync::is_initialized() {
+        // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
+        majit_gc::gc_sync::gc_op(|gc| gc.write_barrier_managed(obj));
     }
 }
 

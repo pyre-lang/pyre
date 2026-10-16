@@ -22,25 +22,21 @@ use pyre_macros::pyre_class;
 /// distinct from W_Root values: StdObjSpace.wrap allocates the former but
 /// calls spacebind on the latter. In particular a wrapped string is NOT the
 /// host string TypeDef.__init__ accepts as its doc candidate.
-#[derive(Clone)]
 pub enum TypeDefValue {
     Text(String),
     None,
-    Root(&'static std::cell::UnsafeCell<PyObjectRef>),
+    Root(std::cell::UnsafeCell<PyObjectRef>),
 }
 
 impl TypeDefValue {
-    /// Own a prebuilt declaration reference, including while its rawdict is
-    /// still being assembled. Slots are process-lifetime like the TypeDefs;
-    /// their addresses are stable even when the ordered host dict grows.
+    /// Wrap a W_Root for `TypeDef.rawdict`. The pointer lives in the host
+    /// dict; `walk_typedef_roots` forwards it in place.
     /// # Safety
     /// `value` must be a live W_Root object, rooted across this call.
     pub unsafe fn root(value: PyObjectRef) -> Self {
         assert!(!value.is_null(), "use TypeDefValue::None for host None");
-        let slot = Box::leak(Box::new(std::cell::UnsafeCell::new(value)));
-        TYPEDEF_VALUE_ROOTS.lock().push(slot.get() as usize);
         crate::gc_roots::mark_prebuilt_roots_dirty();
-        Self::Root(slot)
+        Self::Root(std::cell::UnsafeCell::new(value))
     }
 }
 
@@ -181,58 +177,100 @@ impl TypeDef {
             }
         }
         definition.bases = bases;
-        unsafe { definition.add_entries(rawdict) };
-        crate::lltype::malloc_raw(definition)
+        // Publish before add_entries: TypeDef.add_entries names GetSetProperty
+        // with w_str_new, and collect_static_in_prebuilt_nongc only walks
+        // TypeDefs already in the census.
+        let ptr = publish_typedef(definition);
+        unsafe { (*(ptr as *mut TypeDef)).add_entries(rawdict) };
+        ptr
     }
 
-    /// TypeDef.add_entries: name descriptors before updating the rawdict.
+    /// TypeDef.add_entries: install declarations, then name descriptors.
+    /// Remember incoming keys in order, then extend so a published TypeDef's
+    /// Root cells are in the census before `w_str_new` (`GetSetProperty.name`).
+    /// Name each incoming key by lookup: a replaced key keeps its original
+    /// index, so walking only `start..len` would skip it.
     /// # Safety
     /// Root entries must contain valid W_Root objects; mutate declarations
-    /// only during host initialization, before publishing them to a cache.
+    /// only during host initialization. `self` must already be published.
     pub unsafe fn add_entries(&mut self, entries: indexmap::IndexMap<String, TypeDefValue>) {
-        for (key, entry) in &entries {
-            let TypeDefValue::Root(slot) = entry else {
-                continue;
+        let keys: Vec<String> = entries.keys().cloned().collect();
+        self.rawdict.extend(entries);
+        for key in keys {
+            let value_slot = match self.rawdict.get(&key) {
+                Some(TypeDefValue::Root(slot)) => slot.get(),
+                _ => continue,
             };
-            let value = unsafe { *slot.get() };
+            let value = unsafe { *value_slot };
             if unsafe { crate::gateway::is_interp2app(value) } {
                 let gateway = unsafe { &mut *(value as *mut crate::gateway::interp2app) };
-                gateway.name = Box::leak(key.clone().into_boxed_str());
+                gateway.name = Box::leak(key.into_boxed_str());
                 gateway._is_type_method = true;
             } else if unsafe { is_getset_property(value) } {
-                let w_name = crate::w_str_new(key);
-                let value = unsafe { *slot.get() };
+                let w_name = crate::w_str_new(&key);
+                let value = unsafe { *value_slot };
                 unsafe { w_getset_set_name(value, w_name) };
             }
         }
-        self.rawdict.extend(entries);
     }
 }
 
-// RPython's host GC owns these prebuilt declaration dictionaries. Native
-// bootstrap needs a root census, not a semantic TypeDef lookup side table.
-static TYPEDEF_VALUE_ROOTS: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+/// TypeDef is `@not_rpython` (`typedef.py`). After translation,
+/// `collect_roots_in_nursery` walks static pointers in prebuilt non-gc
+/// structs (`collect_static_in_prebuilt_nongc`). Native bootstrap has no
+/// PBC section, so the census is the TypeDefs themselves.
+///
+/// `*const TypeDef` is `!Send`; these pointers are process-lifetime host
+/// structs, the same addresses a PBC static-root table would name.
+#[derive(Clone, Copy)]
+struct TypeDefPtr(*const TypeDef);
+unsafe impl Send for TypeDefPtr {}
+unsafe impl Sync for TypeDefPtr {}
 
-/// Trace the host declaration values, including templates no namespace owns.
+static TYPEDEFS: parking_lot::Mutex<Vec<TypeDefPtr>> = parking_lot::Mutex::new(Vec::new());
+
+fn publish_typedef(definition: TypeDef) -> *const TypeDef {
+    let ptr = crate::lltype::malloc_raw(definition);
+    TYPEDEFS.lock().push(TypeDefPtr(ptr));
+    crate::gc_roots::mark_prebuilt_roots_dirty();
+    ptr
+}
+
+/// Trace `TypeDef.rawdict` Root values in place.
 /// The visitor must not allocate or construct another TypeDef.
 pub fn walk_typedef_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    for &address in TYPEDEF_VALUE_ROOTS.lock().iter() {
+    for &TypeDefPtr(typedef) in TYPEDEFS.lock().iter() {
         unsafe {
-            forward(&mut *(address as *mut PyObjectRef));
+            for value in (*typedef).rawdict.values() {
+                if let TypeDefValue::Root(slot) = value {
+                    forward(&mut *slot.get());
+                }
+            }
         }
     }
 }
 
 pub fn test_declaration_roots_len() -> usize {
-    TYPEDEF_VALUE_ROOTS.lock().len()
+    TYPEDEFS.lock().len()
 }
 
 pub fn test_last_declaration_slot() -> *mut PyObjectRef {
-    *TYPEDEF_VALUE_ROOTS.lock().last().unwrap() as *mut PyObjectRef
+    let typedefs = TYPEDEFS.lock();
+    let mut last = None;
+    for &TypeDefPtr(typedef) in typedefs.iter() {
+        unsafe {
+            for value in (*typedef).rawdict.values() {
+                if let TypeDefValue::Root(slot) = value {
+                    last = Some(slot.get());
+                }
+            }
+        }
+    }
+    last.expect("no TypeDef.rawdict Root in the TypeDef census")
 }
 
 pub fn test_truncate_declaration_roots(len: usize) {
-    TYPEDEF_VALUE_ROOTS.lock().truncate(len);
+    TYPEDEFS.lock().truncate(len);
 }
 
 /// Existing process-lifetime allocation for module-level `W_X.typedef`
@@ -243,7 +281,7 @@ pub fn leak_typedef(
     acceptable_as_base_class: bool,
     hasdict: bool,
 ) -> *const TypeDef {
-    crate::lltype::malloc_raw(TypeDef::new(
+    publish_typedef(TypeDef::new(
         instance_type,
         acceptable_as_base_class,
         hasdict,
@@ -858,6 +896,7 @@ mod tests {
         use super::*;
         use indexmap::IndexMap;
 
+        let _restore = RestoreTypedefCensus::enter();
         unsafe {
             let base = TypeDef::from_rawdict(
                 "base",
@@ -911,10 +950,57 @@ mod tests {
     }
 
     #[test]
+    fn add_entries_names_replaced_interp2app_and_getset() {
+        use super::*;
+        use indexmap::IndexMap;
+
+        let _restore = RestoreTypedefCensus::enter();
+        unsafe {
+            let definition =
+                TypeDef::from_rawdict("replace_probe", vec![], IndexMap::new(), &INSTANCE_TYPE);
+            let definition = &mut *(definition as *mut TypeDef);
+
+            let first_app = crate::gateway::interp2app::new(PY_NULL, "old_app");
+            let first_gs =
+                w_getset_property_new(PY_NULL, PY_NULL, PY_NULL, PY_NULL, PY_NULL, false, PY_NULL);
+            definition.add_entries(IndexMap::from([
+                ("method".into(), TypeDefValue::root(first_app)),
+                ("prop".into(), TypeDefValue::root(first_gs)),
+            ]));
+
+            let second_app = crate::gateway::interp2app::new(PY_NULL, "other_app");
+            let second_gs =
+                w_getset_property_new(PY_NULL, PY_NULL, PY_NULL, PY_NULL, PY_NULL, false, PY_NULL);
+            definition.add_entries(IndexMap::from([
+                ("method".into(), TypeDefValue::root(second_app)),
+                ("prop".into(), TypeDefValue::root(second_gs)),
+            ]));
+
+            let method = match definition.rawdict.get("method") {
+                Some(TypeDefValue::Root(slot)) => *slot.get(),
+                _ => panic!("expected Root slot method"),
+            };
+            assert_eq!(method, second_app);
+            let gateway = &*(method as *const crate::gateway::interp2app);
+            assert_eq!(gateway.name, "method");
+            assert!(gateway._is_type_method);
+
+            let prop = match definition.rawdict.get("prop") {
+                Some(TypeDefValue::Root(slot)) => *slot.get(),
+                _ => panic!("expected Root slot prop"),
+            };
+            assert_eq!(prop, second_gs);
+            let name = w_getset_get_name(prop);
+            assert_eq!(crate::w_str_get_value_opt(name), Some("prop"));
+        }
+    }
+
+    #[test]
     fn method_descriptor_is_projected_from_the_selected_layout_owner() {
         use super::*;
         use crate::typeobject::*;
 
+        let _restore = RestoreTypedefCensus::enter();
         let mut definition = TypeDef::new(&INSTANCE_TYPE, false, false);
         assert!(!definition.method_descriptor);
         definition.method_descriptor = true;
@@ -949,6 +1035,7 @@ mod tests {
         use super::{TypeDef, leak_typedef};
         use crate::typeobject::{DICT_DATA_SLOT_UNRESOLVED, Layout, leak_layout};
 
+        let _restore = RestoreTypedefCensus::enter();
         let definition: *const TypeDef = leak_typedef(&crate::pyobject::INSTANCE_TYPE, true, true);
         let root = leak_layout(Layout {
             typedef: definition,
@@ -988,5 +1075,71 @@ mod tests {
             <W_MemberDescr as crate::lltype::GcType>::SIZE,
             W_MEMBER_OBJECT_SIZE
         );
+    }
+
+    static TYPEDEF_CENSUS_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    struct RestoreTypedefCensus {
+        _guard: parking_lot::MutexGuard<'static, ()>,
+        len: usize,
+    }
+
+    impl RestoreTypedefCensus {
+        fn enter() -> Self {
+            let guard = TYPEDEF_CENSUS_TEST_LOCK.lock();
+            let len = test_declaration_roots_len();
+            Self { _guard: guard, len }
+        }
+    }
+
+    impl Drop for RestoreTypedefCensus {
+        fn drop(&mut self) {
+            test_truncate_declaration_roots(self.len);
+        }
+    }
+
+    #[test]
+    fn leak_typedef_and_from_rawdict_register_the_host_struct() {
+        use indexmap::IndexMap;
+
+        let _restore = RestoreTypedefCensus::enter();
+        let before = test_declaration_roots_len();
+        let _layout_only = leak_typedef(&INSTANCE_TYPE, false, false);
+        assert!(test_declaration_roots_len() >= before + 1);
+        unsafe {
+            let _declared =
+                TypeDef::from_rawdict("census_probe", vec![], IndexMap::new(), &INSTANCE_TYPE);
+        }
+        assert!(test_declaration_roots_len() >= before + 2);
+    }
+
+    #[test]
+    fn walk_typedef_roots_forwards_rawdict_in_place() {
+        let _restore = RestoreTypedefCensus::enter();
+        let marker = 0x0000_0000_0DEF_0009 as PyObjectRef;
+        let forwarded = 0x0000_0000_0DEF_00F1 as PyObjectRef;
+        let definition = leak_typedef(&INSTANCE_TYPE, false, false);
+        unsafe {
+            (*(definition as *mut TypeDef))
+                .rawdict
+                .insert("slot".into(), TypeDefValue::root(marker));
+        }
+        let mut seen = Vec::new();
+        walk_typedef_roots(&mut |slot| seen.push(*slot as usize));
+        assert!(
+            seen.contains(&(marker as usize)),
+            "walk_typedef_roots must visit TypeDef.rawdict Root values"
+        );
+        walk_typedef_roots(&mut |slot| {
+            if *slot == marker {
+                *slot = forwarded;
+            }
+        });
+        unsafe {
+            match (*definition).rawdict.get("slot") {
+                Some(TypeDefValue::Root(slot)) => assert_eq!(*slot.get(), forwarded),
+                _ => panic!("expected Root slot"),
+            }
+        }
     }
 }

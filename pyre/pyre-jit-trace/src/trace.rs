@@ -914,14 +914,14 @@ fn try_commit_midbody_abort_inner(
             "live_locals length does not match varnames",
         ));
     }
-    for slot in &mut locals_w_mut!(frame).as_mut_slice()[..code.varnames.len()] {
-        *slot = pyre_object::PY_NULL;
+    for slot in 0..code.varnames.len() {
+        locals_w_mut!(frame).set_ref(slot, pyre_object::PY_NULL);
     }
     // `_copy_data_from_miframe` restores Ref registers before any scalar
     // boxing allocation; once installed, the rooted frame array owns them.
     for (slot, value) in current.live_locals.iter().enumerate() {
         if let Some(crate::state::ConcreteValue::Ref(value)) = value {
-            locals_w_mut!(frame).as_mut_slice()[slot] = *value;
+            locals_w_mut!(frame).set_ref(slot, *value);
         }
     }
     let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
@@ -929,7 +929,7 @@ fn try_commit_midbody_abort_inner(
         let crate::state::ConcreteValue::Ref(value) = value else {
             return Err(MidBodyDecline::BeforeRun("live stack slot is not a Ref"));
         };
-        locals_w_mut!(frame).as_mut_slice()[stack_base + rel] = *value;
+        locals_w_mut!(frame).set_ref(stack_base + rel, *value);
     }
     // `PyFrame.__init__` creates this as a fresh nursery array.  The barrier
     // helper is harmless for that case and still covers the old-gen spill arm
@@ -959,7 +959,7 @@ fn try_commit_midbody_abort_inner(
         }) else {
             continue;
         };
-        locals_w_mut!(frame).as_mut_slice()[slot] = word;
+        locals_w_mut!(frame).set_ref(slot, word);
     }
     crate::state::frame_array_write_barrier(
         frame.as_mut_ptr() as *mut u8,
@@ -1053,9 +1053,9 @@ fn try_commit_midbody_abort_inner(
             // The handler unwinds from the operand level the CALL raised at,
             // which for an expression-position call is not the empty one.
             let arr_ptr = locals_w_mut!(outer) as *mut _;
-            locals_w_mut!(outer).as_mut_slice()
-                [outer_stack_base..outer_stack_base + below_now.len()]
-                .copy_from_slice(below_now);
+            for (i, &value) in below_now.iter().enumerate() {
+                locals_w_mut!(outer).set_ref(outer_stack_base + i, value);
+            }
             crate::state::frame_array_write_barrier(cf_addr as *mut u8, arr_ptr);
             outer.last_instr = words.call_py_pc as isize;
             outer.valuestackdepth = outer_stack_base + below_now.len();

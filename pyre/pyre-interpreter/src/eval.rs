@@ -1434,9 +1434,6 @@ pub unsafe fn walk_pyframe_roots_area(
 /// app-level interphook handles, the `threading` module's own roots, and the
 /// faulthandler's — so it registers once for the process.
 fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_object::unicodeobject::walk_interned_strings_gc(&mut |slot| {
-        visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
-    });
     walk_global_prebuilt_roots(visitor);
     #[cfg(all(
         feature = "cpyext",
@@ -7100,6 +7097,20 @@ result = (
         walk_global_prebuilt_roots(visitor);
     }
 
+    fn unpublished_rawdict_minor_walk(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !DECL_SHIPPED_WALK.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        pyre_object::gc_roots::walk_shadow_stack(|slot| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+            let value = *slot;
+            unsafe {
+                walk_raw_immortal_roots(value, visitor);
+            }
+        });
+        walk_global_prebuilt_roots(visitor);
+    }
+
     fn declaration_test_owns(addr: usize) -> bool {
         DECL_OWNED.with(|slots| slots.borrow().contains(&addr))
     }
@@ -7128,6 +7139,20 @@ result = (
             prev_dirty: pyre_object::gc_roots::prebuilt_roots_dirty(),
             roots_len: pyre_object::typedef::test_declaration_roots_len(),
         }
+    }
+
+    unsafe fn root_declaration(value: PyObjectRef) -> *mut PyObjectRef {
+        let definition =
+            pyre_object::typedef::leak_typedef(&pyre_object::INSTANCE_TYPE, false, false);
+        unsafe {
+            (*(definition as *mut pyre_object::typedef::TypeDef))
+                .rawdict
+                .insert(
+                    "slot".into(),
+                    pyre_object::typedef::TypeDefValue::root(value),
+                );
+        }
+        pyre_object::typedef::test_last_declaration_slot()
     }
 
     /// A clean minor still walks TypeDef.rawdict slots (`incminimark.py`
@@ -7162,8 +7187,7 @@ result = (
         let young_tid = gc.register_type(TypeInfo::simple(16));
         let young = gc.alloc_nursery_typed(young_tid, 16);
         DECL_OWNED.with(|slots| slots.borrow_mut().push(young.0));
-        let _rooted = unsafe { pyre_object::typedef::TypeDefValue::root(young.0 as PyObjectRef) };
-        let slot = pyre_object::typedef::test_last_declaration_slot();
+        let slot = unsafe { root_declaration(young.0 as PyObjectRef) };
         let young_before = young.0;
         pyre_object::gc_roots::clear_prebuilt_roots_dirty();
 
@@ -7177,8 +7201,7 @@ result = (
         pyre_object::typedef::test_truncate_declaration_roots(roots_len);
         let young2 = gc.alloc_nursery_typed(young_tid, 16);
         DECL_OWNED.with(|slots| slots.borrow_mut().push(young2.0));
-        let _rooted2 = unsafe { pyre_object::typedef::TypeDefValue::root(young2.0 as PyObjectRef) };
-        let slot2 = pyre_object::typedef::test_last_declaration_slot();
+        let slot2 = unsafe { root_declaration(young2.0 as PyObjectRef) };
         let young2_before = young2.0;
         pyre_object::gc_roots::clear_prebuilt_roots_dirty();
         DECL_SHIPPED_WALK.store(true, Ordering::Release);
@@ -7232,11 +7255,11 @@ result = (
         assert!(!pyre_object::gc_hook::try_gc_owns_object(
             gateway as pyre_object::gc_hook::GCREF
         ));
-        let _rooted = unsafe { pyre_object::typedef::TypeDefValue::root(gateway) };
+        let slot = unsafe { root_declaration(gateway) };
 
         let mut seen = Vec::new();
         unsafe {
-            let value = *pyre_object::typedef::test_last_declaration_slot();
+            let value = *slot;
             assert_eq!(value, gateway);
             assert!(!pyre_object::gc_hook::try_gc_owns_object(
                 value as pyre_object::gc_hook::GCREF
@@ -7262,5 +7285,393 @@ result = (
             unsafe { (*(gateway as *mut pyre_object::gateway::interp2app))._code as usize };
         assert_ne!(forwarded, young_before);
         assert!(gc.is_managed_heap_object(forwarded));
+    }
+
+    /// iterobject.rs builds a local IndexMap of `TypeDefValue::root` values
+    /// and only later calls `TypeDef.from_rawdict`. A minor between two
+    /// gateway allocations must forward the first gateway through the house
+    /// pin so the published rawdict stores live pointers.
+    #[test]
+    fn unpublished_rawdict_forwards_across_minor_between_gateways() {
+        use indexmap::IndexMap;
+        use majit_gc::GcAllocator;
+        use majit_gc::collector::{GcConfig, MiniMarkGC};
+        use majit_gc::trace::TypeInfo;
+        use pyre_object::gc_roots::RootedItems;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        crate::module::thread::ensure_runtime_thread();
+        let _restore = restore_declaration_test_state();
+
+        let descr = <pyre_object::gateway::interp2app as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descr.pytype_ptr as usize,
+            descr.ptr_offsets,
+        );
+
+        majit_gc::shadow_stack::register_extra_root_walker(
+            unpublished_rawdict_minor_walk,
+            "unpublished_rawdict_minor",
+        );
+        pyre_object::gc_hook::register_gc_owns_object_hook(declaration_test_owns);
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+
+        let mut items = RootedItems::new();
+        let young1 = gc.alloc_nursery_typed(young_tid, 16);
+        let young1_before = young1.0;
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young1_before));
+        let gateway1 =
+            unsafe { pyre_object::gateway::interp2app::new(young1_before as PyObjectRef, "first") };
+        items.push(young1_before as PyObjectRef);
+        items.push(gateway1);
+
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+        DECL_SHIPPED_WALK.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+
+        let young2 = gc.alloc_nursery_typed(young_tid, 16);
+        let young2_before = young2.0;
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young2_before));
+        let gateway2 = unsafe {
+            pyre_object::gateway::interp2app::new(young2_before as PyObjectRef, "second")
+        };
+        items.push(young2_before as PyObjectRef);
+        items.push(gateway2);
+
+        let mut entries = IndexMap::new();
+        unsafe {
+            entries.insert(
+                "first".into(),
+                pyre_object::typedef::TypeDefValue::root(items.get(1)),
+            );
+            entries.insert(
+                "first_code".into(),
+                pyre_object::typedef::TypeDefValue::root(items.get(0)),
+            );
+            entries.insert(
+                "second".into(),
+                pyre_object::typedef::TypeDefValue::root(items.get(3)),
+            );
+            entries.insert(
+                "second_code".into(),
+                pyre_object::typedef::TypeDefValue::root(items.get(2)),
+            );
+            let definition = pyre_object::typedef::TypeDef::from_rawdict(
+                "unpublished_probe",
+                vec![],
+                entries,
+                &pyre_object::INSTANCE_TYPE,
+            );
+            let slot_ptr = |name: &str| match (*definition).rawdict.get(name) {
+                Some(pyre_object::typedef::TypeDefValue::Root(slot)) => *slot.get(),
+                _ => panic!("expected Root slot {name}"),
+            };
+            let first = slot_ptr("first");
+            let first_code = slot_ptr("first_code");
+            let second = slot_ptr("second");
+            let second_code = slot_ptr("second_code");
+            assert_eq!(first, items.get(1));
+            assert_eq!(first_code, items.get(0));
+            assert_eq!(second, items.get(3));
+            assert_eq!(second_code, items.get(2));
+            let forwarded = (*(first as *mut pyre_object::gateway::interp2app))._code as usize;
+            assert_eq!(forwarded, first_code as usize);
+            assert_ne!(forwarded, young1_before);
+            assert!(gc.is_managed_heap_object(forwarded));
+            let code2 = (*(second as *mut pyre_object::gateway::interp2app))._code as usize;
+            assert_eq!(code2, young2_before);
+            assert_eq!(code2, second_code as usize);
+        }
+    }
+
+    thread_local! {
+        static INTERN_TEST_GC: std::cell::RefCell<Option<*mut majit_gc::collector::MiniMarkGC>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    static INTERN_TEST_WALK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn intern_test_gc<R>(f: impl FnOnce(&mut majit_gc::collector::MiniMarkGC) -> R) -> Option<R> {
+        INTERN_TEST_GC.with(|slot| slot.borrow().map(|ptr| f(unsafe { &mut *ptr })))
+    }
+
+    fn intern_test_stable_alloc(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
+        intern_test_gc(|gc| {
+            use majit_gc::GcAllocator;
+            gc.alloc_oldgen_typed(type_id, payload_size).0 as pyre_object::gc_hook::GCREF
+        })
+        .expect("intern test gc")
+    }
+
+    fn intern_test_nursery_alloc(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
+        intern_test_gc(|gc| {
+            gc.alloc_with_type_no_collect(type_id, payload_size).0 as pyre_object::gc_hook::GCREF
+        })
+        .expect("intern test gc")
+    }
+
+    fn intern_test_write_barrier(obj: pyre_object::gc_hook::GCREF) {
+        intern_test_gc(|gc| {
+            use majit_gc::GcAllocator;
+            gc.write_barrier(majit_ir::GcRef(obj as usize));
+        });
+    }
+
+    fn intern_test_write_barrier_managed(obj: pyre_object::gc_hook::GCREF) {
+        intern_test_gc(|gc| {
+            use majit_gc::GcAllocator;
+            gc.write_barrier_managed(majit_ir::GcRef(obj as usize));
+        });
+    }
+
+    fn intern_test_write_barrier_from_array(obj: pyre_object::gc_hook::GCREF, index: usize) {
+        intern_test_gc(|gc| {
+            use majit_gc::GcAllocator;
+            gc.write_barrier_from_array(majit_ir::GcRef(obj as usize), index);
+        });
+    }
+
+    fn intern_test_owns(addr: usize) -> bool {
+        intern_test_gc(|gc| gc.is_managed_heap_object(addr)).unwrap_or(false)
+    }
+
+    fn intern_test_shadow_stack_walk(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !INTERN_TEST_WALK.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        pyre_object::gc_roots::walk_shadow_stack(|slot| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        });
+    }
+
+    fn pad_types_until(gc: &mut majit_gc::collector::MiniMarkGC, target: u32) {
+        while gc.types.len() < target as usize {
+            let _ = gc.register_type(majit_gc::trace::TypeInfo::simple(16));
+        }
+    }
+
+    struct InternTestRestore {
+        prev_dict: *mut pyre_object::rweakvaldict::WeakDict<pyre_object::celldict::StrKey>,
+        prev_str_tid: u32,
+        prev_weakdict_tid: u32,
+    }
+
+    impl Drop for InternTestRestore {
+        fn drop(&mut self) {
+            INTERN_TEST_WALK.store(false, std::sync::atomic::Ordering::Release);
+            pyre_object::unicodeobject::set_interned_strings_dict_ptr(self.prev_dict);
+            if self.prev_str_tid == 0 {
+                pyre_object::lowlevel_string::clear_lowlevel_str_gc_type_id();
+            } else {
+                pyre_object::lowlevel_string::set_lowlevel_str_gc_type_id(self.prev_str_tid);
+            }
+            pyre_object::rweakvaldict::set_weakdict_gc_type_id(self.prev_weakdict_tid);
+            pyre_object::rweakvaldict::set_weakdict_entries_gc_type_id(0);
+            pyre_object::gc_hook::clear_gc_alloc_hook();
+            pyre_object::gc_hook::clear_gc_alloc_stable_hook();
+            pyre_object::gc_hook::clear_gc_alloc_collecting_hook();
+            pyre_object::gc_hook::clear_gc_alloc_collecting_rooted_hook();
+            pyre_object::gc_hook::clear_gc_owns_object_hook();
+            pyre_object::gc_hook::clear_gc_write_barrier_hook();
+            pyre_object::gc_hook::clear_gc_write_barrier_managed_hook();
+            pyre_object::gc_hook::clear_gc_write_barrier_from_array_hook();
+            INTERN_TEST_GC.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// `ObjSpace.__init__` interned_strings is a prebuilt GC `WEAKDICT`
+    /// (`WeakValueDictRepr.convert_const`). Majors keep it through
+    /// `prebuilt_root_objects` (`seed_major_roots` /
+    /// `rescan_major_nonstack_roots_and_drain`); it is not extra-rooted.
+    /// A young interned str stored after init survives a minor and a major
+    /// because `entries` stores take `barrier_dict`.
+    #[test]
+    fn intern_dict_is_prebuilt_stable_across_minor_and_major() {
+        use majit_gc::GcAllocator;
+        use majit_gc::collector::{GcConfig, MiniMarkGC};
+        use majit_gc::trace::TypeInfo;
+        use pyre_object::celldict::StrKey;
+        use pyre_object::rweakvaldict::{WeakDict, WeakDictEntries, WeakDictEntry};
+        use rustpython_wtf8::Wtf8;
+
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        crate::module::thread::ensure_runtime_thread();
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        pad_types_until(&mut gc, pyre_object::unicodeobject::W_UNICODE_GC_TYPE_ID);
+        let unicode_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+            pyre_object::unicodeobject::W_UNICODE_OBJECT_SIZE,
+            vec![pyre_object::unicodeobject::UNICODE_VALUE_OFFSET],
+        ));
+        assert_eq!(
+            unicode_tid,
+            pyre_object::unicodeobject::W_UNICODE_GC_TYPE_ID
+        );
+        pad_types_until(&mut gc, pyre_object::weakref::WEAKREF_GC_TYPE_ID);
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+        assert_eq!(wref_tid, pyre_object::weakref::WEAKREF_GC_TYPE_ID);
+        let str_tid = gc.register_type(TypeInfo::varsize(
+            pyre_object::lowlevel_string::LOWLEVEL_STR_BASE_SIZE,
+            1,
+            pyre_object::lowlevel_string::LOWLEVEL_STRING_LEN_OFFSET,
+            false,
+            Vec::new(),
+        ));
+        let entries_tid = gc.register_type(TypeInfo::varsize_with_gc_ptr_offsets(
+            std::mem::offset_of!(WeakDictEntries<StrKey>, items),
+            std::mem::size_of::<WeakDictEntry<StrKey>>(),
+            std::mem::offset_of!(WeakDictEntries<StrKey>, length),
+            vec![
+                std::mem::offset_of!(WeakDictEntry<StrKey>, key),
+                std::mem::offset_of!(WeakDictEntry<StrKey>, value),
+            ],
+            vec![],
+        ));
+        let weakdict_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<WeakDict<StrKey>>(),
+            vec![std::mem::offset_of!(WeakDict<StrKey>, entries)],
+        ));
+
+        let prev_str_tid = pyre_object::lowlevel_string::lowlevel_str_gc_type_id();
+        let prev_weakdict_tid = pyre_object::rweakvaldict::weakdict_gc_type_id();
+        let prev_dict = pyre_object::unicodeobject::interned_strings_dict_ptr();
+        INTERN_TEST_GC.with(|slot| *slot.borrow_mut() = Some(&mut gc as *mut MiniMarkGC));
+        let _restore = InternTestRestore {
+            prev_dict,
+            prev_str_tid,
+            prev_weakdict_tid,
+        };
+
+        pyre_object::lowlevel_string::set_lowlevel_str_gc_type_id(str_tid);
+        pyre_object::rweakvaldict::set_weakdict_entries_gc_type_id(entries_tid);
+        pyre_object::rweakvaldict::set_weakdict_gc_type_id(weakdict_tid);
+        pyre_object::gc_hook::register_gc_alloc_hook(intern_test_nursery_alloc);
+        pyre_object::gc_hook::register_gc_alloc_stable_hook(intern_test_stable_alloc);
+        pyre_object::gc_hook::register_gc_alloc_collecting_hook(intern_test_nursery_alloc);
+        pyre_object::gc_hook::register_gc_owns_object_hook(intern_test_owns);
+        pyre_object::gc_hook::register_gc_write_barrier_hook(intern_test_write_barrier);
+        pyre_object::gc_hook::register_gc_write_barrier_managed_hook(
+            intern_test_write_barrier_managed,
+        );
+        pyre_object::gc_hook::register_gc_write_barrier_from_array_hook(
+            intern_test_write_barrier_from_array,
+        );
+        majit_gc::shadow_stack::register_extra_root_walker(
+            intern_test_shadow_stack_walk,
+            "intern_prebuilt_dict",
+        );
+        INTERN_TEST_WALK.store(true, std::sync::atomic::Ordering::Release);
+
+        pyre_object::unicodeobject::replace_interned_strings_dict();
+        let dict = pyre_object::unicodeobject::interned_strings_dict_ptr();
+        assert!(!dict.is_null());
+        assert!(pyre_object::gc_hook::try_gc_owns_object(
+            dict as pyre_object::gc_hook::GCREF
+        ));
+
+        let live = Wtf8::new("__pyre_intern_prebuilt_dict_young_8c1e__");
+        let managed = pyre_object::unicodeobject::w_str_from_wtf8_managed(live.to_owned());
+        assert!(pyre_object::gc_hook::try_gc_owns_object(
+            managed as pyre_object::gc_hook::GCREF
+        ));
+        let _roots = pyre_object::gc_roots::push_roots();
+        let interned_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(managed);
+        let interned = unsafe {
+            pyre_object::unicodeobject::intern_exact_str(pyre_object::gc_roots::shadow_stack_get(
+                interned_slot,
+            ))
+        };
+        assert_eq!(
+            interned,
+            pyre_object::gc_roots::shadow_stack_get(interned_slot)
+        );
+
+        // `ll_dict_resize` `_ll_malloc_entries` on a 4096-byte nursery:
+        // convert_const keys stay findable after the array is replaced and
+        // a minor runs (`rdict.py` `ll_dict_resize` / `old_entries`).
+        let resized: Vec<String> = (0..32)
+            .map(|n| format!("__pyre_intern_resize_{n}__"))
+            .collect();
+        let interned_keys: Vec<_> = resized
+            .iter()
+            .map(|s| pyre_object::unicodeobject::intern_str_value(s))
+            .collect();
+
+        // `ll_set_nonnull` livevar `d` across `weakref_create`
+        // (`_rweakvaldict.py`): `intern_exact_str` / `intern_publish` must
+        // keep `d.entries` findable after a collecting `w_weakref_new` on a
+        // 4096-byte nursery.
+        let exact: Vec<String> = (0..16)
+            .map(|n| format!("__pyre_intern_exact_{n}__"))
+            .collect();
+        let exact_base = pyre_object::gc_roots::shadow_stack_len();
+        for s in &exact {
+            let managed = pyre_object::unicodeobject::w_str_from_wtf8_managed(
+                Wtf8::new(s.as_str()).to_owned(),
+            );
+            let _ = pyre_object::gc_roots::pin_root(managed);
+        }
+        for i in 0..exact.len() {
+            let interned = unsafe {
+                pyre_object::unicodeobject::intern_exact_str(
+                    pyre_object::gc_roots::shadow_stack_get(exact_base + i),
+                )
+            };
+            assert_eq!(
+                interned,
+                pyre_object::gc_roots::shadow_stack_get(exact_base + i)
+            );
+        }
+
+        gc.do_collect_nursery();
+        assert_eq!(
+            pyre_object::unicodeobject::interned_strings_dict_ptr(),
+            dict
+        );
+        let interned = pyre_object::gc_roots::shadow_stack_get(interned_slot);
+        assert_eq!(
+            pyre_object::unicodeobject::get_interned_wtf8(live),
+            Some(interned)
+        );
+
+        gc.do_collect_full();
+        assert_eq!(
+            pyre_object::unicodeobject::interned_strings_dict_ptr(),
+            dict
+        );
+        let interned = pyre_object::gc_roots::shadow_stack_get(interned_slot);
+        assert_eq!(
+            pyre_object::unicodeobject::get_interned_wtf8(live),
+            Some(interned)
+        );
+        assert!(gc.is_managed_heap_object(dict as usize));
+        assert!(gc.is_managed_heap_object(interned as usize));
+        for (s, obj) in resized.iter().zip(interned_keys.iter()) {
+            assert!(
+                std::ptr::eq(pyre_object::unicodeobject::intern_str_value(s), *obj),
+                "intern key {s} must survive resize then minor"
+            );
+        }
+        for (i, s) in exact.iter().enumerate() {
+            let obj = pyre_object::gc_roots::shadow_stack_get(exact_base + i);
+            assert_eq!(
+                pyre_object::unicodeobject::get_interned_wtf8(Wtf8::new(s.as_str())),
+                Some(obj),
+                "intern_exact_str key {s} must survive weakref_create then minor"
+            );
+        }
     }
 }

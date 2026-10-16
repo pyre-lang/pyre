@@ -1057,12 +1057,13 @@ pub fn descr_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "join", 1)?;
-    // `sequence_fast` and the type-error path allocate, so pin the separator
-    // and iterable first and copy the separator payload off the object.
+    // `sequence_fast` and the type-error path allocate. Pin the separator
+    // object and the iterable (`framework.py` `push_roots`); `_utf8` is
+    // a getfield of the reloaded separator inside `_str_join_many_items`
+    // (`unicodeobject.py`), never a derived `&Wtf8` kept across that
+    // collection (`rstr.py` chars after `pop_roots`).
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
-    let sep = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
-        .to_wtf8_buf();
     let items_base = pyre_object::gc_roots::shadow_stack_len();
     let n_items = unsafe {
         let iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
@@ -1119,35 +1120,64 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         return Ok(str_result_unchanged(item));
     }
     let reloaded: Vec<_> = (0..n_items).map(item).collect();
-    str_join_many_items(&sep, &reloaded)
+    str_join_many_items(pyre_object::gc_roots::shadow_stack_get(base), &reloaded)
 }
 
 /// `stringmethods.py _str_join_many_items`:
 /// `@jit.look_inside_iff(lambda self, space, list_w, size: jit.loop_unrolling_heuristic(list_w, size))`.
-fn str_join_many_items_iff(_sep: &rustpython_wtf8::Wtf8, items: &[PyObjectRef]) -> bool {
+fn str_join_many_items_iff(_sep: PyObjectRef, items: &[PyObjectRef]) -> bool {
     majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), 2)
 }
 
 #[majit_macros::look_inside_iff(str_join_many_items_iff)]
 fn str_join_many_items(
-    sep: &rustpython_wtf8::Wtf8,
+    sep: PyObjectRef,
     items: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    let mut out = rustpython_wtf8::Wtf8Buf::new();
-    for (i, item) in items.iter().enumerate() {
-        if unsafe { !is_str(*item) } {
+    // `unicodeobject.py` `_str_join_many_items`: `value = self._utf8` is a
+    // Ptr(STR) getfield. `StringBuilder.append` takes that GCREF, not a
+    // `&Wtf8` chars interior. Pin the separator and items so each append
+    // that collects (`rbuilder.py` `ll_append`) is followed by a reload
+    // (`framework.py` `pop_roots`).
+    if items.is_empty() {
+        return Ok(pyre_object::w_str_from_wtf8_managed(
+            rustpython_wtf8::Wtf8Buf::new(),
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut pinned = Vec::with_capacity(1 + items.len());
+    pinned.push(sep);
+    pinned.extend_from_slice(items);
+    let base = pyre_object::gc_roots::pin_roots(&pinned);
+    let n = items.len();
+    let mut lgt =
+        unsafe { pyre_object::w_str_len(pyre_object::gc_roots::shadow_stack_get(base)) } * (n - 1);
+    let mut prealloc =
+        unsafe { pyre_object::w_str_byte_len(pyre_object::gc_roots::shadow_stack_get(base)) }
+            * (n - 1);
+    for i in 0..n {
+        let item = pyre_object::gc_roots::shadow_stack_get(base + 1 + i);
+        if unsafe { !is_str(item) } {
             return Err(crate::PyError::type_error(format!(
                 "sequence item {i}: expected str instance, {} found",
-                arg_type_name(*item)
+                arg_type_name(item)
             )));
         }
-        if i > 0 {
-            out.push_wtf8(sep);
-        }
-        out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(*item) });
+        lgt += unsafe { pyre_object::w_str_len(item) };
+        prealloc += unsafe { pyre_object::w_str_byte_len(item) };
     }
-    // `str.join` is a dominant dynamic-churn producer; make the result collectable.
-    Ok(pyre_object::w_str_from_wtf8_managed(out))
+    let mut sb = pyre_object::rstring::StringBuilder::new(prealloc as i64);
+    for i in 0..n {
+        if i != 0 {
+            let sep = pyre_object::gc_roots::shadow_stack_get(base);
+            if unsafe { pyre_object::w_str_byte_len(sep) } != 0 {
+                sb.append(unsafe { pyre_object::w_str_storage(sep) });
+            }
+        }
+        let item = pyre_object::gc_roots::shadow_stack_get(base + 1 + i);
+        sb.append(unsafe { pyre_object::w_str_storage(item) });
+    }
+    Ok(pyre_object::w_str_from_storage_and_length(sb.build(), lgt))
 }
 
 /// `str.split` / `str.rsplit` take `sep` and `maxsplit` positionally or by
@@ -6643,10 +6673,20 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `interp2app` turns every builtin method into one of these graphs.
 pub fn __majit_wrap_dict_descr_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 1 {
-        let dict = resolve_dict_backing(args[0]);
-        if !dict.is_null() {
-            return Ok(pyre_object::dictmultiobject::w_dict_keys_new(dict));
+        // Pin the receiver before resolving its backing so the slice is not
+        // live across that call (`framework.py` `push_roots`). Reload every
+        // operand from its slot; do not read `args` afterwards.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(args);
+        let dict = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(base));
+        if dict.is_null() {
+            return dict_descr_keys_residual(&[pyre_object::gc_roots::shadow_stack_get(base)]);
         }
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(dict);
+        return Ok(pyre_object::dictmultiobject::w_dict_keys_new(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        ));
     }
     dict_descr_keys_residual(args)
 }
@@ -6671,10 +6711,18 @@ fn dict_descr_keys_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// shape as `__majit_wrap_dict_descr_keys`, kind tag `Values`.
 pub fn __majit_wrap_dict_descr_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 1 {
-        let dict = resolve_dict_backing(args[0]);
-        if !dict.is_null() {
-            return Ok(pyre_object::dictmultiobject::w_dict_values_new(dict));
+        // Same rooting as `__majit_wrap_dict_descr_keys`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(args);
+        let dict = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(base));
+        if dict.is_null() {
+            return dict_descr_values_residual(&[pyre_object::gc_roots::shadow_stack_get(base)]);
         }
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(dict);
+        return Ok(pyre_object::dictmultiobject::w_dict_values_new(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        ));
     }
     dict_descr_values_residual(args)
 }
@@ -6692,10 +6740,18 @@ fn dict_descr_values_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 /// shape as `__majit_wrap_dict_descr_keys`, kind tag `Items`.
 pub fn __majit_wrap_dict_descr_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 1 {
-        let dict = resolve_dict_backing(args[0]);
-        if !dict.is_null() {
-            return Ok(pyre_object::dictmultiobject::w_dict_items_new(dict));
+        // Same rooting as `__majit_wrap_dict_descr_keys`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(args);
+        let dict = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(base));
+        if dict.is_null() {
+            return dict_descr_items_residual(&[pyre_object::gc_roots::shadow_stack_get(base)]);
         }
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(dict);
+        return Ok(pyre_object::dictmultiobject::w_dict_items_new(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        ));
     }
     dict_descr_items_residual(args)
 }

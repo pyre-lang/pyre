@@ -280,9 +280,16 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
     if version_tag != 0 && !has_c_mirror {
         // `W_TypeObject.setdictvalue` reads through
         // `_pure_getdictvalue_no_unwrapping`, which does not unwrap.
-        let w_name = pyre_object::unicodeobject::box_str_constant(name);
-        let raw =
-            crate::baseobjspace::_pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
+        // Residual ABI needs a `w_name`. `getdictvalue` does not intern
+        // (`typeobject.py` `_getdictvalue_no_unwrapping`); probe
+        // `interned_strings.get` only. A miss walks with the borrowed name.
+        let raw = match pyre_object::unicodeobject::get_interned_wtf8(name) {
+            Some(w_name) => {
+                crate::baseobjspace::_pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag)
+            }
+            None => crate::type_dict_lookup_wtf8_no_unwrapping(w_type, name)
+                .unwrap_or(std::ptr::null_mut()),
+        };
         let w_curr = if raw.is_null() { None } else { Some(raw) };
         match pyre_object::with_roots!(w_type => pyre_object::celldict::write_cell(w_curr, w_value))
         {

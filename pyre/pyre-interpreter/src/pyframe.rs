@@ -1678,8 +1678,16 @@ unsafe fn alloc_frame_locals_array(
                 items.add(i).write(fill);
             }
         }
-        // Nursery-full spill is old-gen; remember young `fill` values.
-        remember_frame_locals_array(arr);
+        // `incminimark.py write_barrier` remembers only after a young
+        // pointer lands. A NULL fill is not one; running the barrier here
+        // would clear `GCFLAG_TRACK_YOUNG_PTRS` on an old-gen spill
+        // (`try_gc_alloc_stable_raw`) before the caller `set_ref`s live
+        // values, and `FixedObjectArray::set_ref` then takes the TRACK-clear
+        // fast path. Nursery objects are born untracked, so this is a no-op
+        // on that arm either way.
+        if !fill.is_null() {
+            remember_frame_locals_array(arr);
+        }
         return arr;
     }
     unsafe { alloc_fixed_array_with_header(len, fill) }
@@ -2488,12 +2496,9 @@ impl PyFrame {
         let src_vals = locals_w!(src).as_slice().to_vec();
         let dst = locals_w_mut!(self);
         let n = src_vals.len().min(dst.as_slice().len());
-        let dst_p = dst.items_mut_ptr();
         for (i, &v) in src_vals.iter().take(n).enumerate() {
-            // `ll_setitem_fast` on the locals array.
-            unsafe {
-                *dst_p.add(i) = v;
-            }
+            // `setarrayitem_gc` / `ll_setitem_fast` on the locals array.
+            dst.set_ref(i, v);
         }
         remember_frame_locals_array(self.locals_cells_stack_w);
     }
@@ -4697,9 +4702,11 @@ impl PyFrame {
             let src = (*anchor.live()).locals_cells_stack_w;
             if !src.is_null() {
                 let items = (*src).as_slice();
-                let dst = (*array).items_mut_ptr();
+                let dst = &mut *array;
                 for (i, &value) in items.iter().take(n).enumerate() {
-                    dst.add(i).write(value);
+                    // `setarrayitem_gc`: the dest may be an old-gen spill
+                    // (`FrameLocalsArrayAllocation::OldGenGc`).
+                    dst.set_ref(i, value);
                 }
             }
             remember_frame_locals_array(array);

@@ -134,8 +134,81 @@ fn residual_funcptr_addr<Sym: WalkSym>(
     })
 }
 
+/// `rewrite.py` `gen_write_barrier` on the list (`SETFIELD_GC` of that
+/// pointer). A void `list_write_barrier` has no following store, so the
+/// Object arm also needs the array half (`handle_write_barrier_setarrayitem`
+/// / `gen_write_barrier_array`): `list_object_custom_trace` forwards a
+/// young block and does not re-scan an already-old one.
+/// `gen_write_barrier_array` falls back to `gen_write_barrier` when the
+/// length is small or the index is absent — this residual has no index,
+/// so `CondCallGcWb` on the array.
+///
+/// Emit the array half only on the Object arm. `list_write_barrier_impl`
+/// Phase L2 barriers `list_gc_ref_items_block` (Object `items`, Ascii
+/// `ascii_items.block`, Bytes `bytes_items.block`) when the block is
+/// non-null and GC-owned. VOID install paths (Empty/Integer) and an
+/// empty Ascii/Bytes list leave that block null.
+/// `assembler.py` `_write_barrier_fastpath` does `TEST8` at
+/// `base + jit_wb_if_flag_byteofs` with no null check (aarch64
+/// `emit_write_barrier_fastpath_for_base` `LDRB` the same), so a
+/// Getfield of `items` / `ascii_items.block` / `bytes_items.block` that
+/// is not on the Object arm must not be barred. Skip `ItemsBlock`
+/// std::alloc (`try_gc_owns_object` is false in the helper):
+/// `CondCallGcWb` on a non-header pointer is undefined.
+fn record_list_and_items_cond_call_gc_wb<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    list_op: OpRef,
+    barrier_items_if_object: bool,
+) -> OpRef {
+    let wb = ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[list_op]);
+    if !barrier_items_if_object || !pyre_object::object_array::itemsblock_gc_enabled() {
+        return wb;
+    }
+    if !list_strategy_is_object(ctx, list_op) {
+        return wb;
+    }
+    let items = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_items_descr(),
+    );
+    ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[items]);
+    wb
+}
+
+/// True when this residual is on the Object arm: a proven `ConstInt`
+/// (`rewrite.rs` `is_null_constant` / `history.py` ConstInt) equal to
+/// `ListStrategy::Object`, or the same Int the strategy Getfield holds
+/// after the match guard this arm already recorded. That guard is the
+/// compiled loop's strategy, so the Object `items` block stays
+/// allocated; it is not the tracing-time `box_value` of `list.items`.
+fn list_strategy_is_object<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    list_op: OpRef,
+) -> bool {
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    let object = pyre_object::listobject::ListStrategy::Object as i64;
+    match ctx.trace_ctx.const_typed_value(strategy) {
+        Some(majit_ir::Value::Int(n)) => n == object,
+        _ => match ctx.trace_ctx.box_value(strategy) {
+            Some(majit_ir::Value::Int(n)) => n == object,
+            _ => false,
+        },
+    }
+}
+
 /// Record the list write-barrier residual as `rewrite.py gen_write_barrier`
 /// would: `CondCallGcWb` on the list, not a `CallN`/`CallR` every append.
+/// A void Object `list_write_barrier` also bars the items array (Phase L2).
+/// `prepare_list_ref_store` is always followed by `ll_setitem_fast`
+/// (`rlist.py`), which is `setarrayitem_gc`; `rewrite.py`
+/// `handle_write_barrier_setarrayitem` / `gen_write_barrier_array` emit
+/// `COND_CALL_GC_WB[_ARRAY]` on that store, so the residual is only the
+/// list half.
 ///
 /// `prepare_list_ref_store` still returns the value — only the barrier half
 /// becomes `CondCallGcWb`. `current_gc_ref` after that barrier is identity
@@ -161,13 +234,32 @@ fn record_list_write_barrier_residual<Sym: WalkSym>(
     let addr_i = addr as i64;
     if VOID_LIST_WRITE_BARRIER_FNADDRS.contains(&addr_i) {
         let list_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
+        // Phase L2 of `list_write_barrier_impl` barriers Object `items` and
+        // also the Ascii/Bytes `GcArray(GCREF)` block. Folding to
+        // `CondCallGcWb` on the list (plus Object `items`) drops that
+        // array half for Ascii/Bytes: `list_object_custom_trace` forwards
+        // the block pointer and does not re-scan an already-old one.
+        // `assembler.py` `_write_barrier_fastpath` TESTs the header with
+        // no null check, and empty Ascii/Bytes keep a null block, so
+        // those arms cannot grow a `Getfield` + `CondCallGcWb`. Keep the
+        // residual Call: the helper is `is_list_write_barrier` (not a
+        // body effect) and runs Phase L2, including the null check.
+        if list_strategy_is_object(ctx, list_op) {
+            return (
+                record_list_and_items_cond_call_gc_wb(ctx, list_op, true),
+                true,
+            );
+        }
         return (
-            ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[list_op]),
-            true,
+            ctx.trace_ctx
+                .record_op_with_descr(call_opcode, allboxes, descr),
+            false,
         );
     }
     if PREPARE_LIST_REF_STORE_FNADDRS.contains(&addr_i) {
         let list_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
+        // `rlist.py ll_setitem_fast` follows; rewrite
+        // `handle_write_barrier_setarrayitem` owns the array half.
         let _wb = ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[list_op]);
         // Executor stamps the (possibly relocated) value onto this box.
         let value_op = *allboxes.get(2).unwrap_or(&allboxes[0]);
@@ -2973,7 +3065,11 @@ pub(crate) fn restore_escape_flush_undo() {
                 if merge && dst.as_slice()[i] != undo.flush_image[i] {
                     continue;
                 }
-                dst[i] = v;
+                // `setarrayitem_gc` / `ll_setitem_fast`. IndexMut is a raw
+                // slot write: if TRACK_YOUNG_PTRS is already clear the trailing
+                // `frame_array_write_barrier` is a no-op
+                // (`incminimark.py write_barrier`).
+                dst.set_ref(i, v);
             }
             pf.last_instr = undo.last_instr;
             pf.valuestackdepth = undo.valuestackdepth;
@@ -9260,9 +9356,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `rewrite.py gen_write_barrier` emits `COND_CALL_GC_WB` after
         // optimize.  A residual `CallN` every Object-strategy append is the
         // slow path of that barrier.  Record `CondCallGcWb` on the list
-        // instead: the fast path is a header-flag check, and remembering the
-        // `W_ListObject` still lets its custom tracer reach every slot
-        // (`list_append_write_barrier_gc`, including `MAJIT_GC_ITEMSBLOCK=0`).
+        // (`list_append_write_barrier_gc`, including `MAJIT_GC_ITEMSBLOCK=0`
+        // where only the list half is load-bearing). A void Object
+        // `list_write_barrier` also records the items `GcArray`; prepare
+        // leaves that half to rewrite on the following `setarrayitem_gc`.
         // The helper still executes concretely below.
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.

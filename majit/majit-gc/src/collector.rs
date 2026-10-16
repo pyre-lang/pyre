@@ -2388,11 +2388,25 @@ impl MiniMarkGC {
         // why it waits on the shadow-stack coverage rather than on anything
         // in this function.
         if total_size >= self.config.large_object_threshold {
+            // malloc_fixedsize: `ll_assert(not contains_weakptr)` on the large
+            // arm. A WEAKREF is a fixed nursery-sized struct; gct_weakref_create
+            // never takes this entry.
+            debug_assert!(
+                !self.type_is_weakref(type_id),
+                "'contains_weakptr' specified for a large object"
+            );
             return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
         }
 
         let ptr = self.nursery.alloc(total_size);
         if ptr.is_null() {
+            // malloc_fixedsize overflow is collect_and_reserve. A WEAKREF
+            // (`contains_weakptr`) is always nursery-sized, so it never takes
+            // this spill; gct_weakref_create uses the collecting malloc.
+            debug_assert!(
+                !self.type_is_weakref(type_id),
+                "WEAKREF allocation uses collect_and_reserve, not the no-collect spill"
+            );
             return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
         }
 
@@ -2517,15 +2531,8 @@ impl MiniMarkGC {
                 return obj;
             }
         }
-        // incminimark.py: a weakref is immutable and is born in the nursery,
-        // so an old weakref never points at a young object. Spilling one into
-        // old-gen while its target is still young leaves `weakptr` unfixed
-        // across the next minor (`invalidate_young_weakrefs` only walks
-        // nursery weakrefs). Refuse the spill; the caller collects and
-        // retries, which promotes the rooted target first.
-        if !FAST && self.type_is_weakref(type_id) {
-            return GcRef(0);
-        }
+        // malloc_fixedsize has no no-collect spill. A WEAKREF reaches
+        // collect_and_reserve through gct_weakref_create, not this entry.
         self.spill_to_oldgen_or_null(type_id, total_size)
     }
 
@@ -2543,6 +2550,13 @@ impl MiniMarkGC {
     #[cold]
     #[inline(never)]
     fn spill_to_oldgen_or_null(&mut self, type_id: u32, total_size: usize) -> GcRef {
+        // Same tripwire as alloc_with_type_no_collect: malloc_fixedsize never
+        // spills a WEAKREF, so a type that still reaches this entry is a
+        // caller that should have used collect_and_reserve.
+        debug_assert!(
+            !self.type_is_weakref(type_id),
+            "WEAKREF allocation uses collect_and_reserve, not the no-collect spill"
+        );
         self.try_alloc_in_oldgen_nursery_substitute(type_id, total_size)
             .unwrap_or(GcRef(0))
     }
@@ -17869,6 +17883,42 @@ cache size\t: 8192 kB\n";
         gc.drag_out_root(&mut exact);
         let mut interior = GcRef(obj.0 + 16);
         gc.drag_out_root(&mut interior);
+    }
+
+    /// malloc_fixedsize overflow for a nursery-sized WEAKREF is
+    /// collect_and_reserve. gct_weakref_create roots the target across that
+    /// collection, so the new object is young and
+    /// young_objects_with_weakrefs records it; invalidate_young_weakrefs
+    /// therefore sees it.
+    #[test]
+    fn nursery_full_weakref_alloc_is_young_after_collect() {
+        let mut gc = test_gc(256);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+        let mut target = gc.alloc_with_type(target_tid, 16);
+        let wref_size = crate::weakref::SIZEOF_WEAKREF;
+
+        while gc.nursery.remaining() >= GcHeader::SIZE + wref_size {
+            let filler = gc.alloc_with_type_no_collect(target_tid, wref_size);
+            assert!(gc.is_in_nursery(filler.0));
+        }
+
+        let mut needs_write_barrier = true;
+        let wref = unsafe {
+            gc.alloc_with_type_rooted(
+                wref_tid,
+                wref_size,
+                &mut target as *mut GcRef,
+                &mut needs_write_barrier,
+            )
+        };
+
+        assert!(!wref.is_null());
+        assert!(gc.is_in_nursery(wref.0));
+        assert_eq!(gc.young_objects_with_weakrefs, vec![wref.0]);
+        assert!(gc.minor_collections >= 1);
+        assert!(!gc.is_in_nursery(target.0));
+        assert!(!needs_write_barrier);
     }
 
     /// incminimark.py:3068-3079 dead-target branch. A WEAKREF whose

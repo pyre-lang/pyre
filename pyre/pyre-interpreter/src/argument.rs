@@ -257,7 +257,8 @@ pub fn do_combine_starstarargs_wrapped(
     // pairs once the loop is done.
     let _roots = pyre_object::gc_roots::push_roots();
     let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
-    let mut live = Vec::with_capacity(2 + existing_len + keys_w.len());
+    let n_out = keys_w.len();
+    let mut live = Vec::with_capacity(2 + existing_len + n_out);
     live.push(w_starstararg);
     live.push(w_function);
     if let Some(existing) = existingkeywords_w {
@@ -268,12 +269,18 @@ pub fn do_combine_starstarargs_wrapped(
     let existing_base = root_base + 2;
     let keys_base = existing_base + existing_len;
     let pairs_base = pyre_object::gc_roots::shadow_stack_len();
-    for _ in 0..2 * keys_w.len() {
+    for _ in 0..2 * n_out {
         let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
     }
+    // The output slices are a native buffer the collector does not rewrite.
+    // Take the pointer now so the `&mut [PyObjectRef]` locals are dead
+    // across `contains_w_names` / `dict_getitem`; fill from the published
+    // pairs after the loop (`argument.py` `keyword_names_w[i] = w_key`).
+    let names_ptr = keyword_names_w.as_mut_ptr();
+    let values_ptr = keywords_w.as_mut_ptr();
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-    for i in 0..keys_w.len() {
+    for i in 0..n_out {
         let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py — `key = space.text_w(w_key)`; raise TypeError
         // if w_key is not a string.  `_PyStack_UnpackDict` reports this
@@ -340,9 +347,11 @@ pub fn do_combine_starstarargs_wrapped(
         // is unread.
         seen.insert(key, ());
     }
-    for i in 0..keys_w.len() {
-        keyword_names_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
-        keywords_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
+    for i in 0..n_out {
+        unsafe {
+            *names_ptr.add(i) = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
+            *values_ptr.add(i) = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
+        }
     }
     Ok(())
 }
