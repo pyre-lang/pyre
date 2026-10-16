@@ -1019,46 +1019,66 @@ mod tests {
         }
     }
 
-    fn reclaim_unheld() {
-        collect_young_const_ptrs(&mut |_| {});
+    /// Sweep unstamped slots whose live word is in `lo..=hi`.
+    ///
+    /// `incminimark.py` `mass_free_incremental` and
+    /// `free_unvisited_rawmalloc_objects_step` free objects in this
+    /// MiniMark's arenas. `sweep_untraced_if` is the table counterpart.
+    /// The table is process-global, so `sweep_untraced` would recycle a
+    /// foreign intern still held in an `OpRef`.
+    fn sweep_untraced_owned(lo: usize, hi: usize) {
+        sweep_untraced_if(&mut |g| (lo..=hi).contains(&g.0));
+    }
+
+    /// Close this test's intern-to-holder window and free its unstamped
+    /// slots. `take_owned_young` is `collect_oldrefs_to_nursery` for one
+    /// MiniMark; a foreign intern stays queued.
+    fn reclaim_unheld(lo: usize, hi: usize) {
+        let young = take_owned_young(&mut |g| (lo..=hi).contains(&g.0));
+        for idx in young {
+            trace_index(idx, &mut |_| {});
+        }
         begin_major_live();
-        sweep_untraced();
+        sweep_untraced_owned(lo, hi);
     }
 
     #[test]
     fn intern_grows_past_the_old_chunk_directory_cap() {
         let _serial = TEST_SERIAL.lock();
-        reclaim_unheld();
         const N: usize = SLOT_CHUNK * 1024 + 1;
         let base = 0x6E6B_C100usize;
+        let last_word = base + (N - 1) * 16;
+        reclaim_unheld(base, last_word);
         let first = intern(GcRef(base));
         for i in 1..N {
             intern(GcRef(base + i * 16));
         }
-        let last_addr = GcRef(base + (N - 1) * 16);
+        let last_addr = GcRef(last_word);
         let last = intern(last_addr);
         assert_eq!(resolve(first), GcRef(base));
         assert_eq!(resolve(last), last_addr);
         assert_ne!(first, last);
-        reclaim_unheld();
+        reclaim_unheld(base, last_word);
     }
 
     #[test]
     fn intern_reuses_slots_across_major_sweeps_past_the_old_cap() {
         let _serial = TEST_SERIAL.lock();
-        reclaim_unheld();
         const BATCH: usize = 80_000;
         const ROUNDS: usize = 4;
+        let base = 0x6E6B_D000usize;
+        let last_word = base + (ROUNDS - 1) * 1_000_000 + (BATCH - 1) * 16;
+        reclaim_unheld(base, last_word);
         let mut lifetime = 0usize;
         for round in 0..ROUNDS {
             begin_major_live();
             for i in 0..BATCH {
-                intern(GcRef(0x6E6B_D000 + round * 1_000_000 + i * 16));
+                intern(GcRef(base + round * 1_000_000 + i * 16));
             }
-            sweep_untraced();
+            sweep_untraced_owned(base, last_word);
             lifetime += BATCH;
             begin_major_live();
-            sweep_untraced();
+            sweep_untraced_owned(base, last_word);
         }
         assert!(
             lifetime > SLOT_CHUNK * 1024,
@@ -1066,52 +1086,55 @@ mod tests {
         );
         let probe = intern(GcRef(0x6E6B_E001));
         assert_eq!(resolve(probe), GcRef(0x6E6B_E001));
-        reclaim_unheld();
+        reclaim_unheld(base, last_word);
     }
 
     #[test]
     fn a_held_slot_survives_a_major_and_keeps_its_index() {
         let _serial = TEST_SERIAL.lock();
-        reclaim_unheld();
         let addr = GcRef(0x6E6B_F010);
+        reclaim_unheld(addr.0, addr.0);
         let idx = intern(addr);
         begin_major_live();
         trace_index(idx, &mut |_| {});
-        sweep_untraced();
+        sweep_untraced_owned(addr.0, addr.0);
         assert_eq!(resolve(idx), addr);
         assert_eq!(intern(addr), idx);
-        reclaim_unheld();
+        reclaim_unheld(addr.0, addr.0);
     }
 
     #[test]
     fn intern_find_hit_does_not_keep_a_slot_without_trace_index() {
         let _serial = TEST_SERIAL.lock();
-        reclaim_unheld();
         let addr = GcRef(0x6E6B_F110);
+        reclaim_unheld(addr.0, addr.0);
         let idx = intern(addr);
         begin_major_live();
         assert_eq!(intern(addr), idx);
-        sweep_untraced();
+        sweep_untraced_owned(addr.0, addr.0);
         assert!(
             resolve(idx).is_null(),
             "find-hit intern is not a holder; sweep must free the slot"
         );
-        reclaim_unheld();
+        reclaim_unheld(addr.0, addr.0);
     }
 
     #[test]
     fn intern_find_hit_survives_when_the_young_list_is_walked() {
         let _serial = TEST_SERIAL.lock();
-        reclaim_unheld();
         let addr = GcRef(0x6E6B_F118);
+        reclaim_unheld(addr.0, addr.0);
         let idx = intern(addr);
         begin_major_live();
         assert_eq!(intern(addr), idx);
-        collect_young_const_ptrs(&mut |_| {});
-        sweep_untraced();
+        let young = take_owned_young(&mut |g| g.0 == addr.0);
+        for young_idx in young {
+            trace_index(young_idx, &mut |_| {});
+        }
+        sweep_untraced_owned(addr.0, addr.0);
         assert_eq!(resolve(idx), addr);
         assert_eq!(intern(addr), idx);
-        reclaim_unheld();
+        reclaim_unheld(addr.0, addr.0);
     }
 
     /// `collect_oldrefs_to_nursery` is per MiniMark. A collector that
@@ -1120,7 +1143,7 @@ mod tests {
     #[test]
     fn collect_young_leaves_slots_the_collector_does_not_own() {
         let _serial = TEST_SERIAL.lock();
-        reclaim_unheld();
+        reclaim_unheld(0x6E6C_0010, 0x6E6C_0020);
         let mine = intern(GcRef(0x6E6C_0010));
         let other = intern(GcRef(0x6E6C_0020));
         let mine_idxs = take_owned_young(&mut |g| g.0 == 0x6E6C_0010);
@@ -1137,7 +1160,7 @@ mod tests {
             young_indexes().contains(&other),
             "the foreign intern must stay in the remembered set"
         );
-        reclaim_unheld();
+        reclaim_unheld(0x6E6C_0010, 0x6E6C_0020);
     }
 
     /// A holder that copies the index (`OpRef` is `Copy`) and never calls
@@ -1147,15 +1170,15 @@ mod tests {
     #[test]
     fn a_copied_index_without_trace_index_is_freed_at_major() {
         let _serial = TEST_SERIAL.lock();
-        reclaim_unheld();
         let addr = GcRef(0x6E6B_F210);
+        reclaim_unheld(addr.0, addr.0);
         let holder = intern(addr);
         begin_major_live();
-        sweep_untraced();
+        sweep_untraced_owned(addr.0, addr.0);
         assert!(
             resolve(holder).is_null(),
             "unwalked holder must not keep the slot"
         );
-        reclaim_unheld();
+        reclaim_unheld(addr.0, addr.0);
     }
 }
