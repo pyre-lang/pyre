@@ -127816,6 +127816,272 @@ mod tests {
         ]));
     }
 
+    /// `policy.py` `look_inside_graph` is false for `dont_look_inside` and
+    /// `elidable`, so the call is `jtransform.py` `handle_residual_call`
+    /// through `helper_return_to_i64` / `nullable_pointer_option`: one
+    /// pointer word. The declaration must be in the CallRegistry or the
+    /// caller's lift records "not registered in CallRegistry". Rust's own
+    /// `Option<*mut T>` is still two words (`ty_is_raw_address`), so the
+    /// `unsafe` collector keeps declining it, and a scalar pointee or a
+    /// `Vec` stays out of both.
+    #[test]
+    fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|segment| serde_json::json!({"Ident": [segment, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false},
+                "is_local": true
+            })
+        };
+        let generics = || {
+            serde_json::json!({
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            })
+        };
+        let adt = |id: u64, args: Vec<serde_json::Value>| {
+            let mut g = generics();
+            g["types"] = serde_json::Value::Array(args);
+            serde_json::json!({"Adt": {"id": id, "generics": g}})
+        };
+        let raw_mut = |pointee: serde_json::Value| serde_json::json!({"RawPtr": [pointee, "Mut"]});
+        let option_of = |inner: serde_json::Value| adt(0, vec![inner]);
+        let result_of = |ok: serde_json::Value, err: serde_json::Value| adt(4, vec![ok, err]);
+        let nominal = adt(1, vec![]);
+        let sized = adt(2, vec![]);
+        let alias = adt(3, vec![]);
+        let host_error = adt(5, vec![]);
+        let vec_of_nominal = adt(6, vec![nominal.clone()]);
+        let open_ended = adt(7, vec![]);
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+
+        let fun = |id: u64, leaf: &str, output: serde_json::Value, is_unsafe: bool| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", "owner", leaf]),
+                "signature": {"is_unsafe": is_unsafe, "inputs": [], "output": output},
+                "body": "Opaque"
+            })
+        };
+        let look_inside_false = |id: u64, leaf: &str| {
+            let marker = format!("_jit_look_inside_{leaf}");
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", "owner", marker.as_str()]),
+                "global_kind": "NamedConst",
+                "value": [{"Bool": false}, {"Scalar": "Bool"}]
+            })
+        };
+        let elidable_marker = |id: u64, leaf: &str| {
+            let marker = format!("_elidable_function_{leaf}");
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", "owner", marker.as_str()]),
+                "global_kind": "NamedConst"
+            })
+        };
+        let ty =
+            |id: u64, path: &[&str], kind: serde_json::Value, layout: Option<serde_json::Value>| {
+                let mut decl = serde_json::json!({
+                    "def_id": id,
+                    "item_meta": item_meta(path),
+                    "kind": kind
+                });
+                if let Some(layout) = layout {
+                    decl["layout"] = layout;
+                }
+                decl
+            };
+
+        let direct = option_of(raw_mut(nominal.clone()));
+        let sized_option = option_of(raw_mut(sized));
+        let alias_option = option_of(alias);
+        let nested = option_of(raw_mut(raw_mut(nominal.clone())));
+        let result_option = result_of(direct.clone(), host_error.clone());
+        let scalar_option = option_of(raw_mut(u8_ty));
+        let unsized_option = option_of(raw_mut(open_ended));
+        let result_scalar = result_of(scalar_option.clone(), host_error);
+
+        let funs = vec![
+            fun(0, "word_result", i64_ty, false),
+            fun(1, "direct_nullable", direct, true),
+            fun(2, "sized_nullable", sized_option, false),
+            fun(3, "alias_nullable", alias_option, false),
+            fun(4, "nested_nullable", nested, false),
+            fun(5, "result_nullable", result_option, false),
+            fun(6, "elidable_nullable", option_of(raw_mut(nominal)), false),
+            fun(7, "scalar_option", scalar_option, true),
+            fun(8, "vec_return", vec_of_nominal, false),
+            fun(9, "unsized_option", unsized_option, false),
+            fun(10, "result_scalar", result_scalar, false),
+        ];
+        let globals = vec![
+            look_inside_false(0, "word_result"),
+            look_inside_false(1, "direct_nullable"),
+            look_inside_false(2, "sized_nullable"),
+            look_inside_false(3, "alias_nullable"),
+            look_inside_false(4, "nested_nullable"),
+            look_inside_false(5, "result_nullable"),
+            elidable_marker(6, "elidable_nullable"),
+            look_inside_false(7, "scalar_option"),
+            look_inside_false(8, "vec_return"),
+            look_inside_false(9, "unsized_option"),
+            look_inside_false(10, "result_scalar"),
+        ];
+        let types = vec![
+            ty(
+                0,
+                &["core", "option", "Option"],
+                serde_json::json!("Opaque"),
+                None,
+            ),
+            // A `Vec` field keeps the pointee off the raw-storage path
+            // (`adt_path_is_gc_container`), so `Option<PointerAlias>` stays
+            // the `ref` token instead of the raw-address `i64`.
+            ty(
+                1,
+                &["fixture", "Nominal"],
+                serde_json::json!({"Struct": [{
+                    "name": "items",
+                    "ty": adt(6, vec![serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})]),
+                    "attr_info": null
+                }]}),
+                None,
+            ),
+            ty(
+                2,
+                &["fixture", "Sized"],
+                serde_json::json!({"Struct": []}),
+                Some(serde_json::json!([{"key": "any", "value": {"size": 8}}])),
+            ),
+            ty(
+                3,
+                &["fixture", "PointerAlias"],
+                serde_json::json!({"Alias": {"RawPtr": [adt(1, vec![]), "Mut"]}}),
+                None,
+            ),
+            ty(
+                4,
+                &["core", "result", "Result"],
+                serde_json::json!("Opaque"),
+                None,
+            ),
+            ty(
+                5,
+                &["fixture", "HostError"],
+                serde_json::json!({"Struct": []}),
+                None,
+            ),
+            ty(
+                6,
+                &["alloc", "vec", "Vec"],
+                serde_json::json!({"Struct": []}),
+                None,
+            ),
+            ty(
+                7,
+                &["fixture", "Unsized"],
+                serde_json::json!({"Struct": []}),
+                Some(serde_json::json!([{"key": "any", "value": {}}])),
+            ),
+        ];
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": funs,
+                "global_decls": globals,
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("nullable-option fixture");
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let carrier = crate::ErrorCarrierSpec {
+            carrier_path: "fixture::HostError",
+            carrier_class: "",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: None,
+        };
+        let policy = super::collect_policy_opaque_fn_stubs_from_llbc(
+            &llbc,
+            &gc_struct_ids,
+            carrier,
+            &std::collections::HashSet::<String>::new(),
+        );
+        let unsafe_stubs = super::collect_unsafe_fn_stubs_from_llbc(
+            &llbc,
+            &gc_struct_ids,
+            carrier,
+            &std::collections::HashSet::<String>::new(),
+        );
+        fn leaf_of<'a>(
+            specs: &'a [(
+                Vec<String>,
+                crate::flowspace::argument::Signature,
+                Option<String>,
+            )],
+            leaf: &str,
+        ) -> Option<&'a (
+            Vec<String>,
+            crate::flowspace::argument::Signature,
+            Option<String>,
+        )> {
+            specs.iter().find(|(segments, _, _)| {
+                segments.len() == 3
+                    && segments[0] == "fixture"
+                    && segments[1] == "owner"
+                    && segments[2] == leaf
+            })
+        }
+        for leaf in [
+            "word_result",
+            "direct_nullable",
+            "sized_nullable",
+            "alias_nullable",
+            "nested_nullable",
+            "result_nullable",
+            "elidable_nullable",
+        ] {
+            let row = leaf_of(&policy, leaf).unwrap_or_else(|| panic!("{leaf} must be registered"));
+            let token = if leaf == "word_result" { "i64" } else { "ref" };
+            assert_eq!(row.2.as_deref(), Some(token), "{leaf}");
+        }
+        for leaf in [
+            "scalar_option",
+            "vec_return",
+            "unsized_option",
+            "result_scalar",
+        ] {
+            assert!(
+                leaf_of(&policy, leaf).is_none(),
+                "{leaf} is not a one-word nullable pointer"
+            );
+        }
+        assert!(
+            leaf_of(&unsafe_stubs, "direct_nullable").is_none(),
+            "an unsafe fn keeps Rust's two-word Option<*mut T> return"
+        );
+        assert!(leaf_of(&unsafe_stubs, "scalar_option").is_none());
+    }
+
     /// The elidable half of the same carrier, on the real declarations.
     /// `interp_exceptions::lookup_exc_class_for_kind` is `#[elidable]` and
     /// reads a process-global slot the MIR driver cannot lower, so it has no
@@ -128079,7 +128345,7 @@ mod tests {
     fn charpsize2str_cp_input_is_ccharp() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
+            "/../../target/llbc/majit-rlib.ullbc"
         );
         let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
         let graph = super::lower_function(&llbc, "charpsize2str").expect("lower charpsize2str");
