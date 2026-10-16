@@ -3048,6 +3048,60 @@ fn retarget_field_bases(
     }
 }
 
+/// Address of a one-word-item `Vec` field (`RustVecRepr`).
+///
+/// `field_ty_is_inline_vec` stays false so the header stays Int, not Ref.
+/// The live field is the 24-byte `{ptr, cap, len}` header; a GETFIELD of
+/// the 8-byte FLAG_UNSIGNED descr loads the first word (or the GC-header
+/// capacity). `_match_signature` / `gcarray_from_pyobject_vec` take the
+/// header address (`rewrite_op_getsubstruct`). A three-word `inline_vec`
+/// borrow keeps [`wide_inline_borrow_offset`] and its GC abort.
+fn rust_vec_header_substruct_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<usize> {
+    if !field.taken_by_address || field.vec_part.is_some() || field.inline_vec {
+        return None;
+    }
+    let cc = cc?;
+    let owner = field.owner_root.as_deref()?;
+    let word = crate::layout::target_word_size();
+    if let Some(layout) = cc.struct_layout_for(owner)
+        && let Some(row) = layout.fields.iter().find(|row| row.name == field.name)
+    {
+        return (row.flag == majit_ir::descr::ArrayFlag::Unsigned && row.size == word)
+            .then_some(row.offset);
+    }
+    let descr = cc.fielddescrof(0, owner, field.owner_id, &field.name)?;
+    let fd = descr.as_field_descr()?;
+    (fd.field_flag() == majit_ir::descr::ArrayFlag::Unsigned && fd.field_size() == word)
+        .then_some(fd.offset())
+}
+
+/// Byte offset of a named field on a raw owner.
+///
+/// `jtransform.py rewrite_op_getsubstruct` is `int_add(ptr, offsetof)`
+/// for `_gckind == 'raw'`. The interior address does not depend on the
+/// field's `get_type_flag`: a FLAG_POINTER `String` slot is still a
+/// substructure address when `taken_by_address` is set.
+fn raw_field_layout_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<usize> {
+    if field.vec_part.is_some() {
+        return None;
+    }
+    let cc = cc?;
+    let owner = field.owner_root.as_deref()?;
+    if let Some(layout) = cc.struct_layout_for(owner)
+        && let Some(row) = layout.fields.iter().find(|row| row.name == field.name)
+    {
+        return Some(row.offset);
+    }
+    let descr = cc.fielddescrof(0, owner, field.owner_id, &field.name)?;
+    descr.as_field_descr().map(|fd| fd.offset())
+}
+
 /// `Rvalue::Ref` / `RawPtr` borrow of [`inline_aggregate_offset`].
 fn wide_inline_borrow_offset(
     field: &FieldDescriptor,
@@ -5125,6 +5179,30 @@ impl<'a> Transformer<'a> {
             {
                 self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
                 RewriteResult::Identity(operand.clone())
+            }
+            // `jtransform.py rewrite_op_cast_ptr_to_int`: keep a GC
+            // operand as `cast_ptr_to_int/r>i`. A non-Ref operand is
+            // already int-kind (`history.getkind`); implicit None aliases.
+            // There is no `cast_ptr_to_int/i>i` byte.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "cast_ptr_to_int" => {
+                let src = resolve_alias(operand, &self.aliases);
+                if let Some(res) = op.result.clone() {
+                    self.cast_ptr_to_int_src.insert(res, src.clone());
+                }
+                if self.get_value_kind_var(&src) == 'r' {
+                    self.stamp_value_kind_from_value_type(
+                        graph,
+                        op.result.clone(),
+                        &ValueType::Int,
+                    );
+                    RewriteResult::Keep
+                } else {
+                    RewriteResult::Identity(src)
+                }
             }
             // ── fold of the `_we_are_jitted` symbolic ──
             //
@@ -8066,10 +8144,11 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         value: &crate::flowspace::model::Variable,
     ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
-        if self.get_value_kind_var(value) != 'r' {
-            return (value.clone(), Vec::new());
+        let value = resolve_alias(value, &self.aliases);
+        if self.get_value_kind_var(&value) != 'r' {
+            return (value, Vec::new());
         }
-        self.emit_cast_ptr_to_int(graph, value)
+        self.emit_cast_ptr_to_int(graph, &value)
     }
 
     /// A raw store of a pointer's integer image must cast the live ref at
@@ -8100,6 +8179,14 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         value: &crate::flowspace::model::Variable,
     ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
+        // `jtransform.py rewrite_op_cast_ptr_to_int`: keep a GC operand
+        // as `cast_ptr_to_int/r>i`. A non-Ref operand is already int-kind
+        // (`history.getkind`); implicit None aliases. Resolve first so a
+        // GcRef-cell var renamed to a Signed payload is not recast.
+        let src = resolve_alias(value, &self.aliases);
+        if self.get_value_kind_var(&src) != 'r' {
+            return (src, Vec::new());
+        }
         let coerced = self.fresh_synthetic_variable_typed(
             graph,
             crate::codewriter::type_state::ConcreteType::Signed,
@@ -8110,7 +8197,7 @@ impl<'a> Transformer<'a> {
                 result: Some(coerced),
                 kind: OpKind::UnaryOp {
                     op: "cast_ptr_to_int".into(),
-                    operand: value.clone(),
+                    operand: src,
                     result_ty: ValueType::Int,
                 },
             }],
@@ -8832,6 +8919,43 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
+        // One-word-item `Vec` header (`RustVecRepr`): the field address
+        // is `rewrite_op_getsubstruct` on a raw owner; a GC owner is
+        // refused as upstream does. `inline_vec` stays false so this
+        // does not open the GC+inline_vec abort below.
+        if let Some(offset) = rust_vec_header_substruct_offset(field, self.callcontrol.as_deref()) {
+            if crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
+            {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    },
+                }]);
+            }
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            return self.rewrite_raw_substruct_address(op, base, offset, graph);
+        }
+        // `jtransform.py rewrite_op_getsubstruct`: `&raw.field` is
+        // `int_add(ptr, offsetof)` whenever `_gckind == 'raw'`.
+        // `wide_inline_borrow_offset` only sees FLAG_STRUCT wider than a
+        // word; a FLAG_POINTER slot (`String`) is still an interior
+        // address. Leaving it as `getfield` with an int base assembles
+        // `getfield_raw_r`, which `rewrite_op_getfield` refuses.
+        if field.taken_by_address
+            && !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
+            && let Some(offset) = raw_field_layout_offset(field, self.callcontrol.as_deref())
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            return self.rewrite_raw_substruct_address(op, base, offset, graph);
+        }
+
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
         // A raw address is an int. A later getfield/setfield/raw_load/
         // raw_store through it keeps that int base (`_gckind == 'raw'`).
@@ -9541,32 +9665,26 @@ impl<'a> Transformer<'a> {
                 nolength,
                 ..
             } => {
-                if self.get_value_kind_var(value) != 'r' || self.get_value_kind_var(base) != 'i' {
+                if self.get_value_kind_var(base) != 'i' {
                     return None;
                 }
-                let word = graph.alloc_value_var_with_type(ConcreteType::Signed);
-                Some(RewriteResult::Replace(vec![
-                    SpaceOperation {
-                        result: Some(word.clone()),
-                        kind: OpKind::UnaryOp {
-                            op: "cast_ptr_to_int".into(),
-                            operand: value.clone(),
-                            result_ty: ValueType::Int,
-                        },
+                let (word, mut ops) = self.emit_cast_ptr_to_int(graph, value);
+                if ops.is_empty() && self.get_value_kind_var(value) != 'r' {
+                    return None;
+                }
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ArrayWrite {
+                        base: base.clone(),
+                        index: index.clone(),
+                        value: crate::model::LinkArg::Value(word),
+                        item_ty: ValueType::Int,
+                        array_type_id: array_type_id.clone(),
+                        nolength: *nolength,
+                        gckind: crate::model::ArrayGcKind::Raw,
                     },
-                    SpaceOperation {
-                        result: op.result.clone(),
-                        kind: OpKind::ArrayWrite {
-                            base: base.clone(),
-                            index: index.clone(),
-                            value: crate::model::LinkArg::Value(word),
-                            item_ty: ValueType::Int,
-                            array_type_id: array_type_id.clone(),
-                            nolength: *nolength,
-                            gckind: crate::model::ArrayGcKind::Raw,
-                        },
-                    },
-                ]))
+                });
+                Some(RewriteResult::Replace(ops))
             }
             _ => None,
         }
@@ -10974,35 +11092,50 @@ impl<'a> Transformer<'a> {
         // the call to it (`codewriter::alloc_and_set`). The nonzero
         // fill is that helper's loop, traced under `look_inside_iff`
         // (`rlist.py _ll_alloc_and_set_nonnull`); `do_fixed_newlist`
-        // refuses a non-zero default. A zero fill is the jit arm's
-        // `new_array_clear`. Without an ARRAY identity the marker
-        // stays a residual call. `LIST` is folded, so the helper
-        // takes `(count, item)`.
+        // refuses a non-zero default. A constant-zero fill is
+        // `_ll_alloc_and_set_jit`'s `_ll_zero_or_null` arm:
+        // `new_array_clear` at the site (`do_fixed_newlist_clear`),
+        // so the family is not minted. Without an ARRAY identity the
+        // marker stays a residual call. `LIST` is folded, so the
+        // helper takes `(count, item)`.
         if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__array_repeat"]
             && args.len() == 2
             && let Some(result) = op.result.as_ref()
             && let Some(identity) = fixed_repeat_identity(graph, result, result_ty)
-            && let Some(cc) = self.callcontrol.as_deref_mut()
         {
-            let path = crate::codewriter::alloc_and_set::ll_fixed_alloc_and_set_path(cc, &identity);
             FunctionGraph::set_concretetype_of_inline(
                 result,
                 crate::codewriter::type_state::ConcreteType::GcRef,
             );
-            let helper_call = SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: path.segments.clone(),
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
+            if is_renamed_falsy_constant(graph, &args[0], &self.aliases, &self.renamings_constants)
+            {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::NewArrayClear {
+                        length: args[1].clone(),
+                        item_ty: identity.item_ty,
+                        array_type_id: Some(identity.array_type_id),
                     },
-                    args: crate::model::call_args(vec![args[1].clone(), args[0].clone()]),
-                    result_ty: ValueType::Ref(None),
-                },
-            };
-            return self.rewrite_operation(&helper_call, graph_name, graph);
+                }]);
+            }
+            if let Some(cc) = self.callcontrol.as_deref_mut() {
+                let path =
+                    crate::codewriter::alloc_and_set::ll_fixed_alloc_and_set_path(cc, &identity);
+                let helper_call = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.segments.clone(),
+                            fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
+                        },
+                        args: crate::model::call_args(vec![args[1].clone(), args[0].clone()]),
+                        result_ty: ValueType::Ref(None),
+                    },
+                };
+                return self.rewrite_operation(&helper_call, graph_name, graph);
+            }
         }
         // `rffi.get_raw_address_of_string` (`rffi.py`): `@jit.dont_look_inside`.
         // The skip-spine leftover is `__majit_get_raw_address_of_string(s)`;
@@ -13365,15 +13498,8 @@ impl<'a> Transformer<'a> {
                 };
                 let items = header_load(graph, &mut ops, l, VEC_PTR_WORD, None);
                 let value = if kind == VecItemKind::Ref {
-                    let word_item = graph.alloc_value_var_with_type(ConcreteType::Signed);
-                    ops.push(SpaceOperation {
-                        result: Some(word_item.clone()),
-                        kind: OpKind::UnaryOp {
-                            op: "cast_ptr_to_int".into(),
-                            operand: item.clone(),
-                            result_ty: ValueType::Int,
-                        },
-                    });
+                    let (word_item, cast_ops) = self.emit_cast_ptr_to_int(graph, item);
+                    ops.extend(cast_ops);
                     word_item
                 } else {
                     item.clone()
@@ -18938,7 +19064,11 @@ mod tests {
                 StructLayout {
                     size: 32,
                     align: 8,
-                    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    gckind: if gc {
+                        crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+                    } else {
+                        crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+                    },
                     fields: vec![
                         StructFieldLayout {
                             name: "word".into(),
@@ -19244,6 +19374,482 @@ mod tests {
         );
     }
 
+    /// `&T` of a harvested `_alloc_flavor_ = raw` struct is front
+    /// `Ref(Some(owner))`; `history.getkind` of that Ptr is int. Storage-raw
+    /// rejects a Vec field, so the front may stamp `owner_declared_gc =
+    /// Some(true)`. Field reads still assemble `getfield_raw_i` off an int
+    /// register (`jtransform.py rewrite_op_getfield` `_gckind == 'raw'`).
+    #[test]
+    fn raw_flavor_ref_param_field_read_is_getfield_raw_i() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::codewriter::type_state::valuetype_to_concrete_for_legacy;
+        use crate::model::FieldDescriptor;
+
+        let owner = "fixture::RawFlavor";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut cc = CallControl::new();
+        cc.raw_alloc_flavor_structs.insert(owner.to_string());
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 80,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "n".into(),
+                    offset: 72,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let mut graph = FunctionGraph::new("read_n");
+        let p = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "p".into(),
+                    ty: ValueType::Ref(Some(owner.into())),
+                    class_root: Some(owner.into()),
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(
+            &p,
+            valuetype_to_concrete_for_legacy(
+                &ValueType::Ref(Some(owner.into())),
+                &cc.raw_alloc_flavor_structs,
+            ),
+        );
+        graph.push_inputarg_var(graph.startblock, p.clone());
+        let n = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: p.clone(),
+                    field: FieldDescriptor::new("n", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(n.clone()));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        let p_after = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::Input { name, .. } if name == "p" => op.result.clone(),
+                _ => None,
+            })
+            .expect("p input");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&p_after),
+            ConcreteType::Signed,
+            "a flavor-raw &T parameter stays an int-kind register"
+        );
+        let n_after = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "n" => op.result.clone(),
+                _ => None,
+            })
+            .expect("n read");
+        FunctionGraph::set_concretetype_of_inline(&n_after, ConcreteType::Signed);
+
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.contains_key("getfield_raw_i/id>i"),
+            "getfield_raw_i missing, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_gc_")),
+            "a flavor-raw &T field read must not emit getfield_gc, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A FieldRead whose base is already Signed and whose
+    /// `owner_declared_gc` is `Some(false)` assembles `getfield_raw_i`.
+    /// Assembler `is_gc` follows the base register kind (`kc == 'r'`).
+    #[test]
+    fn raw_tagged_enum_ref_param_field_read_is_getfield_raw_i() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let owner = "fixture::TaggedOpt";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 24,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "__discriminant".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let mut graph = FunctionGraph::new("is_some");
+        let p = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "p".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&p, ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, p.clone());
+        let n = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: p.clone(),
+                    field: FieldDescriptor::new("__discriminant", Some(owner.into()))
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(n.clone()));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        let p_after = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::Input { name, .. } if name == "p" => op.result.clone(),
+                _ => None,
+            })
+            .expect("p input");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&p_after),
+            ConcreteType::Signed,
+            "a tagged-enum &T parameter stays an int-kind register"
+        );
+        let n_after = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("discriminant read");
+        FunctionGraph::set_concretetype_of_inline(&n_after, ConcreteType::Signed);
+
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.contains_key("getfield_raw_i/id>i"),
+            "getfield_raw_i missing, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_gc_")),
+            "a tagged-enum &T field read must not emit getfield_gc, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `&raw.name` of a FLAG_POINTER slot (`String`) is still
+    /// `rewrite_op_getsubstruct`: `int_add(ptr, offsetof)`, result int.
+    /// `get_type_flag` paints `String` as one-word FLAG_POINTER, so
+    /// `wide_inline_borrow_offset` misses it; leaving the FieldRead
+    /// assembles `getfield_raw_r`.
+    #[test]
+    fn raw_flavor_pointer_field_borrow_is_int_add() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let owner = "fixture::RawFlavorPtr";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let name_offset = 2 * word;
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut cc = CallControl::new();
+        cc.raw_alloc_flavor_structs.insert(owner.to_string());
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 4 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "name".into(),
+                    offset: name_offset,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let mut graph = FunctionGraph::new("borrow_name");
+        let p =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, p.clone());
+        let name = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: p,
+                    field: FieldDescriptor::new("name", Some(owner.into()))
+                        .with_taken_by_address(true)
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(name));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "name"
+            )),
+            "taken_by_address of a raw FLAG_POINTER field is not a getfield; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, rhs, .. } if op == "add" && matches!(
+                    ops.iter().find(|c| c.result.as_ref() == Some(rhs)).map(|c| &c.kind),
+                    Some(OpKind::ConstInt(n)) if *n == name_offset as i64
+                )
+            )),
+            "interior address is int_add of offsetof; ops={ops:?}"
+        );
+        let addr = ops
+            .iter()
+            .find_map(|sop| match &sop.kind {
+                OpKind::BinOp { op, .. } if op == "add" => sop.result.clone(),
+                _ => None,
+            })
+            .expect("int_add result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&addr),
+            ConcreteType::Signed,
+            "the interior address stays int"
+        );
+
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
+            "raw FLAG_POINTER borrow must not assemble getfield_raw_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_gc_")),
+            "a flavor-raw borrow must not emit getfield_gc, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `&raw.opt` of a tagged enum wider than a word is still
+    /// `rewrite_op_getsubstruct`: `int_add(ptr, offsetof)`, result int.
+    /// The caller passes that address in the INT bank to a callee whose
+    /// `&Enum` parameter is int-kind.
+    #[test]
+    fn raw_flavor_tagged_enum_field_borrow_is_int_add() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let owner = "fixture::RawFlavorOpt";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let opt_offset = 2 * word;
+        let opt_size = 3 * word;
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut cc = CallControl::new();
+        cc.raw_alloc_flavor_structs.insert(owner.to_string());
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: opt_offset + opt_size,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "opt".into(),
+                    offset: opt_offset,
+                    size: opt_size,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let mut graph = FunctionGraph::new("borrow_opt");
+        let p =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, p.clone());
+        let opt = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: p,
+                    field: FieldDescriptor::new("opt", Some(owner.into()))
+                        .with_taken_by_address(true)
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(opt));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "opt"
+            )),
+            "taken_by_address of a raw tagged-enum field is not a getfield; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, rhs, .. } if op == "add" && matches!(
+                    ops.iter().find(|c| c.result.as_ref() == Some(rhs)).map(|c| &c.kind),
+                    Some(OpKind::ConstInt(n)) if *n == opt_offset as i64
+                )
+            )),
+            "interior address is int_add of offsetof; ops={ops:?}"
+        );
+        let addr = ops
+            .iter()
+            .find_map(|sop| match &sop.kind {
+                OpKind::BinOp { op, .. } if op == "add" => sop.result.clone(),
+                _ => None,
+            })
+            .expect("int_add result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&addr),
+            ConcreteType::Signed,
+            "the interior address stays int"
+        );
+
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
+            "raw tagged-enum borrow must not assemble getfield_raw_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_gc_")),
+            "a flavor-raw tagged-enum borrow must not emit getfield_gc, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// A scalar wider than a word (an `i64` on a 32-bit target, an `i128`
     /// here) borrowed by address is `FLAG_SIGNED`, not an inline aggregate,
     /// so it is not a substructure address.
@@ -19536,7 +20142,11 @@ mod tests {
                 StructLayout {
                     size: 32,
                     align: 8,
-                    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    gckind: if gc {
+                        crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+                    } else {
+                        crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+                    },
                     fields: vec![
                         StructFieldLayout {
                             name: "word".into(),
@@ -19704,6 +20314,163 @@ mod tests {
                 OpKind::FieldRead { field, .. } if field.name == "tags"
             )),
             "a GC base does not load word 0 of the inline Vec"
+        );
+    }
+
+    /// A one-word-item `Vec` field (`FLAG_UNSIGNED`, word size) taken by
+    /// address is `rewrite_op_getsubstruct` on a raw owner: offset 0 is
+    /// `cast_ptr_to_int`. A GC owner is refused (`Abort` / `RawAddr`) as
+    /// `rewrite_op_getsubstruct` does. The GC+`inline_vec` abort stays
+    /// for the three-word borrow above.
+    #[test]
+    fn rust_vec_header_borrow_is_field_address_on_raw_owner_only() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        fn holder(owner: &str, gc: bool) -> CallControl {
+            let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+            let word = crate::layout::target_word_size();
+            let mut cc = CallControl::new();
+            cc.set_struct_layout(
+                owner_id,
+                StructLayout {
+                    size: 10 * word,
+                    align: word,
+                    gckind: if gc {
+                        crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+                    } else {
+                        crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+                    },
+                    fields: vec![
+                        StructFieldLayout {
+                            name: "arguments_w".into(),
+                            offset: 0,
+                            size: word,
+                            flag: majit_ir::descr::ArrayFlag::Unsigned,
+                            field_type: majit_ir::value::Type::Int,
+                            rank: None,
+                        },
+                        StructFieldLayout {
+                            name: "keyword_names_w".into(),
+                            offset: 3 * word,
+                            size: word,
+                            flag: majit_ir::descr::ArrayFlag::Unsigned,
+                            field_type: majit_ir::value::Type::Int,
+                            rank: None,
+                        },
+                    ],
+                    host: None,
+                    ll_struct: std::cell::RefCell::new(None),
+                    ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+                },
+            );
+            let storage = if gc {
+                crate::StructStorageDescriptor::headerless(owner)
+            } else {
+                crate::StructStorageDescriptor::raw(owner)
+            };
+            cc.set_struct_storage(&[storage]);
+            cc
+        }
+
+        fn graph_for(owner: &str) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("match_signature");
+            let args = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "self".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(graph.startblock, args.clone());
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: args,
+                        field: FieldDescriptor::new("arguments_w", Some(owner.into()))
+                            .with_taken_by_address(true),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph
+        }
+
+        let owner = "jtransform_vec_header::Arguments";
+        let gc_owner = "jtransform_vec_header_gc::Arguments";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let gc_id = majit_ir::descr::StructId::from_canonical(gc_owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (gc_owner.to_string(), Some(gc_id)),
+            ]));
+        let config = GraphTransformConfig::default();
+
+        let mut cc = holder(owner, false);
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph_for(owner));
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
+            )),
+            "offset 0 Vec header is cast_ptr_to_int; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "arguments_w"
+            )),
+            "the Vec header is not loaded as its first word; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::Abort { kind: crate::model::UnknownKind::UnsupportedExpr { variant } }
+                    if *variant == crate::model::UnsupportedExprKind::RawAddr
+            )),
+            "a raw one-word-item Vec header is not refused; ops={ops:?}"
+        );
+
+        let mut gc_cc = holder(gc_owner, true);
+        let gc_out = Transformer::new(&config)
+            .with_callcontrol(&mut gc_cc)
+            .transform(&graph_for(gc_owner));
+        let gc_ops: Vec<_> = gc_out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            gc_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Abort { kind: crate::model::UnknownKind::UnsupportedExpr { variant } }
+                    if *variant == crate::model::UnsupportedExprKind::RawAddr
+            )),
+            "a GC one-word-item Vec header is refused; ops={gc_ops:?}"
+        );
+        assert!(
+            gc_ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
+            )),
+            "a GC owner is not rewritten to an address; ops={gc_ops:?}"
         );
     }
 
@@ -33394,9 +34161,10 @@ mod tests {
     /// `rtype_alloc_and_set`, so a recovered ARRAY identity redirects to
     /// `ll_fixed_alloc_and_set` (`rlist.py`). The nonzero fill is that
     /// helper's loop, traced under `look_inside_iff`; the call site does
-    /// not emit N `setarrayitem`s. A zero fill is the jit arm's
-    /// `new_array_clear`. A headerless reader, a nested item, or two
-    /// consumers that name different items stay the residual call.
+    /// not emit N `setarrayitem`s. A constant-zero fill is
+    /// `new_array_clear` at the site (`do_fixed_newlist_clear`). A
+    /// headerless reader, a nested item, or two consumers that name
+    /// different items stay the residual call.
     #[test]
     fn fixed_array_repeat_redirects_to_alloc_and_set() {
         fn is_repeat(kind: &OpKind) -> bool {
@@ -33642,8 +34410,9 @@ mod tests {
             );
         }
 
-        // Zero fill redirects to the same outer helper. The clear is the
-        // jit arm, not N stores and not a site-level `new_array_clear`.
+        // Constant-zero fill is `_ll_zero_or_null` → `new_array_clear`
+        // at the site (`do_fixed_newlist_clear`). The family is not
+        // minted; the site does not unroll N stores.
         {
             let graph = repeat_graph(
                 "repeat_zero",
@@ -33651,9 +34420,35 @@ mod tests {
                 OpKind::ConstInt(0),
                 Some(OpKind::ConstInt(4)),
             );
-            let (ops, _) = transform_with_cc(&graph);
+            let (ops, cc) = transform_with_cc(&graph);
+            assert!(
+                !ops.iter().any(|op| is_repeat(&op.kind)),
+                "zero repeat must rewrite, got {ops:?}"
+            );
+            assert_eq!(
+                ops.iter()
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::NewArrayClear {
+                                array_type_id: Some(id),
+                                ..
+                            } if id == "[i64]"
+                        )
+                    })
+                    .count(),
+                1,
+                "zero fill is one new_array_clear, got {ops:?}"
+            );
+            assert!(
+                inline_name(&ops).is_none(),
+                "zero fill does not inline the family, got {ops:?}"
+            );
             let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[i64]");
-            assert_redirect(&ops, &names.outer);
+            assert!(
+                !cc.has_function_graph(&crate::parse::CallPath::from_segments([&names.outer])),
+                "zero fill does not mint ll_fixed_alloc_and_set"
+            );
         }
 
         // Non-null object fill: the nonnull alloc clears, then one store.
@@ -34194,6 +34989,10 @@ mod tests {
                 crate::front::mir::fixed_array_index_identity(false, "&[i64; 4]");
             assert_eq!(param_id.as_deref(), Some("[i64]"));
             assert!(!param_nolength);
+            let (mut_id, mut_nolength) =
+                crate::front::mir::fixed_array_index_identity(false, "&mut [i64; 64]");
+            assert_eq!(mut_id.as_deref(), Some("[i64]"));
+            assert!(!mut_nolength);
             let (host_id, host_nolength) =
                 crate::front::mir::fixed_array_index_identity(false, "&[u8; 16]");
             assert_eq!(host_id.as_deref(), Some("[u8; 16]"));
@@ -35641,6 +36440,65 @@ mod tests {
             RewriteResult::Identity(alias) => assert_eq!(alias, raw),
             _ => panic!("expected Identity alias"),
         }
+    }
+
+    /// UnaryOp `cast_ptr_to_int` of an already-int operand aliases
+    /// (`rewrite_op_cast_ptr_to_int` implicit None). The Call form is
+    /// `lltype_cast_ptr_to_int_of_int_aliases`; a leftover UnaryOp would
+    /// assemble as the unwired `cast_ptr_to_int/i>i`.
+    #[test]
+    fn unary_cast_ptr_to_int_of_int_aliases() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("unary_cast_raw_to_int");
+        let raw = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::UnaryOp {
+                op: "cast_ptr_to_int".into(),
+                operand: raw.clone(),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_operation(&op, "unary_cast_raw_to_int", &mut graph) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, raw),
+            _ => panic!("expected Identity alias"),
+        }
+    }
+
+    /// `emit_cast_ptr_to_int` / `coerce_operand_to_int` take the same
+    /// `rewrite_op_cast_ptr_to_int` decision after resolving aliases.
+    #[test]
+    fn emit_cast_ptr_to_int_aliases_a_signed_target_and_keeps_a_gc_operand() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("emit_cast_ptr_to_int_gate");
+        let signed = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let gc = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let aliased = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        transformer.aliases.insert(aliased.clone(), signed.clone());
+
+        let (got, ops) = transformer.emit_cast_ptr_to_int(&mut graph, &aliased);
+        assert_eq!(got, signed);
+        assert!(ops.is_empty(), "Signed alias is not recast, ops={ops:?}");
+
+        let (got, ops) = transformer.coerce_operand_to_int(&mut graph, &aliased);
+        assert_eq!(got, signed);
+        assert!(ops.is_empty(), "coerce sees the Signed alias, ops={ops:?}");
+
+        let (got, ops) = transformer.emit_cast_ptr_to_int(&mut graph, &gc);
+        assert_eq!(ops.len(), 1, "GC operand is recast, ops={ops:?}");
+        assert!(
+            matches!(
+                &ops[0].kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_ptr_to_int" && operand == &gc
+            ),
+            "expected UnaryOp cast_ptr_to_int of the GC operand, ops={ops:?}"
+        );
+        assert_ne!(got, gc);
+        assert_eq!(FunctionGraph::concretetype_of(&got), ConcreteType::Signed);
     }
 
     /// `rbuiltin.py rtype_cast_int_to_ptr` emits `cast_int_to_ptr`.

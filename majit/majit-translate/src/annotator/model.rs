@@ -325,7 +325,7 @@ fn unresolved_option_none_name(name: &str) -> bool {
     name.contains("Option<") && name.contains("??") && name.ends_with("::None")
 }
 
-fn same_struct_identity(a: &str, b: &str) -> bool {
+pub(crate) fn same_struct_identity(a: &str, b: &str) -> bool {
     // Dots-to-`::` only. Aliases of one declaration intern under one
     // `ClassDef.name` (`Bookkeeper.getdesc` / `intern_class_key`), so this
     // fallback is for dotted leftovers that never interned.
@@ -6208,5 +6208,12 @@ mod tests {
             ))),
             SomeValue::None_(_)
         ));
+    }
+
+    #[test]
+    fn same_struct_identity_bare_leaf_matches_module_qualified() {
+        assert!(same_struct_identity("argument::Arguments", "Arguments"));
+        assert!(same_struct_identity("Arguments", "argument::Arguments"));
+        assert!(!same_struct_identity("foo::Bar", "baz::Bar"));
     }
 }

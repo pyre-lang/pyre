@@ -1,12 +1,14 @@
 use super::{
-    adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
-    is_niche_option_gc_payload_spelling, is_raw_ptr_to_classed_instance_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
-    raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_gcref_spelling,
-    tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
-    tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
+    adt_field_read_value_type, charon_type_value_to_ast_string, container_declared_gc,
+    declared_raw_adt_node, dont_look_inside_return_token, is_niche_option_gc_payload_spelling,
+    is_raw_ptr_to_classed_instance_spelling, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
+    json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
+    raw_field_address_value_type, repeat_array_result_ty, shaped_array_parts, ty_is_raw_address,
+    type_decl_is_closure_env, tyref_array_suffix, tyref_fn_ptr_input_class_root,
+    tyref_is_closure_env, tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin,
+    tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
+    tyref_ref_param_class_root, tyref_shaped_tuple_root,
     tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
 
@@ -1568,6 +1570,17 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
         "flavor-raw &RawFlavorStruct is not storage-raw; ty_is_raw_address stays false"
     );
+    let empty_immut = std::collections::HashMap::new();
+    assert_eq!(
+        container_declared_gc(param_ty, &llbc, &empty_gc, &empty_immut, &harvested),
+        Some(false),
+        "flavor-raw owner is raw even with a Vec field"
+    );
+    assert_eq!(
+        container_declared_gc(param_ty, &llbc, &empty_gc, &empty_immut, &empty),
+        Some(true),
+        "without harvest a Vec field is not storage-raw, so declared GC"
+    );
     assert!(
         !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &empty),
         "empty flavor set keeps ty_is_raw_address false"
@@ -1690,6 +1703,77 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         FunctionGraph::concretetype_of(&input_var),
         crate::model::ConcreteType::GcRef,
         "empty flavor set cannot int-bank at the legacy layer"
+    );
+}
+
+/// `&Option<P>` of a tagged enum whose payload is not storage-raw (a
+/// struct with a `Vec` field) is still one address word.
+/// `declared_raw_adt_node` rejects that payload; [`super::pointee_is_raw_word`]
+/// does not recurse, so the borrow is `history.getkind` `'int'`.
+#[test]
+fn borrowed_tagged_option_of_gc_payload_is_raw_address() {
+    let holder = struct_decl(
+        1,
+        ident_path(&["fixture", "Holder"]),
+        serde_json::json!([{
+            "name": "items",
+            "ty": {
+                "Adt": {
+                    "id": 2,
+                    "generics": {
+                        "regions": [],
+                        "types": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}],
+                        "const_generics": [],
+                        "trait_refs": []
+                    },
+                    "builtin": null
+                }
+            },
+            "attr_info": null
+        }]),
+        false,
+    );
+    let vec_decl = serde_json::json!({
+        "def_id": 2,
+        "item_meta": fixture_item_meta(ident_path(&["alloc", "vec", "Vec"])),
+        "kind": "Opaque"
+    });
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), holder, vec_decl], vec![]);
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let option_ty = TyRef::Other(option_adt_node(0, adt_node(1)));
+    let borrowed = TyRef::Other(option_shared_ref(option_adt_node(0, adt_node(1))));
+    assert!(
+        declared_raw_adt_node(
+            super::tyref_node(&option_ty, &llbc).expect("option node"),
+            &llbc,
+            &empty_gc,
+            no_immutable_fields(),
+        )
+        .is_none(),
+        "Option of a Vec-holding struct is not storage-raw"
+    );
+    assert!(
+        ty_is_raw_address(
+            &borrowed,
+            &llbc,
+            &empty_gc,
+            &std::collections::HashSet::<String>::new(),
+        ),
+        "&Option of a non-storage-raw tagged enum is a raw address"
+    );
+    assert!(
+        matches!(super::tyref_to_value_type(&borrowed, &llbc), ValueType::Int),
+        "&Option of a non-storage-raw tagged enum is int-kind, got {:?}",
+        super::tyref_to_value_type(&borrowed, &llbc)
+    );
+    assert!(
+        matches!(
+            super::tyref_to_value_type(&option_ty, &llbc),
+            ValueType::Ref(_)
+        ),
+        "by-value Option of a Vec-holding struct stays a Ref instance, got {:?}",
+        super::tyref_to_value_type(&option_ty, &llbc)
     );
 }
 
@@ -4123,6 +4207,16 @@ fn fixed_array_suffix_separates_item_type_and_length() {
     assert_eq!(tyref_array_suffix(&array(i64_ty, "2"), &llbc), "<i64;2>");
     assert_eq!(tyref_array_suffix(&array(bool_ty, "1"), &llbc), "<bool;1>");
     assert_eq!(shaped_array_parts("Array<[i64;2];3>"), Some(("[i64;2]", 3)));
+    let i64_n = array(
+        serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+        "64",
+    );
+    assert_eq!(
+        repeat_array_result_ty(&i64_n, &llbc),
+        ValueType::Ref(Some("Array<i64;64>".to_string()))
+    );
+    let scalar = TyRef::Other(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}));
+    assert_eq!(repeat_array_result_ty(&scalar, &llbc), ValueType::Ref(None));
 }
 
 #[test]
@@ -7846,7 +7940,8 @@ fn unsuffixed_local_payload_enum_param_is_not_a_template_seed() {
 }
 
 /// A named word-sized tuple struct is a tagged Option payload, not a
-/// pointer niche. `getattr __discriminant` needs the interned class.
+/// pointer niche. By-value intern stays the tagged class (`getattr
+/// __discriminant`). The borrow is one address word (`ty_is_raw_address`).
 #[test]
 fn option_of_word_struct_interns_tagged_class() {
     let llbc = llbc_with_types(
@@ -7870,7 +7965,8 @@ fn option_of_word_struct_interns_tagged_class() {
     let borrowed = TyRef::Other(option_shared_ref(option_adt_node(0, adt_node(1))));
     assert_eq!(
         super::tyref_to_value_type(&borrowed, &llbc),
-        crate::model::ValueType::Ref(Some("option::Option<WordHasher>".into()))
+        crate::model::ValueType::Int,
+        "&Option of a tagged non-GC payload is the address word"
     );
     assert_eq!(
         super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
