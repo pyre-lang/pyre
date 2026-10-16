@@ -4168,6 +4168,17 @@ pub(crate) fn fbw_unjournaled_kinds() -> (bool, bool) {
     )
 }
 
+/// Put the unjournaled flags back to a snapshot taken before a descent.
+///
+/// `cut_declined_subwalk` removes the recorded ops of a wrapper that never
+/// executed; a `ValueUnavailable` residual declined inside that wrapper still
+/// left these flags set, and leaving them set makes the parent look like it
+/// owes an effect the residual `do_residual_call` is about to apply once.
+pub(crate) fn fbw_restore_unjournaled_kinds(value_unavailable: bool, symbolic: bool) {
+    FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(value_unavailable));
+    FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(symbolic));
+}
+
 pub(crate) fn fbw_count_executed_residual(is_void: bool, is_may_force: bool) {
     let counter = if is_void {
         &FBW_EXECUTED_RESIDUAL_VOID

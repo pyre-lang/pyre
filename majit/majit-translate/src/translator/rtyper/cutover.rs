@@ -3266,6 +3266,16 @@ fn residual_return_annotation(
             ))
         });
     }
+    if let Some(spelling) = token.and_then(|t| t.strip_prefix("fn:")) {
+        // `fn_ptr_somevalue_for_spelling` is `#[cfg(test)]`; the `_in`
+        // form is the production path. `getbookkeeper()` is None during
+        // the MIR residual-admission gate and live during annotation.
+        return crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(
+            spelling,
+            crate::annotator::bookkeeper::getbookkeeper().as_deref(),
+        )
+        .or_else(|| crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in("fn", None));
+    }
     return_token_to_lltype(token).and_then(|ll| default_someshell_for_lltype(&ll))
 }
 
@@ -10877,6 +10887,22 @@ mod tests {
             collect_divergences_on(&real_state, &graph, Some(&excluded)).len(),
             1,
             "a real=Void stamp on an excluded colored eq operand is a divergence"
+        );
+    }
+
+    #[test]
+    fn residual_return_shell_fn_token_is_callable_ptr() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+        let shell = residual_return_shell(Some("fn:fn() -> i64"))
+            .expect("fn: token must admit a residual shell");
+        let SomeValue::Ptr(p) = shell else {
+            panic!("fn: token must shell as SomePtr, got {shell:?}");
+        };
+        assert!(
+            matches!(p.ll_ptrtype.TO, PtrTarget::Func(_)),
+            "fn: token must be Ptr(FuncType), got {:?}",
+            p.ll_ptrtype.TO
         );
     }
 

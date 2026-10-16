@@ -81,7 +81,10 @@
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`. `new_array_clear` is produced later by
 //!     `do_fixed_newlist_clear`, after the rtyper, so a `[i64; N]`
-//!     repeat stays the `__array_repeat(fill, count)` call here.
+//!     repeat stays the `__array_repeat(fill, count)` call here. The
+//!     result type is the dest's `Array<T;N>` so
+//!     `fixed_repeat_identity` can redirect without a later
+//!     `ArrayRead` / `ArrayWrite` of the same SSA.
 //!
 //! ### Terminators
 //!   - `Return` → `returnblock`.
@@ -5845,6 +5848,7 @@ fn splice_recorded_fat_dyn_returns(
 #[path = "shadow_stack_erase.rs"]
 mod shadow_stack_erase;
 pub use shadow_stack_erase::census as shadow_stack_erase_census;
+pub use shadow_stack_erase::erase_named as shadow_stack_erase_named;
 pub use shadow_stack_erase::{
     discover_depth_neutral_fns, discover_stack_fn_effects, discover_stack_leaves_above_fns,
     discover_stack_param_slots_fns, discover_stack_returns_index_fns, discover_stack_sensitive_fns,
@@ -6335,22 +6339,33 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         if !lo.result_exc_call_results.is_empty() {
             let carrier = static_addrs.error_carrier;
-            let foreign_sites =
-                crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
-            let mut conversions = Vec::with_capacity(foreign_sites.len());
-            for site in &foreign_sites {
-                conversions.push(
-                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty).map_err(
-                        |err| LowerError::Unsupported(format!("{}: {err}", lo.graph.name)),
-                    )?,
-                );
+            // `FromResidual::from_residual` of a foreign error becomes
+            // `Err(From::from(e))` raised as the carrier only when this
+            // graph *is* `Result<T, PyError>` (`result_exc_callee`).
+            // `argument.py _match_signature` raises `ArgErr` or
+            // `OperationError`; pyre returns `MatchOutcome` (not `Result`)
+            // and `parse_into_scope` catches `ArgErr`. A `from_residual` of
+            // `MatchSignatureError` is that function's own error arm, not a
+            // conversion into `PyError`.
+            if result_exc_callee {
+                let foreign_sites =
+                    crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
+                let mut conversions = Vec::with_capacity(foreign_sites.len());
+                for site in &foreign_sites {
+                    conversions.push(
+                        from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty)
+                            .map_err(|err| {
+                                LowerError::Unsupported(format!("{}: {err}", lo.graph.name))
+                            })?,
+                    );
+                }
+                crate::front::result_exc::apply_foreign_from_residuals(
+                    &mut lo.graph,
+                    &foreign_sites,
+                    &conversions,
+                )
+                .map_err(LowerError::Unsupported)?;
             }
-            crate::front::result_exc::apply_foreign_from_residuals(
-                &mut lo.graph,
-                &foreign_sites,
-                &conversions,
-            )
-            .map_err(LowerError::Unsupported)?;
             let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
                 &lo.result_exc_call_results,

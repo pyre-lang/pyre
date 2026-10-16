@@ -1496,6 +1496,14 @@ fn is_vec_push_segments(segments: &[String]) -> bool {
     segments.len() == 3 && segments[0] == "vec" && segments[1] == "Vec" && segments[2] == "push"
 }
 
+/// `Vec::deref` / `as_slice` (Rust MIR `vec::Vec::deref`) — a view of
+/// the same header. `same_as` keeps the receiver's list / RustVec
+/// annotation so a following `<[T]>::to_vec` sees that lattice value.
+fn is_vec_deref_segments(segments: &[String]) -> bool {
+    (segments.len() == 3 && segments[0] == "vec" && segments[1] == "Vec" && segments[2] == "deref")
+        || (segments.len() == 2 && segments[0] == "Vec" && segments[1] == "deref")
+}
+
 /// `RDict::insert` / `RDict::get` (`rordereddict.py`
 /// `ll_dict_setitem_with_hash` / `ll_dict_get`). The owner segment is the
 /// type; `unspecialized_leaf` sees through the monomorphized copy. The
@@ -1747,7 +1755,10 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
-        } if is_vec_ctor_segments(segments) || is_vec_from_elem_segments(segments, args.len()) => {
+        } if is_vec_ctor_segments(segments)
+            || is_vec_deref_segments(segments)
+            || is_vec_from_elem_segments(segments, args.len()) =>
+        {
             false
         }
         // `Vec::set_len` lowers (in `translate_op`) to `setattr`, whose
@@ -2352,6 +2363,7 @@ enum FunctionPathHighLevel<'a> {
     Len,
     SliceReverse,
     VecCtor,
+    VecDeref,
     NewlistHint,
     VecFromElem,
     VecPush,
@@ -2541,6 +2553,9 @@ fn function_path_high_level_kind<'a>(
     }
     if is_vec_ctor_segments(segments) {
         return Some(FunctionPathHighLevel::VecCtor);
+    }
+    if is_vec_deref_segments(segments) {
+        return Some(FunctionPathHighLevel::VecDeref);
     }
     if is_runtime_newlist_hint_segments(segments) {
         return Some(FunctionPathHighLevel::NewlistHint);
@@ -2904,6 +2919,18 @@ fn emit_function_path_high_level_op(
             ])
         }
         FunctionPathHighLevel::VecCtor => Ok(vec![FlowspaceOp::new("newlist", vec![], result)]),
+        // `Vec::deref(&v)` is `v.as_slice()`: a view of the same header, so
+        // the result is `same_as` the receiver (`rtyper.py` internal
+        // renaming op).
+        FunctionPathHighLevel::VecDeref => {
+            if arg_hls.len() != 1 {
+                return Err(TyperError::message(format!(
+                    "Vec::deref requires exactly one arg (receiver), got {}",
+                    arg_hls.len()
+                )));
+            }
+            Ok(vec![FlowspaceOp::new("same_as", arg_hls, result)])
+        }
         FunctionPathHighLevel::NewlistHint => {
             if arg_hls.len() != 1 {
                 return Err(TyperError::message(format!(
@@ -3327,6 +3354,27 @@ pub fn translate_op(
         } => {
             let v = lookup_operand(value_map, operand, op, "operand")?;
             let result = resolve_result_hlvalue(op, value_map)?;
+            // Remaining frontend sites still emit these as UnaryOp
+            // (`emit_host_cast_llop`, `dyn_fat`, the
+            // `pyobject_from_constant_addr` rewrite). Typed ptr casts
+            // have no flowspace unary (`normalize_unary_op_name`);
+            // upstream spells them `simple_call(lltype.cast_*, v)`.
+            if opname == "cast_int_to_ptr" || opname == "cast_ptr_to_int" {
+                let callable_host = HOST_ENV
+                    .import_module("rpython.rtyper.lltypesystem.lltype")
+                    .and_then(|m| m.module_get(opname))
+                    .ok_or_else(|| {
+                        TyperError::message(format!("HOST_ENV lltype module must expose {opname}"))
+                    })?;
+                return Ok(vec![FlowspaceOp::new(
+                    "simple_call",
+                    vec![
+                        Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                        v,
+                    ],
+                    result,
+                )]);
+            }
             Ok(vec![FlowspaceOp::new(
                 normalize_unary_op_name(opname)?,
                 vec![v],
@@ -10827,6 +10875,70 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_unary_ptr_cast_lowers_to_lltype_simple_call() {
+        // Frontend leftovers still emit UnaryOp `cast_int_to_ptr` /
+        // `cast_ptr_to_int`. The adapter rewrites them to the same
+        // `simple_call(lltype.cast_*, v)` FunctionPath lowering uses.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_unary_ptr_cast");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::UnaryOp {
+                op: "cast_int_to_ptr".into(),
+                operand: vars[1].clone(),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("UnaryOp cast_int_to_ptr must lower to simple_call");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("FunctionPath callable must be ConstValue::HostObject");
+        };
+        let expected = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.lltype")
+            .and_then(|m| m.module_get("cast_int_to_ptr"))
+            .expect("populate_host_env must register lltype.cast_int_to_ptr");
+        assert_eq!(host, &expected);
+    }
+
+    #[test]
+    fn translate_op_vec_deref_is_same_as() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_vec_deref");
+        let vars = mint_vars(&mut graph, 3);
+        let recv = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), recv.clone());
+        value_map.insert(vars[2].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["vec".into(), "Vec".into(), "deref".into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![vars[1].clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("Vec::deref must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "same_as");
+        assert_eq!(translated[0].args, vec![recv]);
+        assert_eq!(translated[0].result, result);
+    }
+
+    #[test]
     fn translate_op_call_function_path_rejects_unregistered_multi_segment_path() {
         // Defense-in-depth: an arbitrary multi-segment user path
         // (`some.unknown.module.path`) that misses every layer —
@@ -12142,6 +12254,37 @@ mod tests {
         assert_eq!(translated[0].args[0], funcptr_hl);
         assert_eq!(translated[0].args[1], arg_hl);
         assert_eq!(translated[0].result, result_hl);
+    }
+
+    /// An IndirectCall carrying eval-hook graphs is `get_eval_fn()`: a stored
+    /// function pointer whose family is the registered evaluators. The
+    /// annotator sees `simple_call` of that pointer (`PtrRepr.rtype_simple_call`
+    /// later emits `indirect_call` with `c_graphs`).
+    #[test]
+    fn translate_op_indirect_call_with_eval_hook_graphs_lowers_to_simple_call() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        for v in &vars[1..4] {
+            value_map.insert(v.clone(), Hlvalue::Variable(Variable::new()));
+        }
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::IndirectCall {
+                funcptr: vars[1].clone(),
+                args: vec![vars[2].clone()],
+                graphs: Some(vec![crate::parse::CallPath::from_segments([
+                    "eval_with_jit",
+                ])]),
+                family_key: None,
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("an eval-hook IndirectCall lowers to simple_call of the pointer");
+        let names: Vec<&str> = translated.iter().map(|o| o.opname.as_str()).collect();
+        assert_eq!(names, vec!["simple_call"]);
+        assert_eq!(translated[0].args.len(), 2);
     }
 
     /// An IndirectCall that does carry a `family_key` names a dyn-trait vtable
