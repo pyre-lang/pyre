@@ -81,6 +81,10 @@ DECLINE = re.compile(r"^\[decline\] " + re.escape(GATE) + r" (?P<body>.*?): ", r
 # spelling that matched no event at all.
 GATE_SUMMARY = re.compile(r"^  " + re.escape(GATE) + r"$", re.M)
 
+# The `_{hash:016x}` suffix `clause_spec.spec_leaf` appends to a
+# specialized graph's name.
+SPEC_DIGEST = re.compile(r"_[0-9a-f]{16}$")
+
 
 def corpus_key() -> tuple[str, list[str]]:
     """What the prepass read, named so a moved corpus is visible.
@@ -327,7 +331,15 @@ def main() -> int:
             "pyre_module::module::",
         ):
             if name.startswith(prefix):
-                return "module::" + name[len(prefix) :]
+                name = "module::" + name[len(prefix) :]
+                break
+        # `clause_spec.spec_leaf` ends a specialized graph's name with an
+        # FNV-1a digest of the spelled trait refs and types. A corpus move
+        # that respells one (a new impl, a changed path) mints a new digest
+        # for the same `{leaf}__spec_{readable}` copy, so the digest is not
+        # part of the subject.
+        if "__spec_" in name:
+            name = SPEC_DIGEST.sub("", name)
         return name
 
     pair_added = ({(c, module_move_key(s)) for c, s in flat_got}

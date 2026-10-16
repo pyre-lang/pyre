@@ -24088,6 +24088,44 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
+                    // Equal-size ptr↔int: `history.getkind` banks
+                    // `Ptr(FuncType)` as `int` and a data pointer as
+                    // `ref`, so the pair is a bank crossing.  Residual
+                    // `transmute` is not in CallRegistry; the same
+                    // conversion is `lltype.cast_ptr_to_int` /
+                    // `lltype.cast_int_to_ptr` (`rbuiltin.py`
+                    // `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr`).
+                    if let Some(src_ty) = first_arg_ty.as_ref()
+                        && tyref_exact_layout_size(src_ty, self.llbc)
+                            == tyref_exact_layout_size(&call.dest.ty, self.llbc)
+                        && tyref_exact_layout_size(src_ty, self.llbc).is_some()
+                    {
+                        let src_vt = tyref_to_value_type(src_ty, self.llbc);
+                        let dst_vt = tyref_to_value_type(&call.dest.ty, self.llbc);
+                        match (value_type_bank(&src_vt), value_type_bank(&dst_vt)) {
+                            (1, 0) => {
+                                return self.emit_host_cast_llop(
+                                    mir_bb,
+                                    dest_local,
+                                    target,
+                                    args[0].clone(),
+                                    "cast_ptr_to_int",
+                                    ValueType::Int,
+                                );
+                            }
+                            (0, 1) => {
+                                return self.emit_host_cast_llop(
+                                    mir_bb,
+                                    dest_local,
+                                    target,
+                                    args[0].clone(),
+                                    "cast_int_to_ptr",
+                                    ValueType::Ref(None),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py); the rtyper folds the surviving
@@ -83620,6 +83658,18 @@ mod tests {
         let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
         let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
         let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
+        let raw_ptr_ty = serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+        });
+        let fnptr_ty = serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "is_unsafe": true,
+                    "inputs": [],
+                    "output": raw_ptr_ty.clone()
+                }
+            }
+        });
         let instruction_ty = serde_json::json!({
             "Adt": {
                 "id": 0,
@@ -83737,7 +83787,8 @@ mod tests {
                 "fun_decls": [
                     caller(0, "transmute_u8_to_instruction", u8_ty, instruction_ty),
                     caller(1, "transmute_u64_to_f64", u64_ty, f64_ty),
-                    transmute
+                    transmute,
+                    caller(3, "transmute_rawptr_to_fnptr", raw_ptr_ty, fnptr_ty)
                 ],
                 "global_decls": [],
                 "trait_decls": [],
@@ -86417,6 +86468,53 @@ mod tests {
                 .count(),
             1,
             "bank-crossing transmute must retain the residual intrinsic call"
+        );
+    }
+
+    #[test]
+    fn equal_size_rawptr_to_fnptr_transmute_lowers_to_cast_ptr_to_int() {
+        // `history.getkind`: data pointer is `ref`, `Ptr(FuncType)` is
+        // `int`.  Equal-size transmute is `lltype.cast_ptr_to_int`
+        // (`rbuiltin.py` `rtype_cast_ptr_to_int`).
+        let llbc = transmute_lowering_fixture();
+        let graph = super::lower_function(&llbc, "transmute_rawptr_to_fnptr")
+            .expect("lower rawptr-to-fnptr transmute");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["core", "intrinsics", "transmute"]
+                )
+            }),
+            "ptr↔int transmute must not stay a residual intrinsic: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments
+                        == &[
+                            "rpython",
+                            "rtyper",
+                            "lltypesystem",
+                            "lltype",
+                            "cast_ptr_to_int",
+                        ]
+                )
+            }),
+            "expected cast_ptr_to_int host call, ops={ops:?}"
         );
     }
 

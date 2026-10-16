@@ -44,8 +44,9 @@ use std::sync::OnceLock;
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, const_str_cache_llstr};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
-use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp};
+use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp};
 
 /// RPython `class NoneRepr(Repr)` (`rnone.py`).
 ///
@@ -173,6 +174,20 @@ impl Repr for NoneRepr {
         ))))
     }
 
+    /// RPython `Repr.rtype_str` (`rmodel.py`) calls
+    /// `hop.gendirectcall(self.ll_str, v_self)`. `NoneRepr.ll_str`
+    /// (`rnone.py`) is `return llstr("None")`.
+    fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_none_str".to_string(),
+            vec![LowLevelType::Void],
+            STRPTR.clone(),
+            |_rtyper, _args, _result| build_ll_none_str_helper_graph("ll_none_str"),
+        )?;
+        hop.gendirectcall(&helper, vlist)
+    }
+
     /// RPython `NoneRepr.none_call(self, hop)` aliased via
     /// `rtype_simple_call = none_call` (`rnone.py`):
     /// `raise TyperError("attempt to call constant None")`.
@@ -234,6 +249,45 @@ pub(crate) fn build_ll_none_hash_helper_graph(
     let zero_const = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
     startblock.closeblock(vec![
         Link::new(vec![zero_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["_".to_string()],
+        func,
+    ))
+}
+
+/// Synthesizes `NoneRepr.ll_str` (`rnone.py`): `return llstr("None")`.
+///
+/// Single block, ignores the `Void` inputarg, returns the prebuilt
+/// `'None'` `Ptr(STR)` (`annlowlevel.llstr`).
+pub(crate) fn build_ll_none_str_helper_graph(
+    name: &str,
+) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
+    use crate::flowspace::model::{Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link};
+    use crate::translator::rtyper::rtyper::{
+        constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
+    };
+
+    let arg = variable_with_lltype("_", LowLevelType::Void);
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg)]);
+    let return_var = variable_with_lltype("result", STRPTR.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let none_ptr = const_str_cache_llstr(b"None").map_err(TyperError::message)?;
+    let none_const = constant_with_lltype(ConstValue::LLPtr(Box::new(none_ptr)), STRPTR.clone());
+    startblock.closeblock(vec![
+        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
     let func = GraphFunc::new(
@@ -590,6 +644,32 @@ mod tests {
         // Upstream `ll_none_hash` ignores its argument; pyre keeps the
         // same shape. Any ConstValue should produce 0.
         assert_eq!(ll_none_hash(&ConstValue::Int(42)), 0);
+    }
+
+    /// rnone.py — `NoneRepr.ll_str` returns `llstr("None")`. The helper
+    /// graph ignores its Void argument and closeblock-returns that
+    /// prebuilt `Ptr(STR)`.
+    #[test]
+    fn none_repr_ll_str_helper_returns_prebuilt_none_string() {
+        use crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash;
+
+        let graph = build_ll_none_str_helper_graph("ll_none_str").expect("ll_none_str graph");
+        let inner = graph.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert!(startblock.operations.is_empty());
+        assert_eq!(startblock.exits.len(), 1);
+        let exit = startblock.exits[0].borrow();
+        match exit.args[0].as_ref() {
+            Some(Hlvalue::Constant(c)) => {
+                assert_eq!(c.concretetype.as_ref(), Some(&*STRPTR));
+                let ConstValue::LLPtr(p) = &c.value else {
+                    panic!("expected Ptr(STR), got {:?}", c.value);
+                };
+                let (bytes, _) = prebuilt_str_bytes_and_hash(p).expect("prebuilt STR chars");
+                assert_eq!(bytes, b"None");
+            }
+            other => panic!("expected Constant Ptr(STR) 'None', got {other:?}"),
+        }
     }
 
     #[test]
