@@ -18079,12 +18079,7 @@ fn inline_call_subreturn_dst(code: &[u8], caller_pc: usize) -> Option<(char, usi
 /// `None` when the byte at `caller_pc` is not a decodable call.
 fn call_opcode_result_dst(code: &[u8], caller_pc: usize) -> Option<(char, usize, usize)> {
     let op = crate::jitcode_runtime::decode_op_at(code, caller_pc)?;
-    let dst_bank = match op.argcodes.rsplit_once('>') {
-        Some((_, dst)) if dst.starts_with('r') => 'r',
-        Some((_, dst)) if dst.starts_with('i') => 'i',
-        Some((_, dst)) if dst.starts_with('f') => 'f',
-        _ => 'v',
-    };
+    let dst_bank = op.result_argcode();
     if dst_bank == 'v' {
         return Some(('v', 0, op.next_pc));
     }

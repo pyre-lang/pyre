@@ -907,23 +907,31 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         .bridge_registers_r()
         .map(|regs| regs.to_vec())
         .unwrap_or_else(|| root_sym.registers_r().to_vec());
+    let mut regs_i = root_sym.registers_i().to_vec();
+    let mut regs_f = root_sym.registers_f().to_vec();
     // The register the returning callee fills is the result operand of the
-    // call that ends at `root_pc`. Only when no call ends there does the
-    // operand stack's top color stand in for it (`u16::MAX`: empty stack).
-    let call_result = super::call_result_register(jitcode_index, root_pc);
-    let result_color = match call_result {
-        super::CallResultRegister::Ref(color) => Some(color),
-        super::CallResultRegister::Void | super::CallResultRegister::NonRef => None,
-        super::CallResultRegister::Unknown => unsafe { &(*root_sym.jitcode()).payload }
-            .result_color_trivia_for_jitcode_pc(root_pc)
-            .map(|c| c as usize)
-            .filter(|&c| c != u16::MAX as usize),
+    // call that ends at `root_pc`; it reads as `CONST_FALSE` / `CONST_NULL` /
+    // `CONST_FZERO` in its bank (`get_list_of_active_boxes(in_a_call=True)`).
+    // The paused `MIFrame` keeps its `_result_argcode`; a call op that does not
+    // decode at `root_pc` leaves no bank to clear, so the parent is not built.
+    let result_register = match super::call_result_register(jitcode_index, root_pc) {
+        super::CallResultRegister::Reg(bank, color) => Some((bank, color)),
+        super::CallResultRegister::Void => None,
+        super::CallResultRegister::Unknown => return None,
     };
-    if let Some(result_color) = result_color {
-        if result_color < regs_r.len() {
-            regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-        }
-    }
+    let cleared = result_register.and_then(|(bank, color)| {
+        let (regs, cleared) = match bank {
+            'i' => (&mut regs_i, trace_ctx.const_int(0)),
+            'r' => (
+                &mut regs_r,
+                trace_ctx.const_ref(pyre_object::PY_NULL as i64),
+            ),
+            'f' => (&mut regs_f, trace_ctx.const_float(0)),
+            _ => return None,
+        };
+        *regs.get_mut(color)? = cleared;
+        Some(cleared)
+    });
     let root_word = ((root_pc as i32) != majit_ir::resumedata::NO_JITCODE_PC
         && (root_pc as i32) >= 0)
         .then_some(root_pc);
@@ -934,9 +942,9 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     let boxes = collect_outer_active_boxes(
         root_sym,
         trace_ctx,
-        root_sym.registers_i(),
+        &regs_i,
         &regs_r,
-        root_sym.registers_f(),
+        &regs_f,
         jitcode_index,
         false,
         // Key the query off the same carried root-frame word the snapshot and
@@ -952,45 +960,41 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     );
     // The concrete image this paused root resumes from when a descendant
     // sub-walk aborts and the drain converts the chain instead of rewinding to
-    // the guard. The Ref bank skips the call-result color for the same reason
-    // it was NULLed above: the callee's blackhole writes it on return.
+    // the guard. Each bank skips the call-result color for the same reason it
+    // was cleared above: the callee's blackhole writes it on return.
     let blackhole = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         jitcode_index as i32,
         root_liveness_word,
     )
     .and_then(|live| {
-        let pairs = |colors: &[u32], regs: &[OpRef]| -> Vec<(usize, OpRef)> {
+        let pairs = |bank: char, colors: &[u32], regs: &[OpRef]| -> Vec<(usize, OpRef)> {
             colors
                 .iter()
                 .map(|&color| color as usize)
+                .filter(|&color| result_register != Some((bank, color)))
                 .map(|color| (color, regs.get(color).copied().unwrap_or(OpRef::NONE)))
                 .collect()
         };
-        let ref_pairs: Vec<(usize, OpRef)> = pairs(&live.ref_, &regs_r)
-            .into_iter()
-            .filter(|&(color, _)| Some(color) != result_color)
-            .collect();
         capture_reconstructed_parent_blackhole(
             trace_ctx,
             root_pc,
-            &pairs(&live.int, root_sym.registers_i()),
-            &ref_pairs,
-            &pairs(&live.float, root_sym.registers_f()),
+            &pairs('i', &live.int, &regs_i),
+            &pairs('r', &live.ref_, &regs_r),
+            &pairs('f', &live.float, &regs_f),
         )
     });
 
-    // The NULLed result's position in `boxes`, which lists the live colors
+    // The cleared result's position in `boxes`, which lists the live colors
     // int bank first, then ref, then float.
-    let result_slot =
-        match root_word.map(|pc| super::call_result_slot(jitcode_index, pc, boxes.len())) {
-            Some(CallResultSlot::At(idx))
-                if boxes.get(idx).is_some_and(|&b| opref_is_null_const_ptr(b)) =>
-            {
-                CallResultSlot::At(idx)
-            }
-            Some(CallResultSlot::Dead) => CallResultSlot::Dead,
-            _ => CallResultSlot::Unknown,
-        };
+    let result_slot = match root_word
+        .map(|pc| super::call_result_slot(jitcode_index, pc, boxes.len()))
+    {
+        Some(CallResultSlot::At(idx)) if cleared.is_some_and(|c| boxes.get(idx) == Some(&c)) => {
+            CallResultSlot::At(idx)
+        }
+        Some(CallResultSlot::Dead) => CallResultSlot::Dead,
+        _ => CallResultSlot::Unknown,
+    };
 
     Some(InlineParentFrame {
         jitcode_index,
@@ -1009,49 +1013,6 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         caller_py_pc: None,
         result_slot,
     })
-}
-
-/// Issue #215 item 2: drive the reconstructed deepest
-/// callee frame of a multi-frame bridge as an INLINE SUB-WALK
-/// (`is_top_level = false`) rooted on the caller-visible portal `root_sym`.
-///
-/// The callee resumes at `entry` (its translated recipe Python pc) with
-/// its registers seeded by `argboxes_r` (portal reds + in-flight operand-stack
-/// temps from `setup_reconstructed_callee_frame`) and its locals carried in the
-/// already-emitted frame vable.  Because the walk is a sub-walk, the callee's
-/// `ref_return` surfaces `SubReturn { result }` (`pyjitpl.py finishframe`)
-/// instead of the top-level `Finish` that pyre's own-portal model cannot close
-/// here — the original #215 item-2 wall.
-///
-/// The root portal is installed as `fbw_mode.snapshot_sym` and pushed onto the
-/// walk framestack for the sub-walk's lifetime, so an in-callee guard
-/// snapshots both the callee frame and the paused root
-/// (`walker_capture_multi_frame_inline_snapshot`).
-///
-/// Diagnostic today: returns the sub-walk outcome; the caller logs it
-/// and aborts (trace discarded).  Threading `SubReturn` into the root operand
-/// stack + walking the root forward to a terminator is not wired yet.
-/// `None` signals a setup failure (terminal descrs unwired / no root frame).
-pub(crate) fn call_dst_reg_for_residual_return(code: &[u8], entry: usize) -> Option<usize> {
-    for op in crate::jitcode_runtime::decoded_ops(code) {
-        if op.next_pc == entry {
-            return (op.opname.starts_with("residual_call") && op.argcodes.ends_with(">r"))
-                .then(|| code.get(entry - 1).map(|&b| b as usize))
-                .flatten();
-        }
-    }
-    None
-}
-
-/// Resume of a continuation level sits on the `-live-` after the never-decoded
-/// `inline_call`. `code[position - 1]` is the register that call's result
-/// lands in (`BhFrame::call_result_reg`).
-fn pending_inline_call_result_reg(code: &[u8], entry: usize) -> Option<usize> {
-    let op = crate::jitcode_runtime::decoded_ops(code)
-        .find(|op| op.next_pc == entry && op.opname.starts_with("inline_call"))?;
-    (op.argcodes.ends_with(">r"))
-        .then(|| code.get(entry.checked_sub(1)?).map(|&b| b as usize))
-        .flatten()
 }
 
 pub(crate) fn recipe_parent_frame_from_recipe(
@@ -1075,8 +1036,12 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     let call_jit_pc = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
         .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
         .map(|op| op.pc);
-    let resume_marker_jit_pc =
-        call_jit_pc.and_then(|pc| super::resume_snapshot::inline_call_return_marker(&pjc, pc));
+    // `rebuild_from_resumedata` (`resume.py`) resumes the level at its encoded
+    // pc (`setup_resume_at_op`) whichever call op it paused after.
+    let resume_marker_jit_pc = pjc
+        .jitcode
+        .can_decode_live_vars(entry, crate::state::op_live())
+        .then_some(entry);
 
     // Bind this paused parent's frame and ec, recorded while the framestack
     // was rebuilt, so the paused-frame snapshot resolves the portal reds
@@ -1100,20 +1065,15 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     let (frame_reg, ec_reg) = (u32::from(frame_reg), u32::from(ec_reg));
     let sentinel = u32::from(u16::MAX);
     // The returning callee fills the result operand of the call that ends at
-    // the resume pc; only when no call ends there does the operand stack's
-    // top color stand in for it (`u16::MAX`: empty stack).
+    // the resume pc.
     let call_result = if recipe.jitcode_pc >= 0 {
         super::call_result_register(recipe.jitcode_index as u32, recipe.jitcode_pc as usize)
     } else {
         super::CallResultRegister::Unknown
     };
-    let result_color = match call_result {
-        super::CallResultRegister::Ref(color) => Some(color),
-        super::CallResultRegister::Void | super::CallResultRegister::NonRef => None,
-        super::CallResultRegister::Unknown => pjc
-            .result_color_trivia_for_jitcode_pc(recipe.jitcode_pc as usize)
-            .map(|c| c as usize)
-            .filter(|&c| c != u16::MAX as usize),
+    let result_register = match call_result {
+        super::CallResultRegister::Reg(bank, color) => Some((bank, color)),
+        _ => None,
     };
 
     let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
@@ -1123,14 +1083,18 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     let stack_only = recipe.valuestackdepth.saturating_sub(recipe.nlocals);
     let maps =
         crate::state::bridge_semantic_maps_from_jitcode_pc(recipe.jitcode_index, recipe.jitcode_pc);
+    // The not-yet-produced call result reads as `CONST_FALSE` / `CONST_NULL` /
+    // `CONST_FZERO` in its bank (`get_list_of_active_boxes(in_a_call=True)`).
+    let cleared_i = ctx.const_int(0);
     let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+    let cleared_f = ctx.const_float(0);
     let mut boxes = Vec::with_capacity(banks.total_len());
     // A void call, or a result register not live at the resume pc: dead.
     let mut result_slot = match call_result {
-        super::CallResultRegister::Void | super::CallResultRegister::Ref(_) => CallResultSlot::Dead,
-        super::CallResultRegister::Unknown | super::CallResultRegister::NonRef => {
-            CallResultSlot::Unknown
+        super::CallResultRegister::Void | super::CallResultRegister::Reg(..) => {
+            CallResultSlot::Dead
         }
+        super::CallResultRegister::Unknown => CallResultSlot::Unknown,
     };
     // Per-color `(color, box)` pairs for the blackhole capture below, collected
     // alongside the liveness-ordered box list the snapshot consumes.
@@ -1138,6 +1102,11 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     let mut bh_ref = Vec::with_capacity(banks.ref_.len());
     let mut bh_float = Vec::with_capacity(banks.float.len());
     for &color in &banks.int {
+        if result_register == Some(('i', color as usize)) {
+            result_slot = CallResultSlot::At(boxes.len());
+            boxes.push(cleared_i);
+            continue;
+        }
         let opref = recipe
             .registers_i
             .get(color as usize)
@@ -1156,10 +1125,8 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     //     from the slot-indexed `registers_r` (the reconstruct decode).
     for &color in &banks.ref_ {
         let c = color as usize;
-        if result_color == Some(c) {
-            if let super::CallResultRegister::Ref(_) = call_result {
-                result_slot = CallResultSlot::At(boxes.len());
-            }
+        if result_register == Some(('r', c)) {
+            result_slot = CallResultSlot::At(boxes.len());
             boxes.push(null_ref);
             continue;
         }
@@ -1186,6 +1153,11 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         bh_ref.push((c, opref));
     }
     for &color in &banks.float {
+        if result_register == Some(('f', color as usize)) {
+            result_slot = CallResultSlot::At(boxes.len());
+            boxes.push(cleared_f);
+            continue;
+        }
         let opref = recipe
             .registers_f
             .get(color as usize)
@@ -1441,6 +1413,23 @@ pub(crate) enum FrameHandlerEntry {
     },
 }
 
+/// Issue #215 item 2: drive the reconstructed deepest
+/// callee frame of a multi-frame bridge as an INLINE SUB-WALK
+/// (`is_top_level = false`) rooted on the caller-visible portal `root_sym`.
+///
+/// The callee resumes at `entry` (its translated recipe Python pc) with
+/// its registers seeded by `argboxes_r` (portal reds + in-flight operand-stack
+/// temps from `setup_reconstructed_callee_frame`) and its locals carried in the
+/// already-emitted frame vable.  Because the walk is a sub-walk, the callee's
+/// `ref_return` surfaces `SubReturn { result }` (`pyjitpl.py finishframe`)
+/// instead of the top-level `Finish` that pyre's own-portal model cannot close
+/// here — the original #215 item-2 wall.
+///
+/// The root portal is installed as `fbw_mode.snapshot_sym` and pushed onto the
+/// walk framestack for the sub-walk's lifetime, so an in-callee guard
+/// snapshots both the callee frame and the paused root
+/// (`walker_capture_multi_frame_inline_snapshot`).
+/// `None` signals a setup failure (terminal descrs unwired / no root frame).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
@@ -1591,8 +1580,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         regs_f[i] = box_ref;
     }
     if let Some(result) = child_result {
-        let call_dst_reg = call_dst_reg_for_residual_return(jc.code.as_slice(), entry)
-            .or_else(|| pending_inline_call_result_reg(jc.code.as_slice(), entry))?;
+        // `_setup_return_value_r` (`blackhole.py`): the callee's result
+        // lands in `code[position - 1]` of the call it paused in.
+        let super::CallResultRegister::Reg('r', call_dst_reg) =
+            super::call_result_register_in(jc.code.as_slice(), entry)
+        else {
+            return None;
+        };
         if call_dst_reg >= regs_r.len() {
             return Some(Err(DispatchError::InlineCallArityMismatch {
                 pc: entry,

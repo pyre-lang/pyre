@@ -662,10 +662,7 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
         decode_op_at(&pjc.jitcode.code, call_jit_pc),
         "parent call op does not decode"
     );
-    let result_bank = need!(
-        call.argcodes.chars().last(),
-        "parent call op has no argcodes"
-    );
+    let result_bank = call.result_argcode();
     let result_slot = (result_bank != 'v' && depth != 0).then_some(nlocals + depth - 1);
     let mut slots = Vec::with_capacity(depth);
     for slot in nlocals..nlocals + depth {
@@ -1355,12 +1352,12 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
 /// Result-register of the CALL this paused parent sits on, if the op returns
 /// a value.  `_setup_return_value_*` writes that color when the callee
 /// finishes, so the captured image must leave it unset.
-fn parent_call_result_color(
+pub(crate) fn parent_call_result_color(
     pjc: &crate::pyjitcode::PyJitCode,
     call_jit_pc: usize,
 ) -> Option<(char, usize)> {
     let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
-    let result_bank = call.argcodes.chars().last()?;
+    let result_bank = call.result_argcode();
     if result_bank == 'v' {
         return None;
     }

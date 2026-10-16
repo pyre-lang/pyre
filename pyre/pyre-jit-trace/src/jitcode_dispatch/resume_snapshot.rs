@@ -2099,7 +2099,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
 ) -> Option<InlineParentBlackhole> {
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
     let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
-    let result_bank = call.argcodes.chars().last()?;
+    let result_bank = call.result_argcode();
     let result_color = (result_bank != 'v')
         .then(|| pjc.jitcode.code.get(call.next_pc.checked_sub(1)?).copied())
         .flatten()
@@ -2440,6 +2440,36 @@ pub(crate) fn inline_call_return_marker(
         .then_some(marker)
 }
 
+/// `get_list_of_active_boxes(in_a_call=True)` (`pyjitpl.py`): the call's
+/// result register `self.bytecode[self.pc - 1]` is not defined yet, so it
+/// reads as `CONST_FALSE` / `CONST_NULL` / `CONST_FZERO` in its
+/// `_result_argcode` bank. `banks` is `[int, ref, float]`. Returns the box
+/// the walk keeps there, for [`restore_in_a_call_result`].
+fn clear_in_a_call_result(
+    trace_ctx: &mut TraceCtx,
+    banks: [&RegisterBank; 3],
+    result_register: Option<(char, usize)>,
+) -> Option<(usize, usize, OpRef)> {
+    let (bank, color) = result_register?;
+    let (index, cleared) = match bank {
+        'i' => (0, trace_ctx.const_int(0)),
+        'r' => (1, trace_ctx.const_ref(pyre_object::PY_NULL as i64)),
+        'f' => (2, trace_ctx.const_float(0)),
+        _ => return None,
+    };
+    let saved = banks[index].get(color)?;
+    banks[index].set(color, cleared);
+    Some((index, color, saved))
+}
+
+/// Put back the box [`clear_in_a_call_result`] displaced: the walk, unlike
+/// the paused `MIFrame`, keeps reading the caller's registers.
+fn restore_in_a_call_result(banks: [&RegisterBank; 3], saved: Option<(usize, usize, OpRef)>) {
+    if let Some((index, color, saved)) = saved {
+        banks[index].set(color, saved);
+    }
+}
+
 pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
@@ -2480,8 +2510,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         }
         let call_is_void =
             crate::jitcode_runtime::decode_op_at(jc.payload.jitcode.code.as_slice(), call_jit_pc)
-                .and_then(|op| op.argcodes.chars().last())
-                .is_some_and(|bank| bank == 'v');
+                .is_some_and(|op| op.result_argcode() == 'v');
         decline_inline_caller_frame_for_catch_marker(
             jc.payload
                 .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
@@ -2579,43 +2608,10 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     }
     let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Top/CallStack"))?;
-    // #73: the result slot's color comes from the codewriter-precomputed
-    // `result_color_at_pc` (top-of-stack color at the return pc), not the flat
-    // `stack_slot_color_map` — when the result remains live, it is not a live
-    // Variable here, so it carries no pcdep entry.
-    let result_color = if call_is_void {
-        None
-    } else {
-        let payload = unsafe { &(*caller_sym.jitcode()).payload };
-        // The trivia twin resolves the return marker only while that marker
-        // doubles as the fallthrough PC's own resume marker (a pc_map
-        // block-head).  A CALL whose fallthrough carries its own per-PC
-        // marker leaves the trailing marker un-keyed there — the
-        // after-residual twin keys the same fallthrough coordinate by the
-        // CALL's byte offset and stays exact in both shapes.
-        resume_marker_jit_pc
-            .and_then(|marker| payload.result_color_trivia_for_jitcode_pc(marker))
-            .filter(|&color| color != u16::MAX)
-            .or_else(|| {
-                payload
-                    .result_color_after_residual_for_jitcode_pc(call_jit_pc)
-                    .filter(|&color| color != u16::MAX)
-            })
-            .map(|color| color as usize)
-    };
-    // A call whose resumed operand stack is EMPTY has no result slot to name,
-    // so the missing color states a fact rather than a gap — `STORE_ATTR`'s
-    // setter body reaches here, its result discarded by the store itself.
-    // The `depth == 0` decline above already refused a defaulted zero, so a
-    // zero surviving to here was answered by a source. Only a non-empty stack
-    // can hide a live result the reconstruction failed to locate.
-    if !call_is_void && depth > 0 && result_color.is_none() {
-        return Err(unavail("Unavail::Top/NoResultColor"));
-    }
-    // Null the not-yet-produced result slot when one is live, build the box
-    // list, then restore the caller's register (the inlined callee, not the
-    // walk, produces the result; the inner frame supplies it on resume).
-    let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+    let result_register = super::residual_call::parent_call_result_color(
+        unsafe { &(*caller_sym.jitcode()).payload },
+        call_jit_pc,
+    );
     let paused = paused_python_live(ctx);
     let paused_regs_r = paused.as_ref().map(|live| live.registers_r.clone());
     let paused_regs_i = paused.as_ref().map(|live| live.registers_i.clone());
@@ -2624,10 +2620,8 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     let registers_i = paused_regs_i.as_ref().unwrap_or(ctx.registers_i);
     let registers_f = paused_regs_f.as_ref().unwrap_or(ctx.registers_f);
     let caller_state = paused.as_ref().map(|live| live.frame_state().clone());
-    let saved = result_color.and_then(|color| registers_r.get(color));
-    if let Some(result_color) = result_color.filter(|&color| color < registers_r.len()) {
-        registers_r.set(result_color, null_ref);
-    }
+    let banks = [registers_i, registers_r, registers_f];
+    let saved = clear_in_a_call_result(ctx.trace_ctx, banks, result_register);
     // Keep the caller at the immediate post-call `-live-`, matching the
     // paused `MIFrame.pc` used by RPython and the blackhole return ABI.
     let caller_liveness_word = match resume_marker_jit_pc {
@@ -2650,12 +2644,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         &[],
         None,
     );
-    if let (Some(result_color), Some(saved)) = (
-        result_color.filter(|&color| color < registers_r.len()),
-        saved,
-    ) {
-        registers_r.set(result_color, saved);
-    }
+    restore_in_a_call_result(banks, saved);
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
@@ -2703,8 +2692,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     let resume_marker_jit_pc = inline_call_return_marker(&pjc, call_jit_pc);
     let call_is_void =
         crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
-            .and_then(|op| op.argcodes.chars().last())
-            .is_some_and(|bank| bank == 'v');
+            .is_some_and(|op| op.result_argcode() == 'v');
     decline_inline_caller_frame_for_catch_marker(
         pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc),
         pjc.jitcode.code.as_slice(),
@@ -2754,41 +2742,9 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     if depth == 0 && !call_is_void {
         return Err(unavail("Unavail::Nested/DepthZero"));
     }
-    // #73: result slot color from the precomputed `result_color_at_pc`, not
-    // the flat `stack_slot_color_map` (see `compute_inline_caller_frame`).
-    //
-    // Both twins are consulted, in that order, for the reason the top-level
-    // sibling states: the trivia twin resolves the return marker only while
-    // that marker doubles as the fallthrough pc's own resume marker (a pc_map
-    // block head).  A CALL whose fallthrough carries its own per-pc marker
-    // leaves the trailing marker un-keyed in the trivia twin, and only the
-    // after-residual twin — which keys the same fallthrough coordinate by the
-    // CALL's byte offset — answers for it.  Selecting one twin on whether a
-    // marker exists reports "no result color" for exactly that shape.
-    let result_color = if call_is_void {
-        None
-    } else {
-        resume_marker_jit_pc
-            .and_then(|marker| pjc.result_color_trivia_for_jitcode_pc(marker))
-            .filter(|&color| color != u16::MAX)
-            .or_else(|| {
-                pjc.result_color_after_residual_for_jitcode_pc(call_jit_pc)
-                    .filter(|&color| color != u16::MAX)
-            })
-            .map(|color| color as usize)
-    };
-    if !call_is_void && result_color.is_none() {
-        return Err(unavail("Unavail::Nested/NoResultColor"));
-    }
-    // Null the not-yet-produced result slot when one is live, build the box
-    // list, then restore the caller's register (the inlined callee, not the
-    // walk, produces the result; the inner frame supplies it on resume) — same
-    // as the top-level `in_a_call=true` shape.
-    let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-    let saved = result_color.and_then(|color| ctx.registers_r.get(color));
-    if let Some(result_color) = result_color.filter(|&color| color < ctx.registers_r.len()) {
-        ctx.registers_r.set(result_color, null_ref);
-    }
+    let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);
+    let banks = [ctx.registers_i, ctx.registers_r, ctx.registers_f];
+    let saved = clear_in_a_call_result(ctx.trace_ctx, banks, result_register);
     // Keep the caller at the immediate post-call `-live-`, matching the
     // paused `MIFrame.pc` used by RPython and the blackhole return ABI.
     // Without a marker there is no coordinate to encode against, so the
@@ -2805,12 +2761,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         call_jit_pc,
         caller_liveness_word,
     );
-    if let (Some(result_color), Some(saved)) = (
-        result_color.filter(|&color| color < ctx.registers_r.len()),
-        saved,
-    ) {
-        ctx.registers_r.set(result_color, saved);
-    }
+    restore_in_a_call_result(banks, saved);
     let boxes = match boxes {
         Ok(b) => b,
         Err(_) => return Err(unavail("Unavail::Nested/BoxesErr")),

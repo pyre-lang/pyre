@@ -1488,16 +1488,16 @@ fn select_recipe_entry(
         .flatten()
 }
 
-fn residual_ref_call_before(code: &[u8], entry: usize) -> Option<(usize, usize)> {
-    crate::jitcode_runtime::decoded_ops(code)
-        .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
-        .and_then(|op| {
-            op.argcodes
-                .ends_with(">r")
-                .then(|| code.get(entry - 1).copied())
-                .flatten()
-                .map(|dst| (op.pc, usize::from(dst)))
-        })
+/// The pc and result register of the Ref-returning call that ends at
+/// `entry`: `make_result_of_lastop` writes `self.bytecode[self.pc - 1]` in
+/// the `_result_argcode` bank, whichever call opcode the frame paused in.
+fn ref_call_result_before(code: &[u8], entry: usize) -> Option<(usize, usize)> {
+    let op = crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == entry)?;
+    if op.result_argcode() != 'r' {
+        return None;
+    }
+    let dst = *code.get(entry.checked_sub(1)?)?;
+    Some((op.pc, usize::from(dst)))
 }
 
 /// `MIFrame.make_result_of_lastop` pushes a completed call's result at the
@@ -1555,7 +1555,7 @@ fn inject_root_call_result<Sym: WalkSym>(
         return false;
     }
     let payload = unsafe { &(*sym.jitcode()).payload };
-    let residual_call = residual_ref_call_before(payload.jitcode.code.as_slice(), root_pc);
+    let residual_call = ref_call_result_before(payload.jitcode.code.as_slice(), root_pc);
     let result_reg = residual_call.map(|(_, dst)| dst).or_else(|| {
         payload
             .result_color_trivia_for_jitcode_pc(root_pc)
@@ -4829,7 +4829,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 // cannot recover it under free register coloring (for
                 // Fraction.__rpow__, semantic slot 3 is color r9).
                 let pending_result_color =
-                    residual_ref_call_before(pjc.jitcode.code.as_slice(), entry)
+                    ref_call_result_before(pjc.jitcode.code.as_slice(), entry)
                         .map(|(_, dst)| dst)
                         .or_else(|| {
                             pjc.result_color_trivia_for_jitcode_pc(entry)

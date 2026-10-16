@@ -7994,29 +7994,33 @@ pub(crate) enum CallResultRegister {
     Unknown,
     /// The call has no result operand.
     Void,
-    /// A Ref-bank result register.
-    Ref(usize),
-    /// An Int- or Float-bank result register.
-    NonRef,
+    /// The result register: its bank (`'i'`, `'r'` or `'f'`, the
+    /// `_result_argcode`) and its color in that bank.
+    Reg(char, usize),
 }
 
+/// The [`CallResultRegister`] of the call op in `jitcode_index`'s code whose
+/// next pc is `resume_pc`.
 pub(crate) fn call_result_register(jitcode_index: u32, resume_pc: usize) -> CallResultRegister {
     let Some(payload) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return CallResultRegister::Unknown;
     };
-    let code = payload.jitcode.code.as_slice();
+    call_result_register_in(payload.jitcode.code.as_slice(), resume_pc)
+}
+
+/// [`call_result_register`] over a jitcode's `code` bytes.
+pub(crate) fn call_result_register_in(code: &[u8], resume_pc: usize) -> CallResultRegister {
     let Some(call) = crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
     else {
         return CallResultRegister::Unknown;
     };
-    match call.argcodes.split_once('>') {
-        None => CallResultRegister::Void,
-        Some((_, "r")) => code
+    match call.result_argcode() {
+        'v' => CallResultRegister::Void,
+        bank => code
             .get(resume_pc - 1)
             .map_or(CallResultRegister::Unknown, |&color| {
-                CallResultRegister::Ref(color as usize)
+                CallResultRegister::Reg(bank, color as usize)
             }),
-        Some(_) => CallResultRegister::NonRef,
     }
 }
 
@@ -8027,10 +8031,10 @@ pub(crate) fn call_result_slot(
     resume_pc: usize,
     nboxes: usize,
 ) -> CallResultSlot {
-    let color = match call_result_register(jitcode_index, resume_pc) {
-        CallResultRegister::Ref(color) => color,
+    let (bank, color) = match call_result_register(jitcode_index, resume_pc) {
+        CallResultRegister::Reg(bank, color) => (bank, color),
         CallResultRegister::Void => return CallResultSlot::Dead,
-        CallResultRegister::Unknown | CallResultRegister::NonRef => return CallResultSlot::Unknown,
+        CallResultRegister::Unknown => return CallResultSlot::Unknown,
     };
     let Some(live) = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         jitcode_index as i32,
@@ -8041,8 +8045,14 @@ pub(crate) fn call_result_slot(
     if nboxes != live.int.len() + live.ref_.len() + live.float.len() {
         return CallResultSlot::Unknown;
     }
-    match live.ref_.iter().position(|&c| c as usize == color) {
-        Some(pos) => CallResultSlot::At(live.int.len() + pos),
+    let (offset, colors) = match bank {
+        'i' => (0, &live.int),
+        'r' => (live.int.len(), &live.ref_),
+        'f' => (live.int.len() + live.ref_.len(), &live.float),
+        _ => return CallResultSlot::Unknown,
+    };
+    match colors.iter().position(|&c| c as usize == color) {
+        Some(pos) => CallResultSlot::At(offset + pos),
         None => CallResultSlot::Dead,
     }
 }

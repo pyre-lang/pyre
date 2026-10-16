@@ -8294,41 +8294,6 @@ fn overlay_stream_ref_slots(
     }
 }
 
-/// Result dest of the `inline_call` / `residual_call` that ends at
-/// `resume_pc`. `MIFrame.get_list_of_active_boxes` reads that dest as
-/// `self.bytecode[self.pc - 1]` and the bank as `self._result_argcode`.
-enum CallResultDest {
-    Color { bank: char, color: usize },
-    Void,
-    Missing,
-}
-
-fn call_result_dest_ending_at(code: &[u8], resume_pc: usize) -> CallResultDest {
-    let Some(op) = crate::jitcode_runtime::decoded_ops(code).find(|op| {
-        op.next_pc == resume_pc
-            && (op.opname.starts_with("inline_call") || op.opname.starts_with("residual_call"))
-    }) else {
-        return CallResultDest::Missing;
-    };
-    let mut chars = op.argcodes.chars();
-    let mut bank = None;
-    while let Some(c) = chars.next() {
-        if c == '>' {
-            bank = chars.next();
-        }
-    }
-    let Some(bank) = bank else {
-        return CallResultDest::Void;
-    };
-    let Some(&color) = resume_pc.checked_sub(1).and_then(|idx| code.get(idx)) else {
-        return CallResultDest::Missing;
-    };
-    CallResultDest::Color {
-        bank,
-        color: usize::from(color),
-    }
-}
-
 /// Decode one suspended inline-callee frame's resume section into a
 /// [`ReconstructRecipe`], or `None` to decline the multi-frame inline rebuild.
 ///
@@ -8517,30 +8482,6 @@ fn reconstruct_inline_recipe(
         Some(d) => d,
         None => decline!("NoStackDepthAtPc"),
     };
-    let pending_result_abs_slot = if in_a_call && stack_only > 0 {
-        Some(nlocals + stack_only - 1)
-    } else {
-        None
-    };
-    // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
-    // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
-    // site an `in_a_call` frame is paused on, it still counts the whole operand
-    // region the call consumes — the callable and every argument.  Resuming
-    // once the callee returns collapses that region to one result, which the
-    // framestack walk delivers through `make_result_of_lastop` rather than from
-    // resumedata, so no callee ever flushed those operands to
-    // `locals_cells_stack_w` and none of them is reconstructable.  Exempt the
-    // whole region from the mandatory-operand demand below, not just its
-    // topmost slot: with one argument or more the top slot alone left the
-    // callable and the arguments demanded, so every argument-taking inlined
-    // call declined and its guard was blacklisted.
-    let unreconstructable_operand_floor = if in_a_call {
-        liveness
-            .stack_depth_at(py_pc + 1)
-            .map(|post| nlocals + post.saturating_sub(1))
-    } else {
-        None
-    };
     let pending_result_color = if in_a_call {
         let Some(pc) = usize::try_from(frame.pc).ok() else {
             decline!("NoPendingResultColor");
@@ -8556,25 +8497,46 @@ fn reconstruct_inline_recipe(
         let Some(p) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
             decline!("NoPendingResultColor");
         };
-        match call_result_dest_ending_at(p.jitcode.code.as_slice(), pc) {
-            CallResultDest::Color { bank: 'r', color } => Some(color),
-            CallResultDest::Color { .. } => decline!("PendingResultNotRef"),
-            CallResultDest::Void => None,
-            CallResultDest::Missing => {
-                // Trivia is keyed by the resume marker, which `frame.pc`
-                // is. Used when the body is a skeleton / the call op
-                // cannot be decoded. Never the CALL-keyed after-residual
-                // table.
-                let Some(color) = p
-                    .result_color_trivia_for_jitcode_pc(pc)
-                    .filter(|&c| c != u16::MAX)
-                    .map(|c| c as usize)
-                else {
-                    decline!("NoPendingResultColor");
-                };
-                Some(color)
-            }
+        use crate::jitcode_dispatch::CallResultRegister;
+        match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
+            CallResultRegister::Reg('r', color) => Some(color),
+            CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
+            CallResultRegister::Void => None,
+            // The paused `MIFrame` keeps its `_result_argcode`; a call op
+            // that does not decode at the resume pc leaves no bank to clear.
+            CallResultRegister::Unknown => decline!("NoPendingResultColor"),
         }
+    } else {
+        None
+    };
+    // `MIFrame.get_list_of_active_boxes` clears a destination only for a
+    // result bank (`'i'`, `'r'`, `'f'`); a void call reserves no result slot.
+    let pending_result_abs_slot = if pending_result_color.is_some() && stack_only > 0 {
+        Some(nlocals + stack_only - 1)
+    } else {
+        None
+    };
+    // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
+    // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
+    // site an `in_a_call` frame is paused on, it still counts the whole operand
+    // region the call consumes — the callable and every argument.  Resuming
+    // once the callee returns collapses that region to one result, which the
+    // framestack walk delivers through `make_result_of_lastop` rather than from
+    // resumedata, so no callee ever flushed those operands to
+    // `locals_cells_stack_w` and none of them is reconstructable.  Exempt the
+    // whole region from the mandatory-operand demand below, not just its
+    // topmost slot: with one argument or more the top slot alone left the
+    // callable and the arguments demanded, so every argument-taking inlined
+    // call declined and its guard was blacklisted.  A void call consumes its
+    // operands the same way, so the exemption follows `in_a_call`; only a
+    // result-bank call's result occupies the topmost post-call slot, so a void
+    // call's floor stays at the post-call depth and keeps every slot below it
+    // demanded.
+    let unreconstructable_operand_floor = if in_a_call {
+        let result_slots = usize::from(pending_result_color.is_some());
+        liveness
+            .stack_depth_at(py_pc + 1)
+            .map(|post| nlocals + post.saturating_sub(result_slots))
     } else {
         None
     };
@@ -8588,11 +8550,6 @@ fn reconstruct_inline_recipe(
     // (resume.py consume_boxes).
     let mut pending_value_index: Option<usize> = None;
     if let Some(color) = pending_result_color {
-        if reg_indices.int.iter().any(|&c| c as usize == color)
-            || reg_indices.float.iter().any(|&c| c as usize == color)
-        {
-            decline!("PendingResultNotRef");
-        }
         if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
             pending_value_index = Some(reg_indices.int.len() + ref_pos);
             reg_indices.ref_.remove(ref_pos);

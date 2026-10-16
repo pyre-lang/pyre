@@ -2985,6 +2985,17 @@ pub struct DecodedOp {
     pub next_pc: usize,
 }
 
+impl DecodedOp {
+    /// `MIFrame._result_argcode` as `_get_opimpl_method` (`pyjitpl.py`) sets
+    /// it: the argcode after a trailing `>`, or `'v'` when the key has none.
+    pub fn result_argcode(&self) -> char {
+        match self.argcodes.split_once('>') {
+            Some((_, result)) => result.chars().next().unwrap_or('v'),
+            None => 'v',
+        }
+    }
+}
+
 /// Decode the byte length of a `/P` adapter payload starting at
 /// `cursor`.  Each `_pyre/P` opname has its own pyre helper-side flat
 /// payload shape; the `P` pseudo-argcode is just an opt-out from the
