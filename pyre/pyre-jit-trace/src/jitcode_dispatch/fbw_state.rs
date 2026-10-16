@@ -1637,6 +1637,21 @@ pub fn fbw_foriter_inflight_clear() {
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
 }
 
+/// Height of the in-flight FOR_ITER stack, sampled before an inlined callee's
+/// body runs so [`fbw_foriter_inflight_truncate`] can drop what it pushed.
+pub(crate) fn fbw_foriter_inflight_depth() -> usize {
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow().len())
+}
+
+/// Drop the entries above `depth`. `finishframe` (`pyjitpl.py`) pops the
+/// callee's `MIFrame` with every loop it was running, so once an inlined
+/// callee has finished, or its loop has gone to `CALL_ASSEMBLER`, no consumed
+/// item of its own FOR_ITERs is left to deliver. The enclosing frames' entries
+/// below `depth` stay.
+pub(crate) fn fbw_foriter_inflight_truncate(depth: usize) {
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().truncate(depth));
+}
+
 /// #32 S2 deliver selector for the branch-flush leg.  Returns
 /// `Some((item, body_pc))` to push at the body ONLY when `resume_py_pc` is the
 /// header of a FOR_ITER whose consumed item is in flight (`body_pc ==

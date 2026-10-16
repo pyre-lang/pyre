@@ -10068,6 +10068,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Those recordings can minor-collect. Re-read the rooted holders
     // before the copy is published on the session.
     super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut parent_frame);
+    // The in-flight FOR_ITER entries the callee's own loops push sit above
+    // this height.
+    let inflight_depth_before_subwalk = fbw_foriter_inflight_depth();
     let (mut callee_outcome, callee_class_of_last_exc_is_const, mut operator_tail_caller) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -10776,7 +10779,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     };
 
-    match promote_published_null_return_since(ctx, outcome, op.pc, exc_before_subwalk)? {
+    let outcome = promote_published_null_return_since(ctx, outcome, op.pc, exc_before_subwalk)?;
+    if matches!(
+        outcome,
+        DispatchOutcome::SubReturn { .. }
+            | DispatchOutcome::SubRaise { .. }
+            | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
+    ) {
+        fbw_foriter_inflight_truncate(inflight_depth_before_subwalk);
+    }
+    match outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
