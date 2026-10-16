@@ -93,16 +93,10 @@ pub(crate) struct ClosureSelectSite {
     /// True when the BUILT result is a niche `Option` — `Some(x)` is then `x`
     /// itself and `None` is null, the produce-side mirror of `niche`.
     pub result_niche: bool,
-    /// The built niche is int-banked (`Option<fn>` / raw Address). `None`
-    /// is the int-bank null, not `null_mut` (ref bank)
-    /// (`rnone.py` `rtype_is_None`).
-    pub result_fn_ptr: bool,
-    /// Spelling of the built result's int-bank `None` (`null_fn` / `null_raw`).
-    pub result_int_null: crate::model::NicheIntNull,
-    /// `fn(inputs) -> output` spelling of the built `Option<fn(...)>` so
-    /// `None` is `nullptr` of that `FuncType`. Empty when the result is
-    /// not a function pointer.
-    pub result_fn_ptr_spelling: Option<String>,
+    /// The built niche is int-banked (`Option<fn>` / raw Address). `Some`
+    /// is that int-bank `None` (`null_fn` / `null_raw`; `rnone.py`
+    /// `rtype_is_None`). `None` is a ref-bank niche (`push_niche_null`).
+    pub result_int_null: Option<crate::model::NicheIntNull>,
     /// Repr projection of the built result's niche null; see
     /// `FunctionGraph::push_niche_null`. `map`/`and_then` take it from the
     /// destination `Option`; the other combinators reuse the receiver's cast.
@@ -147,11 +141,10 @@ pub(crate) struct ClosureSelectSite {
     /// itself (identity), not a `__pos_0` field read.  (The closure `Args`
     /// tuple `__pos_0` write is unaffected — that is a real `Tuple` field.)
     pub niche: bool,
-    /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// the int-bank null (`rnone.py` `rtype_is_None`).
-    pub fn_ptr: bool,
-    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
-    pub int_null: crate::model::NicheIntNull,
+    /// Int-banked niche (`Option<fn>` / raw Address): `Some` is that
+    /// int-bank null (`null_fn` / `null_raw`; `rnone.py` `rtype_is_None`).
+    /// `None` is a ref-bank niche (`push_niche_null`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
     /// Receiver-side counterpart of `result_fieldless_none_tag`.
@@ -400,19 +393,9 @@ fn rewire_one_closure_select_site(
             // A niche `Option` is a one-word pointer with no aggregate
             // `__discriminant` / `__pos_0`: `None` is null.
             if site.result_niche {
-                let null = if site.result_fn_ptr {
-                    match &site.result_int_null {
-                        crate::model::NicheIntNull::RawAddress(_) => {
-                            site.result_int_null.push(graph, else_bb)
-                        }
-                        crate::model::NicheIntNull::FnPtr(_) => graph
-                            .push_null_fn_ptr_with_spelling(
-                                else_bb,
-                                site.result_fn_ptr_spelling.as_deref(),
-                            ),
-                    }
-                } else {
-                    graph.push_niche_null(else_bb, site.result_niche_null_cast.as_ref())
+                let null = match site.result_int_null.as_ref() {
+                    Some(int_null) => int_null.push(graph, else_bb),
+                    None => graph.push_niche_null(else_bb, site.result_niche_null_cast.as_ref()),
                 };
                 (null, else_bb, else_inputs.clone())
             } else if let Some(none_tag) = site.result_fieldless_none_tag {
@@ -504,8 +487,7 @@ fn rewire_one_closure_select_site(
         graph.push_niche_is_some(
             a_id,
             opt.clone().into_variable(),
-            site.fn_ptr,
-            &site.int_null,
+            site.int_null.as_ref(),
             site.niche_null_cast.as_ref(),
             disc.clone(),
         );
@@ -799,16 +781,13 @@ mod tests {
             call_result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
-            fn_ptr: false,
-            int_null: crate::model::NicheIntNull::default(),
+            int_null: None,
             niche_null_cast: None,
             fieldless_none_tag: None,
             result_option_owner: RESULT_OPTION.into(),
             result_some_owner: RESULT_SOME.into(),
             result_niche,
-            result_fn_ptr: false,
-            result_int_null: crate::model::NicheIntNull::default(),
-            result_fn_ptr_spelling: None,
+            result_int_null: None,
             result_niche_null_cast: None,
             result_fieldless_none_tag: None,
             call_once_result_exc: None,

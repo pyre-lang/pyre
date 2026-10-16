@@ -81,11 +81,10 @@ pub(crate) struct UnwrapOrSite {
     /// `tyref_is_niche_option_ptr`).  Always an `Option` (never a `Result`)
     /// when set, so `payload_on_disc_true` is `true`.
     pub niche: bool,
-    /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// the int-bank null (`rnone.py` `rtype_is_None`).
-    pub fn_ptr: bool,
-    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
-    pub int_null: crate::model::NicheIntNull,
+    /// Int-banked niche (`Option<fn>` / raw Address): `Some` is that
+    /// int-bank null (`null_fn` / `null_raw`; `rnone.py` `rtype_is_None`).
+    /// `None` is a ref-bank niche (`push_niche_null`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
     /// `None`'s scalar tag for `Option<E>` when `E` is a densely numbered
@@ -302,8 +301,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
         graph.push_niche_is_some(
             a_id,
             opt.clone().into_variable(),
-            site.fn_ptr,
-            &site.int_null,
+            site.int_null.as_ref(),
             site.niche_null_cast.as_ref(),
             disc.clone(),
         );
@@ -400,8 +398,7 @@ mod tests {
             payload_ty: ValueType::Int,
             payload_on_disc_true: true,
             niche: false,
-            fn_ptr: false,
-            int_null: crate::model::NicheIntNull::default(),
+            int_null: None,
             niche_null_cast: None,
             fieldless_none_tag: None,
         }
@@ -426,8 +423,7 @@ mod tests {
             // `Result::Ok = 0`, so the payload arm is the `bool(disc)`-false arm.
             payload_on_disc_true: false,
             niche: false,
-            fn_ptr: false,
-            int_null: crate::model::NicheIntNull::default(),
+            int_null: None,
             niche_null_cast: None,
             fieldless_none_tag: None,
         }
@@ -820,7 +816,7 @@ mod tests {
 
         let mut site = option_site(result);
         site.niche = true;
-        site.fn_ptr = true;
+        site.int_null = Some(crate::model::NicheIntNull::FnPtr(None));
         site.payload_ty = ValueType::Int;
         assert_eq!(rewire_unwrap_or_call_sites(&mut g, &[site]), 1);
 

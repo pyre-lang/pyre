@@ -63,11 +63,10 @@ pub(crate) struct OptionTrySite {
     /// tag switch is then a pointer null-test (`opt != null`) and the `Some`-arm
     /// payload is the base pointer itself (identity).
     pub niche: bool,
-    /// Int-banked niche (`Option<fn>` / raw Address): the null test uses
-    /// the int-bank null (`rnone.py` `rtype_is_None`).
-    pub fn_ptr: bool,
-    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
-    pub int_null: crate::model::NicheIntNull,
+    /// Int-banked niche (`Option<fn>` / raw Address): `Some` is that
+    /// int-bank null (`null_fn` / `null_raw`; `rnone.py` `rtype_is_None`).
+    /// `None` is a ref-bank niche (`push_niche_null`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// `Option<NonZero<_>>`: `None` is 0 and `Some` is the word.
     pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
@@ -423,8 +422,7 @@ fn rewire_one_option_try_site(
         graph.push_niche_is_some(
             a_id,
             opt_a.clone(),
-            site.fn_ptr,
-            &site.int_null,
+            site.int_null.as_ref(),
             site.niche_null_cast.as_ref(),
             opt_disc.clone(),
         );
@@ -743,8 +741,7 @@ mod tests {
                 some_owner: "core::option::Option::Some".into(),
                 payload_ty: ValueType::Int,
                 niche: true,
-                fn_ptr: true,
-                int_null: crate::model::NicheIntNull::default(),
+                int_null: Some(crate::model::NicheIntNull::FnPtr(None)),
                 scalar_niche: false,
                 niche_null_cast: None,
             }],

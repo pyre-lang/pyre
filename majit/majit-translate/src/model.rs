@@ -8168,12 +8168,6 @@ pub enum NicheIntNull {
     RawAddress(Option<String>),
 }
 
-impl Default for NicheIntNull {
-    fn default() -> Self {
-        Self::FnPtr(None)
-    }
-}
-
 impl NicheIntNull {
     pub(crate) fn push(
         &self,
@@ -8495,23 +8489,21 @@ impl FunctionGraph {
     /// The discriminant of the niche `Option` `opt` into `result` (`Some` = 1):
     /// `not (opt is None)`, spelled `eq(is_(opt, None), False)`.  A `ne` would
     /// be value inequality on a `StringRepr` / `ListRepr` payload
-    /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `fn_ptr` selects
-    /// the int-bank null (`rnone.py` `rtype_is_None`); `int_null` is that
-    /// null's spelling (`null_fn` for `Option<fn>`, `null_raw` for a
-    /// raw-address niche). Every other niche uses [`Self::push_niche_null`].
+    /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `int_null` is
+    /// the int-bank null (`rnone.py` `rtype_is_None`; `null_fn` for
+    /// `Option<fn>`, `null_raw` for a raw-address niche). Every other niche
+    /// uses [`Self::push_niche_null`].
     pub fn push_niche_is_some(
         &mut self,
         block: BlockId,
         opt: crate::flowspace::model::Variable,
-        fn_ptr: bool,
-        int_null: &NicheIntNull,
+        int_null: Option<&NicheIntNull>,
         cast: Option<&(String, ValueType)>,
         result: crate::flowspace::model::Variable,
     ) {
-        let nullc = if fn_ptr {
-            int_null.push(self, block)
-        } else {
-            self.push_niche_null(block, cast)
+        let nullc = match int_null {
+            Some(int_null) => int_null.push(self, block),
+            None => self.push_niche_null(block, cast),
         };
         let is_none = self.alloc_value_var();
         let false_var = self.alloc_value_var();

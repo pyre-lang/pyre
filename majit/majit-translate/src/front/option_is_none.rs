@@ -43,12 +43,12 @@ pub(crate) struct IsNoneSite {
     /// container projected to an RPython string/list repr. The null operand
     /// must enter that same repr before comparison.
     pub niche_null_cast: Option<(String, ValueType)>,
-    /// Int-banked niche (`Option<fn>` / raw Address): the null arm is
-    /// the int-bank null (`ValueType::Int`). `null_mut` is a GC ref and
-    /// would emit `is_` on mixed `ir` operands (`rnone.py` `rtype_is_None`).
-    pub fn_ptr: bool,
-    /// Spelling of that int-bank null (`null_fn` / `null_raw`).
-    pub int_null: crate::model::NicheIntNull,
+    /// Int-banked niche (`Option<fn>` / raw Address): `Some` is that
+    /// int-bank null (`ValueType::Int`; `null_fn` / `null_raw`). `None`
+    /// is a ref-bank niche (`push_niche_null`). `null_mut` is a GC ref
+    /// and would emit `is_` on mixed `ir` operands (`rnone.py`
+    /// `rtype_is_None`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// `Option<NonZero<_>>`: the word itself is the tag. `None` is 0, so
     /// the predicate compares that integer and does not read `__discriminant`.
     pub scalar_niche: bool,
@@ -102,10 +102,9 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
         let rhs = {
             let block_id = graph.blocks[a].id;
             let before = graph.block(block_id).operations.len();
-            let rhs = if site.fn_ptr {
-                site.int_null.push(graph, block_id)
-            } else {
-                graph.push_niche_null(block_id, site.niche_null_cast.as_ref())
+            let rhs = match site.int_null.as_ref() {
+                Some(int_null) => int_null.push(graph, block_id),
+                None => graph.push_niche_null(block_id, site.niche_null_cast.as_ref()),
             };
             ops.extend(graph.block_mut(block_id).operations.split_off(before));
             rhs
@@ -221,8 +220,7 @@ mod tests {
             is_some,
             niche: false,
             niche_null_cast: None,
-            fn_ptr: false,
-            int_null: crate::model::NicheIntNull::default(),
+            int_null: None,
             scalar_niche: false,
         }
     }
@@ -328,8 +326,7 @@ mod tests {
                 is_some: true,
                 niche: true,
                 niche_null_cast: None,
-                fn_ptr: false,
-                int_null: crate::model::NicheIntNull::default(),
+                int_null: None,
                 scalar_niche: false,
             }],
         );
@@ -442,8 +439,9 @@ mod tests {
                 is_some: false,
                 niche: true,
                 niche_null_cast: None,
-                fn_ptr: true,
-                int_null: crate::model::NicheIntNull::RawAddress(Some("mmap::MappedObj".into())),
+                int_null: Some(crate::model::NicheIntNull::RawAddress(Some(
+                    "mmap::MappedObj".into(),
+                ))),
                 scalar_niche: false,
             }],
         );
@@ -514,10 +512,9 @@ mod tests {
                 is_some: false,
                 niche: true,
                 niche_null_cast: None,
-                fn_ptr: true,
-                int_null: crate::model::NicheIntNull::FnPtr(Some(
+                int_null: Some(crate::model::NicheIntNull::FnPtr(Some(
                     "fn() -> Result<(), PyError>".into(),
-                )),
+                ))),
                 scalar_niche: false,
             }],
         );
