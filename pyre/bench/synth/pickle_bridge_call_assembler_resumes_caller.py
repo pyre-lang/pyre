@@ -1,5 +1,5 @@
-# pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=load
+# pyre-check: max-pypy-ratio=8.8
+# dynasm 3.8-4.4x (darwin-arm64); the ceiling is twice the slower reading.
 # A guard-failure bridge resumes `pickle._Unpickler.load` in the middle of its
 # `while True` loop, inlines the dispatched opcode handler and reaches the loop
 # header again.  It finishes that frame there and runs the rest of the loop with
@@ -15,7 +15,10 @@
 #
 # Which guard gets that bridge depends on the order bridges are compiled in,
 # so the wrapper around `load`, its writes to a `StringIO` and the loop body
-# below are kept as they were when the failure was found.
+# below are kept as they were when the failure was found, and the jit-stats
+# baseline pins the compiled shape: a change that moves it may stop this
+# fixture from reaching the path.  With those guards capturing the finished
+# callee, the first `EOFError` came at iteration 34; 50 iterations leave room.
 import pickle, io, sys
 out = io.StringIO()
 
@@ -49,7 +52,7 @@ def wrapped(self):
 
 pickle._Unpickler.load = wrapped
 
-for it in range(100):
+for it in range(50):
     for proto in range(6):
         for v in vals:
             f = io.BytesIO()
