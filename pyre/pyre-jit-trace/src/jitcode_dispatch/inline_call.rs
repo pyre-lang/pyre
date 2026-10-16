@@ -10098,9 +10098,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 immediate_inline_caller_py_pc: immediate_inline_caller_py_pc(ctx, op.pc),
                 instance_next_foriter_green_key,
                 instance_next_foriter_census_active: instance_next_seeded_route,
-                // Callee MIFrame. `_interpret` runs `blackhole_if_trace_too_long`
-                // after every one of its `run_one_step`s, so this walk must not
-                // inherit a helper's deferred limit check.
+                // Callee MIFrame, not a translated helper. Do not inherit
+                // `transparent_helper_subwalk`: that flag is the helper-body
+                // snapshot / last_instr / abort-coordinate identity.
                 transparent_helper_subwalk: false,
                 transparent_helper_jitcode_index: None,
                 ..ctx.fbw_mode
@@ -19326,7 +19326,15 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             // `convert_and_run_from_pyjitpl` resumes every frame
             // `aborted_tracing` captured; a single-frame adopt of the
             // caller is not that resume.
-            ctx.session.borrow_mut().crossed_inline_subwalk = true;
+            //
+            // `TraceTooLong` is the enclosing Python walk's length check
+            // (`_interpret` `blackhole_if_trace_too_long`) firing inside
+            // this helper MIFrame. The CALL's register image is the
+            // resume coordinate, so do not mark the abort as a callee-pc
+            // capability gap: that flag declines single-frame adopt.
+            if !matches!(error, DispatchError::TraceTooLong { .. }) {
+                ctx.session.borrow_mut().crossed_inline_subwalk = true;
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[subwalk-propagate] jitcode_pc={pc} effects={} unjournaled={} err={error:?}",
