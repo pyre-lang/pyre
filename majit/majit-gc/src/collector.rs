@@ -6261,7 +6261,8 @@ impl MiniMarkGC {
             seed(self, *gcref, label, true);
         });
         // Intern during this major still sits in the young list. Do not
-        // drain: `collect_young_const_ptrs` runs at pre-sweep.
+        // drain: `collect_young_const_ptrs` runs before the final
+        // marking drain in `finish_incremental_marking`.
         majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
             seed(self, *gcref, "young_const_ptrs", true);
         });
@@ -8502,8 +8503,19 @@ impl MiniMarkGC {
         );
         // Finalizers and destructors run while still MARKING and may store
         // into a live black object. The write barrier re-greys it onto
-        // `more_gray_stack`; drain that work before the sweep freezes
-        // VISITED (`visit_all_objects` until both stacks are empty).
+        // `more_gray_stack`. Intern-during-mark (`Table::young`) is the
+        // intern-to-holder window: `seed_major_extra_root` greys children
+        // onto `gray_stack`, so that set must be processed before this
+        // drain. `history.py` `ConstPtr.value` is a GC field on the box;
+        // copied index words use this remembered set instead.
+        // In test builds, hold the intern-table lock from this drain through
+        // `sweep_untraced` so a rewrite test's slot is not interned or freed
+        // mid-use. Compiles out in production.
+        #[cfg(test)]
+        let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
+        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
+            self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
+        });
         self.drain_marking_worklists();
         if self.config.debug >= 2 {
             self.debug_check_visited_children_not_white("marking_sweep_seam");
@@ -8527,18 +8539,10 @@ impl MiniMarkGC {
             }
         }
         self.oldgen_nonmoving_marked = self.oldgen_nonmoving_active;
-        // Extra-root walkers have stamped every live `ConstPtr` slot.
-        // Drain intern-during-mark first so those slots stamp `live` and
-        // forward; a slot no holder marked is then dead, matching
-        // `history.py` dropping the box when no trace, descr, or op holds it.
-        // In test builds, hold the intern-table lock across this drain and
-        // sweep so a rewrite test's slot is not freed mid-use. Compiles out
-        // in production.
-        #[cfg(test)]
-        let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
-        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
-            self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
-        });
+        // Extra-root walkers and the intern-during-mark drain above have
+        // stamped every live `ConstPtr` slot. A slot no holder marked is
+        // then dead, matching `history.py` dropping the box when no
+        // trace, descr, or op holds it.
         majit_ir::const_ptr_table::sweep_untraced();
         // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
         // the candidate sets have been frozen and before the state changes.

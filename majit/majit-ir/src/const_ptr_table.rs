@@ -494,7 +494,7 @@ pub fn collect_young_const_ptrs(visitor: &mut dyn FnMut(&mut GcRef)) {
 /// `trace_index` every young intern without draining the list.
 ///
 /// Major seed / rescan: intern during incremental mark still has to sit
-/// in the remembered set until the pre-sweep drain. `trace_live_numberings`
+/// in the remembered set until the final marking drain. `trace_live_numberings`
 /// is the NUMBERING counterpart that does not clear `YOUNG_NUMBERINGS`.
 pub fn trace_young_const_ptrs(visitor: &mut dyn FnMut(&mut GcRef)) {
     let young = {

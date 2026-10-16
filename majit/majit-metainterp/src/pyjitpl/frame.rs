@@ -1259,15 +1259,16 @@ impl MIFrame {
                         boxes.push(SnapshotTagged::Const(0, Type::Ref));
                         continue;
                     };
-                    if let Some(v) = opref.inline_const_to_value() {
-                        SnapshotTagged::Const(v.as_raw_i64(), Type::Ref)
+                    if let Some(index) = opref.const_ptr_index() {
+                        // history.py `ConstPtr` — the snapshot stores the
+                        // table index. `snapshot_tagged_to_box` resolves at use.
+                        SnapshotTagged::Const(i64::from(index), Type::Ref)
                     } else {
                         SnapshotTagged::Box(opref, Type::Ref)
                     }
                 } else {
-                    SnapshotTagged::Const(
-                        self.jitcode.constants_r[idx - num_regs_r].get(),
-                        Type::Ref,
+                    SnapshotTagged::const_ref(
+                        self.jitcode.constants_r[idx - num_regs_r].get() as usize
                     )
                 };
                 boxes.push(tagged);

@@ -124,37 +124,25 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Forward every inline gcref this snapshot carries.
-    ///
-    /// `MIFrame.get_list_of_active_snapshot_boxes` copies a constant ref
-    /// register's already-forwarded gcref out of its `OpRef::ConstPtr` into a
-    /// raw [`SnapshotTagged::Const`] word, and `jitcode.constants_r` entries
-    /// reach the same arm. The side table these land in accumulates for the
-    /// whole trace and is only handed to the compiler at the end of it, so
-    /// without this walk a collection between capture and compile leaves the
-    /// resume data naming a pre-move address. RPython has no such copy: its
-    /// snapshot holds the `ConstPtr` box itself, whose `value` the GC traces
-    /// through the object graph.
+    /// `Const` ref words and `OpRef::ConstPtr` are table indexes
+    /// (`history.py` `ConstPtr`). This snapshot is the holder, so the
+    /// walk traces those slots. The index word itself does not move.
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-        let tagged = self
-            .frames
-            .iter_mut()
-            .flat_map(|f| f.boxes.iter_mut())
-            .chain(self.vable_boxes.iter_mut())
-            .chain(self.vref_boxes.iter_mut());
-        for t in tagged {
-            match t {
-                SnapshotTagged::Const(bits, Type::Ref) => {
-                    let mut gcref = majit_ir::GcRef(*bits as usize);
-                    visitor(&mut gcref);
-                    *bits = gcref.0 as i64;
+        let mut trace_tagged =
+            |tagged: &SnapshotTagged, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)| match tagged {
+                SnapshotTagged::Const(bits, majit_ir::Type::Ref) if *bits != 0 => {
+                    majit_ir::const_ptr_table::trace_index(*bits as u32, visitor);
                 }
-                // `build_vable_snapshot_boxes` / `build_vref_snapshot_boxes`
-                // tag their entries by `OpRef::ty()` without asking whether the
-                // operand is constant, so this arm can hold an inline gcref too.
                 SnapshotTagged::Box(op, _) => op.trace_const_ptr(visitor),
-                SnapshotTagged::Const(..) => {}
+                _ => {}
+            };
+        for frame in &self.frames {
+            for tagged in &frame.boxes {
+                trace_tagged(tagged, visitor);
             }
+        }
+        for tagged in self.vable_boxes.iter().chain(self.vref_boxes.iter()) {
+            trace_tagged(tagged, visitor);
         }
     }
 
@@ -218,7 +206,27 @@ pub enum SnapshotTagged {
     /// Compile-time constant value with type.
     /// RPython resume.py getconst: Const boxes carry their type (INT/REF/FLOAT)
     /// for correct TAGINT/TAGCONST encoding in rd_numb.
+    /// `Type::Ref` payload is a [`majit_ir::const_ptr_table`] index
+    /// (`history.py` `ConstPtr`), not the referent address. Index 0 is null.
     Const(i64, majit_ir::Type),
+}
+
+impl SnapshotTagged {
+    /// Intern `addr` and store the table index. Null stays 0.
+    pub fn const_ref(addr: usize) -> Self {
+        let index = majit_ir::const_ptr_table::intern(majit_ir::GcRef(addr));
+        SnapshotTagged::Const(i64::from(index), majit_ir::Type::Ref)
+    }
+
+    /// Current referent. `None` when this is not a ref constant.
+    pub fn ref_address(self) -> Option<majit_ir::GcRef> {
+        match self {
+            SnapshotTagged::Const(index, majit_ir::Type::Ref) => {
+                Some(majit_ir::const_ptr_table::resolve(index as u32))
+            }
+            _ => None,
+        }
+    }
 }
 
 pub struct Trace {
@@ -315,7 +323,7 @@ fn untag_snapshot_pools(
             SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
         }
         TAGINT => SnapshotTagged::Const(v, Type::Int),
-        TAGCONSTPTR => SnapshotTagged::Const(trb.current_ref(v as usize) as i64, Type::Ref),
+        TAGCONSTPTR => SnapshotTagged::const_ref(trb.current_ref(v as usize) as usize),
         TAGCONSTOTHER => {
             let pool_idx = (v >> 1) as usize;
             if v & 1 != 0 {
@@ -596,7 +604,9 @@ impl Trace {
         match tagged {
             SnapshotTagged::Const(v, Type::Int) => OcBox::ConstInt(v),
             SnapshotTagged::Const(v, Type::Float) => OcBox::ConstFloat(v as u64),
-            SnapshotTagged::Const(v, Type::Ref) => OcBox::ConstPtr(v as u64),
+            SnapshotTagged::Const(v, Type::Ref) => {
+                OcBox::ConstPtr(majit_ir::const_ptr_table::resolve(v as u32).0 as u64)
+            }
             SnapshotTagged::Const(_, Type::Void) => {
                 panic!("encode snapshot: Const Void is not a tagged value")
             }
@@ -1868,7 +1878,7 @@ impl Trace {
         let tagged = crate::opencoder::TraceRecordBuffer::encoded_arg_at(&trb._ops, args_pos, 0);
         let obj = match self.untag_snapshot(tagged) {
             SnapshotTagged::Box(r, _) => r,
-            SnapshotTagged::Const(v, Type::Ref) => OpRef::const_ptr(GcRef(v as usize)),
+            SnapshotTagged::Const(v, Type::Ref) => OpRef::ConstPtr(v as u32),
             SnapshotTagged::Const(v, Type::Int) => OpRef::const_int(v),
             SnapshotTagged::Const(v, Type::Float) => OpRef::const_float(f64::from_bits(v as u64)),
             SnapshotTagged::Const(_, Type::Void) => return None,

@@ -3023,6 +3023,12 @@ impl MIFrame {
                 declared_type.unwrap_or(majit_ir::Type::Ref),
             )
         } else if ctx.constant_value(opref).is_some() {
+            if let Some(index) = opref.const_ptr_index() {
+                return majit_metainterp::recorder::SnapshotTagged::Const(
+                    i64::from(index),
+                    majit_ir::Type::Ref,
+                );
+            }
             let val = ctx.constant_value(opref).unwrap_or(0);
             // resume.py `getconst(const)` dispatches on `const.type`.
             // Prefer the pool's actual const type over `declared_type`:
@@ -3347,6 +3353,11 @@ impl MIFrame {
             .map(|(i, &opref)| {
                 if opref.is_none() {
                     majit_metainterp::recorder::SnapshotTagged::Const(0, majit_ir::Type::Ref)
+                } else if let Some(index) = opref.const_ptr_index() {
+                    majit_metainterp::recorder::SnapshotTagged::Const(
+                        i64::from(index),
+                        majit_ir::Type::Ref,
+                    )
                 } else if ctx.constant_value(opref).is_some() {
                     let val = ctx.constant_value(opref).unwrap_or(0);
                     // resume.py `getconst(const)` dispatches on
