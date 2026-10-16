@@ -45,6 +45,13 @@ pub trait SharedOpcodeHandler {
         args: &[Self::Value],
     ) -> OpcodeResult<Self::Value>;
     fn build_list(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
+    /// pyopcode.py BUILD_LIST_FROM_ARG: size an empty list from `iter`'s
+    /// length hint and return `(list, iter)` with `iter` reloaded after the
+    /// allocating call.
+    fn newlist_from_iter_hint(
+        &mut self,
+        iter: Self::Value,
+    ) -> OpcodeResult<(Self::Value, Self::Value)>;
     fn build_tuple(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
     fn build_map(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
     fn store_subscr(
@@ -144,6 +151,18 @@ pub fn opcode_build_list<H: SharedOpcodeHandler + ?Sized>(
     let anchor = handler.anchor();
     let list = handler.build_list(&items)?;
     H::push_anchored(&anchor, list)
+}
+
+/// pyopcode.py `BUILD_LIST_FROM_ARG`: pop the iterator, push
+/// `space.newlist([], sizehint=length_hint)`, push the iterator back.
+pub fn opcode_build_list_from_arg<H: SharedOpcodeHandler + ?Sized>(
+    handler: &mut H,
+) -> OpcodeResult<()> {
+    let last_val = handler.pop_value()?;
+    let anchor = handler.anchor();
+    let (list, last_val) = handler.newlist_from_iter_hint(last_val)?;
+    H::push_anchored(&anchor, list)?;
+    H::push_anchored(&anchor, last_val)
 }
 
 pub fn opcode_build_tuple<H: SharedOpcodeHandler + ?Sized>(

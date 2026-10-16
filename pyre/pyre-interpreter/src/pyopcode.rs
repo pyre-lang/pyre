@@ -5,9 +5,9 @@ use crate::bytecode::{
 };
 
 use crate::{
-    PyBigInt, PyError, SharedOpcodeHandler, opcode_build_list, opcode_build_map,
-    opcode_build_tuple, opcode_call, opcode_list_append, opcode_load_attr, opcode_make_function,
-    opcode_store_attr, opcode_store_subscr, opcode_unpack_sequence,
+    PyBigInt, PyError, SharedOpcodeHandler, opcode_build_list, opcode_build_list_from_arg,
+    opcode_build_map, opcode_build_tuple, opcode_call, opcode_list_append, opcode_load_attr,
+    opcode_make_function, opcode_store_attr, opcode_store_subscr, opcode_unpack_sequence,
 };
 
 use pyre_object::PyObjectRef;
@@ -1231,6 +1231,13 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Self: SharedOpcodeHandler,
     {
         opcode_build_list(self, size)
+    }
+
+    fn build_list_from_arg(&mut self) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler,
+    {
+        opcode_build_list_from_arg(self)
     }
 
     fn build_tuple(&mut self, size: usize) -> Result<(), PyError>
@@ -2970,6 +2977,13 @@ pub fn execute_build_list<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+pub fn execute_build_list_from_arg<E: OpcodeStepExecutor>(
+    executor: &mut E,
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+    OpcodeStepExecutor::build_list_from_arg(executor)?;
+    Ok(StepResult::Continue)
+}
+
 pub fn execute_build_tuple<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
@@ -3727,6 +3741,8 @@ where
         Instruction::ReturnValue => execute_return_value(executor),
 
         Instruction::BuildList { .. } => execute_build_list(executor, instruction, op_arg),
+
+        Instruction::BuildListFromArg => execute_build_list_from_arg(executor),
 
         Instruction::BuildTuple { .. } => execute_build_tuple(executor, instruction, op_arg),
 

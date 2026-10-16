@@ -272,6 +272,11 @@ pub(crate) fn classify_vstack_opcode(
             VstackOpClass::MultiResultFromShadow
         }
 
+        // BUILD_LIST_FROM_ARG pops the iterator and pushes list then iterator.
+        // TOS is the restored iterator, not the list, so ResultToTos (the
+        // BuildList class) would overwrite the wrong slot.
+        Instruction::BuildListFromArg => VstackOpClass::MultiResultFromShadow,
+
         // FOR_ITER (continue arm): peeks the iterator (kept on the stack) and
         // pushes the yielded item on the new TOS (net +1) — the same shape as
         // the value producers above, so the item is `vstack_last_ref`.  The

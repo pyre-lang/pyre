@@ -8613,6 +8613,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        // `W_Range.descr_iter`. The hand fold above needs a non-inlined
+        // concrete box and declines the virtual `range` that the same outer
+        // trace just allocated; this walks the interpreter body instead.
+        // Not a spec-fold row.
+        if let Some(outcome) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
+            return Ok((outcome, op.next_pc));
+        }
         // The instance arm of `iter`: a user class's `__iter__` is Python, and
         // left residual it costs an interpreter frame and the virtualref
         // bracket that forces the caller's, once per `for` statement.
@@ -8740,6 +8747,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    // `make_empty_list`. The hand fold above declines length 0; this walks
+    // the interpreter body instead. Not a spec-fold row.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewlistFromArray {
+        if let Some(outcome) =
+            try_walker_orthodox_empty_newlist(ctx, op.pc, &r_args, dst, dst_bank)?
+        {
+            return Ok((outcome, op.next_pc));
+        }
     }
 
     // #171: specialize `lst.append(x)` so its array ops reach the trace,

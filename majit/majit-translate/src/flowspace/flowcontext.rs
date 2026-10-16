@@ -2639,6 +2639,21 @@ impl FlowContext {
                     self.pushvalue(StackElem::Value(result));
                     Ok(None)
                 }
+                Instruction::BuildListFromArg => {
+                    // pyopcode.py BUILD_LIST_FROM_ARG: pop the iterator,
+                    // `space.newlist([], sizehint=length_hint)`, push the
+                    // list then the iterator. `length_hint` may raise an
+                    // async exception, so this is not a pure `newlist`.
+                    let last_val = self.pop_hlvalue()?;
+                    let result = self.record_maybe_raise_op(
+                        "newlist_from_iter_hint",
+                        vec![last_val.clone()],
+                        Self::common_exception_cases(),
+                    )?;
+                    self.pushvalue(StackElem::Value(result));
+                    self.pushvalue(StackElem::Value(last_val));
+                    Ok(None)
+                }
                 Instruction::BuildSet { .. } => {
                     let items = self.pop_hlvalues(oparg as usize)?;
                     let result = self.record_pure_op("newset", items)?;

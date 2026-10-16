@@ -3854,6 +3854,7 @@ struct FnPtrIndices {
     list_append_fn: HelperHandle,
     store_slice_fn: HelperHandle,
     get_iter_fn: HelperHandle,
+    newlist_from_iter_hint_fn: HelperHandle,
     for_iter_next_fn: HelperHandle,
     for_iter_exception_match_fn: HelperHandle,
     call_kw_fn_0: HelperHandle,
@@ -4633,6 +4634,15 @@ fn register_helper_fn_pointers(
         cpu.bytecode_trace_jitted_slow_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `jit_newlist_from_iter_hint` runs `length_hint` then
+    // `w_list_new_with_sizehint`; a user `__length_hint__` may run Python
+    // and force the virtualizable → `CallFlavor::MayForce`.  Appended last
+    // to preserve fn_ptr indices.
+    let newlist_from_iter_hint_fn = bind(
+        assembler,
+        cpu.newlist_from_iter_hint_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4701,6 +4711,7 @@ fn register_helper_fn_pointers(
         store_slice_fn,
         unpack_ex_fn,
         get_iter_fn,
+        newlist_from_iter_hint_fn,
         for_iter_next_fn,
         for_iter_exception_match_fn,
         unary_positive_fn,
@@ -6826,6 +6837,11 @@ impl CodeWriter {
                     idx: get_iter_fn_idx,
                     flavor: _get_iter_fn_flavor,
                 },
+            newlist_from_iter_hint_fn:
+                HelperHandle {
+                    idx: newlist_from_iter_hint_fn_idx,
+                    flavor: _newlist_from_iter_hint_fn_flavor,
+                },
             for_iter_next_fn:
                 HelperHandle {
                     idx: for_iter_next_fn_idx,
@@ -7066,6 +7082,7 @@ impl CodeWriter {
                 call_kw_fn_12_idx,
                 call_kw_fn_13_idx,
             ],
+            newlist_from_iter_hint_fn_idx,
         });
 
         // RPython flatten.py: pre-create labels for each block.
@@ -10371,6 +10388,34 @@ impl CodeWriter {
                             let pushed: super::flow::FlowValue = result_value.into();
                             current_state.stack.push(pushed.clone());
                             emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
+                        }
+
+                        // pyopcode.py BUILD_LIST_FROM_ARG: pop iterator, call
+                        // `newlist_from_iter_hint` (`space.length_hint` then
+                        // `space.newlist([], sizehint=...)`), push list, push
+                        // iterator. Same operand-stack shape as BUILD_LIST 0;
+                        // SWAP 2. A user `__length_hint__` may run Python →
+                        // `CallFlavor::MayForce`.
+                        Instruction::BuildListFromArg => {
+                            let _iter_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let iter_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let list_var = residual_call!(
+                                newlist_from_iter_hint_fn_idx,
+                                CallFlavor::MayForce,
+                                vec![],
+                                vec![iter_value.clone()],
+                                vec![],
+                                vec![Kind::Ref],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            let list_value = list_var
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            current_state.stack.push(list_value.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, list_value, py_pc);
+                            current_state.stack.push(iter_value.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, iter_value, py_pc);
                         }
 
                         // pyopcode.py BUILD_SLICE:

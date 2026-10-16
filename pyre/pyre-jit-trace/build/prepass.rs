@@ -1166,6 +1166,15 @@ fn real_main() {
                     "intobject",
                     "format_int_decimal",
                 ]),
+                // GET_ITER residual `bh_get_iter_fn`. The portal never
+                // calls `W_Range.descr_iter`, so the descent looks the body
+                // up by this graph key (`specialize.rs
+                // try_walker_orthodox_get_iter`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_range_iter",
+                ]),
                 // Step-1 range `FOR_ITER` descends this body. `space.next`
                 // calls it, and that call stays residual, so the graph is
                 // seeded here for the path lookup.
@@ -1187,6 +1196,15 @@ fn real_main() {
                     "pyre_object",
                     "listobject",
                     "w_list_getitem_inner",
+                ]),
+                // BUILD_LIST residual `newlist_from_array`. The portal never
+                // calls `make_empty_list`, so the descent looks the body up
+                // by this graph key (`specialize.rs
+                // try_walker_orthodox_empty_newlist`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "listobject",
+                    "w_list_make_empty",
                 ]),
                 // BUILD_MAP's `inline_call` target (`flatten.rs
                 // inline_call_targets`). `build_map_from_refs` stores through

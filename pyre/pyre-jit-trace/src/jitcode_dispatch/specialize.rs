@@ -6923,6 +6923,112 @@ pub(crate) fn try_walker_orthodox_binary_slice<Sym: WalkSym>(
     )
 }
 
+/// GET_ITER residual: walk `W_Range.descr_iter` (`functional.py`).
+///
+/// Flatten / the bytecode codewriter lower GET_ITER to `bh_get_iter_fn`, a
+/// MayForce pointer with no jitcode of its own. The interpreter body is
+/// `opcode_get_iter` → `space.iter` → `W_Range.descr_iter`; this walks the
+/// last of those (`w_range_iter`), seeded in `helper_graphs` so the path
+/// lookup finds a graph. Tracing it records `new_with_vtable` of
+/// `W_IntRangeOneArgIterator` (or the sibling machine-int shapes) plus the
+/// field stores, the same ops PyPy inlines. Admission is an exact `range`
+/// so a user `__iter__` stays residual. `inline_subwalk` is allowed: the
+/// GET_ITER that needs this path lives in the inlined caller of a list-comp
+/// (`f` on `comprehension_param_range_call_flush`). Not a spec-fold row.
+const GET_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_range_iter",
+    commit_label: "get_iter_commit",
+    call_site_label: "get_iter_call_site",
+    decline_tag: "GET-ITER-SUBWALK",
+};
+
+/// Walk `w_range_iter` for GET_ITER. Declines when the body is missing or
+/// the walk does not finish; the residual stays.
+pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if unsafe { !pyre_object::functional::is_exact_w_range(obj) } {
+        return Ok(None);
+    }
+    // `w_range_iter` is the range arm of `space.iter`, not the dispatching
+    // body: the type test that selects it is recorded here.
+    let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
+    walker_guard_fold_class(ctx, op_pc, r_args[0], range_type_addr)?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[(r_args[0], obj)],
+        &[],
+        dst,
+        dst_bank,
+        &GET_ITER_DESCENT,
+    )
+}
+
+/// Empty BUILD_LIST residual: walk `make_empty_list` (`listobject.py`).
+///
+/// Flatten / the bytecode codewriter lower BUILD_LIST to `new_array_clear`
+/// plus `newlist_from_array`, a MayForce pointer with no jitcode of its own.
+/// The interpreter body is `space.newlist([])` → `W_ListObject.__init__` →
+/// `get_strategy_from_list_object` → `EmptyListStrategy` /
+/// `from_storage_and_strategy`; this walks the last of those
+/// (`w_list_make_empty`), seeded in `helper_graphs` so the path lookup finds
+/// a graph. Tracing it records `new_with_vtable` of `W_ListObject` plus the
+/// Empty-strategy field stores, the same ops PyPy inlines. Admission is a
+/// const-zero backing array so a non-empty BUILD_LIST stays on the existing
+/// newlist fold. `inline_subwalk` is allowed: the BUILD_LIST that needs this
+/// path lives in the inlined list-comp (`f` on
+/// `comprehension_param_range_call_flush`). Not a spec-fold row.
+const NEWLIST_EMPTY_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::listobject::w_list_make_empty",
+    commit_label: "newlist_empty_commit",
+    call_site_label: "newlist_empty_call_site",
+    decline_tag: "NEWLIST-EMPTY-SUBWALK",
+};
+
+/// Walk `w_list_make_empty` for BUILD_LIST 0. Declines when the body is
+/// missing or the walk does not finish; the residual stays.
+pub(crate) fn try_walker_orthodox_empty_newlist<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+    let arr = r_args[0];
+    let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(arr) else {
+        return Ok(None);
+    };
+    match len_op.inline_const_to_value() {
+        Some(majit_ir::Value::Int(0)) => {}
+        _ => return Ok(None),
+    }
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[],
+        &[],
+        dst,
+        dst_bank,
+        &NEWLIST_EMPTY_DESCENT,
+    )
+}
+
 const WRITE_CELL_DESCENT: HelperDescent = HelperDescent {
     path: "write_cell",
     commit_label: "write_cell_commit",

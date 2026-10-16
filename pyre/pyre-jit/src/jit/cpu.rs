@@ -548,6 +548,11 @@ pub struct Cpu {
     /// `bh_get_iter_fn(obj)` — GET_ITER `iter(obj)` residual
     /// (a user `__iter__` may run Python → fallible).
     pub get_iter_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
+    /// `jit_newlist_from_iter_hint(iter)` — BUILD_LIST_FROM_ARG residual:
+    /// `space.newlist([], sizehint=length_hint(iter))`. A user
+    /// `__length_hint__` may run Python → fallible.
+    pub newlist_from_iter_hint_fn:
+        extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
     /// `jit_next(iter)` — FOR_ITER `next(iter)` residual; returns the next
     /// item, PY_NULL on StopIteration exhaustion (the trailing for-iter
     /// GuardNonnull catches it), or publishes a real exception into the
@@ -893,6 +898,7 @@ impl Cpu {
             make_function_fn: pyre_interpreter::runtime_ops::jit_make_function_from_globals,
             set_function_attribute_fn: pyre_interpreter::runtime_ops::jit_set_function_attribute,
             get_iter_fn: crate::call_jit::bh_get_iter_fn,
+            newlist_from_iter_hint_fn: pyre_interpreter::opcode_ops::jit_newlist_from_iter_hint,
             for_iter_next_fn: pyre_interpreter::runtime_ops::jit_next,
             for_iter_exception_match_fn: pyre_interpreter::runtime_ops::jit_exception_match,
             unary_negative_fn: crate::call_jit::bh_unary_negative_fn,

@@ -260,6 +260,7 @@ opmap = {
     'BINARY_OP': 44,
     'BUILD_INTERPOLATION': 45,
     'BUILD_LIST': 46,
+    'BUILD_LIST_FROM_ARG': 212,
     'BUILD_MAP': 47,
     'BUILD_SET': 48,
     'BUILD_SLICE': 49,
