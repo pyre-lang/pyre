@@ -76,7 +76,10 @@ pub(super) fn cfuncptr_type() -> PyObjectRef {
         unsafe {
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
             // PyPy `function.py:CFuncPtr.__metaclass__ = CFuncPtrType`.
-            (*tp).w_class = super::metaclass::pycfuncptrtype_type();
+            pyre_object::typeobject::w_type_set_w_class(
+                tp,
+                super::metaclass::pycfuncptrtype_type(),
+            );
         }
         super::finish_cpython_type(tp, "_ctypes", true)
     })

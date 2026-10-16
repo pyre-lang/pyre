@@ -39,8 +39,6 @@ pub(crate) struct SpecQueue {
     /// First request that claimed each leaf. A later request for the same
     /// leaf is the same instantiation; one from another function is a clash.
     seen: HashMap<String, SpecRequest>,
-    /// `def_id`s whose body contains a depth-0 `Clause`.
-    clause_body: std::collections::HashMap<u64, bool>,
 }
 
 impl SpecQueue {
@@ -48,27 +46,7 @@ impl SpecQueue {
         Self {
             pending: VecDeque::new(),
             seen: HashMap::new(),
-            clause_body: std::collections::HashMap::new(),
         }
-    }
-
-    /// True when copying the body can bind a `Clause`. A generic callee
-    /// whose body never names one stays on the unspecialized graph.
-    pub(crate) fn body_has_own_clause(&mut self, fd: &FunDecl, llbc: &Llbc) -> bool {
-        if let Some(known) = self.clause_body.get(&fd.def_id) {
-            return *known;
-        }
-        let has = fd.body.as_ref().is_some_and(|raw| {
-            let Ok(value) = serde_json::from_str::<Value>(raw.get()) else {
-                return false;
-            };
-            let Some(body) = value.get("Unstructured") else {
-                return false;
-            };
-            mentions_own_clause(body, llbc, Space::Ty)
-        });
-        self.clause_body.insert(fd.def_id, has);
-        has
     }
 
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
@@ -138,27 +116,6 @@ pub(crate) fn concrete_trait_refs_or_empty(generics: &Value, llbc: &Llbc) -> Opt
     Some(refs)
 }
 
-/// `generics.trait_refs` when every ref is resolved (no `Clause`) and at
-/// least one is a `TraitImpl`. `None` leaves the callee unspecialized.
-pub(crate) fn concrete_trait_refs(generics: &Value, llbc: &Llbc) -> Option<Vec<Value>> {
-    let refs = generics.get("trait_refs")?.as_array()?;
-    if refs.is_empty() {
-        return None;
-    }
-    let mut saw_impl = false;
-    for tref in refs {
-        match ref_class(tref, llbc, 0) {
-            RefClass::Clause => return None,
-            RefClass::TraitImpl => saw_impl = true,
-            RefClass::Other => {}
-        }
-    }
-    if !saw_impl {
-        return None;
-    }
-    Some(refs.clone())
-}
-
 /// `{leaf}__spec_{readable}_{hash}`. `FunctionDesc.cachedgraph` names the
 /// copy `name__valid_identifier(nameof(key))` from the key's names.
 /// `readable` is those type-argument leaves; `hash` is FNV-1a of the
@@ -184,7 +141,7 @@ pub(crate) fn spec_leaf(leaf: &str, fn_id: u64, generics: &Value, llbc: &Llbc) -
         .map(|types| {
             types
                 .iter()
-                .map(|ty| spec_type_name(ty, llbc, 0))
+                .map(|ty| spec_type_name(ty, llbc, 0, false))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -216,6 +173,36 @@ pub(crate) fn unspecialized_leaf(leaf: &str) -> &str {
         Some(at) => &leaf[..at],
         None => leaf,
     }
+}
+
+/// Type and const-generic names of a concrete residual instantiation.
+///
+/// `annlowlevel.specialize` keys each specialized graph on the argument
+/// lltypes; Charon keeps one FunDecl, so these names distinguish the
+/// funcptr (`getfunctionptr`) the residual call must bind.
+pub(crate) fn residual_inst_type_names(generics: &Value, llbc: &Llbc) -> Option<Vec<String>> {
+    let (types, consts) = concrete_type_args(generics, llbc)?;
+    if types.is_empty() && consts.is_empty() {
+        return None;
+    }
+    let mut names = Vec::with_capacity(types.len() + consts.len());
+    for ty in &types {
+        names.push(residual_spec_type_name(ty, llbc, 0));
+    }
+    for cg in &consts {
+        names.push(spec_const_name(cg, llbc, 0));
+    }
+    Some(names)
+}
+
+/// `spec_type_name` with `type T = U` aliases expanded at every nesting level.
+///
+/// rustc `type_name` expands aliases (`PyObjectRef` → `*mut PyObject`,
+/// `IntKeyHash` → `BuildHasherDefault<IntKeyHasher>`). Charon may keep
+/// the alias TypeDecl at a call site; expand so the residual suffix
+/// matches the address registered from `type_name`.
+fn residual_spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
+    spec_type_name(v, llbc, depth, true)
 }
 
 /// `generics.types` / `generics.const_generics` when neither list contains
@@ -775,7 +762,10 @@ fn indirect_body_with_clause(v: &Value, llbc: &Llbc, space: Space) -> Option<Val
 /// Charon type expression spelled from declaration names. Extraction-local
 /// ids are followed (`Deduplicated`, `Value`) or replaced by
 /// `name_path`, never printed.
-pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
+///
+/// `expand_aliases` peels `type T = U` at every nesting level so a residual
+/// suffix matches rustc `type_name`. Other callers pass `false`.
+pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize, expand_aliases: bool) -> String {
     if depth > 32 {
         return "deep".to_string();
     }
@@ -784,14 +774,14 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
     {
         if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
             return match llbc.dedup_body(id) {
-                Some(body) => spec_type_name(body, llbc, depth + 1),
+                Some(body) => spec_type_name(body, llbc, depth + 1, expand_aliases),
                 None => "?dedup".to_string(),
             };
         }
         if let Some(arr) = obj.get("Value").and_then(Value::as_array)
             && arr.len() == 2
         {
-            return spec_type_name(&arr[1], llbc, depth + 1);
+            return spec_type_name(&arr[1], llbc, depth + 1, expand_aliases);
         }
     }
     if let Some(index) = v.pointer("/TypeVar/Bound/1").and_then(Value::as_u64) {
@@ -807,26 +797,37 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
         return crate::front::mir::charon_literal_to_ast_string(scalar);
     }
     if let Some(r) = obj.get("Ref") {
-        return spec_ref(r, llbc, depth);
+        return spec_ref(r, llbc, depth, expand_aliases);
     }
     if let Some(rp) = obj.get("RawPtr") {
-        return spec_raw_ptr(rp, llbc, depth);
+        return spec_raw_ptr(rp, llbc, depth, expand_aliases);
     }
     if let Some(adt) = obj.get("Adt").and_then(Value::as_object) {
-        return spec_adt(adt, llbc, depth);
+        if expand_aliases
+            && let Some(def_id) = crate::front::mir::type_decl_ref_adt_id(adt)
+            && let Some(td) = llbc.type_by_id(def_id)
+            && let majit_charon_reader::ullbc::TypeDeclKind::Alias(body) = &td.kind
+        {
+            let node = body.get("aliased_ty").unwrap_or(body);
+            return spec_type_name(node, llbc, depth + 1, expand_aliases);
+        }
+        return spec_adt(adt, llbc, depth, expand_aliases);
     }
     if let Some(arr) = obj.get("Array").and_then(Value::as_array) {
-        return spec_array_pair(arr, llbc, depth);
+        return spec_array_pair(arr, llbc, depth, expand_aliases);
     }
     if let Some(elem) = obj
         .get("Slice")
         .and_then(Value::as_array)
         .and_then(|arr| arr.first())
     {
-        return format!("[{}]", spec_type_name(elem, llbc, depth + 1));
+        return format!(
+            "[{}]",
+            spec_type_name(elem, llbc, depth + 1, expand_aliases)
+        );
     }
     if let Some(fnptr) = obj.get("FnPtr") {
-        return spec_fn_ptr(fnptr, llbc, depth);
+        return spec_fn_ptr(fnptr, llbc, depth, expand_aliases);
     }
     canonical_type_json(v, llbc, depth)
 }
@@ -886,7 +887,7 @@ fn spec_fn_name(meta: &majit_charon_reader::ullbc::ItemMeta, llbc: &Llbc) -> Str
                     .pointer("/Impl/Ty/skip_binder")
                     .or_else(|| v.pointer("/Impl/Ty/value"))
                 {
-                    return format!("<impl {}>", spec_type_name(ty, llbc, 0));
+                    return format!("<impl {}>", spec_type_name(ty, llbc, 0, false));
                 }
                 canonical_type_json(v, llbc, 0)
             }
@@ -906,7 +907,7 @@ fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
         .map(|items| {
             items
                 .iter()
-                .map(|ty| spec_type_name(ty, llbc, 0))
+                .map(|ty| spec_type_name(ty, llbc, 0, false))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -923,7 +924,7 @@ fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
     Some(format!("{name}{}", angle_args(&types, &consts)))
 }
 
-fn spec_ref(r: &Value, llbc: &Llbc, depth: usize) -> String {
+fn spec_ref(r: &Value, llbc: &Llbc, depth: usize, expand_aliases: bool) -> String {
     let (ty, kind) = if let Some(arr) = r.as_array() {
         (arr.get(1), arr.get(2).and_then(Value::as_str))
     } else if let Some(obj) = r.as_object() {
@@ -934,7 +935,7 @@ fn spec_ref(r: &Value, llbc: &Llbc, depth: usize) -> String {
     let Some(ty) = ty else {
         return "ref".to_string();
     };
-    let inner = spec_type_name(ty, llbc, depth + 1);
+    let inner = spec_type_name(ty, llbc, depth + 1, expand_aliases);
     if kind.is_some_and(|k| k.eq_ignore_ascii_case("Mut")) {
         format!("&mut {inner}")
     } else {
@@ -942,7 +943,7 @@ fn spec_ref(r: &Value, llbc: &Llbc, depth: usize) -> String {
     }
 }
 
-fn spec_raw_ptr(rp: &Value, llbc: &Llbc, depth: usize) -> String {
+fn spec_raw_ptr(rp: &Value, llbc: &Llbc, depth: usize, expand_aliases: bool) -> String {
     let (ty, kind) = if let Some(arr) = rp.as_array().filter(|arr| arr.len() == 2) {
         (arr.first(), arr.get(1).and_then(Value::as_str))
     } else if let Some(obj) = rp.as_object() {
@@ -958,7 +959,7 @@ fn spec_raw_ptr(rp: &Value, llbc: &Llbc, depth: usize) -> String {
     let Some(ty) = ty else {
         return "rawptr".to_string();
     };
-    let inner = spec_type_name(ty, llbc, depth + 1);
+    let inner = spec_type_name(ty, llbc, depth + 1, expand_aliases);
     if kind.is_some_and(|k| k.eq_ignore_ascii_case("Mut")) {
         format!("*mut {inner}")
     } else {
@@ -966,10 +967,15 @@ fn spec_raw_ptr(rp: &Value, llbc: &Llbc, depth: usize) -> String {
     }
 }
 
-fn spec_adt(adt: &serde_json::Map<String, Value>, llbc: &Llbc, depth: usize) -> String {
+fn spec_adt(
+    adt: &serde_json::Map<String, Value>,
+    llbc: &Llbc,
+    depth: usize,
+    expand_aliases: bool,
+) -> String {
     let (types, consts) = crate::front::mir::type_decl_ref_generics(adt, llbc)
         .and_then(Value::as_object)
-        .map(|args| spec_generic_args(args, llbc, depth))
+        .map(|args| spec_generic_args(args, llbc, depth, expand_aliases))
         .unwrap_or_default();
     let tref = Value::Object(adt.clone());
     if crate::front::mir::type_decl_ref_builtin(&tref) == Some("Tuple") {
@@ -995,7 +1001,7 @@ fn spec_adt(adt: &serde_json::Map<String, Value>, llbc: &Llbc, depth: usize) -> 
             .and_then(Value::as_object)
         {
             Some(args) if types.is_empty() && consts.is_empty() => {
-                spec_generic_args(args, llbc, depth)
+                spec_generic_args(args, llbc, depth, expand_aliases)
             }
             _ => (types, consts),
         };
@@ -1009,6 +1015,7 @@ fn spec_generic_args(
     args: &serde_json::Map<String, Value>,
     llbc: &Llbc,
     depth: usize,
+    expand_aliases: bool,
 ) -> (Vec<String>, Vec<String>) {
     let items = |key: &str| {
         args.get(key)
@@ -1018,7 +1025,7 @@ fn spec_generic_args(
     };
     let types = items("types")
         .iter()
-        .map(|ty| spec_type_name(ty, llbc, depth + 1))
+        .map(|ty| spec_type_name(ty, llbc, depth + 1, expand_aliases))
         .collect();
     let consts = items("const_generics")
         .iter()
@@ -1038,9 +1045,9 @@ fn spec_builtin(builtin: &Value, types: &[String], consts: &[String]) -> String 
     }
 }
 
-fn spec_array_pair(arr: &[Value], llbc: &Llbc, depth: usize) -> String {
+fn spec_array_pair(arr: &[Value], llbc: &Llbc, depth: usize, expand_aliases: bool) -> String {
     if arr.len() == 3 {
-        let elem = spec_type_name(&arr[0], llbc, depth + 1);
+        let elem = spec_type_name(&arr[0], llbc, depth + 1, expand_aliases);
         let len = crate::front::mir::charon_array_len_to_string(&arr[1], llbc);
         format!("[{elem};{len}]")
     } else {
@@ -1048,7 +1055,7 @@ fn spec_array_pair(arr: &[Value], llbc: &Llbc, depth: usize) -> String {
     }
 }
 
-fn spec_fn_ptr(fnptr: &Value, llbc: &Llbc, depth: usize) -> String {
+fn spec_fn_ptr(fnptr: &Value, llbc: &Llbc, depth: usize, expand_aliases: bool) -> String {
     let Some(sig) = fnptr.get("skip_binder").unwrap_or(fnptr).as_object() else {
         return "fn".to_string();
     };
@@ -1058,14 +1065,14 @@ fn spec_fn_ptr(fnptr: &Value, llbc: &Llbc, depth: usize) -> String {
         .map(|items| {
             items
                 .iter()
-                .map(|ty| spec_type_name(ty, llbc, depth + 1))
+                .map(|ty| spec_type_name(ty, llbc, depth + 1, expand_aliases))
                 .collect::<Vec<_>>()
                 .join(",")
         })
         .unwrap_or_default();
     let output = sig
         .get("output")
-        .map(|ty| spec_type_name(ty, llbc, depth + 1))
+        .map(|ty| spec_type_name(ty, llbc, depth + 1, expand_aliases))
         .unwrap_or_else(|| "()".to_string());
     if sig.get("is_unsafe").and_then(Value::as_bool) == Some(true) {
         format!("unsafe fn({inputs}) -> {output}")
@@ -1368,8 +1375,8 @@ mod tests {
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
         let dedup = json!({"Deduplicated": 7});
         assert_eq!(
-            spec_type_name(&inline, &llbc, 0),
-            spec_type_name(&dedup, &llbc, 0)
+            spec_type_name(&inline, &llbc, 0, false),
+            spec_type_name(&dedup, &llbc, 0, false)
         );
         let inline_g = json!({"types": [inline], "trait_refs": [], "const_generics": []});
         let dedup_g = json!({"types": [dedup], "trait_refs": [], "const_generics": []});
@@ -1454,8 +1461,8 @@ mod tests {
         let bare = json!({"types": [ty], "trait_refs": [], "const_generics": []});
         let reference = json!({"types": [shared], "trait_refs": [], "const_generics": []});
         assert_ne!(
-            spec_type_name(&ty, &llbc, 0),
-            spec_type_name(&shared, &llbc, 0)
+            spec_type_name(&ty, &llbc, 0, false),
+            spec_type_name(&shared, &llbc, 0, false)
         );
         assert_ne!(
             spec_leaf("f", 7, &bare, &llbc),
@@ -1776,6 +1783,88 @@ mod tests {
         assert!(
             copied.body.iter().all(|bb| !bb.is_cleanup),
             "spec copy must strip cleanup the way FunDecl::unstructured does"
+        );
+    }
+
+    /// Nested `type T = U` aliases expand on the residual path only.
+    #[test]
+    fn residual_spec_type_name_expands_nested_aliases() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let meta = |name: &str| {
+            json!({
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": [name, 0]}],
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let adt = |id: u64| {
+            json!({"Adt": {"id": id, "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}})
+        };
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [],
+                "type_decls": [
+                    {"def_id": 0, "item_meta": meta("Wrapper"), "kind": {"Struct": []}},
+                    {"def_id": 1, "item_meta": meta("Inner"), "kind": {"Struct": []}},
+                    {
+                        "def_id": 2,
+                        "item_meta": meta("Alias"),
+                        "kind": {"Alias": {"RawPtr": [adt(1), "Mut"]}}
+                    }
+                ],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let alias = adt(2);
+        let inner = "*mut fixture::Inner";
+        let kept = "fixture::Alias";
+        let wrapper = json!({"Adt": {"id": 0, "generics": {
+            "regions": [], "types": [alias.clone()], "const_generics": [], "trait_refs": []
+        }}});
+        let shared = json!({"Ref": ["Erased", alias.clone(), "Shared"]});
+        let raw = json!({"RawPtr": [alias.clone(), "Mut"]});
+        let array = json!({"Array": [alias.clone(), usize_const("4"), null]});
+        let slice = json!({"Slice": [alias.clone()]});
+        let tuple = json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": {
+            "regions": [], "types": [alias.clone()], "const_generics": [], "trait_refs": []
+        }}});
+        let cases: &[(&Value, &str, &str)] = &[
+            (&alias, kept, inner),
+            (
+                &wrapper,
+                "fixture::Wrapper<fixture::Alias>",
+                "fixture::Wrapper<*mut fixture::Inner>",
+            ),
+            (&shared, "&fixture::Alias", "&*mut fixture::Inner"),
+            (&raw, "*mut fixture::Alias", "*mut *mut fixture::Inner"),
+            (&array, "[fixture::Alias;4]", "[*mut fixture::Inner;4]"),
+            (&slice, "[fixture::Alias]", "[*mut fixture::Inner]"),
+            (&tuple, "(fixture::Alias,)", "(*mut fixture::Inner,)"),
+        ];
+        for (ty, spec, residual) in cases {
+            assert_eq!(spec_type_name(ty, &llbc, 0, false), *spec, "spec {ty}");
+            assert_eq!(
+                residual_spec_type_name(ty, &llbc, 0),
+                *residual,
+                "residual {ty}"
+            );
+        }
+        let names = residual_inst_type_names(
+            &json!({"types": [wrapper.clone()], "const_generics": []}),
+            &llbc,
+        )
+        .expect("concrete wrapper instantiation");
+        assert_eq!(
+            names,
+            vec!["fixture::Wrapper<*mut fixture::Inner>".to_string()]
         );
     }
 

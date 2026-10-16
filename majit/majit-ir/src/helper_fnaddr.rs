@@ -199,6 +199,124 @@ pub unsafe fn rstr_payload(word: i64) -> &'static [u8] {
     }
 }
 
+/// Suffix that distinguishes one residual monomorph of a generic helper.
+///
+/// `annlowlevel.specialize` / `FunctionDesc.cachedgraph` names each
+/// specialized graph; `getfunctionptr(graph)` is then a distinct funcptr
+/// (`rpython/jit/codewriter/call.py` `get_jitcode_calldescr`). Charon
+/// extracts with `monomorphize: false`, so a generic `dont_look_inside`
+/// helper is one FunDecl. The residual CallPath appends this suffix,
+/// built from the call site's type arguments, so two instantiations
+/// cannot share an address.
+pub fn residual_inst_suffix(type_names: &[&str]) -> String {
+    if type_names.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("__inst");
+    for name in type_names {
+        out.push('_');
+        out.push_str(&residual_inst_type_token(name));
+    }
+    out
+}
+
+/// One path-segment token for a rustc `type_name` or Charon `spec_type_name`.
+///
+/// The input is reduced to a canonical spelling (full module paths, refs,
+/// arrays, tuples and generics kept; whitespace dropped except one space
+/// after `mut` / `const` / `dyn`) and then escaped injectively so two
+/// distinct types cannot share a suffix.
+pub fn residual_inst_type_token(name: &str) -> String {
+    encode_canonical_type(&canonical_type_spelling(name))
+}
+
+/// rustc `type_name` spelling with whitespace collapsed so both renderers
+/// agree: drop whitespace, then keep exactly one space after the keywords
+/// `mut`, `const`, and `dyn`.
+fn canonical_type_spelling(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name.trim();
+    while !rest.is_empty() {
+        let first = rest.chars().next().unwrap();
+        if first.is_whitespace() {
+            rest = rest.trim_start();
+            continue;
+        }
+        if let Some((kw, after)) = match_type_keyword(rest, &out) {
+            out.push_str(kw);
+            rest = after.trim_start();
+            if !rest.is_empty() {
+                out.push(' ');
+            }
+            continue;
+        }
+        out.push(first);
+        rest = &rest[first.len_utf8()..];
+    }
+    out
+}
+
+fn match_type_keyword<'a>(rest: &'a str, out: &str) -> Option<(&'static str, &'a str)> {
+    let prev_ok = match out.chars().last() {
+        None => true,
+        Some(c) => !is_ident_char(c),
+    };
+    if !prev_ok {
+        return None;
+    }
+    for kw in ["const", "mut", "dyn"] {
+        if let Some(after) = rest.strip_prefix(kw) {
+            let next_ok = match after.chars().next() {
+                None => true,
+                Some(c) => !is_ident_char(c),
+            };
+            if next_ok {
+                return Some((kw, after));
+            }
+        }
+    }
+    None
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn encode_canonical_type(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().saturating_mul(2));
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            continue;
+        }
+        if c == '_' {
+            out.push_str("__");
+            continue;
+        }
+        if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            out.push_str("_C");
+            continue;
+        }
+        match c {
+            '<' => out.push_str("_L"),
+            '>' => out.push_str("_G"),
+            ',' => out.push_str("_M"),
+            '&' => out.push_str("_R"),
+            '*' => out.push_str("_P"),
+            ' ' => out.push_str("_S"),
+            '[' => out.push_str("_B"),
+            ']' => out.push_str("_E"),
+            ';' => out.push_str("_Y"),
+            '(' => out.push_str("_O"),
+            ')' => out.push_str("_Q"),
+            other => out.push_str(&format!("_x{:x}_", other as u32)),
+        }
+    }
+    out
+}
+
 /// Visit every registered class singleton, whichever population the target carries.
 pub fn for_each_prebuilt_class_static(mut visit: impl FnMut(&PrebuiltStaticAddr)) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -213,5 +331,101 @@ pub fn for_each_prebuilt_class_static(mut visit: impl FnMut(&PrebuiltStaticAddr)
         for desc in guard.iter() {
             visit(desc);
         }
+    }
+}
+
+#[cfg(test)]
+mod residual_inst_suffix_tests {
+    use super::{residual_inst_suffix, residual_inst_type_token};
+
+    #[test]
+    fn tokens_encode_full_canonical_spelling() {
+        assert_eq!(residual_inst_type_token("i64"), "i64");
+        assert_eq!(residual_inst_type_token("&i64"), "_Ri64");
+        assert_eq!(residual_inst_type_token("&mut i64"), "_Rmut_Si64");
+        assert_eq!(residual_inst_type_token("*mut i64"), "_Pmut_Si64");
+        assert_eq!(residual_inst_type_token("*const i64"), "_Pconst_Si64");
+        assert_eq!(residual_inst_type_token("a::Key"), "a_CKey");
+        assert_eq!(residual_inst_type_token("b::Key"), "b_CKey");
+        assert_eq!(residual_inst_type_token("()"), "_O_Q");
+        assert_eq!(
+            residual_inst_type_token("pyre_object::identitydict::IdentityKey"),
+            "pyre__object_Cidentitydict_CIdentityKey"
+        );
+        assert_eq!(
+            residual_inst_type_token("&pyre_object::dictmultiobject::IntDictStorage"),
+            "_Rpyre__object_Cdictmultiobject_CIntDictStorage"
+        );
+        assert_eq!(
+            residual_inst_type_token("*mut pyre_object::pyobject::PyObject"),
+            "_Pmut_Spyre__object_Cpyobject_CPyObject"
+        );
+        assert_eq!(
+            residual_inst_type_token(
+                "core::hash::BuildHasherDefault<pyre_object::dictmultiobject::IntKeyHasher>"
+            ),
+            "core_Chash_CBuildHasherDefault_Lpyre__object_Cdictmultiobject_CIntKeyHasher_G"
+        );
+        assert_eq!(
+            residual_inst_type_token("Foo<A, B>"),
+            residual_inst_type_token("Foo<A,B>")
+        );
+        assert_eq!(
+            residual_inst_type_token("[T; N]"),
+            residual_inst_type_token("[T;N]")
+        );
+        assert_eq!(
+            residual_inst_type_token("&mut  T"),
+            residual_inst_type_token("&mut T")
+        );
+    }
+
+    #[test]
+    fn tokens_are_injective_for_boundary_cases() {
+        assert_ne!(
+            residual_inst_type_token("i64"),
+            residual_inst_type_token("&i64")
+        );
+        assert_ne!(
+            residual_inst_type_token("&T"),
+            residual_inst_type_token("&mut T")
+        );
+        assert_ne!(
+            residual_inst_type_token("*mut T"),
+            residual_inst_type_token("*const T")
+        );
+        assert_ne!(
+            residual_inst_type_token("a::Key"),
+            residual_inst_type_token("b::Key")
+        );
+        assert_ne!(
+            residual_inst_type_token("Foo<A, B>"),
+            residual_inst_type_token("Foo<A<B>>")
+        );
+        assert_ne!(
+            residual_inst_type_token("hash_map"),
+            residual_inst_type_token("hash::map")
+        );
+    }
+
+    #[test]
+    fn suffix_distinguishes_instantiations() {
+        let int = residual_inst_suffix(&[
+            "i64",
+            "pyre_object::pyobject::PyObjectRef",
+            "pyre_object::dictmultiobject::IntKeyHash",
+        ]);
+        let identity = residual_inst_suffix(&[
+            "pyre_object::identitydict::IdentityKey",
+            "pyre_object::pyobject::PyObjectRef",
+            "std::collections::hash_map::RandomState",
+        ]);
+        assert_ne!(int, identity);
+        assert!(int.starts_with("__inst_"), "{int}");
+        assert!(!int.contains("::"), "{int}");
+        assert!(identity.contains("IdentityKey"), "{identity}");
+        assert!(identity.contains("RandomState"), "{identity}");
+        assert!(int.contains("i64"), "{int}");
+        assert!(!int.contains("IdentityKey"), "{int}");
     }
 }

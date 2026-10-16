@@ -5887,12 +5887,11 @@ pub fn init_gc_subsystem() {
     pyre_interpreter::baseobjspace::publish_method_cache_container();
     pyre_object::unicodeobject::init_interned_strings();
     // The root walkers belong to the same bootstrap as the collector they feed:
-    // interpreter startup builds every builtin type object and its namespace
-    // dict before the first Python frame exists, and `walk_builtin_type_dicts_gc`
-    // is the only path to those young dicts. Installed at first eval instead,
-    // a collection in that window reclaims a namespace dict whose type object
-    // still points at it — measured under `MAJIT_GC_STRESS=1`, which faults in
-    // `w_dict_items` while `retag_classmethod_descriptors` sweeps the registry.
+    // interpreter startup fills interned strings and the immortal stores
+    // (`walk_interpreter_global_roots`, `walk_immortal_store_roots`) before
+    // the first Python frame exists, and those walks are the only path to
+    // their contents. Installed at first eval instead, a collection in that
+    // window reclaims a cache slot whose holder still points at it.
     // Placed after `initialize_rbigint_parts_cache` so the first walk finds
     // that cache built rather than manufacturing it from inside the walker.
     init_gc_root_walkers();

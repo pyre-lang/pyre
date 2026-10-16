@@ -1806,7 +1806,7 @@ pub fn init_typeobjects() {
             let w_typeobj = w_typeobject_addr as PyObjectRef;
             unsafe {
                 if (*w_typeobj).w_class.is_null() {
-                    (*w_typeobj).w_class = w_type_type;
+                    pyre_object::typeobject::w_type_set_w_class(w_typeobj, w_type_type);
                 }
             }
         }
@@ -38108,9 +38108,10 @@ pub(crate) fn copy_for_type(
     // from the source (reqcls stays None per the `if self.reqcls is None`
     // precondition). A heap type's copy is nursery so a discarded
     // `type(name, (), {})` dies at the next minor. An immortal builtin
-    // owner's copy stays `malloc_typed_stable`: its custom trace never
-    // fires and `walk_builtin_type_dicts_gc` is skipped on a clean minor,
-    // so a nursery copy would be swept (`sys.flags.verbose`).
+    // owner's copy stays `malloc_typed_stable`: a clean minor traces the
+    // type only when the write barrier recorded a store
+    // (`incminimark.py` `old_objects_pointing_to_young`), so a nursery
+    // copy would be swept (`sys.flags.verbose`).
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(descr);
