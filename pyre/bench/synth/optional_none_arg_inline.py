@@ -9,10 +9,8 @@
 # cranelift 1.3x; the ceiling is twice the slower, and a ceiling under 3
 # derives no floor.
 #
-# Its sibling `is_none_unboxed_operand_decline` is this fixture with the
-# default changed from `None` to an int, and stays declined.  The pair is what
-# shows the `is`-against-None scan asking about the operand the branch tests
-# rather than about the signature as a whole.
+# Its sibling `is_none_unboxed_operand_inline` is this fixture with the
+# default changed from `None` to an int; it inlines as well.
 #
 # `clamp` is called once more off the hot path so the printed total depends on
 # the arm the trace guards away as well as the one it keeps: an identity test

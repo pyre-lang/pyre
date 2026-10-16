@@ -69,6 +69,17 @@ thread_local! {
         const { UnsafeCell::new(None) };
 }
 
+/// Drop the `CA_WALK_*` handshake.  It belongs to one CALL_ASSEMBLER guard
+/// failure: the bridge hook stamps it and the blackhole hook that runs right
+/// after reads it.  When the bridge hook completes the callee itself, the
+/// blackhole hook does not run, and a stamp left behind would be read by the
+/// next guard failure of the same frame as if its own walk had adopted state.
+fn reset_ca_walk_handshake() {
+    CA_WALK_ADOPTED_FRAME.with(|c| c.set(0));
+    CA_WALK_FINISHED_FRAME.with(|c| c.set(0));
+    CA_WALK_RESUME_FRAME.with(|c| c.set(0));
+}
+
 struct FrameRoot {
     depth: usize,
 }
@@ -2091,6 +2102,23 @@ fn ca_complete_after_bridge_walk(
     None
 }
 
+/// Whether the failing guard's jitdriver has no virtualizable.
+///
+/// `warmspot.py assembler_call_helper` is built per jitdriver and passes its
+/// own `jitdriver_sd` to `handle_fail`, so `resume_in_blackhole` reads that
+/// driver's `virtualizable_info`. One helper serves every driver here; the
+/// failing guard's `rd_loop_token.outermost_jitdriver_sd` names the same
+/// driver. A `generatorentry` callee has no virtualizable.
+fn guard_driver_has_no_vable(descr_arc: &std::sync::Arc<dyn majit_ir::Descr>) -> bool {
+    let (driver, _) = crate::eval::driver_pair();
+    descr_arc
+        .as_fail_descr()
+        .and_then(majit_backend::descr_owning_jct)
+        .and_then(|token| token.outermost_jitdriver_index)
+        .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
+        .is_some_and(|has_vinfo| !has_vinfo)
+}
+
 fn jit_blackhole_resume_from_guard(
     descr_addr: usize,
     deadframe: *mut majit_backend::jitframe::JitFrame,
@@ -2221,6 +2249,7 @@ fn jit_blackhole_resume_from_guard(
         } else {
             None
         };
+        let novable = guard_driver_has_no_vable(&descr_arc);
         let result = blackhole_resume_via_rd_numb(
             storage.rd_numb_ref().expect("rd_numb"),
             storage.rd_consts().unwrap_or(&[]),
@@ -2229,7 +2258,7 @@ fn jit_blackhole_resume_from_guard(
             storage.rd_virtuals(),
             Some(deadframe_types.as_slice()),
             guard_exc,
-            false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
+            novable,
             all_virtuals,
             None, // `raw_deadframe` is rooted only by the copy made inside
         );
@@ -2606,6 +2635,53 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
                 (*f_back).mark_as_escaped();
             }
         }
+    }
+}
+
+/// `pyframe.py execute_frame`'s `finally: ec.leave(self, ...)` for a frame
+/// whose portal call returned into a guard that then failed.
+///
+/// Upstream's merge point sits on `PyFrame.dispatch`, so the frame that made
+/// the recursive portal call is `execute_frame`, and a guard failing behind the
+/// CALL_ASSEMBLER resumes a blackhole frame that still runs that `finally`.
+/// pyre's portal is `execute_frame` itself: the trace records the `enter` ahead
+/// of the call and the `leave` behind `GUARD_NOT_FORCED`
+/// (`record_ec_leave_frame_chain`), and the resume data names only the caller.
+/// A failing `GUARD_NOT_FORCED` therefore resumes past a `leave` nothing runs,
+/// with the returned frame still in `topframeref`.
+///
+/// Such a frame is recognised by what it is not: it sits above every frame
+/// this resume rebuilds, and it has finished executing.  A frame an inlined
+/// call entered and the snapshot still holds open is one of the rebuilt frames;
+/// one that is neither is left alone.
+fn leave_frames_handed_to_portal_call(
+    bh: &majit_metainterp::blackhole::BlackholeInterpreter,
+    got_exception: bool,
+) {
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    if ec.is_null() {
+        return;
+    }
+    let resumed = |frame: *mut PyFrame| {
+        let mut current = Some(bh);
+        while let Some(interp) = current {
+            if std::ptr::eq(interp.virtualizable_ptr as *mut PyFrame, frame) {
+                return true;
+            }
+            current = interp.nextblackholeinterp.as_deref();
+        }
+        false
+    };
+    // The exception the guard grabbed belongs to the innermost call alone.
+    let mut got_exception = got_exception;
+    loop {
+        let top = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+        if top.is_null() || resumed(top) || !unsafe { (*top).frame_finished_execution() } {
+            return;
+        }
+        leave_compiled_frame_chain(top, got_exception);
+        got_exception = false;
     }
 }
 
@@ -2990,6 +3066,8 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             frame_index += 1;
         }
     }
+
+    leave_frames_handed_to_portal_call(&bh, guard_exc != 0);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
@@ -4471,6 +4549,8 @@ fn jit_ca_handle_guard_failure(
     // `num_values == 0` would leave such a guard without a counter tick, and so
     // without a bridge, forever. Only a null pointer with a non-zero length is
     // unusable — that pairing cannot be turned into a slice at all.
+    // A stamp from an earlier failure is not this guard's.
+    reset_ca_walk_handshake();
     if deadframe.is_null() {
         return None;
     }
@@ -4519,6 +4599,21 @@ fn jit_ca_handle_guard_failure(
     let descr_fd = descr_arc
         .as_fail_descr()
         .expect("fail_descr_arc_from_addr returned non-FailDescr");
+    // `compile.py handle_fail` receives the failing loop's `jitdriver_sd`
+    // and `_trace_and_compile_from_bridge` rebuilds that driver's frames.
+    // The bridge start below rebuilds a `pypyjit` frame from failarg 0, its
+    // virtualizable. A `generatorentry` guard has the generator there and
+    // no virtualizable; like `run_compiled_generatorentry`, it resumes in
+    // the blackhole.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        let has_vinfo = majit_backend::descr_owning_jct(descr_fd)
+            .and_then(|token| token.outermost_jitdriver_index)
+            .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx));
+        if has_vinfo == Some(false) {
+            return None;
+        }
+    }
     let n_fail_args = descr_fd.fail_arg_types().len();
     let fail0 = unsafe { majit_backend::get_int_value(deadframe, descr_fd, 0) };
     let guard_value_operand = guard_value_operand_present.then_some(guard_value_operand);
@@ -4616,6 +4711,10 @@ fn jit_ca_handle_guard_failure(
         );
     }
 
+    if !matches!(resolution, BridgeResolution::ResumeBlackhole) {
+        // The callee completes here; no blackhole hook reads the stamp.
+        reset_ca_walk_handshake();
+    }
     match resolution {
         BridgeResolution::CompiledContinue => {
             // compile.py handle_fail must_compile arm raises
@@ -4893,9 +4992,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 // `jitexc.py` `ExitFrameWithExceptionRef`: deliver it
                 // ahead of the guard-state blackhole, which would resume
                 // the frame the exception already left.
-                CA_WALK_FINISHED_FRAME.with(|c| c.set(0));
-                CA_WALK_ADOPTED_FRAME.with(|c| c.set(0));
-                CA_WALK_RESUME_FRAME.with(|c| c.set(0));
+                reset_ca_walk_handshake();
                 pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
                 return match completion {
                     CaFrameCompletion::Raised(cv) => ca_finish_raise_word(cv),
@@ -4934,7 +5031,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 &mut raw_values,
                 &exit_layout,
                 guard_exc,
-                false,
+                guard_driver_has_no_vable(&descr_arc),
                 savedata,
             );
             handle_blackhole_result(bh).unwrap_or(0)

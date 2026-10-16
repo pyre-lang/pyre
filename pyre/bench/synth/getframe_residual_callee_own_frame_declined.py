@@ -4,7 +4,7 @@
 # red frame, so it neither forces that frame nor clears the caller's
 # virtualizable token.
 #
-# The recorded shape is two loops, no bridge, no forcings, no virtualizable
+# The recorded shape is one loop (`bump` inlines, as on `pypy3`), no bridge, no forcings, no virtualizable
 # forcings, and no aborts.  The observable regression guard remains the
 # non-journaled `STORE_ATTR`: frame inspection must execute `bump` exactly once
 # per iteration, so `c.n` must stay equal to the loop count.

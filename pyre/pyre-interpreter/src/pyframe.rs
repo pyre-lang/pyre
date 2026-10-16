@@ -2088,23 +2088,24 @@ impl FrameBox {
         };
         let is_coroutine = self.code().flags.contains(crate::CodeFlags::COROUTINE);
         let _origin_roots = pyre_object::gc_roots::push_roots();
-        let name_slot = name.map(|name| {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(name);
-            slot
+        // Static pins: an absent name, qualname or origin pins null.
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(match name {
+            Some(name) => name,
+            None => pyre_object::PY_NULL,
         });
-        let qualname_slot = qualname.map(|qualname| {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(qualname);
-            slot
+        let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(match qualname {
+            Some(qualname) => qualname,
+            None => pyre_object::PY_NULL,
         });
-        let coroutine_origin_slot = if is_coroutine {
-            let origin = capture_coroutine_origin(crate::call::getexecutioncontext());
-            let _ = pyre_object::gc_roots::pin_root(origin);
-            Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+        let origin = if is_coroutine {
+            capture_coroutine_origin(crate::call::getexecutioncontext())
         } else {
-            None
+            pyre_object::PY_NULL
         };
+        let coroutine_origin_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(origin);
         // A suspended generator frame is off the call chain — `f_back` is
         // None until a resume re-links it (`executioncontext.py enter`
         // rebinds `f_backref = topframeref`; pyre does the same at
@@ -2155,29 +2156,29 @@ impl FrameBox {
         let _generator_roots = pyre_object::gc_roots::push_roots();
         let generator_slot = pyre_object::gc_roots::shadow_stack_len();
         let generator = pyre_object::gc_roots::pin_root(generator);
-        if let Some(slot) = coroutine_origin_slot {
+        if is_coroutine {
             unsafe {
                 pyre_object::generator::w_coroutine_set_origin(
                     generator,
-                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    pyre_object::gc_roots::shadow_stack_get(coroutine_origin_slot),
                 );
             }
         }
         // generator.py:22-23 stores the function's existing `_name` /
         // `_qualname` objects directly on the generator.
-        if let Some(slot) = name_slot {
+        if name.is_some() {
             unsafe {
                 pyre_object::generator::w_generator_set_name(
                     generator,
-                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
                 )
             };
         }
-        if let Some(slot) = qualname_slot {
+        if qualname.is_some() {
             unsafe {
                 pyre_object::generator::w_generator_set_qualname(
                     generator,
-                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    pyre_object::gc_roots::shadow_stack_get(qualname_slot),
                 )
             };
         }

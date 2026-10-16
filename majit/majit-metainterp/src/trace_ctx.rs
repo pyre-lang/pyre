@@ -963,6 +963,35 @@ pub struct BridgeInlineCarrier {
     pub recipes: Vec<ReconstructRecipe>,
 }
 
+impl ReconstructRecipe {
+    /// Every box this level holds.
+    pub fn for_each_box(&self, mut f: impl FnMut(OpRef)) {
+        self.registers_r
+            .iter()
+            .chain(std::iter::once(&self.frame))
+            .chain(self.return_substitute.iter())
+            .chain(self.rebuilt_frame.iter())
+            .chain(self.rebuilt_ec.iter())
+            .for_each(|op| f(*op));
+    }
+}
+
+impl BridgeInlineCarrier {
+    /// Every box the recipes hold, for the live-box census of
+    /// `MetaInterp::walk_active_trace_refs`.
+    pub fn for_each_box(&self, mut f: impl FnMut(OpRef)) {
+        for recipe in self.recipes.iter() {
+            recipe.for_each_box(&mut f);
+        }
+    }
+
+    /// history.py `ConstPtr.value` of the recipes' constant boxes: the
+    /// carrier is their holder, so it traces their `const_ptr_table` slots.
+    pub fn trace_const_ptr_boxes(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        self.for_each_box(|op| op.trace_const_ptr(visitor));
+    }
+}
+
 /// The virtualizable shadow slot a `vable_set*` standard leg overwrote, and
 /// the Box it held before.
 ///
@@ -2050,6 +2079,56 @@ impl TraceCtx {
             );
         }
         true
+    }
+
+    /// `opimpl_virtual_ref`'s recording half, for a `virtual_ref` over an
+    /// object the trace builds and the tracer never holds: `VIRTUAL_REF(box,
+    /// cindex)` with no tracing-time vref and no pair pushed.
+    ///
+    /// Nothing can force such a vref while the trace is recorded, so it stays
+    /// out of `virtualref_boxes` across the residual-call protocol, whose
+    /// `tracing_before_residual_call` / `tracing_after_residual_call` read a
+    /// concrete vref.  [`Self::track_recorded_virtual_ref`] pushes the pair
+    /// for the guards that resume inside its scope.
+    pub fn record_virtual_ref(&mut self, virtual_obj: OpRef) -> OpRef {
+        let cindex = self.const_int((self.virtualref_boxes.len() / 2) as i64);
+        self.virtual_ref(virtual_obj, cindex)
+    }
+
+    /// `virtualref_boxes += [virtualbox, vrefbox]` for a
+    /// [`Self::record_virtual_ref`] box.
+    pub fn track_recorded_virtual_ref(&mut self, virtual_obj: OpRef, vref: OpRef) {
+        self.virtualref_boxes.push((virtual_obj, 0));
+        self.virtualref_boxes.push((vref, 0));
+    }
+
+    /// `opimpl_virtual_ref_finish` for a [`Self::track_recorded_virtual_ref`]
+    /// pair: pops it and records `VIRTUAL_REF_FINISH(vrefbox, nullbox)`, or
+    /// `VIRTUAL_REF_FINISH(vrefbox, virtualbox)` when the scope's `leave`
+    /// forces the vref.  With `record` false the pair is dropped and nothing
+    /// is recorded, for a trace that is being abandoned.
+    pub fn finish_recorded_virtual_ref(&mut self, forced: bool, record: bool) {
+        let (vrefbox, _) = self
+            .virtualref_boxes
+            .pop()
+            .expect("finish_recorded_virtual_ref: no open virtual_ref scope");
+        let (virtualbox, _) = self
+            .virtualref_boxes
+            .pop()
+            .expect("finish_recorded_virtual_ref: vrefbox without its virtualbox");
+        if !record {
+            return;
+        }
+        let second = if forced {
+            virtualbox
+        } else {
+            self.const_ref(0)
+        };
+        let _ = Self::do_record_op(
+            &mut self.recorder,
+            OpCode::VirtualRefFinish,
+            &[vrefbox, second],
+        );
     }
 
     /// `pyjitpl.py MetaInterp.vable_and_vrefs_before_residual_call`

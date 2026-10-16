@@ -3047,7 +3047,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         .const_int(i64::from(open_inline_activations(ctx.session) + 1));
     let (saved_depth, displaced_activation) =
         record_activation_charge(ctx, op.pc, ec, callee_frame, units)?;
-    record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec);
+    let callee_vref = record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec);
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -3080,7 +3080,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             call_descr,
             OpRef::NONE,
             op.pc,
-            None,
+            // `vable_after_residual_call`: an escape goes on behind this
+            // CALL with the executed result in its `>r` register.
+            Some((op.next_pc, dst_bank, dst)),
             false,
         )?
     };
@@ -3224,23 +3226,31 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     }
 
     // pyjitpl.py: GUARD_NOT_FORCED + resume snapshot advanced past
-    // the call (`capture_resumedata(after_residual_call=True)`).
+    // the call (`capture_resumedata(after_residual_call=True)`).  The
+    // callee's `virtual_ref` scope is open at this guard, so its pair rides
+    // the snapshot (`virtualref_boxes`).
+    ctx.trace_ctx
+        .track_recorded_virtual_ref(callee_frame, callee_vref);
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    if let Err(err) = walker_capture_snapshot_for_last_guard(ctx, op.pc) {
+        ctx.trace_ctx.finish_recorded_virtual_ref(false, false);
+        return Err(err);
+    }
     // `execute_frame`'s `finally: ec.leave(...)`.  A `finally` runs on every
-    // exit, and compiled code has no such construct, so the restore is
-    // recorded at the earliest point the call is known to have returned:
-    // after GUARD_NOT_FORCED, which `pyjitpl.py:2049-2079` keeps adjacent to
-    // the call, and BEFORE the exception guard.  Recording it past the
-    // exception guard instead would skip the restore on exactly the exit that
-    // needs it — a raising callee deopts at the guard, leaving the callee
-    // frame published in `topframeref` for the next `enter` to chain onto, and
-    // the root walker then traverses a chain that grows once per raise
+    // exit, and compiled code has no such construct, so the leave is recorded
+    // at the earliest point the call is known to have returned: after
+    // GUARD_NOT_FORCED, which `pyjitpl.py do_residual_call` keeps adjacent to the
+    // call, and BEFORE the exception guard.  Recording it past the exception
+    // guard instead would skip it on exactly the exit that needs it — a
+    // raising callee deopts at the guard, leaving the callee published in
+    // `topframeref` for the next `enter` to chain onto, and the root walker
+    // then traverses a chain that grows once per raise
     // (`walk_pyframe_roots_area` took 100% of a profile of
     // `synth/list_length_hint_validate`, which raises on four of every six
-    // calls).  The residual exposure — a failing GUARD_NOT_FORCED — is the one
-    // `TopFrameRefGuard` (`pyre-jit/src/eval.rs`) already covers.
-    record_ec_leave_frame_chain(ctx.trace_ctx, callee_frame, ec);
+    // calls).  A failing GUARD_NOT_FORCED resumes ahead of it;
+    // `leave_frames_handed_to_portal_call` (`pyre-jit/src/call_jit.rs`) runs
+    // the leave for that exit.
+    record_ec_leave_frame_chain(ctx.trace_ctx, callee_frame, ec, exec_raised);
     // `execute_frame`'s `finally` half of the same seam: give the activation
     // back before either exception arm leaves this compiled caller.
     record_activation_release(ctx.trace_ctx, ec, saved_depth, displaced_activation);
@@ -3331,6 +3341,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         ctx,
         op.pc,
         Some((dst_bank, dst)),
+        Some(op.next_pc),
         callee_frame,
         callee_ec,
         Some(token),
@@ -3372,6 +3383,10 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     dst: Option<(char, usize)>,
+    // The pc behind the caller's CALL op, when `ctx` walks that caller and
+    // `dst` is the CALL's result register. `None` when `ctx` walks the
+    // callee itself, whose jitcode has no op the result is written by.
+    resume_pc: Option<usize>,
     callee_frame: OpRef,
     callee_ec: OpRef,
     token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
@@ -3492,6 +3507,20 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         .trace_ctx
         .const_int(i64::from(open_inline_activations(ctx.session) + 1));
     let activation = record_activation_charge(ctx, pc, callee_ec, callee_frame, units)?;
+    // `pyframe.py execute_frame`'s `ec.enter(self)`, as in
+    // [`try_walker_call_assembler_self_recursive`]: the sub-walk's
+    // `walker_ec_leave` has already taken the callee off the chain, and the
+    // portal call that runs its loop belongs inside that bracket.  A
+    // reconstructed callee (`dst` is None) is still inside its carrier
+    // scope, which `carrier_ec_leave` closes when the frame returns.
+    let portal_vref = dst.is_some().then(|| {
+        record_ec_enter_virtual_ref(
+            ctx.trace_ctx,
+            callee_frame,
+            callee_ec,
+            concrete_callee_frame as usize,
+        )
+    });
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -3579,6 +3608,19 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         callee_frame,
         callee_ec,
     ];
+    // The prologue the sub-walk ran plus this portal run are the whole
+    // CALL, so an escape (`vable_after_residual_call`) continues the caller
+    // behind it with the executed result in the CALL's register.
+    let blackhole_result = resume_pc
+        .zip(dst)
+        .map(|(next_pc, (bank, color))| (next_pc, bank, color));
+    // The concrete half of the enter recorded above, scoped to the call.
+    let displaced_portal_call_frame = portal_vref.map(|vref| {
+        ctx.session
+            .borrow_mut()
+            .portal_call_frame
+            .replace((callee_frame, vref))
+    });
     let exec = try_execute_residual_call_via_executor(
         ctx,
         OpCode::CallMayForceR,
@@ -3586,9 +3628,29 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         portal_view,
         OpRef::NONE,
         pc,
-        None,
+        blackhole_result,
         false,
-    )?;
+    );
+    if let Some(displaced) = displaced_portal_call_frame {
+        ctx.session.borrow_mut().portal_call_frame = displaced;
+    }
+    // `execute_frame` leaves from a `finally`: a walk that stops between the
+    // enter and the recorded leave below still closes the scope.
+    let abandon_portal_scope = |ctx: &mut WalkContext<'_, '_, Sym>| {
+        if portal_vref.is_some()
+            && let Some(majit_ir::Value::Ref(frame)) = ctx.trace_ctx.concrete_of_opref(callee_frame)
+        {
+            ctx.trace_ctx
+                .discard_innermost_virtualref_if_frame(frame.as_usize());
+        }
+    };
+    let exec = match exec {
+        Ok(exec) => exec,
+        Err(err) => {
+            abandon_portal_scope(ctx);
+            return Err(err);
+        }
+    };
     // `pyjitpl.py:2049-2079` records a forced VIRTUAL_REF_FINISH before the
     // selected CALL_ASSEMBLER, followed immediately by GUARD_NOT_FORCED.
     // `direct_assembler_call` records CALL_ASSEMBLER on the portal reds.
@@ -3628,8 +3690,11 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // CALL_MAY_FORCE executed above, not the recorded CALL_ASSEMBLER.
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(OpCode::CallMayForceR, Some(&ei), &allboxes);
-    if let Some((dst_bank, dst)) = dst {
-        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)?;
+    if let Some((dst_bank, dst)) = dst
+        && let Err(err) = write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
+    {
+        abandon_portal_scope(ctx);
+        return Err(err);
     }
     // `opimpl_jit_merge_point` pops the frame holding the merge point
     // (`finishframe(None, leave_portal_frame=False)`) before its caller
@@ -3642,7 +3707,24 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     };
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
+    if let Err(err) = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope) {
+        abandon_portal_scope(ctx);
+        return Err(err);
+    }
+    if portal_vref.is_some() {
+        let escaped = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
+            Some(majit_ir::Value::Ref(frame)) if frame.0 != 0 => unsafe {
+                (*(frame.0 as *const pyre_interpreter::PyFrame)).escaped()
+            },
+            _ => false,
+        };
+        record_ec_leave_virtual_ref(
+            ctx.trace_ctx,
+            callee_frame,
+            callee_ec,
+            escaped || exec_raised,
+        );
+    }
     // Restore before either exception arm leaves the compiled caller.  Put
     // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
     // an emitted call-adjacent operation even when the restore stores fold.
@@ -5498,26 +5580,18 @@ pub(crate) fn unwind_entered_scopes_above<Sym: WalkSym>(
 /// ```
 ///
 /// [`walker_ec_enter`] is the seeded-callee form: it has a live callee frame
-/// at recording time, so it mirrors every store concretely and takes a real
-/// vref of the frame.  This fold builds its callee out of recorded operations
-/// alone, so what is recorded here is the interpreter-level reading of
-/// `jit.virtual_ref(frame)`: the frame pointer itself (`_jit_vref.py
-/// lowleveltype = OBJECTPTR`, no allocation), which is exactly what
-/// [`pyre_interpreter::PyExecutionContext::enter`] stores.
+/// at recording time, so it mirrors every store concretely and takes a
+/// tracing-time vref of the frame.  This fold builds its callee out of
+/// recorded operations alone and executes the call through the ordinary
+/// callable, which enters a frame of its own, so there is no object for a
+/// tracing-time vref to name: the `VIRTUAL_REF` is recorded without one
+/// (`TraceCtx::record_virtual_ref`) and returned for the caller to track
+/// across the guards that resume inside the scope.
 ///
-/// ⛔ Recording a `VIRTUAL_REF` here instead is measurable and is a net loss.
-/// The callee this fold builds is read back through `gettopframe_nohidden`,
-/// which is `force_vref`: `locals()` in a self-recursive callee forces on
-/// every call, and an unwind that crosses suspended copies of the frame
-/// forces once per crossing.  Each force is a GUARD_NOT_FORCED failure, and
-/// `ResumeGuardForcedDescr.handle_fail` never compiles one — it blackholes.
-/// Measured over the synthetic corpus, publishing the vref moves eight
-/// fixtures by one to three guard failures and moves two by +273
-/// (`recursive_forced_frame_kept_stack`) and +169
-/// (`selfrec_tail_exception_unwind`): +430 net, all of it blackholed.  The
-/// portal doors no longer need it — [`crate::PortalEntry`]'s caller names the
-/// door — so the remaining question is what makes those forces unnecessary,
-/// not how to spell the enter.
+/// A force of this vref by the callee — `gettopframe_nohidden` under
+/// `locals()`, or `ExecutionContext.leave`'s `frame.f_backref()` when a
+/// deeper frame escaped or raised — fails the GUARD_NOT_FORCED behind the
+/// call, and `ResumeGuardForcedDescr.handle_fail` blackholes it.
 ///
 /// Upstream reaches `ec.enter` on this path too: `interp_jit.py` puts
 /// `jit_merge_point` on `PyFrame.dispatch`, so the CALL_ASSEMBLER that
@@ -5525,7 +5599,7 @@ pub(crate) fn unwind_entered_scopes_above<Sym: WalkSym>(
 /// execute_frame`'s `ec.enter(self)` already traced ahead of it.  pyre's
 /// portal sits one level up, at `execute_frame` itself, so the fold jumps
 /// over the enter unless it records it here.
-fn record_ec_enter_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_ec: OpRef) {
+fn record_ec_enter_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_ec: OpRef) -> OpRef {
     let caller_topframeref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[callee_ec],
@@ -5536,34 +5610,51 @@ fn record_ec_enter_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_e
         &[callee_frame, caller_topframeref],
         crate::descr::pyframe_f_backref_descr(),
     );
+    let vref = ctx.record_virtual_ref(callee_frame);
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
-        &[callee_ec, callee_frame],
+        &[callee_ec, vref],
         crate::descr::ec_topframeref_descr(),
     );
+    vref
 }
 
 /// `executioncontext.py ExecutionContext.leave`'s frame-chain half, in
-/// `execute_frame`'s `finally` position, recorded with no concrete shadow.
+/// `execute_frame`'s `finally` position, closing
+/// [`record_ec_enter_frame_chain`].
 ///
 /// ```python
+/// frame_vref = self.topframeref
 /// self.topframeref = frame.f_backref
+/// if frame.escaped or got_exception:
+///     ...
+///     frame_vref()
+/// jit.virtual_ref_finish(frame_vref, frame)
 /// ```
 ///
 /// No parens on `f_backref`, so a caller frame that stayed virtual stays
-/// virtual.  The escape branch and `virtual_ref_finish` that [`walker_ec_leave`]
-/// carries have no counterpart here for the same reason the enter takes no
-/// vref: this level never held one.  The profile-hook half stays with
-/// [`pyre_interpreter::PyExecutionContext::leave`] — see [`walker_ec_leave`]
-/// for why the portal-driver GREEN makes that split sound.
+/// virtual.  `got_exception` records `frame_vref()` as
+/// `VIRTUAL_REF_FINISH(vrefbox, virtualbox)`; `f_back.mark_as_escaped()` runs
+/// in the portal runner (`propagate_portal_frame_escape`).  The profile-hook
+/// half stays with [`pyre_interpreter::PyExecutionContext::leave`] — see
+/// [`walker_ec_leave`] for why the portal-driver GREEN makes that split sound.
 ///
 /// Record this at the earliest point the call is known to have returned, not
 /// on the trace's fall-through tail: a guard recorded ahead of it skips it on
 /// the exit it is needed for, and every skipped restore leaves a frame
-/// published in `topframeref` that the next `enter` chains onto.  The portal's
-/// `TopFrameRefGuard` (`pyre-jit/src/eval.rs`) balances the slot only when the
-/// activation itself ends, which is far too late for a loop that raises.
-fn record_ec_leave_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_ec: OpRef) {
+/// published in `topframeref` that the next `enter` chains onto.
+fn record_ec_leave_frame_chain(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    got_exception: bool,
+) {
+    record_ec_restore_topframeref(ctx, callee_frame, callee_ec);
+    ctx.finish_recorded_virtual_ref(got_exception, true);
+}
+
+/// `self.topframeref = frame.f_backref`.
+fn record_ec_restore_topframeref(ctx: &mut TraceCtx, callee_frame: OpRef, callee_ec: OpRef) {
     let f_backref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[callee_frame],
@@ -5576,47 +5667,137 @@ fn record_ec_leave_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_e
     );
 }
 
+/// `executioncontext.py ExecutionContext.enter`'s frame-chain half around a
+/// portal call on a frame the walk holds concretely.
+///
+/// ```python
+/// frame.f_backref = self.topframeref
+/// self.topframeref = jit.virtual_ref(frame)
+/// ```
+///
+/// Recorded only.  The concrete half belongs to the one residual that runs
+/// the portal: its executor publishes the vref for that call
+/// (`WalkSession.portal_call_frame`), above the frame chain it enters for the
+/// level that makes the call.  [`walker_ec_enter`] is the form for a callee
+/// whose body the walk itself runs.
+///
+/// Returns the vref box for [`record_ec_leave_virtual_ref`].
+fn record_ec_enter_virtual_ref(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    concrete_frame: usize,
+) -> OpRef {
+    let caller_topframeref = ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[callee_ec],
+        crate::descr::ec_topframeref_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_frame, caller_topframeref],
+        crate::descr::pyframe_f_backref_descr(),
+    );
+    let (vref, concrete_vref) = ctx.opimpl_virtual_ref(callee_frame, concrete_frame);
+    ctx.set_opref_concrete(
+        vref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_vref as usize)),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_ec, vref],
+        crate::descr::ec_topframeref_descr(),
+    );
+    vref
+}
+
+/// `executioncontext.py ExecutionContext.leave`'s frame-chain half behind a
+/// portal call, closing [`record_ec_enter_virtual_ref`].
+///
+/// ```python
+/// frame_vref = self.topframeref
+/// self.topframeref = frame.f_backref
+/// if frame.escaped or got_exception:
+///     f_back = frame.f_backref()
+///     if f_back:
+///         f_back.mark_as_escaped()
+///     frame_vref()
+/// jit.virtual_ref_finish(frame_vref, frame)
+/// ```
+///
+/// `f_back.mark_as_escaped()` runs in the portal runner for this door
+/// (`propagate_portal_frame_escape`), in the trace-time execution and in the
+/// compiled one alike.  `frame_vref()` is recorded the way
+/// [`walker_ec_leave`] records it: `VIRTUAL_REF_FINISH(vrefbox, virtualbox)`
+/// through `stop_tracking_virtualref`, unless the call already forced the
+/// vref and `vrefs_after_residual_call` recorded that.
+fn record_ec_leave_virtual_ref(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    escaped: bool,
+) {
+    record_ec_restore_topframeref(ctx, callee_frame, callee_ec);
+    if escaped {
+        let live = ctx.virtualref_boxes_len();
+        let vref_is_live = ctx
+            .innermost_virtualref_vref()
+            .is_some_and(|(vrefbox, _)| vrefbox.as_const_ptr().is_none_or(|vref| vref.0 != 0));
+        if live >= 2 && vref_is_live {
+            ctx.stop_tracking_virtualref(live - 2);
+        }
+    }
+    ctx.opimpl_virtual_ref_finish(callee_frame);
+}
+
 #[cfg(test)]
 mod portal_frame_chain_tests {
     use super::*;
 
-    /// The fold's recorded `enter` publishes the callee frame itself, and its
-    /// recorded `leave` restores `f_backref` — neither takes a vref.
-    ///
-    /// The op shape is the contract because publishing a `VIRTUAL_REF` here
-    /// is a measured net loss: the forces it admits are GUARD_NOT_FORCED
-    /// failures, which are blackholed rather than compiled. See
-    /// [`record_ec_enter_frame_chain`] for the census.
+    /// The fold's recorded `enter` publishes `jit.virtual_ref(frame)` and its
+    /// recorded `leave` restores `f_backref` and finishes the vref, leaving
+    /// `virtualref_boxes` balanced.
     #[test]
-    fn the_recorded_enter_and_leave_take_no_virtual_ref() {
-        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
-        let frame = OpRef::input_arg_ref(0);
-        let ec = OpRef::input_arg_ref(1);
+    fn the_recorded_enter_and_leave_bracket_a_virtual_ref() {
+        for got_exception in [false, true] {
+            let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+            let frame = OpRef::input_arg_ref(0);
+            let ec = OpRef::input_arg_ref(1);
 
-        record_ec_enter_frame_chain(&mut ctx, frame, ec);
-        record_ec_leave_frame_chain(&mut ctx, frame, ec);
-        assert_eq!(
-            ctx.virtualref_boxes_len(),
-            0,
-            "this level holds no vref, so it owes no virtual_ref_finish and \
-             must not leave `virtualref_boxes` unbalanced at the loop header",
-        );
+            let vref = record_ec_enter_frame_chain(&mut ctx, frame, ec);
+            assert_eq!(ctx.virtualref_boxes_len(), 0);
+            ctx.track_recorded_virtual_ref(frame, vref);
+            assert_eq!(ctx.virtualref_boxes_len(), 2);
+            record_ec_leave_frame_chain(&mut ctx, frame, ec, got_exception);
+            assert_eq!(
+                ctx.virtualref_boxes_len(),
+                0,
+                "an open pair at the loop header is a missing virtual_ref_finish",
+            );
 
-        let tree_loop = ctx.into_tree_loop();
-        let opcodes: Vec<OpCode> = tree_loop.ops.iter().map(|op| op.opcode).collect();
-        assert_eq!(
-            opcodes,
-            vec![
-                // `frame.f_backref = self.topframeref`
-                OpCode::GetfieldGcR,
-                OpCode::SetfieldGc,
-                // `self.topframeref = frame`
-                OpCode::SetfieldGc,
-                // `self.topframeref = frame.f_backref`
-                OpCode::GetfieldGcR,
-                OpCode::SetfieldGc,
-            ],
-        );
+            let tree_loop = ctx.into_tree_loop();
+            let opcodes: Vec<OpCode> = tree_loop.ops.iter().map(|op| op.opcode).collect();
+            assert_eq!(
+                opcodes,
+                vec![
+                    // `frame.f_backref = self.topframeref`
+                    OpCode::GetfieldGcR,
+                    OpCode::SetfieldGc,
+                    // `self.topframeref = jit.virtual_ref(frame)`
+                    OpCode::VirtualRefR,
+                    OpCode::SetfieldGc,
+                    // `self.topframeref = frame.f_backref`
+                    OpCode::GetfieldGcR,
+                    OpCode::SetfieldGc,
+                    // `jit.virtual_ref_finish(frame_vref, frame)`
+                    OpCode::VirtualRefFinish,
+                ],
+            );
+            let finish = tree_loop.ops.last().unwrap();
+            assert_eq!(finish.arg(0).to_opref(), vref);
+            // `frame_vref()` ahead of the finish is the non-null second operand.
+            assert_eq!(finish.arg(1).to_opref() == frame, got_exception);
+        }
     }
 }
 
@@ -7885,28 +8066,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let vararg_index = nparams + kwonly_count;
     let varkw_index = vararg_index + usize::from(vararg_slot.is_some());
     let seeded_locals = varkw_index + usize::from(varkw_slot.is_some());
-    // Does any incoming binding land a value the callee's register banks can
-    // hold unboxed?  Only the `is`-against-None scan below consults this; see
-    // its hazard-2 arm for why an int-specialized tested local is unsafe to
-    // inline.  A default is pushed above as a raw `Ref` without going through
-    // `ConcreteValue::from_pyobj`, so re-classify here rather than matching the
-    // variant alone — `def _read_from_buffer(self, size=-1)` reaches the scan
-    // with `size` as `Ref(<int object>)` and is exactly the shape that
-    // miscompiled.
-    let binding_is_unboxed = |concrete: ConcreteValue| {
-        let classified = match concrete {
-            ConcreteValue::Ref(obj) => ConcreteValue::from_pyobj(obj),
-            other => other,
-        };
-        matches!(
-            classified,
-            ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_)
-        )
-    };
-    let callee_binds_an_unboxed_local = callee_arg_concretes
-        .iter()
-        .copied()
-        .any(&binding_is_unboxed);
     // Vararg/over-arity calls still use the ordinary residual path. A closure
     // is admissible with or without cellvars of its own: the existing cell
     // objects are threaded into this callee's own frame and each pure cellvar
@@ -9443,19 +9602,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to a bare
         // `ptr_eq`/`ptr_ne` against the None singleton whose `Kind::Int`
         // result feeds the exitswitch -- no residual call and no boxed
-        // bool.  What the shape does need is the tested value popped as a
-        // Ref (`pop_ref_or_fresh`, the codewriter PopJumpIfNone arm).  When
-        // the multiframe inline int-specializes the tested local, the
-        // mid-body guard resume cannot source that operand's Ref form from
-        // the callee register banks (`collect_callee_active_boxes` would
-        // read a stale/mismatched box), so the encoded liveness stream
-        // disagrees with the decoder (`resume.rs decode_ref: unexpected
-        // tag`) and the caller frame is corrupted.  Decline to the ordinary
-        // residual call until the multi-frame resume reboxes
-        // int-specialized identity operands.
+        // bool.  The tested operand's bank does not matter:
+        // `collect_callee_active_boxes` sizes the frame's section from the
+        // liveness at the carried `jitcode_pc`, the coordinate the decoder
+        // reads, so an int-specialized local encodes in the bank it lives in.
         // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
-        // int bank, so no Ref rebox is needed.  A strict straight-line callee
-        // has no branch at all, so this scan never fires for it.
+        // int bank.  A strict straight-line callee has no branch at all, so
+        // this scan never fires for it.
         // Stored bound methods carry their explicit receiver and callee frame,
         // so their Ref operands remain available to the resume path.
         //
@@ -9483,7 +9636,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         _
                     ))
                 ) && (
-                    // Hazard 1 — kept operands. A branch that leaves slots
+                    // Kept operands. A branch that leaves slots
                     // on the value stack needs its guard resume to restore
                     // them, and the inline sub-walk's mirror does not model
                     // them, so the kept Ref reads NULL and
@@ -9495,33 +9648,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // `depth > 1` is exactly "a kept slot survives".  An
                     // unreachable pc has no depth and cannot fire a guard.
                     liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
-                            // Hazard 2 — the tested operand itself.  When the
-                            // multiframe inline int-specializes the tested
-                            // local, the mid-body guard resume cannot source
-                            // that operand's Ref form from the callee register
-                            // banks (`collect_callee_active_boxes` reads a
-                            // stale/mismatched box), so the encoded liveness
-                            // stream disagrees with the decoder and the caller
-                            // frame is corrupted.  This is independent of kept
-                            // depth: a statement-level `if x is None:` reads
-                            // depth 1 and still carries it.
-                            || match crate::liveness::branch_operand_local(callee_code, pc) {
-                                // The branch reads its operand straight out of
-                                // a parameter slot the body never reassigns, so
-                                // that one binding answers which bank holds it.
-                                // `if o is None:` over `def g(x, *, o=None)`
-                                // tests `o`; `x` being an int says nothing about
-                                // `o`.  The shape that miscompiled tests the int
-                                // itself -- `_read_from_buffer(self, size=-1)`
-                                // with `if size is None` -- and still declines.
-                                Some(local) if local < seeded_locals => {
-                                    binding_is_unboxed(callee_arg_concretes[local])
-                                }
-                                // Anything else on top of the stack is not
-                                // described by the incoming bindings, so keep
-                                // the whole-signature answer.
-                                _ => callee_binds_an_unboxed_local,
-                            }
                 )
             });
             if has_is_none_branch {
@@ -15702,7 +15828,9 @@ fn descend_generatorentry<Sym: WalkSym>(
         call_descr,
         OpRef::NONE,
         op.pc,
-        None,
+        // `vable_after_residual_call`: an escape goes on behind this call
+        // with `jit_next`'s result in its `>r` register.
+        Some((op.next_pc, 'r', dst)),
         false,
     )?;
     // `execute_residual_call` consumes `BH_LAST_EXC_VALUE` and returns the

@@ -2215,10 +2215,25 @@ struct ResidualFrameChainGuard {
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when the chain already named `frame`.
     entered: bool,
+    /// `executioncontext.py leave`'s `got_exception`: the frame's own
+    /// execution ended in an exception.  Only a guard whose scope IS that
+    /// execution sets it (the portal call's frame); a frame that merely runs
+    /// a raising residual carries on into its handler lookup.
+    got_exception: std::cell::Cell<bool>,
 }
 
 impl ResidualFrameChainGuard {
     fn enter(frame: usize, shadow: Option<(super::WalkFrameState, u16)>) -> Option<Self> {
+        Self::enter_published(frame, frame, shadow)
+    }
+
+    /// [`Self::enter`] with the word `topframeref` takes named separately:
+    /// the frame itself, or the `jit.virtual_ref` the trace recorded for it.
+    fn enter_published(
+        frame: usize,
+        published: usize,
+        shadow: Option<(super::WalkFrameState, u16)>,
+    ) -> Option<Self> {
         let frame = frame as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
             return None;
@@ -2250,7 +2265,7 @@ impl ResidualFrameChainGuard {
             );
             unsafe {
                 (*frame).f_backref = saved_topframeref;
-                (*ec).topframeref = frame;
+                (*ec).topframeref = published as *mut pyre_interpreter::PyFrame;
             }
         }
         // Published whether or not this guard wrote the chain: `frame` is the
@@ -2267,7 +2282,13 @@ impl ResidualFrameChainGuard {
             previous_published,
             previous_shadow,
             entered,
+            got_exception: std::cell::Cell::new(false),
         })
+    }
+
+    /// The execution this guard brackets left through an exception.
+    fn note_got_exception(&self) {
+        self.got_exception.set(true);
     }
 
     /// The frame as the collector last left it.  Every read below goes through
@@ -2297,7 +2318,9 @@ impl Drop for ResidualFrameChainGuard {
                 (*self.ec).topframeref = (*self.frame()).f_backref;
             }
             let frame = self.frame();
-            if (*frame).escaped() {
+            // `if frame.escaped or got_exception:` -- an exception leaves a
+            // traceback that names this frame, and through it the caller.
+            if (*frame).escaped() || self.got_exception.get() {
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
                     (*f_back).mark_as_escaped();
@@ -5490,6 +5513,21 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 Some((ctx.frame_state.clone(), frame_reg))
             });
         let _frame_chain = ResidualFrameChainGuard::enter(concrete_inline_frame, published_shadow);
+        // `pyframe.py execute_frame`'s `ec.enter(self)` for the frame a
+        // portal call runs: the portal runner continues a frame its caller
+        // entered, and here the caller is this residual.  After the guard
+        // above, so the frame chains onto the level that calls it.
+        let portal_call_frame = ctx.session.borrow().portal_call_frame;
+        let concrete_ref = |ctx: &WalkContext<'_, '_, Sym>, opref: OpRef| match ctx
+            .trace_ctx
+            .concrete_of_opref(opref)
+        {
+            Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => Some(gcref.0),
+            _ => None,
+        };
+        let portal_frame_chain = portal_call_frame
+            .and_then(|(frame, vref)| Some((concrete_ref(ctx, frame)?, concrete_ref(ctx, vref)?)))
+            .and_then(|(frame, vref)| ResidualFrameChainGuard::enter_published(frame, vref, None));
         let live_py_pc = if ctx.fbw_mode.inline_subwalk {
             ctx.vstack_cur_pypc
         } else {
@@ -5507,7 +5545,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             )
         });
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter(ctx.trace_ctx);
-        majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
+        let exec_result =
+            majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args);
+        // `pyframe.py execute_frame`'s `finally: ec.leave(self, w_exitvalue,
+        // got_exception)` for the frame the portal call ran.
+        if exec_result.is_err() {
+            if let Some(chain) = portal_frame_chain.as_ref() {
+                chain.note_got_exception();
+            }
+        }
+        exec_result
     };
     // Publish the Ref into the slot reserved above `residual_locals_roots`.
     // The word returned here is the address at publication. A later minor
@@ -8752,20 +8799,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // Exact `dict.get(identity_key)` follows the promoted strategy-entry
-    // shape produced by tracing `DictStrategy.getitem`: pin the key-set
-    // iterator state and read the resolved entry value live.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::BuiltinDictGet, || {
-            try_walker_specialize_builtin_dict_get(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // PyPy traces through builtin `getattr` into a property's Python getter.
     // The ordinary LOAD_ATTR spelling has the same inline route above; keep
     // the builtin spelling on it too, including lone-surrogate names carried
@@ -9149,6 +9182,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iRd_kind",
         )? {
             LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
@@ -9171,6 +9205,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iRd_kind",
         )? {
             return Ok((outcome, op.next_pc));
@@ -10725,6 +10760,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iIRd_kind",
         )? {
             LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
@@ -10747,6 +10783,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iIRd_kind",
         )? {
             return Ok((outcome, op.next_pc));
@@ -11054,6 +11091,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iIRFd_kind",
         )? {
             LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
@@ -11076,6 +11114,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             dst_bank,
             dst,
             op.pc,
+            op.next_pc,
             "dispatch_residual_call_iIRFd_kind",
         )? {
             return Ok((outcome, op.next_pc));

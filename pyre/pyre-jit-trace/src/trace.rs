@@ -2271,14 +2271,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     if trace_too_long && !adopted {
         crate::jitcode_dispatch::unwind_entered_scopes_above(ctx, sym, entry_depth);
     }
-    discard_bridge_carrier_walk(
-        ctx,
-        sym,
-        entry_depth,
-        pre_pos,
-        &pre_virtualref_boxes,
-        !trace_too_long,
-    );
     if adopted {
         // `try_adopt_blackhole` mirrors `convert_and_run_from_pyjitpl` and can
         // finish the root frame with `DoneWithThisFrame*`; it records that
@@ -2290,10 +2282,21 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // The chain ran the callee forward from where the sub-walk stopped, so
         // the eager stores it journaled stand exactly once.  Its iterator
         // advances stand for the same reason, so drop their pre-advance
-        // cursors rather than restoring them.
+        // cursors rather than restoring them.  Before the discard below: its
+        // `cut_trace` reaches `fbw_gc_store_journal_cut`, which undoes every
+        // store still journaled behind the cut.
         crate::jitcode_dispatch::fbw_store_journal_commit();
         crate::jitcode_dispatch::fbw_bridge_iter_journal_clear();
-    } else {
+    }
+    discard_bridge_carrier_walk(
+        ctx,
+        sym,
+        entry_depth,
+        pre_pos,
+        &pre_virtualref_boxes,
+        !trace_too_long,
+    );
+    if !adopted {
         // No blackhole terminal belongs to this walk.  Clear any sub-walk
         // payload before the guard-state replay, as the old unconditional
         // reset did.

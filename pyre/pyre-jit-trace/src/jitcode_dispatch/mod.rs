@@ -740,6 +740,12 @@ pub struct WalkSession {
     /// `aborted_tracing` captured, so a single-frame adopt of the caller
     /// declines into entry replay.
     pub crossed_inline_subwalk: bool,
+    /// The frame box of a portal call being executed for its caller, with
+    /// the `jit.virtual_ref` box `pyframe.py execute_frame`'s `ec.enter`
+    /// recorded for it.  `record_walker_loop_callee_portal_call` sets it for
+    /// the one residual it executes, and the executor publishes the vref on
+    /// the chain for that call.
+    pub portal_call_frame: Option<(OpRef, OpRef)>,
     /// `DispatchError::TraceTooLong` was raised. A bridge-carrier drain
     /// drops the `Result` (`P2Drain::MiddleDriveErr`, `p2_drain_abort`)
     /// and would otherwise count `AbortReason::Generic`. The raise already
@@ -875,6 +881,7 @@ impl Default for WalkSession {
             root_debug_merge_point_py_pc: None,
             abort_in_subwalk: false,
             crossed_inline_subwalk: false,
+            portal_call_frame: None,
             trace_too_long: false,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
@@ -4392,7 +4399,9 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         call_descr,
         OpRef::NONE,
         op.pc,
-        None,
+        // Same coordinate as `dispatch_recursive_call`'s
+        // `assembler_call=False` arm.
+        Some((op.next_pc, dst_bank, dst)),
         false,
     )?;
     let (concrete, raised) = match exec {
@@ -10084,6 +10093,8 @@ fn direct_libffi_call<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
     pc: usize,
+    // The pc behind the residual-call op at `pc`.
+    next_pc: usize,
     caller: &'static str,
 ) -> Result<LibffiCallOutcome, DispatchError> {
     // pyjitpl.py: box_cif_description = argboxes[1]; if not ConstInt: return None
@@ -10185,7 +10196,7 @@ fn direct_libffi_call<Sym: WalkSym>(
         call_descr,
         recorded,
         pc,
-        None,
+        Some((next_pc, dst_bank, dst)),
         false,
     )?;
     let resid_raised = match resid_exec {
@@ -10339,6 +10350,8 @@ fn direct_call_release_gil<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
     pc: usize,
+    // The pc behind the residual-call op at `pc`.
+    next_pc: usize,
     caller: &'static str,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     // pyjitpl.py `vable_and_vrefs_before_residual_call` —
@@ -10428,7 +10441,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
         call_descr,
         recorded,
         pc,
-        None,
+        Some((next_pc, dst_bank, dst)),
         false,
     )?;
     // A decline leaves the call recorded symbolically WITHOUT running it, so
@@ -12879,7 +12892,7 @@ fn guarded_branch_core<Sym: WalkSym>(
         // When the mirror does NOT cover a kept slot,
         // `mirror_covers_kept` is `false` and the hazard checks below
         // still run — but with the flat maps deleted they decline only
-        // for an unrestorable-Ref arm (Hazard 1) or an INVALID mirror
+        // for an unrestorable-Ref arm (kept operands) or an INVALID mirror
         // (undermodeled walk); a VALID mirror with a NONE hole (an
         // edge-materialized merge temp) compiles, its slot sourced from
         // the decoded trampoline recovery (`resolved_recovered`).  That
