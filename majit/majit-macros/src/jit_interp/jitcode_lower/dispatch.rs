@@ -97,10 +97,11 @@ mod find_dispatch_loop_body_tests {
 ///
 /// This collector is the first slice (of three) closing that gap:
 ///   1. (here) identify the caller-locals the arm body references;
-///   2. wire the sub-Lowerer to pre-bind those names as portal-input
-///      bindings so `lower_value_expr` can resolve them;
-///   3. emit `inline_call_<types>_v(__sub_idx, args...)` with the
-///      caller's regs paired against the callee's portal-input slots.
+///   2. pre-bind those names plus packed array `{ptr, len}` / vable-ref
+///      as the callee's own declared arguments (`MIFrame.setup_call` /
+///      `bhimpl_inline_call_ir_v`);
+///   3. emit `inline_call_<types>_v(__sub_idx, args...)` with
+///      `(parent_reg, callee_packed_reg)` pairs.
 ///
 /// **Field/method recognition**: `state.selected` only contributes
 /// `state` (skipped because state isn't a parent binding); `expr.field`
@@ -1858,14 +1859,12 @@ fn lower_matchless_portal_body(
 ///   no-arg form when layout is empty).
 ///
 /// Arg pairs are `(parent_reg, callee_reg)` per `assembler.rs
-/// inline_call_<types>_v` API.  Mirrors `inline_call_tokens` at
-/// `:5098`'s family-by-bank pattern but always selects the void-result
-/// variant — dispatch arms never produce an inline_call return value
-/// (the arm body's return path is always the loop back-edge to
-/// `jit_merge_point` or the default exit, never a value).
+/// inline_call_<types>_v` API.  Same family-by-bank selection as
+/// `inline_call_tokens`, always the void-result variant: dispatch arms
+/// never produce an inline_call return value (the arm body's return
+/// path is the loop back-edge to `jit_merge_point` or the default exit).
 pub(super) fn dispatch_arm_inline_call_tokens(
     layout: &[CallerLocalLayout],
-    identity_int_pairs: &[(u16, u16)],
 ) -> proc_macro2::TokenStream {
     use quote::quote;
     let has_float = layout.iter().any(|l| matches!(l.kind, BindingKind::Float));
@@ -1880,14 +1879,14 @@ pub(super) fn dispatch_arm_inline_call_tokens(
             })
             .collect()
     };
-    let args_i_pairs = extend_int_args_with_array_identity(
-        layout
-            .iter()
-            .filter(|l| l.kind == BindingKind::Int)
-            .map(|l| (l.parent_reg, l.callee_reg))
-            .collect(),
-        identity_int_pairs,
-    );
+    // Dense per-bank packing, including packed array `{ptr, len}` and
+    // the vable ref (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`).
+    // `inline_call_grouped` requires `callee_dst == index`.
+    let args_i_pairs: Vec<(u16, u16)> = layout
+        .iter()
+        .filter(|l| l.kind == BindingKind::Int)
+        .map(|l| (l.parent_reg, l.callee_reg))
+        .collect();
     let has_int = !args_i_pairs.is_empty();
     let args_i = args_i_pairs.iter().map(|&(parent, callee)| {
         quote! { (#parent as u16, #callee as u16) }
@@ -1933,7 +1932,6 @@ pub(super) fn dispatch_arm_inline_call_tokens(
 pub(super) fn dispatch_arm_inline_call_tokens_i(
     layout: &[CallerLocalLayout],
     return_i_reg: u16,
-    identity_int_pairs: &[(u16, u16)],
 ) -> proc_macro2::TokenStream {
     use quote::quote;
     let has_float = layout.iter().any(|l| matches!(l.kind, BindingKind::Float));
@@ -1948,14 +1946,11 @@ pub(super) fn dispatch_arm_inline_call_tokens_i(
             })
             .collect()
     };
-    let args_i_pairs = extend_int_args_with_array_identity(
-        layout
-            .iter()
-            .filter(|l| l.kind == BindingKind::Int)
-            .map(|l| (l.parent_reg, l.callee_reg))
-            .collect(),
-        identity_int_pairs,
-    );
+    let args_i_pairs: Vec<(u16, u16)> = layout
+        .iter()
+        .filter(|l| l.kind == BindingKind::Int)
+        .map(|l| (l.parent_reg, l.callee_reg))
+        .collect();
     let has_int = !args_i_pairs.is_empty();
     let args_i = args_i_pairs.iter().map(|&(parent, callee)| {
         quote! { (#parent as u16, #callee as u16) }
@@ -2011,7 +2006,7 @@ mod dispatch_arm_inline_call_tokens_tests {
 
     #[test]
     fn empty_layout_emits_inline_call_r_v_no_args() {
-        let out = dispatch_arm_inline_call_tokens(&[], &[]);
+        let out = dispatch_arm_inline_call_tokens(&[]);
         let s = render(&out);
         assert!(s.contains("inline_call_r_v"), "got: {s}");
         // Both arg vec literal and the no-return None must appear.
@@ -2022,7 +2017,7 @@ mod dispatch_arm_inline_call_tokens_tests {
     #[test]
     fn ref_only_layout_uses_inline_call_r_v() {
         let layout = vec![entry("program", 3, 0, BindingKind::Ref)];
-        let s = render(&dispatch_arm_inline_call_tokens(&layout, &[]));
+        let s = render(&dispatch_arm_inline_call_tokens(&layout));
         assert!(s.contains("inline_call_r_v"), "got: {s}");
         assert!(s.contains("3u16") || s.contains("3 as u16"), "got: {s}");
         assert!(!s.contains("inline_call_ir_v"), "got: {s}");
@@ -2034,7 +2029,7 @@ mod dispatch_arm_inline_call_tokens_tests {
             entry("pc", 7, 0, BindingKind::Int),
             entry("program", 3, 0, BindingKind::Ref),
         ];
-        let s = render(&dispatch_arm_inline_call_tokens(&layout, &[]));
+        let s = render(&dispatch_arm_inline_call_tokens(&layout));
         assert!(s.contains("inline_call_ir_v"), "got: {s}");
         // Both parent regs land in their respective arg slices.
         assert!(s.contains("7"), "got: {s}");
@@ -2047,17 +2042,21 @@ mod dispatch_arm_inline_call_tokens_tests {
             entry("pc", 7, 0, BindingKind::Int),
             entry("flt", 9, 0, BindingKind::Float),
         ];
-        let s = render(&dispatch_arm_inline_call_tokens(&layout, &[]));
+        let s = render(&dispatch_arm_inline_call_tokens(&layout));
         assert!(s.contains("inline_call_irf_v"), "got: {s}");
     }
 
     #[test]
     fn plain_array_identity_pairs_are_declared_int_args() {
         // `MIFrame.setup_call` / `bhimpl_inline_call_ir_v`: a value the
-        // callee reads must be a declared argument. Empty caller-locals
-        // still pass ptr/len at the identity slot numbers. Holes below
-        // those slots are padded so the I-list stays positional.
-        let s = render(&dispatch_arm_inline_call_tokens(&[], &[(2, 2), (3, 3)]));
+        // callee reads must be a declared argument. Ptr/len pack densely
+        // after the callee's other int args (`inline_call_grouped`
+        // `callee_dst == index`).
+        let layout = vec![
+            entry("__plain_array_ptr_cells", 2, 0, BindingKind::Int),
+            entry("__plain_array_len_cells", 3, 1, BindingKind::Int),
+        ];
+        let s = render(&dispatch_arm_inline_call_tokens(&layout));
         assert!(s.contains("inline_call_ir_v"), "got: {s}");
         assert!(s.contains("2u16 as u16"), "got: {s}");
         assert!(s.contains("3u16 as u16"), "got: {s}");
@@ -2219,11 +2218,11 @@ fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
         fn visit_expr_break(&mut self, _: &'ast syn::ExprBreak) {
             self.hit = true;
         }
-        // Residual-call arms ARE eligible to split: their GuardNoException
-        // resume snapshot's identity-slot references resolve through the
-        // sized rd_virtuals (negative virtual numbering) and the reserved
-        // sub-JitCode identity prefix, so they no longer read uninitialized
-        // holes. Only control-flow / loop-header constructs below disqualify.
+        // Residual-call arms ARE eligible to split. Array `{ptr, len}` and
+        // the vable ref are packed declared arguments (`MIFrame.setup_call`
+        // / `bhimpl_inline_call_ir_v`); leftover identity-slot scalars fail
+        // expansion (`SubJitcodeBodyError::IdentitySlot`). Only control-flow
+        // / loop-header constructs below disqualify.
         fn visit_macro(&mut self, m: &'ast syn::Macro) {
             if let Some(id) = m.path.get_ident() {
                 let n = id.to_string();
@@ -3103,14 +3102,16 @@ pub(super) fn lower_dispatch_chain(
                     //
                     // Dispatch-arm caller-local plumbing: walk the arm
                     // body to collect parent-scope idents (via `collect_arm_caller_locals`),
-                    // pre-bind them on the sub-Lowerer at fresh per-bank callee regs
+                    // pre-bind them plus packed array `{ptr, len}` / vable-ref
+                    // on the sub-Lowerer at fresh per-bank callee regs
                     // (via `try_generate_jitcode_body_parts_with_caller_bindings`), and
                     // emit the typed `inline_call_<types>_v(__sub_idx, args_i, args_r,
-                    // args_f)` so the callee jitcode receives them as portal-input
-                    // bindings.  Mirrors `handle_regular_call` `inline_call_<types>(jitcode,
-                    // args...)`.  When the arm body has no parent-scope refs the layout
-                    // is empty and the emit reduces to the no-arg `inline_call_r_v`
-                    // (equivalent to the previous `__builder.inline_call(__sub_idx)`).
+                    // args_f)` so the callee receives them as its own declared
+                    // arguments (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`).
+                    // Mirrors `handle_regular_call` `inline_call_<types>(jitcode,
+                    // args...)`. When the arm body has no declared args the
+                    // layout is empty and the emit reduces to the no-arg
+                    // `inline_call_r_v`.
                     let mut arm_inline_call_reads: Vec<Register> = Vec::new();
                     let (arm_body_tokens, arm_inline_call_emit): (
                         proc_macro2::TokenStream,
@@ -3168,47 +3169,32 @@ pub(super) fn lower_dispatch_chain(
                                 }
                                 // `MIFrame.setup_call` / `bhimpl_inline_call_ir_v`
                                 // give the callee only the declared argument
-                                // boxes. A plain `[int]` ptr/len is appended
-                                // as `(slot, slot)` here, not through
-                                // `assign_caller_local_layout`.
-                                let identity_int_pairs =
-                                    plain_array_identity_int_pairs(Some(config));
+                                // boxes. Array `{ptr, len}` and the vable ref
+                                // are packed into `layout` as ordinary
+                                // arguments (`assign_caller_local_layout`).
                                 let inline_call_emit = match pc_return_reg {
-                                    Some(pc_reg) => dispatch_arm_inline_call_tokens_i(
-                                        &layout,
-                                        pc_reg,
-                                        &identity_int_pairs,
-                                    ),
-                                    None => dispatch_arm_inline_call_tokens(
-                                        &layout,
-                                        &identity_int_pairs,
-                                    ),
+                                    Some(pc_reg) => {
+                                        dispatch_arm_inline_call_tokens_i(&layout, pc_reg)
+                                    }
+                                    None => dispatch_arm_inline_call_tokens(&layout),
                                 };
-                                // Reserve the identity-slot prefix in the sub-JitCode
-                                // register file so int[int_identity_base..int_end) /
-                                // ref[ref_identity_base..ref_end) exist as real
-                                // registers — the arm body's state-field ops address
-                                // them and the resume path re-derives them at deopt.
-                                // Identity slots are the portal's argument
-                                // registers (`MIFrame.setup_call`) and must
-                                // exist in every arm whose `load/store_state_field*`
-                                // addresses them, including `switch_dispatch`.
-                                let (__split_int_end, __split_ref_end) =
-                                    config.split_identity_reg_ends();
+                                // Sub-JitCode register file is the packed
+                                // declared-arg prefix. Temps grow it via
+                                // `touch_reg`; the abort stub needs the same
+                                // shape so the paired BC_INLINE_CALL's arg
+                                // copies stay in bounds.
                                 let min_i_regs = layout
                                     .iter()
                                     .filter(|e| matches!(e.kind, BindingKind::Int))
                                     .map(|e| e.callee_reg + 1)
                                     .max()
-                                    .unwrap_or(0)
-                                    .max(__split_int_end);
+                                    .unwrap_or(0);
                                 let min_r_regs = layout
                                     .iter()
                                     .filter(|e| matches!(e.kind, BindingKind::Ref))
                                     .map(|e| e.callee_reg + 1)
                                     .max()
-                                    .unwrap_or(0)
-                                    .max(__split_ref_end);
+                                    .unwrap_or(0);
                                 let min_f_regs = layout
                                     .iter()
                                     .filter(|e| matches!(e.kind, BindingKind::Float))
@@ -3285,7 +3271,7 @@ pub(super) fn lower_dispatch_chain(
                                 );
                                 (
                                     syn::Error::new(span, msg).to_compile_error(),
-                                    dispatch_arm_inline_call_tokens(&[], &[]),
+                                    dispatch_arm_inline_call_tokens(&[]),
                                 )
                             }
                             Err(SubJitcodeBodyError::Degrade(reason)) => {
@@ -3300,7 +3286,7 @@ pub(super) fn lower_dispatch_chain(
                                             __sub_builder.finish()
                                         }
                                     },
-                                    dispatch_arm_inline_call_tokens(&[], &[]),
+                                    dispatch_arm_inline_call_tokens(&[]),
                                 )
                             }
                         }

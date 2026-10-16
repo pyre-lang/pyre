@@ -1655,7 +1655,7 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::InlineVoid => {
                     let shared_path = inline_shared_path(&call.func)?;
                     let prebuild_path = inline_prebuild_path(&call.func)?;
-                    let identity = plain_array_identity_int_pairs(self.config);
+                    let identity = self.packed_plain_array_int_args_for_callee(&arg_bindings);
                     let (inline_call, post_live) =
                         inline_call_tokens_void(&arg_bindings, &identity);
                     let __arg_regs = inline_call_read_regs(&arg_bindings, &identity);
@@ -1681,7 +1681,7 @@ impl<'c> Lowerer<'c> {
                             .map(|segment| segment.ident.to_string()),
                         _ => None,
                     }?;
-                    let identity = plain_array_identity_int_pairs(self.config);
+                    let identity = self.packed_plain_array_int_args_for_callee(&arg_bindings);
                     let (inline_call, post_live) =
                         inline_call_tokens_void(&arg_bindings, &identity);
                     let arg_regs = inline_call_read_regs(&arg_bindings, &identity);
@@ -1726,7 +1726,7 @@ impl<'c> Lowerer<'c> {
                             .map(|segment| segment.ident.to_string()),
                         _ => None,
                     }?;
-                    let identity = plain_array_identity_int_pairs(self.config);
+                    let identity = self.packed_plain_array_int_args_for_callee(&arg_bindings);
                     let (inline_call, post_live) =
                         inline_call_tokens(&arg_bindings, throwaway_reg, &identity);
                     let arg_regs = inline_call_read_regs(&arg_bindings, &identity);
@@ -1756,7 +1756,7 @@ impl<'c> Lowerer<'c> {
                     let shared_path = inline_shared_path(&call.func)?;
                     let sub_return_kind = jit_arg_kind_tokens(result_kind);
                     let prebuild_path = inline_prebuild_path(&call.func)?;
-                    let identity = plain_array_identity_int_pairs(self.config);
+                    let identity = self.packed_plain_array_int_args_for_callee(&arg_bindings);
                     let (inline_call, post_live) =
                         inline_call_tokens(&arg_bindings, throwaway_reg, &identity);
                     let __arg_regs = inline_call_read_regs(&arg_bindings, &identity);

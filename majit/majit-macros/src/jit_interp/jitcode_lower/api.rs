@@ -77,9 +77,10 @@ pub fn try_generate_jitcode_body_with_config(
 ///
 /// The dispatch arm parent emit needs three things to construct the
 /// `inline_call_<types>_v(__sub_idx, args_i, args_r, args_f)` call:
-/// - the parent's reg (read from caller's `Binding`),
-/// - the callee's portal-input reg (assigned per-bank by the sub-Lowerer
-///   pre-bind pass),
+/// - the parent's reg (read from caller's `Binding`, or a portal identity
+///   slot for a packed plain-array `{ptr, len}` / vable ref),
+/// - the callee's packed argument register (assigned per-bank by the
+///   sub-Lowerer pre-bind pass),
 /// - the bank (Int / Ref / Float) so the (parent, callee) pair lands in
 ///   the matching `args_<kind>` vector.
 #[allow(private_interfaces)]
@@ -101,19 +102,20 @@ pub(crate) struct CallerLocalLayout {
 /// [`collect_arm_caller_locals`] and threads the same list through
 /// `inline_call_<types>_v` as `(parent_reg, callee_reg)` pairs.
 ///
-/// Layout convention (mirrors the existing portal-input pre-bind in
-/// `lower_dispatch_body` at `:7440-7457`):
+/// Layout convention (mirrors the portal-input pre-bind in
+/// `lower_dispatch_body`):
 /// - per-bank packed regs starting at 0 (first Int → int_reg 0, second
 ///   Int → int_reg 1, …; same for Ref and Float independently);
 /// - flat `next_reg` counter advanced past the highest per-bank slot
 ///   so subsequent `alloc_reg()` calls inside the body lowering do not
 ///   collide with the pre-bound caller-locals.
 ///
-/// `pyopcode.py` and `jtransform.py:480` parity: PyPy's dispatch
+/// `pyopcode.py` / `jtransform.py` `handle_regular_call`: PyPy's dispatch
 /// inline_call passes `(opcode, oparg, ...)` as call args; the callee
-/// jitcode receives them via portal-input binding slots indexed
-/// per-bank.  Pyre's sub-frame uses the same `int_regs[]` / `ref_regs[]`
-/// arrays per kind, so per-bank packing is the orthodox layout.
+/// jitcode receives them via its own argument registers
+/// (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`). Pyre's sub-frame
+/// uses the same `int_regs[]` / `ref_regs[]` arrays per kind, so per-bank
+/// packing is the orthodox layout.
 /// Layout-side helper extracted from
 /// [`try_generate_jitcode_body_parts_with_caller_bindings`] so the
 /// per-bank packing rule is testable without needing a body that
@@ -157,63 +159,98 @@ pub(crate) fn assign_caller_local_layout(
     (layout, max_pre_bound)
 }
 
-/// Floor for a sub-JitCode body's flat `next_reg`: the max of the int
-/// and ref identity-slot ends, so body-side `alloc_reg()` never reuses a
-/// reserved identity slot. The identity range is the portal's argument
-/// registers (`MIFrame.setup_call`) and must be reserved in every jitcode
-/// whose `load_state_field*` / `store_state_field*` addresses those
-/// slots, including `switch_dispatch` arm sub-JitCodes. Inert (0) when
-/// the kernel has no identity slots.
-fn split_identity_floor(config: Option<&LowererConfig>) -> u16 {
-    config
-        .map(|c| {
-            let (int_end, ref_end) = c.split_identity_reg_ends();
-            int_end.max(ref_end)
-        })
+fn layout_bank_end(layout: &[CallerLocalLayout], kind: BindingKind) -> u16 {
+    layout
+        .iter()
+        .filter(|entry| entry.kind == kind)
+        .map(|entry| entry.callee_reg.saturating_add(1))
+        .max()
         .unwrap_or(0)
 }
 
-/// Floor for a sub-JitCode body's flat `next_reg` past the float identity
-/// slots `[float_identity_base, float_identity_end)`. Floats have no
-/// caller-local to raise the pre-bound floor, so a temp would otherwise
-/// alias a sibling float scalar's identity slot (`{ a: float, b: float }`:
-/// a read of `a` lands on `b`).
-fn float_identity_floor(config: Option<&LowererConfig>) -> u16 {
-    config.map(|c| c.float_identity_end()).unwrap_or(0)
-}
-
-/// Compile-time guard for `split_dispatch`: no caller-local may be pre-bound
-/// into its bank's reserved identity range `[identity_base, identity_end)`.
-/// Those registers hold the virtualizable identity (array base/len, state
-/// scalars) that the arm body's `load/store_state_field` ops address and the
-/// resume path re-derives at deopt; a caller-local packed onto one would share
-/// the physical register and be read as the identity slot (or vice-versa) — a
-/// silent miscompile that the `frame.rs` trim's `is_none()` gate cannot catch,
-/// since the arg writes the slot `Some`. Caller-locals pack densely from reg 0,
-/// so the first int local lands at reg 0 (below `int_identity_base` = 1) and is
-/// safe; this only fires if an arm captures a SECOND identity-range local.
-/// Inert unless `split_dispatch` is on.
-fn assert_no_split_identity_alias(layout: &[CallerLocalLayout], config: Option<&LowererConfig>) {
-    let Some(config) = config.filter(|c| c.split_dispatch) else {
+/// Append plain-array `{ptr, len}` words and the state virtualizable ref as
+/// ordinary declared arguments, packed in the same per-bank numbering
+/// [`assign_caller_local_layout`] uses.
+///
+/// Parent registers stay the portal identity slots (`int_identity_base` /
+/// `vable_input_ref_reg`); callee registers continue densely after the
+/// caller-locals. `MIFrame.setup_call` / `bhimpl_inline_call_ir_v` copy
+/// only those declared boxes into the callee's own argument registers.
+fn extend_layout_with_callee_declared_args(
+    layout: &mut Vec<CallerLocalLayout>,
+    config: Option<&LowererConfig>,
+) {
+    let Some(config) = config else {
         return;
     };
-    let (int_end, ref_end) = config.split_identity_reg_ends();
-    for entry in layout {
-        let (base, end, bank) = match entry.kind {
-            BindingKind::Int => (config.int_identity_base(), int_end, "int"),
-            BindingKind::Ref => (config.ref_identity_base(), ref_end, "ref"),
-            BindingKind::Float => continue,
-        };
-        assert!(
-            !(base <= entry.callee_reg && entry.callee_reg < end),
-            "split_dispatch: caller-local `{}` binds {bank}-reg {} inside the \
-             reserved identity range [{base}, {end}). A split arm may capture at \
-             most {base} {bank} caller-local(s); offset the arg packing past the \
-             identity range or reduce the arm's captured locals.",
-            entry.name,
-            entry.callee_reg,
+    let next_int = layout_bank_end(layout, BindingKind::Int);
+    let array_pairs = plain_array_identity_int_pairs(Some(config), next_int);
+    let mut pair_idx = 0usize;
+    for name in config.state_array_names_in_order() {
+        let (ptr_parent, ptr_callee) = array_pairs[pair_idx];
+        pair_idx += 1;
+        let (len_parent, len_callee) = array_pairs[pair_idx];
+        pair_idx += 1;
+        layout.push(CallerLocalLayout {
+            name: plain_array_ptr_binding_name(name),
+            parent_reg: ptr_parent,
+            callee_reg: ptr_callee,
+            kind: BindingKind::Int,
+        });
+        layout.push(CallerLocalLayout {
+            name: plain_array_len_binding_name(name),
+            parent_reg: len_parent,
+            callee_reg: len_callee,
+            kind: BindingKind::Int,
+        });
+    }
+    let (Some(vable_var), Some(parent_reg)) =
+        (config.vable_var.as_ref(), config.vable_input_ref_reg)
+    else {
+        return;
+    };
+    if layout.iter().any(|entry| entry.name == *vable_var) {
+        return;
+    }
+    layout.push(CallerLocalLayout {
+        name: vable_var.clone(),
+        parent_reg,
+        callee_reg: layout_bank_end(layout, BindingKind::Ref),
+        kind: BindingKind::Ref,
+    });
+}
+
+/// Pre-bind caller-locals plus packed array `{ptr, len}` / vable-ref
+/// arguments on a sub-JitCode lowerer.
+///
+/// `next_reg` is the packed declared-arg floor, not the portal identity
+/// range: temps must not alias the callee's own argument registers, and
+/// they must not be forced up to `int_identity_base()`.
+fn bind_callee_declared_args(
+    lowerer: &mut Lowerer<'_>,
+    caller_locals: &[(String, Binding)],
+    config: Option<&LowererConfig>,
+) -> Vec<CallerLocalLayout> {
+    let (mut layout, _) = assign_caller_local_layout(caller_locals);
+    extend_layout_with_callee_declared_args(&mut layout, config);
+    for entry in &layout {
+        lowerer.bindings.insert(
+            entry.name.clone(),
+            Binding {
+                reg: entry.callee_reg,
+                kind: entry.kind,
+                depends_on_stack: false,
+                struct_type: None,
+            },
         );
     }
+    let max_pre_bound = layout
+        .iter()
+        .map(|entry| entry.callee_reg.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    lowerer.next_reg = max_pre_bound;
+    layout
 }
 
 #[allow(private_interfaces)]
@@ -240,28 +277,11 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     // a driver index.
     lowerer.in_dispatch_arm_body = true;
 
-    let (layout, max_pre_bound) = assign_caller_local_layout(caller_locals);
-    assert_no_split_identity_alias(&layout, config);
-    for entry in &layout {
-        lowerer.bindings.insert(
-            entry.name.clone(),
-            Binding {
-                reg: entry.callee_reg,
-                kind: entry.kind,
-                depends_on_stack: false,
-                struct_type: None,
-            },
-        );
-    }
-    // Advance the flat `next_reg` past the worst-case per-bank max so
-    // body-side `alloc_reg()` cannot reuse any pre-bound slot in any
-    // bank.  Mirrors the `next_reg.max(1)` advance after the
-    // pc=Int(0)+program=Ref(0) pre-bind in `lower_dispatch_body`.
-    lowerer.next_reg = lowerer
-        .next_reg
-        .max(max_pre_bound)
-        .max(split_identity_floor(config))
-        .max(float_identity_floor(config));
+    // Packed declared args in the callee's own numbering
+    // (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`). Temps start
+    // after those registers; they are not reserved up to the portal
+    // identity range.
+    let layout = bind_callee_declared_args(&mut lowerer, caller_locals, config);
 
     for (i, stmt) in stmts.iter().enumerate() {
         if lowerer.lower_stmt(stmt).is_none() {
@@ -342,24 +362,7 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
     let mut lowerer = Lowerer::new(config);
     lowerer.in_dispatch_arm_body = true;
 
-    let (layout, max_pre_bound) = assign_caller_local_layout(caller_locals);
-    assert_no_split_identity_alias(&layout, config);
-    for entry in &layout {
-        lowerer.bindings.insert(
-            entry.name.clone(),
-            Binding {
-                reg: entry.callee_reg,
-                kind: entry.kind,
-                depends_on_stack: false,
-                struct_type: None,
-            },
-        );
-    }
-    lowerer.next_reg = lowerer
-        .next_reg
-        .max(max_pre_bound)
-        .max(split_identity_floor(config))
-        .max(float_identity_floor(config));
+    let layout = bind_callee_declared_args(&mut lowerer, caller_locals, config);
 
     for (i, stmt) in work.iter().enumerate() {
         if lowerer.lower_stmt(stmt).is_none() {

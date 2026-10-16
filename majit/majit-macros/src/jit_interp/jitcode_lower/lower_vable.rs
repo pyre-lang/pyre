@@ -1030,7 +1030,7 @@ impl<'c> Lowerer<'c> {
         if config.state_virt_arrays.contains_key(&member_name) {
             return None;
         }
-        let &(array_index, item_kind) = config.state_arrays.get(&member_name)?;
+        let &(_, item_kind) = config.state_arrays.get(&member_name)?;
         let opcode = match item_kind {
             ValueKind::Float => opcode_for_assign_binop_f(&binary.op)?,
             ValueKind::Int => opcode_for_assign_binop(&binary.op)?,
@@ -1048,13 +1048,11 @@ impl<'c> Lowerer<'c> {
             ValueKind::Ref => unreachable!(),
             _ => {}
         }
-        // Identity reds are the `{ptr, len}` pair; the get/set are the
-        // `dum_nocheck` item ops off the pointer (`rlist.py`
-        // `rtype_getitem` / `rtype_setitem`).
-        let base_reg = config
-            .int_identity_base()
-            .saturating_add(config.plain_int_scalar_count())
-            .saturating_add((array_index as u16).saturating_mul(2));
+        // The `{ptr, len}` words are declared int arguments of this
+        // JitCode (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`). The
+        // get/set are the `dum_nocheck` item ops off the pointer
+        // (`rlist.py` `rtype_getitem` / `rtype_setitem`).
+        let base_reg = self.plain_array_ptr_reg(&member_name)?;
         let lhs_reg = self.alloc_reg();
 
         match item_kind {
@@ -1182,7 +1180,7 @@ impl<'c> Lowerer<'c> {
         if config.state_virt_arrays.contains_key(&member_name) {
             return None;
         }
-        let &(array_index, item_kind) = config.state_arrays.get(&member_name)?;
+        let &(_, item_kind) = config.state_arrays.get(&member_name)?;
         // Assignment evaluates the RHS first, then the place (index).
         let value = self.lower_value_expr(&assign.right)?;
         let value_kind = match item_kind {
@@ -1199,12 +1197,10 @@ impl<'c> Lowerer<'c> {
         }
         let idx_reg = idx_binding.reg;
         let value_reg = value.reg;
-        // Identity reds are the `{ptr, len}` pair; this op is the
-        // `dum_nocheck` item store off the pointer.
-        let base_reg = config
-            .int_identity_base()
-            .saturating_add(config.plain_int_scalar_count())
-            .saturating_add((array_index as u16).saturating_mul(2));
+        // The `{ptr, len}` words are declared int arguments of this
+        // JitCode (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`); this
+        // op is the `dum_nocheck` item store off the pointer.
+        let base_reg = self.plain_array_ptr_reg(&member_name)?;
 
         let (value_register, descr, set_raw) = match item_kind {
             ValueKind::Float => (
@@ -3142,16 +3138,14 @@ impl<'c> Lowerer<'c> {
         if config.state_virt_arrays.contains_key(&member_name) {
             return None;
         }
-        let &(array_index, item_kind) = config.state_arrays.get(&member_name)?;
+        let &(_, item_kind) = config.state_arrays.get(&member_name)?;
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
         let idx_reg = idx_binding.reg;
         let reg = self.alloc_reg();
-        // Identity reds are the `{ptr, len}` pair; this op is the
-        // `dum_nocheck` item read off the pointer.
-        let base_reg = config
-            .int_identity_base()
-            .saturating_add(config.plain_int_scalar_count())
-            .saturating_add((array_index as u16).saturating_mul(2));
+        // The `{ptr, len}` words are declared int arguments of this
+        // JitCode (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`); this
+        // op is the `dum_nocheck` item read off the pointer.
+        let base_reg = self.plain_array_ptr_reg(&member_name)?;
 
         let (dst, descr, get_raw, binding_kind) = match item_kind {
             ValueKind::Float => (

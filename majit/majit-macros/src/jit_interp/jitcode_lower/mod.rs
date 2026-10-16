@@ -41,17 +41,17 @@ mod reexports {
         binop_i_accepts_constant, binop_i_const_emit_tokens, binop_i_emit_tokens,
         binop_is_symmetric, block_has_loop_control, call_is_null_ptr,
         expr_has_infer_or_pipeline_call, expr_has_loop_control, expr_is_literal_call,
-        expr_is_null_ptr, expr_is_ptr_is_null_method, expr_is_unsigned_int,
-        extend_int_args_with_array_identity, extract_block_tail_int, extract_bool_branch_values,
-        extract_branch_int, extract_pat_switch_case_tokens, extract_pat_value_tokens,
-        extract_stmts, inline_call_read_regs, inline_call_tokens, inline_call_tokens_void,
-        inline_float_arg_tokens, inline_prebuild_path, inline_ref_arg_tokens, inline_shared_path,
-        int_arg_regs, int_literal_value, is_lowercase_binding_pat, is_supported_float_type,
-        is_supported_int_cast, is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens,
-        mirrored_compare_binop, opcode_for_assign_binop, opcode_for_assign_binop_f,
-        opcode_for_binop, opcode_for_binop_f, opcode_for_compare_f, plain_array_identity_int_pairs,
-        quote_inline_arg_pairs, resolve_call_policy_for_probe, stmt_has_loop_control,
-        type_is_raw_pointer, type_is_unsigned_int, typed_call_arg_tokens,
+        expr_is_null_ptr, expr_is_ptr_is_null_method, expr_is_unsigned_int, extract_block_tail_int,
+        extract_bool_branch_values, extract_branch_int, extract_pat_switch_case_tokens,
+        extract_pat_value_tokens, extract_stmts, inline_call_read_regs, inline_call_tokens,
+        inline_call_tokens_void, inline_float_arg_tokens, inline_prebuild_path,
+        inline_ref_arg_tokens, inline_shared_path, int_arg_regs, int_literal_value,
+        is_lowercase_binding_pat, is_supported_float_type, is_supported_int_cast,
+        is_supported_ref_type, is_word_width_int, jit_arg_kind_tokens, mirrored_compare_binop,
+        opcode_for_assign_binop, opcode_for_assign_binop_f, opcode_for_binop, opcode_for_binop_f,
+        opcode_for_compare_f, plain_array_identity_int_pairs, plain_array_len_binding_name,
+        plain_array_ptr_binding_name, quote_inline_arg_pairs, resolve_call_policy_for_probe,
+        stmt_has_loop_control, type_is_raw_pointer, type_is_unsigned_int, typed_call_arg_tokens,
         word_result_addr_for_kind, word_result_addr_tokens, word_void_addr_tokens,
     };
     pub(super) use super::liveness::{
@@ -426,20 +426,40 @@ impl LowererConfig {
         (self.state_arrays.len() as u16).saturating_mul(2)
     }
 
+    /// Portal identity register of a plain `[int]`/`[float]` items pointer.
+    /// Sub-JitCode callees read the same word from a packed declared-arg
+    /// binding (`plain_array_ptr_binding_name`); only the dispatch JitCode
+    /// (`lower_dispatch_body`) addresses this slot.
+    pub(super) fn plain_array_ptr_identity_reg(&self, array_name: &str) -> Option<u16> {
+        let &(array_index, _) = self.state_arrays.get(array_name)?;
+        Some(
+            self.int_identity_base()
+                .saturating_add(self.plain_int_scalar_count())
+                .saturating_add((array_index as u16).saturating_mul(2)),
+        )
+    }
+
+    /// Portal identity register of a plain `[int]`/`[float]` length word.
+    pub(super) fn plain_array_len_identity_reg(&self, array_name: &str) -> Option<u16> {
+        Some(
+            self.plain_array_ptr_identity_reg(array_name)?
+                .saturating_add(1),
+        )
+    }
+
     /// Exclusive end of the int-bank and ref-bank identity-slot ranges
     /// `[int_identity_base, int_end)` / `[ref_identity_base, ref_end)`.
     ///
-    /// Mirrors the dispatch JitCode's identity reservation: int identity =
-    /// the scalar slots plus the ONE virtualizable identity word (present
-    /// whenever the state declares any `[.. ; virt]` array — the
-    /// virtualizable is one red, `warmspot.py:538`, and array lengths are
-    /// read off the live object, `virtualizable.py:150-153`);
-    /// ref identity = the ref scalars. An arm sub-JitCode must reserve the
-    /// SAME prefix so its register file spans the identity slots that the
-    /// arm body's `load/store_state_field` ops address (`MIFrame.setup_call`
-    /// plants them on the portal; the arm addresses the same range).
-    /// Returns `0` for a bank with no identity slots so the caller's `.max()`
-    /// floor is inert there.
+    /// The dispatch JitCode (`lower_dispatch_body`) reserves this prefix:
+    /// int identity = the scalar slots plus ptr then len per plain `[int]`
+    /// (`jtransform.py` `rewrite_op_getarrayitem` raw arm); ref identity =
+    /// the ref scalars. `warmspot.py` `make_virtualizable_infos` has one
+    /// virtualizable red; array lengths of `[.. ; virt]` fields are read
+    /// off the live object (`virtualizable.py` `VirtualizableInfo`).
+    /// Sub-JitCode callees receive those words as packed declared arguments
+    /// (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`) and do not reserve
+    /// this range. Returns `0` for a bank with no identity slots so the
+    /// portal's `.max()` floor is inert there.
     pub(super) fn split_identity_reg_ends(&self) -> (u16, u16) {
         // Scalars redirected onto the virtualizable (`vable_fields`) are
         // not independent identity slots. Counting them here would
@@ -2902,6 +2922,93 @@ mod tests {
         assert!(
             !body.contains("store_state_field"),
             "state-as-vable must not emit identity-slot stores: {body}"
+        );
+    }
+
+    /// Three int caller-locals plus a plain `[int]` read: ptr/len pack
+    /// densely after the locals (`MIFrame.setup_call` /
+    /// `bhimpl_inline_call_ir_v`). The old identity-range floor
+    /// (`assert_no_split_identity_alias`) treated callee 1 as an alias of
+    /// `[int_identity_base, identity_end)`.
+    #[test]
+    fn split_arm_packs_plain_array_after_many_int_locals() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(cells),
+                kind: crate::jit_interp::StateFieldKind::Array(syn::parse_quote!(int)),
+            }],
+        };
+        let config = empty_lowerer_config(Some(&state_fields), true, false);
+        let identity_end = config.split_identity_reg_ends().0;
+        let ptr_identity = config
+            .plain_array_ptr_identity_reg("cells")
+            .expect("cells ptr identity");
+        let len_identity = config
+            .plain_array_len_identity_reg("cells")
+            .expect("cells len identity");
+        assert_eq!(config.int_identity_base(), 1);
+        assert_eq!(identity_end, 3);
+        assert!(
+            identity_end > 1,
+            "the old floor [int_identity_base, identity_end) overlaps packed locals"
+        );
+        let caller_locals = vec![
+            ("a".to_string(), binding(10, BindingKind::Int)),
+            ("b".to_string(), binding(11, BindingKind::Int)),
+            ("c".to_string(), binding(12, BindingKind::Int)),
+        ];
+        let body: Expr = syn::parse_quote!({
+            let _sum = a + b + c;
+            let _x = state.cells[0];
+        });
+        let (generated, layout) = try_generate_jitcode_body_parts_with_caller_bindings(
+            &body,
+            Some(&config),
+            &caller_locals,
+        )
+        .expect("split arm with locals + cells must lower");
+        let ints: Vec<&CallerLocalLayout> = layout
+            .iter()
+            .filter(|entry| matches!(entry.kind, BindingKind::Int))
+            .collect();
+        assert_eq!(ints.len(), 5, "three locals plus ptr then len: {layout:?}");
+        assert_eq!(ints[0].name, "a");
+        assert_eq!(ints[0].parent_reg, 10);
+        assert_eq!(ints[1].name, "b");
+        assert_eq!(ints[1].parent_reg, 11);
+        assert_eq!(ints[2].name, "c");
+        assert_eq!(ints[2].parent_reg, 12);
+        assert_eq!(ints[3].name, plain_array_ptr_binding_name("cells"));
+        assert_eq!(ints[3].parent_reg, ptr_identity);
+        assert_eq!(ints[4].name, plain_array_len_binding_name("cells"));
+        assert_eq!(ints[4].parent_reg, len_identity);
+        for (index, entry) in ints.iter().enumerate() {
+            assert_eq!(
+                entry.callee_reg as usize, index,
+                "inline_call_grouped callee_dst == index; no hole padding"
+            );
+        }
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("getarrayitem_raw_i"),
+            "cells read must emit getarrayitem_raw_i: {body}"
+        );
+        assert!(
+            body.contains("3u16"),
+            "ptr must be the packed callee register after a,b,c: {body}"
+        );
+        let call = dispatch_arm_inline_call_tokens(&layout).to_string();
+        assert!(
+            call.contains("inline_call_ir_v"),
+            "int declared args require an I-list: {call}"
+        );
+        assert!(
+            call.contains("1u16 as u16") && call.contains("3u16 as u16"),
+            "portal ptr identity maps onto packed callee 3: {call}"
+        );
+        assert!(
+            call.contains("2u16 as u16") && call.contains("4u16 as u16"),
+            "portal len identity maps onto packed callee 4: {call}"
         );
     }
 

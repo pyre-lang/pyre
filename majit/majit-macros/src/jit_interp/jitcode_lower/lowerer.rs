@@ -284,6 +284,10 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// Portal binding: `vable_input_ref_reg` is the dispatch JitCode's
+    /// virtualizable argument (`with_vable_input_ref_reg`). A sub-JitCode
+    /// overwrites this with a packed declared-arg register
+    /// (`bind_callee_declared_args` / `MIFrame.setup_call`).
     pub(super) fn install_vable_input_binding(&mut self) {
         let Some(config) = self.config else {
             return;
@@ -313,6 +317,57 @@ impl<'c> Lowerer<'c> {
             BindingKind::Ref => Some(binding.reg),
             _ => None,
         }
+    }
+
+    /// Items-pointer register of a plain `[int]`/`[float]` for the current
+    /// JitCode. A sub-JitCode pre-binds the packed declared argument
+    /// (`plain_array_ptr_binding_name`); the portal (`lower_dispatch_body`)
+    /// keeps the identity slot (`plain_array_ptr_identity_reg`).
+    pub(super) fn plain_array_ptr_reg(&self, array_name: &str) -> Option<u16> {
+        if let Some(binding) = self.bindings.get(&plain_array_ptr_binding_name(array_name)) {
+            return Some(binding.reg);
+        }
+        self.config?.plain_array_ptr_identity_reg(array_name)
+    }
+
+    /// Length-word register of a plain `[int]`/`[float]` for the current
+    /// JitCode. Same packed-vs-identity split as [`Self::plain_array_ptr_reg`].
+    pub(super) fn plain_array_len_reg(&self, array_name: &str) -> Option<u16> {
+        if let Some(binding) = self.bindings.get(&plain_array_len_binding_name(array_name)) {
+            return Some(binding.reg);
+        }
+        self.config?.plain_array_len_identity_reg(array_name)
+    }
+
+    /// `(parent_reg, callee_packed)` pairs for every plain array, packed
+    /// densely after `callee_int_args`. Parent registers are this frame's
+    /// ptr/len words so a nested `inline_call` copies from the live callee
+    /// numbering (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`).
+    pub(super) fn packed_plain_array_int_args_for_callee(
+        &self,
+        callee_int_args: &[Binding],
+    ) -> Vec<(u16, u16)> {
+        let Some(config) = self.config else {
+            return Vec::new();
+        };
+        let mut callee = callee_int_args
+            .iter()
+            .filter(|binding| matches!(binding.kind, BindingKind::Int))
+            .count() as u16;
+        let mut pairs = Vec::new();
+        for name in config.state_array_names_in_order() {
+            let Some(ptr) = self.plain_array_ptr_reg(name) else {
+                continue;
+            };
+            let Some(len) = self.plain_array_len_reg(name) else {
+                continue;
+            };
+            pairs.push((ptr, callee));
+            callee = callee.saturating_add(1);
+            pairs.push((len, callee));
+            callee = callee.saturating_add(1);
+        }
+        pairs
     }
 
     pub(super) fn alloc_reg(&mut self) -> u16 {
@@ -402,15 +457,16 @@ impl<'c> Lowerer<'c> {
     }
 
     /// `-live-` after `inline_call_*` (`jtransform.py handle_regular_call`).
-    /// Force-alives the portal identity prefix so
-    /// `get_list_of_active_boxes(in_a_call=True)` captures those reds on
-    /// the caller frame.
+    /// On the caller frame, force-alives the portal identity prefix
+    /// (`identity_slot_registers`) so `get_list_of_active_boxes(in_a_call=True)`
+    /// keeps those reds. A sub-JitCode receives array `{ptr, len}` / vable as
+    /// packed declared arguments (`MIFrame.setup_call`); its `-live-` must
+    /// not list the portal identity numbers.
     pub(super) fn emit_post_inline_live_marker(&mut self, tokens: TokenStream) {
-        // Arm sub-JitCodes address portal identity through `frames[0]`;
-        // those slots are not this frame's registers, so they must not
-        // appear in this jitcode's `-live-` (`get_list_of_active_boxes`
-        // would read uninitialized arm-frame slots). The parent dispatch
-        // INLINE_CALL's trailing `-live-` keeps them on the portal frame.
+        // The parent dispatch INLINE_CALL's trailing `-live-` keeps portal
+        // identity reds on the portal frame. Listing those numbers on the
+        // arm would make `get_list_of_active_boxes` read uninitialized
+        // arm-frame slots.
         let reads = if self.in_dispatch_arm_body {
             Vec::new()
         } else {
