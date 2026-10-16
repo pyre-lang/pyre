@@ -117,11 +117,19 @@ fn module_value(name: &str) -> Module {
     }
 }
 
-/// Bootstrap/import allocation. Native owners of these modules still keep
-/// stable raw pointers, so retain the legacy immortal allocation until those
-/// owners are migrated to ordinary GC roots.
+/// Bootstrap/import allocation. `init_gc_object_immortal`
+/// (`GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`). The construction
+/// write barrier enrolls the module in `prebuilt_root_objects`
+/// (`incminimark.py` `remember_young_pointer`), and the collector traces
+/// it through `W_MODULE_GC_TYPE_ID` / `W_MODULE_GC_PTR_OFFSETS`.
 pub fn w_module_new(name: &str) -> PyObjectRef {
-    crate::lltype::malloc_typed(module_value(name)) as PyObjectRef
+    let obj = crate::lltype::malloc_typed_immortal(module_value(name)) as PyObjectRef;
+    // Construction wrote the pointer fields with no per-store barrier.
+    // One barrier behind the bulk write enrolls the immortal module in
+    // `prebuilt_root_objects` (`incminimark.py` `remember_young_pointer`),
+    // matching `w_type_init_builtin`.
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
+    obj
 }
 
 /// Python-visible module allocation (`types.ModuleType.__new__`).
@@ -211,14 +219,20 @@ pub fn w_module_user_new(w_class: PyObjectRef) -> PyObjectRef {
 /// Module(space, None, w_builtin)` where `w_name=None`).
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
-/// the body performs a `lltype::malloc_typed` allocation (`Module`) that
-/// `fuse_boxing_alloc` leaves unfused, so the JIT residualises the whole call
-/// to a stable runtime fnaddr instead of tracing the allocation. The `-> PyObjectRef` result is a plain GCREF with no
-/// discriminant to erase.
+/// the body performs a `lltype::malloc_typed_immortal` allocation (`Module`)
+/// that `fuse_boxing_alloc` leaves unfused, so the JIT residualises the whole
+/// call to a stable runtime fnaddr instead of tracing the allocation. The
+/// `-> PyObjectRef` result is a plain GCREF with no discriminant to erase.
 #[majit_macros::dont_look_inside]
 pub fn w_module_new_aliasing_dict(name: &str, w_dict_object: PyObjectRef) -> PyObjectRef {
-    let value = module_aliasing_dict_value(name, w_dict_object);
-    crate::lltype::malloc_typed(value) as PyObjectRef
+    let obj = crate::lltype::malloc_typed_immortal(module_aliasing_dict_value(name, w_dict_object))
+        as PyObjectRef;
+    // Construction wrote the pointer fields with no per-store barrier.
+    // One barrier behind the bulk write enrolls the immortal module in
+    // `prebuilt_root_objects` (`incminimark.py` `remember_young_pointer`),
+    // matching `w_type_init_builtin`.
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
+    obj
 }
 
 /// GC-managed counterpart of [`w_module_new_aliasing_dict`].
@@ -271,15 +285,16 @@ pub unsafe fn w_module_get_name(obj: PyObjectRef) -> PyObjectRef {
 
 /// Replace the wrapped module name (`module.py:22 self.w_name = w_name`). Used
 /// by `module.__init__(name, doc)` after `module.__new__` allocates an
-/// anonymous module. The holder may already be old, so publish the new edge
-/// through the ordinary minimark write barrier.
+/// anonymous module. Barrier first, as the emitted `COND_CALL_GC_WB`
+/// precedes its `SETFIELD_GC`; an immortal holder is enrolled in
+/// `prebuilt_root_objects` (`incminimark.py` `remember_young_pointer`).
 ///
 /// # Safety
 /// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
+    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     let module = &mut *(obj as *mut Module);
     module.w_name = w_name;
-    crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
 
 /// `MixedModule.w_initialdict`.
@@ -291,16 +306,15 @@ pub unsafe fn w_module_get_initialdict(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// `mixedmodule.py save_module_content_for_future_reload` stores the copy.
-/// A managed holder records the edge through the minimark write barrier; an
-/// immortal one is extra-rooted every minor by
-/// `walk_process_import_object_roots` (`Module.w_initialdict`).
+/// Barrier first, as the emitted `COND_CALL_GC_WB` precedes its
+/// `SETFIELD_GC`; an immortal holder is enrolled in `prebuilt_root_objects`
+/// (`incminimark.py` `remember_young_pointer`).
 ///
 /// # Safety
 /// `obj` must point to a valid `Module`.
 pub unsafe fn w_module_set_initialdict(obj: PyObjectRef, w_initialdict: PyObjectRef) {
-    (*(obj as *mut Module)).w_initialdict = w_initialdict;
     crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
-    crate::gc_roots::mark_prebuilt_roots_dirty();
+    (*(obj as *mut Module)).w_initialdict = w_initialdict;
 }
 
 /// `Module.startup_called`.
@@ -380,6 +394,9 @@ mod tests {
             assert!(!is_int(obj));
             let w_name = w_module_get_name(obj);
             assert_eq!(crate::w_str_get_wtf8(w_name), "test_mod");
+            let header = majit_gc::header::header_of(obj as usize);
+            assert!((*header).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
         }
     }
 }

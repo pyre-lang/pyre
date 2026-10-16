@@ -1154,11 +1154,11 @@ pub unsafe fn walk_pyframe_roots_area(
     // recorded a store into it since the previous minor collection
     // (`old_objects_pointing_to_young`); a major collection always traces
     // `prebuilt_root_objects`.  The Box-immortal structures walked below
-    // (module dicts / cells, method caches, function fields) are pyre's
-    // prebuilt family; their mutation helpers set
-    // `mark_prebuilt_roots_dirty`, so a clean bit during a minor
-    // collection means no young pointer can be inside and the walks are
-    // skipped.  Live-frame slots are real stack roots and are always walked.
+    // (method caches, function fields) are pyre's prebuilt family; their
+    // mutation helpers set `mark_prebuilt_roots_dirty`, so a clean bit
+    // during a minor collection means no young pointer can be inside and
+    // the walks are skipped.  Live-frame slots are real stack roots and
+    // are always walked.
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor
@@ -1307,9 +1307,10 @@ pub unsafe fn walk_pyframe_roots_area(
                 visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
                 let w_builtin = (*frame).w_builtin;
                 if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
-                    // Module is a Box-immortal carrier, but its module dict is
-                    // now a non-moving GC object. Mark the header through the
-                    // owning field so its custom trace can retain the values.
+                    // Grey the live frame's builtin dict through the module
+                    // field. An immortal module is traced through
+                    // `prebuilt_root_objects`; this stack-root visit covers
+                    // the same `w_dict` slot for the executing frame.
                     let w_dict_slot = &mut (*(w_builtin as *mut pyre_object::module::Module)).w_dict
                         as *mut PyObjectRef;
                     visitor(&mut *(w_dict_slot as *mut majit_ir::GcRef));
@@ -1395,12 +1396,9 @@ pub unsafe fn walk_pyframe_roots_area(
             }
             frame = next_frame;
         }
-        // Box-immortal modules (and their Box-immortal dicts) are not
-        // reachable transitively by the collector, so walk every loaded
-        // module's dict storage as a pinned root source.  This covers
-        // module-scope movable values bound in modules other than the
-        // running frame's globals — e.g. `gc.collect` reached through
-        // `gc.__dict__` on a fresh `LOAD_METHOD` after a collection.
+        // Per-mutator import area: `SYS_ARGV_PENDING` between
+        // `set_sys_argv` and `take_pending_sys_argv`. Immortal modules
+        // are traced through `prebuilt_root_objects`.
         if scan_prebuilt {
             unsafe {
                 let mut forward = |slot: &mut PyObjectRef| {
@@ -1593,13 +1591,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         if let Some(hooks) = crate::importing::optional_module_hooks() {
             (hooks.walk_prebuilt_slots)(&mut fwd);
         }
-        // Immortal `Module.w_dict` / `MixedModule.w_initialdict` are young
-        // dicts in `malloc_typed` modules. `w_module_set_initialdict` dirties
-        // the prebuilt family, but `w_dict` is published at construction
-        // without that bit, and a minor that runs while the bit is clear
-        // leaves the field holding the pre-move address. Same shape as
-        // CodecState above: forward every collection.
-        unsafe { crate::importing::walk_process_import_object_roots(&mut fwd) };
     }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
@@ -1647,10 +1638,8 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // (`SysModuleState` / `space`). Mutator stores into them take
         // `mark_prebuilt_roots_dirty`
         // (`incminimark.py remember_young_pointer_from_prebuilt`); this
-        // gated walk is the `prebuilt_root_objects` scan. Interior
-        // immortal-module cell words live here too, so a major's
-        // end-of-marking rescan still sees modules installed after the
-        // initial root snapshot.
+        // gated walk visits those static slots once. Immortal modules
+        // themselves are traced through `prebuilt_root_objects`.
         crate::importing::walk_process_import_roots(&mut forward);
     }
     if is_minor {
@@ -1669,7 +1658,8 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 ///
 /// Only the slots unique to the suspended frame are forwarded here.
 /// The globals/builtin dict VALUES are not walked: a module dict is
-/// rooted globally by `walk_module_dicts_gc`, and a GC-managed `exec`
+/// reached through the owning module's `W_MODULE_GC_PTR_OFFSETS` (an
+/// immortal module via `prebuilt_root_objects`), and a GC-managed `exec`
 /// globals dict is reached transitively once its (forwarded) object
 /// pointer is marked — its own trace walks the values.  This deliberately
 /// avoids the globals-proxy / module-dict-cell walk that

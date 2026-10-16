@@ -463,19 +463,6 @@ pub fn mount_embedded_stdlib(mount: &Path) {
 // foreign STW root walks well-defined.
 static SYS_MODULES: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Every `Module` ever bound by [`set_sys_module`], keyed by address.
-///
-/// A builtin module is allocated immortal (`w_module_new_aliasing_dict` ->
-/// `malloc_typed`), so the collector never traces it and its `w_dict` is
-/// reachable only through [`walk_module_dicts_gc`].  Keying that walk on the
-/// name→module map alone loses the dict the moment a second module takes the
-/// name — `del sys.modules['_functools']` followed by a fresh `import`
-/// mints a new module, and the collection after that frees the first
-/// module's dict while Python still holds the module.  The module itself is
-/// immortal and can never be freed, so its dict has to stay valid for as
-/// long; entries are added and never removed.
-static MODULE_DICT_ROOTS: LazyLock<Mutex<std::collections::HashSet<usize>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 static SYS_MODULES_DICT: AtomicUsize = AtomicUsize::new(0);
 /// `baseobjspace.py:730` — `self.w_default_importlib_import =
 /// frozen_importlib.w_import`: the interp-level `__import__` gateway, held on
@@ -3647,16 +3634,9 @@ pub fn sys_modules_dict() -> PyObjectRef {
 }
 
 pub fn set_sys_module(name: &str, module: PyObjectRef) {
-    // Native-owned immortal modules need their managed dicts in
-    // `walk_module_dicts_gc`; managed modules are instead reached through the
-    // ordinary object graph rooted at `sys.modules`.  Test actual ownership,
-    // not whether that dict currently exists: the immortal bootstrap `sys`
-    // module installs `sys.modules` from inside its initializer, before this
-    // function receives the finished module.
+    // Young module pointer into the prebuilt `sys.modules` slot
+    // (`incminimark.py remember_young_pointer_from_prebuilt`).
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-    if !majit_gc::gc_owns_object(module as usize) {
-        MODULE_DICT_ROOTS.lock().insert(module as usize);
-    }
     SYS_MODULES.lock().insert(name.to_string(), module as usize);
     // Keep the Python-visible sys.modules dict in sync.  The read is fresh —
     // the collector walks that cell — but the `dict` moves, and the key string
@@ -3740,80 +3720,6 @@ pub fn release_sys_modules_for_shutdown() -> ReleasedSysModules {
     ReleasedSysModules { modules }
 }
 
-/// GC root walk over every bound module's wrapped name and dict storage.
-///
-/// The walk is keyed on [`MODULE_DICT_ROOTS`], not on the live name→module
-/// map: a module that lost its name to a later import is still immortal and
-/// still reachable from Python, so its dict must keep being marked.
-///
-/// Modules (`malloc_typed`) are Box-immortal, while their non-moving
-/// `W_ModuleDictObject`s are GC-managed. Visit each `Module.w_name` and
-/// `Module.w_dict` field first so their headers are marked and the dict's
-/// custom trace can reach the
-/// authoritative `dstorage` / `object_storage` / cell registry. A movable
-/// value bound at module scope
-/// — e.g. `gc.collect` reached through `gc.__dict__`, or any
-/// module-level list / instance — would otherwise be read back stale
-/// after a collection relocates it.  Treat each loaded module's dict as
-/// a pinned root source so those slots stay forwarded.  This complements
-/// the per-frame `w_globals` walk in `eval::walk_pyframe_roots`,
-/// which additionally covers `exec`/`eval` globals dicts that are not
-/// registered in `sys.modules`.
-///
-/// # Safety
-/// `visitor` must tolerate being called on every movable module-dict
-/// value slot reachable here.
-pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    unsafe { walk_bound_module_dicts(visitor) };
-}
-
-/// Forward the immortal `Module` field GCREFs (`w_name`, `w_dict`,
-/// `w_initialdict`). `malloc_typed` modules are outside the nursery, so a
-/// minor does not trace them; the dicts they hold are young
-/// (`mixedmodule.py MixedModule.w_initialdict`, `module.py self.w_dict`).
-///
-/// # Safety
-/// `visitor` must tolerate a non-nursery or already-forwarded pointer.
-unsafe fn walk_bound_module_fields(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    for &module in MODULE_DICT_ROOTS.lock().iter() {
-        let module = module as PyObjectRef;
-        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
-            continue;
-        }
-        unsafe {
-            let module = &mut *(module as *mut pyre_object::module::Module);
-            if !module.w_name.is_null() {
-                visitor(&mut module.w_name);
-            }
-            if !module.w_dict.is_null() {
-                visitor(&mut module.w_dict);
-            }
-            if !module.w_initialdict.is_null() {
-                visitor(&mut module.w_initialdict);
-            }
-        }
-    }
-}
-
-/// The shared body of the two module-dict root walks.
-///
-/// # Safety
-/// `visitor` must tolerate being called on every movable module-dict value
-/// slot reachable here.
-unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    unsafe { walk_bound_module_fields(visitor) };
-    for &module in MODULE_DICT_ROOTS.lock().iter() {
-        let module = module as PyObjectRef;
-        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
-            continue;
-        }
-        unsafe {
-            let w_dict = (*(module as *mut pyre_object::module::Module)).w_dict;
-            pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
-        }
-    }
-}
-
 /// `baseobjspace.py` — record the interp-level `__import__` as the space's
 /// default importer.  Called where `builtins.__import__` is bound, which is
 /// what `moduledef.py:87 startup` copies from.
@@ -3849,13 +3755,13 @@ pub(crate) fn default_importlib_import_word() -> PyObjectRef {
 /// Forward the `sys.modules` dict pointer cached in `SYS_MODULES_DICT`.
 ///
 /// The same dict object is also reachable as `sys.__dict__["modules"]`
-/// (forwarded by [`walk_module_dicts_gc`]), but this fast-path cell holds an
-/// independent raw copy.  `w_dict_new` allocates the dict in the movable
-/// nursery, so a collection relocates it and leaves this cell pointing at the
-/// vacated (reclaimed) slot; the next `check_sys_modules` would then run
-/// `w_dict_lookup` against dead memory.  Forward the cell in place so it
-/// tracks the relocation, mirroring the EC-slot forwarding in
-/// `eval::walk_pyframe_roots`.
+/// (an immortal `sys` module traces `w_dict` through `prebuilt_root_objects`),
+/// but this fast-path cell holds an independent raw copy.  `w_dict_new`
+/// allocates the dict in the movable nursery, so a collection relocates it
+/// and leaves this cell pointing at the vacated (reclaimed) slot; the next
+/// `check_sys_modules` would then run `w_dict_lookup` against dead memory.
+/// Forward the cell in place so it tracks the relocation, mirroring the
+/// EC-slot forwarding in `eval::walk_pyframe_roots`.
 ///
 /// # Safety
 /// `visitor` must tolerate a non-nursery or already-forwarded pointer.
@@ -3888,28 +3794,28 @@ pub(crate) unsafe fn walk_import_roots_area(
     }
 }
 
-/// The Module field GCREFs and the process-owned import cells, without
-/// walking module-dict *contents*. Immortal modules are not nursery-traced,
-/// so these slots have to be extra-rooted on every minor — the same shape
-/// as `space.fromcache(CodecState)`'s young dicts. Dict cells stay on
-/// [`walk_process_import_roots`]: those are the object's own edges once
-/// `w_dict` has been forwarded.
+/// Walk the import state owned by PyPy's process/interpreter object space.
 ///
-/// The SYS_MODULES / default-importer / builtin-module slots are prebuilt
-/// (`space.sys` / `SysModuleState`). A mutator store of a young pointer
-/// into them takes `mark_prebuilt_roots_dirty` (`incminimark.py
+/// Unlike `SYS_ARGV_PENDING`, these slots are not thread-local.  Keeping this
+/// walk separate lets the collector's `collect_nonstack_roots` parity rescan
+/// them exactly once at the end of incremental marking.
+///
+/// `space.sys.modules`, `space.w_default_importlib_import`, and
+/// `space.builtin_modules` are process-owned prebuilt slots
+/// (`SysModuleState` / `space`). A mutator store of a young pointer into
+/// them takes `mark_prebuilt_roots_dirty` (`incminimark.py
 /// remember_young_pointer_from_prebuilt`); this walk is the corresponding
-/// `prebuilt_root_objects` visit. Stores here rewrite forwarded addresses
-/// and are not mutator stores.
+/// visit. Stores here rewrite forwarded addresses and are not mutator
+/// stores. An immortal module is traced through `prebuilt_root_objects`
+/// (`W_MODULE_GC_TYPE_ID` / `W_MODULE_GC_PTR_OFFSETS`), so these slots
+/// are visited once and not expanded.
 ///
 /// # Safety
 /// `visitor` must tolerate a non-nursery or already-forwarded pointer.
-pub(crate) unsafe fn walk_process_import_object_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    unsafe { walk_bound_module_fields(visitor) };
-    unsafe { walk_process_import_object_roots_tail(visitor) };
-}
-
-unsafe fn walk_process_import_object_roots_tail(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    // `space.sys.modules` is process-owned in PyPy.  STW has quiesced every
+    // mutator, so the process-global cache cannot be semantically mutated
+    // while this walk holds its native lock.
     let mut dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if !dict.is_null() {
         visitor(&mut dict);
@@ -3920,9 +3826,9 @@ unsafe fn walk_process_import_object_roots_tail(visitor: &mut dyn FnMut(&mut PyO
         visitor(&mut w_import);
         DEFAULT_IMPORTLIB_IMPORT.store(w_import as usize, Ordering::Release);
     }
-    // `space.builtin_modules`. An immortal module's fields are walked above,
-    // since `getbuiltinmodule` binds it in `sys.modules` before anything
-    // else; a managed one is traced through its own fields.
+    // `space.builtin_modules`. An immortal module is traced through
+    // `prebuilt_root_objects`; a managed one is traced through its own
+    // fields. This slot is the process table that names the module.
     for def in BUILTIN_MODULES.lock().values_mut() {
         if def.w_mod != 0 {
             let mut w_mod = def.w_mod as PyObjectRef;
@@ -3930,19 +3836,6 @@ unsafe fn walk_process_import_object_roots_tail(visitor: &mut dyn FnMut(&mut PyO
             def.w_mod = w_mod as usize;
         }
     }
-}
-
-/// Walk the import state owned by PyPy's process/interpreter object space.
-///
-/// Unlike `SYS_ARGV_PENDING`, these slots are not thread-local.  Keeping this
-/// walk separate lets the collector's `collect_nonstack_roots` parity rescan
-/// them exactly once at the end of incremental marking.
-pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    // `space.sys.modules` is process-owned in PyPy.  STW has quiesced every
-    // mutator, so the process-global cache cannot be semantically mutated
-    // while this walk holds its native lock.
-    unsafe { walk_bound_module_dicts(visitor) };
-    unsafe { walk_process_import_object_roots_tail(visitor) };
 }
 
 /// Set the Python-visible sys.modules dict reference. Called during sys
