@@ -9028,6 +9028,23 @@ mod tests {
         assert_eq!(ctx.opref_to_box(c), OcBox::ConstPtr(addr));
     }
 
+    /// Other cargo test threads share this process-global counter, so the
+    /// bound is loose: 100_000 calls must add fewer than 10_000 wide ids.
+    #[test]
+    fn const_ref_does_not_mint_wide_ids() {
+        let mut ctx = TraceCtx::for_test(0);
+        let addr = 0x1000_i64;
+        let before = majit_ir::operand::wide_ids_minted();
+        for _ in 0..100_000 {
+            let _ = ctx.const_ref(addr);
+        }
+        let delta = majit_ir::operand::wide_ids_minted().wrapping_sub(before);
+        assert!(
+            delta < 10_000,
+            "repeated const_ref of the same non-null address must not mint wide ids"
+        );
+    }
+
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {
         let mut recorder = ctx.recorder;
         let inputarg_types = recorder.inputarg_types();
