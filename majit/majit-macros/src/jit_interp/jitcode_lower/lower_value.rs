@@ -3336,6 +3336,7 @@ impl<'c> Lowerer<'c> {
             nested_failure_reasons: Vec::new(),
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
+            sub_jitcode_identity_slot: None,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
             join_merge: self.enclosing_join_merge(),
@@ -3355,6 +3356,7 @@ impl<'c> Lowerer<'c> {
 
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
+        self.absorb_nested_identity_slot(&mut nested);
         self.inline_liveness_prebuild
             .extend(nested.inline_liveness_prebuild);
         Some(LoweredSequence::new(nested.statements, nested.op_metadata))
@@ -3380,6 +3382,7 @@ impl<'c> Lowerer<'c> {
             nested_failure_reasons: Vec::new(),
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
+            sub_jitcode_identity_slot: None,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
             join_merge: self.enclosing_join_merge(),
@@ -3396,6 +3399,7 @@ impl<'c> Lowerer<'c> {
         };
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
+        self.absorb_nested_identity_slot(&mut nested);
         self.inline_liveness_prebuild
             .extend(nested.inline_liveness_prebuild);
         Some((

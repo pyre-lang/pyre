@@ -231,3 +231,35 @@ fn the_dispatch_jitcode_inline_calls_the_build_time_callee() {
          depth it was written for",
     );
 }
+
+/// OP_DOUBLE / OP_VOID stay on the sub-JitCode path because they call
+/// `inline_pipeline_*` helpers (`arm_body_has_infer_call`). Those callees
+/// used to emit `load_state_field` / `store_state_field` against the
+/// parent's identity slots. The state-as-vable gate now covers that arm
+/// shape, so `rewrite_op_getfield` / `rewrite_op_setfield` land on the
+/// live virtualizable (`opimpl_getfield_vable_*` /
+/// `opimpl_setfield_vable_*`) and no callee JitCode reads identity slots.
+#[test]
+fn doubling_state_callee_jitcodes_do_not_read_identity_slots() {
+    let mut asm = Assembler::new();
+    asm.set_canonical_liveness_triple(vec![0], vec![], vec![]);
+    __prebuild_jitcode_liveness_doubling_interp(&mut asm);
+    let _ = asm.ensure_canonical_liveness_offset();
+    let dispatch = Arc::new(
+        __dispatch_jitcode_doubling_interp(&mut asm, 0i64)
+            .expect("dispatch lower must succeed for the pipeline fixture"),
+    );
+    let reached = reachable(&dispatch);
+    let identity_callees: Vec<&str> = reached
+        .iter()
+        .skip(1)
+        .filter(|jc| jc.reads_identity_slots())
+        .map(|jc| jc.name())
+        .collect();
+    assert!(
+        identity_callees.is_empty(),
+        "DoublingState infer-call arms must use getfield_vable / \
+         setfield_vable, not load_state_field / store_state_field; \
+         callees with identity slots: {identity_callees:?}"
+    );
+}

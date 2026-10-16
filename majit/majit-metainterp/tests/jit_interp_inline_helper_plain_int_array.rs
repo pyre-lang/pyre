@@ -31,7 +31,7 @@ struct CellReadState {
 fn dispatch_cell_read(program: &Bytecode, threshold: u32, cells: Vec<i64>) -> i64 {
     let mut driver: JitDriver<CellReadState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let state = CellReadState { cells };
+    let mut state = CellReadState { cells };
     {
         use majit_metainterp::JitState as _;
         state
@@ -97,8 +97,7 @@ fn interpreter_cells_read_matches_the_seeded_value() {
 }
 
 /// The lowerer inlines a `return state.cells[i]` arm into the dispatch
-/// JitCode (`try_inline_dispatch_arm`), so that body is not a callee of
-/// `copy_identity_slots_from_parent`. This helper is the same emit the
+/// JitCode (`try_inline_dispatch_arm`). This helper is the same emit the
 /// lowerer writes — `getarrayitem_raw_i` off the ptr identity slot — and
 /// the parent passes ptr/len as declared int arguments (`MIFrame.setup_call`,
 /// `bhimpl_inline_call_ir_i`). `inline_call_grouped` requires a positional
@@ -141,7 +140,7 @@ fn blackhole_inline_call_passes_cells_ptr_as_int_args() {
     let cpu = TestBackend::new();
     let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&[(
         "recursive_call_v/iIRFIRF",
-        34,
+        majit_metainterp::jitcode::insns::BC_RECURSIVE_CALL_VOID,
     )]);
     bh_builder.set_cpu(&cpu);
     bh_builder.setup_insns(&bh_insns);

@@ -110,7 +110,7 @@ fn an_opaque_carrier_contributes_no_red_slot() {
     use majit_metainterp::JitState as _;
 
     let program = [OP_BUMP];
-    let carried = OpaqueState {
+    let mut carried = OpaqueState {
         acc: 7,
         storage: Storage {
             names: vec!["a".to_string()],
@@ -123,7 +123,7 @@ fn an_opaque_carrier_contributes_no_red_slot() {
         vec![majit_ir::Type::Int],
     );
 
-    let plain = PlainState { acc: 7 };
+    let mut plain = PlainState { acc: 7 };
     let plain_meta = plain.build_meta(0, &program[..]);
     assert_eq!(
         carried.extract_live(&carried_meta),

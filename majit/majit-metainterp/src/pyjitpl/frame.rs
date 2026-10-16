@@ -1124,7 +1124,6 @@ impl MIFrame {
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
-        skip_int_identity: Option<(usize, usize)>,
     ) -> Vec<SnapshotTagged> {
         const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
         use majit_jitcode::liveness::{LivenessIterator, decode_offset};
@@ -1210,81 +1209,6 @@ impl MIFrame {
                 let tagged = if Some(idx) == clear_int_idx {
                     #[cfg(feature = "jit-audits")]
                     majit_ir::reg_write_audit::note_int_read_diverted(idx, "clear_int_idx");
-                    SnapshotTagged::Const(0, Type::Int)
-                } else if skip_int_identity.is_some_and(|(b, e)| idx >= b && idx < e)
-                    && idx < num_regs_i
-                {
-                    // A non-root (inline) frame reserves the virtualizable
-                    // identity-slot prefix int[base..end) so its register file
-                    // spans them. Emit a count-preserving Const(0) placeholder
-                    // (the liveness marker's length_i is baked, so dropping
-                    // would desync the decoder).
-                    //
-                    // OPEN, and narrower than an earlier version of this note
-                    // claimed: deopt reconstructs the virtualizable on the
-                    // `virtualizable_ptr` / `virtualizable_info` FIELD channel,
-                    // which is what a vable opcode reading through vinfo gets.
-                    // It does NOT re-derive these REGISTERS — `write_an_int`
-                    // (`resume.py`) writes each section's decoded values,
-                    // these zeros included, straight into the frame's own
-                    // bank. So a blackhole resuming inside a split arm reads
-                    // `Const(0)` through `handler_load_state_field_di`, and
-                    // the deopt side needs a real re-derivation before any
-                    // resume path is entitled to re-fill the slots.
-                    //
-                    // If such a re-fill is ever written, it must read the
-                    // reconstructed vable list (`TraceCtx::virtualizable_boxes`)
-                    // the way `pyjitpl.py rebuild_state_after_failure` does —
-                    // never frame 0's int registers, which hold a DIFFERENT
-                    // quantity at the same index (see the dualtape note
-                    // below) — and must use this trim's own `idx < num_regs_i`
-                    // bound. Until then `trace_jitcode_at_resume_framestack`
-                    // declines any multi-frame bridge for a symbol that
-                    // reserves these slots.
-                    //
-                    // Neither the trim nor that decline runs anywhere today.
-                    // `dualtape` is the only `split_dispatch` symbol in the
-                    // tree, and across its whole suite, debug and release,
-                    // this branch is taken zero times: its tier gates are
-                    // still `#[ignore]`d, so nothing records a guard inside an
-                    // inlined dispatch arm and no snapshot is built with more
-                    // than one frame. `dualtape`'s
-                    // `the_reserved_identity_trim_and_its_decline_are_unreached`
-                    // holds both counters at 0 and names the re-derivation
-                    // that has to be written when one of them moves.
-                    //
-                    // Blank the range UNCONDITIONALLY. An earlier version also
-                    // required `self.int_regs[idx].is_none()`, on the premise
-                    // that a sub-frame's identity slots are always unwritten
-                    // holes. That is false: dualtape's sub-frame at
-                    // `jitcode_pos=9` carries the virtualizable identity in
-                    // int reg 2, bit-identical to the root frame's ref reg 1
-                    // (`with_vable_input_ref_reg(1)`), so the slot is written
-                    // and the guard skipped the trim. The identity was then
-                    // seeded back as a live Int and used as an array index,
-                    // faulting in `handler_getarrayitem_vable_i`.
-                    //
-                    // `end` here is `int_identity_reserved_end()`: that
-                    // stops after the scalars plus the vable-identity slot.
-                    // Virt-array live element counts sit past it as ordinary
-                    // working registers, and blanking those would drop live
-                    // data.
-                    //
-                    // Count the slots this actually TAKES something away from.
-                    // The range is `num_scalars` int state-field slots plus the
-                    // one vable-identity slot, so a blanked slot that held a
-                    // live box is a state field the resumed frame will read
-                    // back as zero through `load_state_field/di`. A slot
-                    // already holding a constant loses nothing. `MC_DIAG` 93
-                    // counts the guards the bridge walk refuses over this
-                    // range; this is the quantity that says whether the
-                    // blackhole arm 93 hands them to can read a fabricated
-                    // zero.
-                    if self.int_regs[idx].is_some_and(|op| !op.is_constant()) {
-                        crate::mc_diag_bump(crate::mc_diag_slot(
-                            "inline_frame_trim_blanked_live_int",
-                        ));
-                    }
                     SnapshotTagged::Const(0, Type::Int)
                 } else if idx < num_regs_i {
                     let opref = self.int_regs[idx]

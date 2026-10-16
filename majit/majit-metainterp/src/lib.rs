@@ -1987,20 +1987,10 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     "guard_resume_decline_call_not_jitcode",
     "guard_resume_decline_callee_mismatch",
     "guard_resume_decline_return_slot",
-    // 93 = the resume spans more than one frame and the sym reserves an
-    // identity-only int range. Unlike 88-92 this is not a disagreement: the
-    // snapshot trim blanked those registers in every frame below the root and
-    // nothing re-derives them, so a nonzero tally is a workload property of a
-    // `split_dispatch` symbol, not a defect. Only a symbol that opts in can
-    // raise it; every other one reserves nothing and never reaches the test.
+    // 93 / 94 are historical: the snapshot trim that blanked callee identity
+    // slots and `GuardResumeDecline::ReservedIdentitySlots` are gone. The
+    // names stay so later `mc_diag_bump(N)` indices do not shift.
     "guard_resume_decline_reserved_identity",
-    // 94 = the inline-frame snapshot trim blanked a reserved identity slot
-    // that held a LIVE (non-constant) box. 93 counts the guards the bridge
-    // walk refuses because of the trim; this counts the slots the trim
-    // actually took something away from, which is the quantity that decides
-    // whether the blackhole arm 93 hands those guards to can read a fabricated
-    // zero through `load_state_field/di`. A slot that already held a constant
-    // loses nothing, so it is not counted.
     "inline_frame_trim_blanked_live_int",
     // A `confirm_enter_jit` hook was installed, but a hash-only compatibility
     // door had no structured greens to pass it. The door declines rather than

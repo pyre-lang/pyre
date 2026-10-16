@@ -13,7 +13,7 @@ impl JitState for Idle {
 
     fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         Vec::new()
     }
 

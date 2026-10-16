@@ -5029,6 +5029,11 @@ where
             .descr_at(sub_idx)
             .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned)
             .unwrap_or_else(|| panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry"));
+        assert!(
+            !sub_jitcode.reads_identity_slots(),
+            "inline_call callee {:?} emits load/store_state_field*; only the portal JitCode may",
+            sub_jitcode.name()
+        );
         let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
         sub_frame.inline_frame = true;
         let (return_i, return_r, return_f) = {

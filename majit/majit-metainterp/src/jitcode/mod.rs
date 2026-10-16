@@ -621,11 +621,10 @@ pub struct JitCodeExecState {
     /// parity, no payload-byte collision risk.
     pub jit_merge_point_offset: Option<usize>,
     /// The body addresses portal identity slots through
-    /// `load_state_field` / `store_state_field` (and the array forms).
-    /// Set by `JitCodeBuilder` when it emits one of those ops. An
-    /// ordinary inline JitCode leaves this false: the same register
-    /// indices are working registers, and seeding them would overwrite
-    /// a live value.
+    /// `load_state_field` / `store_state_field` (and the ref and float
+    /// forms). Set by `JitCodeBuilder` when it emits one of those ops.
+    /// An ordinary inline JitCode leaves this false; `add_sub_jitcode`
+    /// refuses a callee that latched it.
     pub reads_identity_slots: bool,
 }
 
@@ -774,9 +773,10 @@ impl JitCode {
     /// Whether this body's register file reserves portal identity slots.
     ///
     /// True only when the lowering emitted `load_state_field` /
-    /// `store_state_field` (or the ref, float, or array form). Those ops
-    /// address `int_identity_slots_base + field`. A translated helper
-    /// JitCode never emits them.
+    /// `store_state_field` (or the ref or float form). Those ops
+    /// address `int_identity_slots_base + field`. Only the portal JitCode
+    /// emits them; `JitCodeBuilder::add_sub_jitcode` refuses a callee that
+    /// latched this flag.
     pub fn reads_identity_slots(&self) -> bool {
         self.exec.reads_identity_slots
     }

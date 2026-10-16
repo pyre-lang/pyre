@@ -67,11 +67,11 @@ impl JitState for TestState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.stack]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.frame)), Value::Int(self.stack)]
     }
 
@@ -115,11 +115,11 @@ impl JitState for BadLiveState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.frame))]
     }
 
@@ -159,11 +159,11 @@ impl JitState for ExtraLiveState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.stack, self.extra]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![
             Value::Ref(GcRef(self.frame)),
             Value::Int(self.stack),
@@ -208,11 +208,11 @@ impl JitState for TypedState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.acc.to_bits() as i64]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.frame)), Value::Float(self.acc)]
     }
 
@@ -265,11 +265,11 @@ impl JitState for MismatchedTypedState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame, self.acc.to_bits() as i64]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Int(self.frame), Value::Float(self.acc)]
     }
 
@@ -304,11 +304,11 @@ impl JitState for TypedRestoreOnlyState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.acc.to_bits() as i64]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.frame)), Value::Float(self.acc)]
     }
 
@@ -362,11 +362,11 @@ impl JitState for VirtualizableSyncState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.stack]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.frame)), Value::Int(self.stack)]
     }
 
@@ -533,11 +533,11 @@ impl JitState for NamedVirtualizableSyncState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.stack]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.frame)), Value::Int(self.stack)]
     }
 
@@ -600,11 +600,11 @@ impl JitState for AutoVirtualizableState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.stackpos, self.top]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![
             Value::Ref(GcRef(self.frame)),
             Value::Int(self.stackpos),
@@ -633,7 +633,7 @@ impl JitState for AutoVirtualizableState {
     }
 
     fn virtualizable_heap_ptr(
-        &self,
+        &mut self,
         _meta: &Self::Meta,
         virtualizable: &str,
         _info: &VirtualizableInfo,
@@ -703,11 +703,11 @@ impl JitState for ResumeMappedState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.stackpos, self.top]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![
             Value::Ref(GcRef(self.frame)),
             Value::Int(self.stackpos),
@@ -765,11 +765,11 @@ impl JitState for VirtualResumeState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.obj as i64, self.flag]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.obj)), Value::Int(self.flag)]
     }
 
@@ -838,11 +838,11 @@ impl JitState for PendingWriteState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.obj as i64, self.flag]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.obj)), Value::Int(self.flag)]
     }
 
@@ -903,11 +903,11 @@ impl JitState for PendingArrayWriteState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.array as i64, self.flag]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.array)), Value::Int(self.flag)]
     }
 
@@ -969,11 +969,11 @@ impl JitState for MultiFrameResumeState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.flag]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.frame)), Value::Int(self.flag)]
     }
 
@@ -1041,11 +1041,11 @@ impl JitState for GenericMultiFrameResumeState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.frame as i64, self.flag]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![Value::Ref(GcRef(self.frame)), Value::Int(self.flag)]
     }
 
@@ -1142,11 +1142,11 @@ impl JitState for PendingVirtualWriteState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.parent as i64, self.child as i64]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![
             Value::Ref(GcRef(self.parent)),
             Value::Ref(GcRef(self.child)),
@@ -1235,11 +1235,11 @@ impl JitState for NestedVirtualResumeState {
         TestMeta { header_pc }
     }
 
-    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
         vec![self.outer as i64, self.inner as i64, self.alias as i64]
     }
 
-    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
         vec![
             Value::Ref(GcRef(self.outer)),
             Value::Ref(GcRef(self.inner)),

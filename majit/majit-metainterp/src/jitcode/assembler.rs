@@ -2156,6 +2156,63 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_raw_i dst");
     }
 
+    /// `blackhole.py` `bhimpl_setarrayitem_raw_i`: `[array_reg][index_reg][value_reg][descr]`,
+    /// `setarrayitem_raw_i/iiid`. Int-bank base (raw address).
+    /// `jtransform.py` `rewrite_op_setarrayitem` raw arm.
+    pub fn setarrayitem_raw_i(
+        &mut self,
+        array_reg: u16,
+        index_reg: u16,
+        value_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_reg(value_reg);
+        self.write_insn("setarrayitem_raw_i/iiid");
+        self.push_reg_u8(array_reg, "setarrayitem_raw_i array");
+        self.push_reg_u8(index_reg, "setarrayitem_raw_i index");
+        self.push_reg_u8(value_reg, "setarrayitem_raw_i value");
+        self.push_u16(descr_idx);
+    }
+
+    /// `blackhole.py` `bhimpl_getarrayitem_raw_f`: `[array_reg][index_reg][descr][dst]`,
+    /// `getarrayitem_raw_f/iid>f`. Int-bank base (raw address), float dest.
+    /// `jtransform.py` `rewrite_op_getarrayitem` raw arm when
+    /// `getkind(ARRAY.OF)` is float. The descr is
+    /// [`Self::add_raw_float_array_descr`].
+    pub fn getarrayitem_raw_f(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
+        self.touch_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_float_reg(dst);
+        self.write_insn("getarrayitem_raw_f/iid>f");
+        self.push_reg_u8(array_reg, "getarrayitem_raw_f array");
+        self.push_reg_u8(index_reg, "getarrayitem_raw_f index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_raw_f dst");
+    }
+
+    /// `blackhole.py` `bhimpl_setarrayitem_raw_f`: `[array_reg][index_reg][value_reg][descr]`,
+    /// `setarrayitem_raw_f/iifd`. Int-bank base (raw address), float value.
+    /// `jtransform.py` `rewrite_op_setarrayitem` raw arm when the stored
+    /// value's kind is float.
+    pub fn setarrayitem_raw_f(
+        &mut self,
+        array_reg: u16,
+        index_reg: u16,
+        value_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_float_reg(value_reg);
+        self.write_insn("setarrayitem_raw_f/iifd");
+        self.push_reg_u8(array_reg, "setarrayitem_raw_f array");
+        self.push_reg_u8(index_reg, "setarrayitem_raw_f index");
+        self.push_reg_u8(value_reg, "setarrayitem_raw_f value");
+        self.push_u16(descr_idx);
+    }
+
     /// The always-pure spelling of [`Self::getarrayitem_gc_i`], for an array
     /// whose elements never change after it is built.
     ///
@@ -6143,10 +6200,19 @@ impl JitCodeBuilder {
         idx as u16
     }
 
+    fn assert_sub_jitcode_has_no_identity_slots(jitcode: &JitCode) {
+        assert!(
+            !jitcode.reads_identity_slots(),
+            "sub-JitCode {:?} emits load/store_state_field*; only the portal JitCode may",
+            jitcode.name()
+        );
+    }
+
     /// Variant accepting an already-shared `Arc<JitCode>` for callers
     /// that already hold a shared handle (e.g. a re-export from
     /// `MetaInterpStaticData::indirectcalltargets`).
     pub fn add_sub_jitcode_arc(&mut self, jitcode: std::sync::Arc<JitCode>) -> u16 {
+        Self::assert_sub_jitcode_has_no_identity_slots(&jitcode);
         // `assembler.py Assembler._encode_descr` memoises every descr through
         // `_descr_dict`, and upstream's `JitCode` IS an `AbstractDescr`, so a
         // jitcode operand goes through that memo like any other.  This was the
@@ -6174,6 +6240,9 @@ impl JitCodeBuilder {
         match edge {
             crate::jitcode::InlineJitCodeRef::Strong(arc) => self.add_sub_jitcode_arc(arc),
             crate::jitcode::InlineJitCodeRef::BackEdge(weak) => {
+                if let Some(jc) = weak.upgrade() {
+                    Self::assert_sub_jitcode_has_no_identity_slots(&jc);
+                }
                 let target = std::sync::Weak::as_ptr(&weak);
                 if let Some(existing) = self.descrs.iter().position(|entry| {
                     matches!(entry, RuntimeBhDescr::JitCodeBackEdge(seen)

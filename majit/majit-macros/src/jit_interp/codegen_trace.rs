@@ -17,20 +17,23 @@ use super::jitcode_lower::{
 /// JitCode's remaining arguments are the plain reds (int scalars,
 /// ptr then len per `[int]`, ref scalars, float scalars).
 /// `jtransform.py` `rewrite_op_getarrayitem` raw arm emits
-/// `getarrayitem_raw_<kind>` for a raw (non-GC) array; a Rust slice
-/// is that `{ptr, len}` view, so both words are identity reds.
+/// `getarrayitem_raw_<kind>` for a raw (non-GC) array (`_i` or `_f`
+/// from `getkind(ARRAY.OF)`); a Rust slice is that `{ptr, len}` view,
+/// so both words are INT identity reds regardless of element kind.
 /// Vable-field scalars stay in
 /// `initialize_virtualizable` / `virtualizable_boxes` and are not
 /// pushed here.
-fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
+fn plain_red_argbox_pushes(config: &JitInterpConfig, has_infer_call_arm: bool) -> TokenStream {
     let Some(sf) = config.state_fields.as_ref() else {
         return quote! {};
     };
-    let has_virt = sf
-        .fields
-        .iter()
-        .any(|f| matches!(f.kind, StateFieldKind::VirtArray(_)));
-    let int_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+    let skip_vable_scalars = super::state_is_vable_identity(
+        config.virtualizable_decl.as_ref(),
+        config.state_fields.as_ref(),
+        config.split_dispatch,
+        has_infer_call_arm,
+    );
+    let int_scalars: Vec<&super::StateFieldDecl> = if skip_vable_scalars {
         Vec::new()
     } else {
         sf.fields
@@ -45,7 +48,7 @@ fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
         .iter()
         .filter(|f| matches!(f.kind, StateFieldKind::Array(_)))
         .collect();
-    let ref_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+    let ref_scalars: Vec<&super::StateFieldDecl> = if skip_vable_scalars {
         Vec::new()
     } else {
         sf.fields
@@ -53,7 +56,21 @@ fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
             .filter(|f| matches!(f.kind, StateFieldKind::Ref(_) | StateFieldKind::Str))
             .collect()
     };
-    let float_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+    // `warmspot.py` `make_virtualizable_infos`: the heap virtualizable is
+    // one red at `jitdriver.reds.index(vname)`. Push it with the other
+    // `ref(_)` / `str` fields, in declaration order, and give that slot
+    // the identity box (`pyjitpl.py` `_nonstandard_virtualizable` step 3:
+    // a bridge's fail args are not the loop's reds, so the walk's vable
+    // base must be `virtualizable_boxes[-1]`).
+    let heap_vable_name: Option<String> = if skip_vable_scalars {
+        None
+    } else {
+        config
+            .virtualizable_decl
+            .as_ref()
+            .map(|decl| decl.var_name.to_string())
+    };
+    let float_scalars: Vec<&super::StateFieldDecl> = if skip_vable_scalars {
         Vec::new()
     } else {
         sf.fields
@@ -94,7 +111,9 @@ fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
             let fname = &f.name;
             quote! {
                 {
-                    let __bits = state.#fname.as_ptr() as i64;
+                    // JIT stores through this address (`setarrayitem_raw_*`), so
+                    // it is derived from a mutable borrow.
+                    let __bits = state.#fname.as_mut_ptr() as i64;
                     let __box = majit_ir::OpRef::input_arg_int(__red_offset);
                     __red_offset = __red_offset.wrapping_add(1);
                     __jitcode_args.push((
@@ -119,17 +138,21 @@ fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
     let ref_pushes: Vec<TokenStream> = ref_scalars
         .iter()
         .map(|f| {
-            let fname = &f.name;
-            quote! {
-                {
-                    let __bits = state.#fname as i64;
-                    let __box = majit_ir::OpRef::input_arg_ref(__red_offset);
-                    __red_offset = __red_offset.wrapping_add(1);
-                    __jitcode_args.push((
-                        majit_metainterp::JitArgKind::Ref,
-                        __box,
-                        __bits,
-                    ));
+            if heap_vable_name.as_ref().is_some_and(|n| f.name == *n) {
+                heap_vable_identity_argbox_push()
+            } else {
+                let fname = &f.name;
+                quote! {
+                    {
+                        let __bits = state.#fname as i64;
+                        let __box = majit_ir::OpRef::input_arg_ref(__red_offset);
+                        __red_offset = __red_offset.wrapping_add(1);
+                        __jitcode_args.push((
+                            majit_metainterp::JitArgKind::Ref,
+                            __box,
+                            __bits,
+                        ));
+                    }
                 }
             }
         })
@@ -162,7 +185,50 @@ fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
     }
 }
 
-pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+/// One argbox for a `virtualizable_fields` heap object.
+///
+/// `pyjitpl.py` `_nonstandard_virtualizable` step 3: the walk's vable
+/// base is standard only when it IS `virtualizable_boxes[-1]`. A heap
+/// frame's entry index is not that box on a bridge (fail args are not
+/// the loop's reds), so this slot carries the identity box itself. It
+/// is the object's one red (`warmspot.py` `make_virtualizable_infos`
+/// `index_of_virtualizable`), occupying `__red_offset` so later ref
+/// scalars mint distinct `input_arg_ref` boxes.
+fn heap_vable_identity_argbox_push() -> TokenStream {
+    quote! {
+        {
+            let __vable_argbox = match (
+                __ctx.standard_virtualizable_box(),
+                __ctx.standard_virtualizable_concrete(),
+            ) {
+                (Some(__op), Some(majit_ir::Value::Ref(__r))) => (
+                    majit_metainterp::JitArgKind::Ref,
+                    __op,
+                    __r.as_usize() as i64,
+                ),
+                (Some(__op), Some(majit_ir::Value::Int(__bits))) => (
+                    majit_metainterp::JitArgKind::Ref,
+                    __op,
+                    __bits,
+                ),
+                _ => {
+                    let Some(__fallback) = __ctx.standard_virtualizable_jitcode_argbox() else {
+                        return TraceAction::Abort;
+                    };
+                    __fallback
+                }
+            };
+            __jitcode_args.push(__vable_argbox);
+            __red_offset = __red_offset.wrapping_add(1);
+        }
+    }
+}
+
+pub fn generate_trace_fn(
+    config: &JitInterpConfig,
+    func: &ItemFn,
+    has_infer_call_arm: bool,
+) -> TokenStream {
     let fn_name = &func.sig.ident;
     let trace_fn_name = format_ident!("__trace_{}", fn_name);
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", fn_name);
@@ -243,6 +309,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         &config.native_tag_small,
         &config.native_identity,
         config.split_dispatch,
+        has_infer_call_arm,
         config.switch_dispatch,
     )
     .with_loop_carried_greens(
@@ -254,7 +321,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 
     let env_type = &config.env_type;
     let state_type = &config.state_type;
-    let red_argbox_pushes = plain_red_argbox_pushes(config);
+    let red_argbox_pushes = plain_red_argbox_pushes(config, has_infer_call_arm);
 
     // Dispatch JitCode singleton produced by lower_dispatch_body.
     // `__trace_*` invokes it; the install pipeline registers it as the
@@ -265,7 +332,13 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // factory will emit — preserving the no-growth invariant asserted in
     // `__trace_*` below for the dispatch JitCode build path.
     let (_, portal_ref_args, _) = lowerer_config.portal_input_kind_counts();
-    let dispatch_lowerer_config = lowerer_config.with_vable_input_ref_reg(portal_ref_args);
+    // Heap virtualizable: the object's one red sits at its declared
+    // position among the ref state fields (`warmspot.py`
+    // `make_virtualizable_infos` `index_of_virtualizable`). `[.. ; virt]`
+    // still extra-pushes the state identity at `portal_ref_args`.
+    let vable_input_reg =
+        portal_ref_args.saturating_add(lowerer_config.heap_vable_ref_pos().unwrap_or(0));
+    let dispatch_lowerer_config = lowerer_config.with_vable_input_ref_reg(vable_input_reg);
     let (
         dispatch_body,
         dispatch_prebuild,
@@ -316,53 +389,25 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // `with_trace_ctx_and_token_resolver` split-borrow helper.
     // (Legacy identity closure `|pc| pc` retained at the
     // call site there.)
-    // State-field `[int; virt]` arrays also seed a standard-virtualizable
-    // identity: the OpRef of `virtualizable_boxes[-1]` must reach ref reg 1
-    // so the `getarrayitem_vable_*` dispatch ops resolve the same box that
+    // A state-as-vable identity (`[.. ; virt]`, or a sub-JitCode arm
+    // (`split_dispatch` / infer / `inline_pipeline_*`) with scalar/`ref(_)`/
+    // `str` fields) seeds a standard-virtualizable identity: the OpRef of
+    // `virtualizable_boxes[-1]` must reach the extra-pushed ref register so
+    // `getfield_vable_*` / `getarrayitem_vable_*` resolve the same box that
     // `init_virtualizable_boxes` minted (identity-equal per
-    // `begin_nonstandard_virtualizable` Step 3). Push the identity argbox for
-    // both the PyFrame-style declaration and the state-field virt-array case.
-    let state_has_virt_array = config
-        .state_fields
-        .as_ref()
-        .map(|sf| {
-            sf.fields
-                .iter()
-                .any(|f| matches!(f.kind, crate::jit_interp::StateFieldKind::VirtArray(_)))
-        })
-        .unwrap_or(false);
-    // `pyjitpl.py` `_nonstandard_virtualizable` step 3: the walk's vable
-    // base is standard only when it IS `virtualizable_boxes[-1]`. A heap
-    // frame's entry index is not that box on a bridge (fail args are not
-    // the loop's reds), so the declaration pushes the identity box itself.
-    // A state-level `[.. ; virt]` array keeps the entry-index argbox: its
-    // identity slot and `virtualizable_boxes[-1]` are the same inputarg.
-    let push_virtualizable_argbox = if config.virtualizable_decl.is_some() {
-        quote! {
-            let __vable_argbox = match (
-                __ctx.standard_virtualizable_box(),
-                __ctx.standard_virtualizable_concrete(),
-            ) {
-                (Some(__op), Some(majit_ir::Value::Ref(__r))) => (
-                    majit_metainterp::JitArgKind::Ref,
-                    __op,
-                    __r.as_usize() as i64,
-                ),
-                (Some(__op), Some(majit_ir::Value::Int(__bits))) => (
-                    majit_metainterp::JitArgKind::Ref,
-                    __op,
-                    __bits,
-                ),
-                _ => {
-                    let Some(__fallback) = __ctx.standard_virtualizable_jitcode_argbox() else {
-                        return TraceAction::Abort;
-                    };
-                    __fallback
-                }
-            };
-            __jitcode_args.push(__vable_argbox);
-        }
-    } else if state_has_virt_array {
+    // `begin_nonstandard_virtualizable` Step 3). A `virtualizable_fields`
+    // heap object is already a named red among the ref scalars and is
+    // pushed once in `plain_red_argbox_pushes`.
+    let state_has_vable_identity = super::state_is_vable_identity(
+        config.virtualizable_decl.as_ref(),
+        config.state_fields.as_ref(),
+        config.split_dispatch,
+        has_infer_call_arm,
+    );
+    // `[.. ; virt]` keeps the extra identity argbox: its identity slot
+    // and `virtualizable_boxes[-1]` are the same inputarg. A heap
+    // virtualizable occupies its declared ref slot instead.
+    let push_virtualizable_argbox = if state_has_vable_identity {
         quote! {
             let Some(__vable_argbox) = __ctx.standard_virtualizable_jitcode_argbox() else {
                 return TraceAction::Abort;
@@ -463,7 +508,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         fn #trace_fn_name<__R: majit_metainterp::JitCodeRuntime>(
             __ctx: &mut majit_metainterp::TraceCtx,
             __sym: &mut #sym_ty,
-            state: &#state_type,
+            state: &mut #state_type,
             program: &#env_type,
             pc: usize,
             #(#portal_green_param_decls)*

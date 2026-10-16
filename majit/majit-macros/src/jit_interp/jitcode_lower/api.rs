@@ -21,6 +21,44 @@ pub struct GeneratedJitCodeBody {
     pub red_schema: Vec<(String, TokenStream)>,
 }
 
+/// Failure from a per-arm sub-JitCode body (`split_dispatch` / infer /
+/// `inline_pipeline_*`). A degrade is the historical abort-stub path; an
+/// identity-slot access must fail expansion instead.
+#[derive(Debug)]
+pub(crate) enum SubJitcodeBodyError {
+    Degrade(String),
+    /// The arm would emit `load_state_field*` / `store_state_field*` for
+    /// this state field. `MIFrame.setup_call` / `bhimpl_inline_call_*`
+    /// copy declared args only, so a callee cannot reach portal identity
+    /// reds.
+    IdentitySlot {
+        field: String,
+        span: proc_macro2::Span,
+    },
+}
+
+impl SubJitcodeBodyError {
+    /// Expansion diagnostic for an identity-slot access inside a
+    /// sub-JitCode arm. `warmspot.py` `make_virtualizable_infos` has one
+    /// virtualizable per jitdriver, so leftover state scalars stay portal
+    /// reds.
+    pub(crate) fn identity_slot_message(arm: &str, field: &str) -> String {
+        format!(
+            "sub-JitCode arm `{arm}` emits load/store_state_field* for state field `{field}`; \
+             a sub-JitCode cannot reach identity-slot state reds \
+             (`MIFrame.setup_call` copies declared args only; `bhimpl_inline_call_*`). \
+             With `virtualizable_fields` declared the state struct is not the virtualizable \
+             (`warmspot.py` `make_virtualizable_infos` has one virtualizable per jitdriver), \
+             so `{field}` must be a field of the declared virtualizable object \
+             (or the arm must not be split)"
+        )
+    }
+}
+
+fn sub_jitcode_lower_error(lowerer: &mut Lowerer<'_>) -> SubJitcodeBodyError {
+    SubJitcodeBodyError::Degrade(lowerer.take_body_failure_reason())
+}
+
 #[allow(dead_code)]
 pub fn try_generate_jitcode_body(body: &Expr) -> Option<TokenStream> {
     try_generate_jitcode_body_inner(body, None).map(|p| p.body)
@@ -183,10 +221,12 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     body: &Expr,
     config: Option<&LowererConfig>,
     caller_locals: &[(String, Binding)],
-) -> Result<(GeneratedJitCodeBody, Vec<CallerLocalLayout>), String> {
+) -> Result<(GeneratedJitCodeBody, Vec<CallerLocalLayout>), SubJitcodeBodyError> {
     let stmts = extract_stmts(body);
     if stmts.is_empty() {
-        return Err("arm body has no statements to lower".to_string());
+        return Err(SubJitcodeBodyError::Degrade(
+            "arm body has no statements to lower".to_string(),
+        ));
     }
 
     let mut lowerer = Lowerer::new(config);
@@ -239,8 +279,14 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
             for rest in &stmts[i + 1..] {
                 let _ = lowerer.lower_stmt(rest);
             }
-            return Err(lowerer.take_body_failure_reason());
+            return Err(sub_jitcode_lower_error(&mut lowerer));
         }
+    }
+    // Completed body with load/store_state_field*: assembler.rs
+    // `assert_sub_jitcode_has_no_identity_slots` would trip at construct
+    // time. Fail expansion at the field (`MIFrame.setup_call`).
+    if let Some((field, span)) = lowerer.sub_jitcode_identity_slot.take() {
+        return Err(SubJitcodeBodyError::IdentitySlot { field, span });
     }
 
     // flatten.py GraphFlattener.make_return emits void_return for a void
@@ -283,12 +329,14 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
     config: Option<&LowererConfig>,
     caller_locals: &[(String, Binding)],
     increment: i64,
-) -> Result<(GeneratedJitCodeBody, Vec<CallerLocalLayout>), String> {
+) -> Result<(GeneratedJitCodeBody, Vec<CallerLocalLayout>), SubJitcodeBodyError> {
     let stmts = extract_stmts(body);
     // The predicate (`arm_is_pure_pc_advance`) guarantees a trailing `pc += N`,
     // which is replaced by the explicit pc-return below.  Lower only the work.
     let Some((_pc_advance, work)) = stmts.split_last() else {
-        return Err("arm body has no statements to lower".to_string());
+        return Err(SubJitcodeBodyError::Degrade(
+            "arm body has no statements to lower".to_string(),
+        ));
     };
 
     let mut lowerer = Lowerer::new(config);
@@ -333,15 +381,21 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
             for rest in &work[i + 1..] {
                 let _ = lowerer.lower_stmt(rest);
             }
-            return Err(lowerer.take_body_failure_reason());
+            return Err(sub_jitcode_lower_error(&mut lowerer));
         }
+    }
+    // Same completed-body check as `try_generate_jitcode_body_parts_with_caller_bindings`.
+    if let Some((field, span)) = lowerer.sub_jitcode_identity_slot.take() {
+        return Err(SubJitcodeBodyError::IdentitySlot { field, span });
     }
 
     // `pc` is collected as a caller-local (the trailing `pc += N` references it),
     // so it is pre-bound at its callee reg; the work statements only read it, so
     // the binding still holds the incoming pc.  Return pc + increment.
     let Some(pc_binding) = lowerer.bindings.get("pc") else {
-        return Err("arm body has no `pc` binding for the pc-return writeback".to_string());
+        return Err(SubJitcodeBodyError::Degrade(
+            "arm body has no `pc` binding for the pc-return writeback".to_string(),
+        ));
     };
     let pc_reg = pc_binding.reg;
     let ret_reg = lowerer.alloc_reg();

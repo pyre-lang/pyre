@@ -420,16 +420,15 @@ pub struct BlackholeInterpreter {
     /// `handler_inline_call_nested_ext` through
     /// [`Self::reset_for_inline_reuse`].
     ///
-    /// That reset does NOT restore `Default::default()`, and reading it as if
-    /// it did is how `state_field_layout` came to be missing from
-    /// [`Self::clone_context_from`].  `position` / `last_opcode_position` /
-    /// `entry_position` / `jitcode` survive it and are overwritten by the
-    /// [`Self::setposition`] the take path always runs; `dispatch_table` and
-    /// the vable fields survive it and are overwritten by
-    /// [`Self::clone_context_from`]; `inline_callee_scratch` survives it on
-    /// purpose, which is what makes a grandchild frame free too.  A reused
-    /// frame is indistinguishable from a fresh one because those THREE steps
-    /// together cover every field, not because any one of them does.
+    /// That reset does NOT restore `Default::default()`.  `position` /
+    /// `last_opcode_position` / `entry_position` / `jitcode` survive it and
+    /// are overwritten by the [`Self::setposition`] the take path always
+    /// runs; `dispatch_table` and the vable fields survive it and are
+    /// overwritten by [`Self::clone_context_from`]; `inline_callee_scratch`
+    /// survives it on purpose, which is what makes a grandchild frame free
+    /// too.  A reused frame is indistinguishable from a fresh one because
+    /// those THREE steps together cover every field, not because any one of
+    /// them does.
     pub(crate) inline_callee_scratch: Option<Box<BlackholeInterpreter>>,
     /// Per-kind argument lists for the native arm of `BC_INLINE_CALL`.
     ///
@@ -459,9 +458,9 @@ pub struct BlackholeInterpreter {
     /// `state_field` handlers can map a logical field/array index to the
     /// flat register slot the resume reader seeded.  Empty (no scalars /
     /// arrays) for pyre frames, which never dispatch `state_field` opcodes.
-    /// An inline callee inherits the caller's, because a `split_dispatch`
-    /// sub-jitcode dispatches the SAME machine's state fields — see
-    /// [`Self::clone_context_from`], which used to leave it blanked.
+    /// Inline callees do not emit `load_state_field*` / `store_state_field*`
+    /// (`bhimpl_inline_call_*` copies declared args only), so they do not
+    /// read this layout.
     pub state_field_layout: StateFieldLayout,
     /// Address of this thread's [`BH_LAST_EXC_VALUE`] cell. Residual and
     /// inline-call handlers clear and read that cell once per host call;
@@ -886,20 +885,6 @@ impl BlackholeInterpreter {
         self.jitdrivers_sd = std::sync::Arc::clone(&parent.jitdrivers_sd);
         self.virtualizable_stack_base = parent.virtualizable_stack_base;
         self.record_caught_exception = parent.record_caught_exception;
-        // `state_field_layout` belongs to the same group and was missing from
-        // it. A sub-jitcode's `load_state_field` reads
-        // `state_field_layout.scalar_slot(field_idx)`, and the reused callee
-        // frame arrives with the layout `reset_for_inline_reuse` blanked, so
-        // without this line the slot resolves through an all-zero default:
-        // `int_scalar_base + field_idx` = `0 + field_idx`, which addresses the
-        // sub-jitcode's own ARGUMENT registers. The range check that would
-        // have caught it is on the layout, not here, and it is an `assert!`
-        // only since this line was written.
-        //
-        // The layout describes the machine, not the frame — a sub-jitcode
-        // dispatches the same state fields the portal does — so the parent's
-        // is the right one, exactly as for the vable handles above.
-        self.state_field_layout = parent.state_field_layout.clone();
     }
 
     /// blackhole.py setposition
@@ -5341,8 +5326,10 @@ mod tests {
 
         #[test]
         fn reraise_of_a_null_exception_aborts_the_frame() {
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.exception_last_value = 0;
             let err = super::handler_reraise(&mut bh, &[], 0)
@@ -5353,8 +5340,10 @@ mod tests {
 
         #[test]
         fn obsolete_vtable_method_opcode_bails_instead_of_panicking() {
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             let err = super::handler_vtable_method_ptr_bail(&mut bh, &[], 0)
                 .expect_err("unsupported named vtable lookup must leave blackhole");
@@ -5504,8 +5493,10 @@ mod tests {
         #[test]
         fn production_bh_builder_wires_every_canonical_inline_call_byte() {
             use majit_jitcode::insns;
-            let builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             for (opname, byte) in [
                 ("inline_call_r_i/dR>i", insns::BC_INLINE_CALL_R_I),
@@ -5532,8 +5523,10 @@ mod tests {
         /// is already wired, only the curated byte was missing.
         #[test]
         fn production_bh_builder_wires_cast_int_to_float() {
-            let builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             let byte = majit_jitcode::insns::BC_CAST_INT_TO_FLOAT;
             let slot = builder.dispatch_table[byte as usize];
@@ -5549,8 +5542,10 @@ mod tests {
         /// `bhimpl_cast_float_to_int` handler in the production builder.
         #[test]
         fn production_bh_builder_wires_cast_float_to_int() {
-            let builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             let byte = majit_jitcode::insns::BC_CAST_FLOAT_TO_INT;
             let slot = builder.dispatch_table[byte as usize];
@@ -5566,8 +5561,10 @@ mod tests {
         #[test]
         fn production_bh_builder_leaves_call_assembler_unwired() {
             use majit_jitcode::insns;
-            let builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             for byte in [
                 insns::BC_CALL_ASSEMBLER_INT,
@@ -5592,8 +5589,10 @@ mod tests {
         #[test]
         fn production_bh_builder_leaves_cond_call_ext_unwired() {
             use majit_jitcode::insns;
-            let builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             for byte in [
                 insns::BC_COND_CALL_VOID,
@@ -5624,8 +5623,10 @@ mod tests {
         #[test]
         fn production_bh_builder_wires_every_interior_field_load() {
             use majit_jitcode::insns;
-            let builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             for (opname, byte) in [
                 (
@@ -5737,8 +5738,10 @@ mod tests {
             // route through `handler_inline_call_nested_ext`
             // (the production builder shape) so this test exercises the
             // same path as the production blackhole resume.
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             assert!(
                 builder.unwired_opnames().is_empty(),
                 "build_inline_call_only_bh_builder left opnames unwired: {:?}",
@@ -5809,8 +5812,10 @@ mod tests {
             };
 
             for portal in [true, false] {
-                let mut builder =
-                    super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+                let mut builder = super::build_inline_call_only_bh_builder(&[(
+                    "recursive_call_v/iIRFIRF",
+                    majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+                )]);
                 let mut bh = builder.acquire_interp();
                 bh.setposition(std::sync::Arc::new(build_chain(portal)), 0);
                 bh.registers_i[0] = 42;
@@ -5860,8 +5865,10 @@ mod tests {
                 jitcode
             };
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut portal_bh = builder.acquire_interp();
             portal_bh.setposition(std::sync::Arc::new(build(true)), 0);
             portal_bh.virtualizable_ptr = 0x2000;
@@ -5915,8 +5922,10 @@ mod tests {
             caller_b.int_return(0);
             let caller_jitcode = caller_b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             // `jitdrivers_sd[jdindex]` for the stamped portal jitcode.
             builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
                 result_type: super::BhReturnType::Int,
@@ -5970,8 +5979,10 @@ mod tests {
             caller_b.void_return();
             let caller_jitcode = caller_b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             // `jitdrivers_sd[jdindex]` for the stamped portal jitcode.
             builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
                 result_type: super::BhReturnType::Int,
@@ -6054,8 +6065,10 @@ mod tests {
             caller_b.int_return(0);
             let caller_jitcode = caller_b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             // `jitdrivers_sd[jdindex]` for the stamped portal jitcode.
             builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
                 result_type: super::BhReturnType::Int,
@@ -6117,8 +6130,10 @@ mod tests {
         /// recursive-portal branch.
         #[test]
         fn every_interp_a_builder_hands_out_carries_the_jitdriver_table() {
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             builder.setup_jitdrivers_sd(vec![super::BhJitDriverSd {
                 result_type: super::BhReturnType::Int,
                 ..Default::default()
@@ -6165,8 +6180,10 @@ mod tests {
         /// the dispatch JitCode's argument registers.
         #[test]
         fn released_interp_does_not_leak_its_state_field_layout_to_the_next_user() {
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.state_field_layout = super::StateFieldLayout::with_ref_scalars(1, 0, 0, 2, 8, 0);
             assert_eq!(bh.state_field_layout.ref_scalar_slot(0), 8);
@@ -6198,8 +6215,10 @@ mod tests {
             b.void_return();
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -6224,8 +6243,10 @@ mod tests {
             b.void_return();
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -6255,8 +6276,10 @@ mod tests {
             b.void_return();
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -6300,8 +6323,10 @@ mod tests {
             b.int_return(2);
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -6339,8 +6364,10 @@ mod tests {
             b.int_return(2);
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
 
@@ -6363,8 +6390,10 @@ mod tests {
             b.int_return(0);
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
 
@@ -6427,8 +6456,10 @@ mod tests {
             b.int_return(2);
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             bh.record_caught_exception = Some(probe_exception_slot_at_record_time);
@@ -6471,8 +6502,10 @@ mod tests {
             b.int_return(0);
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -6509,8 +6542,10 @@ mod tests {
             b.int_return(0);
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -6539,8 +6574,10 @@ mod tests {
         #[test]
         fn test_bh_abort_permanent_rehomes_exception_into_walked_root() {
             const EXC: i64 = 0x5eed_0001;
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             super::BH_LAST_EXC_VALUE.with(|c| c.set(EXC));
 
@@ -6584,8 +6621,10 @@ mod tests {
             b.int_return(0);
             let jitcode = b.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -6627,8 +6666,10 @@ mod tests {
             main.int_return(1);
             let main_jitcode = main.finish();
 
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(main_jitcode), 0);
             let _ = bh.run();
@@ -6649,8 +6690,10 @@ mod tests {
         /// recursive_call opcode.
         #[test]
         fn test_clone_context_from_mirrors_acquire_interp_fields() {
-            let mut builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let mut builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let mut parent = builder.acquire_interp();
             let table: &'static [BhDescr; 2] = Box::leak(Box::new([
                 BhDescr::VableField { index: 1 },
@@ -7061,8 +7104,10 @@ mod tests {
             // the inline builder's insns map so `wire_handler` installs a
             // real handler; a forward blackhole resume through an unwired
             // byte panics at `dispatch_step`.
-            let builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let placeholder = super::unwired_handler_placeholder as *const () as usize;
             for byte in [
                 majit_jitcode::insns::BC_FLOAT_LT,
@@ -7894,60 +7939,8 @@ impl StateFieldLayout {
 
 /// `load_state_field/di` — `registers_i[dest] = registers_i[slot(field_idx)]`.
 /// Encoding: 1× u16 `field_idx` + 1× u8 dest register = 3 bytes.
-fn portal_registers_i(bh: &BlackholeInterpreter) -> &[i64] {
-    let mut root = bh;
-    while let Some(ref parent) = root.nextblackholeinterp {
-        root = parent;
-    }
-    &root.registers_i
-}
-
-fn portal_registers_i_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
-    let mut root: *mut BlackholeInterpreter = bh;
-    unsafe {
-        while let Some(ref mut parent) = (*root).nextblackholeinterp {
-            root = parent.as_mut();
-        }
-        (*root).registers_i.as_mut_slice()
-    }
-}
-
-fn portal_registers_r(bh: &BlackholeInterpreter) -> &[i64] {
-    let mut root = bh;
-    while let Some(ref parent) = root.nextblackholeinterp {
-        root = parent;
-    }
-    &root.registers_r
-}
-
-fn portal_registers_r_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
-    let mut root: *mut BlackholeInterpreter = bh;
-    unsafe {
-        while let Some(ref mut parent) = (*root).nextblackholeinterp {
-            root = parent.as_mut();
-        }
-        (*root).registers_r.as_mut_slice()
-    }
-}
-
-fn portal_registers_f(bh: &BlackholeInterpreter) -> &[i64] {
-    let mut root = bh;
-    while let Some(ref parent) = root.nextblackholeinterp {
-        root = parent;
-    }
-    &root.registers_f
-}
-
-fn portal_registers_f_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
-    let mut root: *mut BlackholeInterpreter = bh;
-    unsafe {
-        while let Some(ref mut parent) = (*root).nextblackholeinterp {
-            root = parent.as_mut();
-        }
-        (*root).registers_f.as_mut_slice()
-    }
-}
-
+/// Only the portal JitCode emits this opcode (`blackhole.py`
+/// `bhimpl_inline_call_*` never inherits caller registers).
 fn handler_load_state_field_di(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7956,7 +7949,7 @@ fn handler_load_state_field_di(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.scalar_slot(field_idx);
-    let value = portal_registers_i(bh)[slot];
+    let value = bh.registers_i[slot];
     bh.registers_i[dest] = value;
     Ok(position + 3)
 }
@@ -7972,7 +7965,7 @@ fn handler_store_state_field_di(
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.scalar_slot(field_idx);
     let value = bh.registers_i[src];
-    portal_registers_i_mut(bh)[slot] = value;
+    bh.registers_i[slot] = value;
     Ok(position + 3)
 }
 
@@ -7989,7 +7982,7 @@ fn handler_load_state_field_ref_dr(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
-    let value = portal_registers_r(bh)[slot];
+    let value = bh.registers_r[slot];
     bh.registers_r[dest] = value;
     Ok(position + 3)
 }
@@ -8005,7 +7998,7 @@ fn handler_store_state_field_ref_dr(
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
     let value = bh.registers_r[src];
-    portal_registers_r_mut(bh)[slot] = value;
+    bh.registers_r[slot] = value;
     Ok(position + 3)
 }
 
@@ -8019,7 +8012,7 @@ fn handler_load_state_field_float_df(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.float_scalar_slot(field_idx);
-    let value = portal_registers_f(bh)[slot];
+    let value = bh.registers_f[slot];
     bh.registers_f[dest] = value;
     Ok(position + 3)
 }
@@ -8035,7 +8028,7 @@ fn handler_store_state_field_float_df(
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.float_scalar_slot(field_idx);
     let value = bh.registers_f[src];
-    portal_registers_f_mut(bh)[slot] = value;
+    bh.registers_f[slot] = value;
     Ok(position + 3)
 }
 
@@ -11264,6 +11257,24 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         "getarrayitem_raw_i/iid>i".to_string(),
         majit_jitcode::insns::BC_GETARRAYITEM_RAW_I,
     );
+    // `blackhole.py` `bhimpl_setarrayitem_raw_i`: store sibling of
+    // `getarrayitem_raw_i/iid>i`. Canonical `BC_SETARRAYITEM_RAW_I`.
+    insns.insert(
+        "setarrayitem_raw_i/iiid".to_string(),
+        majit_jitcode::insns::BC_SETARRAYITEM_RAW_I,
+    );
+    // `blackhole.py` `bhimpl_getarrayitem_raw_f` / `bhimpl_setarrayitem_raw_f`.
+    // `jtransform.py` `rewrite_op_getarrayitem` / `rewrite_op_setarrayitem`
+    // pick these when `getkind(ARRAY.OF)` is float. `wire_handler` is a
+    // no-op until the key is in this map.
+    insns.insert(
+        "getarrayitem_raw_f/iid>f".to_string(),
+        majit_jitcode::insns::BC_GETARRAYITEM_RAW_F,
+    );
+    insns.insert(
+        "setarrayitem_raw_f/iifd".to_string(),
+        majit_jitcode::insns::BC_SETARRAYITEM_RAW_F,
+    );
     insns.insert(
         "getarrayitem_gc_r/rid>r".to_string(),
         majit_jitcode::insns::BC_GETARRAYITEM_GC_R_RID,
@@ -11478,6 +11489,10 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
     // below and no-ops until the key is in this map (`blackhole.py
     // bhimpl_recursive_call_v`).
     for (key, byte) in dynamic_insns {
+        debug_assert!(
+            !insns.values().any(|&b| b == *byte),
+            "dynamic insn {key} byte {byte} collides with a registered insn"
+        );
         insns.insert((*key).to_string(), *byte);
     }
     builder.setup_insns(&insns);
@@ -13738,49 +13753,7 @@ fn reject_unresolved_inline_call(
 /// already interprets that shape when `fnaddr` is 0. The canonical
 /// handlers must do the same, or `convert_and_run_from_pyjitpl` aborts
 /// mid-opcode and the portal sees `usize::MAX` instead of a merge point.
-/// Copy the portal identity-slot registers into a callee blackhole frame.
 ///
-/// `blackhole.py` `bhimpl_inline_call_*` does not build a callee interpreter.
-/// `resume.py` `rebuild_from_resumedata` writes each live register through
-/// `consume_boxes`. The slots `load_state_field` / `store_state_field` address
-/// are those registers when the parent already holds them. A plain `[int]`
-/// ptr/len is a declared `inline_call_*` argument (`MIFrame.setup_call`,
-/// `bhimpl_inline_call_ir_v`), not an implicit copy.
-fn copy_identity_slots_from_parent(
-    parent: &BlackholeInterpreter,
-    callee: &mut BlackholeInterpreter,
-) {
-    // The callee must already be seated (`setposition`). Only a body that
-    // emitted `load_state_field` / `store_state_field` reads these indices
-    // as identity slots.
-    if !callee.jitcode.reads_identity_slots() {
-        return;
-    }
-    let layout = &parent.state_field_layout;
-    let i_end = layout.int_scalar_base.saturating_add(layout.total_slots());
-    for slot in layout.int_scalar_base..i_end {
-        if slot < parent.registers_i.len() && slot < callee.registers_i.len() {
-            callee.registers_i[slot] = parent.registers_i[slot];
-        }
-    }
-    let r_end = layout
-        .ref_scalar_base
-        .saturating_add(layout.num_ref_scalars);
-    for slot in layout.ref_scalar_base..r_end {
-        if slot < parent.registers_r.len() && slot < callee.registers_r.len() {
-            callee.registers_r[slot] = parent.registers_r[slot];
-        }
-    }
-    let f_end = layout
-        .float_scalar_base
-        .saturating_add(layout.num_float_scalars);
-    for slot in layout.float_scalar_base..f_end {
-        if slot < parent.registers_f.len() && slot < callee.registers_f.len() {
-            callee.registers_f[slot] = parent.registers_f[slot];
-        }
-    }
-}
-
 /// Bytecode-only callee: `JitCodeBuilder` sub-jitcodes and translator
 /// graphs absent from `jit_trace_fnaddrs` have no machine entry, so
 /// `bhimpl_inline_call_*`'s `cpu.bh_call_*(jitcode.fnaddr)` cannot run
@@ -13800,6 +13773,11 @@ fn interpret_unresolved_inline_call(
     let Some(sub_jitcode) = handle.as_callee_jitcode() else {
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     };
+    assert!(
+        !sub_jitcode.reads_identity_slots(),
+        "inline_call callee {:?} emits load/store_state_field*; only the portal JitCode may",
+        sub_jitcode.name()
+    );
     if crate::majit_log_enabled() {
         eprintln!(
             "[bh] inline_call interpreting jitcodes[{jitcode_index}] name={:?} \
@@ -13828,11 +13806,6 @@ fn interpret_unresolved_inline_call(
             callee.registers_f[index] = value;
         }
     }
-    // `resume.py` `rebuild_from_resumedata` fills a callee's registers via
-    // `consume_boxes`. A byte-interpreted arm also reads the portal identity
-    // slots (`load_state_field`), which are not inline-call arguments, so
-    // copy the slots the parent frame already holds.
-    copy_identity_slots_from_parent(bh, &mut callee);
 
     let outcome = 'callee: {
         match callee.run() {
@@ -14266,6 +14239,11 @@ fn handler_inline_call_nested_ext(
                 bh.jitcode.exec.descrs.len()
             )
         });
+    assert!(
+        !sub_jitcode.reads_identity_slots(),
+        "inline_call callee {:?} emits load/store_state_field*; only the portal JitCode may",
+        sub_jitcode.name()
+    );
 
     // The callee frame is seated before the argument triples are decoded so
     // each one can be copied where it is read, with no list in between.  The
@@ -14294,7 +14272,6 @@ fn handler_inline_call_nested_ext(
             }
         }
     }
-    copy_identity_slots_from_parent(bh, &mut callee);
 
     let dest = decode_return_slot_at(code, &mut p);
 

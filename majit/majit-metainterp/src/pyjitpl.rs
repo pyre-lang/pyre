@@ -19373,7 +19373,6 @@ impl<M: Clone> MetaInterp<M> {
             true,
             &vable,
             &vref,
-            None,
         );
         let ctx = self.tracing.as_mut().expect("trace still active");
         let snapshot_id = ctx.capture_resumedata(snapshot);
@@ -25493,7 +25492,7 @@ mod metainterp_static_data_tests {
         assert_eq!(meta.tracing.as_ref().unwrap().box_bits(i0), Some(41));
         let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
             "recursive_call_v/iIRFIRF",
-            34,
+            crate::jitcode::insns::BC_RECURSIVE_CALL_VOID,
         )]);
         assert_eq!(
             meta.run_blackhole_interp_to_cancel_tracing(
@@ -25554,7 +25553,7 @@ mod metainterp_static_data_tests {
             ));
             let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
                 "recursive_call_v/iIRFIRF",
-                34,
+                crate::jitcode::insns::BC_RECURSIVE_CALL_VOID,
             )]);
             let outcome = meta.run_blackhole_interp_to_cancel_tracing(
                 SwitchToBlackhole {
@@ -25637,7 +25636,7 @@ mod metainterp_static_data_tests {
         let per_frame = [(0x1000, 0), (0x2000, 0)];
         let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
             "recursive_call_v/iIRFIRF",
-            34,
+            crate::jitcode::insns::BC_RECURSIVE_CALL_VOID,
         )]);
         let _ = meta.run_blackhole_interp_to_cancel_tracing(
             SwitchToBlackhole::bad_loop(),

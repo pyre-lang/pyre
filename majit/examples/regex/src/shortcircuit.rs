@@ -1672,28 +1672,6 @@ mod tests {
         );
     }
 
-    /// This portal reserves no identity-only register, which is why its
-    /// bridges exist at all.
-    ///
-    /// A state that reserves identity slots cannot be bridged across inline
-    /// frames: the snapshot trim blanks that range on every non-root frame and
-    /// nothing re-derives it, so `bridge_from_guard_resume_position` refuses
-    /// and the blackhole serves the guard. This portal fails its guards 4 to 7
-    /// frames deep, so if it ever started reserving slots every bridge count
-    /// next door would silently drop to zero and the finding would read as a
-    /// regression in the fix rather than in the declaration. Assert the
-    /// premise instead of inferring it from the counts.
-    #[test]
-    fn this_portal_reserves_no_identity_slots_so_the_decline_is_inert() {
-        assert_eq!(
-            <ShortCircuitState as majit_metainterp::JitState>::reserved_int_identity_range(),
-            None,
-            "the branching portal now reserves identity slots, so every \
-             multi-frame bridge is refused and the bridge counts in this \
-             module are measuring a different thing",
-        );
-    }
-
     /// How many bridges a pass grows, and what sets that number.
     ///
     /// The finding next door is that ten bridges do not move the deopt rate.

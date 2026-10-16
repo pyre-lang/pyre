@@ -82,7 +82,7 @@ mod scalar {
             "float write must lower to store_state_field_float; bodies: {bodies:?}"
         );
 
-        let state = FloatScalarState { a: 7, f: 3.5 };
+        let mut state = FloatScalarState { a: 7, f: 3.5 };
         let meta = state.build_meta(0, &[OP_NOP]);
         let live = state.extract_live(&meta);
         let types = state.live_value_types(&meta);
@@ -262,7 +262,7 @@ mod scalar_f32 {
     fn f32_scalar_minimal(program: &Bytecode, threshold: u32) -> i64 {
         let mut driver: JitDriver<F32State> = JitDriver::new(threshold);
         let mut pc: usize = 0;
-        let state = F32State { a: 0, f: 0.0 };
+        let mut state = F32State { a: 0, f: 0.0 };
         {
             use majit_metainterp::JitState as _;
             state
@@ -284,7 +284,7 @@ mod scalar_f32 {
     #[test]
     fn f32_scalar_extracts_f64_widened_bits() {
         use majit_metainterp::JitState as _;
-        let state = F32State { a: 0, f: 1.5f32 };
+        let mut state = F32State { a: 0, f: 1.5f32 };
         let meta = state.build_meta(0, &[OP_NOP]);
         let live = state.extract_live(&meta);
         // The f32 field is encoded as its f64 widening, so the restore path
@@ -599,7 +599,7 @@ mod virt_array_with_float_scalar {
     /// elements after all of them.
     #[test]
     fn the_entry_contract_carries_no_element_in_its_red_block() {
-        let state = MixedState {
+        let mut state = MixedState {
             sp: 0,
             cells: vec![0; 2],
             acc: 0.0,
@@ -647,10 +647,11 @@ mod virt_array_with_float_scalar {
         let mut sym = <MixedState as JitState>::create_sym(&meta, 0);
         state.initialize_sym(&mut sym, &meta);
 
-        // Plain reds live in the portal frame; `__JitSym` keeps `{name}_len`
-        // for is_compatible / fresh-entry sizing and virt-array length
-        // mirrors (fresh-callee capacity).
-        assert_eq!(sym.cells_len, 2);
+        // Plain reds live in the portal frame, including the `[int]`
+        // length (`extract_live` ptr then len). `__JitSym` keeps only
+        // virt-array length mirrors (fresh-callee capacity);
+        // `warmstate.py` `maybe_compile_and_run` does not copy a plain
+        // `[int]` length onto the dispatcher handle.
         assert_eq!(sym.stack_len_value, 2);
         assert_eq!(
             <MixedState as JitState>::count_bound_sym_inputargs(&sym),

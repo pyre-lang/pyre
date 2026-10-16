@@ -226,6 +226,62 @@ pub struct JitInterpConfig {
     pub switch_dispatch: bool,
 }
 
+/// Whether the state struct itself is the virtualizable identity.
+///
+/// `jtransform.py` `rewrite_op_getfield` / `rewrite_op_setfield` on a
+/// virtualizable field: the live object is the vable argument, shared by
+/// every frame of the portal (`pyjitpl.py` `opimpl_getfield_vable_*` /
+/// `opimpl_setfield_vable_*` on `metainterp.virtualizable_boxes`;
+/// `blackhole.py` `bhimpl_getfield_vable_*` / `bhimpl_setfield_vable_*`
+/// on the live object).
+///
+/// A `[.. ; virt]` array is always the state-as-vable path, even when a
+/// `virtualizable_fields` heap object is also declared. `split_dispatch`,
+/// or a classified Lowerable arm that stays on the sub-JitCode path
+/// because it has an inferred-policy or `inline_pipeline_*` call
+/// (`arm_body_has_infer_call`), takes the same path when that declaration
+/// is absent and a scalar, `ref(_)`, or `str` field is present, so a
+/// callee JitCode writes the same boxes the caller reads. A `str` field
+/// is a GC ref field of the virtualizable (`jtransform.py`
+/// `rewrite_op_getfield` on a virtualizable field of kind `r`;
+/// `virtualizable.py` `VirtualizableInfo` static fields of any kind).
+pub(super) fn state_is_vable_identity(
+    virtualizable_decl: Option<&VirtualizableDecl>,
+    state_fields: Option<&StateFieldsConfig>,
+    split_dispatch: bool,
+    has_infer_call_arm: bool,
+) -> bool {
+    let Some(sf) = state_fields else {
+        return false;
+    };
+    let mut has_virt = false;
+    let mut has_vable_field = false;
+    for f in &sf.fields {
+        match &f.kind {
+            StateFieldKind::VirtArray(_) => has_virt = true,
+            StateFieldKind::Scalar { .. } | StateFieldKind::Ref(_) | StateFieldKind::Str => {
+                has_vable_field = true
+            }
+            _ => {}
+        }
+    }
+    let sub_jitcode_arm = split_dispatch || has_infer_call_arm;
+    has_virt || (virtualizable_decl.is_none() && sub_jitcode_arm && has_vable_field)
+}
+
+/// True when a classified Lowerable dispatch arm would stay on the
+/// sub-JitCode path because it contains an inferred-policy or
+/// `inline_pipeline_*` call. Same predicate as
+/// `Lowerer::arm_body_has_infer_call`. A matchless portal has no
+/// classified arms and is false.
+pub(super) fn machine_has_infer_call_arm(config: &JitInterpConfig, func: &ItemFn) -> bool {
+    let Some(match_expr) = codegen_trace::find_dispatch_match(&func.block) else {
+        return false;
+    };
+    let classified = classify::classify_arms(&match_expr.arms);
+    jitcode_lower::classified_arms_have_infer_call(&classified, &config.calls, config.auto_calls)
+}
+
 /// Virtualizable frame field declaration for `#[jit_interp]`.
 ///
 /// RPython equivalent: VirtualizableInfo from virtualizable.py, combined
@@ -342,7 +398,8 @@ pub enum StateFieldKind {
         /// `int(<path>)` syntax.
         rust_type: Option<syn::Path>,
     },
-    /// Array value (e.g., `regs: [int]`) — items-pointer then length.
+    /// Array value (e.g., `regs: [int]`, `cells: [float]`) — items-pointer
+    /// then length, two INT identity reds regardless of element kind.
     /// `rlist.py` `rtype_getitem` uses `dum_nocheck` for a plain `l[i]`;
     /// `ll_getitem_nonneg`'s only check is `ll_assert`, which translation
     /// removes. `jtransform.py` `rewrite_op_getarrayitem` raw arm
@@ -705,6 +762,18 @@ pub(crate) enum CallPolicyKind {
     /// side effects (e.g. returning a node to a free-list -- RPython's `del`
     /// generates zero IR ops).
     ConcreteOnlyVoid,
+}
+
+impl CallPolicyKind {
+    pub(crate) fn is_inline_pipeline(self) -> bool {
+        matches!(
+            self,
+            Self::InlinePipelineInt
+                | Self::InlinePipelineRef
+                | Self::InlinePipelineFloat
+                | Self::InlinePipelineVoid
+        )
+    }
 }
 
 pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
@@ -1355,7 +1424,7 @@ fn parse_expr_list(input: ParseStream) -> syn::Result<Vec<Expr>> {
 /// Parse virtualizable_fields = { var: IDENT, token_offset: PATH, fields: { ... }, arrays: { ... } }
 ///
 /// Parse `state_fields = { name: type, ... }` where type is `int`, `float`,
-/// `[int]`, `[int; virt]`, `[float; virt]`, or `opaque(TypePath)`.
+/// `[int]`, `[float]`, `[int; virt]`, `[float; virt]`, or `opaque(TypePath)`.
 fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
     let content;
     braced!(content in input);
@@ -1664,166 +1733,14 @@ fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<CallEntry>> {
         .collect())
 }
 
-/// Reject a plain `[int]` state-array that is stored-to inside the traced
-/// loop. Such an array is *loop-carried*, and the observable — measured on
-/// `majit/examples/tinyframe` with this refusal disabled — is that the element
-/// does not read back its heap value: three committed value tests answer 0
-/// where the program answers 40, 40 and 5, and they answer 0 whatever the
-/// array held, including when the register is seeded through the mainloop's
-/// own input ahead of every candidate arming pc. The supported declaration for
-/// a mutated, loop-carried array is `[int; virt]`, which answers correctly on
-/// the same fixtures. A plain `[int]` array that is only *read* in the loop
-/// (or only written before it) is loop-invariant and stays valid, so the check
-/// fires solely on stores reached by the dispatch loop the lowerer traces.
-///
-/// Do not read the refusal as asking for a restore path. In the measured
-/// subject the trace carries no array operation at all — the recorded body is
-/// `IntAdd, IntGt, GuardTrue, GuardFutureCondition, Jump`, the register file
-/// is traced as loop-carried inputargs, and nothing lowers to a state-array
-/// load or store — so there is no array write for a deopt to fail to restore.
-/// What the 0 actually is remains UNMEASURED: the `[int; virt]` arm was never
-/// logged beside the plain one, so the two op inventories and the two guards'
-/// resume payloads have never been compared.
-///
-/// `validate_rejects_loop_carried_plain_array`, `validate_accepts_virt_array`
-/// and `validate_accepts_read_only_plain_array` grade *which declarations this
-/// function refuses*; none of them grades whether the refused declaration
-/// miscompiles. This is a selector with no classifier, and the readback above
-/// is the first witness it has ever had.
-fn validate_state_fields(config: &JitInterpConfig, func: &ItemFn) -> syn::Result<()> {
-    let Some(sf) = &config.state_fields else {
-        return Ok(());
-    };
-    let plain_arrays: std::collections::HashSet<String> = sf
-        .fields
-        .iter()
-        .filter(|f| matches!(f.kind, StateFieldKind::Array(_)))
-        .map(|f| f.name.to_string())
-        .collect();
-    if plain_arrays.is_empty() {
-        return Ok(());
-    }
-    // Only stores reached by the traced dispatch loop are a hazard; init
-    // stores before the loop are not traced.
-    let Some(loop_body) = find_traced_loop_body(&func.block) else {
-        return Ok(());
-    };
-    let mut finder = PlainArrayStoreFinder {
-        plain_arrays: &plain_arrays,
-        offender: None,
-    };
-    syn::visit::Visit::visit_block(&mut finder, loop_body);
-    if let Some((name, span)) = finder.offender {
-        return Err(syn::Error::new(
-            span,
-            format!(
-                "state field `{name}` is a plain `[int]` array stored inside the traced loop, \
-                 so it is loop-carried. A loop-carried plain `[int]` element does not read back \
-                 its heap value: the traced loop answers as if the element were 0, whatever the \
-                 array holds, silently miscompiling. Declare it as `[int; virt]`, which answers \
-                 correctly on the same program."
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// The `loop {}` / `while {}` body that contains the `jit_merge_point!()`
-/// marker — the region the lowerer traces.
-fn find_traced_loop_body(block: &syn::Block) -> Option<&syn::Block> {
-    for stmt in &block.stmts {
-        let syn::Stmt::Expr(expr, _) = stmt else {
-            continue;
-        };
-        let body = match expr {
-            Expr::Loop(l) => &l.body,
-            Expr::While(w) => &w.body,
-            _ => continue,
-        };
-        let has_merge_point = body
-            .stmts
-            .iter()
-            .any(|s| matches!(s, syn::Stmt::Macro(m) if m.mac.path.is_ident("jit_merge_point")));
-        if has_merge_point {
-            return Some(body);
-        }
-    }
-    None
-}
-
-struct PlainArrayStoreFinder<'a> {
-    plain_arrays: &'a std::collections::HashSet<String>,
-    offender: Option<(String, proc_macro2::Span)>,
-}
-
-impl<'a> PlainArrayStoreFinder<'a> {
-    /// `state.<field>[_]` with `<field>` a plain array → the field name.
-    fn plain_array_index_target(&self, left: &Expr) -> Option<String> {
-        let Expr::Index(idx) = left else {
-            return None;
-        };
-        let Expr::Field(f) = &*idx.expr else {
-            return None;
-        };
-        if !matches!(&*f.base, Expr::Path(p) if p.qself.is_none() && p.path.is_ident("state")) {
-            return None;
-        }
-        let syn::Member::Named(member) = &f.member else {
-            return None;
-        };
-        let name = member.to_string();
-        self.plain_arrays.contains(&name).then_some(name)
-    }
-
-    fn check_assign_target(&mut self, left: &Expr) {
-        if self.offender.is_some() {
-            return;
-        }
-        if let Some(name) = self.plain_array_index_target(left) {
-            use syn::spanned::Spanned as _;
-            self.offender = Some((name, left.span()));
-        }
-    }
-}
-
-impl<'ast, 'a> syn::visit::Visit<'ast> for PlainArrayStoreFinder<'a> {
-    fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
-        self.check_assign_target(&node.left);
-        syn::visit::visit_expr_assign(self, node);
-    }
-
-    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
-        // Compound assignment (`state.regs[i] += 1`) is a store too.
-        use syn::BinOp::*;
-        if matches!(
-            node.op,
-            AddAssign(_)
-                | SubAssign(_)
-                | MulAssign(_)
-                | DivAssign(_)
-                | RemAssign(_)
-                | BitXorAssign(_)
-                | BitAndAssign(_)
-                | BitOrAssign(_)
-                | ShlAssign(_)
-                | ShrAssign(_)
-        ) {
-            self.check_assign_target(&node.left);
-        }
-        syn::visit::visit_expr_binary(self, node);
-    }
-}
-
 /// Main entry point: transform the function with JIT support.
 pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStream {
-    if let Err(err) = validate_state_fields(&config, &func) {
-        return err.to_compile_error();
-    }
     if let Err(err) = validate_merge_point_forms(&func) {
         return err.to_compile_error();
     }
-    let trace_fn = codegen_trace::generate_trace_fn(&config, &func);
-    let state_impl = codegen_state::generate_jit_state(&config, &func);
+    let has_infer_call_arm = machine_has_infer_call_arm(&config, &func);
+    let trace_fn = codegen_trace::generate_trace_fn(&config, &func, has_infer_call_arm);
+    let state_impl = codegen_state::generate_jit_state(&config, &func, has_infer_call_arm);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
     let green_key_fn = generate_green_key_fn(&config, &func);
     let transformed_fn = transform_function(&config, &func, true);
@@ -2423,7 +2340,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __driver: &mut majit_metainterp::JitDriver<#state_type>,
             __env: &#env_type,
             __pc: usize,
-            state: &#state_type,
+            state: &mut #state_type,
             #(#portal_green_param_decls)*
             #(#carried_param_decls)*
         ) -> ::core::option::Option<(
@@ -4056,7 +3973,7 @@ fn rewrite_body(
                                     &mut #driver,
                                     #env,
                                     #pc,
-                                    &#state,
+                                    &mut #state,
                                     #(#portal_green_args),*
                                     #(#carried_green_args),*
                                 );
@@ -4228,7 +4145,7 @@ fn rewrite_body(
                                     &mut #driver,
                                     #env,
                                     #pc,
-                                    &state,
+                                    &mut state,
                                     #(#portal_green_args),*
                                     #(#carried_green_args),*
                                 );
@@ -5169,100 +5086,13 @@ mod tests {
         }
     }
 
-    fn validate(config_tokens: proc_macro2::TokenStream, func: ItemFn) -> syn::Result<()> {
-        let config: JitInterpConfig = syn::parse2(config_tokens).unwrap();
-        validate_state_fields(&config, &func)
-    }
-
-    /// A plain `[int]` array stored inside the traced loop must be rejected:
-    /// the loop-carried element does not read back its heap value.
-    #[test]
-    fn validate_rejects_loop_carried_plain_array() {
-        let func: ItemFn = parse_quote! {
-            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
-                let mut state = S { regs: vec![0; 3] };
-                let mut pc: usize = 0;
-                loop {
-                    jit_merge_point!();
-                    let op = program[pc];
-                    match op {
-                        0 => { state.regs[0] = state.regs[0] + 1; pc += 1; }
-                        _ => return state.regs[0],
-                    }
-                }
-            }
-        };
-        let err = validate(
-            quote! { state = S, env = Bytecode, greens = [pc, program],
-            state_fields = { regs: [int] } },
-            func,
-        )
-        .expect_err("loop-carried plain [int] store must be rejected");
-        assert!(err.to_string().contains("[int; virt]"));
-        assert!(err.to_string().contains("regs"));
-    }
-
-    /// `[int; virt]` is the supported loop-carried form — accepted.
-    #[test]
-    fn validate_accepts_virt_array() {
-        let func: ItemFn = parse_quote! {
-            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
-                let mut state = S { regs: vec![0; 3] };
-                let mut pc: usize = 0;
-                loop {
-                    jit_merge_point!();
-                    let op = program[pc];
-                    match op {
-                        0 => { state.regs[0] = state.regs[0] + 1; pc += 1; }
-                        _ => return state.regs[0],
-                    }
-                }
-            }
-        };
-        validate(
-            quote! { state = S, env = Bytecode, greens = [pc, program],
-            state_fields = { regs: [int; virt] } },
-            func,
-        )
-        .expect("virt array must be accepted");
-    }
-
-    /// A plain `[int]` array only *read* in the loop is loop-invariant and
-    /// stays valid — no false positive.
-    #[test]
-    fn validate_accepts_read_only_plain_array() {
-        let func: ItemFn = parse_quote! {
-            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
-                let mut state = S { regs: vec![0; 3] };
-                let mut pc: usize = 0;
-                let mut acc: i64 = 0;
-                loop {
-                    jit_merge_point!();
-                    let op = program[pc];
-                    match op {
-                        0 => { acc += state.regs[0]; pc += 1; }
-                        _ => return acc,
-                    }
-                }
-            }
-        };
-        validate(
-            quote! { state = S, env = Bytecode, greens = [pc, program],
-            state_fields = { regs: [int] } },
-            func,
-        )
-        .expect("read-only plain [int] array must be accepted");
-    }
-
-    /// An unsupported `state_fields` entry is reported the way it was
-    /// declared, brackets included.
+    /// A plain `[float]` expands the same way a plain `[int]` does.
+    /// `jtransform.py` `rewrite_op_getarrayitem` selects `getarrayitem_raw_f`
+    /// from `getkind(ARRAY.OF)`; identity slots stay two INT reds.
     ///
-    /// `parse_state_fields` accepts `[<ident>]` for any element type and
-    /// `codegen_state` is where the int-only restriction on plain arrays
-    /// lives, so `[float]` is refused there. Rendering the element type alone
-    /// printed `regs: float` — the scalar spelling the same message lists as
-    /// supported — so the reader was told their declaration was both
-    /// supported and not.
+    /// An unsupported item type is still reported with the field name and
+    /// the declared brackets, so `regs: [bool]` cannot be misread as the
+    /// scalar form `regs: bool`.
     #[test]
     fn an_unsupported_state_field_is_reported_as_declared() {
         fn expand(fields: proc_macro2::TokenStream) -> String {
@@ -5296,24 +5126,29 @@ mod tests {
 
         let flat_float = expand(quote! { acc: int, regs: [float] });
         assert!(
-            flat_float.contains("compile_error"),
-            "a plain `[float]` array has no lowering and must be refused:\n\
-             {flat_float}"
-        );
-        assert!(
-            flat_float.contains("regs: [float]"),
-            "the refusal must render the declaration, not the element type — \
-             `regs: float` names the supported scalar form instead of the \
-             rejected array one:\n{flat_float}"
+            !flat_float.contains("compile_error"),
+            "`[float]` is a supported plain array:\n{flat_float}"
         );
 
-        // The control: the same array over `int` expands cleanly, so the
-        // assertions above are about the element type and not about the
-        // fixture failing for some other reason.
         let flat_int = expand(quote! { acc: int, regs: [int] });
         assert!(
             !flat_int.contains("compile_error"),
             "`[int]` is the supported plain array:\n{flat_int}"
+        );
+
+        let err = match syn::parse2::<JitInterpConfig>(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [],
+            state_fields = { acc: int, regs: [bool] },
+        }) {
+            Err(err) => err,
+            Ok(_) => panic!("a non-int/non-float item type must fail to parse"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("regs") && msg.contains("bool"),
+            "the refusal must name the field and the declared item type:\n{msg}"
         );
     }
 

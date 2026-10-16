@@ -4244,6 +4244,202 @@ fn setarrayitem_raw_i_records_the_store_and_performs_it() {
     );
 }
 
+#[test]
+fn getarrayitem_raw_and_setarrayitem_raw_f_record_and_execute() {
+    // `getarrayitem_raw_i/iid>i` — pyjitpl.py `opimpl_getarrayitem_raw_i`
+    // via `execute_with_descr(GETARRAYITEM_RAW_I)`. Operand layout
+    // `iid>i`: 1B array + 1B index + 2B descr + 1B dst. The load is
+    // unaligned (`trace_getarrayitem_raw`), so an i64 at a non-8-aligned
+    // address still reads.
+    {
+        let byte = *insns_opname_to_byte()
+            .get("getarrayitem_raw_i/iid>i")
+            .expect("`getarrayitem_raw_i/iid>i` must be in insns table");
+        let code = [byte, 0x00, 0x01, 0x00, 0x00, 0x02];
+        let descr_pool = vec![crate::descr::raw_carray_descr(majit_ir::Type::Int, 8, true)];
+        #[repr(C, align(8))]
+        struct Aligned([u8; 16]);
+        let mut cell = Aligned([0u8; 16]);
+        let loaded: i64 = 0x0102_0304_0506_0708;
+        unsafe {
+            std::ptr::write_unaligned(cell.0.as_mut_ptr().add(1).cast::<i64>(), loaded);
+        }
+        let addr = cell.0.as_ptr() as i64 + 1;
+        assert_ne!(
+            addr as usize % 8,
+            0,
+            "the i64 slot must sit off an 8-byte boundary"
+        );
+        let mut tc = fresh_trace_ctx();
+        let array = tc.const_int(addr);
+        let index = tc.const_int(0);
+        let mut regs_i = [array, index, OpRef::NONE];
+        let mut concrete_i = [
+            ConcreteValue::Int(addr),
+            ConcreteValue::Int(0),
+            ConcreteValue::Null,
+        ];
+        let (outcome, next_pc) = run_hint_step_full(
+            &code,
+            &mut tc,
+            &mut [],
+            &mut [],
+            &mut regs_i,
+            &mut concrete_i,
+            &mut [],
+            &descr_pool,
+        )
+        .expect("`getarrayitem_raw_i/iid>i` must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc, 6,
+            "`iid>i` consumes 3 register bytes plus a 2B descr"
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemRawI);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![array, index],
+            "GetarrayitemRawI args must be [array, index]",
+        );
+        assert_eq!(
+            concrete_i[2],
+            ConcreteValue::Int(loaded),
+            "the walk executes the unaligned i64 load into the Int-bank shadow"
+        );
+        assert_eq!(
+            tc.concrete_of_opref(regs_i[2]),
+            Some(Value::Int(loaded)),
+            "pyjitpl.py opimpl_getarrayitem_raw_i stamps box.value via execute_with_descr"
+        );
+    }
+
+    // `getarrayitem_raw_f/iid>f` — pyjitpl.py `opimpl_getarrayitem_raw_f`.
+    {
+        let byte = *insns_opname_to_byte()
+            .get("getarrayitem_raw_f/iid>f")
+            .expect("`getarrayitem_raw_f/iid>f` must be in insns table");
+        let code = [byte, 0x00, 0x01, 0x00, 0x00, 0x00];
+        let descr_pool = vec![crate::descr::raw_carray_descr(
+            majit_ir::Type::Float,
+            8,
+            false,
+        )];
+        let mut cell = [0u8; 16];
+        unsafe {
+            std::ptr::write_unaligned(cell.as_mut_ptr().cast::<f64>(), 1.5);
+        }
+        let addr = cell.as_ptr() as i64;
+        let mut tc = fresh_trace_ctx();
+        let array = tc.const_int(addr);
+        let index = tc.const_int(0);
+        let mut regs_i = [array, index];
+        let mut concrete_i = [ConcreteValue::Int(addr), ConcreteValue::Int(0)];
+        let mut regs_f = [OpRef::NONE];
+        let (outcome, next_pc) = run_hint_step_full(
+            &code,
+            &mut tc,
+            &mut [],
+            &mut [],
+            &mut regs_i,
+            &mut concrete_i,
+            &mut regs_f,
+            &descr_pool,
+        )
+        .expect("`getarrayitem_raw_f/iid>f` must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc, 6,
+            "`iid>f` consumes 3 register bytes plus a 2B descr"
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemRawF);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![array, index],
+            "GetarrayitemRawF args must be [array, index]",
+        );
+        assert_eq!(
+            regs_f[0],
+            last.pos().get(),
+            "the `>f` decorator writes the dst"
+        );
+        assert_eq!(
+            tc.concrete_of_opref(regs_f[0]),
+            Some(Value::Float(1.5)),
+            "pyjitpl.py opimpl_getarrayitem_raw_f stamps box.value via execute_with_descr"
+        );
+    }
+
+    // `setarrayitem_raw_f/iifd` — pyjitpl.py `_opimpl_setarrayitem_raw_any`
+    // / `opimpl_setarrayitem_raw_f`. Operand layout `iifd`: 1B array +
+    // 1B index + 1B float-bank value + 2B descr.
+    {
+        let byte = *insns_opname_to_byte()
+            .get("setarrayitem_raw_f/iifd")
+            .expect("`setarrayitem_raw_f/iifd` must be in insns table");
+        let code = [byte, 0x00, 0x01, 0x00, 0x00, 0x00];
+        let descr_pool = vec![crate::descr::raw_carray_descr(
+            majit_ir::Type::Float,
+            8,
+            false,
+        )];
+        let mut cell = [0u8; 16];
+        let addr = cell.as_mut_ptr() as i64;
+        let mut tc = fresh_trace_ctx();
+        let array = tc.const_int(addr);
+        let index = tc.const_int(1);
+        let value = tc.const_float(1.5f64.to_bits() as i64);
+        let mut regs_i = [array, index];
+        let mut concrete_i = [ConcreteValue::Int(addr), ConcreteValue::Int(1)];
+        let mut regs_f = [value];
+        let (outcome, next_pc) = run_hint_step_full(
+            &code,
+            &mut tc,
+            &mut [],
+            &mut [],
+            &mut regs_i,
+            &mut concrete_i,
+            &mut regs_f,
+            &descr_pool,
+        )
+        .expect("`setarrayitem_raw_f/iifd` must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc, 6,
+            "`iifd` consumes 3 register bytes plus a 2B descr"
+        );
+        let stored = unsafe { std::ptr::read_unaligned(cell.as_ptr().add(8).cast::<f64>()) };
+        assert_eq!(stored, 1.5, "the walk performs the store it records");
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::SetarrayitemRaw);
+        assert_eq!(
+            last.getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![array, index, value],
+            "SetarrayitemRaw args must be [array, index, value]",
+        );
+        assert_eq!(
+            regs_i,
+            [array, index],
+            "a raw array store leaves the int registers untouched"
+        );
+        assert_eq!(
+            regs_f,
+            [value],
+            "a raw array store leaves the float register untouched"
+        );
+    }
+}
+
 /// Float twin of the above: the value comes from the Float bank and the
 /// descr names a `CArray(Float)`.
 #[test]

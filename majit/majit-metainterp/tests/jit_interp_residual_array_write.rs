@@ -65,7 +65,7 @@ pub type Bytecode = [u8];
 fn arr_minimal(program: &Bytecode, threshold: u32) -> i64 {
     let mut driver: JitDriver<ArrTestState> = JitDriver::new(threshold);
     let mut pc: usize = 0;
-    let state = ArrTestState { a: 0, sel: 0 };
+    let mut state = ArrTestState { a: 0, sel: 0 };
     {
         use majit_metainterp::JitState as _;
         state
@@ -186,7 +186,7 @@ mod without_the_bracket_suffix {
     fn field_only(program: &Bytecode, threshold: u32) -> i64 {
         let mut driver: JitDriver<FieldOnlyState> = JitDriver::new(threshold);
         let mut pc: usize = 0;
-        let state = FieldOnlyState { a: 0, sel: 0 };
+        let mut state = FieldOnlyState { a: 0, sel: 0 };
         {
             use majit_metainterp::JitState as _;
             state
@@ -278,7 +278,7 @@ mod unsigned_elements {
     fn byte_elements(program: &Bytecode, threshold: u32) -> i64 {
         let mut driver: JitDriver<ByteState> = JitDriver::new(threshold);
         let mut pc: usize = 0;
-        let state = ByteState { a: 0, sel: 0 };
+        let mut state = ByteState { a: 0, sel: 0 };
         {
             use majit_metainterp::JitState as _;
             state
