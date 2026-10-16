@@ -99,11 +99,16 @@ pub unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
     }
 }
 
-/// [`w_list_lock`] for the residual-call ABI: the guard's lock word.  The
-/// jitcode's drop of the guard releases it through [`w_list_lock_release`].
+/// [`w_list_lock`] for the residual-call ABI: the guard's lock word.
+/// Arguments and the result are descr words (`'r'`/`'i'` → i64;
+/// `descr.py` `CallDescr.create_call_stub`, `callbuilder.py` `emit_raw_call`).
+/// Conversion matches `helper_arg_from_i64` / `helper_return_to_i64` on the
+/// macro trampoline (`emit_helper_fnaddr_registration`). The jitcode's drop
+/// of the guard releases it through [`w_list_lock_release`].
 /// `obj` must be a live list, as for [`w_list_lock_acquire`].
-pub extern "C" fn w_list_lock_jit_abi(obj: PyObjectRef) -> usize {
-    std::mem::ManuallyDrop::new(unsafe { w_list_lock(obj) }).lock
+pub extern "C" fn w_list_lock_jit_abi(obj: i64) -> i64 {
+    let obj = obj as usize as PyObjectRef;
+    std::mem::ManuallyDrop::new(unsafe { w_list_lock(obj) }).lock as i64
 }
 
 // The traced call names `w_list_lock`. Its return is `ListGuard`, which the

@@ -269,7 +269,7 @@ fn release_gil_runtime_addr(addr: u64) -> u64 {
 }
 
 fn not_linked_addr() -> u64 {
-    call_release_gil_target_not_linked as *const () as usize as u64
+    pyre_interpreter::residual_word_addr!(0, call_release_gil_target_not_linked) as usize as u64
 }
 
 /// Stand-in target for a `CALL_RELEASE_GIL` funcptr that this binary does

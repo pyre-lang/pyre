@@ -3524,9 +3524,9 @@ pub struct GuardGcTypeInfo {
 
 /// Descr-derived wasm type the direct arm would use for this op.
 ///
-/// CallN's void-word vs true-void result follows the oracle's real result
-/// when one is known; otherwise it follows `result_size`. Shared by the
-/// direct-vs-trampoline predicate and the emitter's type-index choice.
+/// CallN's void-word vs true-void result follows `result_size`
+/// (`descr.py` `CallDescr.get_result_size`): 0 is void, 8 is `i64`.
+/// Shared by the direct-vs-trampoline predicate and the emitter's type-index choice.
 fn expected_direct_wasm_sig(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3536,7 +3536,7 @@ fn expected_direct_wasm_sig(
 
 fn expected_direct_wasm_sig_at(
     op: &Op,
-    constants: &indexmap::IndexMap<u32, i64>,
+    _constants: &indexmap::IndexMap<u32, i64>,
     func_arg: usize,
 ) -> Option<TypedResidualSig> {
     let descr = op.getdescr()?;
@@ -3570,7 +3570,7 @@ fn expected_direct_wasm_sig_at(
             | OpCode::CallReleaseGilN
             | OpCode::CondCallN
     );
-    let mut result = if is_void_op {
+    let result = if is_void_op {
         if cd.result_type() != Type::Void {
             return None;
         }
@@ -3592,33 +3592,7 @@ fn expected_direct_wasm_sig_at(
             Type::Void => return None,
         }
     };
-    // A void op's `result_size` is the historical dummy-word bit. When the
-    // table names the callee, its declared result wins (`get_result_size`
-    // cannot see an i32/void split the table already published).
-    if is_void_op
-        && let Some(addr) = const_funcptr_addr(op, constants, func_arg)
-        && let Some(real) = crate::residual_target_sig(addr)
-    {
-        match real.result {
-            None => result = None,
-            Some(crate::FuncSigVal::I64) | Some(crate::FuncSigVal::I32) => {
-                result = Some(ValType::I64)
-            }
-            Some(crate::FuncSigVal::F32) | Some(crate::FuncSigVal::F64) => {}
-        }
-    }
     Some((params, result))
-}
-
-fn const_funcptr_addr(
-    op: &Op,
-    constants: &indexmap::IndexMap<u32, i64>,
-    func_arg: usize,
-) -> Option<i64> {
-    let func_ptr = op.getarglist().get(func_arg).map(|arg| arg.to_opref())?;
-    func_ptr
-        .is_constant()
-        .then(|| resolve_const_bits(constants, func_ptr))
 }
 
 fn func_sig_val_to_valtype(val: crate::FuncSigVal) -> ValType {
@@ -3641,37 +3615,12 @@ fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
     )
 }
 
-/// True when `real` differs from `expected` only by a narrower wasm spelling
-/// of the same descr slot: i32 for an i64, or f32 for an f64 or for i64 bits.
-fn table_type_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
-    if expected.0.len() != real.0.len() || expected.1.is_some() != real.1.is_some() {
-        return false;
-    }
-    for (want, got) in expected.0.iter().zip(&real.0) {
-        if !narrow_valtype(*want, *got) {
-            return false;
-        }
-    }
-    match (expected.1, real.1) {
-        (None, None) => true,
-        (Some(want), Some(got)) => narrow_valtype(want, got),
-        _ => false,
-    }
-}
-
-fn narrow_valtype(want: ValType, got: ValType) -> bool {
-    matches!(
-        (want, got),
-        (a, b) if a == b
-            || (want == ValType::I64 && matches!(got, ValType::I32 | ValType::F32))
-            || (want == ValType::F64 && got == ValType::F32)
-    )
-}
-
 /// `_genop_call` emits `CallDescr.get_arg_types` / `get_result_type` /
-/// `get_result_size`. The descr is the call type. A constant callee may
-/// narrow that to the table's i32 or f32 spelling. A slot the table does
-/// not hold (a host import) keeps `jit_call`.
+/// `get_result_size`. The descr is the call type. A constant callee whose
+/// table type differs keeps `jit_call`. An unknown table type keeps
+/// `jit_call` only when the host reflects table types (`host-import` on
+/// wasm32); everywhere else the descr FUNC is the type, the same call the
+/// native backends emit.
 fn residual_callee_direct_emit_sig_at(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3683,7 +3632,6 @@ fn residual_callee_direct_emit_sig_at(
     };
     if !func_ptr.is_constant() {
         // The descr is the type, the same call the native backends emit.
-        // A constant callee below may narrow that to the table's i32 or f32.
         return Some(expected.clone());
     }
     let addr = resolve_const_bits(constants, func_ptr);
@@ -3692,13 +3640,20 @@ fn residual_callee_direct_emit_sig_at(
             let real_typed = wasm_sig_to_typed(&real);
             if real_typed == *expected {
                 Some(expected.clone())
-            } else if table_type_variance(expected, &real_typed) {
-                Some(real_typed)
             } else {
+                // Native tests inject table types; the guest is where a
+                // missing `residual_word_addr` is a programming error.
+                #[cfg(target_arch = "wasm32")]
+                debug_assert_eq!(
+                    real_typed, *expected,
+                    "residual callee table type differs from the calldescr FUNC; \
+                     publish the target through residual_word_addr \
+                     (descr.py create_call_stub, callbuilder.py emit_raw_call)"
+                );
                 None
             }
         }
-        None if cfg!(target_arch = "wasm32") => None,
+        None if cfg!(all(target_arch = "wasm32", feature = "host-import")) => None,
         None => Some(expected.clone()),
     }
 }
@@ -3775,8 +3730,9 @@ fn conditional_call_true_void_arity(
         .map(|(arity, _)| arity)
 }
 
-/// Mixed `i32`/`i64`/`f64` signature of a `COND_CALL`, when the uniform word
-/// families do not already cover it. The callee sits at arg 1.
+/// Descr-derived signature of a `COND_CALL` when the uniform word families
+/// do not already cover it. The callee sits at arg 1. A table type that
+/// differs from the descr is not emitted here.
 fn conditional_call_typed_sig(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -10530,9 +10486,9 @@ fn build_function(
                             .map(|type_idx| (sig, type_idx))
                     })
                 {
-                    // Direct in-module typed residual call: descr-derived
-                    // mixed `(i64/f64…) -> i64/f64`, or the oracle's i32-ABI
-                    // twin (`i32.wrap_i64` / `i64.extend_i32_u`).
+                    // Direct in-module typed residual call. The `call_indirect`
+                    // type is the descr FUNC (`'i'`/`'r'` → i64, `'f'` → f64,
+                    // `'S'` → f32).
                     let (params, result_ty) = &sig;
                     let call_args = &op.getarglist()[func_ofs + 1..];
                     debug_assert_eq!(call_args.len(), params.len());

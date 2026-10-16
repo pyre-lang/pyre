@@ -798,6 +798,77 @@ pub struct Cpu {
     pub lowering_ctx: parking_lot::RwLock<Option<super::flatten::LoweringContext>>,
 }
 
+/// wasm32: publish the descr-word shim (`word_publish::extern_addrN`) so
+/// the table type equals the calldescr FUNC. Native keeps the raw address.
+/// The stored bits are only taken as `*const ()` into jitcode constants.
+macro_rules! cpu_word {
+    (0, $f:path) => {
+        cpu_word!(@apply extern_addr0, $f,)
+    };
+    (1, $f:path) => {
+        cpu_word!(@apply extern_addr1, $f, a0)
+    };
+    (2, $f:path) => {
+        cpu_word!(@apply extern_addr2, $f, a0, a1)
+    };
+    (3, $f:path) => {
+        cpu_word!(@apply extern_addr3, $f, a0, a1, a2)
+    };
+    (4, $f:path) => {
+        cpu_word!(@apply extern_addr4, $f, a0, a1, a2, a3)
+    };
+    (5, $f:path) => {
+        cpu_word!(@apply extern_addr5, $f, a0, a1, a2, a3, a4)
+    };
+    (6, $f:path) => {
+        cpu_word!(@apply extern_addr6, $f, a0, a1, a2, a3, a4, a5)
+    };
+    (7, $f:path) => {
+        cpu_word!(@apply extern_addr7, $f, a0, a1, a2, a3, a4, a5, a6)
+    };
+    (8, $f:path) => {
+        cpu_word!(@apply extern_addr8, $f, a0, a1, a2, a3, a4, a5, a6, a7)
+    };
+    (9, $f:path) => {
+        cpu_word!(@apply extern_addr9, $f, a0, a1, a2, a3, a4, a5, a6, a7, a8)
+    };
+    (10, $f:path) => {
+        cpu_word!(@apply extern_addr10, $f, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)
+    };
+    (11, $f:path) => {
+        cpu_word!(@apply extern_addr11, $f, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10)
+    };
+    (12, $f:path) => {
+        cpu_word!(@apply extern_addr12, $f, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+    };
+    (13, $f:path) => {
+        cpu_word!(@apply extern_addr13, $f, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
+    };
+    (14, $f:path) => {
+        cpu_word!(@apply extern_addr14, $f, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13)
+    };
+    (15, $f:path) => {
+        cpu_word!(@apply extern_addr15, $f, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14)
+    };
+    (16, $f:path) => {
+        cpu_word!(@apply extern_addr16, $f, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15)
+    };
+    (@apply $addr:ident, $f:path, $($a:ident),*) => {{
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            $f
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let p = pyre_interpreter::jit_fnaddr::word_publish::$addr(|$($a),*| $f($($a),*), $f);
+            #[allow(clippy::missing_transmute_annotations)]
+            unsafe {
+                ::core::mem::transmute(p)
+            }
+        }
+    }};
+}
+
 impl Cpu {
     /// Default pyre `Cpu` — wires the production `bh_*` thunks from
     /// `crate::call_jit`. Matches the implicit `cpu = LLGraphCPU(...)`
@@ -838,115 +909,142 @@ impl Cpu {
             Some(ptr as i64)
         });
         Self {
-            call_fn: crate::call_jit::bh_call_fn,
-            call_fn_0: crate::call_jit::bh_call_fn_0,
-            call_fn_2: crate::call_jit::bh_call_fn_2,
-            call_fn_3: crate::call_jit::bh_call_fn_3,
-            call_fn_4: crate::call_jit::bh_call_fn_4,
-            call_fn_5: crate::call_jit::bh_call_fn_5,
-            call_fn_6: crate::call_jit::bh_call_fn_6,
-            call_fn_7: crate::call_jit::bh_call_fn_7,
-            call_fn_8: crate::call_jit::bh_call_fn_8,
-            call_fn_9: crate::call_jit::bh_call_fn_9,
-            call_fn_10: crate::call_jit::bh_call_fn_10,
-            call_fn_11: crate::call_jit::bh_call_fn_11,
-            call_fn_12: crate::call_jit::bh_call_fn_12,
-            call_fn_13: crate::call_jit::bh_call_fn_13,
-            call_fn_14: crate::call_jit::bh_call_fn_14,
-            load_global_fn: crate::call_jit::bh_load_global_fn,
-            load_from_dict_or_globals_fn: crate::call_jit::bh_load_from_dict_or_globals_fn,
-            call_function_ex_fn: crate::call_jit::bh_call_function_ex_fn,
-            call_kw_fn_0: crate::call_jit::bh_call_kw_0,
-            call_kw_fn_1: crate::call_jit::bh_call_kw_1,
-            call_kw_fn_2: crate::call_jit::bh_call_kw_2,
-            call_kw_fn_3: crate::call_jit::bh_call_kw_3,
-            call_kw_fn_4: crate::call_jit::bh_call_kw_4,
-            call_kw_fn_5: crate::call_jit::bh_call_kw_5,
-            call_kw_fn_6: crate::call_jit::bh_call_kw_6,
-            call_kw_fn_7: crate::call_jit::bh_call_kw_7,
-            call_kw_fn_8: crate::call_jit::bh_call_kw_8,
-            call_kw_fn_9: crate::call_jit::bh_call_kw_9,
-            call_kw_fn_10: crate::call_jit::bh_call_kw_10,
-            call_kw_fn_11: crate::call_jit::bh_call_kw_11,
-            call_kw_fn_12: crate::call_jit::bh_call_kw_12,
-            call_kw_fn_13: crate::call_jit::bh_call_kw_13,
-            load_attr_fn: crate::call_jit::bh_load_attr_fn,
-            load_method_self_fn: crate::call_jit::bh_load_method_self_fn,
-            load_special_fn: crate::call_jit::bh_load_special_fn,
-            with_except_start_fn: crate::call_jit::bh_with_except_start_fn,
-            store_attr_fn: crate::call_jit::bh_store_attr_fn,
-            binary_slice_fn: crate::call_jit::bh_binary_slice_fn,
-            store_slice_fn: crate::call_jit::bh_store_slice_fn,
-            delete_subscr_fn: crate::call_jit::bh_delete_subscr_fn,
-            delete_attr_fn: crate::call_jit::bh_delete_attr_fn,
-            list_extend_fn: crate::call_jit::bh_list_extend_fn,
-            set_add_fn: crate::call_jit::bh_set_add_fn,
-            set_update_fn: crate::call_jit::bh_set_update_fn,
-            dict_update_fn: crate::call_jit::bh_dict_update_fn,
-            map_add_fn: crate::call_jit::bh_map_add_fn,
-            dict_merge_fn: crate::call_jit::bh_dict_merge_fn,
-            list_append_fn: pyre_object::listobject::jit_list_append,
-            format_simple_fn: crate::call_jit::bh_format_simple_fn,
-            format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
-            convert_value_fn: crate::call_jit::bh_convert_value_fn,
-            import_from_fn: crate::call_jit::bh_import_from_fn,
-            load_super_attr_fn: crate::call_jit::bh_load_super_attr_fn,
-            super_attr_unwrap_fn: crate::call_jit::bh_super_attr_unwrap_fn,
-            load_deref_value_fn: crate::call_jit::bh_load_deref_value_fn,
-            store_deref_value_fn: crate::call_jit::bh_store_deref_value_fn,
-            make_cell_fn: crate::call_jit::bh_make_cell_fn,
-            make_function_fn: pyre_interpreter::runtime_ops::jit_make_function_from_globals,
-            set_function_attribute_fn: pyre_interpreter::runtime_ops::jit_set_function_attribute,
-            get_iter_fn: crate::call_jit::bh_get_iter_fn,
-            newlist_from_iter_hint_fn: pyre_interpreter::opcode_ops::jit_newlist_from_iter_hint,
-            for_iter_next_fn: pyre_interpreter::runtime_ops::jit_next,
-            for_iter_exception_match_fn: pyre_interpreter::runtime_ops::jit_exception_match,
-            unary_negative_fn: crate::call_jit::bh_unary_negative_fn,
-            unary_invert_fn: crate::call_jit::bh_unary_invert_fn,
-            unary_positive_fn: crate::call_jit::bh_unary_positive_fn,
-            load_common_constant_fn: crate::call_jit::bh_load_common_constant_fn,
-            list_to_tuple_fn: crate::call_jit::bh_list_to_tuple_fn,
-            get_len_fn: crate::call_jit::bh_get_len_fn,
-            match_sequence_fn: crate::call_jit::bh_match_sequence_fn,
-            match_mapping_fn: crate::call_jit::bh_match_mapping_fn,
-            match_keys_fn: crate::call_jit::bh_match_keys_fn,
-            match_class_fn: crate::call_jit::bh_match_class_fn,
-            unary_not_fn: crate::call_jit::bh_unary_not_fn,
-            load_fast_check_fn: crate::call_jit::bh_load_fast_check_fn,
-            unbound_local_error_fn: crate::call_jit::bh_unbound_local_error_fn,
-            compare_fn: pyre_interpreter::opcode_ops::jit_compare_value_from_tag,
-            binary_op_fn: pyre_interpreter::opcode_ops::jit_binary_value_from_tag,
-            box_int_fn: crate::call_jit::bh_box_int_fn,
-            truth_fn: crate::call_jit::bh_truth_fn,
-            load_const_fn: crate::call_jit::bh_load_const_fn,
-            store_subscr_fn: pyre_interpreter::opcode_ops::bh_store_subscr_fn,
-            getattr_fn: crate::call_jit::bh_getattr_fn,
-            load_name_fn: crate::call_jit::bh_load_name_fn,
-            store_name_fn: crate::call_jit::bh_store_name_fn,
-            store_global_fn: crate::call_jit::bh_store_global_fn,
-            delete_name_fn: crate::call_jit::bh_delete_name_fn,
-            delete_global_fn: crate::call_jit::bh_delete_global_fn,
-            load_locals_fn: crate::call_jit::bh_load_locals_fn,
-            load_build_class_fn: crate::call_jit::bh_load_build_class_fn,
-            load_import_fn: crate::call_jit::bh_load_import_fn,
-            load_import_locals_fn: crate::call_jit::bh_load_import_locals_fn,
-            load_import_globals_fn: crate::call_jit::bh_load_import_globals_fn,
-            newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
-            build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
-            build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,
-            build_string_from_array_fn: crate::call_jit::bh_build_string_from_array,
-            newlist_from_array_fn: crate::call_jit::bh_newlist_from_array,
-            unpack_sequence_fn: crate::call_jit::bh_unpack_sequence_fn,
-            unpack_item_fn: crate::call_jit::bh_unpack_item_fn,
-            unpack_ex_fn: crate::call_jit::bh_unpack_ex_fn,
-            build_slice_fn: crate::call_jit::bh_build_slice_fn,
-            normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_with_frame,
-            get_current_exception_fn: crate::call_jit::bh_get_current_exception,
-            current_exception_or_none_fn: crate::call_jit::bh_current_exception_or_none,
-            reraise_varargs_zero_fn: crate::call_jit::bh_reraise_varargs_zero,
-            set_current_exception_fn: crate::call_jit::bh_set_current_exception,
-            clear_in_flight_exception_fn: crate::call_jit::bh_clear_in_flight_exception,
-            bytecode_trace_jitted_slow_fn: crate::call_jit::bh_bytecode_trace_jitted_slow,
+            call_fn: cpu_word!(3, crate::call_jit::bh_call_fn),
+            call_fn_0: cpu_word!(2, crate::call_jit::bh_call_fn_0),
+            call_fn_2: cpu_word!(4, crate::call_jit::bh_call_fn_2),
+            call_fn_3: cpu_word!(5, crate::call_jit::bh_call_fn_3),
+            call_fn_4: cpu_word!(6, crate::call_jit::bh_call_fn_4),
+            call_fn_5: cpu_word!(7, crate::call_jit::bh_call_fn_5),
+            call_fn_6: cpu_word!(8, crate::call_jit::bh_call_fn_6),
+            call_fn_7: cpu_word!(9, crate::call_jit::bh_call_fn_7),
+            call_fn_8: cpu_word!(10, crate::call_jit::bh_call_fn_8),
+            call_fn_9: cpu_word!(11, crate::call_jit::bh_call_fn_9),
+            call_fn_10: cpu_word!(12, crate::call_jit::bh_call_fn_10),
+            call_fn_11: cpu_word!(13, crate::call_jit::bh_call_fn_11),
+            call_fn_12: cpu_word!(14, crate::call_jit::bh_call_fn_12),
+            call_fn_13: cpu_word!(15, crate::call_jit::bh_call_fn_13),
+            call_fn_14: cpu_word!(16, crate::call_jit::bh_call_fn_14),
+            load_global_fn: cpu_word!(4, crate::call_jit::bh_load_global_fn),
+            load_from_dict_or_globals_fn: cpu_word!(
+                4,
+                crate::call_jit::bh_load_from_dict_or_globals_fn
+            ),
+            call_function_ex_fn: cpu_word!(4, crate::call_jit::bh_call_function_ex_fn),
+            call_kw_fn_0: cpu_word!(3, crate::call_jit::bh_call_kw_0),
+            call_kw_fn_1: cpu_word!(4, crate::call_jit::bh_call_kw_1),
+            call_kw_fn_2: cpu_word!(5, crate::call_jit::bh_call_kw_2),
+            call_kw_fn_3: cpu_word!(6, crate::call_jit::bh_call_kw_3),
+            call_kw_fn_4: cpu_word!(7, crate::call_jit::bh_call_kw_4),
+            call_kw_fn_5: cpu_word!(8, crate::call_jit::bh_call_kw_5),
+            call_kw_fn_6: cpu_word!(9, crate::call_jit::bh_call_kw_6),
+            call_kw_fn_7: cpu_word!(10, crate::call_jit::bh_call_kw_7),
+            call_kw_fn_8: cpu_word!(11, crate::call_jit::bh_call_kw_8),
+            call_kw_fn_9: cpu_word!(12, crate::call_jit::bh_call_kw_9),
+            call_kw_fn_10: cpu_word!(13, crate::call_jit::bh_call_kw_10),
+            call_kw_fn_11: cpu_word!(14, crate::call_jit::bh_call_kw_11),
+            call_kw_fn_12: cpu_word!(15, crate::call_jit::bh_call_kw_12),
+            call_kw_fn_13: cpu_word!(16, crate::call_jit::bh_call_kw_13),
+            load_attr_fn: cpu_word!(3, crate::call_jit::bh_load_attr_fn),
+            load_method_self_fn: cpu_word!(4, crate::call_jit::bh_load_method_self_fn),
+            load_special_fn: cpu_word!(2, crate::call_jit::bh_load_special_fn),
+            with_except_start_fn: cpu_word!(3, crate::call_jit::bh_with_except_start_fn),
+            store_attr_fn: cpu_word!(4, crate::call_jit::bh_store_attr_fn),
+            binary_slice_fn: cpu_word!(3, crate::call_jit::bh_binary_slice_fn),
+            store_slice_fn: cpu_word!(4, crate::call_jit::bh_store_slice_fn),
+            delete_subscr_fn: cpu_word!(2, crate::call_jit::bh_delete_subscr_fn),
+            delete_attr_fn: cpu_word!(3, crate::call_jit::bh_delete_attr_fn),
+            list_extend_fn: cpu_word!(2, crate::call_jit::bh_list_extend_fn),
+            set_add_fn: cpu_word!(2, crate::call_jit::bh_set_add_fn),
+            set_update_fn: cpu_word!(2, crate::call_jit::bh_set_update_fn),
+            dict_update_fn: cpu_word!(2, crate::call_jit::bh_dict_update_fn),
+            map_add_fn: cpu_word!(3, crate::call_jit::bh_map_add_fn),
+            dict_merge_fn: cpu_word!(3, crate::call_jit::bh_dict_merge_fn),
+            list_append_fn: cpu_word!(2, pyre_object::listobject::jit_list_append),
+            format_simple_fn: cpu_word!(1, crate::call_jit::bh_format_simple_fn),
+            format_with_spec_fn: cpu_word!(2, crate::call_jit::bh_format_with_spec_fn),
+            convert_value_fn: cpu_word!(2, crate::call_jit::bh_convert_value_fn),
+            import_from_fn: cpu_word!(3, crate::call_jit::bh_import_from_fn),
+            load_super_attr_fn: cpu_word!(7, crate::call_jit::bh_load_super_attr_fn),
+            super_attr_unwrap_fn: cpu_word!(2, crate::call_jit::bh_super_attr_unwrap_fn),
+            load_deref_value_fn: cpu_word!(3, crate::call_jit::bh_load_deref_value_fn),
+            store_deref_value_fn: cpu_word!(2, crate::call_jit::bh_store_deref_value_fn),
+            make_cell_fn: cpu_word!(3, crate::call_jit::bh_make_cell_fn),
+            make_function_fn: cpu_word!(
+                2,
+                pyre_interpreter::runtime_ops::jit_make_function_from_globals
+            ),
+            set_function_attribute_fn: cpu_word!(
+                3,
+                pyre_interpreter::runtime_ops::jit_set_function_attribute
+            ),
+            get_iter_fn: cpu_word!(1, crate::call_jit::bh_get_iter_fn),
+            newlist_from_iter_hint_fn: cpu_word!(
+                1,
+                pyre_interpreter::opcode_ops::jit_newlist_from_iter_hint
+            ),
+            for_iter_next_fn: cpu_word!(1, pyre_interpreter::runtime_ops::jit_next),
+            for_iter_exception_match_fn: cpu_word!(
+                2,
+                pyre_interpreter::runtime_ops::jit_exception_match
+            ),
+            unary_negative_fn: cpu_word!(1, crate::call_jit::bh_unary_negative_fn),
+            unary_invert_fn: cpu_word!(1, crate::call_jit::bh_unary_invert_fn),
+            unary_positive_fn: cpu_word!(1, crate::call_jit::bh_unary_positive_fn),
+            load_common_constant_fn: cpu_word!(1, crate::call_jit::bh_load_common_constant_fn),
+            list_to_tuple_fn: cpu_word!(1, crate::call_jit::bh_list_to_tuple_fn),
+            get_len_fn: cpu_word!(1, crate::call_jit::bh_get_len_fn),
+            match_sequence_fn: cpu_word!(1, crate::call_jit::bh_match_sequence_fn),
+            match_mapping_fn: cpu_word!(1, crate::call_jit::bh_match_mapping_fn),
+            match_keys_fn: cpu_word!(2, crate::call_jit::bh_match_keys_fn),
+            match_class_fn: cpu_word!(4, crate::call_jit::bh_match_class_fn),
+            unary_not_fn: cpu_word!(1, crate::call_jit::bh_unary_not_fn),
+            load_fast_check_fn: cpu_word!(3, crate::call_jit::bh_load_fast_check_fn),
+            unbound_local_error_fn: cpu_word!(2, crate::call_jit::bh_unbound_local_error_fn),
+            compare_fn: cpu_word!(3, pyre_interpreter::opcode_ops::jit_compare_value_from_tag),
+            binary_op_fn: cpu_word!(3, pyre_interpreter::opcode_ops::jit_binary_value_from_tag),
+            box_int_fn: cpu_word!(1, crate::call_jit::bh_box_int_fn),
+            truth_fn: cpu_word!(1, crate::call_jit::bh_truth_fn),
+            load_const_fn: cpu_word!(2, crate::call_jit::bh_load_const_fn),
+            store_subscr_fn: cpu_word!(3, pyre_interpreter::opcode_ops::bh_store_subscr_fn),
+            getattr_fn: cpu_word!(2, crate::call_jit::bh_getattr_fn),
+            load_name_fn: cpu_word!(3, crate::call_jit::bh_load_name_fn),
+            store_name_fn: cpu_word!(3, crate::call_jit::bh_store_name_fn),
+            store_global_fn: cpu_word!(3, crate::call_jit::bh_store_global_fn),
+            delete_name_fn: cpu_word!(2, crate::call_jit::bh_delete_name_fn),
+            delete_global_fn: cpu_word!(2, crate::call_jit::bh_delete_global_fn),
+            load_locals_fn: cpu_word!(1, crate::call_jit::bh_load_locals_fn),
+            load_build_class_fn: cpu_word!(1, crate::call_jit::bh_load_build_class_fn),
+            load_import_fn: cpu_word!(1, crate::call_jit::bh_load_import_fn),
+            load_import_locals_fn: cpu_word!(1, crate::call_jit::bh_load_import_locals_fn),
+            load_import_globals_fn: cpu_word!(1, crate::call_jit::bh_load_import_globals_fn),
+            newtuple_from_array_fn: cpu_word!(1, crate::call_jit::bh_newtuple_from_array),
+            build_map_from_array_fn: cpu_word!(1, crate::call_jit::bh_build_map_from_array),
+            build_set_from_array_fn: cpu_word!(1, crate::call_jit::bh_build_set_from_array),
+            build_string_from_array_fn: cpu_word!(1, crate::call_jit::bh_build_string_from_array),
+            newlist_from_array_fn: cpu_word!(1, crate::call_jit::bh_newlist_from_array),
+            unpack_sequence_fn: cpu_word!(2, crate::call_jit::bh_unpack_sequence_fn),
+            unpack_item_fn: cpu_word!(2, crate::call_jit::bh_unpack_item_fn),
+            unpack_ex_fn: cpu_word!(3, crate::call_jit::bh_unpack_ex_fn),
+            build_slice_fn: cpu_word!(4, crate::call_jit::bh_build_slice_fn),
+            normalize_raise_varargs_fn: cpu_word!(
+                3,
+                crate::call_jit::bh_normalize_raise_varargs_with_frame
+            ),
+            get_current_exception_fn: cpu_word!(0, crate::call_jit::bh_get_current_exception),
+            current_exception_or_none_fn: cpu_word!(
+                0,
+                crate::call_jit::bh_current_exception_or_none
+            ),
+            reraise_varargs_zero_fn: cpu_word!(0, crate::call_jit::bh_reraise_varargs_zero),
+            set_current_exception_fn: cpu_word!(1, crate::call_jit::bh_set_current_exception),
+            clear_in_flight_exception_fn: cpu_word!(
+                0,
+                crate::call_jit::bh_clear_in_flight_exception
+            ),
+            bytecode_trace_jitted_slow_fn: cpu_word!(
+                2,
+                crate::call_jit::bh_bytecode_trace_jitted_slow
+            ),
             rtyper,
             lowering_ctx: parking_lot::RwLock::new(None),
         }

@@ -3939,6 +3939,14 @@ unsafe fn try_compare_override(
         CompareOp::Ne => "__ne__",
     };
     let rdunder = reverse_dunder(dunder).unwrap_or(dunder);
+    // Both `_invoke_comparison` calls run arbitrary Python, so a minor
+    // collection can land between them.  `gctransform/shadowstack.py`
+    // `push_roots`/`pop_roots` reloads every live GCREF after such a call;
+    // pin the operands once and swap the slot *index* rather than the
+    // values, matching `try_dispatch_binary_special`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let operands = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
     let comparison_method = |obj: PyObjectRef, name: &str| {
         if is_instance(obj) {
             let w_type = crate::typedef::r#type(obj)?;
@@ -3948,10 +3956,8 @@ unsafe fn try_compare_override(
             crate::baseobjspace::subclass_special_override(obj, name)
         }
     };
-    let a_type = crate::typedef::r#type(a);
-    let b_type = crate::typedef::r#type(b);
-    let a_ov = comparison_method(a, dunder);
-    let b_ov = comparison_method(b, rdunder);
+    let a_ov = comparison_method(operand(0), dunder);
+    let b_ov = comparison_method(operand(1), rdunder);
     if a_ov.is_none() && b_ov.is_none() {
         return Ok(None);
     }
@@ -3959,18 +3965,32 @@ unsafe fn try_compare_override(
     // proper subclass of `a`'s type and `b` overrides the reflected op, run it
     // first.
     let b_first = b_ov.is_some()
-        && match (a_type, b_type) {
+        && match (
+            crate::typedef::r#type(operand(0)),
+            crate::typedef::r#type(operand(1)),
+        ) {
             (Some(at), Some(bt)) => at != bt && issubtype_cached(bt.as_ptr(), at.as_ptr()),
             _ => false,
         };
-    let order = if b_first {
-        [(b_ov, b, a), (a_ov, a, b)]
-    } else {
-        [(a_ov, a, b), (b_ov, b, a)]
-    };
-    for (ov, recv, other) in order {
-        if let Some((method, w_type)) = ov
-            && let Some(result) = unsafe { invoke_comparison(method, recv, w_type, other) }?
+    // Methods and `w_type`s are live across the first `invoke_comparison`
+    // and used by the second; a function born in a class body is
+    // nursery-allocated and moves too.  Absent overrides pin `PY_NULL` so
+    // the slot layout stays fixed.
+    let (a_method, a_w_type) = a_ov.unwrap_or((pyre_object::PY_NULL, pyre_object::PY_NULL));
+    let (b_method, b_w_type) = b_ov.unwrap_or((pyre_object::PY_NULL, pyre_object::PY_NULL));
+    let ov_base = pyre_object::gc_roots::pin_roots(&[a_method, a_w_type, b_method, b_w_type]);
+    let ov_get = |i: usize| pyre_object::gc_roots::shadow_stack_get(ov_base + i);
+    // `_make_comparison_impl` swaps the two values; swapping the *index*
+    // keeps the pinned copies authoritative across a collection.
+    let (first, second) = if b_first { (1, 0) } else { (0, 1) };
+    for (recv_i, other_i) in [(first, second), (second, first)] {
+        let method = ov_get(recv_i * 2);
+        if method.is_null() {
+            continue;
+        }
+        let w_type = ov_get(recv_i * 2 + 1);
+        if let Some(result) =
+            unsafe { invoke_comparison(method, operand(recv_i), w_type, operand(other_i)) }?
         {
             return Ok(Some(result));
         }
@@ -3986,8 +4006,8 @@ unsafe fn try_compare_override(
 /// implementation is absent (notably `__eq__ = property(...)`).
 unsafe fn invoke_comparison(
     mut w_descr: PyObjectRef,
-    w_obj: PyObjectRef,
-    w_type: PyObjectRef,
+    mut w_obj: PyObjectRef,
+    mut w_type: PyObjectRef,
     mut w_other: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     let direct_function = std::ptr::eq(
@@ -4000,7 +4020,11 @@ unsafe fn invoke_comparison(
     let result = if direct_function {
         crate::call::call_function_impl_result(w_descr, &[w_obj, w_other])?
     } else {
-        let w_impl = match pyre_object::with_roots!(w_descr, w_other => unsafe {
+        // Non-direct arm: `space.get` allocates (`w_method_new`, a
+        // `__get__` call).  `w_obj` and `w_type` are passed to that call,
+        // and `w_descr`/`w_other` are used afterwards, so all four words
+        // are live across it (`gctransform/shadowstack.py` `push_roots`).
+        let w_impl = match pyre_object::with_roots!(w_descr, w_obj, w_type, w_other => unsafe {
             crate::baseobjspace::get(w_descr, w_obj, w_type)
         }) {
             Ok(Some(w_impl)) => w_impl,

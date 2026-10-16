@@ -3334,8 +3334,10 @@ pub fn clear_test_residual_target_sigs() {
 }
 
 /// Declared wasm type of table slot `addr`, or `None` when the slot is not a
-/// function in this module's table. No address-keyed cache: each lookup reads
-/// the table (or the test injection).
+/// function, the type is not a single result (`encode_func_sig` = 0:
+/// multi-value, sret / aggregate), or the address is a host import outside
+/// the guest table. No address-keyed cache: each lookup reads the table (or
+/// the test injection).
 pub fn residual_target_sig(addr: i64) -> Option<WasmSig> {
     decode_func_sig(query_residual_target_sig(addr))
 }
@@ -3364,6 +3366,8 @@ fn query_residual_target_sig(addr: i64) -> i64 {
     }
 }
 
+/// `None` (encoding 0) when the slot is not one wasm function type: multi-value
+/// result, sret / aggregate, or a host import outside the guest table.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
@@ -3380,21 +3384,26 @@ mod jit_func_sig_web {
     }
 }
 
-/// Install the wasm guest-side residual-call trampoline.
+/// Install the host fallback for a residual callee wasm cannot name as one
+/// function type, or whose address is a host import outside the guest table.
 ///
-/// Consumers with additional exact-function ABI knowledge can install their
-/// own hook and delegate its fallback to [`residual_host_call`].
+/// `descr.py` `CallDescr.create_call_stub` calls `lltype.Ptr(FUNC)` built
+/// from the same FUNC as the calldescr. Published guests match that type and
+/// take the word stub; this hook is the remaining case.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 pub fn install_residual_host_call() {
     majit_backend::call_stub::set_residual_host_call(Some(residual_host_call));
 }
 
-/// Call a residual target using the backend-owned call area and host import.
+/// Call a residual target whose wasm type is not a single function type the
+/// descr can name, or whose address is a host import outside the guest table.
 ///
-/// This is the wasm transport for `llmodel.py AbstractLLCPU.bh_call_i` and its
-/// siblings. Upstream uses native ABI call builders; wasm requires reflection
-/// for targets whose real signature is not the uniform word ABI. Keep that
-/// platform adaptation here until those calls carry exact typed signatures.
+/// `descr.py` `CallDescr.create_call_stub` calls `lltype.Ptr(FUNC)` built from
+/// the same FUNC as the calldescr. Published guests match that type, and
+/// `stub_matches_table` then returns `None` so the word stub runs. This hook
+/// remains for a callee `encode_func_sig` cannot describe (multi-value result,
+/// sret / aggregate such as `Vec` or `Result`, encoding 0) and for host
+/// imports that are not in the guest table.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 pub fn residual_host_call(
     func_ptr: usize,
@@ -3462,6 +3471,10 @@ pub fn widen_reflected_result(
     }
 }
 
+/// True when the guest table type is the descr's FUNC (`'i'`/`'r'` → i64,
+/// `'f'` → f64, `'S'` → f32, `'v'` → no result). A match falls through to the
+/// word stub. `None` from `residual_target_sig` (no table type: multi-value,
+/// sret/aggregate, or a host import) is not a match.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 fn stub_matches_table(
     func_ptr: usize,
@@ -3502,6 +3515,8 @@ fn stub_matches_table(
     sig.result == expect_result
 }
 
+/// Host import used when the callee has no single wasm function type or lives
+/// outside the guest table.
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 #[link(wasm_import_module = "majit_host")]
 unsafe extern "C" {
