@@ -593,21 +593,27 @@ pub fn gc_op<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
 
 /// Catches a second `&mut` formed from inside a collection, which the GIL
 /// cannot rule out because both borrows belong to the same thread. Only the
-/// GIL holder can reach it, so one plain global replaces per-thread state —
-/// and it compiles away entirely outside debug builds.
+/// GIL holder can reach it, so one plain global replaces per-thread state.
+///
+/// The flag stays in release builds. `dynasm_id_or_identityhash`,
+/// `id_or_identityhash_via_active_runtime`, and `wasm_id_or_identityhash`
+/// read [`in_gc_op`] to pick `gc_query_reentrant` while a root walk already
+/// holds this `&mut`. The assert that rejects a nested `gc_op` stays
+/// debug-only.
 struct ReentryGuard;
 
-#[cfg(debug_assertions)]
 static IN_GC_OP: AtomicBool = AtomicBool::new(false);
 
 impl ReentryGuard {
     #[inline]
     fn enter() -> Self {
-        #[cfg(debug_assertions)]
-        assert!(
-            !IN_GC_OP.swap(true, Ordering::Relaxed),
-            "reentrant &mut gc_op — a collection-time query must use gc_query_reentrant"
-        );
+        let already = IN_GC_OP.swap(true, Ordering::Relaxed);
+        if already {
+            debug_assert!(
+                false,
+                "reentrant &mut gc_op — a collection-time query must use gc_query_reentrant"
+            );
+        }
         ReentryGuard
     }
 }
@@ -615,24 +621,15 @@ impl ReentryGuard {
 impl Drop for ReentryGuard {
     #[inline]
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
         IN_GC_OP.store(false, Ordering::Relaxed);
     }
 }
 
 /// Whether the current thread is inside [`gc_op`] (and therefore [`gc_query`],
-/// which is `gc_op`). `ReentryGuard` owns the flag and compiles it out of
-/// release builds, so this is false when the guard is absent.
+/// which is `gc_op`).
 #[inline]
-pub(crate) fn in_gc_op() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        IN_GC_OP.load(Ordering::Relaxed)
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        false
-    }
+pub fn in_gc_op() -> bool {
+    IN_GC_OP.load(Ordering::Relaxed)
 }
 
 /// Execute a closure with `&MiniMarkGC` access (read-only query).

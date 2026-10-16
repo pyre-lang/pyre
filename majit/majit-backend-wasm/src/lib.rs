@@ -1190,6 +1190,39 @@ pub(crate) mod gc_box {
         }
     }
 
+    /// Identity hash for this thread's box.
+    ///
+    /// A free borrow allocates the shadow. `with_mut` already holds the
+    /// `RefCell` across a collection, and that walk calls
+    /// `Trace::refresh_from_gc` without entering `gc_op`, so the busy
+    /// arm reads `id_or_identityhash_reentrant` through the raw mirror.
+    /// `None` means this thread has no box.
+    pub(super) fn id_or_identityhash(addr: usize) -> Option<usize> {
+        if !majit_gc::gc_box_installed() {
+            return None;
+        }
+        WASM_ACTIVE_GC
+            .try_with(|cell| match cell.try_borrow_mut() {
+                Ok(mut guard) => {
+                    let raw: *mut dyn GcAllocator = guard.0.as_deref_mut()?;
+                    // SAFETY: `guard` holds the borrow for this call.
+                    Some(unsafe { &mut *raw }.id_or_identityhash(addr))
+                }
+                Err(_) => WASM_ACTIVE_GC_RAW
+                    .try_with(|raw| {
+                        raw.get().map(|p| {
+                            // SAFETY: the mirror is published under the borrow
+                            // the caller still holds, and this query only reads.
+                            unsafe { &*p }.id_or_identityhash_reentrant(addr)
+                        })
+                    })
+                    .ok()
+                    .flatten(),
+            })
+            .ok()
+            .flatten()
+    }
+
     /// Whether this thread holds a box at all.
     pub(super) fn present() -> bool {
         majit_gc::gc_box_installed()
@@ -1301,6 +1334,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
+    majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         wasm_alloc_nursery_headerless_no_collect,
     ));
@@ -1393,6 +1427,10 @@ impl Drop for ActiveGcBox {
 /// the backend thread. Production uses [`install_gc_standalone`], which
 /// registers the same hooks WITHOUT a box so the trampolines fall through
 /// to `gc_sync`.
+///
+/// Two live boxes at once is not a supported configuration: `ConstPtr`
+/// `MAJOR_LIVE` and `TRACE_OPS_GC_TYPE_ID` are process-global indexes
+/// into one collector.
 fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
@@ -1732,7 +1770,20 @@ fn wasm_id_or_identityhash(addr: usize) -> usize {
     if !majit_gc::collector_installed() {
         return !addr;
     }
-    with_wasm_active_gc_mut(|gc| gc.id_or_identityhash(addr)).unwrap_or(addr)
+    // `Trace::refresh_from_gc` runs from `MetaInterp::walk_active_trace_refs`
+    // during a collection. The singleton arm is already inside `gc_op`.
+    // A per-thread box holds `gc_box::with_mut` instead and never sets that
+    // flag; `gc_box::id_or_identityhash` answers from the box either way.
+    if majit_gc::gc_sync::in_gc_op() {
+        return majit_gc::gc_sync::gc_query_reentrant(|g| g.id_or_identityhash_reentrant(addr));
+    }
+    if let Some(id) = gc_box::id_or_identityhash(addr) {
+        return id;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|g| g.id_or_identityhash(addr));
+    }
+    addr
 }
 
 fn wasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
@@ -7509,6 +7560,90 @@ mod tests {
     use majit_gc::trace::TypeInfo;
     use majit_ir::InputArg;
     use majit_ir::forwarding::bound_operand_from_opref as rb;
+
+    #[test]
+    fn boxed_identity_hash_reads_through_the_raw_mirror() {
+        use std::cell::Cell;
+
+        thread_local! {
+            static MUT_CALLS: Cell<u32> = const { Cell::new(0) };
+            static RE_CALLS: Cell<u32> = const { Cell::new(0) };
+        }
+
+        struct Probe;
+        impl GcAllocator for Probe {
+            fn alloc_nursery(&mut self, _size: usize) -> majit_ir::GcRef {
+                majit_ir::GcRef(0)
+            }
+            fn alloc_nursery_no_collect(&mut self, _size: usize) -> majit_ir::GcRef {
+                majit_ir::GcRef(0)
+            }
+            fn alloc_varsize(
+                &mut self,
+                _base_size: usize,
+                _item_size: usize,
+                _length: usize,
+            ) -> majit_ir::GcRef {
+                majit_ir::GcRef(0)
+            }
+            fn alloc_varsize_no_collect(
+                &mut self,
+                _base_size: usize,
+                _item_size: usize,
+                _length: usize,
+            ) -> majit_ir::GcRef {
+                majit_ir::GcRef(0)
+            }
+            fn write_barrier(&mut self, _obj: majit_ir::GcRef) {}
+            fn jit_remember_young_pointer_from_array(&mut self, _obj: majit_ir::GcRef) {}
+            fn remember_young_pointer_from_array2(
+                &mut self,
+                _obj: majit_ir::GcRef,
+                _index: usize,
+                _card_page_shift: u32,
+            ) {
+            }
+            fn collect_nursery(&mut self) {}
+            fn collect_full(&mut self) {}
+            fn nursery_free(&self) -> *mut u8 {
+                std::ptr::null_mut()
+            }
+            fn nursery_free_addr(&self) -> usize {
+                0
+            }
+            fn nursery_top(&self) -> *const u8 {
+                std::ptr::null()
+            }
+            fn nursery_top_addr(&self) -> usize {
+                0
+            }
+            fn max_nursery_object_size(&self) -> usize {
+                0
+            }
+            fn id_or_identityhash(&mut self, addr: usize) -> usize {
+                MUT_CALLS.with(|calls| calls.set(calls.get() + 1));
+                addr.wrapping_add(1)
+            }
+            fn id_or_identityhash_reentrant(&self, addr: usize) -> usize {
+                RE_CALLS.with(|calls| calls.set(calls.get() + 1));
+                addr.wrapping_add(2)
+            }
+        }
+
+        let _lock = failguard::lock_cpu();
+        let _box = install_gc_box(Box::new(Probe));
+        MUT_CALLS.with(|calls| calls.set(0));
+        RE_CALLS.with(|calls| calls.set(0));
+
+        assert_eq!(wasm_id_or_identityhash(10), 11);
+        assert_eq!(MUT_CALLS.with(|calls| calls.get()), 1);
+        assert_eq!(RE_CALLS.with(|calls| calls.get()), 0);
+
+        gc_box::with_mut(|_| assert_eq!(wasm_id_or_identityhash(10), 12))
+            .expect("the installed box answers");
+        assert_eq!(MUT_CALLS.with(|calls| calls.get()), 1);
+        assert_eq!(RE_CALLS.with(|calls| calls.get()), 1);
+    }
 
     fn gcmap_marks(buf: &[usize], index: usize) -> bool {
         let bits = usize::BITS as usize;

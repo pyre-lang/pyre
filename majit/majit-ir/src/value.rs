@@ -502,6 +502,9 @@ impl InputArg {
 
     /// Stamp the concrete runtime value on this frontend-arg identity.
     pub fn set_value(&self, v: Value) {
+        if let Value::Ref(r) = v {
+            crate::gcref_diag(r.0, "InputArg::set_value");
+        }
         self.value.set(Some(v));
     }
 
@@ -967,6 +970,60 @@ pub fn gc_id_or_identityhash(addr: usize) -> usize {
         let f: GcIdOrIdentityHashFn = unsafe { std::mem::transmute_copy(&p) };
         f(addr)
     }
+}
+
+/// Live address of a managed object (`gc_current_object_address`).
+///
+/// Follows a nursery forwarding stub without treating `addr` as a root.
+/// Unset means the address. `majit-ir` has no collector dependency; the
+/// backend installs the real query next to `set_gc_id_or_identityhash`.
+pub type GcCurrentObjectAddressFn = fn(usize) -> usize;
+
+static GC_CURRENT_OBJECT_ADDRESS: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Install or clear the process-global live-address hook.
+#[inline]
+pub fn set_gc_current_object_address(hook: Option<GcCurrentObjectAddressFn>) {
+    let raw: *mut () = match hook {
+        None => std::ptr::null_mut(),
+        Some(f) => unsafe { std::mem::transmute_copy::<GcCurrentObjectAddressFn, *mut ()>(&f) },
+    };
+    GC_CURRENT_OBJECT_ADDRESS.store(raw, Ordering::Release);
+}
+
+/// The installed live address, or `addr` when the slot is clear.
+#[inline]
+pub fn gc_current_object_address(addr: usize) -> usize {
+    let p = GC_CURRENT_OBJECT_ADDRESS.load(Ordering::Acquire);
+    if p.is_null() {
+        addr
+    } else {
+        let f: GcCurrentObjectAddressFn = unsafe { std::mem::transmute_copy(&p) };
+        f(addr)
+    }
+}
+
+/// Temporary P92 intern/ConstPtr classification hook.
+pub type GcrefDiagFn = fn(usize, &'static str);
+
+static GCREF_DIAG: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+pub fn set_gcref_diag(hook: Option<GcrefDiagFn>) {
+    let raw: *mut () = match hook {
+        None => std::ptr::null_mut(),
+        Some(f) => unsafe { std::mem::transmute_copy::<GcrefDiagFn, *mut ()>(&f) },
+    };
+    GCREF_DIAG.store(raw, Ordering::Release);
+}
+
+#[inline]
+pub fn gcref_diag(addr: usize, site: &'static str) {
+    let p = GCREF_DIAG.load(Ordering::Acquire);
+    if p.is_null() {
+        return;
+    }
+    let f: GcrefDiagFn = unsafe { std::mem::transmute_copy(&p) };
+    f(addr, site);
 }
 
 /// OPEN POLICY FORK — the one place that decides what an unregistered

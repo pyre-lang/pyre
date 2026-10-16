@@ -101,7 +101,7 @@ pub fn numb_next_n_items(buf: &[u8], size: usize, mut index: usize) -> usize {
 
 /// resumecode.py create_numbering(l) — module-level helper:
 /// build a single Writer from the list and return its encoded buffer.
-pub fn create_numbering(items: &[i32]) -> Vec<u8> {
+pub fn create_numbering(items: &[i32]) -> NumberingRef {
     let mut w = Writer::new(items.len());
     for &item in items {
         w.append_int(item as i64);
@@ -162,8 +162,8 @@ impl Writer {
         self.append_short(item as i32);
     }
 
-    /// resumecode.py: create_numbering
-    pub fn create_numbering(&self) -> Vec<u8> {
+    /// Byte list `Writer.create_numbering` builds before `lltype.malloc`.
+    pub fn encode_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.current.len() * 3);
         for &item in &self.current {
             encode_varint(&mut buf, item);
@@ -171,17 +171,16 @@ impl Writer {
         buf
     }
 
-    /// Encode onto the stack when the numbering fits, then one slab cell.
-    /// `lltype.malloc(NUMBERING)` is one GC object; a per-guard `Arc<[u8]>`
-    /// was a 96 B class. Cells come from a chunked slab so identity is
-    /// still a pointer.
+    /// resumecode.py `Writer.create_numbering`: malloc `NUMBERING` and
+    /// copy the encoded bytes into `numb.code`.
+    pub fn create_numbering(&self) -> NumberingRef {
+        NumberingRef::from_bytes(&self.encode_bytes())
+    }
+
+    /// Same object as `create_numbering`. Kept so callers that shared
+    /// the old handle name keep compiling.
     pub fn create_numbering_arc(&self) -> NumberingRef {
-        let mut buf = smallvec::SmallVec::<[u8; 128]>::new();
-        for &item in &self.current {
-            let (bytes, n) = encode_varint_bytes(item);
-            buf.extend_from_slice(&bytes[..n]);
-        }
-        NumberingRef::from_bytes(&buf)
+        self.create_numbering()
     }
 
     /// resumecode.py: patch_current_size
@@ -196,8 +195,15 @@ impl Writer {
 }
 
 /// resumecode.py: Reader
+///
+/// Holds `numb` and an index. Each item re-reads `numb.code[index]`
+/// (`numb_next_item`): one plain load of the payload cell. The byte
+/// pointer is not cached across an item. The consumer of an item can
+/// allocate, and a minor forwards `compile.py` `ResumeGuardDescr.rd_numb`.
 pub struct Reader<'a> {
     code: &'a [u8],
+    /// When set, reads come from this numbering's payload.
+    numb: Option<&'a NumberingRef>,
     pub cur_pos: usize,
     pub items_read: usize,
 }
@@ -206,183 +212,532 @@ impl<'a> Reader<'a> {
     pub fn new(code: &'a [u8]) -> Self {
         Reader {
             code,
+            numb: None,
             cur_pos: 0,
             items_read: 0,
         }
     }
 
-    /// resumecode.py: next_item
-    #[inline]
+    /// Subsequent reads follow `numb` across a minor.
+    ///
+    /// `resumecode.py` `Reader.next_item` calls `numb_next_item`, which
+    /// loads `numb.code[index]` from the GC pointer on every item.
+    pub fn bind_numbering(&mut self, numb: &'a NumberingRef) {
+        self.numb = Some(numb);
+    }
+
+    pub fn from_numbering(numb: &'a NumberingRef) -> Self {
+        Reader {
+            code: &[],
+            numb: Some(numb),
+            cur_pos: 0,
+            items_read: 0,
+        }
+    }
+
+    /// One `numb_next_item` view. The slice dies with the call that
+    /// decodes it; the next item loads the cell again.
+    #[inline(always)]
+    fn bytes(&self) -> &[u8] {
+        if let Some(numb) = self.numb {
+            numb.as_slice()
+        } else {
+            self.code
+        }
+    }
+
+    /// resumecode.py: next_item / `numb_next_item` (always inline).
+    #[inline(always)]
     pub fn next_item(&mut self) -> i32 {
-        let (result, new_pos) = decode_varint(self.code, self.cur_pos);
+        let pos = self.cur_pos;
+        let (result, new_pos) = {
+            let buf = self.bytes();
+            decode_varint(buf, pos)
+        };
         self.cur_pos = new_pos;
         self.items_read += 1;
         result
     }
 
     /// resumecode.py: peek
+    #[inline]
     pub fn peek(&self) -> i32 {
-        let (result, _) = decode_varint(self.code, self.cur_pos);
+        let (result, _) = decode_varint(self.bytes(), self.cur_pos);
         result
     }
 
     /// resumecode.py: jump — skip n items forward
     pub fn jump(&mut self, size: usize) {
         for _ in 0..size {
-            let (_, new_pos) = decode_varint(self.code, self.cur_pos);
+            let pos = self.cur_pos;
+            let (_, new_pos) = decode_varint(self.bytes(), pos);
             self.cur_pos = new_pos;
         }
         self.items_read += size;
     }
 
+    #[inline]
     pub fn has_more(&self) -> bool {
-        self.cur_pos < self.code.len()
+        self.cur_pos < self.bytes().len()
     }
 }
 
-/// One `NUMBERING` object. Small payloads live in a chunked slab so
-/// `create_numbering` does not mint a 96 B `Arc<[u8]>` per guard.
-const NUMB_DATA: usize = 80;
-const NUMB_CHUNK: usize = 256;
+/// `NUMBERING` payload: one length word, then `code` bytes.
+/// Installed by `register_trace_ops_gc_type` once a collector exists.
+/// Absent in GC-less unit tests, which use the host block below.
+static NUMBERING_ALLOC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-struct NumbCell {
-    refs: std::sync::atomic::AtomicUsize,
-    len: u16,
-    bytes: [u8; NUMB_DATA],
+/// `fn(&[u8]) -> usize` payload address of a fresh `NUMBERING`.
+pub fn set_numbering_alloc(hook: Option<fn(&[u8]) -> usize>) {
+    let bits = hook.map(|f| f as usize).unwrap_or(0);
+    NUMBERING_ALLOC.store(bits, std::sync::atomic::Ordering::Release);
 }
 
-struct NumbHeap {
-    chunks: Vec<(*mut NumbCell, usize)>,
-    free: Vec<*mut NumbCell>,
+fn call_numbering_alloc(bytes: &[u8]) -> Option<usize> {
+    let bits = NUMBERING_ALLOC.load(std::sync::atomic::Ordering::Acquire);
+    if bits == 0 {
+        return None;
+    }
+    let hook: fn(&[u8]) -> usize = unsafe { std::mem::transmute(bits) };
+    Some(hook(bytes))
 }
 
-unsafe impl Send for NumbHeap {}
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-impl NumbHeap {
-    const fn new() -> Self {
-        Self {
-            chunks: Vec::new(),
-            free: Vec::new(),
-        }
-    }
-
-    fn alloc(&mut self, bytes: &[u8]) -> *mut NumbCell {
-        debug_assert!(bytes.len() <= NUMB_DATA);
-        let cell = if let Some(cell) = self.free.pop() {
-            cell
-        } else {
-            self.fresh_cell()
-        };
-        unsafe {
-            (*cell).refs.store(1, std::sync::atomic::Ordering::Relaxed);
-            (*cell).len = bytes.len() as u16;
-            (&mut (*cell).bytes)[..bytes.len()].copy_from_slice(bytes);
-        }
-        cell
-    }
-
-    fn fresh_cell(&mut self) -> *mut NumbCell {
-        if let Some((ptr, used)) = self.chunks.last_mut()
-            && *used < NUMB_CHUNK
-        {
-            let cell = unsafe { (*ptr).add(*used) };
-            *used += 1;
-            return cell;
-        }
-        let layout = std::alloc::Layout::array::<NumbCell>(NUMB_CHUNK).expect("numb slab");
-        let ptr = unsafe { std::alloc::alloc(layout) as *mut NumbCell };
-        assert!(!ptr.is_null(), "numb slab alloc");
-        self.chunks.push((ptr, 1));
-        ptr
-    }
-
-    fn release(&mut self, cell: *mut NumbCell) {
-        self.free.push(cell);
-    }
+/// One address cell. Clones share it so a minor rewrites every holder
+/// when any of them is walked. Two cells with the same young address
+/// make the second root trace an already-forwarded object.
+struct NumSlot {
+    /// Payload address (length word, then bytes). Relaxed: a collection
+    /// is exclusive, and cross-thread readers must not race an `UnsafeCell`.
+    addr: AtomicUsize,
+    host: bool,
+    /// `NumberingRef` clones plus an in-flight list walk.
+    users: AtomicUsize,
+    /// Index in [`LIVE_NUMBERINGS`], or `usize::MAX` when absent.
+    live_index: AtomicUsize,
+    /// Index in [`YOUNG_NUMBERINGS`], or `usize::MAX` when absent.
+    young_index: AtomicUsize,
 }
 
-static NUMB_HEAP: parking_lot::Mutex<NumbHeap> = parking_lot::Mutex::new(NumbHeap::new());
+/// `NonNull` is `!Send`. The slot is shared across threads: the address
+/// cell is atomic, and list edits plus the last free run under
+/// [`LIVE_NUMBERINGS`] then [`YOUNG_NUMBERINGS`].
+struct SlotList {
+    slots: Vec<std::ptr::NonNull<NumSlot>>,
+}
 
-/// Handle for a `NUMBERING` buffer. Clone is a refcount bump.
-#[derive(Debug)]
+unsafe impl Send for SlotList {}
+
+/// Young `NUMBERING` slots. `incminimark.py` `collect_oldrefs_to_nursery`
+/// drains `old_objects_pointing_to_young` once per minor; this list is that
+/// remembered set for `compile.py` `ResumeGuardDescr.rd_numb`. A minor
+/// forwards each cell and clears the list. The payload is then old.
+static YOUNG_NUMBERINGS: parking_lot::Mutex<SlotList> =
+    parking_lot::Mutex::new(SlotList { slots: Vec::new() });
+
+/// Live `NUMBERING` slots until the last [`NumberingRef`] drops.
+///
+/// `collect_oldrefs_to_nursery` clears the young list at the minor, and the
+/// descr may not be in the holder graph yet (`ResumeGuardDescr.rd_numb` is
+/// stored before the loop is published). A major in that window still has
+/// to mark the payload. Holder walks mark the same object again once the
+/// descr is reachable; `GCFLAG_VISITED` makes the second mark a no-op.
+static LIVE_NUMBERINGS: parking_lot::Mutex<SlotList> =
+    parking_lot::Mutex::new(SlotList { slots: Vec::new() });
+
+/// One `NUMBERING` (`GcStruct` with inline `Array(UCHAR)`).
+///
+/// `addr` is the payload (length word, then bytes). A minor rewrites
+/// that word when the young list hands the cell to the collector.
+/// GC-less tests use a process block with the same layout; that arm
+/// is not taken once `set_numbering_alloc` is installed.
 pub struct NumberingRef {
-    inner: NumberingInner,
-}
-
-#[derive(Debug)]
-enum NumberingInner {
-    Slab(std::ptr::NonNull<NumbCell>),
-    Heap(std::sync::Arc<[u8]>),
+    slot: std::ptr::NonNull<NumSlot>,
 }
 
 unsafe impl Send for NumberingRef {}
 unsafe impl Sync for NumberingRef {}
 
-impl NumberingRef {
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        if bytes.len() <= NUMB_DATA {
-            let cell = NUMB_HEAP.lock().alloc(bytes);
-            Self {
-                inner: NumberingInner::Slab(std::ptr::NonNull::new(cell).expect("numb cell")),
-            }
-        } else {
-            Self {
-                inner: NumberingInner::Heap(std::sync::Arc::from(bytes)),
-            }
+fn numb_len_word() -> usize {
+    std::mem::size_of::<usize>()
+}
+
+fn fresh_slot(addr: usize, host: bool) -> *mut NumSlot {
+    Box::into_raw(Box::new(NumSlot {
+        addr: AtomicUsize::new(addr),
+        host,
+        users: AtomicUsize::new(1),
+        live_index: AtomicUsize::new(usize::MAX),
+        young_index: AtomicUsize::new(usize::MAX),
+    }))
+}
+
+/// Temporary P92 NUMBERING diagnostic. `PYRE_DIAG_P92` records payload
+/// address and first bytes at creation; a later read panics if the cell
+/// was not forwarded or the bytes were overwritten.
+static DIAG_NUMB_ON: AtomicUsize = AtomicUsize::new(0);
+static DIAG_NUMB: parking_lot::Mutex<Vec<NumbDiag>> = parking_lot::Mutex::new(Vec::new());
+
+struct NumbDiag {
+    slot: usize,
+    payload: usize,
+    len: usize,
+    first: [u8; 16],
+    nfirst: usize,
+}
+
+fn diag_numb_on() -> bool {
+    let v = DIAG_NUMB_ON.load(Ordering::Relaxed);
+    if v != 0 {
+        return v == 2;
+    }
+    let on = std::env::var_os("PYRE_DIAG_P92").is_some();
+    DIAG_NUMB_ON.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
+fn diag_numb_first_bytes(addr: usize) -> (usize, [u8; 16], usize) {
+    if addr == 0 {
+        return (0, [0; 16], 0);
+    }
+    let len = unsafe { *(addr as *const usize) };
+    let n = len.min(16);
+    let mut first = [0u8; 16];
+    if n > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (addr as *const u8).add(numb_len_word()),
+                first.as_mut_ptr(),
+                n,
+            );
         }
     }
+    (len, first, n)
+}
 
-    pub fn as_slice(&self) -> &[u8] {
-        match &self.inner {
-            NumberingInner::Slab(ptr) => unsafe {
-                let cell = ptr.as_ref();
-                &cell.bytes[..cell.len as usize]
-            },
-            NumberingInner::Heap(arc) => arc.as_ref(),
-        }
+fn diag_numb_record(slot: *mut NumSlot, addr: usize) {
+    if !diag_numb_on() || addr == 0 {
+        return;
     }
+    if unsafe { (*slot).host } {
+        return;
+    }
+    let (len, first, nfirst) = diag_numb_first_bytes(addr);
+    DIAG_NUMB.lock().push(NumbDiag {
+        slot: slot as usize,
+        payload: addr,
+        len,
+        first,
+        nfirst,
+    });
+}
 
-    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        match (&a.inner, &b.inner) {
-            (NumberingInner::Slab(x), NumberingInner::Slab(y)) => x.as_ptr() == y.as_ptr(),
-            (NumberingInner::Heap(x), NumberingInner::Heap(y)) => std::sync::Arc::ptr_eq(x, y),
-            _ => false,
+fn diag_numb_forwarded(slot: *mut NumSlot, old: usize, new: usize) {
+    if !diag_numb_on() || old == new {
+        return;
+    }
+    let mut guard = DIAG_NUMB.lock();
+    for row in guard.iter_mut() {
+        if row.slot == slot as usize {
+            row.payload = new;
+            return;
         }
     }
 }
 
+fn diag_numb_check(slot: *mut NumSlot, addr: usize, site: &'static str) {
+    if !diag_numb_on() {
+        return;
+    }
+    if unsafe { (*slot).host } || addr == 0 {
+        return;
+    }
+    let (len, first, nfirst) = diag_numb_first_bytes(addr);
+    let guard = DIAG_NUMB.lock();
+    let Some(row) = guard.iter().rev().find(|r| r.slot == slot as usize) else {
+        return;
+    };
+    let payload_moved = row.payload != addr;
+    let bytes_changed = nfirst != row.nfirst || first[..nfirst] != row.first[..row.nfirst];
+    if !payload_moved && !bytes_changed {
+        return;
+    }
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    panic!(
+        "STALE_NUMBERING site={site} slot={:#x} create_payload={:#x} read_payload={:#x} \
+         payload_moved={payload_moved} bytes_changed={bytes_changed} create_len={} read_len={len} \
+         create_first={:02x?} read_first={:02x?}\n{backtrace}",
+        slot as usize,
+        row.payload,
+        addr,
+        row.len,
+        &row.first[..row.nfirst],
+        &first[..nfirst]
+    );
+}
+
+/// Lock order is [`LIVE_NUMBERINGS`] then [`YOUNG_NUMBERINGS`].
+fn register_gc_slot(slot: *mut NumSlot) {
+    let nn = std::ptr::NonNull::new(slot).expect("numb slot");
+    let mut live = LIVE_NUMBERINGS.lock();
+    let mut young = YOUNG_NUMBERINGS.lock();
+    let live_index = live.slots.len();
+    unsafe { (*slot).live_index.store(live_index, Ordering::Relaxed) };
+    live.slots.push(nn);
+    let young_index = young.slots.len();
+    unsafe { (*slot).young_index.store(young_index, Ordering::Relaxed) };
+    young.slots.push(nn);
+}
+
+impl NumberingRef {
+    fn from_gc_addr(addr: usize) -> Self {
+        // `Box::new` follows the allocating hook. It is the system
+        // allocator, not a collection point. The address store and the
+        // two list pushes then run with no safepoint between them.
+        let slot = fresh_slot(0, false);
+        unsafe { (*slot).addr.store(addr, Ordering::Relaxed) };
+        register_gc_slot(slot);
+        diag_numb_record(slot, addr);
+        Self {
+            slot: std::ptr::NonNull::new(slot).expect("numb slot"),
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        if let Some(addr) = call_numbering_alloc(bytes) {
+            return Self::from_gc_addr(addr);
+        }
+        Self::host_from_bytes(bytes)
+    }
+
+    fn host_from_bytes(bytes: &[u8]) -> Self {
+        let layout = host_layout(bytes.len());
+        let block = unsafe { std::alloc::alloc_zeroed(layout) };
+        if block.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        unsafe {
+            let body = block.add(numb_len_word());
+            *(body as *mut usize) = bytes.len();
+            if !bytes.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    body.add(numb_len_word()),
+                    bytes.len(),
+                );
+            }
+            let slot = fresh_slot(body as usize, true);
+            Self {
+                slot: std::ptr::NonNull::new(slot).expect("numb slot"),
+            }
+        }
+    }
+
+    /// Address of the `NUMBERING` payload. One relaxed load.
+    /// `incminimark.py` `collect_oldrefs_to_nursery` stores the
+    /// forwarded address back into this cell.
+    #[inline(always)]
+    pub fn payload_addr(&self) -> usize {
+        unsafe { self.slot.as_ref().addr.load(Ordering::Relaxed) }
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
+        let addr = self.payload_addr();
+        if addr == 0 {
+            return &[];
+        }
+        if diag_numb_on() {
+            diag_numb_check(self.slot.as_ptr(), addr, "NumberingRef::as_slice");
+        }
+        let len = unsafe { *(addr as *const usize) };
+        unsafe { std::slice::from_raw_parts((addr as *const u8).add(numb_len_word()), len) }
+    }
+
+    /// Hand the payload address to a holder walk. Host blocks are not `GcRef`s.
+    ///
+    /// The walked cell is this slot. A minor between `create_numbering`
+    /// and the descr joining the holder graph rewrites it from
+    /// [`collect_young_numberings`].
+    pub fn visit_gc(&self, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+        forward_slot(self.slot, visitor);
+    }
+
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.payload_addr() == b.payload_addr() && a.payload_addr() != 0
+    }
+}
+
+fn forward_slot(slot: std::ptr::NonNull<NumSlot>, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+    let addr = unsafe { slot.as_ref().addr.load(Ordering::Relaxed) };
+    if unsafe { slot.as_ref().host } || addr == 0 {
+        return;
+    }
+    let mut gc = crate::GcRef(addr);
+    visitor(&mut gc);
+    unsafe { slot.as_ref().addr.store(gc.0, Ordering::Relaxed) };
+    if addr != gc.0 {
+        diag_numb_forwarded(slot.as_ptr(), addr, gc.0);
+    }
+}
+
+/// Minor remembered-set drain. Forwards each young cell and clears the list.
+/// The payload is old afterwards and the old generation does not move it.
+pub fn collect_young_numberings(visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+    let taken = {
+        let mut young = YOUNG_NUMBERINGS.lock();
+        if young.slots.is_empty() {
+            return;
+        }
+        let taken = std::mem::take(&mut young.slots);
+        for &slot in &taken {
+            unsafe {
+                slot.as_ref().users.fetch_add(1, Ordering::Relaxed);
+                slot.as_ref()
+                    .young_index
+                    .store(usize::MAX, Ordering::Relaxed);
+            }
+        }
+        taken
+    };
+    visit_bumped(&taken, visitor);
+}
+
+/// Major root for every live `NUMBERING`, including one whose descr is
+/// not yet reachable from a holder. Does not clear [`YOUNG_NUMBERINGS`].
+pub fn trace_live_numberings(visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+    let taken = {
+        let live = LIVE_NUMBERINGS.lock();
+        if live.slots.is_empty() {
+            return;
+        }
+        let taken = live.slots.clone();
+        for &slot in &taken {
+            unsafe { slot.as_ref().users.fetch_add(1, Ordering::Relaxed) };
+        }
+        taken
+    };
+    visit_bumped(&taken, visitor);
+}
+
+fn visit_bumped(slots: &[std::ptr::NonNull<NumSlot>], visitor: &mut dyn FnMut(&mut crate::GcRef)) {
+    let _release = ReleaseAll(slots);
+    for &slot in slots {
+        forward_slot(slot, visitor);
+    }
+}
+
+struct ReleaseAll<'a>(&'a [std::ptr::NonNull<NumSlot>]);
+
+impl Drop for ReleaseAll<'_> {
+    fn drop(&mut self) {
+        for &slot in self.0 {
+            release_user(slot);
+        }
+    }
+}
+
+fn host_layout(len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(numb_len_word() * 2 + len, numb_len_word())
+        .unwrap_or_else(|_| std::alloc::Layout::new::<usize>())
+}
+
 impl Clone for NumberingRef {
     fn clone(&self) -> Self {
-        match &self.inner {
-            NumberingInner::Slab(ptr) => {
-                unsafe {
-                    (*ptr.as_ptr())
-                        .refs
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Self {
-                    inner: NumberingInner::Slab(*ptr),
-                }
-            }
-            NumberingInner::Heap(arc) => Self {
-                inner: NumberingInner::Heap(std::sync::Arc::clone(arc)),
-            },
+        unsafe {
+            self.slot.as_ref().users.fetch_add(1, Ordering::Relaxed);
         }
+        Self { slot: self.slot }
     }
 }
 
 impl Drop for NumberingRef {
     fn drop(&mut self) {
-        if let NumberingInner::Slab(ptr) = self.inner {
-            let prev = unsafe {
-                (*ptr.as_ptr())
-                    .refs
-                    .fetch_sub(1, std::sync::atomic::Ordering::Release)
-            };
-            if prev == 1 {
-                NUMB_HEAP.lock().release(ptr.as_ptr());
+        release_user(self.slot);
+    }
+}
+
+fn release_user(slot: std::ptr::NonNull<NumSlot>) {
+    let prev = unsafe { slot.as_ref().users.fetch_sub(1, Ordering::Release) };
+    if prev != 1 {
+        return;
+    }
+    std::sync::atomic::fence(Ordering::Acquire);
+    if unsafe { slot.as_ref().host } {
+        free_slot(slot);
+        return;
+    }
+    {
+        // A walker may have bumped `users` while this drop waited.
+        let mut live = LIVE_NUMBERINGS.lock();
+        let mut young = YOUNG_NUMBERINGS.lock();
+        if unsafe { slot.as_ref().users.load(Ordering::Acquire) } != 0 {
+            return;
+        }
+        detach(&mut live.slots, slot, true);
+        detach(&mut young.slots, slot, false);
+    }
+    free_slot(slot);
+}
+
+fn detach(
+    list: &mut Vec<std::ptr::NonNull<NumSlot>>,
+    slot: std::ptr::NonNull<NumSlot>,
+    live: bool,
+) {
+    let index_ptr = unsafe {
+        if live {
+            &(*slot.as_ptr()).live_index
+        } else {
+            &(*slot.as_ptr()).young_index
+        }
+    };
+    let index = index_ptr.load(Ordering::Relaxed);
+    let pos = if index < list.len() && list[index] == slot {
+        Some(index)
+    } else {
+        list.iter().position(|entry| *entry == slot)
+    };
+    index_ptr.store(usize::MAX, Ordering::Relaxed);
+    let Some(pos) = pos else {
+        return;
+    };
+    let last = list.len() - 1;
+    list.swap_remove(pos);
+    if pos != last {
+        let moved = list[pos];
+        let moved_index = unsafe {
+            if live {
+                &(*moved.as_ptr()).live_index
+            } else {
+                &(*moved.as_ptr()).young_index
+            }
+        };
+        moved_index.store(pos, Ordering::Relaxed);
+    }
+}
+
+fn free_slot(slot: std::ptr::NonNull<NumSlot>) {
+    unsafe {
+        if slot.as_ref().host {
+            let addr = slot.as_ref().addr.load(Ordering::Relaxed);
+            if addr != 0 {
+                let len = *(addr as *const usize);
+                let block = (addr as *mut u8).sub(numb_len_word());
+                std::alloc::dealloc(block, host_layout(len));
             }
         }
+        drop(Box::from_raw(slot.as_ptr()));
+    }
+}
+
+impl std::fmt::Debug for NumberingRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NumberingRef")
+            .field("len", &self.as_slice().len())
+            .field("host", &unsafe { (*self.slot.as_ptr()).host })
+            .finish()
     }
 }
 
@@ -443,24 +798,38 @@ mod tests {
     }
 
     #[test]
-    fn numbering_ref_slab_shares_identity() {
+    fn numbering_ref_shares_identity() {
         let mut w = Writer::new(8);
         for i in 0..20 {
             w.append_int(i);
         }
-        let a = w.create_numbering_arc();
+        let a = w.create_numbering();
         let b = a.clone();
         assert!(NumberingRef::ptr_eq(&a, &b));
         assert_eq!(a.as_slice(), b.as_slice());
-        assert_eq!(a.as_slice(), w.create_numbering());
+        assert_eq!(a.as_slice(), w.encode_bytes().as_slice());
     }
 
     #[test]
     fn numbering_ref_large_payload_round_trips() {
-        let bytes = vec![0x5a; NUMB_DATA + 8];
+        let bytes = vec![0x5a; 200];
         let a = NumberingRef::from_bytes(&bytes);
         assert_eq!(a.as_slice(), bytes.as_slice());
         let b = a.clone();
         assert!(NumberingRef::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn reader_reads_each_item_from_the_numbering() {
+        // `resumecode.py` `numb_next_item` loads `numb.code[index]` per item.
+        let numb = create_numbering(&[1, -2, 3, 64]);
+        let mut reader = Reader::from_numbering(&numb);
+        assert_eq!(reader.next_item(), 1);
+        assert_eq!(reader.peek(), -2);
+        assert_eq!(reader.next_item(), -2);
+        assert_eq!(reader.next_item(), 3);
+        reader.jump(1);
+        assert!(!reader.has_more());
+        assert_eq!(reader.items_read, 4);
     }
 }

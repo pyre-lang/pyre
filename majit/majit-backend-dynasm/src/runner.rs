@@ -504,6 +504,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
         walk_live_deadframes: Some(majit_backend::libc_deadframe::walk_live_deadframes),
     });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
+    majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         dynasm_alloc_nursery_headerless_no_collect,
     ));
@@ -588,6 +589,11 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
 /// allocator to the backend thread. Production uses
 /// [`install_gc_standalone`], which registers the same hooks WITHOUT a
 /// box so the trampolines fall through to `gc_sync`.
+///
+/// Two live boxes at once is not a supported configuration: `ConstPtr`
+/// `MAJOR_LIVE` and `TRACE_OPS_GC_TYPE_ID` are process-global indexes
+/// into one collector. Sequential replace on one thread is the test
+/// shape.
 fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> JitframeDescrFacts {
     // This thread now answers heap queries from its own allocator, whose
     // nursery is not the singleton's, so the process-wide published range can
@@ -1006,6 +1012,15 @@ fn dynasm_alloc_young_nonmoving_typed_no_collect(type_id: u32, size: usize) -> G
 /// A typed descr never does: absence/failure of its collector is NULL, the
 /// translated `do_malloc_fixedsize_clear` failure edge.
 fn bh_alloc_struct(sizedescr: &majit_jitcode::jitcode::BhDescr) -> *mut libc::c_void {
+    // `MAJIT_GC_STRESS_TRACE_ALLOC`: a minor before the blackhole
+    // materializes a struct, so a resume constant captured as an address
+    // dies here instead of in a later collection.
+    if majit_gc::gc_stress_trace_alloc_enabled()
+        && majit_gc::gc_sync::is_initialized()
+        && !majit_gc::gc_sync::in_gc_op()
+    {
+        majit_gc::gc_sync::gc_op(|g| g.do_collect_nursery());
+    }
     let size = sizedescr.as_size();
     let type_id = sizedescr.resolve_gc_tid();
     let gc_ptr = if sizedescr.is_headerless() {
@@ -1357,6 +1372,12 @@ fn dynasm_id_or_identityhash(addr: usize) -> usize {
     // `GcLLDescr_boehm.gcrootmap` is `None`, which is `!collector_installed`.
     if !majit_gc::collector_installed() {
         return !addr;
+    }
+    // `Trace::refresh_from_gc` calls this from a root walk. `gc_op` already
+    // holds the collector; a second one panics in debug
+    // (`reentrant &mut gc_op`).
+    if majit_gc::gc_sync::in_gc_op() {
+        return majit_gc::gc_sync::gc_query_reentrant(|g| g.id_or_identityhash_reentrant(addr));
     }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so

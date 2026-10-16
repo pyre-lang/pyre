@@ -164,13 +164,21 @@ pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
 /// decidable from the name alone. `Tuple` and `Array` without a suffix are the
 /// bare roots and are not this: the bare `Tuple` is the unit handled above, and
 /// a bare `Array` carries no length to be zero.
-fn is_zero_length_shaped_aggregate(name: &str) -> bool {
-    if majit_ir::descr::is_shaped_tuple_name(name) {
-        return name
+pub(crate) fn is_zero_length_shaped_aggregate(name: &str) -> bool {
+    is_zero_length_shaped_tuple(name) || is_zero_length_shaped_array(name)
+}
+
+/// `Tuple<>` — `rtuple.TUPLE_TYPE` of an empty field list is Void.
+fn is_zero_length_shaped_tuple(name: &str) -> bool {
+    majit_ir::descr::is_shaped_tuple_name(name)
+        && name
             .strip_prefix("Tuple<")
             .and_then(|rest| rest.strip_suffix('>'))
-            .is_some_and(|args| args.trim().is_empty());
-    }
+            .is_some_and(|args| args.trim().is_empty())
+}
+
+/// `Array<T;0>` — a prebuilt zero-length `GcArray` (`_ll_prebuilt_empty_array`).
+pub(crate) fn is_zero_length_shaped_array(name: &str) -> bool {
     majit_ir::descr::is_shaped_array_name(name)
         && name
             .rsplit_once(';')
@@ -231,24 +239,16 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
                 op.kind = OpKind::ConstRefNull;
                 continue;
             }
-            // A zero-length shaped aggregate — `Tuple<>`, `Array<T;0>`, the
-            // empty argument slice `&[]` — carries no runtime data either, but
-            // unlike the unit above its value IS read: it flows on as a call
-            // argument.  Upstream answers both halves the same way and neither
-            // one allocates: `rtuple.TUPLE_TYPE` returns `Void` for an empty
-            // field list before any `GcStruct` exists, `TupleRepr.newtuple`
-            // returns `inputconst(Void, ())` instead of emitting a `malloc`,
-            // and `TupleRepr.instantiate` hands back the prebuilt
-            // `dum_empty_tuple` PBC.  A zero-length `FixedSizeArray` is
-            // excluded more strongly still: it inherits `Struct._gckind =
-            // 'raw'`, so `lltype.malloc(flavor='gc')` refuses it outright.
+            // A zero-length shaped aggregate that is read as a call argument.
+            // `Tuple<>` is Void (`rtuple.TUPLE_TYPE` of an empty field list).
+            // `Array<T;0>` — the empty argument slice `&[]` — is a prebuilt
+            // zero-length `GcArray`: `ListRepr.convert_const` /
+            // `FixedSizeListRepr.prepare_const` malloc immortal with `n == 0`,
+            // and `_ll_prebuilt_empty_array` memos one empty `GcArray` per
+            // item type. Intern the instance so `emit_const_r` can pool that
+            // prebuilt pointer; `history.CONST_NULL` is only a genuine NULL.
             //
-            // So the value is a prebuilt singleton, not an allocation. It must
-            // also be non-null, which is why this arm interns an instance where
-            // the unit above emits the null ref: a caller passes it on, and the
-            // walker refuses a null ref argument to a may-force call.
-            //
-            // Leaving it as an allocation is what
+            // Leaving it as a traced allocation is what
             // `positional_shape_metadata` derives with zero rows and no
             // collector-issued type id, which the walker rejects with
             // `UnregisteredNewGcType` after the descent has already run.

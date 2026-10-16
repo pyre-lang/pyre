@@ -13,7 +13,10 @@
 //! referent alive for the process. Compiled loops keep their own
 //! `GcTable` roots. A major collection stamps the slots extra-root
 //! walkers still hold and [`sweep_untraced`] frees the rest onto a
-//! free list `intern` reuses. Index 0 stays null.
+//! free list `intern` reuses. Index 0 stays null. The table and
+//! [`MAJOR_LIVE`] are process-global: a major that walked only one
+//! thread's extra areas must not sweep. Two live `install_gc_box`
+//! collectors at once is not a supported configuration.
 //!
 //! Intern key is `gc_id_or_identityhash` (`minimark.py`
 //! `id_or_identityhash`), not the address. The key is recorded at
@@ -23,7 +26,18 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering}
 
 use parking_lot::Mutex;
 
-use crate::value::{GcRef, gc_id_or_identityhash};
+use crate::value::{GcRef, gc_current_object_address, gc_id_or_identityhash};
+
+/// Live word of `addr`. `gc_current_object_address` follows a nursery
+/// forwarding stub (`_trace_drag_out`) without treating the address as a
+/// root. Unset (tests, no collector) is identity.
+fn live_gcref(addr: GcRef) -> GcRef {
+    if addr.is_null() {
+        addr
+    } else {
+        GcRef(gc_current_object_address(addr.0))
+    }
+}
 
 struct Table {
     /// Index 0 is null and is never interned.
@@ -130,6 +144,8 @@ static DIR: AtomicPtr<ChunkDir> = AtomicPtr::new(std::ptr::null_mut());
 
 /// `history.py` drops a `ConstPtr` with the last holder. A major that
 /// traces every live holder then frees a slot no holder stamped.
+/// Process-global: one generation for the whole table. Sound when the
+/// stamping walk covered every holder (STW, or a single-mutator process).
 static MAJOR_LIVE: AtomicU32 = AtomicU32::new(1);
 
 fn current_live() -> u32 {
@@ -231,11 +247,45 @@ pub fn intern(addr: GcRef) -> u32 {
     if addr.is_null() {
         return 0;
     }
+    // Follow the stub before hashing. `minimark.py` `id_or_identityhash`
+    // already follows it, so a find-hit is the dest slot; storing the
+    // from-space address would `stamp_reuse` dest with a gap corpse
+    // (`arena_reset` mode 0). `history.py` `ConstPtr.value` is the live
+    // word.
+    let addr = live_gcref(addr);
+    crate::gcref_diag(addr.0, "intern-before-hash");
     let hash = gc_id_or_identityhash(addr.0) as u64;
+    crate::gcref_diag(addr.0, "intern-after-hash");
     let mut guard = table();
-    if let Some(idx) = find(&guard, hash, addr.0) {
-        stamp_reuse(&mut guard, idx, addr, hash);
-        note_young(&mut guard, idx);
+    intern_under(&mut guard, addr, hash)
+}
+
+/// Intern `addr` and drain [`Table::young`] under one table lock.
+///
+/// A sibling `MiniMarkGC` minor in the same process would otherwise
+/// `take_young` this slot before the caller traces it. Two live
+/// collectors at once is not a supported configuration; cargo test
+/// still starts many `MiniMarkGC` values in one process.
+pub fn intern_and_take_young(addr: GcRef) -> (u32, Vec<u32>) {
+    if addr.is_null() {
+        let mut guard = table();
+        return (0, take_young_under(&mut guard));
+    }
+    let addr = live_gcref(addr);
+    crate::gcref_diag(addr.0, "intern-before-hash");
+    let hash = gc_id_or_identityhash(addr.0) as u64;
+    crate::gcref_diag(addr.0, "intern-after-hash");
+    let mut guard = table();
+    let idx = intern_under(&mut guard, addr, hash);
+    let young = take_young_under(&mut guard);
+    (idx, young)
+}
+
+fn intern_under(guard: &mut Table, addr: GcRef, hash: u64) -> u32 {
+    let addr = live_gcref(addr);
+    if let Some(idx) = find(guard, hash, addr.0) {
+        stamp_reuse(guard, idx, addr, hash);
+        note_young(guard, idx);
         return idx;
     }
     // `find` keys `by_hash`. A nursery intern that hashed the nursery
@@ -244,9 +294,9 @@ pub fn intern(addr: GcRef) -> u32 {
     // object. `history.py` `ConstPtr` is one object: the live word
     // already in a slot is that intern (`same_constant` compares
     // `value`).
-    if let Some(idx) = find_by_addr(&guard, addr.0) {
-        stamp_reuse(&mut guard, idx, addr, hash);
-        note_young(&mut guard, idx);
+    if let Some(idx) = find_by_addr(guard, addr.0) {
+        stamp_reuse(guard, idx, addr, hash);
+        note_young(guard, idx);
         return idx;
     }
     let idx = if let Some(free_idx) = guard.free.pop() {
@@ -266,7 +316,7 @@ pub fn intern(addr: GcRef) -> u32 {
     };
     insert_pair(&mut guard.by_hash, hash, idx);
     insert_pair(&mut guard.by_addr, addr.0 as u64, idx);
-    note_young(&mut guard, idx);
+    note_young(guard, idx);
     // Publish before releasing the intern lock so another thread that
     // finds this index cannot `resolve` a still-zero mirror.
     publish_slot(idx as usize, addr);
@@ -335,18 +385,21 @@ pub fn trace_index(index: u32, visitor: &mut dyn FnMut(&mut GcRef)) {
     if index == 0 || walking() {
         return;
     }
-    let mut guard = table();
     let idx = index as usize;
-    if idx >= guard.slots.len() || guard.slots[idx].is_null() {
-        return;
-    }
-    if idx >= guard.live.len() {
-        guard.live.resize(idx + 1, 0);
-    }
-    guard.live[idx] = current_live();
-    if !claim_wave(&mut guard.marks, idx) {
-        return;
-    }
+    let mut slot = {
+        let mut guard = table();
+        if idx >= guard.slots.len() || guard.slots[idx].is_null() {
+            return;
+        }
+        if idx >= guard.live.len() {
+            guard.live.resize(idx + 1, 0);
+        }
+        guard.live[idx] = current_live();
+        if !claim_wave(&mut guard.marks, idx) {
+            return;
+        }
+        guard.slots[idx]
+    };
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
@@ -355,14 +408,19 @@ pub fn trace_index(index: u32, visitor: &mut dyn FnMut(&mut GcRef)) {
     }
     set_walking(true);
     let _clear = Clear;
+    visitor(&mut slot);
+    let mut guard = table();
+    if idx >= guard.slots.len() {
+        return;
+    }
     let old = guard.slots[idx].0 as u64;
-    visitor(&mut guard.slots[idx]);
-    let new = guard.slots[idx].0 as u64;
+    guard.slots[idx] = slot;
+    let new = slot.0 as u64;
     if old != new {
         remove_pair(&mut guard.by_addr, old, index);
         insert_pair(&mut guard.by_addr, new, index);
     }
-    publish_slot(idx, guard.slots[idx]);
+    publish_slot(idx, slot);
 }
 
 /// `true` when this wave has not yet traced `idx`. Wave 0 always claims.
@@ -460,22 +518,41 @@ pub fn walk(visitor: &mut dyn FnMut(&mut GcRef)) {
     }
     set_walking(true);
     let _clear = Clear;
-    let mut guard = table();
-    let mut idx = 1;
-    while idx < guard.slots.len() {
-        if guard.slots[idx].is_null() || !claim_wave(&mut guard.marks, idx) {
-            idx += 1;
-            continue;
+    let mut idx = 1usize;
+    loop {
+        let (index, mut slot) = {
+            let mut guard = table();
+            let found = loop {
+                if idx >= guard.slots.len() {
+                    break None;
+                }
+                if guard.slots[idx].is_null() || !claim_wave(&mut guard.marks, idx) {
+                    idx += 1;
+                    continue;
+                }
+                let slot = guard.slots[idx];
+                let index = idx as u32;
+                idx += 1;
+                break Some((index, slot));
+            };
+            match found {
+                Some(pair) => pair,
+                None => return,
+            }
+        };
+        visitor(&mut slot);
+        let mut guard = table();
+        let i = index as usize;
+        if i < guard.slots.len() {
+            let old = guard.slots[i].0 as u64;
+            guard.slots[i] = slot;
+            let new = slot.0 as u64;
+            if old != new {
+                remove_pair(&mut guard.by_addr, old, index);
+                insert_pair(&mut guard.by_addr, new, index);
+            }
+            publish_slot(i, slot);
         }
-        let old = guard.slots[idx].0 as u64;
-        visitor(&mut guard.slots[idx]);
-        let new = guard.slots[idx].0 as u64;
-        if old != new {
-            remove_pair(&mut guard.by_addr, old, idx as u32);
-            insert_pair(&mut guard.by_addr, new, idx as u32);
-        }
-        publish_slot(idx, guard.slots[idx]);
-        idx += 1;
     }
 }
 
@@ -508,6 +585,10 @@ pub fn trace_young_const_ptrs(visitor: &mut dyn FnMut(&mut GcRef)) {
 
 fn take_young() -> Vec<u32> {
     let mut guard = table();
+    take_young_under(&mut guard)
+}
+
+fn take_young_under(guard: &mut Table) -> Vec<u32> {
     let taken = std::mem::take(&mut guard.young);
     for &idx in &taken {
         let i = idx as usize;
@@ -535,6 +616,9 @@ fn note_young(guard: &mut Table, idx: u32) {
 
 /// Free a slot no holder stamped in this major. `history.py` drops
 /// the `ConstPtr` when no trace, descr, or op holds the box.
+///
+/// Call only after a complete holder census. A major that walked one
+/// thread's extra areas would recycle another thread's live indexes.
 pub fn sweep_untraced() {
     let live = current_live();
     let mut guard = table();
@@ -585,7 +669,9 @@ fn stamp_reuse(guard: &mut Table, idx: u32, addr: GcRef, hash: u64) {
     // Find-hit is not a root. `history.py` `ConstPtr` lives only while a
     // holder traces `value`. The interned word is still the live address
     // (`same_constant` compares `value`); rewrite a from-space slot so
-    // the next intern of this referent reuses this index.
+    // the next intern of this referent reuses this index. `intern`
+    // already stored dest (`live_gcref`); a from-space intern must not
+    // write the gap corpse over dest.
     if guard.slots[i] != addr {
         let old = guard.slots[i].0 as u64;
         guard.slots[i] = addr;
@@ -674,6 +760,34 @@ mod tests {
     }
 
     #[test]
+    fn visitor_may_call_index_of_current_without_deadlocking() {
+        let _serial = TEST_SERIAL.lock();
+        let addr = GcRef(0x6E6A_DEAD_0100);
+        let idx = intern(addr);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut found_trace = None;
+            trace_index(idx, &mut |slot| {
+                found_trace = index_of_current(*slot);
+            });
+            let mut found_walk = None;
+            walk(&mut |slot| {
+                if slot.0 == addr.0 {
+                    found_walk = index_of_current(*slot);
+                }
+            });
+            let _ = tx.send((found_trace, found_walk));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok((found_trace, found_walk)) => {
+                assert_eq!(found_trace, Some(idx));
+                assert_eq!(found_walk, Some(idx));
+            }
+            Err(_) => panic!("const_ptr_table visitor deadlock: index_of_current under TABLE"),
+        }
+    }
+
+    #[test]
     fn intern_reuses_the_slot_when_the_referent_moved() {
         let _serial = TEST_SERIAL.lock();
         struct ResetHook;
@@ -694,6 +808,39 @@ mod tests {
         let idx = intern(GcRef(0x5555_0000));
         assert_eq!(intern(GcRef(0x5555_0080)), idx);
         assert_eq!(resolve(idx), GcRef(0x5555_0080));
+    }
+
+    #[test]
+    fn intern_of_a_from_space_address_does_not_overwrite_dest() {
+        let _serial = TEST_SERIAL.lock();
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                crate::set_gc_id_or_identityhash(None);
+                crate::set_gc_current_object_address(None);
+            }
+        }
+        let _reset = ResetHook;
+        const FROM: usize = 0x5555_4000;
+        const TO: usize = 0x5555_4080;
+        fn stable_id(addr: usize) -> usize {
+            if addr == FROM || addr == TO {
+                0x1D_0002
+            } else {
+                addr
+            }
+        }
+        fn current(addr: usize) -> usize {
+            if addr == FROM { TO } else { addr }
+        }
+        crate::set_gc_id_or_identityhash(Some(stable_id));
+        crate::set_gc_current_object_address(Some(current));
+        let idx = intern(GcRef(TO));
+        assert_eq!(intern(GcRef(FROM)), idx);
+        assert_eq!(resolve(idx), GcRef(TO));
+        let idx_from = intern(GcRef(FROM));
+        assert_eq!(idx_from, idx);
+        assert_eq!(resolve(idx_from), GcRef(TO));
     }
 
     #[test]

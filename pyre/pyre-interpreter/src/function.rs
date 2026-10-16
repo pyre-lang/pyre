@@ -4329,6 +4329,10 @@ pub fn funccall_valuestack(
     // for that push; this inner one is what the peek/dropvalues after
     // createframe read through.
     let caller = crate::eval::FrameAnchor::new(frame);
+    // `func` is a Copy the caller read before this CALL was recorded; keep
+    // it on the shadow stack beside the anchored frame.
+    let _entry_roots = pyre_object::gc_roots::push_roots();
+    let func = _entry_roots.pin_root(func);
     // `function.py funccall_valuestack` does not register an extra root: the
     // caller frame is already a GC object kept live by `FrameAnchor` and the
     // execution-context chain, and `pyframe_object_custom_trace` visits

@@ -99,3 +99,45 @@ pub fn layout_for_fail_descr(
 // `DynasmFailDescr` all went away with the struct.  The metainterp
 // `AbstractFailDescr` Arc carries the canonical `FailDescr` impl now
 // reached through `op.descr` and `DescrRef::as_fail_descr`.
+
+/// `BaseAssembler.store_info_on_descr`.
+///
+/// Encode `fail_locs` once. When every position equals
+/// `_previous_rd_locs`, return that handle instead of a new allocation.
+pub(crate) fn store_info_on_descr(
+    previous: &mut majit_ir::RdLocs,
+    faillocs: &[Option<crate::regloc::Loc>],
+    slot_for_loc: fn(&crate::regloc::Loc) -> Option<u16>,
+) -> majit_ir::RdLocs {
+    let mut shared = previous.len() == faillocs.len();
+    let mut positions: Option<Vec<u16>> = if shared {
+        None
+    } else {
+        Some(vec![0; faillocs.len()])
+    };
+    for (i, fl) in faillocs.iter().enumerate() {
+        let position = match fl {
+            None => 0xFFFF,
+            Some(loc) => slot_for_loc(loc).unwrap_or_else(|| {
+                panic!("store_info_on_descr: cannot encode fail-arg loc {loc:?} (gen_regs.index)")
+            }),
+        };
+        if shared {
+            if previous[i] == position {
+                continue;
+            }
+            let mut owned = previous.as_slice().to_vec();
+            owned[i] = position;
+            positions = Some(owned);
+            shared = false;
+            continue;
+        }
+        positions.as_mut().expect("rd_locs buffer")[i] = position;
+    }
+    if shared {
+        return previous.clone();
+    }
+    let locs = majit_ir::RdLocs::from_vec(positions.expect("rd_locs buffer"));
+    *previous = locs.clone();
+    locs
+}

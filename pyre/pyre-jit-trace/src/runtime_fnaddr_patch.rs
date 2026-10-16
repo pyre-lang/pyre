@@ -350,44 +350,42 @@ pub fn patch_static_addr_constants(jitcodes: &mut [Arc<JitCode>]) {
                     .any(|d| matches!(d.kind, ConstIRelocKind::StaticAddr { .. }))
         })
     });
-    if !has_static_reloc {
-        return;
-    }
-
-    for arc in jitcodes.iter_mut() {
-        let jc = Arc::get_mut(arc).expect(
-            "patch_static_addr_constants: Arc<JitCode> already shared before patch — \
-             every caller must run this before publishing the table to consumers",
-        );
-        if jc.try_body().is_some() {
-            let body = jc.body_mut();
-            let updates_i: Vec<(usize, i64)> = body
-                .reloc_consts_i
-                .iter()
-                .filter_map(|desc| {
-                    let ConstIRelocKind::StaticAddr { name } = &desc.kind else {
-                        return None;
-                    };
-                    runtime_static_addr_by_name(name)
-                        .map(|runtime| (desc.constants_i_index, runtime))
-                })
-                .collect();
-            for (index, runtime) in updates_i {
-                body.constants_i[index] = runtime;
-            }
-            let updates_r: Vec<(usize, i64)> = body
-                .reloc_consts_r
-                .iter()
-                .filter_map(|desc| {
-                    let ConstIRelocKind::StaticAddr { name } = &desc.kind else {
-                        return None;
-                    };
-                    runtime_static_addr_by_name(name)
-                        .map(|runtime| (desc.constants_r_index, runtime))
-                })
-                .collect();
-            for (index, runtime) in updates_r {
-                *body.constants_r[index].get_mut() = runtime;
+    if has_static_reloc {
+        for arc in jitcodes.iter_mut() {
+            let jc = Arc::get_mut(arc).expect(
+                "patch_static_addr_constants: Arc<JitCode> already shared before patch — \
+                 every caller must run this before publishing the table to consumers",
+            );
+            if jc.try_body().is_some() {
+                let body = jc.body_mut();
+                let updates_i: Vec<(usize, i64)> = body
+                    .reloc_consts_i
+                    .iter()
+                    .filter_map(|desc| {
+                        let ConstIRelocKind::StaticAddr { name } = &desc.kind else {
+                            return None;
+                        };
+                        runtime_static_addr_by_name(name)
+                            .map(|runtime| (desc.constants_i_index, runtime))
+                    })
+                    .collect();
+                for (index, runtime) in updates_i {
+                    body.constants_i[index] = runtime;
+                }
+                let updates_r: Vec<(usize, i64)> = body
+                    .reloc_consts_r
+                    .iter()
+                    .filter_map(|desc| {
+                        let ConstIRelocKind::StaticAddr { name } = &desc.kind else {
+                            return None;
+                        };
+                        runtime_static_addr_by_name(name)
+                            .map(|runtime| (desc.constants_r_index, runtime))
+                    })
+                    .collect();
+                for (index, runtime) in updates_r {
+                    *body.constants_r[index].get_mut() = runtime;
+                }
             }
         }
     }
@@ -855,6 +853,85 @@ pub fn materialize_type_static_consts(jitcodes: &mut [Arc<JitCode>]) {
     }
 }
 
+/// Materialize every deferred zero-length array constant
+/// ([`materialize_str_consts`]' sibling for `_ll_prebuilt_empty_array`).
+/// Each descriptor names a `constants_r` slot holding a non-canonical
+/// sentinel; overwrite it with one immortal empty `GcArray` per item type.
+pub fn materialize_empty_array_consts(jitcodes: &mut [Arc<JitCode>]) {
+    static CELLS: LazyLock<std::sync::Mutex<Vec<(String, i64)>>> =
+        LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    for arc in jitcodes.iter_mut() {
+        if arc
+            .try_body()
+            .is_none_or(|b| b.empty_array_consts.is_empty())
+        {
+            continue;
+        }
+        let jc = Arc::get_mut(arc).expect(
+            "materialize_empty_array_consts: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        let body = jc.body_mut();
+        for i in 0..body.empty_array_consts.len() {
+            let idx = body.empty_array_consts[i].constants_r_index;
+            let type_name = body.empty_array_consts[i].type_name.clone();
+            let addr = {
+                let mut cells = CELLS.lock().unwrap();
+                if let Some((_, a)) = cells.iter().find(|(q, _)| *q == type_name) {
+                    *a
+                } else {
+                    let a = prebuilt_empty_array_addr(&type_name);
+                    cells.push((type_name, a));
+                    a
+                }
+            };
+            assert_eq!(
+                (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
+                (majit_jitcode::codewriter::assembler::EMPTY_ARRAY_CONST_SENTINEL_BASE as u64)
+                    & SENTINEL_HIGH_MASK,
+                "constants_r[{idx}] did not hold an empty-array sentinel",
+            );
+            body.constants_r[idx] = addr.into();
+        }
+    }
+}
+
+/// One immortal empty `GcArray` for `type_name` (`Array<T;0>`).
+fn prebuilt_empty_array_addr(type_name: &str) -> i64 {
+    let item = empty_array_item(type_name)
+        .unwrap_or_else(|| panic!("empty-array constant {type_name} is not Array<T;0>"));
+    if item_is_object_pointer(item) {
+        pyre_object::prebuilt_empty_object_array() as i64
+    } else if item == "u8" {
+        pyre_object::prebuilt_empty_bytes_block() as i64
+    } else {
+        // Header-only empty GcArray (`prepare_const(0)`). Length is 0, so the
+        // item stride is unused; one block per `type_name` via the caller cache.
+        unsafe { pyre_object::alloc_mro_block_gc(&[]) as i64 }
+    }
+}
+
+fn empty_array_item(type_name: &str) -> Option<&str> {
+    let inner = type_name.strip_prefix("Array<")?.strip_suffix('>')?;
+    let (item, len) = inner.rsplit_once(';')?;
+    (len.trim() == "0").then_some(item.trim())
+}
+
+fn item_is_object_pointer(item: &str) -> bool {
+    let item = item.trim();
+    if item == "PyObjectRef" || item.ends_with("::PyObjectRef") {
+        return true;
+    }
+    let Some(pointee) = item
+        .strip_prefix("*mut ")
+        .or_else(|| item.strip_prefix("*const "))
+    else {
+        return false;
+    };
+    let pointee = pointee.trim();
+    pointee == "PyObject" || pointee.ends_with("::PyObject")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +962,27 @@ mod tests {
             ..Default::default()
         });
         Arc::new(jc)
+    }
+
+    #[test]
+    fn patch_static_addr_constants_keeps_sentinels_and_runtime_statics() {
+        let known = pyre_interpreter::jit_static_ref_addrs()
+            .into_iter()
+            .find(|(_, addr)| *addr != 0)
+            .map(|(_, addr)| addr)
+            .expect("jit_static_ref_addrs");
+        let exc = majit_jitcode::codewriter::assembler::EXC_INSTANCE_CONST_SENTINEL_BASE | 2;
+        let jc = JitCode::new("listed-ref");
+        jc.set_body(JitCodeBody {
+            constants_r: vec![sentinel(1).into(), known.into(), exc.into()],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        patch_static_addr_constants(&mut jcs);
+        let body = jcs[0].body();
+        assert_eq!(body.constants_r[0].get(), sentinel(1));
+        assert_eq!(body.constants_r[1].get(), known);
+        assert_eq!(body.constants_r[2].get(), exc);
     }
 
     #[test]
@@ -1127,6 +1225,58 @@ mod tests {
             "implicit AssertionError shouldn't occur",
         );
         assert_eq!(addr, again as usize as i64);
+    }
+
+    #[test]
+    fn materialize_empty_array_consts_overwrites_sentinel_with_zero_length_gcarray() {
+        use majit_jitcode::codewriter::assembler::EMPTY_ARRAY_CONST_SENTINEL_BASE;
+        use majit_jitcode::jitcode::EmptyArrayConstDescriptor;
+
+        let desc = EmptyArrayConstDescriptor {
+            constants_r_index: 0,
+            type_name: "Array<PyObjectRef;0>".into(),
+        };
+        let jc = JitCode::new("empty_args_w");
+        jc.set_body(JitCodeBody {
+            empty_array_consts: vec![desc],
+            constants_r: vec![EMPTY_ARRAY_CONST_SENTINEL_BASE.into()],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        materialize_empty_array_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_ne!(addr, EMPTY_ARRAY_CONST_SENTINEL_BASE);
+        assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
+        assert_ne!(addr, 0);
+        assert_eq!(
+            pyre_object::gcarray_len(addr as *const pyre_object::GcTypedArray),
+            0
+        );
+        let again = pyre_object::prebuilt_empty_object_array() as i64;
+        assert_eq!(addr, again);
+    }
+
+    #[test]
+    fn materialize_empty_u8_array_consts_overwrites_sentinel() {
+        use majit_jitcode::codewriter::assembler::EMPTY_ARRAY_CONST_SENTINEL_BASE;
+        use majit_jitcode::jitcode::EmptyArrayConstDescriptor;
+
+        let desc = EmptyArrayConstDescriptor {
+            constants_r_index: 0,
+            type_name: "Array<u8;0>".into(),
+        };
+        let jc = JitCode::new("empty_bytes");
+        jc.set_body(JitCodeBody {
+            empty_array_consts: vec![desc],
+            constants_r: vec![EMPTY_ARRAY_CONST_SENTINEL_BASE.into()],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        materialize_empty_array_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_ne!(addr, 0);
+        assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
+        assert_eq!(addr, pyre_object::prebuilt_empty_bytes_block() as i64);
     }
 
     /// Walker folds that recognise a residual by callee compare against this

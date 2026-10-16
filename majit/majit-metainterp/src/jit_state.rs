@@ -221,12 +221,101 @@ pub struct GuardResumeFrame {
 /// `rebuild_from_resumedata`'s `virtualizable_boxes, virtualref_boxes`:
 /// what `consume_vref_and_vable_boxes` decoded ahead of the frames, each box
 /// with the concrete the reader stamped on it.
-#[derive(Debug, Clone, Default)]
+///
+/// The `(OpRef, Value)` copies are not roots. A later `bridge_decode_box`
+/// `NEW` / Trace-pool append, or `rebuild_portal_framestack_from_resumedata`,
+/// can collect before `setup_bridge_sym` stores them. `vable_ref_roots` holds
+/// each Ref as a translated livevar (`OwnerRootGuard`) so the collector
+/// forwards it in place, the way `consume_boxes` keeps the decoded GCREF in
+/// a traced local across the setattr.
+#[derive(Default)]
 pub struct VrefVableBoxes {
     /// `consume_virtualizable_boxes`: `[vable, static fields..., array items...]`.
     pub virtualizable_boxes: Vec<(OpRef, Value)>,
     /// `consume_virtualref_boxes`: `(virtual, vref)` pairs, flattened.
     pub virtualref_boxes: Vec<(OpRef, Value)>,
+    /// One slot per `virtualizable_boxes` entry; `None` for a non-Ref.
+    vable_ref_roots: Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>>,
+}
+
+impl std::fmt::Debug for VrefVableBoxes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VrefVableBoxes")
+            .field("virtualizable_boxes", &self.virtualizable_boxes)
+            .field("virtualref_boxes", &self.virtualref_boxes)
+            .field("vable_ref_roots", &self.vable_ref_roots.len())
+            .finish()
+    }
+}
+
+impl VrefVableBoxes {
+    fn pin_ref_value(val: Value) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
+        match val {
+            Value::Ref(gc) if !gc.is_null() && gc != GcRef::NO_CONCRETE => {
+                // `pin_root` / `normalize_published_slot`: a decode that
+                // collected may hand back a word that already carries a
+                // forwarding stub. Publish the to-space address; the
+                // guard then tracks later moves.
+                let live = majit_gc::gc_current_object_address(gc.0);
+                if live == 0 {
+                    return None;
+                }
+                Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                    majit_ir::GcRef(live),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Pin every `Box` GCREF from the deadframe before the first decode can
+    /// collect. Index-aligned with `virtualizable_boxes`.
+    pub fn pre_pin_vable_boxes(
+        &mut self,
+        vvals: &[majit_ir::resumedata::RebuiltValue],
+        fail_values: &[i64],
+    ) {
+        self.vable_ref_roots.clear();
+        self.vable_ref_roots.reserve(vvals.len());
+        for v in vvals {
+            let guard = match v {
+                majit_ir::resumedata::RebuiltValue::Box(n, Type::Ref) => fail_values
+                    .get(*n)
+                    .copied()
+                    .map(|bits| Value::Ref(GcRef(bits as usize)))
+                    .and_then(Self::pin_ref_value),
+                _ => None,
+            };
+            self.vable_ref_roots.push(guard);
+        }
+    }
+
+    /// Reload a pre-pinned Box, or pin a Virtual/Const just decoded.
+    pub fn reload_or_pin_vable(&mut self, idx: usize, val: Value) -> Value {
+        if let Some(g) = self.vable_ref_roots.get(idx).and_then(|slot| slot.as_ref()) {
+            return Value::Ref(g.get());
+        }
+        if let Some(g) = Self::pin_ref_value(val) {
+            let live = Value::Ref(g.get());
+            if idx < self.vable_ref_roots.len() {
+                self.vable_ref_roots[idx] = Some(g);
+            }
+            return live;
+        }
+        val
+    }
+
+    /// Live GCREF at store time (`setup_bridge_sym`). The guard is a root
+    /// across `rebuild_portal_framestack_from_resumedata`.
+    pub fn live_vable(&self, idx: usize, fallback: Value) -> Value {
+        let live = self
+            .vable_ref_roots
+            .get(idx)
+            .and_then(|slot| slot.as_ref())
+            .map(|g| Value::Ref(g.get()))
+            .unwrap_or(fallback);
+        live
+    }
 }
 
 pub trait JitState: Sized {

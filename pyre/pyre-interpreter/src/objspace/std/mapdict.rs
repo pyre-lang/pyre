@@ -23,9 +23,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock};
 
 // PyPy serializes mapdict map/storage transitions with the GIL.  Pyre is
-// free-threaded, so use narrow address-striped reentrant locks around the same
-// transition boundaries.  This is synchronization only; attribute state
-// remains on `W_ObjectObject.map/storage`, exactly as upstream.
+// free-threaded, so use narrow reentrant locks around the same transition
+// boundaries.  The stripe is the instance's class, not its address: a nursery
+// instance moves while the guard is held (`w_list_lock_acquire`).  Attribute
+// state remains on `W_ObjectObject.map/storage`, exactly as upstream.
 struct ForkReentrantLock(UnsafeCell<ReentrantMutex<()>>);
 unsafe impl Sync for ForkReentrantLock {}
 
@@ -69,8 +70,82 @@ fn lock_stripe(lock: &'static ReentrantMutex<()>) -> MapDictGuard {
     guard
 }
 
-fn instance_lock(obj: PyObjectRef) -> MapDictGuard {
-    lock_stripe(INSTANCE_LOCKS[(obj as usize >> 4) & (INSTANCE_LOCKS.len() - 1)].get())
+fn instance_stripe_index(w_class: PyObjectRef) -> usize {
+    (w_class as usize >> 4) & (INSTANCE_LOCKS.len() - 1)
+}
+
+fn lock_instance_stripe(index: usize) -> MapDictGuard {
+    lock_stripe(INSTANCE_LOCKS[index].get())
+}
+
+/// Both class stripes, lower index first, so two transitions cannot deadlock.
+///
+/// One guard when both classes hash to the same stripe. The locks are
+/// reentrant, but a second acquire of the same stripe is not required.
+pub(crate) struct InstanceStripes {
+    _first: MapDictGuard,
+    _second: Option<MapDictGuard>,
+}
+
+/// Residual: the acquire parks in `before_external_block` (`Lock.acquire`).
+/// Stripe indices stay inside this boundary so `INSTANCE_LOCKS` is not a
+/// host path on a looked-inside caller.
+#[majit_macros::dont_look_inside]
+pub(crate) fn lock_instance_stripes(first: PyObjectRef, second: PyObjectRef) -> InstanceStripes {
+    let first = instance_stripe_index(first);
+    let second = instance_stripe_index(second);
+    if first == second {
+        InstanceStripes {
+            _first: lock_instance_stripe(first),
+            _second: None,
+        }
+    } else if first < second {
+        let held = lock_instance_stripe(first);
+        InstanceStripes {
+            _first: held,
+            _second: Some(lock_instance_stripe(second)),
+        }
+    } else {
+        let held = lock_instance_stripe(second);
+        InstanceStripes {
+            _first: held,
+            _second: Some(lock_instance_stripe(first)),
+        }
+    }
+}
+
+fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
+    // A nursery instance moves while this guard is held. Stripe on its class,
+    // as `w_list_lock_acquire` does, so a collection inside
+    // `type_terminator_or_create` does not put later accessors on another stripe.
+    // `__class__` assignment changes that stripe. After the acquire, re-read
+    // `w_class`; a mismatch means the transition published a new class while
+    // this thread waited, so drop and take the new stripe.
+    // A contended acquire parks in `before_external_block`. The owner can
+    // minor-collect before this thread resumes, so pin the receiver across that
+    // wait and return the forwarded word. Callers dereference that word
+    // (`ensure_mapdict_initialized`, `node_write`) with no bracket of their own.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut obj = pyre_object::gc_roots::pin_root(obj);
+    loop {
+        let w_class = unsafe { (*obj).w_class };
+        let guard = lock_instance_stripe(instance_stripe_index(w_class));
+        obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        if unsafe { (*obj).w_class } == w_class {
+            return (guard, obj);
+        }
+    }
+}
+
+/// [`ensure_mapdict_initialized`] for a pair. The terminator is a leaked
+/// `Box` and this does not collect, so `extra` is unchanged.
+unsafe fn ensure_initialized_pair(
+    obj: PyObjectRef,
+    extra: PyObjectRef,
+) -> (PyObjectRef, PyObjectRef) {
+    let obj = ensure_mapdict_initialized(obj);
+    (obj, extra)
 }
 
 fn code_cache_lock(code: PyObjectRef) -> MapDictGuard {
@@ -493,22 +568,26 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
 /// covering types built before the eager install site — then set it as the
 /// instance map. Must run before any `node_read`/`node_write`/`node_delete`.
 ///
+/// Returns `obj`. [`new_terminator`] leaks a `Box`, so
+/// [`type_terminator_or_create`] does not collect and the instance does not
+/// move here. Callers that collect after this returns pin the pointer
+/// themselves (`instance_setclass`).
+///
 /// # Safety
 /// `obj` must be a live mapdict carrier. User-layout instances
 /// (`W_IntObjectUser`, …) are nursery-born (`w_int_subclass_new`).
-/// `type_terminator_or_create` allocates an immortal `Box`
-/// (`new_terminator`), so the carrier address stays put across the call.
-pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) {
+pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
-        return;
+        return obj;
     }
     let mut inst = unsafe { mapdict_carrier(obj) };
     if !inst._get_mapdict_map().is_null() {
-        return;
+        return obj;
     }
     let w_type = pyre_object::w_instance_get_type(obj);
     let term = type_terminator_or_create(w_type);
     inst._set_mapdict_map(term);
+    obj
 }
 
 /// [`type_terminator_or_create`] for callers outside the mapdict layer — the
@@ -679,8 +758,8 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
 /// `descr_set___class__` for a `W_ObjectObject`. pyre additionally keeps the
 /// `w_class` field authoritative for `type()` (the node layer's
-/// `terminator.w_cls` is never read for `getclass`), so the caller sets that
-/// after this returns.
+/// `terminator.w_cls` is never read for `getclass`), so this store writes
+/// that field while the stripes are held.
 ///
 /// `dont_look_inside` — same residual-call rationale as
 /// [`instance_node_setdictvalue`]: `node_set_terminator` rebuilds through
@@ -689,7 +768,8 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
 /// not annotator-lowerable.
 ///
 /// # Safety
-/// `obj` must be a live `W_ObjectObject`.
+/// `obj` must be a live `W_ObjectObject`. The class store runs while both
+/// the old and the new class stripes are held.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     unsafe { ensure_mapdict_initialized(obj) };
@@ -727,7 +807,7 @@ pub unsafe fn instance_node_setdictvalue(
 ) -> bool {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj, value]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let value = pyre_object::gc_roots::shadow_stack_get(base + 1);
     ensure_mapdict_initialized(obj);
@@ -777,7 +857,7 @@ pub unsafe fn mapdict_boxed_dict_attr(obj: PyObjectRef, name: &Wtf8) -> Option<P
     // or write, so the lock only covers the read.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let inst = unsafe { mapdict_carrier(obj) };
     let map = inst._get_mapdict_map();
@@ -829,7 +909,7 @@ pub unsafe fn instance_node_getdictvalue_checked(
 ) -> Result<Option<PyObjectRef>, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
@@ -855,7 +935,7 @@ pub unsafe fn instance_node_getdictvalue_checked(
 pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
@@ -884,7 +964,7 @@ pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool 
 pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
@@ -907,7 +987,7 @@ pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
 pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> bool {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj, w_dict]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let w_dict = pyre_object::gc_roots::shadow_stack_get(base + 1);
     ensure_mapdict_initialized(obj);
@@ -925,7 +1005,7 @@ pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> b
 pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
@@ -945,7 +1025,7 @@ pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef>
 pub unsafe fn instance_set_weakref_slot(obj: PyObjectRef, lifeline: PyObjectRef) -> bool {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj, lifeline]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let lifeline = pyre_object::gc_roots::shadow_stack_get(base + 1);
     ensure_mapdict_initialized(obj);
@@ -963,7 +1043,7 @@ pub unsafe fn instance_set_weakref_slot(obj: PyObjectRef, lifeline: PyObjectRef)
 pub unsafe fn instance_del_weakref_slot(obj: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
@@ -995,7 +1075,7 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
         unsafe { has_mapdict_layout(obj) },
         "W_Root.getslotvalue: receiver has no mapdict slot storage"
     );
-    ensure_mapdict_initialized(obj);
+    let obj = ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
@@ -1021,7 +1101,7 @@ pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRe
         unsafe { has_mapdict_layout(obj) },
         "W_Root.setslotvalue: receiver has no mapdict slot storage"
     );
-    ensure_mapdict_initialized(obj);
+    let (obj, w_value) = ensure_initialized_pair(obj, w_value);
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
@@ -1047,7 +1127,7 @@ pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
         unsafe { has_mapdict_layout(obj) },
         "W_Root.delslotvalue: receiver has no mapdict slot storage"
     );
-    ensure_mapdict_initialized(obj);
+    let obj = ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
@@ -1325,7 +1405,7 @@ pub unsafe fn mapdict_strategy_repr(obj: PyObjectRef) -> Option<rustpython_wtf8:
     // `strategy()` always has one to describe.  pyre installs it on first
     // touch instead, which would otherwise make an untouched instance report
     // nothing and raise `TypeError` for the caller.
-    unsafe { ensure_mapdict_initialized(obj) };
+    let obj = unsafe { ensure_mapdict_initialized(obj) };
     let map = unsafe { mapdict_carrier(obj) }._get_mapdict_map();
     if map.is_null() {
         None
@@ -1604,7 +1684,7 @@ unsafe fn mapdict_map_or_null(w_obj: PyObjectRef) -> MapRef {
     if !unsafe { has_mapdict_storage(w_obj) } {
         return std::ptr::null();
     }
-    unsafe { ensure_mapdict_initialized(w_obj) };
+    let w_obj = unsafe { ensure_mapdict_initialized(w_obj) };
     let inst = unsafe { mapdict_carrier(w_obj) };
     inst._get_mapdict_map()
 }
@@ -1790,7 +1870,7 @@ unsafe fn descr_type_is_heaptype(w_descr: PyObjectRef) -> bool {
 #[majit_macros::dont_look_inside]
 pub unsafe fn load_attr_caching(
     pycode: PyObjectRef,
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     nameindex: usize,
     name: &str,
 ) -> Result<PyObjectRef, PyError> {
@@ -1818,7 +1898,7 @@ pub unsafe fn load_attr_caching(
         }
     };
     let map = {
-        let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
+        let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
         // mapdict.py `map = w_obj._get_mapdict_map()`.
         let map = unsafe { mapdict_map_or_null(pyre_object::gc_roots::shadow_stack_get(base + 1)) };
         if let Some(e) = entry {
@@ -1894,7 +1974,7 @@ unsafe fn load_attr_slowpath(
                 let _roots = pyre_object::gc_roots::push_roots();
                 let base = pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type]);
                 let direct = {
-                    let _instance_guard =
+                    let (_instance_guard, _) =
                         instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
                     let current_map = unsafe {
                         mapdict_map_or_null(pyre_object::gc_roots::shadow_stack_get(base + 1))
@@ -3454,7 +3534,7 @@ pub unsafe fn store_attr_add_commit(
 ) {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_value]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
     let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let mut inst = unsafe { mapdict_carrier(w_obj) };
@@ -3546,7 +3626,7 @@ pub unsafe fn write_unboxed_storage_raw(
 #[majit_macros::dont_look_inside]
 pub unsafe fn store_attr_caching(
     pycode: PyObjectRef,
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     nameindex: usize,
     name: &str,
     w_value: PyObjectRef,
@@ -3563,7 +3643,7 @@ pub unsafe fn store_attr_caching(
         }
     };
     let map = {
-        let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
+        let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
         // mapdict.py `map = w_obj._get_mapdict_map()`.
         let map = unsafe { mapdict_map_or_null(pyre_object::gc_roots::shadow_stack_get(base + 1)) };
         if let Some(e) = entry {
@@ -3667,7 +3747,7 @@ unsafe fn store_attr_slowpath(
                     let _roots = pyre_object::gc_roots::push_roots();
                     let base = pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type, w_value]);
                     let switched = {
-                        let _instance_guard =
+                        let (_instance_guard, _live) =
                             instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
                         let current_map = unsafe {
                             mapdict_map_or_null(pyre_object::gc_roots::shadow_stack_get(base + 1))
@@ -3722,7 +3802,7 @@ unsafe fn store_attr_slowpath(
                         let base =
                             pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type, w_value]);
                         let written = {
-                            let _instance_guard =
+                            let (_instance_guard, _live) =
                                 instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
                             let current_map = unsafe {
                                 mapdict_map_or_null(pyre_object::gc_roots::shadow_stack_get(
@@ -3797,7 +3877,7 @@ unsafe fn store_attr_slowpath(
                             let base =
                                 pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type, w_value]);
                             let mapnew = {
-                                let _instance_guard = instance_lock(
+                                let (_instance_guard, _live) = instance_lock(
                                     pyre_object::gc_roots::shadow_stack_get(base + 1),
                                 );
                                 let current_map = unsafe {
@@ -5878,7 +5958,7 @@ pub unsafe fn node_write<O: MapdictObject>(
 pub unsafe fn instance_node_dict_length(obj: PyObjectRef) -> usize {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
@@ -5903,7 +5983,7 @@ pub unsafe fn instance_node_dict_length(obj: PyObjectRef) -> usize {
 pub unsafe fn instance_node_dict_clear(obj: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
@@ -5945,7 +6025,7 @@ unsafe fn dict_nodes_in_order<O: MapdictObject>(inst: &O) -> Vec<MapRef> {
 pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
-    let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
+    let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
@@ -5984,7 +6064,7 @@ pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
 pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = roots.pin_roots(&[obj]);
-    let _instance_guard = instance_lock(roots.get(obj_slot));
+    let (_instance_guard, _) = instance_lock(roots.get(obj_slot));
     let obj = roots.get(obj_slot);
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
@@ -6021,7 +6101,7 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
 pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = roots.pin_roots(&[obj]);
-    let _instance_guard = instance_lock(roots.get(obj_slot));
+    let (_instance_guard, _) = instance_lock(roots.get(obj_slot));
     let obj = roots.get(obj_slot);
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
@@ -6364,7 +6444,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let _roots = pyre_object::gc_roots::push_roots();
         let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict, w_obj]);
         let obj_slot = dict_slot + 1;
-        let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         ensure_mapdict_initialized(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         let inst = mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         let map = inst._get_mapdict_map();
@@ -6448,7 +6528,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let w_obj = mapdict_strategy_unerase(w_dict);
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
-        let _instance_guard = instance_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         ensure_mapdict_initialized(w_obj);
         let inst = mapdict_carrier(w_obj);
@@ -6465,7 +6545,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let w_obj = mapdict_strategy_unerase(w_dict);
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.pin_roots(&[w_obj]);
-        let _instance_guard = instance_lock(roots.get(obj_slot));
+        let (_instance_guard, _) = instance_lock(roots.get(obj_slot));
         let w_obj = roots.get(obj_slot);
         ensure_mapdict_initialized(w_obj);
         let inst = mapdict_carrier(w_obj);

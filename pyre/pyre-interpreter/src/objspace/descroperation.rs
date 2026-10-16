@@ -3203,6 +3203,11 @@ fn compare_tuples_general(
     }
     let la = unsafe { w_tuple_len(roots.get(base)) };
     let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
+    // `tupleobject.py _descr_eq`: `if lgt1 != lgt2: return space.w_False`
+    // before any item `eq_w`; `descr_ne` is `negate(descr_eq)`.
+    if matches!(op, CompareOp::Eq | CompareOp::Ne) && la != lb {
+        return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+    }
     let min_len = la.min(lb);
     for i in 0..min_len {
         let ea = unsafe { w_tuple_getitem(roots.get(base), i as i64) }.unwrap_or(PY_NULL);
@@ -3214,6 +3219,13 @@ fn compare_tuples_general(
         // `_compare_tuples`: `if not space.eq_w(items1[p], items2[p]):
         //     return getattr(space, name)(items1[p], items2[p])`
         if !crate::baseobjspace::eq_w(pair_scope.get(pair_at), pair_scope.get(pair_at + 1))? {
+            // `tupleobject.py _descr_eq` returns false at the first element
+            // `eq_w` rejects, and `descr_ne` is `negate(descr_eq)`. A second
+            // element compare would call `__ne__`. Ordering still asks the
+            // elements (`_compare_tuples`).
+            if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+                return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+            }
             return compare(pair_scope.get(pair_at), pair_scope.get(pair_at + 1), op);
         }
     }
@@ -7090,6 +7102,22 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     compare_slot_rest(a, b, op)
 }
 
+/// Keys/Items dict views and sets share the set-like comparison walk.
+unsafe fn view_operand_is_set_like(obj: PyObjectRef) -> bool {
+    if pyre_object::is_set_or_frozenset(obj) {
+        return true;
+    }
+    if pyre_object::dictmultiobject::is_dict_view(obj) {
+        let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
+        return matches!(
+            kind,
+            pyre_object::dictmultiobject::DictViewKind::Keys
+                | pyre_object::dictmultiobject::DictViewKind::Items
+        );
+    }
+    false
+}
+
 /// [`compare_slot`] for layouts whose comparison iterates (containers) or
 /// is not the loop-free long/int/str arm.
 #[inline(never)]
@@ -7189,15 +7217,17 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
                 let mut index = 0usize;
                 while index < n_items {
                     let k = pyre_object::gc_roots::shadow_stack_get(items_base + index * 2);
-                    let other = pyre_object::dictmultiobject::w_dict_lookup_checked(
+                    let other = match pyre_object::dictmultiobject::w_dict_lookup_checked(
                         pyre_object::gc_roots::shadow_stack_get(root_base + 1),
                         k,
-                    )
-                    .map_err(|_| {
-                        crate::baseobjspace::take_pending_dict_key_error(
-                            pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
-                        )
-                    })?;
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Err(crate::baseobjspace::take_pending_dict_key_error(
+                                pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
+                            ));
+                        }
+                    };
                     match other {
                         Some(other_v) => {
                             // dictmultiobject.py:664 `if not space.eq_w(w_val,
@@ -7240,21 +7270,7 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             && (pyre_object::dictmultiobject::is_dict_view(a)
                 || pyre_object::dictmultiobject::is_dict_view(b))
         {
-            let view_set_like = |obj: PyObjectRef| -> bool {
-                if pyre_object::is_set_or_frozenset(obj) {
-                    return true;
-                }
-                if pyre_object::dictmultiobject::is_dict_view(obj) {
-                    let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(obj);
-                    return matches!(
-                        kind,
-                        pyre_object::dictmultiobject::DictViewKind::Keys
-                            | pyre_object::dictmultiobject::DictViewKind::Items
-                    );
-                }
-                false
-            };
-            if view_set_like(a) && view_set_like(b) {
+            if view_operand_is_set_like(a) && view_operand_is_set_like(b) {
                 // `SetLikeDictView` owns every one of these comparisons
                 // upstream: a set answers `NotImplemented` for a view, and the
                 // reflected call on the view side is what decides.  Reaching
@@ -7292,19 +7308,53 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             // value stack, so pin them for the length reads and the walk.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
-            let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
-            let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-            let la = pyre_object::w_set_len(a());
-            let lb = pyre_object::w_set_len(b());
-            let a_subset_b = || crate::typedef::set_is_subset_of(a(), b());
-            let b_subset_a = || crate::typedef::set_is_subset_of(b(), a());
+            let a = pyre_object::gc_roots::shadow_stack_get(root_base);
+            let b = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let la = pyre_object::w_set_len(a);
+            let lb = pyre_object::w_set_len(b);
             return Ok(w_bool_from(match op {
-                CompareOp::Eq => la == lb && a_subset_b()?,
-                CompareOp::Ne => la != lb || !a_subset_b()?,
-                CompareOp::Le => la <= lb && a_subset_b()?,
-                CompareOp::Lt => la < lb && a_subset_b()?,
-                CompareOp::Ge => la >= lb && b_subset_a()?,
-                CompareOp::Gt => la > lb && b_subset_a()?,
+                CompareOp::Eq => {
+                    la == lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        )?
+                }
+                CompareOp::Ne => {
+                    la != lb
+                        || !crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        )?
+                }
+                CompareOp::Le => {
+                    la <= lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        )?
+                }
+                CompareOp::Lt => {
+                    la < lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        )?
+                }
+                CompareOp::Ge => {
+                    la >= lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                        )?
+                }
+                CompareOp::Gt => {
+                    la > lb
+                        && crate::typedef::set_is_subset_of(
+                            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                            pyre_object::gc_roots::shadow_stack_get(root_base),
+                        )?
+                }
             }));
         }
         // List comparison. Unlike tuples, element comparison may mutate either
@@ -7320,10 +7370,11 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             // what makes the "read the live lists" contract above hold.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
-            let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
-            let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             if matches!(op, CompareOp::Eq | CompareOp::Ne)
-                && pyre_object::w_list_len(a()) != pyre_object::w_list_len(b())
+                && pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base))
+                    != pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(
+                        root_base + 1,
+                    ))
             {
                 return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
             }
@@ -7337,26 +7388,39 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             let pair = elem_roots.publish(&[PY_NULL, PY_NULL]);
             elem_roots.normalize(pair, 2);
             let mut i = 0usize;
-            while i < pyre_object::w_list_len(a()) && i < pyre_object::w_list_len(b()) {
+            while i < pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base))
+                && i < pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(
+                    root_base + 1,
+                ))
+            {
                 // Integer/float/range strategies box through `w_int_new` /
                 // `w_float_new`.  Store the first box before the second
                 // getitem, which is another collecting malloc
                 // (`listobject.py list_eq` / `_compare_unwrappeditems`).
                 elem_roots.set(
                     pair,
-                    pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL),
+                    pyre_object::w_list_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(root_base),
+                        i as i64,
+                    )
+                    .unwrap_or(PY_NULL),
                 );
                 elem_roots.set(
                     pair + 1,
-                    pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL),
+                    pyre_object::w_list_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        i as i64,
+                    )
+                    .unwrap_or(PY_NULL),
                 );
                 if !crate::baseobjspace::eq_w(elem_roots.get(pair), elem_roots.get(pair + 1))? {
                     break;
                 }
                 i += 1;
             }
-            let la = pyre_object::w_list_len(a());
-            let lb = pyre_object::w_list_len(b());
+            let la = pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base));
+            let lb =
+                pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base + 1));
             if i >= la || i >= lb {
                 return Ok(w_bool_from(match op {
                     CompareOp::Lt => la < lb,
@@ -7375,11 +7439,19 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             // `set` as the equality loop: the second getitem can collect.
             elem_roots.set(
                 pair,
-                pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL),
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    i as i64,
+                )
+                .unwrap_or(PY_NULL),
             );
             elem_roots.set(
                 pair + 1,
-                pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL),
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                    i as i64,
+                )
+                .unwrap_or(PY_NULL),
             );
             return compare(elem_roots.get(pair), elem_roots.get(pair + 1), op);
         }
@@ -8220,6 +8292,111 @@ mod tests {
     fn assert_compare_bool(a: PyObjectRef, b: PyObjectRef, op: CompareOp, expected: bool) {
         let result = compare(a, b, op).unwrap();
         assert_eq!(unsafe { w_bool_get_value(result) }, expected);
+    }
+
+    #[test]
+    fn tuple_eq_length_first_does_not_call_element_eq() {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile::compile_exec(
+            "calls = []\n\
+             class X:\n    \
+             def __eq__(self, other):\n        \
+             calls.append(1)\n        \
+             return True\n\
+             eq_len = (X(),) == (X(), 0)\n\
+             ne_len = (X(),) != (X(), 0)\n\
+             same = (1, 2) == (1, 2)\n\
+             nan_a = float('nan')\n\
+             nan_b = float('nan')\n\
+             nan_same = (1.0, nan_a) == (1.0, nan_a)\n\
+             nan_distinct = (1.0, nan_a) == (1.0, nan_b)\n\
+             a, b, c = object(), object(), object()\n\
+             ne_tail = (a, b) != (a, c)\n",
+        )
+        .expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execute");
+        let globals = frame.get_w_globals();
+        let eq_len = unsafe { pyre_object::w_dict_getitem_str(globals, "eq_len") }.expect("eq_len");
+        let ne_len = unsafe { pyre_object::w_dict_getitem_str(globals, "ne_len") }.expect("ne_len");
+        let same = unsafe { pyre_object::w_dict_getitem_str(globals, "same") }.expect("same");
+        let nan_same =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "nan_same") }.expect("nan_same");
+        let nan_distinct = unsafe { pyre_object::w_dict_getitem_str(globals, "nan_distinct") }
+            .expect("nan_distinct");
+        let ne_tail =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "ne_tail") }.expect("ne_tail");
+        let calls = unsafe { pyre_object::w_dict_getitem_str(globals, "calls") }.expect("calls");
+        assert!(!unsafe { w_bool_get_value(eq_len) });
+        assert!(unsafe { w_bool_get_value(ne_len) });
+        assert!(unsafe { w_bool_get_value(same) });
+        assert!(unsafe { w_bool_get_value(nan_same) });
+        assert!(!unsafe { w_bool_get_value(nan_distinct) });
+        assert!(unsafe { w_bool_get_value(ne_tail) });
+        assert_eq!(unsafe { pyre_object::w_list_len(calls) }, 0);
+    }
+
+    #[test]
+    fn tuple_lt_calls_ordering_on_first_differing_pair() {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile::compile_exec(
+            "seen = []\n\
+             class X:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __lt__(self, other):\n        \
+             seen.append('X')\n        \
+             return True\n\
+             class Y:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __lt__(self, other):\n        \
+             seen.append('Y')\n        \
+             return False\n\
+             ordered = (1, X()) < (1, Y())\n",
+        )
+        .expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execute");
+        let globals = frame.get_w_globals();
+        let ordered =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "ordered") }.expect("ordered");
+        let seen = unsafe { pyre_object::w_dict_getitem_str(globals, "seen") }.expect("seen");
+        assert!(unsafe { w_bool_get_value(ordered) });
+        assert_eq!(unsafe { pyre_object::w_list_len(seen) }, 1);
+        let first = unsafe { pyre_object::w_list_getitem(seen, 0) }.expect("seen[0]");
+        assert_eq!(crate::baseobjspace::str_utf8_w(first).unwrap(), "X");
+    }
+
+    #[test]
+    fn tuple_equality_does_not_call_element_ne_after_eq_rejects() {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile::compile_exec(
+            "class Cell:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __ne__(self, other):\n        \
+             return False\n\
+             class Ord:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __lt__(self, other):\n        \
+             return True\n\
+             ne = (Cell(), 1, 2) != (Cell(), 1, 2)\n\
+             eq = (Cell(), 1, 2) == (Cell(), 1, 2)\n\
+             ordered = (Ord(),) < (Ord(),)\n",
+        )
+        .expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execute");
+        let globals = frame.get_w_globals();
+        let ne = unsafe { pyre_object::w_dict_getitem_str(globals, "ne") }.expect("ne");
+        let eq = unsafe { pyre_object::w_dict_getitem_str(globals, "eq") }.expect("eq");
+        let ordered =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "ordered") }.expect("ordered");
+        assert!(unsafe { w_bool_get_value(ne) });
+        assert!(!unsafe { w_bool_get_value(eq) });
+        assert!(unsafe { w_bool_get_value(ordered) });
     }
 
     #[test]

@@ -982,6 +982,51 @@ fn journaled_concrete_traceback_attach(
     *exc_ptr = pyre_object::gc_roots::shadow_stack_get(slot);
 }
 
+/// Intern `ptr` as `history.py` `ConstPtr` and return the live address.
+///
+/// `TraceCtx::const_ref` appends to `opencoder.py Trace._ops`. The
+/// caller's Copy of `ptr` is from-space after that collection; storing it
+/// in `WalkSession.last_exc_value_concrete` publishes an interior through
+/// `walk_session_roots`. Pin across the intern and re-read.
+pub(crate) fn intern_live_exc(ctx: &mut TraceCtx, ptr: usize) -> (OpRef, ConcreteValue) {
+    let pin = residual_call::owner_root_if_gc(ptr);
+    let live = pin.as_ref().map(|p| p.get().0).unwrap_or(ptr);
+    let opref = ctx.const_ref(live as i64);
+    let live = pin.as_ref().map(|p| p.get().0).unwrap_or(live);
+    let live = match ctx.box_value(opref) {
+        Some(majit_ir::Value::Ref(r)) if r.0 != 0 && r != majit_ir::GcRef::NO_CONCRETE => r.0,
+        _ => live,
+    };
+    (opref, ConcreteValue::Ref(live as pyre_object::PyObjectRef))
+}
+
+/// Live exception pointer from a rooted holder.
+///
+/// `SubRaise.exc_concrete` is a Copy word. The holders are
+/// `history.py *FrontendOp.value` on `exc` and
+/// `WalkSession.last_exc_value_concrete` (`walk_session_roots`).
+fn pin_exc_from_holder<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    exc: OpRef,
+    copied: pyre_object::PyObjectRef,
+) -> (
+    Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    pyre_object::PyObjectRef,
+) {
+    let from_holder = walker_concrete_ref_object(ctx, exc)
+        .or_else(|| match ctx.last_exc_value_concrete() {
+            ConcreteValue::Ref(ptr) if !ptr.is_null() => Some(ptr),
+            _ => None,
+        })
+        .unwrap_or(copied);
+    let pin = residual_call::owner_root_if_gc(from_holder as usize);
+    let live = pin
+        .as_ref()
+        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
+        .unwrap_or(from_holder);
+    (pin, live)
+}
+
 fn note_forwarded_exc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     exc_concrete: &mut ConcreteValue,
@@ -994,6 +1039,22 @@ fn note_forwarded_exc<Sym: WalkSym>(
     // `PyreSym::last_exc_value` / `current_exc_value` only).
     if ctx.last_exc_value_concrete() == ConcreteValue::Ref(old) {
         ctx.set_last_exc_value_concrete(ConcreteValue::Ref(live));
+    }
+}
+
+/// The box's own `Box.value` (`getref_base`) when `op` carries one, else
+/// the `carried` copy.  The collector forwards the box's slot; a copy
+/// carried in a Rust local across a Trace-pool append is the pre-move
+/// address.
+fn live_box_concrete(ctx: &TraceCtx, op: OpRef, carried: ConcreteValue) -> ConcreteValue {
+    if op.is_none() {
+        return carried;
+    }
+    match ctx.box_value(op) {
+        Some(Value::Ref(r)) if r.0 != 0 && r != majit_ir::GcRef::NO_CONCRETE => {
+            ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef)
+        }
+        _ => carried,
     }
 }
 
@@ -1029,9 +1090,26 @@ fn note_forwarded_exc<Sym: WalkSym>(
 /// and `get_sys_exception` reads `getexecutioncontext`.  None of those collect,
 /// so the call is not a safepoint.
 fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete: ConcreteValue) {
-    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+    let ConcreteValue::Ref(copied) = exc_concrete else {
         return;
     };
+    // `is_exception` / `chain_context` run after the walk has already
+    // appended to `opencoder.py Trace._ops`. The Copy is not
+    // `history.py *FrontendOp.value`; pin it the way
+    // `record_prepend_application_traceback` reads the box / WalkSession
+    // holder (`pin_exc_from_holder`).
+    let from_holder = match ctx.concrete_of_opref(exc) {
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
+            let obj = r.as_usize() as pyre_object::PyObjectRef;
+            if obj.is_null() { copied } else { obj }
+        }
+        _ => copied,
+    };
+    let pin = residual_call::owner_root_if_gc(from_holder as usize);
+    let exc_ptr = pin
+        .as_ref()
+        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
+        .unwrap_or(from_holder);
     if exc_ptr.is_null() || !unsafe { pyre_object::is_exception(exc_ptr) } {
         return;
     }
@@ -1064,6 +1142,10 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
     let hook = majit_metainterp::resolve_exception_context_hook_address();
     if !hook.is_null() && !exc.is_none() {
+        let exc_ptr = pin
+            .as_ref()
+            .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
+            .unwrap_or(exc_ptr);
         // `w_context` sits at one offset for every kind, so the recording
         // iteration's kind names the right bytes even if a later one differs;
         // the descr must still name the layout `allocate_instance` stamped,
@@ -1092,12 +1174,16 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
     if !ctx.is_top_level {
         return;
     }
-    let ConcreteValue::Ref(mut exc_ptr) = *exc_concrete else {
-        return;
+    let copied = match *exc_concrete {
+        ConcreteValue::Ref(ptr) => ptr,
+        _ => return,
     };
+    let (exc_pin, mut exc_ptr) = pin_exc_from_holder(ctx, exc, copied);
     if exc_ptr.is_null() {
         return;
     }
+    *exc_concrete = ConcreteValue::Ref(exc_ptr);
+    let _exc_pin = exc_pin;
     let (frame_ptr, jitcode_index) = {
         let session = ctx.session.borrow();
         (session.recording_frame_ptr, session.recording_jitcode_index)
@@ -1110,12 +1196,18 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
         // `w_pytraceback_new` collect; the exception word stays on the
         // shadow stack `journaled_concrete_traceback_attach` publishes.
         let old = exc_ptr;
+        // `flush_locals_region_to_frame` and `w_pytraceback_new` collect.
+        // `walk_session_roots` traces `recording_frame_ptr`; the Copy here
+        // is not that slot. Pin and re-read across the flush and attach.
+        let frame_pin = (frame_ptr != 0)
+            .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame_ptr)));
+        let live_frame = || frame_pin.as_ref().map(|pin| pin.get().0).unwrap_or(0);
         journaled_concrete_traceback_attach(&mut exc_ptr, |slot| {
-            crate::state::flush_locals_region_to_frame(ctx.trace_ctx, frame_ptr);
+            crate::state::flush_locals_region_to_frame(ctx.trace_ctx, live_frame());
             let live = pyre_object::gc_roots::shadow_stack_get(slot);
             majit_metainterp::record_application_traceback_for_recording(
                 live as usize as i64,
-                frame_ptr as i64,
+                live_frame() as i64,
                 jitcode_index,
                 opcode_position as i32,
             );
@@ -1125,7 +1217,7 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
             ctx,
             node,
             exc_ptr,
-            frame_ptr as *mut pyre_interpreter::PyFrame,
+            live_frame() as *mut pyre_interpreter::PyFrame,
         );
     }
     let hook = majit_metainterp::record_application_traceback_hook_address();
@@ -1266,12 +1358,16 @@ fn record_inline_application_traceback<Sym: WalkSym>(
     if !unsafe { pyre_interpreter::pycode::is_code(w_code as pyre_object::PyObjectRef) } {
         return;
     }
-    let ConcreteValue::Ref(mut exc_ptr) = *exc_concrete else {
-        return;
+    let copied = match *exc_concrete {
+        ConcreteValue::Ref(ptr) => ptr,
+        _ => return,
     };
+    let (exc_pin, mut exc_ptr) = pin_exc_from_holder(ctx, exc, copied);
     if exc_ptr.is_null() {
         return;
     }
+    *exc_concrete = ConcreteValue::Ref(exc_ptr);
+    let _exc_pin = exc_pin;
     if execute_concrete {
         // `pytraceback.py record_application_traceback(space, operror,
         // frame, last_instruction)` anchors the node on the frame that is
@@ -1448,22 +1544,16 @@ pub(crate) fn flush_callee_locals_region(
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
         return false;
     }
-    // `virtualizable.py write_boxes` keeps the source boxes and destination
-    // array live throughout writeback. Native boxing can collect: retain roots
-    // for both destinations and read each source from its shared owner after
-    // the preceding allocation, with no frame-state borrow across boxing.
-    let frame_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame as usize));
-    let array_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(arr_ptr as usize));
-    state.write_callee_locals(nlocals, frame_reg, |abs, value| {
-        let boxed = crate::state::boxed_slot_value_for_type(Type::Ref, &value);
-        let arr_ptr = array_root.get().0 as *mut pyre_object::FixedObjectArray;
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
-        }
-        // Boxing an Int/Float slot allocates, and each minor collection
-        // consumes the array's remembered-set entry, so re-arm per store.
-        crate::state::frame_array_write_barrier(frame_root.get().0 as *mut u8, arr_ptr);
-    })
+    // Copy the shadow first. `write_callee_locals` must not allocate, and
+    // boxing inside the callback would collect between a copied `Ref` and
+    // its store.
+    let mut slots = Vec::new();
+    if !state.write_callee_locals(nlocals, frame_reg, |abs, value| {
+        slots.push((abs, value));
+    }) {
+        return false;
+    }
+    crate::state::store_pinned_frame_locals(frame as usize, &slots).is_some()
 }
 
 /// Apply `PyFrame.frame_finished_execution = True` on the concrete frame a
@@ -1582,6 +1672,11 @@ struct TracebackNodeSite {
     frame: OpRef,
     w_code: usize,
     last_instruction: i32,
+    /// `W_Code` is a GCREF. `traceback_node_site` copies it out of the
+    /// live frame; `emit_traceback_node` then `execute_new_with_vtable`
+    /// / `record_op` appends to `opencoder.py Trace._ops`. Pin the
+    /// referent so `const_ref` intern's the forwarded address.
+    w_code_pin: Option<majit_gc::shadow_stack::OwnerRootGuard>,
 }
 
 /// Resolve the `PyTraceback` fields of the frame the walk is currently in.
@@ -1651,6 +1746,7 @@ fn traceback_node_site<Sym: WalkSym>(
         frame,
         w_code,
         last_instruction,
+        w_code_pin: residual_call::owner_root_if_gc(w_code),
     })
 }
 
@@ -1668,6 +1764,11 @@ fn emit_traceback_node<Sym: WalkSym>(
     let traceback = ctx
         .trace_ctx
         .execute_new_with_vtable(crate::descr::pytraceback_size_descr());
+    let w_code = site
+        .w_code_pin
+        .as_ref()
+        .map(|pin| pin.get().0)
+        .unwrap_or(site.w_code);
     let fields = [
         (site.frame, 0),
         // Field 1 is `lasti`, which the slot holds in bytes.
@@ -1684,7 +1785,7 @@ fn emit_traceback_node<Sym: WalkSym>(
                 .const_int(pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED),
             3,
         ),
-        (ctx.trace_ctx.const_ref(site.w_code as i64), 4),
+        (ctx.trace_ctx.const_ref(w_code as i64), 4),
         (
             ctx.trace_ctx
                 .const_ref(pyre_object::pyobject::get_instantiate(
@@ -1794,9 +1895,14 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
         // opaque hook takes the live exception as an argument instead.
         return Ok(None);
     }
-    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return Ok(None);
+    let copied = match exc_concrete {
+        ConcreteValue::Ref(ptr) => ptr,
+        _ => pyre_object::PY_NULL,
     };
+    // `error.py` `OperationError` is a GCREF local across
+    // `opimpl_getfield_gc_r` / `emit_traceback_node`, which append to
+    // `opencoder.py Trace._ops`. Pin before `is_exception`.
+    let (exc_pin, exc_ptr) = pin_exc_from_holder(ctx, exc, copied);
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
         return Ok(None);
     }
@@ -1819,6 +1925,10 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
         // path does not perform).
         return Ok(None);
     }
+    let exc_ptr = exc_pin
+        .as_ref()
+        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
+        .unwrap_or(exc_ptr);
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
     // `tb = operror.get_traceback()`.  MUST precede the node's own store, or
@@ -1901,9 +2011,11 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
     exc_concrete: ConcreteValue,
     opcode_position: usize,
 ) -> Result<Option<OpRef>, DispatchError> {
-    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return Ok(None);
+    let copied = match exc_concrete {
+        ConcreteValue::Ref(ptr) => ptr,
+        _ => pyre_object::PY_NULL,
     };
+    let (exc_pin, exc_ptr) = pin_exc_from_holder(ctx, exc, copied);
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
         return Ok(None);
     }
@@ -1917,6 +2029,10 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
         // that follows `tb_frame.f_code` — `traceback.print_exc` among them.
         return Ok(None);
     }
+    let exc_ptr = exc_pin
+        .as_ref()
+        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
+        .unwrap_or(exc_ptr);
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
     let w_next = ctx.trace_ctx.const_ref(0);
@@ -2426,6 +2542,15 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
     /// `metainterp.last_exc_value = exc` with its concrete shadow
     /// (`pyjitpl.py`, `:2775 execute_ll_raised`).
     fn set_last_exc_value(&self, exc: OpRef, concrete: ConcreteValue) {
+        // `history.py *FrontendOp.getref_base` is the live cell. The
+        // caller's Copy of `concrete` can be from-space after a
+        // Trace-pool append that interned `exc`.
+        let concrete = match concrete {
+            ConcreteValue::Ref(p) if !p.is_null() => {
+                live_box_concrete(&*self.trace_ctx, exc, concrete)
+            }
+            _ => concrete,
+        };
         let mut sess = self.session.borrow_mut();
         sess.last_exc_value = Some(exc);
         sess.last_exc_value_concrete = concrete;
@@ -4309,6 +4434,13 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
         }
     };
+    // The CALL_ASSEMBLER op and the guards after it append to
+    // `opencoder.py Trace._ops` and can minor-collect; the stamp and the
+    // raise take the forwarded result and exception.
+    let result_pin = (dst_bank == 'r' && raised == 0)
+        .then(|| residual_call::owner_root_if_gc(concrete as usize))
+        .flatten();
+    let raised_pin = residual_call::owner_root_if_gc(raised as usize);
     let recorded = match dst_bank {
         'r' => ctx
             .trace_ctx
@@ -4336,6 +4468,9 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     // `make_result_of_lastop(resbox)`: the executed result is the op's
     // value whatever its bits (zero, +0.0 and null included).
     if recorded != OpRef::NONE && raised == 0 {
+        let concrete = result_pin
+            .as_ref()
+            .map_or(concrete, |pin| pin.get().0 as i64);
         let value = match dst_bank {
             'i' => majit_ir::Value::Int(concrete),
             'f' => majit_ir::Value::Float(f64::from_bits(concrete as u64)),
@@ -4366,10 +4501,12 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         // `handle_possible_exception`: `last_exc_box` is the
         // `GUARD_EXCEPTION` result, not `ConstPtr` of the recording-time
         // object (`pyjitpl.py`).
+        let raised = raised_pin.as_ref().map_or(raised, |pin| pin.get().0 as i64);
         let exc_concrete = crate::state::ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
         ctx.set_last_exc_value_concrete(exc_concrete);
         ctx.fbw_mode.class_of_last_exc_is_const = false;
         walker_record_guard_exception(ctx, op.pc)?;
+        // The session slot is a root; the guard above may have moved it.
         let exc = ctx
             .last_exc_value()
             .expect("handle_possible_exception seeds last_exc_value");
@@ -4935,6 +5072,13 @@ pub fn walk<Sym: WalkSym>(
                 return Ok((outcome, pc));
             }
             DispatchOutcome::SubRaise { exc, mut exc_concrete } => {
+                // Every traceback and context record below appends to
+                // `opencoder.py Trace._ops` and can minor-collect; each step
+                // re-reads the exception from this pin.
+                let exc_pin = match exc_concrete {
+                    ConcreteValue::Ref(p) => residual_call::owner_root_if_gc(p as usize),
+                    _ => None,
+                };
                 // RPython `finishframe_exception`: before
                 // unwinding to the caller, scan THIS frame for a matching
                 // `catch_exception/L` handler at the post-op position. A
@@ -4977,6 +5121,9 @@ pub fn walk<Sym: WalkSym>(
                     } else {
                         record_prepend_application_traceback(ctx, exc, exc_concrete, node_position)?
                     };
+                    if let Some(pin) = &exc_pin {
+                        exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+                    }
                     let emit_runtime = !raised_in_this_frame && node.is_none();
                     // `RaiseWithExplicitTraceback` (`RAISE_VARARGS 0`, `RERAISE`)
                     // re-raises the handled instance and does not write
@@ -4999,6 +5146,9 @@ pub fn walk<Sym: WalkSym>(
                     } else {
                         record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                     }
+                    if let Some(pin) = &exc_pin {
+                        exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+                    }
                     record_inline_application_traceback(
                         ctx,
                         exc,
@@ -5008,6 +5158,9 @@ pub fn walk<Sym: WalkSym>(
                         emit_runtime,
 node,
                     );
+                    if let Some(pin) = &exc_pin {
+                        exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+                    }
                     record_top_level_application_traceback(
                         ctx,
                         exc,
@@ -5017,6 +5170,9 @@ node,
                         emit_runtime,
 node,
                     );
+                    if let Some(pin) = &exc_pin {
+                        exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+                    }
                     ctx.set_last_exc_value(exc, exc_concrete);
                     // pyjitpl.py `finishframe_exception` only
                     // unwinds frames and selects the handler.  The shared
@@ -5065,6 +5221,9 @@ node,
                     // too; a traceback reader forces it through the armed
                     // deadframe only if redirected fields are observed.
                     fbw_store_token_in_vable(ctx, recording_opcode_position)?;
+                    if let Some(pin) = &exc_pin {
+                        exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+                    }
                     // Runtime node after the vable token, same order as
                     // `compile_exit_frame_with_exception` (`pyjitpl.py`) plus
                     // `record_application_traceback` (`pytraceback.py`):
@@ -5106,6 +5265,9 @@ node,
                             exc_concrete,
                             recording_opcode_position,
                         )?;
+                        if let Some(pin) = &exc_pin {
+                            exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+                        }
                         let emit_runtime = node.is_none();
                         record_top_level_application_traceback(
                             ctx,
@@ -5131,6 +5293,9 @@ node,
                     // records the FINISH once against
                     // `exit_frame_with_exception_descr`.  Recording it here too
                     // would double it.
+                    if let Some(pin) = &exc_pin {
+                        exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+                    }
                     let (finish_arg, finish_arg_type) =
                         fbw_terminate_with_raise(ctx, exc, exc_concrete);
                     return Ok((
@@ -5156,6 +5321,9 @@ node,
                             exc_concrete,
                             opcode_position,
                         )?;
+                        if let Some(pin) = &exc_pin {
+                            exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
+                        }
                         let emit_runtime = node.is_none();
                         record_inline_application_traceback(
                             ctx,
@@ -5166,6 +5334,9 @@ node,
                             emit_runtime,
 node,
                         );
+                    }
+                    if let Some(pin) = &exc_pin {
+                        exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
                     }
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
                 }
@@ -5863,6 +6034,10 @@ fn write_ref_reg<Sym: WalkSym>(
     // (`getfield_gc_r` sanity loads, `raise/r` GUARD_CLASS) that
     // expect `ConcreteValue::Ref(_)` or `Null`.
     let sanitized = match concrete {
+        // `pyjitpl.py` registers hold the box and the value is the box's
+        // own (`getref_base`).  A caller's copy may have been taken before a
+        // Trace-pool append moved the object; the box's slot is forwarded.
+        ConcreteValue::Ref(p) if !p.is_null() => live_box_concrete(ctx.trace_ctx, value, concrete),
         ConcreteValue::Ref(_) | ConcreteValue::Null => concrete,
         ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => {
             ConcreteValue::Null
@@ -8261,6 +8436,11 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
     if let ConcreteValue::Ref(value) = &mut session.tmpreg_r_concrete {
         walk_ptr(value, visitor);
     }
+    if session.recording_frame_ptr != 0 {
+        let mut root = majit_ir::GcRef(session.recording_frame_ptr);
+        visitor(&mut root);
+        session.recording_frame_ptr = root.0;
+    }
     for frame in session.framestack.iter_mut() {
         for parent in frame.parents.iter_mut() {
             // history.py ConstPtr.value remains reachable through each
@@ -9329,9 +9509,9 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // handler takes the latch. The adopters bridge the pre-drive publication
     // window and the blackhole drivers then install their own packed roots.
     //
-    // A `MIFrame` stores each Ref register as the box itself. Once the
-    // frames are latched here, `MetaInterp::walk_active_trace_refs` no
-    // longer reaches them, so ConstPtr gcrefs are forwarded below.
+    // A `MIFrame` stores each Ref register as the box itself. ConstPtr
+    // in `ref_regs` is a table index. The latch is the holder while
+    // `walk_active_trace_refs` cannot see the frame.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
         // `ConstPtr` in `ref_regs` is a table index. This latch is the
@@ -9812,16 +9992,29 @@ pub(crate) fn walker_record_guard_exception_scoped<Sym: WalkSym>(
     // `ob_header.ob_type` is the layout vtable `allocate_instance` stamps.
     // `_getusercls` shares one vtable across every `_new_exception` class of
     // a realbase, so the guard pins the layout, not the Python class.
+    let exc_pin = residual_call::owner_root_if_gc(exc_obj as usize);
+    let exc_obj = exc_pin
+        .as_ref()
+        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
+        .unwrap_or(exc_obj);
     let exc_type_ptr = unsafe {
         (*(exc_obj as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
             .ob_type as i64
     };
     let exc_type_const = ctx.trace_ctx.const_int(exc_type_ptr);
+    // The guard and its snapshot append to `opencoder.py Trace._ops` and can
+    // minor-collect; stamp the forwarded exception.
+    let exc_pin = residual_call::owner_root_if_gc(exc_obj as usize);
     let guard_op = ctx
         .trace_ctx
         .record_guard(OpCode::GuardException, &[exc_type_const], 0);
     walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
+    let exc_obj = exc_pin
+        .as_ref()
+        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
+        .unwrap_or(exc_obj);
+    ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc_obj));
     // `op.setref_base(val)` supplies the recording-time shadow without
     // changing the guard result's live replay identity.
     ctx.trace_ctx.set_opref_concrete(
@@ -11172,12 +11365,15 @@ fn walker_coerce_operand_to_float<Sym: WalkSym>(
     val: f64,
     exact_int: bool,
 ) -> Result<OpRef, DispatchError> {
+    // Read off `concrete_obj` before the first guard: recording appends to
+    // `opencoder.py Trace._ops` and can minor-collect.
+    let w_class = walker_numeric_builtin_class(concrete_obj);
     let raw = if is_int {
         // bool shares int's `intval`; guard its own &BOOL_TYPE before the cast.
         let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete_obj);
+        let value = unsafe { pyre_object::w_int_get_value(concrete_obj) };
         let raw_int = walker_unbox_int_typed(ctx, op_pc, obj, type_addr, descr)?;
         if exact_int {
-            let value = unsafe { pyre_object::w_int_get_value(concrete_obj) };
             walker_guard_int_exact_as_float(ctx, op_pc, raw_int, value)?;
         }
         ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[raw_int])
@@ -11188,7 +11384,7 @@ fn walker_coerce_operand_to_float<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(val));
     if is_int {
-        walker_guard_exact_w_class(ctx, op_pc, obj, walker_numeric_builtin_class(concrete_obj))?;
+        walker_guard_exact_w_class(ctx, op_pc, obj, w_class)?;
     }
     Ok(raw)
 }
@@ -11207,10 +11403,11 @@ fn walker_coerce_dispatching_operand_to_float<Sym: WalkSym>(
     val: f64,
     exact_int: bool,
 ) -> Result<OpRef, DispatchError> {
+    let w_class = walker_numeric_builtin_class(concrete_obj);
     let raw =
         walker_coerce_operand_to_float(ctx, op_pc, obj, concrete_obj, is_int, val, exact_int)?;
     if !is_int {
-        walker_guard_exact_w_class(ctx, op_pc, obj, walker_numeric_builtin_class(concrete_obj))?;
+        walker_guard_exact_w_class(ctx, op_pc, obj, w_class)?;
     }
     Ok(raw)
 }
@@ -11587,6 +11784,10 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
     // `implement_guard_value`).
+    // GuardClass, the `w_class` pin and the version-tag pin can minor-collect.
+    // `concrete_obj` is a copy; the receiver box is `obj`
+    // (`RefFrontendOp` / `getref_base`).
+    let concrete_obj = walker_concrete_ref_object(ctx, obj).unwrap_or(concrete_obj);
     let map_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, unsafe {
         crate::descr::mapdict_map_descr(concrete_obj)
     });
@@ -11753,13 +11954,19 @@ fn walker_promote_object_mutable_cell<Sym: WalkSym>(
     cell: pyre_object::PyObjectRef,
     expected: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
-    let cell_const = ctx.trace_ctx.const_ref(cell as i64);
+    // `opimpl_getfield_gc_r` records the getfield and can minor-collect
+    // while the trace buffer grows. `expected` is not a root until the
+    // guard constant below; reload it from the pin. The cell constant's
+    // table index is held by `record_bytes` across that growth.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[cell, expected]);
+    let cell_const = ctx.trace_ctx.const_ref(roots.get(base) as i64);
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_const,
         crate::descr::object_mutable_cell_value_descr(),
     );
-    let expected_const = ctx.trace_ctx.const_ref(expected as i64);
+    let expected_const = ctx.trace_ctx.const_ref(roots.get(base + 1) as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[value, expected_const])?;
     ctx.trace_ctx
         .heap_cache_mut()
@@ -14787,25 +14994,16 @@ fn handle<Sym: WalkSym>(
                 });
             }
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, false);
-            // The `set_opref_concrete` below is what roots this object: it
-            // stamps the allocation onto the recorded op's `value` cell, which
-            // `MetaInterp::walk_active_trace_refs` forwards.  Nothing between
-            // here and there allocates from the GC heap, so no collection can
-            // observe the object before it is reachable from that root.
-            // pyjitpl.py `execute_new`.
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(OpCode::New, majit_metainterp::counters::OPS);
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(OpCode::New, majit_metainterp::counters::RECORDED_OPS);
-            let resbox = ctx.trace_ctx.record_op_with_descr(OpCode::New, &[], descr);
+            // pyjitpl.py `execute_new` → `execute_and_record(rop.NEW, typedescr)`.
+            // `_record_helper` pins the allocation across the Trace-pool
+            // append (`opencoder.py Trace._ops`) and stamps the forwarded
+            // address onto the recorded op.
+            let resbox =
+                ctx.trace_ctx
+                    .execute_and_record(None, OpCode::New, Some(descr), &[], concrete, 0);
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             let dst = code[op.pc + 3] as usize;
-            if let Some(value) = concrete {
-                ctx.trace_ctx.set_opref_concrete(resbox, value);
-            }
-            let concrete = match concrete {
+            let concrete = match ctx.trace_ctx.box_value(resbox) {
                 Some(Value::Ref(majit_ir::GcRef(ptr))) => {
                     ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
                 }
@@ -14835,8 +15033,20 @@ fn handle<Sym: WalkSym>(
                 });
             }
             let concrete = ctx.trace_ctx.execute_new_allocation(&descr, true);
-            // Rooted by the `set_opref_concrete` stamp below, as in `new/d>r`.
-            if let Some(Value::Ref(majit_ir::GcRef(ptr))) = concrete
+            let alloc_pin = match concrete {
+                Some(Value::Ref(r)) if r.0 != 0 && majit_gc::gc_owns_object(r.0) => {
+                    Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+                }
+                _ => None,
+            };
+            if let Some(ptr) =
+                alloc_pin
+                    .as_ref()
+                    .map(|pin| pin.get().0)
+                    .or_else(|| match concrete {
+                        Some(Value::Ref(r)) => Some(r.0),
+                        _ => None,
+                    })
                 && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
             {
                 unsafe {
@@ -14844,24 +15054,25 @@ fn handle<Sym: WalkSym>(
                         w_class as pyre_object::PyObjectRef;
                 }
             }
-            // pyjitpl.py `execute_new_with_vtable`.
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(OpCode::NewWithVtable, majit_metainterp::counters::OPS);
-            ctx.trace_ctx.profiler().count_ops(
+            let concrete = alloc_pin
+                .as_ref()
+                .map(|pin| Value::Ref(pin.get()))
+                .or(concrete);
+            // pyjitpl.py `execute_new_with_vtable` →
+            // `execute_and_record(rop.NEW_WITH_VTABLE, descr)`. Same pin as
+            // `new/d>r`: the Trace-pool append can minor-collect.
+            let resbox = ctx.trace_ctx.execute_and_record(
+                None,
                 OpCode::NewWithVtable,
-                majit_metainterp::counters::RECORDED_OPS,
+                Some(descr.clone()),
+                &[],
+                concrete,
+                0,
             );
-            let resbox =
-                ctx.trace_ctx
-                    .record_op_with_descr(OpCode::NewWithVtable, &[], descr.clone());
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             crate::helpers::note_class_word_after_new(ctx.trace_ctx, resbox, &descr);
             let dst = code[op.pc + 3] as usize;
-            if let Some(value) = concrete {
-                ctx.trace_ctx.set_opref_concrete(resbox, value);
-            }
-            let concrete = match concrete {
+            let concrete = match ctx.trace_ctx.box_value(resbox) {
                 Some(Value::Ref(majit_ir::GcRef(ptr))) => {
                     ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
                 }

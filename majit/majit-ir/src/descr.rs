@@ -968,6 +968,26 @@ pub fn is_list_container_spelling(spelling: &str) -> bool {
         || stripped.starts_with("Slice<")
 }
 
+/// `object_array::ItemsBlock` is RPython `GcArray(OBJECTPTR)`
+/// (`rlist.py` `FixedSizeListRepr` / `ll_fixed_items`, the tuple
+/// `wrappeditems` array and the resizable list's `l.items` field).
+/// The leaf is exactly `ItemsBlock`; `TypedItemsBlock` is
+/// `GcArray(Signed|Float)` and stays out.
+pub fn is_object_gcarray_items_block(name: &str) -> bool {
+    let stripped = name
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches("*const ")
+        .trim_start_matches("*mut ")
+        .trim();
+    strip_instantiation_suffix(stripped)
+        .rsplit("::")
+        .next()
+        .unwrap_or(stripped)
+        == "ItemsBlock"
+}
+
 /// Remove the first balanced generic-argument group from a (possibly
 /// variant-qualified) name, preserving any trailing path segment:
 /// `Result<Tuple>::Ok` → `Result::Ok`, `Result<Tuple>` → `Result`,
@@ -4657,7 +4677,8 @@ impl QuasiImmutDescr {
 
     /// Forward the `struct` word and a `Value::Ref` captured on this descr
     /// after a moving collection. `MetaInterp::walk_active_trace_refs` calls
-    /// this through the recorder's slot descrs.
+    /// this through the recorder's slot descrs and the in-flight
+    /// `record_bytes` holder.
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
         let raw = self.struct_ptr();
         if raw != 0 {
@@ -4717,9 +4738,61 @@ impl Descr for QuasiImmutDescr {
 }
 
 /// `history.py` `AbstractFailDescr.rd_locs` — per-fail-arg jitframe
-/// slots. Eight `u16`s stay inline so `append_guard_token` does not
-/// mint a 16 B `Vec` for the common guard.
-pub type RdLocs = smallvec::SmallVec<[u16; 8]>;
+/// slots. Equal encodings share one allocation (`assembler.py`
+/// `store_info_on_descr` assigns the same `positions` list to
+/// `_previous_rd_locs` and `guardtok.faildescr.rd_locs`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RdLocs {
+    inner: std::sync::Arc<[u16]>,
+}
+
+impl RdLocs {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::from([]),
+        }
+    }
+
+    pub fn from_vec(v: Vec<u16>) -> Self {
+        Self {
+            inner: std::sync::Arc::from(v),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u16] {
+        &self.inner
+    }
+
+    /// True when `self` and `other` are the same allocation.
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&this.inner, &other.inner)
+    }
+}
+
+impl std::ops::Deref for RdLocs {
+    type Target = [u16];
+    fn deref(&self) -> &[u16] {
+        &self.inner
+    }
+}
+
+impl AsRef<[u16]> for RdLocs {
+    fn as_ref(&self) -> &[u16] {
+        &self.inner
+    }
+}
+
+impl From<Vec<u16>> for RdLocs {
+    fn from(v: Vec<u16>) -> Self {
+        Self::from_vec(v)
+    }
+}
+
+impl FromIterator<u16> for RdLocs {
+    fn from_iter<I: IntoIterator<Item = u16>>(iter: I) -> Self {
+        Self::from_vec(iter.into_iter().collect())
+    }
+}
 
 /// Descriptor for guard failures — carries resume information.
 ///
@@ -4812,6 +4885,15 @@ pub trait FailDescr: Descr {
              carry rd_numb (compile.py:855 `_attrs_` only on \
              AbstractResumeGuardDescr subclasses)"
         );
+    }
+
+    /// Visit the `NUMBERING` payload address stored on this descr.
+    /// The cell is the walked slot; a clone is not.
+    fn visit_rd_numb(&self, _visitor: &mut dyn FnMut(&mut crate::GcRef)) {}
+
+    /// The walked `NUMBERING` slot, not a clone.
+    fn rd_numb_ref(&self) -> Option<&crate::NumberingRef> {
+        None
     }
 
     /// resume.py:451 — shared constant pool referenced by `rd_numb`.
@@ -10848,6 +10930,18 @@ mod tests {
         assert!(!is_shaped_array_name("Array"));
         assert!(is_shaped_array_name("Array<*mut PyObject;1>"));
         assert!(!is_shaped_array_name("module::Array<i64;2>"));
+    }
+
+    #[test]
+    fn object_gcarray_items_block_is_the_array_not_typed_digits() {
+        assert!(is_object_gcarray_items_block("ItemsBlock"));
+        assert!(is_object_gcarray_items_block("*mut ItemsBlock"));
+        assert!(is_object_gcarray_items_block("object_array::ItemsBlock"));
+        assert!(is_object_gcarray_items_block(
+            "*mut object_array::ItemsBlock"
+        ));
+        assert!(!is_object_gcarray_items_block("TypedItemsBlock"));
+        assert!(!is_object_gcarray_items_block("rlist::TypedItemsBlock"));
     }
 
     #[test]

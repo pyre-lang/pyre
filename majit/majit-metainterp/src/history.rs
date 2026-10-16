@@ -2556,10 +2556,18 @@ impl TraceCtx {
     /// `rd_resume_position` (`create_top_snapshot`).
     pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
         if self.recorder.has_byte_buffer() {
-            let id = self.recorder.encode_captured_snapshot(&snapshot);
-            // A later `snapshots()` / `take_snapshots` must see this
-            // capture. RPython has no cache: it always reads
-            // `_snapshot_data`. Drop any earlier decode.
+            // `history.py` `capture_resumedata` encodes the live `Const`
+            // boxes. A ref `SnapshotTagged::Const` is a table index.
+            // `walk_const_ptr_refs` traces that index; the word itself
+            // does not move. Encoding can minor-collect between boxes,
+            // so the snapshot stays in `self.snapshots` for that walk.
+            // `snapshot_tagged_to_box` resolves each index immediately
+            // before `_encode`. Dropped after: the byte stream is the
+            // record.
+            self.snapshots.push(snapshot);
+            let id = self
+                .recorder
+                .encode_captured_snapshot(self.snapshots.last().unwrap());
             self.snapshots.clear();
             return id;
         }
@@ -2715,6 +2723,13 @@ impl TraceCtx {
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
+        if majit_gc::diag_p92_enabled() && pc == 836 && active_boxes.len() != 4 {
+            eprintln!(
+                "P92_SF_CAPTURE jc={jitcode_index} pc={pc} n={}",
+                active_boxes.len()
+            );
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         // The pc word is a raw JitCode offset.
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
@@ -2805,6 +2820,16 @@ impl TraceCtx {
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
+        if majit_gc::diag_p92_enabled() {
+            let hdrs: Vec<(u32, u32, usize)> = frames
+                .iter()
+                .map(|(jc, pc, _, boxes)| (*jc, *pc, boxes.len()))
+                .collect();
+            if hdrs.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
+                eprintln!("P92_MF_CAPTURE frames={hdrs:?}");
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
+        }
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
             .map(|(jitcode_index, pc, _py_pc, boxes)| {
@@ -2841,6 +2866,16 @@ impl TraceCtx {
         vref_boxes: &[crate::recorder::SnapshotTagged],
         from_end: usize,
     ) {
+        if majit_gc::diag_p92_enabled() {
+            let hdrs: Vec<(u32, u32, usize)> = frames
+                .iter()
+                .map(|(jc, pc, _, boxes)| (*jc, *pc, boxes.len()))
+                .collect();
+            if hdrs.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
+                eprintln!("P92_MF_CAPTURE_OP frames={hdrs:?} from_end={from_end}");
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
+        }
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
             .map(|(jitcode_index, pc, _py_pc, boxes)| {
@@ -2883,10 +2918,17 @@ impl TraceCtx {
                     )
                 });
                 if opref.is_constant() {
-                    let value = self.constant_value(*opref).expect(
-                        "capture_snapshot_for_last_guard: constant OpRef missing recorded value",
-                    );
-                    crate::recorder::SnapshotTagged::Const(value, tp)
+                    if let Some(index) = opref.const_ptr_index() {
+                        crate::recorder::SnapshotTagged::Const(
+                            i64::from(index),
+                            majit_ir::Type::Ref,
+                        )
+                    } else {
+                        let value = self.constant_value(*opref).expect(
+                            "capture_snapshot_for_last_guard: constant OpRef missing recorded value",
+                        );
+                        crate::recorder::SnapshotTagged::Const(value, tp)
+                    }
                 } else {
                     crate::recorder::SnapshotTagged::Box(*opref, tp)
                 }

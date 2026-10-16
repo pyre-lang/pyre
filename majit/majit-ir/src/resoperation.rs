@@ -551,6 +551,7 @@ impl OpRef {
 
     /// history.py `ConstPtr(value)`. Interns `v` and stores the index.
     pub fn const_ptr(v: GcRef) -> OpRef {
+        crate::gcref_diag(v.0, "const_ptr");
         OpRef::ConstPtr(crate::const_ptr_table::intern(v))
     }
 
@@ -3481,6 +3482,9 @@ impl Op {
     /// Stamp the concrete runtime value on this op identity
     /// (`history.py *FrontendOp(pos, value)`).
     pub fn set_value(&self, v: crate::value::Value) {
+        if let crate::value::Value::Ref(r) = v {
+            crate::gcref_diag(r.0, "Op::set_value");
+        }
         self.descr.set_stamp_word(pack_stamp(v));
     }
 

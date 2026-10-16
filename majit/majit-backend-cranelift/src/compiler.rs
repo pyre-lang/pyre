@@ -318,6 +318,9 @@ const JF_FRAME_ITEM0_OFS: i32 = JF_FRAME_OFS as i32 + BASEITEMOFS as i32;
 /// without requiring a `CraneliftBackend` instance.
 /// Install a GC box into TLS and register all `set_active_*` hooks.
 /// Used by tests and embedders whose whole managed heap is thread-confined.
+/// Two live boxes at once is not a supported configuration: `ConstPtr`
+/// `MAJOR_LIVE` and `TRACE_OPS_GC_TYPE_ID` are process-global indexes
+/// into one collector.
 fn install_gc_box(mut gc: Box<dyn GcAllocator>) -> JitframeDescrFacts {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
@@ -376,6 +379,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     // here would silently drop dynasm's, and the frames it dropped would go
     // untraced rather than fail loudly.
     majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
+    majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         alloc_nursery_headerless_no_collect_via_active_runtime,
     ));
@@ -2041,6 +2045,11 @@ fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
     // which is `!collector_installed`.
     if !majit_gc::collector_installed() {
         return !addr;
+    }
+    // Same reentry as `dynasm_id_or_identityhash`: a root walk is already
+    // inside `gc_op`.
+    if majit_gc::gc_sync::in_gc_op() {
+        return majit_gc::gc_sync::gc_query_reentrant(|g| g.id_or_identityhash_reentrant(addr));
     }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so
@@ -4969,6 +4978,10 @@ thread_local! {
     static OP_RESULT_VARS: std::cell::RefCell<Option<indexmap::IndexSet<u32>>> = const { std::cell::RefCell::new(None) };
     /// `assembler.py` `genop_load_from_gc_table` base for this compile.
     static GC_TABLE_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Entry SSA of that base. `emit_load_gc_table_slot` uses it so the
+    /// 48-bit address is materialized once; cranelift rematerializes a
+    /// raw `iconst` of the slot address at every use.
+    static GC_TABLE_BASE_VAR: std::cell::Cell<Option<Variable>> = const { std::cell::Cell::new(None) };
     /// Vars that are `LoadFromGcTable` results (or SameAs of one), keyed by
     /// OpRef raw. rewrite.py clears `gcrefs_recently_loaded` at LABEL, so a
     /// later failarg must rematerialize the load rather than reuse a
@@ -4977,20 +4990,24 @@ thread_local! {
         std::cell::RefCell::new(indexmap::IndexMap::new());
 }
 
-/// RAII guard that restores `GC_TABLE_BASE` / `GC_TABLE_VAR_INDEX` on Drop
-/// so nested compiles (bridge compilation re-entry) keep their own table
-/// base and rematerialize map across nested `do_compile` re-entry.
+/// RAII guard that restores `GC_TABLE_BASE` / `GC_TABLE_BASE_VAR` /
+/// `GC_TABLE_VAR_INDEX` on Drop so nested compiles (bridge compilation
+/// re-entry) keep their own table base and rematerialize map across
+/// nested `do_compile` re-entry.
 struct GcTableCompileGuard {
     saved_base: usize,
+    saved_base_var: Option<Variable>,
     saved_index: indexmap::IndexMap<u32, u32>,
 }
 
 impl GcTableCompileGuard {
     fn enter(new_base: usize) -> Self {
         let saved_base = GC_TABLE_BASE.with(|cell| cell.replace(new_base));
+        let saved_base_var = GC_TABLE_BASE_VAR.with(|cell| cell.replace(None));
         let saved_index = GC_TABLE_VAR_INDEX.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
         Self {
             saved_base,
+            saved_base_var,
             saved_index,
         }
     }
@@ -4999,6 +5016,7 @@ impl GcTableCompileGuard {
 impl Drop for GcTableCompileGuard {
     fn drop(&mut self) {
         GC_TABLE_BASE.with(|cell| cell.set(self.saved_base));
+        GC_TABLE_BASE_VAR.with(|cell| cell.set(self.saved_base_var));
         GC_TABLE_VAR_INDEX.with(|cell| *cell.borrow_mut() = std::mem::take(&mut self.saved_index));
     }
 }
@@ -5013,19 +5031,34 @@ fn gc_table_index_for_var(var_idx: u32) -> Option<u32> {
     GC_TABLE_VAR_INDEX.with(|cell| cell.borrow().get(&var_idx).copied())
 }
 
+fn gc_table_slot_offset(table_index: u32) -> i32 {
+    (table_index as i64)
+        .checked_mul(std::mem::size_of::<usize>() as i64)
+        .and_then(|b| i32::try_from(b).ok())
+        .expect("LoadFromGcTable index fits the load immediate")
+}
+
+/// `assembler.py genop_load_from_gc_table`: one load from
+/// `gc_ll_descr.gcrefs[index]`. Dynasm emits a PC-relative load of the
+/// reserved slot. Cranelift's `JITModule` has no code-buffer reservation
+/// seam, so the table base is one entry SSA (`GC_TABLE_BASE_VAR`) and
+/// this is `load(base, index*WORD)`.
 fn emit_load_gc_table_slot(
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     table_index: u32,
 ) -> CValue {
-    let base = GC_TABLE_BASE.with(std::cell::Cell::get);
-    let base_v = builder.ins().iconst(cl_types::I64, base as i64);
-    let index_v = builder.ins().iconst(cl_types::I64, table_index as i64);
-    let byte_ofs = builder.ins().ishl_imm_u(index_v, 3);
-    let slot_addr = builder.ins().iadd(base_v, byte_ofs);
+    let offset = gc_table_slot_offset(table_index);
+    let base_v = match GC_TABLE_BASE_VAR.with(std::cell::Cell::get) {
+        Some(base_var) => builder.use_var(base_var),
+        None => {
+            let base = GC_TABLE_BASE.with(std::cell::Cell::get);
+            builder.ins().iconst(cl_types::I64, base as i64)
+        }
+    };
     builder
         .ins()
-        .load(ptr_type, MemFlagsData::trusted(), slot_addr, 0)
+        .load(ptr_type, MemFlagsData::trusted(), base_v, offset)
 }
 
 fn opref_is_op_result_var(opref: OpRef) -> bool {
@@ -13213,6 +13246,18 @@ impl CraneliftBackend {
         // it to a stack slot reloaded on every access.
         builder.ins().set_pinned_reg(jf_ptr);
 
+        // `assembler.py genop_load_from_gc_table` holds the table in the
+        // code buffer and loads PC-relative. cranelift's JITModule has no
+        // such reservation seam, so the base is one absolute iconst at
+        // entry; FunctionBuilder carries it through the loop as an SSA
+        // var. Each LoadFromGcTable is then `load(base, index*WORD)`.
+        if gc_table_base != 0 {
+            let base_var = builder.declare_var(cl_types::I64);
+            let base_v = builder.ins().iconst(cl_types::I64, gc_table_base as i64);
+            builder.def_var(base_var, base_v);
+            GC_TABLE_BASE_VAR.with(|cell| cell.set(Some(base_var)));
+        }
+
         // Debug: save declared_vars snapshot for resolve_opref checking.
         DECLARED_VARS_DEBUG.with(|cell| {
             *cell.borrow_mut() = Some(declared_vars.clone());
@@ -19834,16 +19879,14 @@ impl CraneliftBackend {
                 }
 
                 // ── Load from GC table ──
-                // `assembler.py:1545` `genop_load_from_gc_table`: load the
+                // `assembler.py genop_load_from_gc_table`: load the
                 // reference constant at `gc_table_base + index*WORD`.
                 // arg(0) is the `ConstInt(index)` produced by the rewrite's
-                // `remove_constptr`; the table base is baked absolute
-                // because cranelift's `JITModule` exposes no
-                // code-buffer-start reservation seam (x86-32 `MOV_rj`
-                // model, `assembler.py:1551-1552`). The slot value is
-                // GC-forwarded in place by the gc_table root walker, so
-                // each load observes the relocated object. Cranelift folds
-                // `base + (const_index << 3)` to a single address.
+                // `remove_constptr`. The table base is one entry SSA
+                // (`GC_TABLE_BASE_VAR`); JITModule has no code-buffer
+                // reservation seam (x86-32 `MOV_rj` model,
+                // `assembler.py` `reserve_gcref_table`). The slot value
+                // is GC-forwarded in place by the gc_table root walker.
                 OpCode::LoadFromGcTable => {
                     let table_index = lookup_const_i64(&constants, op.arg(0).to_opref())
                         .expect("LoadFromGcTable index is ConstInt")
@@ -25653,7 +25696,7 @@ mod tests {
             descr
                 .as_fail_descr()
                 .unwrap()
-                .set_rd_locs(smallvec::smallvec![0u16]);
+                .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         }
         let inputargs = vec![InputArg::new_int_rc(0)];
         let counter = OpRef::input_arg_int(0);
@@ -25733,7 +25776,7 @@ mod tests {
         enter_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let counter = OpRef::input_arg_int(0);
         let exit = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
@@ -26294,7 +26337,7 @@ mod tests {
         descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
     }
 
     /// A adds 1 and, on an odd value, bridges to C. C adds 10 and, on an odd
@@ -26826,12 +26869,12 @@ mod tests {
         exit_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(
@@ -26937,12 +26980,12 @@ mod tests {
         exit_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(
@@ -27029,17 +27072,17 @@ mod tests {
         exit_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let bridge_guard_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
         bridge_guard_descr
             .as_fail_descr()
             .unwrap()
-            .set_rd_locs(smallvec::smallvec![0u16]);
+            .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(

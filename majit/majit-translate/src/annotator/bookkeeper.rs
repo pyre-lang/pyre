@@ -4039,8 +4039,15 @@ impl Bookkeeper {
             // queries it with the slice, so the key cell is the same
             // `SomeString`. A nominal key instance cannot union with
             // that slice.
-            "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "BytesKey" | "StrKey"
-            | "Utf8Str" => {
+            "String"
+            | "str"
+            | "Wtf8"
+            | "Wtf8Buf"
+            | "BytesBlock"
+            | "BytesKey"
+            | "StrKey"
+            | "Utf8Str"
+            | "UnicodeValueStorage" => {
                 return super::model::s_str0();
             }
             // `malachite_bigint::BigInt` is deliberately foreign and opaque

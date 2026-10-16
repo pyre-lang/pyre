@@ -2620,6 +2620,18 @@ fn analyze_pipeline_from_module_paths(
             "newlist_clear(count)".to_string(),
         );
     }
+    // `rlist.py` `listeq_unroll_case` calls `jit.isvirtual`. The helper
+    // graph is minted as `_ll_listeq_isvirtual_{fixed,resized}` and
+    // `direct_call`s `majit_rlib::jit::isvirtual` (`NonConstant(False)`
+    // interpreter fallback lives in that intrinsic). The oopspec is on
+    // `rlib/jit.py` `isvirtual`; this mark also rewrites a call of the
+    // helper name itself when BFS does not look inside.
+    for isvirtual_name in ["_ll_listeq_isvirtual_fixed", "_ll_listeq_isvirtual_resized"] {
+        call_control.mark_oopspec(
+            parse::CallPath::from_segments([isvirtual_name]),
+            "jit.isvirtual".to_string(),
+        );
+    }
 
     // `LLHelpers.ll_str2unicode` owns
     // `@jit.oopspec("str.str2unicode(str)")` in `rstr.py`.  Pyre's rtyper

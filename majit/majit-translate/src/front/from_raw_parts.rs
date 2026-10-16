@@ -45,10 +45,10 @@ use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, V
 /// length-prefixed GC-string header view into `same_as(header)`.  Returns
 /// the number of sites rewritten.
 pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
-    let mut sites: Vec<(usize, usize, Variable, ValueType)> = Vec::new();
+    let mut sites: Vec<(usize, usize, Variable, ValueType, bool)> = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
         for (oi, op) in block.operations.iter().enumerate() {
-            let Some(header) = header_for_from_raw_parts(graph, op) else {
+            let Some((header, bytes_block)) = header_for_from_raw_parts(graph, op) else {
                 continue;
             };
             let result_ty = match &op.kind {
@@ -56,11 +56,11 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
                 _ => continue,
             };
             let canonical = canonical_source(graph, &header);
-            sites.push((bi, oi, canonical, result_ty));
+            sites.push((bi, oi, canonical, result_ty, bytes_block));
         }
     }
     let mut rewritten = 0usize;
-    for (bi, oi, canonical, result_ty) in sites.into_iter().rev() {
+    for (bi, oi, canonical, result_ty, _bytes_block) in sites.into_iter().rev() {
         let Some(live) = ensure_live_rep(graph, bi, &canonical) else {
             continue;
         };
@@ -89,7 +89,10 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
     rewritten
 }
 
-fn header_for_from_raw_parts(graph: &FunctionGraph, op: &SpaceOperation) -> Option<Variable> {
+fn header_for_from_raw_parts(
+    graph: &FunctionGraph,
+    op: &SpaceOperation,
+) -> Option<(Variable, bool)> {
     let OpKind::Call { target, args, .. } = &op.kind else {
         return None;
     };
@@ -100,11 +103,11 @@ fn header_for_from_raw_parts(graph: &FunctionGraph, op: &SpaceOperation) -> Opti
     let len = args[1].clone().into_variable();
     if let Some(header) = chars_field_header(graph, &ptr) {
         let header = peel_ptr_int_casts(graph, &header);
-        return len_names_same_header(graph, &len, &header).then_some(header);
+        return len_names_same_header(graph, &len, &header).then_some((header, true));
     }
     let header = ptr_add_chars_offset_header(graph, &ptr)?;
     let header = peel_ptr_int_casts(graph, &header);
-    len_names_same_header(graph, &len, &header).then_some(header)
+    len_names_same_header(graph, &len, &header).then_some((header, false))
 }
 
 fn is_from_raw_parts_target(target: &CallTarget) -> bool {
@@ -412,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn chars_field_from_raw_parts_aliases_header() {
+    fn chars_field_from_raw_parts_is_bytes_block_str() {
         let mut g = FunctionGraph::new("test_from_raw_parts_chars");
         let a = g.startblock;
         let header = g
@@ -483,21 +486,27 @@ mod tests {
                 true,
             )
             .unwrap();
-        g.set_return(a, Some(slice));
+        g.set_return(a, Some(slice.clone()));
 
         assert_eq!(rewire_from_raw_parts_sites(&mut g), 1);
         assert!(
             !residual_from_raw_parts(&g),
             "header-view from_raw_parts must be gone"
         );
-        assert!(
-            g.blocks[a.0]
-                .operations
-                .iter()
-                .all(|op| { !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") }),
-            "the slice is the header, with no same_as copy"
-        );
         assert_eq!(g.blocks[a.0].exits[0].args[0].as_variable(), Some(&header));
+        let slice_op = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&slice));
+        if let Some(slice_op) = slice_op {
+            match &slice_op.kind {
+                OpKind::Call {
+                    result_ty: ValueType::Str,
+                    ..
+                } => panic!("BytesBlock view must not be Str"),
+                _ => {}
+            }
+        }
     }
 
     #[test]

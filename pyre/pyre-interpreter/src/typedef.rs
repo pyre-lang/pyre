@@ -23454,14 +23454,15 @@ pub(crate) fn format_complex_component_repr(val: f64) -> String {
 /// RPython `rfloat.formatd` residual ABI for a complex repr component.
 ///
 /// The translator replaces only the component-format call with this one-word
-/// low-level string result.  The surrounding positive-zero/sign/parenthesis
-/// builder remains visible in `complex_repr_string`, matching PyPy.
+/// `STR` (`rstr.py` `rpy_string`) result.  The surrounding
+/// positive-zero/sign/parenthesis builder remains visible in
+/// `complex_repr_string`, matching PyPy.
 #[majit_macros::dont_look_inside]
 pub fn jit_format_complex_component_repr_rstr(
     val: f64,
-) -> *mut pyre_object::bytesobject::BytesBlock {
+) -> *mut pyre_object::unicodeobject::Utf8Str {
     let text = format_complex_component_repr(val);
-    pyre_object::bytesobject::alloc_bytes_block(text.as_bytes())
+    pyre_object::unicodeobject::alloc_utf8_payload(text.as_bytes(), true)
 }
 
 /// `complexobject.py W_ComplexObject.descr_repr` — a pure positive-zero real
@@ -38362,8 +38363,8 @@ mod tests {
     #[test]
     fn complex_component_residual_returns_the_same_lowlevel_string_bytes() {
         for value in [0.0, -0.0, 1.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
-            let block = super::jit_format_complex_component_repr_rstr(value);
-            let bytes = unsafe { pyre_object::bytesobject::bytes_block_chars(block) };
+            let s = super::jit_format_complex_component_repr_rstr(value);
+            let bytes = unsafe { pyre_object::unicodeobject::utf8_payload_bytes(s) };
             assert_eq!(
                 bytes,
                 super::format_complex_component_repr(value).as_bytes()

@@ -14739,8 +14739,15 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // mapdict.py BaseUserClassMapdict.setclass re-roots every physical
         // mapdict layout, including a slots-only subclass whose class has
         // no instance dict (`has_mapdict_storage` is false there).
+        // Take both class stripes around the map/storage migration and the
+        // `w_class` store so a reader cannot observe a half-published pair
+        // when the two classes hash to different stripes.
         let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_newcls]);
+        let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_newcls, w_oldcls.as_ptr()]);
+        let _stripes = crate::objspace::std::mapdict::lock_instance_stripes(
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        );
         if crate::objspace::std::mapdict::has_mapdict_layout(
             pyre_object::gc_roots::shadow_stack_get(base),
         ) {
@@ -24764,49 +24771,97 @@ fn contains_bytes_like(
             return Ok(pyre_object::bytesobject::jit_bytes_contains(haystack, needle) != 0);
         }
         // The receiver's export owns a bracket of its own, above this one;
-        // this one stays open until the export is gone.
+        // this one stays open until the export is gone. Release before each
+        // return so the Result shell is a bare Ok/Err (`result_exc`
+        // `lower_result_exc_returns`).
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.pin_roots(&[haystack, needle]);
-        let receiver = simple_buffer_bytes(haystack);
+        let exported = simple_buffer_bytes(haystack);
         haystack = roots.get(base);
         needle = roots.get(base + 1);
-        let receiver = receiver?.expect("bytes/bytearray receiver always exports a buffer");
-        let result = if is_int(needle) || is_long(needle) {
+        let receiver = exported?.expect("bytes/bytearray receiver always exports a buffer");
+        if is_int(needle) || is_long(needle) {
             let v = if is_int(needle) {
                 pyre_object::w_int_get_value(needle)
             } else {
                 -1
             };
-            if !(0..=255).contains(&v) {
-                Err(PyError::value_error("byte must be in range(0, 256)"))
-            } else if is_bytes(haystack) {
-                Ok(pyre_object::bytesobject::jit_bytes_contains_byte(haystack, v) != 0)
-            } else {
-                Ok(receiver.as_bytes().contains(&(v as u8)))
+            if v < 0 || v > 255 {
+                receiver.release();
+                return Err(PyError::value_error("byte must be in range(0, 256)"));
             }
-        } else {
-            match pyre_object::with_roots!(needle =>
-                simple_buffer_bytes(needle).map(|sub| sub.map(SimpleBufferBytes::into_bytes)))
-            {
-                Ok(Some(sub)) => Ok(sub.is_empty()
-                    || receiver
-                        .as_bytes()
-                        .windows(sub.len())
-                        .any(|window| window == sub.as_slice())),
-                Ok(None) => {
-                    let tname = match crate::typedef::r#type(needle) {
-                        Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-                        None => "object".to_string(),
-                    };
-                    Err(PyError::type_error(format!(
-                        "a bytes-like object is required, not '{tname}'"
-                    )))
+            if is_bytes(haystack) {
+                let found = pyre_object::bytesobject::jit_bytes_contains_byte(haystack, v) != 0;
+                receiver.release();
+                return Ok(found);
+            }
+            // `stringmethods.py descr_contains` via `_single_char`:
+            // `value.find(other) >= 0`.
+            let hay = receiver.as_bytes();
+            let byte = v as u8;
+            let mut i = 0;
+            let mut found = false;
+            while i < hay.len() {
+                if hay[i] == byte {
+                    found = true;
+                    break;
                 }
-                Err(error) => Err(error),
+                i += 1;
             }
-        };
-        receiver.release();
-        result
+            receiver.release();
+            return Ok(found);
+        }
+        match pyre_object::with_roots!(needle => {
+            simple_buffer_bytes(needle).map(|sub| sub.map(SimpleBufferBytes::into_bytes))
+        }) {
+            Ok(Some(sub)) => {
+                // `stringmethods.py descr_contains`: `value.find(other, start, end) >= 0`.
+                let hay = receiver.as_bytes();
+                let needle = sub.as_slice();
+                let found = if needle.is_empty() {
+                    true
+                } else if hay.len() < needle.len() {
+                    false
+                } else {
+                    let mut i = 0;
+                    let last = hay.len() - needle.len();
+                    let mut found = false;
+                    while i <= last {
+                        let mut j = 0;
+                        while j < needle.len() && hay[i + j] == needle[j] {
+                            j += 1;
+                        }
+                        if j == needle.len() {
+                            found = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    found
+                };
+                receiver.release();
+                Ok(found)
+            }
+            Ok(None) => {
+                let tname = match crate::typedef::r#type(needle) {
+                    Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+                    None => "object".to_string(),
+                };
+                receiver.release();
+                Err(PyError::type_error(format!(
+                    "a bytes-like object is required, not '{tname}'"
+                )))
+            }
+            Err(mut error) => {
+                // `PyError::pin` names this handle for `get_livevars_for_roots`.
+                // `release` can collect; `reload` stores the forwarded word
+                // (`shadowstack.py expand_pop_roots`).
+                let error_slot = error.pin(&roots);
+                receiver.release();
+                error.reload(&roots, error_slot);
+                Err(error)
+            }
+        }
     }
 }
 

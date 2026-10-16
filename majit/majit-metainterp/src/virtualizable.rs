@@ -1297,28 +1297,13 @@ impl VirtualizableInfo {
     /// RPython equivalent: `vinfo.get_array_length(virtualizable, array_index)`
     ///
     /// Reads the array pointer from the virtualizable, then reads the length
-    /// from the array header at `length_offset`.
+    /// from the array header at `length_offset`. Both pointers are reloaded
+    /// first ([`live_vable_array_length`]).
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn get_array_length(&self, obj_ptr: *const u8, array_index: usize) -> usize {
-        unsafe {
-            let ai = &self.array_fields[array_index];
-            match ai.storage {
-                VableArrayStorage::DirectPointer => {
-                    let array_ptr = *(obj_ptr.add(ai.field_offset) as *const *const u8);
-                    if array_ptr.is_null() {
-                        0
-                    } else {
-                        *(array_ptr.add(ai.length_offset) as *const usize)
-                    }
-                }
-                VableArrayStorage::EmbeddedArray { .. } => {
-                    let container = *(obj_ptr.add(ai.field_offset) as *const *const u8);
-                    *(container.add(ai.length_offset) as *const usize)
-                }
-            }
-        }
+        unsafe { live_vable_array_length(obj_ptr, &self.array_fields[array_index]) }
     }
 
     /// Read an array element from the heap object.
@@ -3246,6 +3231,15 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         // in the stream to be re-read as somebody else's values.  A null gets
         // no write — upstream has no such case at all, `cast_gcref_to_vtype`
         // hands `setattr` a null and it crashes — but the read still happens.
+        if majit_gc::diag_p92_trace_io() {
+            eprintln!(
+                "P92_WRITE_VABLE start statics={} arrays={} vable_ptr={:#x} items_read={}",
+                self.static_fields.len(),
+                self.array_fields.len(),
+                virtualizable as usize,
+                reader.resumecodereader.items_read,
+            );
+        }
         for (field_index, field) in self.static_fields.iter().enumerate() {
             let value = reader.next_value_of_type(field.field_type);
             let vable_ptr = reader.virtualizable_ptr as *mut u8;
@@ -3254,6 +3248,12 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
                     self.write_field(vable_ptr, field_index, value);
                 }
             }
+        }
+        if majit_gc::diag_p92_trace_io() {
+            eprintln!(
+                "P92_WRITE_VABLE after_statics items_read={} vable_ptr={:#x}",
+                reader.resumecodereader.items_read, reader.virtualizable_ptr as usize,
+            );
         }
         if reader.virtualizable_ptr == 0 {
             // Matches `get_total_size`, which adds no array length without a
@@ -3264,6 +3264,12 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         for array in &self.array_fields {
             let vable_ptr = reader.virtualizable_ptr as *mut u8;
             let arr_len = unsafe { bhimpl_arraylen_vable(vable_ptr as *const u8, array) };
+            if majit_gc::diag_p92_trace_io() {
+                eprintln!(
+                    "P92_WRITE_VABLE array len={arr_len} item_type={:?} items_read={}",
+                    array.item_type, reader.resumecodereader.items_read,
+                );
+            }
             // `lst = getattr(virtualizable, ARRAYFIELD)` is bound outside the
             // item loop upstream, where the GC transform roots it and forwards
             // it across whatever the reader does.  A bare base pointer is not
@@ -3293,20 +3299,49 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
 /// Read the length of a virtualizable array field.
 /// blackhole.py bhimpl_arraylen_vable parity.
 pub(crate) unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
+    unsafe { live_vable_array_length(vable_ptr, array) }
+}
+
+/// Reload a pointer that may name a nursery corpse.
+///
+/// `GcHeader::set_forwarding_address` stores the survivor in the first
+/// payload word. `FixedObjectArray.len` is that word, so a size read of the
+/// corpse returns the forwarding address. `gc_current_object_address` follows
+/// the stub while the marker is intact and returns every other address
+/// unchanged, including null. The frame corpse is not rewritten by
+/// `walk_pyframe_roots`; `current_live_frame_array` reloads the frame and
+/// then the array for the same reason.
+#[inline]
+fn live_gc_addr(ptr: *const u8) -> *const u8 {
+    majit_gc::gc_current_object_address(ptr as usize) as *const u8
+}
+
+/// Length of `array` on the live virtualizable.
+///
+/// The virtualizable is reloaded before the array pointer is read, and the
+/// array (or embedded container) is reloaded before `length_offset`. A null
+/// direct pointer is still length 0.
+///
+/// # Safety
+/// `vable_ptr` must point at a virtualizable object, or at a nursery corpse
+/// whose forwarding stub is still intact.
+unsafe fn live_vable_array_length(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
     unsafe {
+        let vable_ptr = live_gc_addr(vable_ptr);
         match array.storage {
-            VableArrayStorage::EmbeddedArray { .. } => {
-                // Pointer to container struct: deref then read length
-                let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
-                *(container.add(array.length_offset) as *const usize)
-            }
             VableArrayStorage::DirectPointer => {
-                let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
-                if arr_ptr.is_null() {
+                let array_ptr =
+                    live_gc_addr(*(vable_ptr.add(array.field_offset) as *const *const u8));
+                if array_ptr.is_null() {
                     0
                 } else {
-                    *(arr_ptr.add(array.length_offset) as *const usize)
+                    *(array_ptr.add(array.length_offset) as *const usize)
                 }
+            }
+            VableArrayStorage::EmbeddedArray { .. } => {
+                let container =
+                    live_gc_addr(*(vable_ptr.add(array.field_offset) as *const *const u8));
+                *(container.add(array.length_offset) as *const usize)
             }
         }
     }
@@ -3326,9 +3361,14 @@ pub(crate) unsafe fn bhimpl_arraybase_vable(
     array: &VableArrayInfo,
 ) -> *const u8 {
     unsafe {
+        // Same reload as [`live_vable_array_length`]: the field is read from
+        // the live virtualizable, and the array or container is followed
+        // before the items offset is applied.
+        let vable_ptr = live_gc_addr(vable_ptr);
         match array.storage {
             VableArrayStorage::EmbeddedArray { ptr_offset } => {
-                let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                let container =
+                    live_gc_addr(*(vable_ptr.add(array.field_offset) as *const *const u8));
                 // Offsetting a null pointer is undefined behaviour even when
                 // the caller is about to reject the result: `add` requires the
                 // pointer to stay inside one allocation.  Hand the null back
@@ -3340,7 +3380,8 @@ pub(crate) unsafe fn bhimpl_arraybase_vable(
                 *(container.add(ptr_offset) as *const *const u8)
             }
             VableArrayStorage::DirectPointer => {
-                let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                let arr_ptr =
+                    live_gc_addr(*(vable_ptr.add(array.field_offset) as *const *const u8));
                 if arr_ptr.is_null() {
                     return std::ptr::null();
                 }
@@ -3446,11 +3487,13 @@ pub(crate) unsafe fn vable_array_write_base(
     array: &VableArrayInfo,
 ) -> (*mut u8, *mut u8) {
     unsafe {
+        let vable_ptr = live_gc_addr(vable_ptr as *const u8) as *mut u8;
         let data_ptr = bhimpl_arraybase_vable(vable_ptr, array) as *mut u8;
         let owner_ptr = match array.storage {
             VableArrayStorage::EmbeddedArray { .. } => data_ptr,
             VableArrayStorage::DirectPointer => {
-                *(vable_ptr.add(array.field_offset) as *const *mut u8)
+                live_gc_addr(*(vable_ptr.add(array.field_offset) as *const *mut u8) as *const u8)
+                    as *mut u8
             }
         };
         (data_ptr, owner_ptr)

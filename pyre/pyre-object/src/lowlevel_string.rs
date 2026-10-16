@@ -602,6 +602,39 @@ pub fn ll_stringslice_startstop(
     _ll_stringslice(s1, start, stop)
 }
 
+/// `Repr.rtype_str` for a rust-heap `String` (`{cap, ptr, len}`).
+///
+/// `AbstractStringRepr.ll_str` is identity because the value is already
+/// rstr `STR` (`{hash, chars}`). A rust-heap header is not that struct, so
+/// `str()` copies the bytes into a fresh `mallocstr` payload. Residual:
+/// looking inside would rtype `String` field reads as `STR` offsets.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_ll_str_from_rust_string(
+    s: *const String,
+) -> *mut crate::unicodeobject::Utf8Str {
+    if s.is_null() {
+        let out = bh_alloc_lowlevel_string(0, LOWLEVEL_STR_BASE_SIZE, 1);
+        if out == 0 {
+            return std::ptr::null_mut();
+        }
+        return out as *mut crate::unicodeobject::Utf8Str;
+    }
+    let bytes = unsafe { (*s).as_bytes() };
+    let n = bytes.len();
+    let out = bh_alloc_str_nofill(n);
+    if out == 0 {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET),
+            n,
+        );
+    }
+    out as *mut crate::unicodeobject::Utf8Str
+}
+
 /// `ll_str.py ll_int2dec` — `@jit.elidable` decimal render of a Signed
 /// into a fresh rstr `STR`, returned as the `Ptr(STR)` it is.
 /// `descr_repr` (intobject.py) wraps the result with
@@ -754,6 +787,22 @@ mod tests {
         bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(cut as i64, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
+
+    #[test]
+    fn jit_ll_str_from_rust_string_copies_bytes_into_rstr() {
+        let src = String::from("int");
+        let buf = jit_ll_str_from_rust_string(&src);
+        assert!(!buf.is_null());
+        let buf = buf as i64;
+        assert_eq!(bh_lowlevel_string_len(buf), 3);
+        assert_eq!(
+            bh_read_lowlevel_string(buf, 1),
+            vec![b'i' as i64, b'n' as i64, b't' as i64]
+        );
+        // Source layout is untouched; the payload is a distinct STR.
+        assert_ne!(buf as *const u8, src.as_ptr());
+        bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
     }
 
     #[test]

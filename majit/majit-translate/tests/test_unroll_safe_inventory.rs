@@ -416,16 +416,21 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("exception_match", "baseobjspace.py exception_match"),
     // `tupleobject.py` short-tuple arms. `_unroll_condition` is
     // `loop_unrolling_heuristic(..., UNROLL_CUTOFF=10)`; contains/hash
-    // fork to these `@jit.unroll_safe` bodies, and `_compare_tuples`
-    // is `@jit.look_inside_iff(_unroll_condition_cmp)`.
+    // fork to these `@jit.unroll_safe` bodies. `_compare_tuples` and
+    // `_descr_eq` are `@jit.look_inside_iff(_unroll_condition_cmp)`.
+    // `look_inside_iff` still marks the orig `unroll_safe` (`rlib/jit.py`).
     (
         "_descr_contains_unroll_safe",
         "tupleobject.py _descr_contains_unroll_safe",
     ),
     ("_descr_hash_unroll", "tupleobject.py _descr_hash_unroll"),
     (
+        "_orig_tuple_descr_eq",
+        "tupleobject.py _descr_eq look_inside_iff(_unroll_condition_cmp)",
+    ),
+    (
         "_orig_compare_tuples",
-        "rlib/jit.py look_inside_iff unroll_safe(_compare_tuples)",
+        "tupleobject.py _compare_tuples look_inside_iff(_unroll_condition_cmp)",
     ),
     // `intobject.py _pow_mod` / `_pow_nomod` are
     // `@jit.look_inside_iff(... jit.isconstant(iw) ...)`. With the descent,

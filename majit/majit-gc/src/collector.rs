@@ -1885,6 +1885,41 @@ impl MiniMarkGC {
         }
     }
 
+    /// Minor-collect before a Trace-pool allocation when
+    /// [`crate::gc_stress_trace_alloc_enabled`] is set.
+    ///
+    /// `opencoder.py` `Trace._ops` and the other pools in `trace_bufs` call
+    /// this through [`crate::stress_trace_pool_alloc`]. `malloc_fast`
+    /// (`framework.py`, `inline=True`) does not: rbigint digit arrays share
+    /// that entry (`rlist.try_alloc_typed_items_block_nursery_rooted`).
+    ///
+    /// A collection callback that allocates again must not re-enter: the
+    /// flag is process-global because `gc_op` already serializes the
+    /// collector.
+    pub(crate) fn stress_trace_alloc_minor(&mut self, roots: *mut GcRef, root_count: usize) {
+        if !crate::gc_stress_trace_alloc_enabled() {
+            return;
+        }
+        static IN_STRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if IN_STRESS.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                IN_STRESS.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _clear = Clear;
+        for i in 0..root_count {
+            unsafe { self.roots.add(roots.add(i)) };
+        }
+        self.minor_collection_only();
+        for i in (0..root_count).rev() {
+            self.roots.remove(unsafe { roots.add(i) });
+        }
+    }
+
     /// `malloc_fast` with the full `gc_push_roots(livevars)` span.  The
     /// common bump path touches none of the slots; only the collection tail
     /// registers and later reloads them, as `postprocess_inlining` arranges for
@@ -3479,24 +3514,30 @@ impl MiniMarkGC {
         // root, so the list cannot move under the walk, and copying it first
         // was one allocation and one pass over every registered root per minor
         // collection.
-        let mut i = 0;
-        while i < self.roots.roots.len() {
-            let root_ptr = self.roots.roots[i];
-            let gcref = unsafe { &mut *root_ptr };
-            self.drag_out_root(gcref);
-            i += 1;
+        {
+            let _label = crate::shadow_stack::extra_area_scope("registered_roots");
+            let mut i = 0;
+            while i < self.roots.roots.len() {
+                let root_ptr = self.roots.roots[i];
+                let gcref = unsafe { &mut *root_ptr };
+                self.drag_out_root(gcref);
+                i += 1;
+            }
         }
 
         // Phase 1b: Process shadow stack roots.
         // RPython gc.py: GcRootMap_shadowstack — walk the thread-local
         // shadow stack to find GC refs pushed by compiled JIT code.
-        let mut visit_shadow_root = |gcref: &mut GcRef| {
-            self.drag_out_root(gcref);
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
-        } else {
-            crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+        {
+            let _label = crate::shadow_stack::extra_area_scope("shadow_stack");
+            let mut visit_shadow_root = |gcref: &mut GcRef| {
+                self.drag_out_root(gcref);
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_roots(&mut visit_shadow_root);
+            } else {
+                crate::shadow_stack::walk_roots(&mut visit_shadow_root);
+            }
         }
 
         // Phase 1c: Process jitframe shadow stack roots.
@@ -3510,44 +3551,47 @@ impl MiniMarkGC {
         // after the walk finishes without reborrowing `self` inside the
         // tracer callback.
         let mut libc_jf_slots: Vec<*mut majit_ir::GcRef> = Vec::new();
-        let mut visit_jf_root = |gcref: &mut GcRef| {
-            if self.is_nursery_object_start(gcref.0) {
-                self.drag_out_root(gcref);
-            } else if self.is_young_rawmalloced(gcref.0) {
-                // `_trace_drag_out` on a young rawmalloced frame: flag it
-                // GCFLAG_VISITED_RMY so it survives, and queue it for the
-                // remembered walk that traces its slots.
-                self.visit_young_rawmalloced_object(gcref.0);
-            } else if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
-                // pyre dynasm extension: jitframes allocated via
-                // `libc::calloc` in execute_token are neither in the
-                // nursery nor the old gen. The registered libc-jitframe
-                // tracer walks `jf_gcmap` bits to expose ref slots.
-                crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
+        {
+            let _jf_label = crate::shadow_stack::extra_area_scope("jitframe");
+            let mut visit_jf_root = |gcref: &mut GcRef| {
+                if self.is_nursery_object_start(gcref.0) {
+                    self.drag_out_root(gcref);
+                } else if self.is_young_rawmalloced(gcref.0) {
+                    // `_trace_drag_out` on a young rawmalloced frame: flag it
+                    // GCFLAG_VISITED_RMY so it survives, and queue it for the
+                    // remembered walk that traces its slots.
+                    self.visit_young_rawmalloced_object(gcref.0);
+                } else if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
+                    // pyre dynasm extension: jitframes allocated via
+                    // `libc::calloc` in execute_token are neither in the
+                    // nursery nor the old gen. The registered libc-jitframe
+                    // tracer walks `jf_gcmap` bits to expose ref slots.
+                    crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
+                        libc_jf_slots.push(slot_ptr);
+                    });
+                }
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
+            } else {
+                crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
+            }
+            // The jitframes the backend is still holding as DEADFRAMES. A frame
+            // reaches this walk exactly when it has left the shadow stack — the
+            // compiled epilogue pops it before returning — and has not yet been
+            // freed, which is the window in which the frontend reads its slots.
+            // `llmodel.py grab_exc_value` reads those slots straight out of the frame, so
+            // the interior refs are live for the whole window and nothing else in
+            // this phase can see them. See `ActiveGcDeadFrameHooks`.
+            crate::walk_active_live_deadframes(&mut |addr| {
+                crate::shadow_stack::trace_libc_jitframe(addr, &mut |slot_ptr| {
                     libc_jf_slots.push(slot_ptr);
                 });
-            }
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_jf_roots(&mut visit_jf_root);
-        } else {
-            crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
-        }
-        // The jitframes the backend is still holding as DEADFRAMES. A frame
-        // reaches this walk exactly when it has left the shadow stack — the
-        // compiled epilogue pops it before returning — and has not yet been
-        // freed, which is the window in which the frontend reads its slots.
-        // `llmodel.py grab_exc_value` reads those slots straight out of the frame, so
-        // the interior refs are live for the whole window and nothing else in
-        // this phase can see them. See `ActiveGcDeadFrameHooks`.
-        crate::walk_active_live_deadframes(&mut |addr| {
-            crate::shadow_stack::trace_libc_jitframe(addr, &mut |slot_ptr| {
-                libc_jf_slots.push(slot_ptr);
             });
-        });
-        for slot_ptr in libc_jf_slots {
-            let field_ref = unsafe { &mut *slot_ptr };
-            self.drag_out_root(field_ref);
+            for slot_ptr in libc_jf_slots {
+                let field_ref = unsafe { &mut *slot_ptr };
+                self.drag_out_root(field_ref);
+            }
         }
 
         // Phase 1d: Process blackhole interpreter register banks.
@@ -3556,13 +3600,16 @@ impl MiniMarkGC {
         // root set. RPython traces these via the RPython object graph
         // (Box arrays); pyre stores raw i64 in Vec<i64> so we walk the
         // explicit thread-local stack of register banks.
-        let mut visit_bh_root = |gcref: &mut GcRef| {
-            self.drag_out_root(gcref);
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
-        } else {
-            crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+        {
+            let _bh_label = crate::shadow_stack::extra_area_scope("bh_regs");
+            let mut visit_bh_root = |gcref: &mut GcRef| {
+                self.drag_out_root(gcref);
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_bh_regs(&mut visit_bh_root);
+            } else {
+                crate::shadow_stack::walk_bh_regs(&mut visit_bh_root);
+            }
         }
 
         // blackhole resume construction roots (`resume.py blackhole_from_resumedata`): the
@@ -3570,13 +3617,16 @@ impl MiniMarkGC {
         // materializing virtuals before `run()` re-roots them via
         // `push_bh_regs`; forward any already-materialized nursery refs so a
         // later materialization's collection does not strand them.
-        let mut visit_resume_root = |gcref: &mut GcRef| {
-            self.drag_out_root(gcref);
-        };
-        if walk_all_mutators {
-            crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
-        } else {
-            crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+        {
+            let _resume_label = crate::shadow_stack::extra_area_scope("resume_ref_roots");
+            let mut visit_resume_root = |gcref: &mut GcRef| {
+                self.drag_out_root(gcref);
+            };
+            if walk_all_mutators {
+                crate::shadow_stack::walk_all_resume_ref_roots(&mut visit_resume_root);
+            } else {
+                crate::shadow_stack::walk_resume_ref_roots(&mut visit_resume_root);
+            }
         }
 
         // Phase 1e: framework.py `root_walker.walk_roots` parity — the
@@ -3617,11 +3667,27 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.drag_out_root(gcref);
         });
+        // `incminimark.py` `collect_oldrefs_to_nursery`: a young
+        // `resumecode.py` `NUMBERING` stored into `compile.py`
+        // `ResumeGuardDescr.rd_numb` is forwarded here. The list is the
+        // remembered set. Clearing it is this minor's end for these cells.
+        // Always this minor, even when a pinned object announced a Major
+        // extra-root walk. Before the nursery reset and before
+        // `free_young_rawmalloced_objects`.
+        {
+            let _numb_label = crate::shadow_stack::extra_area_scope("young_numberings");
+            majit_ir::resumecode::collect_young_numberings(&mut |gcref| {
+                self.drag_out_root(gcref);
+            });
+        }
         // `history.py` `ConstPtr` intern-to-holder window. A minor before
         // extra-area `trace_index` still forwards the table slot.
-        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
-            self.drag_out_root(gcref);
-        });
+        {
+            let _const_label = crate::shadow_stack::extra_area_scope("young_const_ptrs");
+            majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
+                self.drag_out_root(gcref);
+            });
+        }
         crate::shadow_stack::set_extra_root_walk_kind(
             crate::shadow_stack::ExtraRootWalkKind::Major,
         );
@@ -3798,7 +3864,14 @@ impl MiniMarkGC {
         // survive the clear, else the next `id_or_identityhash`
         // re-allocates a fresh shadow and the identity hash changes.
         if !self.nursery_objects_shadows.is_empty() {
+            // Keys first: clearing `GCFLAG_HAS_SHADOW` on a corpse must not
+            // run while the map is borrowed, and must not touch a forwarded
+            // header (`FORWARDED_MARKER` would stop comparing equal).
+            let shadow_keys: Vec<usize> = self.nursery_objects_shadows.keys().copied().collect();
             if self.surviving_pinned_objects.is_empty() {
+                for obj_addr in shadow_keys {
+                    self.forget_dropped_shadow_flag(obj_addr);
+                }
                 self.nursery_objects_shadows.clear();
             } else {
                 let mut new_shadows = AddressMap::default();
@@ -3815,6 +3888,11 @@ impl MiniMarkGC {
                         unsafe { (*header_of(shadow_addr)).set_flag(GcFlags::GCFLAG_VISITED) };
                     }
                     new_shadows.insert(obj_addr, shadow_addr);
+                }
+                for obj_addr in shadow_keys {
+                    if !new_shadows.contains_key(&obj_addr) {
+                        self.forget_dropped_shadow_flag(obj_addr);
+                    }
                 }
                 self.nursery_objects_shadows = new_shadows;
             }
@@ -3872,6 +3950,7 @@ impl MiniMarkGC {
         // nursery is reset and accounted for, and before the timing and the
         // gc-minor hook below.
         crate::invoke_after_minor_collection_hook();
+        crate::bump_minor_epoch();
 
         // incminimark.py:1962-1974 — report the completed minor before the
         // wrapper advances the incremental major state machine.
@@ -5122,21 +5201,97 @@ impl MiniMarkGC {
         shadow
     }
 
+    /// Drop `GCFLAG_HAS_SHADOW` from a nursery header whose map entry is going
+    /// away and that was not forwarded.
+    ///
+    /// `record_pinned_object_with_shadow` keeps the entry for a surviving pin.
+    /// Every other key dies with this minor. `arena_reset` mode 0 does not
+    /// scrub the header, so the flag would otherwise outlive
+    /// `nursery_objects_shadows` and the next `id_or_identityhash` would hit
+    /// `_find_shadow`'s missing-shadow assert.
+    fn forget_dropped_shadow_flag(&self, obj_addr: usize) {
+        if !self.is_in_nursery(obj_addr) {
+            return;
+        }
+        let hdr = unsafe { header_of(obj_addr) };
+        if unsafe { (*hdr).is_forwarded() } {
+            return;
+        }
+        unsafe { (*hdr).clear_flag(GcFlags::GCFLAG_HAS_SHADOW) };
+    }
+
     /// minimark.py `id_or_identityhash(gcobj)`.
     /// Return a stable address usable as identity hash.  For nursery
     /// objects, returns the shadow's address (which is where the object
     /// will be copied to at the next minor collection).  For old-gen
     /// objects, returns the object's own address (old-gen objects don't
     /// move in mark-sweep).
-    pub fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
-        if self.is_valid_gc_object(obj_addr) && self.is_in_nursery(obj_addr) {
-            let hdr = unsafe { header_of(obj_addr) };
-            if unsafe { (*hdr).is_forwarded() } {
-                return unsafe { GcHeader::forwarding_address(hdr) };
+    /// `id_or_identityhash` without allocating a shadow.
+    ///
+    /// `Trace::refresh_from_gc` rekeys `_refs_dict` from a root walk, which
+    /// is already inside `gc_op`. A second `gc_op` aliases the collector.
+    /// A nursery object that has no shadow yet keeps its address: the walk
+    /// cannot call `allocate_shadow`.
+    pub fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        if !self.is_valid_gc_object(obj_addr) || !self.is_in_nursery(obj_addr) {
+            return obj_addr;
+        }
+        let hdr = unsafe { *header_of(obj_addr) };
+        if hdr.is_forwarded() {
+            let forwarded = unsafe { GcHeader::forwarding_address(header_of(obj_addr)) };
+            if self.is_in_nursery(forwarded) {
+                return self
+                    .nursery_objects_shadows
+                    .get(&forwarded)
+                    .copied()
+                    .unwrap_or(forwarded);
             }
-            return self.find_shadow(obj_addr);
+            return forwarded;
+        }
+        let free = self.nursery.free_ptr() as usize;
+        let top = self.nursery.top_ptr() as usize;
+        if obj_addr >= free && obj_addr < top {
+            return obj_addr;
+        }
+        if hdr.has_flag(GcFlags::GCFLAG_HAS_SHADOW) {
+            return self
+                .nursery_objects_shadows
+                .get(&obj_addr)
+                .copied()
+                .expect("GCFLAG_HAS_SHADOW but no shadow found");
         }
         obj_addr
+    }
+
+    pub fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
+        if !self.is_valid_gc_object(obj_addr) || !self.is_in_nursery(obj_addr) {
+            return obj_addr;
+        }
+        // A caller that kept the pre-move address still names the nursery
+        // corpse. `set_forwarding_address` wrote the copy there, and for an
+        // object that had a shadow that copy *is* the shadow — the same
+        // address `id_or_identityhash` returned before the minor.
+        // `_find_shadow` asserts on a forwarded header; follow it first.
+        let hdr = unsafe { *header_of(obj_addr) };
+        if hdr.is_forwarded() {
+            let forwarded = unsafe { GcHeader::forwarding_address(header_of(obj_addr)) };
+            if self.is_in_nursery(forwarded) {
+                return self.find_shadow(forwarded);
+            }
+            return forwarded;
+        }
+        // `arena_reset` mode 0 leaves the old header in the unused gap
+        // `[nursery_free, nursery_top)`. A dead object that had taken
+        // `id_or_identityhash` still has `GCFLAG_HAS_SHADOW`, and the minor
+        // has already cleared `nursery_objects_shadows`. `_find_shadow`
+        // would then assert. Nothing live sits in that gap: the bump is
+        // `nursery_free`, and a pin is at or past `nursery_top`.
+        let free = self.nursery.free_ptr() as usize;
+        let top = self.nursery.top_ptr() as usize;
+        if obj_addr >= free && obj_addr < top {
+            return obj_addr;
+        }
+        self.find_shadow(obj_addr)
     }
 
     /// Copy a single nursery object to old gen.
@@ -5194,6 +5349,103 @@ impl MiniMarkGC {
             in_nursery,
             self.minor_collections,
             self.major_collections,
+        );
+    }
+
+    /// Recorder stamp check: a nursery address must be the start of a
+    /// live object allocated since the last minor.
+    ///
+    /// `history.py` `*FrontendOp.value` is a GCREF. A Rust `Copy` of
+    /// that word held across `opencoder.py` `Trace._ops` growth is
+    /// from-space when it is later stamped. [`validate_type_id`] is the
+    /// `GC BUG: invalid type_id` diagnostic; the nursery-free test
+    /// catches a leftover header `arena_reset` mode 0 leaves in
+    /// `[nursery_free, nursery_top)`. A pin can sit in that gap and is
+    /// still live.
+    pub(crate) fn assert_stamped_ref_is_live_object(
+        &self,
+        addr: usize,
+        location: &'static std::panic::Location,
+    ) {
+        if self.nursery.contains_retired(addr) {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            panic!(
+                "stamped Ref {addr:#x} is in a retired nursery arena at {location}\n{backtrace}"
+            );
+        }
+        if !self.is_in_nursery(addr) {
+            return;
+        }
+        if !self.is_nursery_object_start(addr) {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            panic!(
+                "stamped Ref {addr:#x} is in the nursery but is not an object start \
+                 (header would sit outside the arena) at {location}\n{backtrace}"
+            );
+        }
+        let hdr = unsafe { *header_of(addr) };
+        if hdr.is_forwarded() {
+            self.report_invalid_type_id(hdr.type_id(), addr, "stamped_ref");
+        }
+        self.validate_type_id(hdr.type_id(), addr, "stamped_ref");
+        let free = self.nursery.free_ptr() as usize;
+        if addr >= free && !hdr.has_flag(GcFlags::GCFLAG_PINNED) {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            panic!(
+                "stamped Ref {addr:#x} is in the nursery but not allocated since \
+                 the last minor (nursery_free={free:#x}, type_id={}) at {location}\n{backtrace}",
+                hdr.type_id()
+            );
+        }
+    }
+
+    /// P92 intern/ConstPtr diagnostic. Panics at the first stale GC word.
+    pub(crate) fn diag_stale_gcref(&self, addr: usize, site: &'static str) {
+        let owns = self.is_managed_heap_object(addr);
+        let nursery = self.is_in_nursery(addr);
+        let retired = self.nursery.contains_retired(addr);
+        if !owns && !nursery && !retired {
+            return;
+        }
+        let mut forwarded = false;
+        let mut type_id = 0u32;
+        let mut header_valid = false;
+        let mut chased = 0usize;
+        let mut object_start = false;
+        if nursery {
+            object_start = self.is_nursery_object_start(addr);
+        } else if owns {
+            object_start = true;
+        }
+        let mut past_free = false;
+        if object_start {
+            let hdr = unsafe { *header_of(addr) };
+            forwarded = hdr.is_forwarded();
+            type_id = hdr.type_id();
+            header_valid = !forwarded && (type_id as usize) < self.types.len();
+            if forwarded {
+                chased = unsafe { GcHeader::forwarding_address(header_of(addr)) };
+            }
+            if nursery {
+                let free = self.nursery.free_ptr() as usize;
+                past_free = addr >= free && !hdr.has_flag(GcFlags::GCFLAG_PINNED);
+            }
+        }
+        let stale = forwarded
+            || retired
+            || past_free
+            || (nursery && !object_start)
+            || (nursery && !header_valid);
+        if !stale {
+            return;
+        }
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        panic!(
+            "STALE_GCREF site={site} addr={addr:#x} owns={owns} nursery={nursery} \
+             object_start={object_start} forwarded={forwarded} retired={retired} \
+             type_id={type_id} header_valid={header_valid} chased={chased:#x} \
+             minors={} majors={}\n{backtrace}",
+            self.minor_collections, self.major_collections
         );
     }
 
@@ -5459,7 +5711,9 @@ impl MiniMarkGC {
                  nearest_header={}, \
                  child_nursery_offset={:#x}, child_gen={}, holder_gen={}, \
                  holder_tid_and_flags={:#x}, holder_in_remembered={}, \
-                 enclosing={}, extra_area={}, gc_state={:?}, minors={}, majors={})",
+                 store_sites={:#x}, \
+                 enclosing={}, extra_area={}, gc_state={:?}, minors={}, majors={}, \
+                 root_slot={})",
                 type_id,
                 obj_addr,
                 self.minor_collections,
@@ -5485,11 +5739,13 @@ impl MiniMarkGC {
                 self.describe_generation(holder_addr),
                 holder_hdr_tid_and_flags,
                 self.old_objects_pointing_to_young.contains(&holder_addr),
+                crate::bh_probe_store_sites(holder_addr, slot_addr.saturating_sub(holder_addr),),
                 self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
                 crate::shadow_stack::current_extra_area(),
                 self.gc_state,
                 self.minor_collections,
                 self.major_collections,
+                crate::shadow_stack::describe_root_slot(slot_addr),
             );
         }
         // Compute the actual payload size (for varsize objects, read the length).
@@ -5656,6 +5912,16 @@ impl MiniMarkGC {
             "minor_root",
             "minor_root",
         );
+        if crate::gc_stress_trace_alloc_enabled()
+            && self.nursery.contains(gcref.0)
+            && !self.is_nursery_object_start(gcref.0)
+        {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            panic!(
+                "minor_root {:#x} is in the nursery but is not an object start\n{backtrace}",
+                gcref.0
+            );
+        }
         if self.is_nursery_object_start(gcref.0) {
             let slot_addr = gcref as *mut GcRef as usize;
             // incminimark.py `_trace_drag_out`: `is_in_nursery` is a range
@@ -6158,6 +6424,11 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
             result.push((*gcref, label));
         });
+        // Live `NUMBERING` cells. `seed_major_roots` marks the same set;
+        // a root omitted here is a white root at the marking check.
+        majit_ir::resumecode::trace_live_numberings(&mut |gcref| {
+            result.push((*gcref, "numbering"));
+        });
         majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
             result.push((*gcref, "young_const_ptrs"));
         });
@@ -6259,6 +6530,11 @@ impl MiniMarkGC {
         Self::walk_stack_shaped_roots(|gcref, site| seed(self, gcref, site, false));
         crate::shadow_stack::walk_extra_roots_labeled(|gcref, label| {
             seed(self, *gcref, label, true);
+        });
+        // `ResumeGuardDescr.rd_numb` may still be off the holder graph.
+        // Mark the live `NUMBERING` list without clearing the young list.
+        majit_ir::resumecode::trace_live_numberings(&mut |gcref| {
+            seed(self, *gcref, "numbering", true);
         });
         // Intern during this major still sits in the young list. Do not
         // drain: `collect_young_const_ptrs` runs at pre-sweep.
@@ -6905,10 +7181,17 @@ impl MiniMarkGC {
             crate::shadow_stack::walk_extra_roots(|gcref| {
                 self.seed_major_extra_root(*gcref, "rescan_extra_root");
             });
+            // Same live `NUMBERING` set as `seed_major_roots`. A numbering
+            // allocated during marking is still white until this rescan.
+            // Do not clear the young list: `seed_major_extra_root` does not
+            // forward a nursery payload.
             // In test builds, serialize the rescan young-const-ptr trace
             // against intern tests. Compiles out in production.
             #[cfg(test)]
             let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
+            majit_ir::resumecode::trace_live_numberings(&mut |gcref| {
+                self.seed_major_extra_root(*gcref, "rescan_numbering");
+            });
             majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
                 self.seed_major_extra_root(*gcref, "rescan_young_const_ptrs");
             });
@@ -8500,6 +8783,13 @@ impl MiniMarkGC {
             self.oldgen_nonmoving_active || !self.oldgen.has_young_rawmalloced(),
             "young raw-malloced objects in a major collection"
         );
+        // Finalizers and destructors run while still MARKING and may intern
+        // a ConstPtr the earlier rescan did not see. Seed those extra roots
+        // before the last drain so `visit_all_objects` empties gray_stack
+        // (`major_collection_step` STATE_MARKING) before `sweep_prepare`.
+        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
+            self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
+        });
         // Finalizers and destructors run while still MARKING and may store
         // into a live black object. The write barrier re-greys it onto
         // `more_gray_stack`; drain that work before the sweep freezes
@@ -8527,10 +8817,16 @@ impl MiniMarkGC {
             }
         }
         self.oldgen_nonmoving_marked = self.oldgen_nonmoving_active;
-        // Extra-root walkers have stamped every live `ConstPtr` slot.
-        // Drain intern-during-mark first so those slots stamp `live` and
-        // forward; a slot no holder marked is then dead, matching
-        // `history.py` dropping the box when no trace, descr, or op holds it.
+        // Extra-root walkers stamp live `ConstPtr` slots. Interns seeded
+        // above already ran `trace_index`. Sweep only when this major's
+        // extra-area walk was a complete census: STW walks every mutator
+        // (`mutators_quiesced`), and a single-mutator process
+        // (`!foreign_mutator_seen`) has only this thread's extra areas.
+        // Two live `install_gc_box` collectors at once is not a supported
+        // configuration (`MAJOR_LIVE` and the intern table are
+        // process-global). A major that walked only this thread must not
+        // recycle another thread's indexes; the next STW major restamps
+        // and sweeps.
         // In test builds, hold the intern-table lock across this drain and
         // sweep so a rewrite test's slot is not freed mid-use. Compiles out
         // in production.
@@ -8539,7 +8835,9 @@ impl MiniMarkGC {
         majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
             self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
         });
-        majit_ir::const_ptr_table::sweep_untraced();
+        if crate::gc_sync::mutators_quiesced() || !crate::gc_sync::foreign_mutator_seen() {
+            majit_ir::const_ptr_table::sweep_untraced();
+        }
         // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
         // the candidate sets have been frozen and before the state changes.
         self.stat_ac_arenas_count = self.oldgen.arenas_count();
@@ -10669,6 +10967,10 @@ impl GcAllocator for MiniMarkGC {
         self.id_or_identityhash(obj_addr)
     }
 
+    fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        MiniMarkGC::id_or_identityhash_reentrant(self, obj_addr)
+    }
+
     unsafe fn add_root(&mut self, root: *mut GcRef) {
         unsafe { self.roots.add(root) };
     }
@@ -11057,6 +11359,35 @@ mod tests {
     /// (incminimark.py:1019), so a fixture that means to exercise them has to
     /// ask for an array that would really have been rawmalloced.
     const CARD_ARRAY_LEN: usize = 512;
+
+    /// A rooted nursery object that has taken `id_or_identityhash` is copied
+    /// into its shadow. After the minor drops `nursery_objects_shadows`, the
+    /// pre-move address is a forwarding stub (`arena_reset` mode 0) and
+    /// `id_or_identityhash` still answers the shadow. An unrooted peer keeps
+    /// `GCFLAG_HAS_SHADOW` on the leftover header; asking its id must not
+    /// assert in `_find_shadow`.
+    #[test]
+    fn id_after_minor_follows_the_shadow_and_skips_a_dead_header() {
+        let mut gc = test_gc(8192);
+        let tid = gc.register_type(TypeInfo::simple(24));
+        let mut live = gc.alloc_with_type(tid, 24);
+        let old_live = live.0;
+        let shadow = gc.id_or_identityhash(old_live);
+        assert_ne!(shadow, old_live);
+        unsafe { gc.add_root(&mut live) };
+
+        let dead = gc.alloc_with_type(tid, 24);
+        let _ = gc.id_or_identityhash(dead.0);
+
+        gc.do_collect_nursery();
+
+        assert_eq!(live.0, shadow);
+        assert!(!gc.is_in_nursery(live.0));
+        assert_eq!(gc.id_or_identityhash(old_live), shadow);
+        let dead_id = gc.id_or_identityhash(dead.0);
+        assert_eq!(dead_id, dead.0);
+        gc.remove_root(&mut live);
+    }
 
     /// Helper: create a GC with a small nursery for testing.
     fn test_gc(nursery_size: usize) -> MiniMarkGC {
@@ -14377,6 +14708,61 @@ mod tests {
         assert_eq!(gc.oldgen.object_count(), 4);
 
         gc.roots.clear();
+    }
+
+    /// A ConstPtr interned after `collect_nonstack_roots` / `visit_all_objects`
+    /// is still a major extra root. Seeding it must finish before
+    /// `sweep_prepare`, so a child reachable only through that intern is
+    /// black when Sweeping starts.
+    #[test]
+    fn a_const_ptr_interned_after_root_rescan_marks_its_child_before_sweep() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let child_tid = gc.register_type(TypeInfo::simple(16));
+        let parent_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        let child = gc.alloc_with_type(child_tid, 16);
+        let parent = gc.alloc_with_type(parent_tid, ptr_size);
+        unsafe {
+            *(parent.0 as *mut GcRef) = child;
+        }
+
+        let mut rooted = parent;
+        unsafe {
+            gc.roots.add(&mut rooted);
+        }
+        gc.collect_nursery();
+        gc.roots.clear();
+        let parent = rooted;
+        let child = unsafe { *(parent.0 as *const GcRef) };
+        assert!(!gc.is_in_nursery(parent.0));
+        assert!(!gc.is_in_nursery(child.0));
+
+        gc.start_incremental_cycle();
+        assert_eq!(gc.gc_state, GcState::Marking);
+        gc.rescan_major_nonstack_roots_and_drain();
+        // The intern table is process-global. Intern and drain young
+        // under one table lock so a sibling `MiniMarkGC` minor cannot
+        // `take_young` this slot first.
+        let (_idx, young) = majit_ir::const_ptr_table::intern_and_take_young(parent);
+        for idx in young {
+            majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
+                gc.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
+            });
+        }
+        gc.drain_marking_worklists();
+        assert!(
+            gc.incr_state.gray_stack.is_empty() && gc.incr_state.more_gray_stack.is_empty(),
+            "seeding a post-rescan intern must drain before Sweeping"
+        );
+        assert!(
+            unsafe { (*header_of(parent.0)).has_flag(GcFlags::GCFLAG_VISITED) },
+            "the interned parent is a major extra root"
+        );
+        assert!(
+            unsafe { (*header_of(child.0)).has_flag(GcFlags::GCFLAG_VISITED) },
+            "a child reachable only through that intern is marked before sweep"
+        );
     }
 
     #[test]

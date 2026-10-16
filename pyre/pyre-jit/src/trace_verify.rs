@@ -29,6 +29,14 @@ mod tests {
     const FAKE_INT_TYPE: i64 = 0x1234_5678;
     const FAKE_FLOAT_TYPE: i64 = 0x1234_9876;
 
+    /// GuardClass recording allocates the nursery-backed `Trace._ops`
+    /// GcArray (`opencoder.py` Trace), so this thread has to be a mutator
+    /// with the collector installed.
+    fn test_ctx(num_inputs: usize) -> TraceCtx {
+        crate::eval::init_gc_subsystem();
+        TraceCtx::for_test(num_inputs)
+    }
+
     /// Get ops from TraceCtx, excluding the dummy Finish we add for finalization.
     fn get_ops(ctx: TraceCtx) -> Vec<OpCode> {
         let mut recorder = ctx.into_recorder();
@@ -45,7 +53,7 @@ mod tests {
 
     #[test]
     fn test_unbox_int_ops() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = test_ctx(1);
         let obj = OpRef::input_arg_ref(0);
         let _intval = crate::trace_unbox_int(&mut ctx, obj, FAKE_INT_TYPE, intval_descr());
         let ops = get_ops(ctx);
@@ -58,7 +66,7 @@ mod tests {
 
     #[test]
     fn test_box_int_ops() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = test_ctx(1);
         let _obj = crate::trace_box_int(
             &mut ctx,
             OpRef::input_arg_ref(0),
@@ -76,7 +84,7 @@ mod tests {
 
     #[test]
     fn test_int_binop_ovf_ops() {
-        let mut ctx = TraceCtx::for_test(2);
+        let mut ctx = test_ctx(2);
         let _result = crate::trace_int_binop_ovf(
             &mut ctx,
             OpRef::input_arg_ref(0),
@@ -105,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_unbox_float_ops() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = test_ctx(1);
         let obj = OpRef::input_arg_ref(0);
         let _floatval = crate::trace_unbox_float(&mut ctx, obj, FAKE_FLOAT_TYPE, floatval_descr());
         let ops = get_ops(ctx);
@@ -115,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_unbox_int_ops_read_immutable_descrs_as_plain_getfield() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = test_ctx(1);
         let obj = OpRef::input_arg_ref(0);
         let _intval =
             crate::trace_unbox_int(&mut ctx, obj, FAKE_INT_TYPE, immutable_intval_descr());
@@ -128,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_unbox_float_ops_read_immutable_descrs_as_plain_getfield() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = test_ctx(1);
         let obj = OpRef::input_arg_ref(0);
         let _floatval =
             crate::trace_unbox_float(&mut ctx, obj, FAKE_FLOAT_TYPE, immutable_floatval_descr());
@@ -138,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_box_float_ops() {
-        let mut ctx = TraceCtx::for_test(1);
+        let mut ctx = test_ctx(1);
         let _obj = crate::trace_box_float(
             &mut ctx,
             OpRef::input_arg_ref(0),
@@ -153,7 +161,7 @@ mod tests {
 
     #[test]
     fn test_float_binop_ops() {
-        let mut ctx = TraceCtx::for_test(2);
+        let mut ctx = test_ctx(2);
         let _result = crate::trace_float_binop(
             &mut ctx,
             OpRef::input_arg_ref(0),

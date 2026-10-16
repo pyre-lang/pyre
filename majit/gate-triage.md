@@ -263,6 +263,13 @@ cover the condition they diagnose.
 - What it does: with the `gc_stress` feature compiled in, force a full collection at the start of every `alloc_with_type` so a live object that is not reachable from a registered root or custom-trace path is moved or swept on the next allocation. Off by default even when the feature is compiled (`stress_collect` starts false unless the name is set). Test/diagnostic only.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_GC_STRESS_TRACE_ALLOC`
+
+- Read sites: 1 — `majit/majit-gc/src/lib.rs`
+- Accessor: `gc_stress_trace_alloc_enabled()`. Presence, not a parse: empty is on. Read once and cached, for the reason `MAJIT_GC_LIFETIME_LOG` records.
+- What it does: off by default. When set, run a minor collection before Trace-pool mallocs (`opencoder.py` `Trace._ops` and the other pools in `trace_bufs`) and before `bh_alloc_struct` in the dynasm runner, so a young address copied into a Rust local and used after a Trace-pool append dies at that use. `malloc_fast` (`framework.py`, `inline=True`) does not take the call: rbigint digit arrays share that entry. Diagnostic only; it is not the `gc_stress` feature path.
+- Retirement condition: **UNRECORDED** — owed by this gate's owner.
+
 ### `MAJIT_GC_YOUNG_RAWMALLOC`
 
 - Read sites: 2 — `majit/majit-gc/src/collector.rs`, `majit/majit-gc/src/rewrite.rs`

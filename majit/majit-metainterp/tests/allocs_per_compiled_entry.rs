@@ -313,6 +313,7 @@ fn install_gc() {
         let jitframe_tid =
             majit_gc::GcAllocator::register_type(gc, majit_backend::jitframe::jitframe_type_info());
         majit_gc::GcAllocator::set_jitframe_type_id(gc, jitframe_tid);
+        majit_metainterp::opencoder::register_trace_ops_gc_type(gc);
     });
     #[cfg(feature = "cranelift")]
     majit_backend_cranelift::install_gc_standalone();

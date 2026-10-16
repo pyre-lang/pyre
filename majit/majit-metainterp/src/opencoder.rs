@@ -5,6 +5,248 @@ use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 use majit_ir::{InputArg, OPCODE_COUNT, OpCode, OpRc, OpRef, Type, Value};
 use smallvec::SmallVec;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+#[path = "trace_bufs.rs"]
+mod trace_bufs;
+
+/// `GcArray(Char)` length word. `opencoder.py` `FixedSizeListRepr` stores
+/// the list as that one array; the length the collector copies is this word.
+const TRACE_OPS_CHARS: usize = std::mem::size_of::<usize>();
+
+/// Unregistered sentinel. A real `register_type` id is a table index.
+/// These ids index the collector that last called
+/// [`register_trace_ops_gc_type`]. Production is one `gc_sync` singleton;
+/// tests install one box at a time. Two live `install_gc_box` collectors
+/// at once is not a supported configuration: a second register overwrites
+/// the process-global id and later allocs on the first collector would
+/// use the wrong type table.
+static TRACE_OPS_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+static NUMBERING_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Register `Trace._ops`' `GcArray(Char)` (`TypeInfo::varsize`, item size 1,
+/// no GC pointers, no destructor). Call once, beside the JITFRAME
+/// registration, before the type table freezes.
+pub fn register_trace_ops_gc_type(gc: &mut dyn majit_gc::GcAllocator) -> u32 {
+    let id = gc.register_type(majit_gc::trace::TypeInfo::varsize(
+        TRACE_OPS_CHARS,
+        1,
+        0,
+        false,
+        Vec::new(),
+    ));
+    TRACE_OPS_GC_TYPE_ID.store(id, Ordering::Release);
+    // `resumecode.py` `NUMBERING`: length word plus `Array(UCHAR)`.
+    let numb_id = gc.register_type(majit_gc::trace::TypeInfo::varsize(
+        TRACE_OPS_CHARS,
+        1,
+        0,
+        false,
+        Vec::new(),
+    ));
+    NUMBERING_GC_TYPE_ID.store(numb_id, Ordering::Release);
+    majit_ir::resumecode::set_numbering_alloc(Some(alloc_numbering_bytes));
+    // List header, word arrays, and `Trace._refs`. Same registration pass.
+    trace_bufs::register_trace_pool_gc_types(gc);
+    id
+}
+
+fn numbering_gc_type_id() -> u32 {
+    let id = NUMBERING_GC_TYPE_ID.load(Ordering::Acquire);
+    assert!(
+        id != u32::MAX,
+        "NUMBERING GcArray is not registered; call register_trace_ops_gc_type"
+    );
+    id
+}
+
+/// `lltype.malloc(NUMBERING, len)` via the collecting nursery entry.
+fn alloc_numbering_bytes(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    let payload = TRACE_OPS_CHARS + len;
+    let mut live = majit_ir::GcRef(0);
+    let mut needs_write_barrier = false;
+    majit_gc::stress_trace_pool_alloc(&mut live, 1);
+    let fresh = unsafe {
+        majit_gc::alloc_fast_nursery_collecting_typed_rooted(
+            numbering_gc_type_id(),
+            payload,
+            &mut live,
+            &mut needs_write_barrier,
+        )
+    };
+    if fresh.0 == 0 {
+        majit_gc::gc_alloc_failed(payload);
+    }
+    unsafe {
+        *(fresh.0 as *mut usize) = len;
+        if len > 0 {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (fresh.0 as *mut u8).add(TRACE_OPS_CHARS),
+                len,
+            );
+        }
+    }
+    let _ = needs_write_barrier;
+    let _ = live;
+    fresh.0
+}
+
+fn trace_ops_gc_type_id() -> u32 {
+    let id = TRACE_OPS_GC_TYPE_ID.load(Ordering::Acquire);
+    assert!(
+        id != u32::MAX,
+        "Trace._ops GcArray is not registered; call register_trace_ops_gc_type"
+    );
+    id
+}
+
+/// Host holder for `opencoder.py` `Trace._ops`.
+///
+/// The array is one nursery `GcArray(Char)` rooted by `OwnerRootGuard`.
+/// Every access re-reads that guard. A raw `*mut u8` is never kept across
+/// an allocation. When this thread has no collector (`current_thread_gc_available`
+/// is false — bare unit tests, or a thread that never installed a box /
+/// singleton), the same length-word-plus-chars block is a process
+/// allocation. A process-global alloc hook (`gc_allocator_installed`) is
+/// not enough: the dynasm trampoline would then call `standalone_alloc_*`
+/// and panic on an uninitialized singleton.
+struct TraceOpsBuf {
+    root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    /// Non-null only on the no-GC arm. Freed in `Drop`.
+    host: *mut u8,
+    /// Char capacity. `len(_ops)` in `opencoder.py`. Not `_pos`.
+    len: usize,
+}
+
+impl TraceOpsBuf {
+    fn new(len: usize) -> Self {
+        if majit_gc::current_thread_gc_available() {
+            Self::alloc_gc(len, majit_ir::GcRef(0), 0)
+        } else {
+            Self::alloc_host(len, std::ptr::null(), 0)
+        }
+    }
+
+    fn alloc_host(len: usize, src: *const u8, src_len: usize) -> Self {
+        let payload = TRACE_OPS_CHARS + len;
+        let layout = std::alloc::Layout::from_size_align(payload, std::mem::align_of::<usize>())
+            .unwrap_or_else(|_| std::alloc::Layout::new::<usize>());
+        let host = unsafe { std::alloc::alloc_zeroed(layout) };
+        if host.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        unsafe {
+            *(host as *mut usize) = len;
+            if !src.is_null() && src_len > 0 {
+                std::ptr::copy_nonoverlapping(src, host.add(TRACE_OPS_CHARS), src_len);
+            }
+        }
+        Self {
+            root: None,
+            host,
+            len,
+        }
+    }
+
+    fn alloc_gc(len: usize, mut live: majit_ir::GcRef, src_len: usize) -> Self {
+        let payload = TRACE_OPS_CHARS + len;
+        let mut needs_write_barrier = false;
+        // `malloc_varsize`: the nursery arm for everything up to
+        // `nonlarge_max`, and `external_malloc` only past it. That test lives
+        // in `alloc_fast_nursery_collecting_typed_rooted`
+        // (`alloc_with_type_rooted_body`), not at this caller.
+        // `malloc_fast` + one live root. The public no-collect entry spills
+        // instead of collecting; `Trace._double_ops` has to collect.
+        majit_gc::stress_trace_pool_alloc(&mut live, 1);
+        let fresh = unsafe {
+            majit_gc::alloc_fast_nursery_collecting_typed_rooted(
+                trace_ops_gc_type_id(),
+                payload,
+                &mut live,
+                &mut needs_write_barrier,
+            )
+        };
+        if fresh.0 == 0 {
+            majit_gc::gc_alloc_failed(payload);
+        }
+        // The collector sizes a varsize object from this word. Write it
+        // before the new array is rooted and before the next allocation.
+        unsafe {
+            *(fresh.0 as *mut usize) = len;
+            let dst = (fresh.0 as *mut u8).add(TRACE_OPS_CHARS);
+            if live.0 != 0 && src_len > 0 {
+                let src = (live.0 as *const u8).add(TRACE_OPS_CHARS);
+                std::ptr::copy_nonoverlapping(src, dst, src_len);
+            }
+            if len > src_len {
+                std::ptr::write_bytes(dst.add(src_len), 0, len - src_len);
+            }
+        }
+        let _ = needs_write_barrier;
+        Self {
+            root: Some(majit_gc::shadow_stack::OwnerRootGuard::new(fresh)),
+            host: std::ptr::null_mut(),
+            len,
+        }
+    }
+
+    /// `opencoder.py` `Trace._double_ops`: a new array, not a resize.
+    fn double(&mut self) {
+        let new_len = self.len.max(1).saturating_mul(2);
+        let src = self.chars();
+        let src_len = self.len;
+        let next = if let Some(guard) = &self.root {
+            Self::alloc_gc(new_len, guard.get(), src_len)
+        } else {
+            debug_assert!(
+                !majit_gc::current_thread_gc_available(),
+                "host Trace._ops buffer used while this thread has a collector"
+            );
+            Self::alloc_host(new_len, src, src_len)
+        };
+        *self = next;
+    }
+
+    fn addr(&self) -> *mut u8 {
+        if let Some(guard) = &self.root {
+            guard.get().0 as *mut u8
+        } else {
+            self.host
+        }
+    }
+
+    fn chars(&self) -> *mut u8 {
+        unsafe { self.addr().add(TRACE_OPS_CHARS) }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.chars(), self.len) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.chars(), self.len) }
+    }
+}
+
+impl Drop for TraceOpsBuf {
+    fn drop(&mut self) {
+        if self.host.is_null() {
+            return;
+        }
+        let payload = TRACE_OPS_CHARS + self.len;
+        let layout = std::alloc::Layout::from_size_align(payload, std::mem::align_of::<usize>())
+            .unwrap_or_else(|_| std::alloc::Layout::new::<usize>());
+        unsafe { std::alloc::dealloc(self.host, layout) };
+    }
+}
+
+fn pin_gc_addr(addr: usize) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
+    let addr = majit_gc::gc_current_object_address(addr);
+    (addr != 0 && majit_gc::gc_owns_object(addr))
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)))
+}
 
 #[allow(dead_code)]
 fn u16_to_opcode(v: u16) -> OpCode {
@@ -37,27 +279,66 @@ fn u16_to_opcode(v: u16) -> OpCode {
 // This replaces the pre-Phase-B zigzag LEB128 encoder so the pyre wire
 // format binary-matches RPython.
 
-/// opencoder.py encode_varint_signed.
-pub fn encode_varint_signed(buf: &mut Vec<u8>, value: i64) {
+/// opencoder.py encode_varint_signed. Two bytes, or four when bit 7 of byte 0 is set.
+pub fn encode_varint_signed_array(value: i64) -> ([u8; 4], usize) {
     debug_assert!(
         (MIN_VALUE..=MAX_VALUE).contains(&value),
         "encode_varint_signed out of range: {value}"
     );
+    let mut out = [0u8; 4];
     let mut v = value;
     let flag: u8 = if !(-(1 << 14)..(1 << 14)).contains(&v) {
         0x80
     } else {
         0
     };
-    buf.push(((v & 0b0111_1111) as u8) | flag);
+    out[0] = ((v & 0b0111_1111) as u8) | flag;
     v >>= 7;
-    buf.push((v & 0xff) as u8);
-    if flag != 0 {
-        v >>= 8;
-        buf.push((v & 0xff) as u8);
-        v >>= 8;
-        buf.push((v & 0xff) as u8);
+    out[1] = (v & 0xff) as u8;
+    if flag == 0 {
+        return (out, 2);
     }
+    v >>= 8;
+    out[2] = (v & 0xff) as u8;
+    v >>= 8;
+    out[3] = (v & 0xff) as u8;
+    (out, 4)
+}
+
+/// Silent encode log for P92: I/O at `_encode_snapshot` Heisenbugs the 6-box numbering.
+static P92_ENC_LOG: std::sync::Mutex<Vec<(i64, i64, i64, i64, bool, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn p92_note_enc(
+    jc: i64,
+    pc: i64,
+    array: i64,
+    n: i64,
+    is_last: bool,
+    snap_len: usize,
+    arr_len: usize,
+) {
+    if let Ok(mut log) = P92_ENC_LOG.lock() {
+        log.push((jc, pc, array, n, is_last, snap_len, arr_len));
+    }
+}
+
+pub(crate) fn p92_dump_enc_log() {
+    if let Ok(log) = P92_ENC_LOG.lock() {
+        let n6: Vec<_> = log.iter().filter(|r| r.3 != 4).cloned().collect();
+        eprintln!(
+            "P92_ENC_LOG total={} n_ne_4={} last8={:?} ne4={n6:?}",
+            log.len(),
+            n6.len(),
+            log.iter().rev().take(8).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// opencoder.py encode_varint_signed.
+pub fn encode_varint_signed(buf: &mut Vec<u8>, value: i64) {
+    let (bytes, n) = encode_varint_signed_array(value);
+    buf.extend_from_slice(&bytes[..n]);
 }
 
 /// opencoder.py decode_varint_signed. Returns (value, bytes_consumed).
@@ -899,7 +1180,7 @@ impl<'a> ByteTraceIter<'a> {
 
     /// opencoder.py `_nextbyte`.
     fn _nextbyte(&mut self) -> u8 {
-        let b = self.trace._ops[self.pos];
+        let b = self.trace.ops_bytes()[self.pos];
         self.pos += 1;
         b
     }
@@ -908,7 +1189,7 @@ impl<'a> ByteTraceIter<'a> {
     /// `trace._ops` at `self.pos`.  Shares the wire format with
     /// `TraceRecordBuffer::append_int`.
     fn _next(&mut self) -> i64 {
-        let (v, consumed) = decode_varint_signed(&self.trace._ops[self.pos..]);
+        let (v, consumed) = decode_varint_signed(&self.trace.ops_bytes()[self.pos..]);
         self.pos += consumed;
         v
     }
@@ -973,6 +1254,7 @@ impl<'a> ByteTraceIter<'a> {
                 // op-graph walker forwards `OpRef::ConstPtr(GcRef)`
                 // slots across minor collection.
                 let addr = self.trace._refs[v as usize];
+                majit_gc::diag_stale_gcref(addr as usize, "byte_iter_untag");
                 Operand::from_opref(OpRef::const_ptr(majit_ir::GcRef(addr as usize)))
             }
             TAGCONSTOTHER => {
@@ -1528,6 +1810,27 @@ impl Box {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_ENCODE_HOOK: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run once after the next `_encode`. The recorder test uses this to
+/// publish a forwarded ConstPtr slot the way `walk_const_ptr_refs`
+/// would during the pool growth inside that encode.
+#[cfg(test)]
+pub(crate) fn set_after_encode_hook_for_test(hook: Option<fn()>) {
+    AFTER_ENCODE_HOOK.with(|cell| cell.set(hook));
+}
+
+#[cfg(test)]
+fn fire_after_encode_hook() {
+    let hook = AFTER_ENCODE_HOOK.with(|cell| cell.get());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// opencoder.py: Trace — compact trace recording buffer.
 ///
 /// Literal port of `rpython/jit/metainterp/opencoder.py::Trace`. The state
@@ -1545,11 +1848,11 @@ impl Box {
 pub(crate) type TraceRecordBuffer = Trace;
 
 pub struct Trace {
-    /// opencoder.py:473 self._ops — pre-allocated byte buffer that records
-    /// the operation stream. `_pos` walks forward over it; `_double_ops`
-    /// doubles the buffer when `_pos + 4 > len`. The length-of-trace is
-    /// `_pos`, NOT `_ops.len()` (opencoder.py length()).
-    pub _ops: Vec<u8>,
+    /// opencoder.py `Trace._ops` — `['\x00'] * INIT_SIZE`, one
+    /// `GcArray(Char)`. `_pos` walks forward over it; `_double_ops`
+    /// allocates a new array when `_pos + 4 > len`. The encoded length
+    /// is `_pos`, not the array length (`opencoder.py` `length`).
+    _ops: TraceOpsBuf,
     /// opencoder.py self._pos — next write position into `_ops`.
     pub _pos: usize,
     /// opencoder.py:497 self._count — total count of ops recorded, seeded
@@ -1569,46 +1872,31 @@ pub struct Trace {
     /// opencoder.py:491,504 self.inputargs — the actual inputarg boxes
     /// after `set_inputargs` is called. Empty until `set_inputargs` runs.
     pub inputargs: Vec<InputArg>,
-    /// opencoder.py:481 self._descrs — `_descrs[0]` is always None; new
-    /// descrs append. Indexed by `descr_index - all_descrs_len - 1` when
-    /// the descr has no global `get_descr_index` (opencoder.py).
+    /// opencoder.py `Trace._descrs` — `_descrs[0]` is always None; new
+    /// descrs append. Host `Vec` for this stage: `DescrRef` is
+    /// `Arc<dyn Descr>`, not a GC item. The list becomes a `GcArray` of
+    /// descr instances when those objects themselves are nursery GC.
     pub _descrs: Vec<Option<majit_ir::DescrRef>>,
-    /// opencoder.py:482 self._refs — `_refs[0]` is always nullptr (index
-    /// 0 reserved for the 0-length snapshot array). Non-null GC refs
-    /// append; Rust adaptation roots them through `rooted_refs`
-    /// so a moving GC can update the pointers
-    /// in-place (gcreftracer.py parity).
-    pub _refs: Vec<u64>,
-    /// `opencoder.py Trace._refs` is a GC-traced list. Rust's raw-word
-    /// vector needs explicit roots, one per non-null entry (slot i roots
-    /// `_refs[i + 1]`). Use independently owned slots: a Trace can outlive
-    /// a lexical root scope or be dropped before roots registered later,
-    /// so it must never truncate somebody else's shadow-stack frame.
-    /// The guards also keep this owner thread-bound. Copy forwarded values
-    /// back at the tracing GC boundary with `refresh_from_gc`.
-    rooted_refs: Vec<majit_gc::shadow_stack::OwnerRootGuard>,
-    /// opencoder.py:483 self._refs_dict — caches addr → index into
-    /// `_refs`. Cleared by `tracing_done`.
+    /// opencoder.py `Trace._refs`. `GcArray` of `GCREF`, one
+    /// `OwnerRootGuard` on the array (`items_have_gc_ptrs`). Index 0 is
+    /// nullptr. A minor rewrites the slots; `refresh_from_gc` rekeys
+    /// `_refs_dict`, which stays a host `IndexMap` until the dict stage.
+    pub _refs: trace_bufs::WordArray<usize>,
+    /// opencoder.py `Trace._refs_dict`. Key is `id_or_identityhash`,
+    /// value is the index into `_refs`. Cleared by `tracing_done`.
     pub _refs_dict: crate::FxIndexMap<u64, u32>,
-    /// opencoder.py:484 self._bigints — constant pool for big ints
-    /// (> SMALL_INT_STOP). Indexed via `(idx << 1)` in TAGCONSTOTHER
-    /// (bit 0 = 0 means bigint).
-    pub _bigints: Vec<i64>,
-    /// opencoder.py:485 self._bigints_dict — caches value → index.
-    /// Cleared by `tracing_done`.
+    /// opencoder.py `Trace._bigints`. `GcArray` of plain words.
+    pub _bigints: trace_bufs::WordArray<i64>,
+    /// opencoder.py `Trace._bigints_dict`. Host until the dict stage.
     pub _bigints_dict: crate::FxIndexMap<i64, u32>,
-    /// opencoder.py:486 self._floats — constant pool for floats. Indexed
-    /// via `(idx << 1) | 1` in TAGCONSTOTHER (bit 0 = 1 means float).
-    pub _floats: Vec<u64>,
-    /// opencoder.py:487 self._snapshot_data — byte chain encoding the
-    /// per-guard snapshot records (jitcode_index, pc, array_index,
-    /// prev) in RPython `encode_varint_signed` format.
-    pub _snapshot_data: Vec<u8>,
-    /// opencoder.py:488 self._snapshot_array_data — byte chain encoding
-    /// the box arrays referenced by snapshots. Index 0 is reserved for
-    /// the empty (length 0) array — `append_snapshot_array_data_int(0)`
-    /// is called in the constructor (opencoder.py).
-    pub _snapshot_array_data: Vec<u8>,
+    /// opencoder.py `Trace._floats`. `GcArray` of plain words.
+    pub _floats: trace_bufs::WordArray<u64>,
+    /// opencoder.py `Trace._snapshot_data`. `ListRepr`: header plus
+    /// `GcArray(Char)`. `encode_varint_signed` appends.
+    pub _snapshot_data: trace_bufs::CharList,
+    /// opencoder.py `Trace._snapshot_array_data`. Same `ListRepr` shape.
+    /// Index 0 is the empty array (`append_snapshot_array_data_int(0)`).
+    pub _snapshot_array_data: trace_bufs::CharList,
     /// opencoder.py:478 self._total_snapshots — monotonic snapshot
     /// counter; bumped in `create_snapshot` / `create_top_snapshot`.
     pub _total_snapshots: u32,
@@ -1695,7 +1983,7 @@ impl Trace {
         // (`create_empty_history` after `initialize_virtualizable`).
         let all_descr_len = metainterp_sd.all_descrs().lock().len() as u32;
         let mut t = Trace {
-            _ops: vec![0u8; INIT_SIZE.max(max_num_inputargs as usize)],
+            _ops: TraceOpsBuf::new(INIT_SIZE.max(max_num_inputargs as usize)),
             _pos: max_num_inputargs as usize,
             _count: max_num_inputargs,
             _index: max_num_inputargs,
@@ -1703,25 +1991,18 @@ impl Trace {
             max_num_inputargs,
             inputargs: Vec::new(),
             // opencoder.py — `_descrs = [None]` so index 0 is reserved.
+            // Stays host: items are `DescrRef`, not GC objects yet.
             _descrs: vec![None],
-            // opencoder.py:482 — `_refs = [lltype.nullptr(GCREF.TO)]` so
-            // index 0 is the null reference / empty-array sentinel.
-            // A fresh Trace per bridge grew these through the 64 B / 128 B
-            // classes on the regex and/or timed row (`_encode_ptr`,
-            // `encode_varint_signed`). One reserve matches
-            // `recorder::Trace::attach_byte_buffer`'s slots reserve.
-            _refs: {
-                let mut refs = Vec::with_capacity(32);
-                refs.push(0);
-                refs
-            },
-            rooted_refs: Vec::with_capacity(32),
+            // opencoder.py `Trace._refs = [nullptr]`. Items array starts at
+            // 32 slots so the first ConstPtrs do not reallocate.
+            _refs: trace_bufs::new_refs(),
             _refs_dict: crate::FxIndexMap::with_capacity_and_hasher(32, Default::default()),
-            _bigints: Vec::new(),
+            _bigints: trace_bufs::new_bigints(),
             _bigints_dict: crate::FxIndexMap::default(),
-            _floats: Vec::new(),
-            _snapshot_data: Vec::with_capacity(128),
-            _snapshot_array_data: Vec::with_capacity(128),
+            _floats: trace_bufs::new_floats(),
+            // `ListRepr` items reserved at 128 chars (`ll_newlist_hint`).
+            _snapshot_data: trace_bufs::new_snapshot(),
+            _snapshot_array_data: trace_bufs::new_snapshot(),
             _total_snapshots: 0,
             tag_overflow: false,
             _consts_bigint: 0,
@@ -1825,20 +2106,47 @@ impl Trace {
         self.get_byte_iter().last()
     }
 
-    /// opencoder.py _double_ops — double the byte buffer when
-    /// `_pos` gets close to the end.
+    /// opencoder.py `_double_ops` — a new array twice as long. The
+    /// previous array dies once the root is replaced.
     fn _double_ops(&mut self) {
-        let new_len = self._ops.len().max(1) * 2;
-        self._ops.resize(new_len, 0);
+        self._ops.double();
+    }
+
+    /// Grow `_ops` until `extra` more bytes fit.
+    ///
+    /// `record_bytes` calls this before it snapshots a `ConstPtr`
+    /// address, so the collection inside `_double_ops` runs while the
+    /// recorder still holds those indexes.
+    pub(crate) fn reserve_ops_bytes(&mut self, extra: usize) {
+        while self._pos.saturating_add(extra) > self._ops.len {
+            self._double_ops();
+        }
+    }
+
+    /// Char items of `_ops`. Re-reads the root; do not hold the slice
+    /// across an allocation.
+    pub fn ops_bytes(&self) -> &[u8] {
+        self._ops.bytes()
+    }
+
+    /// `TraceIterator._nextbyte` over `[0, _pos)`.
+    pub fn bytes_read_by_iterator(&self) -> Vec<u8> {
+        let mut it = ByteTraceIter::new(self, 0, self._pos, 0);
+        let mut out = Vec::with_capacity(self._pos);
+        while !it.done() {
+            out.push(it._nextbyte());
+        }
+        out
     }
 
     /// opencoder.py append_byte(c) — write a single byte and
     /// advance `_pos`. Doubles the buffer if needed.
     pub fn append_byte(&mut self, c: u8) {
-        while self._pos >= self._ops.len() {
+        while self._pos >= self._ops.len {
             self._double_ops();
         }
-        self._ops[self._pos] = c;
+        let pos = self._pos;
+        self._ops.bytes_mut()[pos] = c;
         self._pos += 1;
     }
 
@@ -1855,7 +2163,7 @@ impl Trace {
             self.tag_overflow = true;
             v = 0;
         }
-        while self._pos + 4 > self._ops.len() {
+        while self._pos + 4 > self._ops.len {
             self._double_ops();
         }
         let flag: u8 = if !(-(1 << 14)..(1 << 14)).contains(&v) {
@@ -1863,19 +2171,23 @@ impl Trace {
         } else {
             0
         };
-        self._ops[self._pos] = ((v & 0b0111_1111) as u8) | flag;
-        self._pos += 1;
+        // Re-read after `_double_ops`. The writes below do not allocate.
+        let buf = self._ops.bytes_mut();
+        let mut pos = self._pos;
+        buf[pos] = ((v & 0b0111_1111) as u8) | flag;
+        pos += 1;
         v >>= 7;
-        self._ops[self._pos] = (v & 0xff) as u8;
-        self._pos += 1;
+        buf[pos] = (v & 0xff) as u8;
+        pos += 1;
         if flag != 0 {
             v >>= 8;
-            self._ops[self._pos] = (v & 0xff) as u8;
-            self._pos += 1;
+            pos += 1;
+            buf[pos - 1] = (v & 0xff) as u8;
             v >>= 8;
-            self._ops[self._pos] = (v & 0xff) as u8;
-            self._pos += 1;
+            buf[pos] = (v & 0xff) as u8;
+            pos += 1;
         }
+        self._pos = pos;
     }
 
     /// opencoder.py tag_overflow_imminent — returns true once
@@ -2029,29 +2341,45 @@ impl Trace {
         tag(TAGCONSTOTHER, (idx << 1) | 1) as i64
     }
 
-    /// opencoder.py _cached_const_ptr + :629-632 _encode for
-    /// ConstPtr — dedup via `_refs_dict` (by address), push to `_refs`,
-    /// return `tag(TAGCONSTPTR, idx)`. Index 0 is reserved for nullptr
-    /// (seeded by the constructor).
+    /// opencoder.py `_cached_const_ptr` + `_encode` for ConstPtr.
+    /// Dedup via `_refs_dict` keyed by `id_or_identityhash`, push the
+    /// address to `_refs`, return `tag(TAGCONSTPTR, idx)`. Index 0 is
+    /// nullptr (seeded by the constructor).
     ///
-    /// Rust adaptation: non-null `addr` gets an independently owned root
-    /// so a moving GC can update the entry in-place. RPython's
-    /// `_refs` list is natively GC-tracked; `Vec<u64>` is not.
+    /// The array is one rooted `GcArray` of `GCREF`. The dict key is the
+    /// identity hash, so a minor that forwards `_refs` does not move the
+    /// key. `opencoder.py` `_refs_dict` is keyed by the ref itself, whose
+    /// hash is `lltype.identityhash`.
+    ///
+    /// `history.py` `ConstPtr.value` is a GCREF local. A Rust `u64` is
+    /// not; `_refs.push` can minor-collect (`WordArray` list-header growth).
+    /// Pin the referent, store the forwarded address, and re-hash from
+    /// that address so the dict key matches the slot.
     pub fn _encode_ptr(&mut self, addr: u64) -> i64 {
         self._consts_ptr += 1;
         if addr == 0 {
             return tag(TAGCONSTPTR, 0) as i64;
         }
-        let v = if let Some(&idx) = self._refs_dict.get(&addr) {
+        let pin = pin_gc_addr(addr as usize);
+        let addr = pin.as_ref().map(|p| p.get().0 as u64).unwrap_or(addr);
+        let addr = majit_gc::gc_current_object_address(addr as usize) as u64;
+        let key = majit_ir::gc_id_or_identityhash(addr as usize) as u64;
+        let cached = self
+            ._refs_dict
+            .get(&key)
+            .copied()
+            .or_else(|| self._refs_dict.get(&(addr as u64)).copied())
+            .filter(|&idx| self._refs.as_slice().get(idx as usize).copied() == Some(addr as usize));
+        let v = if let Some(idx) = cached {
             idx
         } else {
-            let idx = self._refs.len() as u32;
-            self._refs.push(addr);
-            self.rooted_refs
-                .push(majit_gc::shadow_stack::OwnerRootGuard::new(
-                    majit_ir::GcRef(addr as usize),
-                ));
-            self._refs_dict.insert(addr, idx);
+            let stored = self._refs.push(addr as usize);
+            let idx = (self._refs.len() - 1) as u32;
+            let key = majit_ir::gc_id_or_identityhash(stored) as u64;
+            self._refs_dict.insert(key, idx);
+            if key != stored as u64 {
+                self._refs_dict.insert(stored as u64, idx);
+            }
             idx
         };
         tag(TAGCONSTPTR, v) as i64
@@ -2071,7 +2399,7 @@ impl Trace {
     /// `ConstInt` further splits on the SMALL_INT range
     /// (opencoder.py vs 609-622).
     pub(crate) fn _encode(&mut self, b: Box) -> i64 {
-        match b {
+        let tagged = match b {
             // opencoder.py:605-608 ConstInt within SMALL_INT range.
             Box::ConstInt(v) if (SMALL_INT_START..SMALL_INT_STOP).contains(&v) => {
                 Self::_encode_smallint(v)
@@ -2084,7 +2412,13 @@ impl Trace {
             Box::ConstPtr(addr) => self._encode_ptr(addr),
             // opencoder.py:633-638 AbstractResOp.get_position().
             Box::ResOp(p) => Self::_encode_box_position(p),
-        }
+        };
+        // A pool push above can minor-collect. The test hook stands in
+        // for `walk_const_ptr_refs` updating a later ConstPtr slot
+        // before the next argument is resolved.
+        #[cfg(test)]
+        fire_after_encode_hook();
+        tagged
     }
 
     // ── Snapshot writers (opencoder.py _list_of_boxes) ──
@@ -2119,7 +2453,19 @@ impl Trace {
     /// path used by callers that already have a tagged value; this
     /// method matches the RPython call shape for callers that hold a
     /// `Box` (e.g. `MIFrame::get_list_of_active_boxes`).
+    ///
+    /// `history.py` `ConstPtr.value` stays a GCREF local across
+    /// `_encode` and the `_snapshot_array_data` append. The append can
+    /// minor-collect (`CharList::realloc_items`).
     pub(crate) fn _add_box_to_storage_box(&mut self, b: Box) {
+        let pin = match b {
+            Box::ConstPtr(addr) => pin_gc_addr(addr as usize),
+            _ => None,
+        };
+        let b = match &pin {
+            Some(p) => Box::ConstPtr(p.get().0 as u64),
+            None => b,
+        };
         let tagged = self._encode(b);
         self.append_snapshot_array_data_int(tagged);
     }
@@ -2170,6 +2516,22 @@ impl Trace {
         array: i64,
         is_last: bool,
     ) -> i64 {
+        if majit_gc::diag_p92_enabled() && pc == 836 {
+            let n = if array == 0 {
+                0
+            } else {
+                varint_only_decode(&self._snapshot_array_data, array as usize, 0)
+            };
+            p92_note_enc(
+                index,
+                pc,
+                array,
+                n,
+                is_last,
+                self._snapshot_data.len(),
+                self._snapshot_array_data.len(),
+            );
+        }
         let res = self._snapshot_data.len() as i64;
         self.append_snapshot_data_int(index);
         self.append_snapshot_data_int(pc);
@@ -2625,7 +2987,8 @@ impl Trace {
     /// `patch_descr_slot_at` on the named slot instead of rewinding
     /// `_pos`.
     pub(crate) fn last_descr_slot_is_placeholder(&self) -> bool {
-        self._pos >= 2 && self._ops[self._pos - 2] == 0 && self._ops[self._pos - 1] == 0
+        let ops = self.ops_bytes();
+        self._pos >= 2 && ops[self._pos - 2] == 0 && ops[self._pos - 1] == 0
     }
 
     #[allow(dead_code)]
@@ -2647,26 +3010,27 @@ impl Trace {
         let mut pos = self._start as usize;
         let end = self._pos;
         let mut index = self._start;
+        let ops = self.ops_bytes();
         while pos < end {
-            let opnum = self._ops[pos];
+            let opnum = ops[pos];
             pos += 1;
             let opcode = OpCode::from_u16(opnum as u16)
                 .unwrap_or_else(|| panic!("encoded op: unknown opnum {opnum}"));
             let arity = match opcode.arity() {
                 Some(n) => n as usize,
                 None => {
-                    let (v, n) = decode_varint_signed(&self._ops[pos..]);
+                    let (v, n) = decode_varint_signed(&ops[pos..]);
                     pos += n;
                     v as usize
                 }
             };
             let args_pos = pos;
             for _ in 0..arity {
-                let (_, n) = decode_varint_signed(&self._ops[pos..]);
+                let (_, n) = decode_varint_signed(&ops[pos..]);
                 pos += n;
             }
             let descr_index = if opcode.has_descr() {
-                let (idx, n) = decode_varint_signed(&self._ops[pos..]);
+                let (idx, n) = decode_varint_signed(&ops[pos..]);
                 pos += n;
                 idx
             } else {
@@ -2705,7 +3069,7 @@ impl Trace {
             self.tag_overflow = true;
             value = 0;
         }
-        let (_, old_len) = decode_varint_signed(&self._ops[descr_pos..]);
+        let (_, old_len) = decode_varint_signed(&self.ops_bytes()[descr_pos..]);
         let mut encoded = Vec::with_capacity(4);
         encode_varint_signed(&mut encoded, value);
         let new_len = encoded.len();
@@ -2713,18 +3077,18 @@ impl Trace {
             let tail = descr_pos + old_len;
             if new_len > old_len {
                 let d = new_len - old_len;
-                while self._pos + d > self._ops.len() {
+                while self._pos + d > self._ops.len {
                     self._double_ops();
                 }
-                self._ops.copy_within(tail..self._pos, tail + d);
+                self._ops.bytes_mut().copy_within(tail..self._pos, tail + d);
                 self._pos += d;
             } else {
                 let d = old_len - new_len;
-                self._ops.copy_within(tail..self._pos, tail - d);
+                self._ops.bytes_mut().copy_within(tail..self._pos, tail - d);
                 self._pos -= d;
             }
         }
-        self._ops[descr_pos..descr_pos + new_len].copy_from_slice(&encoded);
+        self._ops.bytes_mut()[descr_pos..descr_pos + new_len].copy_from_slice(&encoded);
     }
 
     /// Patch the named guard's trailing descr slot to `snapshot_index`.
@@ -2870,10 +3234,27 @@ impl Trace {
         argboxes: &[Box],
         descr: Option<&majit_ir::DescrRef>,
     ) -> u32 {
+        self.record_op_resolved(opcode, argboxes.len(), descr, |i| argboxes[i])
+    }
+
+    /// `record_op`, resolving one argument at a time.
+    ///
+    /// `Trace::record_bytes` reads each ConstPtr from `const_ptr_table`
+    /// immediately before `_encode`. An earlier argument can grow
+    /// `_refs`, `_bigints`, or `_floats` and minor-collect.
+    /// `live_const_indexes` forwards the table; a `Box::ConstPtr` built
+    /// before that collection still holds the from-space address.
+    pub(crate) fn record_op_resolved(
+        &mut self,
+        opcode: OpCode,
+        nargs: usize,
+        descr: Option<&majit_ir::DescrRef>,
+        mut resolve_arg: impl FnMut(usize) -> Box,
+    ) -> u32 {
         let pos = self._index;
-        let old_pos = self._op_start(opcode, argboxes.len());
-        for &b in argboxes {
-            let tagged = self._encode(b);
+        let old_pos = self._op_start(opcode, nargs);
+        for i in 0..nargs {
+            let tagged = self._encode(resolve_arg(i));
             self.append_int(tagged);
         }
         self._op_end_descr(opcode, descr, old_pos);
@@ -3041,9 +3422,9 @@ impl Trace {
     pub(crate) fn append_snapshot_array_data_int(&mut self, i: i64) {
         if !(MIN_VALUE..=MAX_VALUE).contains(&i) {
             self.tag_overflow = true;
-            encode_varint_signed(&mut self._snapshot_array_data, 0);
+            self._snapshot_array_data.append_varint(0);
         } else {
-            encode_varint_signed(&mut self._snapshot_array_data, i);
+            self._snapshot_array_data.append_varint(i);
         }
     }
 
@@ -3052,9 +3433,9 @@ impl Trace {
     pub(crate) fn append_snapshot_data_int(&mut self, i: i64) {
         if !(MIN_VALUE..=MAX_VALUE).contains(&i) {
             self.tag_overflow = true;
-            encode_varint_signed(&mut self._snapshot_data, 0);
+            self._snapshot_data.append_varint(0);
         } else {
-            encode_varint_signed(&mut self._snapshot_data, i);
+            self._snapshot_data.append_varint(i);
         }
     }
 
@@ -3081,7 +3462,7 @@ impl Trace {
         let mut p: usize = self._start as usize;
         let end = self._pos;
         while p < end {
-            let opnum = self._ops[p];
+            let opnum = self.ops_bytes()[p];
             p += 1;
             let opcode = u16_to_opcode(opnum as u16);
             // opencoder.py:644-649 — variadic ops store `num_argboxes`
@@ -3089,14 +3470,14 @@ impl Trace {
             let argnum = match opcode.arity() {
                 Some(n) => n as usize,
                 None => {
-                    let (n, consumed) = decode_varint_signed(&self._ops[p..]);
+                    let (n, consumed) = decode_varint_signed(&self.ops_bytes()[p..]);
                     p += consumed;
                     n as usize
                 }
             };
             // opencoder.py:346-350 — TAGBOX args set liveranges[v] = index.
             for _ in 0..argnum {
-                let (tagged, consumed) = decode_varint_signed(&self._ops[p..]);
+                let (tagged, consumed) = decode_varint_signed(&self.ops_bytes()[p..]);
                 p += consumed;
                 let (tag, v) = untag(tagged as u32);
                 if tag == TAGBOX {
@@ -3113,7 +3494,7 @@ impl Trace {
             }
             // opencoder.py:353-357 — guards drive the snapshot walk.
             if opcode.has_descr() {
-                let (descr_index, consumed) = decode_varint_signed(&self._ops[p..]);
+                let (descr_index, consumed) = decode_varint_signed(&self.ops_bytes()[p..]);
                 p += consumed;
                 if opcode.is_guard() {
                     update_liveranges(
@@ -3179,44 +3560,152 @@ impl Trace {
         deadranges
     }
 
-    /// `_refs[index]` at the address the GC holds now.
-    ///
-    /// `_refs` is a GC-traced list, so a read always sees the moved object.
-    /// The raw words here are refreshed only at the tracing GC boundary;
-    /// after tracing ends the owner root is the authoritative copy.
+    /// `_refs[index]` at the address the GC holds now. `_refs` is the
+    /// traced `GcArray` of `GCREF`, so its slot is the forwarded address.
     pub(crate) fn current_ref(&self, index: usize) -> u64 {
-        if index == 0 {
-            return 0;
-        }
-        self.rooted_refs[index - 1].get().0 as u64
+        self._refs.as_slice()[index] as u64
     }
 
-    /// Rust adaptation: mirror pointer moves performed by the GC back
-    /// into `_refs`. The owner roots hold the authoritative post-move
-    /// pointer for each entry pushed by `_encode_ptr`; copy those
-    /// values into `_refs` so TAGCONSTPTR decodes land on the current
-    /// address. This helper is the required write-back point for the
-    /// `_refs` shadow-stack adaptation; callers must wire it at the same
-    /// GC boundaries as the op-graph Ref-walker
-    /// (`MetaInterp::walk_active_trace_refs`).
+    /// `history.py new_ref_dict` keys are object identities
+    /// (`id_or_identityhash`). The ref `GcArray` slots are already the
+    /// forwarded addresses; this rekeys the host `_refs_dict` by that
+    /// hash. A dictionary cleared by `tracing_done` stays cleared.
     pub(crate) fn refresh_from_gc(&mut self) {
-        let mut moved = false;
-        for (reference, root) in self._refs[1..].iter_mut().zip(&self.rooted_refs) {
-            let current = root.get().0 as u64;
-            moved |= *reference != current;
-            *reference = current;
+        self.rekey_refs();
+    }
+
+    fn rekey_refs(&mut self) {
+        if self._refs_dict.is_empty() {
+            return;
         }
-        // `history.py new_ref_dict/rd_hash` hashes stable object identities.
-        // Our address keys need rehashing after movement. Rebuild only after
-        // updating ALL entries (new addresses can overlap old keys), preserving
-        // pool indexes already written into the byte stream. A dictionary
-        // cleared by `tracing_done` must remain cleared.
-        if moved && !self._refs_dict.is_empty() {
-            self._refs_dict.clear();
-            for (index, &reference) in self._refs.iter().enumerate().skip(1) {
-                self._refs_dict.insert(reference, index as u32);
+        self._refs_dict.clear();
+        for index in 1..self._refs.len() {
+            let addr = self._refs[index];
+            if addr == 0 {
+                continue;
+            }
+            let key = majit_ir::gc_id_or_identityhash(addr) as u64;
+            self._refs_dict.insert(key, index as u32);
+            if key != addr as u64 {
+                self._refs_dict.insert(addr as u64, index as u32);
             }
         }
+    }
+
+    /// Fill `_ops`, `_refs`, `_bigints`, `_floats`, and both snapshot
+    /// lists past their initial allocation, with a minor between appends.
+    /// Read back through `ByteTraceIter` and `SnapshotIterator`.
+    pub fn fill_pools_past_reserve_for_test(&mut self, obj_tid: u32) {
+        let total = INIT_SIZE + 64;
+        for i in 0..total {
+            if i == INIT_SIZE / 2 || i == INIT_SIZE + 8 {
+                majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+            }
+            self.append_byte((i & 0xff) as u8);
+        }
+        let expected: Vec<u8> = (0..total).map(|i| (i & 0xff) as u8).collect();
+        assert_eq!(self.bytes_read_by_iterator(), expected);
+
+        let mut ptr_payloads = Vec::new();
+        for i in 0..40u64 {
+            if i == 8 || i == 36 {
+                majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+            }
+            let obj = majit_gc::gc_sync::gc_op(|gc| gc.alloc_with_type(obj_tid, 8));
+            unsafe { *(obj.0 as *mut u64) = i };
+            ptr_payloads.push(i);
+            let _ = self._encode_ptr(obj.0 as u64);
+        }
+        let bigint = (1i64 << 40) + 7;
+        for i in 0..10i64 {
+            if i == 3 {
+                majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+            }
+            let _ = self._encode_bigint(bigint + i);
+        }
+        let float_bits = 1.5f64.to_bits();
+        for i in 0..6u64 {
+            if i == 2 {
+                majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+            }
+            let _ = self._encode_float(float_bits.wrapping_add(i));
+        }
+        for i in 0..80i64 {
+            if i == 20 {
+                majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+            }
+            self.append_snapshot_data_int(i.wrapping_mul(10));
+            self.append_snapshot_array_data_int(i);
+        }
+        assert!(self._refs.len() > 32, "refs {}", self._refs.len());
+        assert!(self._bigints.len() > 4, "bigints {}", self._bigints.len());
+        assert!(self._floats.len() > 4, "floats {}", self._floats.len());
+        assert!(self._snapshot_data.len() > 128);
+        assert!(self._snapshot_array_data.len() > 128);
+
+        majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+        self.refresh_from_gc();
+        for (i, payload) in ptr_payloads.iter().enumerate() {
+            let addr = self._refs[i + 1];
+            assert_ne!(addr, 0);
+            assert_eq!(unsafe { *(addr as *const u64) }, *payload);
+        }
+        for i in 0..10i64 {
+            assert_eq!(self._bigints[i as usize], bigint + i);
+        }
+        for i in 0..6u64 {
+            assert_eq!(self._floats[i as usize], float_bits.wrapping_add(i));
+        }
+
+        let ptr_for_op = self._refs[1];
+        let ops_at = self._pos;
+        let _ = self.record_op1(OpCode::SameAsR, Box::ConstPtr(ptr_for_op as u64), None);
+        let _ = self.record_op1(OpCode::SameAsI, Box::ConstInt(bigint), None);
+        let _ = self.record_op1(OpCode::SameAsF, Box::ConstFloat(float_bits), None);
+        majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+        self.refresh_from_gc();
+        let moved_ptr = self._refs[1];
+        let mut saw_ptr = false;
+        let mut saw_int = false;
+        let mut saw_float = false;
+        // The leading `_ops` bytes are the raw fill, not opcodes. The
+        // iterator starts where `record_op1` began (`TraceIterator`).
+        let mut it = ByteTraceIter::new(self, ops_at, self._pos, 0);
+        while let Some(op) = it.next() {
+            match op.opcode {
+                OpCode::SameAsR => {
+                    assert_eq!(
+                        op.arg(0).to_opref().as_const_ptr(),
+                        Some(majit_ir::GcRef(moved_ptr as usize))
+                    );
+                    saw_ptr = true;
+                }
+                OpCode::SameAsI => {
+                    assert_eq!(op.arg(0).to_opref().as_const_int(), Some(bigint));
+                    saw_int = true;
+                }
+                OpCode::SameAsF => {
+                    assert_eq!(
+                        op.arg(0).to_opref().as_const_float(),
+                        Some(f64::from_bits(float_bits))
+                    );
+                    saw_float = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_ptr && saw_int && saw_float);
+
+        self.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
+        let array = self.new_array(1);
+        self._add_box_to_storage(Self::_encode_smallint(7));
+        let snap = self.create_top_snapshot(1, 2, array, &[], &[], true);
+        majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+        let iter = self.get_snapshot_iter(snap as usize);
+        assert_eq!(iter.framestack.len(), 1);
+        let frame = iter.framestack[0];
+        let mut boxes = iter.iter_array(frame);
+        assert_eq!(boxes.next(), Some(Self::_encode_smallint(7)));
     }
 }
 
@@ -3292,9 +3781,11 @@ mod tests {
         let mut trace = TraceRecordBuffer::new(0, empty_sd());
         let first = trace._encode_ptr(0x1000);
         let second = trace._encode_ptr(0x2000);
-        majit_gc::shadow_stack::walk_roots(|reference| reference.0 += 0x1000);
+        // The collector rewrites `GcArray` slots in place. No per-element guard.
+        trace._refs.set(1, 0x2000);
+        trace._refs.set(2, 0x3000usize);
         trace.refresh_from_gc();
-        assert_eq!(trace._refs, vec![0, 0x2000, 0x3000]);
+        assert_eq!(&trace._refs[..], &[0usize, 0x2000, 0x3000]);
         assert_eq!(trace._encode_ptr(0x2000), first);
         assert_eq!(trace._encode_ptr(0x3000), second);
         assert_eq!(trace._refs.len(), 3);
@@ -3302,22 +3793,21 @@ mod tests {
     }
 
     #[test]
-    fn trace_roots_outlive_lexical_scopes_and_other_traces() {
+    fn trace_refs_do_not_push_per_element_shadow_roots() {
         let base = majit_gc::shadow_stack::depth();
         majit_gc::shadow_stack::push(majit_ir::GcRef(0x1000));
         let mut first = TraceRecordBuffer::new(0, empty_sd());
         first._encode_ptr(0x2000);
         let mut second = TraceRecordBuffer::new(0, empty_sd());
         second._encode_ptr(0x3000);
+        // No collector: the ref array is a host block, not an owner root.
+        // Encoding must not push the shadow stack, and dropping one trace
+        // must not pop the other trace's storage or the lexical root.
+        assert_eq!(majit_gc::shadow_stack::depth(), base + 1);
         majit_gc::shadow_stack::pop_to(base);
         drop(first);
-        let mut roots = Vec::new();
-        majit_gc::shadow_stack::walk_roots(|reference| roots.push(*reference));
-        assert_eq!(roots, vec![majit_ir::GcRef(0x3000)]);
+        assert_eq!(second._refs[1], 0x3000);
         drop(second);
-        roots.clear();
-        majit_gc::shadow_stack::walk_roots(|reference| roots.push(*reference));
-        assert!(roots.is_empty());
         assert_eq!(majit_gc::shadow_stack::depth(), base);
     }
 
@@ -3326,7 +3816,7 @@ mod tests {
         let mut trace = TraceRecordBuffer::new(0, empty_sd());
         trace.record_op1(OpCode::SameAsR, Box::ConstPtr(0x1000), None);
         trace.tracing_done().unwrap();
-        majit_gc::shadow_stack::walk_roots(|reference| reference.0 += 0x1000);
+        trace._refs.set(1, 0x2000usize);
         trace.refresh_from_gc();
         assert!(trace._refs_dict.is_empty());
         let op = trace.get_byte_iter().next().unwrap();
@@ -3797,7 +4287,7 @@ mod tests {
         assert_eq!(buf._descrs.len(), 1);
         assert!(buf._descrs[0].is_none());
         // _refs starts with nullptr so index 0 means "null".
-        assert_eq!(buf._refs, vec![0u64]);
+        assert_eq!(&buf._refs[..], &[0usize][..]);
         // _snapshot_array_data has one signed-varint-encoded 0 recorded.
         assert!(!buf._snapshot_array_data.is_empty());
     }
@@ -4393,7 +4883,7 @@ mod tests {
         // The guard's trailing 2 zero bytes should have been replaced
         // with `s` (which fits in 2 bytes since it's 0 here).
         assert_eq!(buf._pos, pos_after_guard);
-        let (decoded, _) = decode_varint_signed(&buf._ops[pos_after_guard - 2..]);
+        let (decoded, _) = decode_varint_signed(&buf.ops_bytes()[pos_after_guard - 2..]);
         assert_eq!(decoded, s, "guard descr slot not patched to snapshot index");
     }
 
@@ -4480,11 +4970,11 @@ mod tests {
         buf.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
         let pos_before_patch = buf._pos;
         assert_eq!(
-            buf._ops[pos_before_patch - 2],
+            buf.ops_bytes()[pos_before_patch - 2],
             0u8,
             "guard descr placeholder missing"
         );
-        assert_eq!(buf._ops[pos_before_patch - 1], 0u8);
+        assert_eq!(buf.ops_bytes()[pos_before_patch - 1], 0u8);
 
         // Patch to a small snapshot index (fits in 2 bytes).
         buf.patch_last_guard_descr_slot(42);
@@ -4494,7 +4984,7 @@ mod tests {
         );
         // Verify we can decode it back.
         let tail_start = pos_before_patch - 2;
-        let (decoded, consumed) = decode_varint_signed(&buf._ops[tail_start..]);
+        let (decoded, consumed) = decode_varint_signed(&buf.ops_bytes()[tail_start..]);
         assert_eq!(decoded, 42);
         assert_eq!(consumed, 2);
 
@@ -4569,7 +5059,7 @@ mod tests {
         assert_eq!(buf._index, start_index + 1, "non-void should bump _index");
         // opnum byte at `start_pos` (= max_num_inputargs = 2, opencoder.py:500),
         // then 2 varints for args. IntAdd has no descr.
-        assert_eq!(buf._ops[start_pos], OpCode::IntAdd.as_u16() as u8);
+        assert_eq!(buf.ops_bytes()[start_pos], OpCode::IntAdd.as_u16() as u8);
         // 2 args × 2-byte varint each = 4 bytes after opnum.
         assert_eq!(buf._pos, start_pos + 1 + 2 + 2, "opnum + 2 varint-2 args");
 
@@ -4593,7 +5083,10 @@ mod tests {
         let pos_e = expected.record_op(OpCode::IntAdd, &[Box::ResOp(0), Box::ResOp(1)], None);
         let pos_a = actual.record_op_oprefs(OpCode::IntAdd, &[iarg(0), iarg(1)], None);
         assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
+        assert_eq!(
+            expected.ops_bytes()[..expected._pos],
+            actual.ops_bytes()[..actual._pos]
+        );
         assert_eq!(expected._count, actual._count);
         assert_eq!(expected._index, actual._index);
     }
@@ -4609,7 +5102,10 @@ mod tests {
         let pos_e = expected.record_op(OpCode::IntAdd, &[Box::ResOp(0), Box::ConstInt(42)], None);
         let pos_a = actual.record_op_oprefs(OpCode::IntAdd, &[iarg(0), c], None);
         assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
+        assert_eq!(
+            expected.ops_bytes()[..expected._pos],
+            actual.ops_bytes()[..actual._pos]
+        );
     }
 
     /// Inline-Const OpRef (Float) must resolve to `Box::ConstFloat`.
@@ -4627,9 +5123,12 @@ mod tests {
         );
         let pos_a = actual.record_op_oprefs(OpCode::FloatAdd, &[farg(0), c], None);
         assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
+        assert_eq!(
+            expected.ops_bytes()[..expected._pos],
+            actual.ops_bytes()[..actual._pos]
+        );
         // Both should have registered the float constant in the pool.
-        assert_eq!(expected._floats, actual._floats);
+        assert_eq!(&expected._floats[..], &actual._floats[..]);
     }
 
     /// Inline-Const OpRef (Ref) must resolve to `Box::ConstPtr`.
@@ -4643,8 +5142,11 @@ mod tests {
         let pos_e = expected.record_op(OpCode::PtrEq, &[Box::ResOp(0), Box::ConstPtr(addr)], None);
         let pos_a = actual.record_op_oprefs(OpCode::PtrEq, &[rarg(0), c], None);
         assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
-        assert_eq!(expected._refs, actual._refs);
+        assert_eq!(
+            expected.ops_bytes()[..expected._pos],
+            actual.ops_bytes()[..actual._pos]
+        );
+        assert_eq!(&expected._refs[..], &actual._refs[..]);
     }
 
     // ── ops / get_op_by_pos / last_op tests ────────────────────────────
@@ -4740,7 +5242,10 @@ mod tests {
         let pos_e = expected.record_op(OpCode::Jump, &[Box::ResOp(0), Box::ResOp(1)], None);
         let pos_a = actual.close_loop_oprefs(&[OpRef::input_arg_int(0), OpRef::input_arg_int(1)]);
         assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
+        assert_eq!(
+            expected.ops_bytes()[..expected._pos],
+            actual.ops_bytes()[..actual._pos]
+        );
     }
 
     /// `close_loop_oprefs_with_descr` records a JUMP with the
@@ -4756,7 +5261,10 @@ mod tests {
         let pos_e = expected.record_op(OpCode::Jump, &[Box::ResOp(0)], Some(&descr));
         let pos_a = actual.close_loop_oprefs_with_descr(&[OpRef::input_arg_int(0)], Some(&descr));
         assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
+        assert_eq!(
+            expected.ops_bytes()[..expected._pos],
+            actual.ops_bytes()[..actual._pos]
+        );
     }
 
     /// `finish_oprefs` records a FINISH op with its terminal
@@ -4771,7 +5279,10 @@ mod tests {
         let pos_e = expected.record_op(OpCode::Finish, &[Box::ResOp(0)], Some(&descr));
         let pos_a = actual.finish_oprefs(&[OpRef::input_arg_int(0)], &descr);
         assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
+        assert_eq!(
+            expected.ops_bytes()[..expected._pos],
+            actual.ops_bytes()[..actual._pos]
+        );
     }
 
     /// `record_op_oprefs` with a descr must encode the descr
@@ -4785,7 +5296,10 @@ mod tests {
         let pos_a =
             actual.record_op_oprefs(OpCode::CallN, &[OpRef::input_arg_int(0)], Some(&descr));
         assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
+        assert_eq!(
+            expected.ops_bytes()[..expected._pos],
+            actual.ops_bytes()[..actual._pos]
+        );
         assert_eq!(expected._descrs.len(), actual._descrs.len());
     }
 

@@ -1320,18 +1320,19 @@ impl TraceCtx {
     /// so later residual calls and field operations observe a real pointer
     /// while the optimizer remains free to virtualize the recorded allocation.
     ///
-    /// Rooting contract: the result is returned unrooted, and the caller must
-    /// stamp it onto the op it records for this allocation
-    /// (`set_opref_concrete`) before performing any GC allocation.  The
-    /// result box is then written into `MIFrame.registers_r`; that live
-    /// box is what makes the object a root — `MetaInterp::walk_active_trace_refs`
+    /// Rooting contract: the result is returned unrooted.  The caller must
+    /// keep it reachable until it is stamped onto the op it records for this
+    /// allocation (`set_opref_concrete` / `execute_and_record`).  The result
+    /// box is then written into `MIFrame.registers_r`; that live box is what
+    /// makes the object a root — `MetaInterp::walk_active_trace_refs`
     /// forwards `RefFrontendOp._resref` of boxes still reachable from
     /// registers / heapcache, matching the `history.py` `*FrontendOp(pos,
-    /// value)` slot upstream reaches through the object graph.  Between the
-    /// `bh_new` here and that stamp there is no root at all, so the caller's
-    /// window must contain no GC allocation; recording the op and populating
-    /// the heapcache allocate from the Rust heap only, which is why the
-    /// existing call sites are sound.
+    /// value)` slot upstream reaches through the object graph.  `record_op*`
+    /// appends to `opencoder.py Trace._ops` and can minor-collect
+    /// (`stress_trace_pool_alloc` / `alloc_fast_nursery_collecting`), so a
+    /// bare Rust `Value::Ref` across that append is not enough —
+    /// `execute_and_record` / `_record_helper` pin it the way the translated
+    /// GCREF local would.
     ///
     /// A side list of executed allocations is NOT the way to widen that
     /// window: it duplicates a root the op graph already owns, and it hands
@@ -1610,7 +1611,9 @@ impl TraceCtx {
         }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache_mut()
-            .setfield_cached(obj, field_index, value, oracle)
+            .setfield_cached(obj, field_index, value, oracle);
+        self.recorder.hold_live_const_ptr(obj);
+        self.recorder.hold_live_const_ptr(value);
     }
 
     /// heapcache.py `getfield_now_known` parity (no aliasing).
@@ -1624,7 +1627,9 @@ impl TraceCtx {
         }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache_mut()
-            .getfield_now_known(obj, field_index, value, oracle)
+            .getfield_now_known(obj, field_index, value, oracle);
+        self.recorder.hold_live_const_ptr(obj);
+        self.recorder.hold_live_const_ptr(value);
     }
 
     /// heapcache.py `invalidate_caches_varargs` parity.
@@ -2459,6 +2464,29 @@ impl TraceCtx {
         current
     }
 
+    /// Forward `ReconstructRecipe::concrete_r` ref words while the carrier
+    /// still sits on this context. Those words are copies of resume values;
+    /// once the carrier is taken off, the caller has to publish them onto a
+    /// recorder cell or the shadow stack before the next minor.
+    pub(crate) fn walk_bridge_carrier_concrete_refs(
+        &mut self,
+        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
+        let Some(carrier) = self.bridge_inline_carrier.as_mut() else {
+            return;
+        };
+        for recipe in &mut carrier.recipes {
+            for value in &mut recipe.concrete_r {
+                if let majit_ir::Value::Ref(r) = value
+                    && !r.is_null()
+                    && *r != majit_ir::GcRef::NO_CONCRETE
+                {
+                    visitor(r);
+                }
+            }
+        }
+    }
+
     /// Stash the bridge guard frame's per-bank live register indices (set by
     /// `start_bridge_tracing` before `setup_bridge_sym`).
     pub fn set_bridge_reg_indices(&mut self, indices: crate::resume::FrameLivenessRegIndices) {
@@ -2647,6 +2675,7 @@ impl TraceCtx {
     /// that was never constructed — an invariant violation that would
     /// silently swallow the value under the previous `if let Some`
     /// shape and hide cache-hit sanity-check mismatches.  Panic instead.
+    #[track_caller]
     pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
         if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return;
@@ -2675,6 +2704,7 @@ impl TraceCtx {
     /// allocated in the active recorder (a deeper inlined / recursive
     /// frame's result).  Leaving that result symbolic makes the downstream
     /// branch abort the trace cleanly rather than crash the tracer.
+    #[track_caller]
     pub fn try_set_opref_concrete(&mut self, opref: OpRef, concrete: Value) -> bool {
         if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return true;
@@ -2810,8 +2840,25 @@ impl TraceCtx {
     /// history.py `ConstPtr.value` is a field on the Box; pyre
     /// stores a `const_ptr_table` index on `OpRef::ConstPtr`. The
     /// op-graph walker traces that index across minor collection.
+    ///
+    /// `intern` records the address; the slot is a root only while a
+    /// holder traces it (`const_ptr_table::trace_index`). A Rust
+    /// `OpRef` is a Copy index, not that holder. Register the box in
+    /// `recorder.const_ptrs` immediately so the next Trace-pool append
+    /// forwards `ConstPtr.value` the way the translated local would.
     pub fn const_ref(&mut self, value: i64) -> OpRef {
-        OpRef::const_ptr(majit_ir::GcRef(value as usize))
+        let addr = majit_gc::gc_current_object_address(value as usize);
+        let pin = (addr != 0 && majit_gc::gc_owns_object(addr))
+            .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)));
+        let opref = OpRef::const_ptr(
+            pin.as_ref()
+                .map(|p| p.get())
+                .unwrap_or(majit_ir::GcRef(addr)),
+        );
+        if opref.const_ptr_index().is_some_and(|index| index != 0) {
+            let _ = self.recorder.box_for_operand(opref);
+        }
+        opref
     }
 
     /// history.py CONST_NULL = ConstPtr(ConstPtr.value).
@@ -3988,10 +4035,18 @@ impl TraceCtx {
         let Some(vable_ptr) = self.standard_virtualizable_ptr() else {
             return;
         };
+        // `record_op_with_descr_value` grows `Trace._ops`
+        // (`opencoder.py Trace._double_ops`) and can minor-collect.
+        // RPython traces the vable and each Ref field as GC locals; the
+        // copied addresses here are not. Pin them for the whole rebuild
+        // and re-read after the last append before publishing `values`.
+        let vable_pin = majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(vable_ptr));
         let lengths = self.virtualizable_array_lengths.clone().unwrap_or_default();
         let capacity = info.static_fields.len() + lengths.iter().sum::<usize>() + 1;
         let mut boxes = Vec::with_capacity(capacity);
         let mut values = Vec::with_capacity(capacity);
+        let mut field_pins: Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>> =
+            Vec::with_capacity(capacity);
 
         for (field_index, field) in info.static_fields.iter().enumerate() {
             let opcode = match field.field_type {
@@ -4000,8 +4055,14 @@ impl TraceCtx {
                 Type::Float => OpCode::GetfieldGcF,
                 Type::Void => continue,
             };
-            let bits = unsafe { info.read_field(vable_ptr as *const u8, field_index) };
+            let bits = unsafe { info.read_field(vable_pin.get().0 as *const u8, field_index) };
             let concrete = crate::pyjitpl::heap_value_for_pub(field.field_type, bits);
+            let field_pin = match concrete {
+                Value::Ref(r) if !r.is_null() => {
+                    Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+                }
+                _ => None,
+            };
             let opref = self.record_op_with_descr_value(
                 opcode,
                 &[vable],
@@ -4010,6 +4071,7 @@ impl TraceCtx {
             );
             boxes.push(opref);
             values.push(concrete);
+            field_pins.push(field_pin);
         }
         for (array_index, &length) in lengths.iter().enumerate() {
             let field_descr = info.array_pointer_field_descr(array_index);
@@ -4017,7 +4079,7 @@ impl TraceCtx {
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable], field_descr.clone());
             self.stamp_vable_array_base(
                 array_ref,
-                Some(Value::Ref(majit_ir::GcRef(vable_ptr))),
+                Some(Value::Ref(GcRef(vable_pin.get().0))),
                 &field_descr,
             );
             let array_ref = self.vable_embedded_items_base(array_ref, array_index);
@@ -4032,9 +4094,15 @@ impl TraceCtx {
             for item_index in 0..length {
                 let index = self.const_int(item_index as i64);
                 let bits = unsafe {
-                    info.read_array_item(vable_ptr as *const u8, array_index, item_index)
+                    info.read_array_item(vable_pin.get().0 as *const u8, array_index, item_index)
                 };
                 let concrete = crate::pyjitpl::heap_value_for_pub(item_type, bits);
+                let item_pin = match concrete {
+                    Value::Ref(r) if !r.is_null() => {
+                        Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+                    }
+                    _ => None,
+                };
                 let opref = self.record_op_with_descr_value(
                     item_opcode,
                     &[array_ref, index],
@@ -4043,10 +4111,23 @@ impl TraceCtx {
                 );
                 boxes.push(opref);
                 values.push(concrete);
+                field_pins.push(item_pin);
+            }
+        }
+        debug_assert_eq!(field_pins.len(), values.len());
+        for ((value, pin), opref) in values
+            .iter_mut()
+            .zip(field_pins.iter())
+            .zip(boxes.iter().copied())
+        {
+            if let Some(pin) = pin {
+                let live = Value::Ref(pin.get());
+                *value = live;
+                self.set_opref_concrete(opref, live);
             }
         }
         boxes.push(vable);
-        values.push(Value::Ref(majit_ir::GcRef(vable_ptr)));
+        values.push(Value::Ref(GcRef(vable_pin.get().0)));
         self.set_virtualizable_boxes_with_info(boxes, values, &info, &lengths);
     }
 
@@ -4917,8 +4998,8 @@ impl TraceCtx {
     /// Each box is an `InputArg*` / `*FrontendOp` / `Const*` that carries its
     /// own value. `InputArg*` and `*FrontendOp` refs are forwarded by the
     /// recorder walk (`walk_active_trace_refs` visits `inputargs` and
-    /// `value_slots`); this walk rewrites `ConstPtr` gcrefs that live in the
-    /// box list itself, then forwards `virtualizable_heap_ptr`. The trailing
+    /// `value_slots`); this walk traces `ConstPtr` indexes the vable box
+    /// list still holds, then forwards `virtualizable_heap_ptr`. The trailing
     /// identity is `virtualizable_boxes[-1]`; a bridge must keep that rebuilt
     /// frame identity live instead of falling back to an older cached
     /// portal-frame pointer.
@@ -7357,7 +7438,27 @@ impl TraceCtx {
             return VableArrayStore::OutOfVable;
         };
         let overwritten = VableEntryWrite::of(self, flat_idx);
-        self.set_virtualizable_entry_at(flat_idx, value, concrete);
+        // `set_virtualizable_entry_at` → `try_set_opref_concrete` can intern
+        // and collect. Pin the Ref before that call and store the live word
+        // (`store_reconstructed_callee_array_image`).
+        let pinned = match concrete {
+            Value::Ref(gc) if !gc.is_null() && gc != GcRef::NO_CONCRETE => {
+                let live = majit_gc::gc_current_object_address(gc.0);
+                if live == 0 {
+                    None
+                } else {
+                    Some(majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(live)))
+                }
+            }
+            _ => None,
+        };
+        // Stamp the pinned word, not the pre-pin copy: `box_value` is
+        // the GETARRAYITEM_GC_R heapcache sanity's cache side.
+        let stamp = pinned
+            .as_ref()
+            .map(|g| Value::Ref(g.get()))
+            .unwrap_or(concrete);
+        self.set_virtualizable_entry_at(flat_idx, value, stamp);
         if live_null_push
             && matches!(concrete, Value::Ref(r) if r.is_null())
             && let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut()
@@ -7365,8 +7466,18 @@ impl TraceCtx {
             live_null_slots[flat_idx] = true;
         }
         // pyjitpl.py MIFrame._opimpl_setarrayitem_vable →
-        // virtualizable.py write_box_at.
-        self.synchronize_virtualizable_at(flat_idx);
+        // virtualizable.py write_box_at. A Const OpRef's
+        // `inline_const_to_value` is not a root; write the live word the
+        // caller pinned across `walker_promote_vable_array_index`.
+        if matches!(concrete, Value::Ref(_)) {
+            let live = pinned
+                .as_ref()
+                .map(|g| Value::Ref(g.get()))
+                .unwrap_or(stamp);
+            self.write_virtualizable_heap_value_at(flat_idx, live);
+        } else {
+            self.synchronize_virtualizable_at(flat_idx);
+        }
         VableArrayStore::Stored(overwritten)
     }
 

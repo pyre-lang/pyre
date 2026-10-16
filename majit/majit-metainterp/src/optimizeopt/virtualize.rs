@@ -2488,8 +2488,10 @@ pub(crate) fn parent_list_slot(field: &dyn FieldDescr) -> u32 {
 /// Rust `Arc` itself to be shared.  When that identity is not populated yet,
 /// resolve the qualified display owners through pyre's StructId table; never
 /// collapse two *known* distinct owners merely because their leaf field and
-/// offset happen to agree.  Unnamed dynamic/test descriptors carry no owner
-/// evidence at all and retain the positional fallback.
+/// offset happen to agree.  An inherited `_getusercls` field uses the
+/// base STRUCT's descr (`get_field_descr`).  Unnamed
+/// dynamic/test descriptors carry no owner evidence at all and retain the
+/// positional fallback.
 ///
 /// The key is not always carried — the flattened inline aggregates
 /// (`ob_header`, an enum's `__pos_0`) reach here under the documented
@@ -4179,6 +4181,38 @@ mod tests {
         assert!(
             slot_holds_field(&alias_slot, &alias_base),
             "the crate-stripped alias of the standard-library shell must still reconcile"
+        );
+    }
+
+    /// Distinct STRUCT owners that only share a `User` suffix are not
+    /// the same field. `get_field_descr` keys by the STRUCT that defines
+    /// the field, so a raise and `exc_info` share the base descr.
+    #[test]
+    fn slot_identity_does_not_infer_owner_from_a_user_suffix() {
+        let descr = |size: usize, owner: &str, key: &str, offset: usize| {
+            let mut size_descr = majit_ir::descr::SimpleSizeDescr::new(0, size, 1);
+            size_descr
+                .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(owner).as_u64());
+            let parent = Arc::new(size_descr) as DescrRef;
+            let field = majit_ir::SimpleFieldDescr::new_with_name(
+                0,
+                offset,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                format!("{owner}.{key}"),
+                key.to_string(),
+            )
+            .with_parent_descr(parent.clone(), 4);
+            (field, parent)
+        };
+
+        let (user_tb, _user_parent) = descr(88, "W_BaseExceptionUser", "w_traceback", 48);
+        let (base_tb, _base_parent) = descr(64, "W_BaseException", "w_traceback", 48);
+        assert!(
+            !slot_holds_field(&user_tb, &base_tb),
+            "a User suffix is not proof the descrs name one field"
         );
     }
 

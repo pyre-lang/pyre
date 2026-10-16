@@ -152,6 +152,14 @@ impl RdPayload {
     pub fn set_rd_numb_arc(&self, value: Option<NumberingRef>) {
         unsafe { *self.rd_numb.get() = value }
     }
+    pub fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if let Some(numb) = unsafe { (*self.rd_numb.get()).as_ref() } {
+            numb.visit_gc(visitor);
+        }
+    }
+    pub fn rd_numb_ref(&self) -> Option<&NumberingRef> {
+        unsafe { (*self.rd_numb.get()).as_ref() }
+    }
 
     pub fn rd_consts(&self) -> Option<&[Const]> {
         unsafe {

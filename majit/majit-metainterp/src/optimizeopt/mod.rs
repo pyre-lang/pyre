@@ -122,6 +122,212 @@ impl IntoIterator for ExtraQueue {
     }
 }
 
+/// ConstPtr indexes created while an optimizer pass runs.
+///
+/// `history.py` `ConstPtr.value` lives on the op the optimizer is rewriting.
+/// A bridge seeds `input_ops` empty, and the recorder pool does not yet name
+/// an index minted only on those ops, on `Forwarded`, or in `OptContext`.
+/// The compile walker traces the published holders. Drop pops by pointer
+/// identity and does not dereference the holder: the `Vec` may already have
+/// moved.
+#[derive(Default)]
+pub(crate) struct CompileLiveOpRoots {
+    contexts: Vec<usize>,
+    spans: Vec<(usize, usize)>,
+    vecs: Vec<usize>,
+    /// `TreeLoop` still owned by the compile after `compile_tracing` is taken.
+    loops: Vec<usize>,
+}
+
+/// Pops one published holder. Empty when the optimizer has no metainterp slot.
+#[must_use = "dropping the guard unpublishes the holder"]
+pub(crate) struct LiveOpPublication {
+    roots: *mut CompileLiveOpRoots,
+    kind: u8,
+    key: usize,
+}
+
+impl CompileLiveOpRoots {
+    pub(crate) fn clear(&mut self) {
+        self.contexts.clear();
+        self.spans.clear();
+        self.vecs.clear();
+        self.loops.clear();
+    }
+
+    /// True when no compile holder is published. The snapshot-walk test
+    /// checks the guard released every vec, including a `TreeLoop`.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.contexts.is_empty()
+            && self.spans.is_empty()
+            && self.vecs.is_empty()
+            && self.loops.is_empty()
+    }
+
+    pub(crate) fn publish_context(&mut self, ctx: *const OptContext) -> LiveOpPublication {
+        let key = ctx as usize;
+        if key == 0 {
+            return LiveOpPublication::noop();
+        }
+        self.contexts.push(key);
+        LiveOpPublication {
+            roots: self as *mut _,
+            kind: 1,
+            key,
+        }
+    }
+
+    pub(crate) fn publish_span(&mut self, ops: &[OpRc]) -> LiveOpPublication {
+        if ops.is_empty() {
+            return LiveOpPublication::noop();
+        }
+        let key = ops.as_ptr() as usize;
+        self.spans.push((key, ops.len()));
+        LiveOpPublication {
+            roots: self as *mut _,
+            kind: 2,
+            key,
+        }
+    }
+
+    // The stored address is the `Vec` header. A slice would not name that
+    // header once the caller reallocates the buffer.
+    #[allow(clippy::ptr_arg)]
+    pub(crate) fn publish_vec(&mut self, ops: &Vec<OpRc>) -> LiveOpPublication {
+        let key = ops as *const Vec<OpRc> as usize;
+        self.vecs.push(key);
+        LiveOpPublication {
+            roots: self as *mut _,
+            kind: 3,
+            key,
+        }
+    }
+
+    /// `trace` must stay put until the guard drops. A moved `TreeLoop`
+    /// leaves this address pointing at the old header.
+    pub(crate) fn publish_tree_loop(
+        &mut self,
+        trace: &mut crate::history::TreeLoop,
+    ) -> LiveOpPublication {
+        let key = trace as *mut crate::history::TreeLoop as usize;
+        self.loops.push(key);
+        LiveOpPublication {
+            roots: self as *mut _,
+            kind: 4,
+            key,
+        }
+    }
+
+    pub(crate) fn walk(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        for &addr in &self.contexts {
+            if addr == 0 {
+                continue;
+            }
+            // SAFETY: the publisher drops this entry before moving the
+            // context. The walker runs only while that compile is paused
+            // for a collection.
+            unsafe { (*(addr as *mut OptContext)).walk_live_const_ptrs(visitor) };
+        }
+        for &(ptr, len) in &self.spans {
+            if ptr == 0 || len == 0 {
+                continue;
+            }
+            let ops = unsafe { std::slice::from_raw_parts(ptr as *const OpRc, len) };
+            for op in ops {
+                walk_live_op(op, visitor);
+            }
+        }
+        for &addr in &self.vecs {
+            if addr == 0 {
+                continue;
+            }
+            let ops = unsafe { &*(addr as *const Vec<OpRc>) };
+            for op in ops {
+                walk_live_op(op, visitor);
+            }
+        }
+        for &addr in &self.loops {
+            if addr == 0 {
+                continue;
+            }
+            // SAFETY: the publisher drops this entry before moving the
+            // `TreeLoop`. The walker runs only while that compile is paused.
+            let trace = unsafe { &mut *(addr as *mut crate::history::TreeLoop) };
+            for op in &trace.ops {
+                walk_live_op(op, visitor);
+            }
+            for ia in &trace.inputargs {
+                if let Some(majit_ir::Value::Ref(mut r)) = ia.get_value() {
+                    visitor(&mut r);
+                    ia.set_value(majit_ir::Value::Ref(r));
+                }
+            }
+            for snapshot in &mut trace.snapshots {
+                snapshot.walk_const_ptr_refs(visitor);
+            }
+        }
+    }
+}
+
+impl LiveOpPublication {
+    pub(crate) fn noop() -> Self {
+        Self {
+            roots: std::ptr::null_mut(),
+            kind: 0,
+            key: 0,
+        }
+    }
+}
+
+impl Drop for LiveOpPublication {
+    fn drop(&mut self) {
+        if self.roots.is_null() {
+            return;
+        }
+        // SAFETY: `roots` is the `CompileLiveOpRoots` that pushed `key`.
+        // Popping does not read the published holder.
+        unsafe {
+            let roots = &mut *self.roots;
+            match self.kind {
+                1 => {
+                    if let Some(i) = roots.contexts.iter().rposition(|p| *p == self.key) {
+                        roots.contexts.swap_remove(i);
+                    }
+                }
+                2 => {
+                    if let Some(i) = roots.spans.iter().rposition(|(p, _)| *p == self.key) {
+                        roots.spans.swap_remove(i);
+                    }
+                }
+                3 => {
+                    if let Some(i) = roots.vecs.iter().rposition(|p| *p == self.key) {
+                        roots.vecs.swap_remove(i);
+                    }
+                }
+                4 => {
+                    if let Some(i) = roots.loops.iter().rposition(|p| *p == self.key) {
+                        roots.loops.swap_remove(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn walk_live_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
+    op.walk_const_ptr_refs_mut(visitor);
+    // A folded const can sit on `_forwarded` before emit copies it into an arg.
+    // `ForwardedSlot::borrow` copies the packed word; `walk_const_ptr_refs`
+    // still traces the `SmallWide` index.
+    op.forwarded().borrow().walk_const_ptr_refs(visitor);
+    if let Some(Value::Ref(mut gcref)) = op.get_value() {
+        visitor(&mut gcref);
+        op.set_value(Value::Ref(gcref));
+    }
+}
+
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
 /// this adapter copies OpRefs into a side table. A six-box list is one
 /// 96 B `Layout::array` (`SnapshotBox` is one `OpRef`); twelve boxes
@@ -5857,8 +6063,16 @@ impl OptContext {
             return self.get_box_replacement_operand(arg.to_opref());
         }
         let resolved = arg.get_box_replacement(false);
-        let resolved = if resolved.same_box(arg) && arg.is_inputarg() {
-            self.imported_inputarg_operand(arg).unwrap_or(resolved)
+        // Self-resolved: the canonical box for this position may live in
+        // the OpRef store (`get_box_replacement_operand`), the same
+        // fallback `resolve_operand_operand_positional` takes.
+        let resolved = if resolved.same_box(arg) {
+            if let Some(imported) = self.imported_inputarg_operand(arg) {
+                imported
+            } else {
+                self.get_box_replacement_operand_opt(arg.to_opref())
+                    .unwrap_or(resolved)
+            }
         } else {
             resolved
         };
@@ -9760,6 +9974,94 @@ impl OptContext {
             .get(guard_pos as usize)
             .and_then(|op| op.getdescr())
             .is_some_and(|descr| descr.is_resume_at_position())
+    }
+
+    /// Trace ConstPtr indexes this context owns while it is still in place.
+    ///
+    /// `trace_index` is idempotent across overlapping holders (`new_operations`
+    /// and `resop_refs` share ops). `const_infos` keys are raw addresses;
+    /// the values hold `_fields` and must still be walked (`info.py`
+    /// `optheap.const_infos`).
+    fn walk_live_const_ptrs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        for op in &self.new_operations {
+            walk_live_op(op, visitor);
+        }
+        for op in &self.input_ops {
+            walk_live_op(op, visitor);
+        }
+        for op in &self.live_synthetics {
+            walk_live_op(op, visitor);
+        }
+        for op in self.resop_refs.values() {
+            walk_live_op(op, visitor);
+        }
+        for op in &self.phase1_emit_ops {
+            walk_live_op(op, visitor);
+        }
+        for (_, op) in self.extra_operations_after.iter() {
+            walk_live_op(op, visitor);
+        }
+        for queue in &self.extra_pending {
+            for (_, op) in queue.iter() {
+                walk_live_op(op, visitor);
+            }
+        }
+        if let Some(op) = &self.patchguardop {
+            walk_live_op(op, visitor);
+        }
+        if let Some(op) = &self.pending_finish_guard_postprocess {
+            walk_live_op(op, visitor);
+        }
+        for r in &self.inputargs {
+            r.trace_const_ptr(visitor);
+        }
+        for entry in &self.exported_const_short_boxes {
+            walk_live_op(&entry.op, visitor);
+            if let Some(source) = &entry.source_op {
+                walk_live_op(source, visitor);
+            }
+            entry.res.walk_const_ptr_refs(visitor);
+            if let Some(same) = &entry.same_as_source {
+                same.walk_const_ptr_refs(visitor);
+            }
+        }
+        for pop in self.potential_extra_ops.values() {
+            pop.op.walk_const_ptr_refs(visitor);
+            walk_live_op(&pop.preamble_op, visitor);
+            if let Some(same) = &pop.same_as_source {
+                same.walk_const_ptr_refs(visitor);
+            }
+        }
+        if let Some(preview) = self.preview_short_state.as_mut() {
+            for entry in &preview.short_boxes {
+                walk_live_op(&entry.op, visitor);
+                if let Some(source) = &entry.source_op {
+                    walk_live_op(source, visitor);
+                }
+                entry.res.walk_const_ptr_refs(visitor);
+                if let Some(same) = &entry.same_as_source {
+                    same.walk_const_ptr_refs(visitor);
+                }
+            }
+            for r in &preview.short_inputargs {
+                r.trace_const_ptr(visitor);
+            }
+            if let Some(state) = preview.args_state.as_mut() {
+                state.0.walk_const_ptr_refs_mut(visitor);
+                for r in &state.1 {
+                    r.trace_const_ptr(visitor);
+                }
+                for r in &state.2 {
+                    r.trace_const_ptr(visitor);
+                }
+                for operand in &state.4 {
+                    operand.walk_const_ptr_refs(visitor);
+                }
+            }
+        }
+        for info in self.const_infos.values_mut() {
+            info.walk_const_ptr_refs_mut(visitor);
+        }
     }
 
     /// Drain the emitted-operation buffer and invalidate every PtrInfo guard

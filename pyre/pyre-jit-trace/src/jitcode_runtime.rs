@@ -122,6 +122,7 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
         &mut jitcode,
     ));
     crate::runtime_fnaddr_patch::materialize_type_static_consts(std::slice::from_mut(&mut jitcode));
+    crate::runtime_fnaddr_patch::materialize_empty_array_consts(std::slice::from_mut(&mut jitcode));
     // RPython codewriter.py:80: `all_jitcodes[jitcode.index] is jitcode`.
     // Check per entry so any regression in
     // `collect_jitcodes_in_alloc_order` is caught immediately.

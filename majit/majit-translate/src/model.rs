@@ -7958,10 +7958,10 @@ pub struct FunctionGraph {
     /// scalar, pointer and unit returns.
     pub return_class_root: Option<String>,
     /// The declared return is a pointer to the low-level `STR` storage
-    /// (`*mut BytesBlock`) — the `SomeString` result a `_signature_`
-    /// (`returns=types.str()`) would declare.  `return_type` carries only its
-    /// register kind (`ref`), so a `dont_look_inside` stub reads the string
-    /// result from here.
+    /// (`*mut Utf8Str` / rstr `rpy_string`) — the `SomeString` result a
+    /// `_signature_` (`returns=types.str()`) would declare.  `return_type`
+    /// carries only its register kind (`ref`), so a `dont_look_inside` stub
+    /// reads the string result from here.
     pub return_is_str: bool,
     /// Field-layout spelling of a raw pointer onto a Rust container
     /// (`*mut Vec<T>`, `*mut VecDeque<T>`, `*mut [T]`). A `dont_look_inside`

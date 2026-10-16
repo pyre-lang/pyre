@@ -169,8 +169,12 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
             concrete_if_known(kind_char_to_concrete(*result_kind))
         }
         OpKind::VtableMethodPtr { .. } => Some(ConcreteType::Signed),
-        // `arraylen_vable/rdd>i` answers a length, never the element kind.
-        OpKind::VableArrayLen { .. } => Some(ConcreteType::Signed),
+        // `arraylen_gc/rd>i` and `arraylen_vable/rdd>i` answer a length
+        // (`jtransform.py rewrite_op_getarraysize`, `blackhole.py`
+        // `bhimpl_arraylen_gc` `@arguments("cpu", "r", "d", returns="i")`).
+        // Leaving this Unknown maps `getkind` to `'r'`, so a fused
+        // `i < len` becomes `goto_if_not_int_lt/irL`.
+        OpKind::ArrayLen { .. } | OpKind::VableArrayLen { .. } => Some(ConcreteType::Signed),
         _ => None,
     }
 }
@@ -1821,6 +1825,34 @@ mod tests {
         assert!(
             field_owner_is_gc(&unnamed, None),
             "a descriptor with no owner_root is treated as GC"
+        );
+    }
+
+    #[test]
+    fn arraylen_result_is_signed_like_arraylen_vable() {
+        let mut graph = FunctionGraph::new("arraylen_kind");
+        let base = push_input(&mut graph, "arr", ValueType::Ref(None));
+        let arraylen = OpKind::ArrayLen {
+            base: base.clone(),
+            array_type_id: None,
+            nolength: false,
+        };
+        let vable = OpKind::VableArrayLen {
+            base,
+            array_index: 0,
+            item_ty: ValueType::Ref(None),
+            array_itemsize: 8,
+            array_is_signed: false,
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&arraylen),
+            Some(ConcreteType::Signed),
+            "arraylen_gc/rd>i returns a length, never the array"
+        );
+        assert_eq!(
+            authoritative_result_type_from_op(&vable),
+            Some(ConcreteType::Signed),
+            "arraylen_vable/rdd>i returns a length"
         );
     }
 

@@ -383,6 +383,8 @@ fn main() {
     // across the whole sweep so compiled loops are reused between matches.
     let mut masking_matcher = jit_interp::Matcher::new(roots[1], THRESHOLD);
     let mut branching_matcher = shortcircuit::Matcher::new(roots[2], THRESHOLD);
+    masking_matcher.register_gc_roots();
+    branching_matcher.register_gc_roots();
 
     println!();
     println!("timed rows: {REPEATS} runs each, median (min - max).");
@@ -626,6 +628,14 @@ fn main() {
                 shortcircuit::BRIDGE_OPS.load(Relaxed) as f64 / bridges as f64,
             );
         }
+        // `MiniMarkGC.collection_counts` — real minor collections, not the
+        // `HostNurseryClock` byte quantum. `PYPYLOG=gc-minor` is not wired
+        // on this example; the count is the stats line beside the bridges.
+        let (minors, _) = majit_gc::gc_sync::gc_op(|gc| {
+            use majit_gc::GcAllocator;
+            gc.collection_counts()
+        });
+        eprintln!("minor collections {minors}");
     }
 
     if bad != 0 {

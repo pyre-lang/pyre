@@ -6331,6 +6331,12 @@ where
                         effectinfo,
                     )
             {
+                // The cached i64 is not a root. The frontend slot is,
+                // and `walk_active_trace_refs` forwards it in place.
+                let cached_concrete = match ctx.box_value(cached_traced) {
+                    Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+                    _ => cached_concrete,
+                };
                 self.set_ref_reg(ctx, dst, Some(cached_traced), Some(cached_concrete));
                 return TraceAction::Continue;
             }
@@ -6365,6 +6371,9 @@ where
                     Some(&raw_f),
                 )
             };
+            // `history.py` `ConstPtr` keeps this word alive across
+            // `record_nospec`. Drop pops it on every return below.
+            let residual_ref = ResidualRefRoot::pin(concrete);
             if let Some(action) =
                 host_requested_walk_abort(ctx, concrete_ptr as usize, &calldescr.arg_classes)
             {
@@ -6394,6 +6403,7 @@ where
                     effectinfo.clone(),
                 )
             } else if is_loopinvariant {
+                let concrete = residual_ref.word(concrete);
                 ctx.call_loopinvariant_ref_typed_with_effect(
                     trace_ptr,
                     &args,
@@ -6411,6 +6421,7 @@ where
             };
             // pyjitpl.py MIFrame.execute_varargs gate (see int sibling for full cite).
             let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+            let concrete = residual_ref.word(concrete);
             let traced = match patch_pos {
                 Some(patch_pos) if last_exc_value == 0 => {
                     let func_ref = ctx.const_int(trace_ptr as usize as i64);
@@ -6445,6 +6456,10 @@ where
             // vable access on that register takes the nonstandard leg.
             // The full-body walker already stamps its own residual
             // results this way (`jitcode_dispatch/residual_call.rs`).
+            // Re-read after the record. `_double_ops` may have
+            // forwarded the shadow slot while `concrete` above was
+            // still the nursery address captured at the call.
+            let concrete = residual_ref.word(concrete);
             ctx.set_opref_concrete(
                 traced,
                 majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),

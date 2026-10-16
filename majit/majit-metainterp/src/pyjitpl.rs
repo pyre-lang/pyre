@@ -50,6 +50,8 @@ use majit_ir::operand::Operand;
 pub fn register_active_backend_jitframe_gc_type(gc: &mut dyn majit_gc::GcAllocator) -> u32 {
     let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
     gc.set_jitframe_type_id(id);
+    // `opencoder.py` `Trace._ops`, same registration pass as `JITFRAME`.
+    crate::opencoder::register_trace_ops_gc_type(gc);
     id
 }
 
@@ -808,6 +810,22 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
     slots
 }
 
+/// Virtualizable identity held from capture until
+/// `patch_new_loop_to_load_virtualizable_fields`.
+///
+/// `store_final_boxes_in_guard` allocates `NUMBERING` and can minor-collect
+/// in between. A copied `*const u8` stays in from-space after that
+/// collection overwrites the forwarding stub, so `get_array_length` reads
+/// an unrelated nursery object. A `ConstPtr` index is resolved at the
+/// patch; a raw frame address is stored where the snapshot walker can
+/// forward it.
+#[derive(Clone, Copy, Debug)]
+enum OrigVable {
+    Missing,
+    Index(u32),
+    Addr(GcRef),
+}
+
 /// RAII guard that empties `MetaInterp.compile_snapshot_refs` and unpublishes
 /// `MetaInterp.compile_short_preamble_producer` when dropped. Every compile
 /// entry point that calls
@@ -817,11 +835,15 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
 /// are dangling. Holding this guard at the top of every such entry
 /// point forces the vector to be cleared before any subsequent GC
 /// walk (driven by `compile_snapshot_root_walker`) can observe the
-/// stale pointers.
+/// stale pointers. The same drop releases the virtualizable anchor
+/// and the live-op holders published for that compile.
 pub(crate) struct CompileSnapshotRootsGuard {
     refs: *mut Vec<usize>,
     short_preamble_producer: *mut Option<usize>,
     resume_memos: *mut Vec<crate::resume::LiveResumeMemo>,
+    vable_index: *mut Option<u32>,
+    vable_root: *mut GcRef,
+    live_ops: *mut crate::optimizeopt::CompileLiveOpRoots,
 }
 
 impl CompileSnapshotRootsGuard {
@@ -829,27 +851,37 @@ impl CompileSnapshotRootsGuard {
         refs: &mut Vec<usize>,
         short_preamble_producer: &mut Option<usize>,
         resume_memos: &mut Vec<crate::resume::LiveResumeMemo>,
+        vable_index: &mut Option<u32>,
+        vable_root: &mut GcRef,
+        live_ops: &mut crate::optimizeopt::CompileLiveOpRoots,
     ) -> Self {
         Self {
             refs: refs as *mut _,
             short_preamble_producer: short_preamble_producer as *mut _,
             resume_memos: resume_memos as *mut _,
+            vable_index: vable_index as *mut _,
+            vable_root: vable_root as *mut _,
+            live_ops: live_ops as *mut _,
         }
     }
 }
 
 impl Drop for CompileSnapshotRootsGuard {
     fn drop(&mut self) {
-        // SAFETY: the guard is constructed from a `&mut Vec<usize>`
-        // and lives no longer than the enclosing `&mut self` borrow
-        // of `MetaInterp`. The raw pointer therefore stays valid for
-        // the guard's entire scope; nothing else mutates the vector
-        // through a competing reference, because the borrow checker
-        // observed the original `&mut` at construction.
+        // SAFETY: the guard is constructed from fields of one
+        // `MetaInterp` and lives no longer than the enclosing `&mut self`
+        // borrow. The raw pointers stay valid for the guard's entire
+        // scope; nothing else mutates those fields through a competing
+        // reference, because the borrow checker observed the original
+        // `&mut` at construction. Clearing live-op holders does not
+        // dereference a published `Vec` or `OptContext`.
         unsafe {
             (*self.refs).clear();
             *self.short_preamble_producer = None;
             (*self.resume_memos).clear();
+            *self.vable_index = None;
+            *self.vable_root = GcRef::NULL;
+            (*self.live_ops).clear();
         }
     }
 }
@@ -910,10 +942,10 @@ impl Drop for JitlogAbortGuard {
 
 /// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
 /// must number as TAGBOX. `make_constant_box` already refuses that fold
-/// in the optimizer; the tracer can still snapshot the concrete address
-/// as `SnapshotTagged::Const`. Resume then TAGCONSTs it and the next
-/// `Vm::new` has no failarg to rebind. Map the address back to the
-/// InputArg that already carries those bits.
+/// in the optimizer; the tracer can still snapshot the interned
+/// `ConstPtr` as `SnapshotTagged::Const`. Resume then TAGCONSTs it and
+/// the next `Vm::new` has no failarg to rebind. Map the resolved
+/// address back to the InputArg that already carries those bits.
 fn snapshot_inputarg_for_stack_ptr(
     inputargs: &[majit_ir::InputArgRc],
     addr: usize,
@@ -943,12 +975,18 @@ pub(crate) fn snapshot_tagged_to_box(
             SnapshotBox::typed(*opref, tp)
         }
         crate::recorder::SnapshotTagged::Const(val, tp) => {
+            // `Type::Ref` stores a const_ptr_table index. Resolve at the use.
+            let bits = if *tp == majit_ir::Type::Ref {
+                majit_ir::const_ptr_table::resolve(*val as u32).0 as i64
+            } else {
+                *val
+            };
             if *tp == majit_ir::Type::Ref
-                && let Some(ia) = snapshot_inputarg_for_stack_ptr(inputargs, *val as usize)
+                && let Some(ia) = snapshot_inputarg_for_stack_ptr(inputargs, bits as usize)
             {
                 return SnapshotBox::typed(ia, *tp);
             }
-            let value = heap_value_for(*tp, *val);
+            let value = heap_value_for(*tp, bits);
             let opref = majit_ir::OpRef::const_inline_from_value(&value);
             SnapshotBox::typed(opref, *tp)
         }
@@ -962,7 +1000,13 @@ pub(crate) fn snapshot_tagged_to_box(
 /// is `[InputArg(0), InputArg(2)]` while ops still name slot 2. The fresh
 /// boxes are allocated densely from 0, which is the namespace
 /// `UnrollOptimizer`'s later `TraceIterator::new` walks.
-fn prepare_retrace_snapshot(mut trace: crate::history::TreeLoop) -> crate::history::TreeLoop {
+fn prepare_retrace_snapshot(
+    mut trace: crate::history::TreeLoop,
+    roots: &mut crate::optimizeopt::CompileLiveOpRoots,
+) -> crate::history::TreeLoop {
+    // `TraceIterator::next` re-interns each source value. The reminted
+    // ops are a second holder; publish that vec before `next` can collect.
+    let _src = roots.publish_tree_loop(&mut trace);
     let (ops, reminted_inputargs, cache) = {
         let mut iter = crate::opencoder::TraceIterator::new_with_inputargs(
             &trace.ops,
@@ -973,6 +1017,7 @@ fn prepare_retrace_snapshot(mut trace: crate::history::TreeLoop) -> crate::histo
             0,
         );
         let mut ops = Vec::with_capacity(trace.ops.len());
+        let _fresh = roots.publish_vec(&ops);
         while let Some(op) = iter.next() {
             ops.push(op);
         }
@@ -1023,6 +1068,7 @@ fn prepare_retrace_snapshot(mut trace: crate::history::TreeLoop) -> crate::histo
     }
     trace.ops = ops;
     trace.inputargs = reminted_inputargs;
+    drop(_src);
     trace
 }
 
@@ -2812,6 +2858,19 @@ pub struct MetaInterp<M: Clone> {
     /// `consts` — and the raw-address keys of its `refs` cache — name nothing
     /// the collector forwards. Emptied by [`CompileSnapshotRootsGuard`].
     pub(crate) compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
+    /// `ConstPtr` index of the virtualizable for the in-flight compile.
+    ///
+    /// `walk_compile_snapshot_refs` traces it after `compile_tracing` is
+    /// taken, so `get_array_length` can resolve the forwarded slot.
+    compile_vable_index: Option<u32>,
+    /// Concrete virtualizable address for that same window, when the frame
+    /// is not a `ConstPtr` (merge-point `vable_ptr`, or the trace `Value::Ref`).
+    /// The snapshot walker forwards this word in place.
+    compile_vable_root: GcRef,
+    /// Prepared ops, optimizer context, and the emitted op vec for the
+    /// in-flight compile. `walk_compile_snapshot_refs` traces them.
+    /// [`CompileSnapshotRootsGuard`] clears the lists on every exit.
+    compile_live_op_roots: crate::optimizeopt::CompileLiveOpRoots,
     /// Reused across sequential `compile_bridge` calls so the pass boxes
     /// and `ResumeDataLoopMemo` scratch stay allocated. RPython
     /// `BridgeCompileData.optimize` constructs a new `UnrollOptimizer`
@@ -3465,7 +3524,67 @@ impl<M: Clone> MetaInterp<M> {
     /// the same Arc, so walking the `exit_layouts` /
     /// `terminal_exit_layouts` storage slots once updates the pool for
     /// every observer.
+    /// `NUMBERING` payload addresses. A minor moves the array until it is
+    /// promoted, so this walk is not gated on the const-pool scan bit.
+    pub fn walk_rd_numb_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        // `resumecode.py` `NUMBERING` is `compile.py` `ResumeGuardDescr.rd_numb`.
+        // A minor forwards young payloads through `collect_young_numberings`
+        // (`incminimark.py` `collect_oldrefs_to_nursery`); the holder graph
+        // is not scanned. Major marking traces every live descr. The kind
+        // flag is the one `walk_rd_consts_refs` passes to its pool visit.
+        if majit_gc::shadow_stack::extra_root_walk_kind()
+            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
+        {
+            return;
+        }
+        for entry in self.compiled_loops.values_mut() {
+            for trace in entry.traces.values_mut() {
+                for layout in trace
+                    .exit_layouts
+                    .values_mut()
+                    .chain(trace.terminal_exit_layouts.values_mut())
+                {
+                    if let Some(fd) = layout
+                        .descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                    {
+                        fd.visit_rd_numb(&mut visitor);
+                    }
+                }
+            }
+            let tokens = entry.live_token().into_iter().chain(
+                entry
+                    .previous_tokens
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade),
+            );
+            for token in tokens {
+                let Some(clt) = token.compiled_loop_token() else {
+                    continue;
+                };
+                for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+                    let mut visit_descr = |descr: &dyn majit_ir::Descr| {
+                        if let Some(fd) = descr.as_fail_descr() {
+                            fd.visit_rd_numb(&mut visitor);
+                        }
+                    };
+                    if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+                        for cell in store.iter() {
+                            visit_descr(&*cell.descr);
+                        }
+                    } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
+                        for descr in descrs {
+                            visit_descr(&**descr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        self.walk_rd_numb_refs(&mut visitor);
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
             generation: u64,
@@ -3495,6 +3614,10 @@ impl<M: Clone> MetaInterp<M> {
             // SAFETY: pyre is single-threaded and the minor-collection
             // walker is the only writer; concurrent readers run outside
             // GC cycles.
+            // `Const::Ref` is an index. This pool is the holder, so trace
+            // those slots. `history.py` `ResumeGuardDescr.rd_consts` is a
+            // GC list of `Const`; a constant that no descr still names is
+            // not a root.
             let consts = unsafe { pool.as_mut_vec_for_gc() };
             for c in consts.iter_mut() {
                 if let Const::Ref(index) = c {
@@ -3517,6 +3640,17 @@ impl<M: Clone> MetaInterp<M> {
         if scan_compiled_graph {
             for entry in self.compiled_loops.values_mut() {
                 for trace in entry.traces.values_mut() {
+                    // Blackhole replays `trace.ops`. Those `ConstPtr`
+                    // indexes stay live for the loop, same as the guard
+                    // pools below.
+                    for op in &trace.ops {
+                        op.walk_const_ptr_refs_mut(&mut visitor);
+                    }
+                    for constant in trace.constants.values() {
+                        if let majit_ir::Const::Ref(index) = constant {
+                            majit_ir::const_ptr_table::trace_index(*index, &mut visitor);
+                        }
+                    }
                     for layout in trace.exit_layouts.values_mut() {
                         let descr_pool = layout
                             .descr
@@ -3674,6 +3808,9 @@ impl<M: Clone> MetaInterp<M> {
     /// object graph; pyre's `Vec<Op>` lives in Rust storage so the
     /// embedder registers this walker.
     pub fn walk_partial_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
+        // Live ops trace their own `ConstPtr` indexes. A process-wide
+        // table walk would keep constants from traces that have already
+        // been dropped (`history.py` `ConstPtr` dies with its box).
         if let Some(partial) = self.partial_trace.as_mut() {
             for op in partial.ops.iter_mut() {
                 walk_op_const_ptr_refs(op, &mut visitor);
@@ -3789,6 +3926,10 @@ impl<M: Clone> MetaInterp<M> {
             return;
         };
         trace_ctx.recorder.walk_const_ptr_refs(&mut visitor);
+        // Resume copies in `ReconstructRecipe::concrete_r` are not recorder
+        // cells. Forward them until `take_bridge_inline_carrier` moves the
+        // carrier onto the stack.
+        trace_ctx.walk_bridge_carrier_concrete_refs(&mut visitor);
         // `set_concrete_at` also stamps a runtime `Value::Ref` onto recorder
         // InputArgs (loop / bridge entry args). No other walker visits them,
         // and an InputArg carries no args / fail_args, so `.value` is the only
@@ -3817,6 +3958,7 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py `MetaInterp.virtualref_boxes`: each pair is
         // `[virtualbox, vrefbox]`. The OpRef is the Box; the `usize` is
         // `box.getref_base()` for the concrete `JitVirtualRef*`.
+        // A `ConstPtr` box names its own table slot.
         for (op, ptr) in &mut trace_ctx.virtualref_boxes {
             op.trace_const_ptr(&mut visitor);
             if *ptr != 0 {
@@ -3836,14 +3978,14 @@ impl<M: Clone> MetaInterp<M> {
                 gb.opref.trace_const_ptr(&mut visitor);
             }
         }
-        if let Some(reds) = trace_ctx.live_portal_reds.as_mut() {
+        if let Some(reds) = trace_ctx.live_portal_reds.as_ref() {
             for (op, ty) in reds {
                 if *ty == Type::Ref {
                     op.trace_const_ptr(&mut visitor);
                 }
             }
         }
-        if let Some(boxes) = trace_ctx.close_jump_boxes.as_mut() {
+        if let Some(boxes) = trace_ctx.close_jump_boxes.as_ref() {
             for (op, ty) in boxes {
                 if *ty == Type::Ref {
                     op.trace_const_ptr(&mut visitor);
@@ -4026,6 +4168,44 @@ impl<M: Clone> MetaInterp<M> {
             // Forward the snapshot slot's inline const gcref in place (an
             // in-place `ConstPtr.value` update).
             r.trace_const_ptr(&mut visitor);
+        }
+        self.walk_compile_vable_anchor(&mut visitor);
+        self.compile_live_op_roots.walk(&mut visitor);
+    }
+
+    /// Publish `ops` until the returned guard drops. The guard does not
+    /// borrow `self`, so the caller can keep using the vec.
+    #[allow(clippy::ptr_arg)]
+    fn publish_live_ops(
+        &mut self,
+        ops: &Vec<majit_ir::OpRc>,
+    ) -> crate::optimizeopt::LiveOpPublication {
+        self.compile_live_op_roots.publish_vec(ops)
+    }
+
+    /// Forward ops, inputarg values, and snapshots on a compile-local loop.
+    ///
+    /// The guard does not borrow `trace`. The `TreeLoop` must not move
+    /// while the guard is alive: the walker re-reads that header.
+    fn publish_tree_loop(
+        &mut self,
+        trace: &mut crate::history::TreeLoop,
+    ) -> crate::optimizeopt::LiveOpPublication {
+        self.compile_live_op_roots.publish_tree_loop(trace)
+    }
+
+    /// Forward the virtualizable anchor published for the in-flight compile.
+    ///
+    /// After `compile_tracing` is taken, `initial_inputarg_consts` is no
+    /// longer reached by `walk_active_trace_refs`. The index or rooted
+    /// address captured for `patch_new_loop_to_load_virtualizable_fields`
+    /// still has to move when `NUMBERING` allocation collects.
+    fn walk_compile_vable_anchor(&mut self, visitor: &mut impl FnMut(&mut GcRef)) {
+        if let Some(index) = self.compile_vable_index {
+            majit_ir::const_ptr_table::trace_index(index, visitor);
+        }
+        if !self.compile_vable_root.is_null() {
+            visitor(&mut self.compile_vable_root);
         }
     }
 
@@ -4424,6 +4604,9 @@ impl<M: Clone> MetaInterp<M> {
             compile_snapshot_refs: Vec::new(),
             compile_short_preamble_producer: None,
             compile_resume_memos: Vec::new(),
+            compile_vable_index: None,
+            compile_vable_root: GcRef::NULL,
+            compile_live_op_roots: crate::optimizeopt::CompileLiveOpRoots::default(),
             cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
@@ -5269,15 +5452,22 @@ impl<M: Clone> MetaInterp<M> {
     /// (greens prepended as positional placeholders), matching RPython's
     /// `original_boxes[num_green_args + index_of_virtualizable]` read.
     ///
-    /// Split at `vinfo.clear_vable_token` so a parked recorder in
-    /// `compile_tracing` is not mutably borrowed across the collection
-    /// in `force_now`. Driver-descriptor numbers are read first;
-    /// [`Self::initialize_virtualizable_force`] may collect and does not
-    /// touch the ctx; [`Self::initialize_virtualizable_write_ctx`] writes
-    /// the ctx and does not borrow `MetaInterp`.
-    fn initialize_virtualizable(&mut self, ctx: &mut TraceCtx, live_values: &[Value]) {
-        let (num_green_args, virtualizable_arg_index, num_reds) =
-            Self::initialize_virtualizable_driver_layout(ctx);
+    /// The caller has stored this trace in `self.tracing`.
+    /// [`Self::initialize_virtualizable_force`] may collect inside
+    /// `clear_vable_token` and does not borrow the ctx, so
+    /// `walk_active_trace_refs` can forward `initial_inputarg_consts`
+    /// during that collection. [`Self::initialize_virtualizable_write_ctx`]
+    /// writes the ctx afterwards and does not borrow `MetaInterp`.
+    /// `initialize_state_from_start` parks the same ctx in
+    /// `compile_tracing` and calls the two halves itself.
+    fn initialize_virtualizable(&mut self, live_values: &[Value]) {
+        let Some((num_green_args, virtualizable_arg_index, num_reds)) = self
+            .tracing
+            .as_ref()
+            .map(Self::initialize_virtualizable_driver_layout)
+        else {
+            return;
+        };
         let Some(state) = self.initialize_virtualizable_force(
             live_values,
             num_green_args,
@@ -5286,7 +5476,9 @@ impl<M: Clone> MetaInterp<M> {
         ) else {
             return;
         };
-        Self::initialize_virtualizable_write_ctx(ctx, state, live_values);
+        if let Some(ctx) = self.tracing.as_mut() {
+            Self::initialize_virtualizable_write_ctx(ctx, state, live_values);
+        }
     }
 
     /// `driver_descriptor()` numbers `initialize_virtualizable` needs
@@ -5622,14 +5814,13 @@ impl<M: Clone> MetaInterp<M> {
         } = state;
 
         if !virtualizable_ptr.is_null() {
-            // Both `force_start_tracing` and `setup_tracing` call this
-            // before `self.tracing = Some(ctx)`. Write the forwarded
-            // pointer onto the ctx being initialized, not the empty slot.
+            // `clear_vable_token` reloaded this pointer from the shadow
+            // stack. The caller already published the ctx on `self.tracing`,
+            // or parked it in `compile_tracing` (`initialize_state_from_start`).
             ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
-            // `initial_inputarg_consts` was copied from `live_values` before
-            // this force. `walk_active_trace_refs` cannot forward those
-            // ConstPtrs until `self.tracing` is assigned.
-            // `orig_vable_ptr_from_trace_ctx` reads that slot first.
+            // A minor during that force forwarded the ConstPtr interned
+            // from `live_values`. `orig_vable_from_trace_ctx` reads
+            // this slot, so store the reloaded address over the pre-force one.
             let vable_const_index = virtualizable_arg_index.unwrap_or(index_of_virtualizable);
             if let Some(OpRef::ConstPtr(slot)) = ctx.initial_inputarg_consts.get(vable_const_index)
             {
@@ -6109,6 +6300,12 @@ impl<M: Clone> MetaInterp<M> {
         opt.string_length_resolver = self.string_length_resolver.clone();
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
+        // `&self` cannot hand out `&mut` of this field. The slot is the
+        // address `publish_live_op_*` writes through while this compile runs.
+        opt.set_compile_live_op_roots_slot(Some(
+            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
+                as usize,
+        ));
     }
 
     fn make_optimizer(&self) -> Optimizer {
@@ -6431,13 +6628,6 @@ impl<M: Clone> MetaInterp<M> {
                 // keeps `jd_no`; electing a vinfo-bearing sibling would
                 // stamp leftover compiling onto this function-entry token.
                 self.active_jitdriver_sd = Some(jd_no);
-                // initialize_virtualizable establishes the virtualizable heap pointer.
-                self.initialize_virtualizable(&mut ctx, live_values);
-                // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
-                // runs after `initialize_state_from_start`, which has already
-                // appended `virtualizable_boxes` onto `original_boxes`. Attach
-                // here so `Trace(max_num_inputargs)` sees the full cap.
-                ctx.attach_live_byte_recorder();
                 // `prepare_trace_segmenting` writes `JC_FORCE_FINISH` through
                 // `current_merge_points[0]`. The seed below copies
                 // `green_key_values`; without them the hash form files a
@@ -6449,13 +6639,11 @@ impl<M: Clone> MetaInterp<M> {
                 {
                     ctx.set_green_key_values(key);
                 }
-                // pyjitpl.py `_compile_and_run_once` — see `setup_tracing`.
-                ctx.seed_compile_and_run_once_merge_point();
                 // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
                 // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
                 // matched. The typed door is that cell; the hash read misses it
                 // when the bucket has two owners.
-                self.force_finish_trace = {
+                let force_finish = {
                     let hashed = self
                         .warm_state_for_driver(jd_no)
                         .should_force_finish_tracing(green_key);
@@ -6465,13 +6653,10 @@ impl<M: Clone> MetaInterp<M> {
                     });
                     typed.unwrap_or(false) || hashed
                 };
-                ctx.set_force_finish(self.force_finish_trace);
-                // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog —
-                // see `setup_tracing` for the contract on raw-pointer
-                // lifetime pinning by MetaInterp ownership.
-                ctx.set_cpu(Some(&self.backend));
-                self.tracing = Some(ctx);
-                self.arm_portal_trace_positions();
+                // Store the ctx before `initialize_virtualizable`.
+                // `clear_vable_token` can minor-collect, and
+                // `walk_active_trace_refs` only sees `self.tracing`.
+                self.publish_trace_start(ctx, live_values, force_finish);
                 // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
                 // `setup_tracing` for rationale.  Bridge-trace
                 // distinction now flows through
@@ -6822,6 +7007,41 @@ impl<M: Clone> MetaInterp<M> {
         self.force_finish_trace = false;
     }
 
+    /// Install `ctx` before `initialize_virtualizable` or the trace
+    /// buffer allocation can collect.
+    ///
+    /// `clear_vable_token` allocates inside `force_now`.
+    /// `_compile_and_run_once` then calls `create_empty_history` after
+    /// `initialize_virtualizable` has appended `virtualizable_boxes`.
+    /// `initial_inputarg_consts` already interns the reds, and
+    /// `walk_active_trace_refs` forwards those ConstPtrs only from
+    /// `self.tracing`, so the ctx is stored first. `set_cpu` and
+    /// `set_force_finish` do not allocate. Bridges go through
+    /// `start_retrace_from_guard` and do not use this helper, so their
+    /// merge-point list stays empty.
+    fn publish_trace_start(
+        &mut self,
+        mut ctx: TraceCtx,
+        live_values: &[Value],
+        force_finish: bool,
+    ) {
+        // Caller read `warmstate.py bound_reached`'s `JC_FORCE_FINISH`.
+        // The bit is sticky; this only copies it onto the trace.
+        self.force_finish_trace = force_finish;
+        ctx.set_force_finish(force_finish);
+        // `_opimpl_getfield_gc_any_pureornot` reads `self.metainterp.cpu`.
+        // MetaInterp owns both `tracing` and `backend`, and tracing is
+        // torn down before `self` moves.
+        ctx.set_cpu(Some(&self.backend));
+        self.tracing = Some(ctx);
+        self.initialize_virtualizable(live_values);
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.attach_live_byte_recorder();
+            ctx.seed_compile_and_run_once_merge_point();
+        }
+        self.arm_portal_trace_positions();
+    }
+
     fn setup_tracing(
         &mut self,
         green_key: u64,
@@ -6897,31 +7117,11 @@ impl<M: Clone> MetaInterp<M> {
         // driver matching the descriptor; with the single-portal pyre
         // shell driver this collapses to slot 0.
         self.active_jitdriver_sd = Some(jd_no);
-        // initialize_virtualizable establishes the virtualizable heap pointer.
-        self.initialize_virtualizable(&mut ctx, live_values);
-        // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
-        // runs after `initialize_state_from_start`, which has already
-        // appended `virtualizable_boxes` onto `original_boxes`. Attach
-        // here so `Trace(max_num_inputargs)` sees the full cap.
-        ctx.attach_live_byte_recorder();
-        // pyjitpl.py `_compile_and_run_once` seeds the start boxes so
-        // the first matching header visit closes. Bridges go through
-        // `start_retrace_from_guard` and stay empty.
-        ctx.seed_compile_and_run_once_merge_point();
-
-        // Computed above, before `green_key_values` moved.
-        self.force_finish_trace = force_finish;
-        // pyjitpl.py:2411: propagate force_finish_trace to TraceCtx
-        // so the proc-macro merge_fn closure can read it.
-        ctx.set_force_finish(self.force_finish_trace);
-        // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog: install the
-        // backend reference for the cache-hit sanity-check load.
-        // Captures a raw pointer that stays valid for the duration of
-        // this trace because `self` (MetaInterp) owns both `tracing`
-        // and `backend`, and tracing is torn down before `self` moves.
-        ctx.set_cpu(Some(&self.backend));
-        self.tracing = Some(ctx);
-        self.arm_portal_trace_positions();
+        // Store the ctx before `initialize_virtualizable`.
+        // `force_finish` was read above, before `green_key_values` moved.
+        // `clear_vable_token` can minor-collect, and
+        // `walk_active_trace_refs` only sees `self.tracing`.
+        self.publish_trace_start(ctx, live_values, force_finish);
         // pyjitpl.py `opimpl_jit_merge_point` auto-stamp
         // gate inputs.  Both `portal_call_depth` and
         // `has_compiled_targets(ptoken)` feed the primary-trace gate;
@@ -8227,7 +8427,6 @@ impl<M: Clone> MetaInterp<M> {
         ops: &mut Vec<majit_ir::OpRc>,
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
-        orig_vable_ptr: *const u8,
     ) {
         let Some(vinfo) = self.virtualizable_info() else {
             return;
@@ -8262,6 +8461,11 @@ impl<M: Clone> MetaInterp<M> {
         // the constant Ref value from that inputarg. A null pointer means
         // the tracer-time inputarg lookup failed, which is a bug upstream
         // of this helper.
+        //
+        // Read the address here. `store_final_boxes_in_guard` has already
+        // allocated `NUMBERING`, and a pointer copied before that allocation
+        // is the from-space frame once the forwarding stub is overwritten.
+        let orig_vable_ptr = self.current_orig_vable_ptr();
         assert!(
             !orig_vable_ptr.is_null(),
             "patch_new_loop_to_load_virtualizable_fields requires \
@@ -8309,53 +8513,54 @@ impl<M: Clone> MetaInterp<M> {
     /// whose `locals_cells_stack_w` is a different length, and the field-load
     /// preamble then expands to an arity the inputargs never had
     /// (compile.py:458).
-    fn orig_vable_ptr_for_cut(
+    fn orig_vable_for_cut(
         &self,
         cut: Option<&crate::trace_ctx::MergePoint>,
         ctx: &TraceCtx,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
-    ) -> *const u8 {
+    ) -> OrigVable {
         match cut.filter(|mp| mp.vable_ptr != 0) {
-            Some(mp) => mp.vable_ptr as *const u8,
-            None => self.orig_vable_ptr_from_trace_ctx(ctx, driver_descriptor),
+            Some(mp) => OrigVable::Addr(GcRef(mp.vable_ptr)),
+            None => Self::orig_vable_from_trace_ctx(ctx, driver_descriptor),
         }
     }
 
-    fn orig_vable_ptr_from_trace_ctx(
-        &self,
+    /// `ctx` is borrowed from `self.tracing` at the entry bridge, so this
+    /// does not take `&self`.
+    fn orig_vable_from_trace_ctx(
         ctx: &TraceCtx,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
-    ) -> *const u8 {
+    ) -> OrigVable {
         // history.py ConstPtr.value lives inline on the box —
-        // `orig_inpargs[idx].getref_base()` parity read.
+        // `orig_inpargs[idx].getref_base()` parity read. Keep the index;
+        // `current_orig_vable_ptr` resolves it at the patch.
         let from_consts = driver_descriptor
             .and_then(|driver| driver.virtualizable_arg_index())
             .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
             .and_then(|const_ref| match const_ref {
-                OpRef::ConstPtr(index) => {
-                    Some(majit_ir::const_ptr_table::resolve(*index).0 as *const u8)
-                }
+                OpRef::ConstPtr(index) if *index != 0 => Some(OrigVable::Index(*index)),
                 _ => None,
             });
-        if let Some(ptr) = from_consts {
-            return ptr;
+        if let Some(vable) = from_consts {
+            return vable;
         }
         // resume.py `consume_virtualizable_boxes` finds the bridge's
         // virtualizable in `nums[-1]` and `load_list_of_boxes` returns it as
         // the trailing box, which `rebuild_state_after_failure` installs as
         // `metainterp.virtualizable_boxes`.  That is the authoritative bridge
         // identity; prefer its concrete value over MetaInterp's portal-entry
-        // cache. `walk_active_trace_refs` forwards this Value::Ref in place.
+        // cache. The address is rooted in `compile_vable_root` because this
+        // `Value::Ref` stops being walked once `compile_tracing` is taken.
         if let Some(Value::Ref(frame)) = ctx.standard_virtualizable_concrete()
             && !frame.is_null()
         {
-            return frame.as_usize() as *const u8;
+            return OrigVable::Addr(frame);
         }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
         // virtualizable inputarg's ConstPtr.  The TraceCtx pointer is the
         // trace-bound equivalent of `orig_inpargs[idx].getref_base()`
-        // (compile.py:510), which reads a value belonging to the trace being
+        // (`compile.py` `send_loop_to_backend`), which reads a value belonging to the trace being
         // compiled and never an ambient one.
         //
         // Prefer it over MetaInterp's ambient pointer: an inlined residual
@@ -8363,8 +8568,10 @@ impl<M: Clone> MetaInterp<M> {
         // boundary restores the caller's pointer on this TraceCtx. Reading the
         // ambient slot here would combine the caller loop's expanded inputargs
         // with the callee frame's array length, collapsing frame identity.
-        if let Some(ptr) = ctx.virtualizable_heap_ptr() {
-            return ptr;
+        if let Some(ptr) = ctx.virtualizable_heap_ptr()
+            && !ptr.is_null()
+        {
+            return OrigVable::Addr(GcRef(ptr as usize));
         }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
@@ -8372,7 +8579,33 @@ impl<M: Clone> MetaInterp<M> {
         // boxes nor their heap mirror were installed, there is no
         // trace-bound identity to name — do not fall back to the
         // ambient host seed.
-        std::ptr::null()
+        OrigVable::Missing
+    }
+
+    /// Publish the anchor `walk_compile_snapshot_refs` forwards until the patch.
+    fn publish_orig_vable(&mut self, vable: OrigVable) {
+        match vable {
+            OrigVable::Index(index) => {
+                self.compile_vable_index = Some(index);
+                self.compile_vable_root = GcRef::NULL;
+            }
+            OrigVable::Addr(addr) => {
+                self.compile_vable_index = None;
+                self.compile_vable_root = addr;
+            }
+            OrigVable::Missing => {
+                self.compile_vable_index = None;
+                self.compile_vable_root = GcRef::NULL;
+            }
+        }
+    }
+
+    /// `orig_inpargs[index_of_virtualizable].getref_base()` at the patch.
+    fn current_orig_vable_ptr(&self) -> *const u8 {
+        if let Some(index) = self.compile_vable_index {
+            return majit_ir::const_ptr_table::resolve(index).0 as *const u8;
+        }
+        self.compile_vable_root.0 as *const u8
     }
 
     /// compile.py:168 / pyjitpl.py direct_call_may_force parity: every real loop token must  allow-line-citation
@@ -8475,6 +8708,9 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
             &mut self.compile_resume_memos,
+            &mut self.compile_vable_index,
+            &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         // Only this call's own give-up decides the reason the caller accounts.
         self.pending_abort_reason = None;
@@ -8788,7 +9024,7 @@ impl<M: Clone> MetaInterp<M> {
         // (compile.py patch_new_loop_to_load_virtualizable_fields). Clone
         // merge-point data out of the parked ctx
         // so later `&mut` accesses do not fight a live `&MergePoint`.
-        let (orig_vable_ptr_loop, cross_loop_cut, call_pure_results) = {
+        let (orig_vable_loop, cross_loop_cut, call_pure_results) = {
             let ctx = self.compile_tracing.as_ref().unwrap();
             let n_inputargs = ctx.num_inputargs();
             // `reached_loop_header` `same_greenkey`: typed greens, not a
@@ -8796,8 +9032,8 @@ impl<M: Clone> MetaInterp<M> {
             let cut_merge_point = ctx
                 .find_merge_point_same_greenkey(green_key, closed_for_scan.as_ref())
                 .filter(|mp| mp.position.has_prefix_ops(n_inputargs));
-            let orig_vable_ptr_loop =
-                self.orig_vable_ptr_for_cut(cut_merge_point, ctx, driver_descriptor.as_ref());
+            let orig_vable_loop =
+                self.orig_vable_for_cut(cut_merge_point, ctx, driver_descriptor.as_ref());
             let cross_loop_cut = cut_merge_point.map(|mp| {
                 (
                     mp.green_boxes.clone(),
@@ -8808,8 +9044,11 @@ impl<M: Clone> MetaInterp<M> {
             });
             // compile.py compile_simple_loop: call_pure_results = metainterp.call_pure_results
             let call_pure_results = ctx.call_pure_results.clone();
-            (orig_vable_ptr_loop, cross_loop_cut, call_pure_results)
+            (orig_vable_loop, cross_loop_cut, call_pure_results)
         };
+        // Before `close_loop` and the later `take` of `compile_tracing`.
+        // Optimization allocates `NUMBERING` with the ctx already detached.
+        self.publish_orig_vable(orig_vable_loop);
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
         // resume.py ResumeDataLoopMemo.number walks `trace.get_snapshot_iter`
@@ -8839,8 +9078,14 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap()
             .recorder
             .close_loop(jump_args);
-        // Taking the parked ctx ends walk_active_trace_refs coverage;
-        // compile_snapshot_refs roots the final maps below.
+        // `materialize_ops` copies `FrontendSlot.concrete` onto op values
+        // and interns. `walk_active_trace_refs` stops seeing this recorder
+        // at `take`, so materialize first.
+        self.compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .materialize_into_ops();
         let mut ctx = self.compile_tracing.take().unwrap();
         let mut recorder = ctx.recorder;
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
@@ -8868,7 +9113,10 @@ impl<M: Clone> MetaInterp<M> {
         // When the trace was retargeted to a different loop header,
         // cut_trace_from removes ops before the merge point and
         // replaces inputargs with original_boxes at the cut position.
-        let trace = if let Some((ref original_boxes, start)) = cross_loop_cut {
+        let mut trace = if let Some((ref original_boxes, start)) = cross_loop_cut {
+            // `cut_trace_from` reads op values while it builds
+            // the cut. Keep the source forwarded for that whole read.
+            let _cut_src = self.publish_tree_loop(&mut trace);
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] cut_trace_from: start.op_index={} original_boxes={} jump_args={} trace_ops={} header_pc={}",
@@ -8894,7 +9142,10 @@ impl<M: Clone> MetaInterp<M> {
             // is total: `opencoder.py CutTrace` views the suffix with
             // `inputargs` = the merge-point live boxes. A pre-cut producer
             // the suffix names is one of those boxes (`TraceIterator._get`).
-            trace.cut_trace_from(start, original_boxes)
+            let cut = trace.cut_trace_from(start, original_boxes);
+            drop(_cut_src);
+            drop(trace);
+            cut
         } else {
             trace
         };
@@ -8909,6 +9160,9 @@ impl<M: Clone> MetaInterp<M> {
             .max_retrace_guards();
         let (enable_opts, disable_unrolling, pureop_historylength) =
             self.snapshot_compiling_opt_params();
+        // `compile_tracing` no longer names these ops. Preamble setup and
+        // snapshot lowering allocate before `publish_ops_span`.
+        let _trace_roots = self.publish_tree_loop(&mut trace);
         let preamble_data =
             compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, &enable_opts);
         let trace_snapshots = preamble_data.base.snapshots();
@@ -8999,6 +9253,10 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_live_op_roots_slot = Some(
+            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
+                as usize,
+        );
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.compile_resume_memos_slot = Some(
@@ -9757,7 +10015,6 @@ impl<M: Clone> MetaInterp<M> {
             &mut compiled_ops,
             &mut constants,
             driver_descriptor.as_ref(),
-            orig_vable_ptr_loop,
         );
         if crate::majit_log_enabled() {
             eprintln!(
@@ -10353,6 +10610,9 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
             &mut self.compile_resume_memos,
+            &mut self.compile_vable_index,
+            &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         let ends_with_jump = finish_descr.is_none();
         if self.tracing.is_none() {
@@ -10464,28 +10724,13 @@ impl<M: Clone> MetaInterp<M> {
         // ambient `active_jitdriver_sd` / `vable_ptr` can belong to an inlined
         // callee and is not an admissible substitute for this frame.
         let entry_driver_descriptor = ctx.driver_descriptor().cloned();
-        let entry_orig_vable_ptr = if entry_bridge.is_some() {
-            let from_initial_args = entry_driver_descriptor
-                .as_ref()
-                .and_then(|driver| driver.virtualizable_arg_index())
-                .and_then(|idx| ctx.initial_inputarg_consts.get(idx))
-                .and_then(|value| match value {
-                    OpRef::ConstPtr(index) if *index != 0 => {
-                        Some(majit_ir::const_ptr_table::resolve(*index).0 as *const u8)
-                    }
-                    _ => None,
-                });
-            from_initial_args
-                .or_else(|| match ctx.standard_virtualizable_concrete() {
-                    Some(Value::Ref(reference)) if !reference.is_null() => {
-                        Some(reference.as_usize() as *const u8)
-                    }
-                    _ => None,
-                })
-                .or_else(|| ctx.virtualizable_heap_ptr())
-                .unwrap_or(std::ptr::null())
+        // Same anchor as `orig_vable_from_trace_ctx`. Resolving here would
+        // copy the from-space address across `compile_entry_bridge`'s
+        // `NUMBERING` allocation.
+        let entry_vable = if entry_bridge.is_some() {
+            Self::orig_vable_from_trace_ctx(ctx, entry_driver_descriptor.as_ref())
         } else {
-            std::ptr::null()
+            OrigVable::Missing
         };
         // The recorder carries Const values inline on the OpRef variants
         // (history.py:227/268/314), so there is no legacy TraceCtx
@@ -10638,12 +10883,12 @@ impl<M: Clone> MetaInterp<M> {
                     self.jitlog_trace_aborted();
                     return CompileOutcome::Cancelled;
                 };
+                self.publish_orig_vable(entry_vable);
                 let success = self.compile_entry_bridge(
                     green_key,
                     original_green_key,
                     entry_meta,
                     entry_driver_descriptor,
-                    entry_orig_vable_ptr,
                     &bridge_ops,
                     &bridge_inputargs,
                     finish_args,
@@ -10726,6 +10971,9 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
             &mut self.compile_resume_memos,
+            &mut self.compile_vable_index,
+            &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
@@ -10832,10 +11080,9 @@ impl<M: Clone> MetaInterp<M> {
         let (
             green_key,
             driver_descriptor,
-            orig_vable_ptr_retrace,
             loop_jitcell_token,
             mut constants,
-            trace,
+            mut trace,
             call_pure_results,
             phase2_input_ops_seed,
             mut ctx,
@@ -10859,7 +11106,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             };
-            let (orig_vable_ptr_retrace, retrace_cut, call_pure_results) = {
+            let (orig_vable_retrace, retrace_cut, call_pure_results) = {
                 let ctx = self.compile_tracing.as_ref().unwrap();
                 let retrace_merge_point = ctx
                     .merge_point_at_start(retrace_pos)
@@ -10900,14 +11147,13 @@ impl<M: Clone> MetaInterp<M> {
                         ),
                     )
                 });
-                let orig_vable_ptr_retrace = self.orig_vable_ptr_for_cut(
-                    retrace_merge_point,
-                    ctx,
-                    driver_descriptor.as_ref(),
-                );
+                let orig_vable_retrace =
+                    self.orig_vable_for_cut(retrace_merge_point, ctx, driver_descriptor.as_ref());
                 let call_pure_results = ctx.call_pure_results.clone();
-                (orig_vable_ptr_retrace, retrace_cut, call_pure_results)
+                (orig_vable_retrace, retrace_cut, call_pure_results)
             };
+            // Before `close_loop` can collect, and before `take` detaches the ctx.
+            self.publish_orig_vable(orig_vable_retrace);
             let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
             // `compile_retrace` records the closing JUMP on the same history
@@ -10919,9 +11165,13 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.close_loop(jump_args);
                 jump_cut
             };
+            // Decode snapshots and copy `FrontendSlot.concrete` while
+            // `walk_active_trace_refs` still forwards this recorder.
+            let parked_trace = self.compile_tracing.as_mut().unwrap().snapshot_tree_loop();
             let mut ctx = self.compile_tracing.take().unwrap();
-            let trace = ctx.snapshot_tree_loop();
+            let mut trace = parked_trace;
             let trace = if let Some((ref original_boxes, start)) = retrace_cut {
+                let _cut_src = self.publish_tree_loop(&mut trace);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={}",
@@ -10943,7 +11193,10 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile.py compile_retrace` `cut_trace_from` is total:
                 // `opencoder.py CutTrace` views the suffix with the merge
                 // point's live boxes as inputargs.
-                trace.cut_trace_from(start, original_boxes)
+                let cut = trace.cut_trace_from(start, original_boxes);
+                drop(_cut_src);
+                drop(trace);
+                cut
             } else {
                 trace
             };
@@ -10951,7 +11204,7 @@ impl<M: Clone> MetaInterp<M> {
             // `inputargs[i].get_position()`, then `next` rewrites ops and
             // snapshots onto the fresh boxes. The unroll phases walk that
             // rewritten trace with a dense `TraceIterator::new`.
-            let trace = prepare_retrace_snapshot(trace);
+            let trace = prepare_retrace_snapshot(trace, &mut self.compile_live_op_roots);
             // Seed the retrace optimizer's `input_ops` directly. Retrace runs
             // no Phase 1, so the recorder ops carry no `_forwarded`, and
             // `trace.ops` (non-cut) are the recorder `Rc<Op>` themselves. Cut
@@ -10965,7 +11218,6 @@ impl<M: Clone> MetaInterp<M> {
             (
                 green_key,
                 driver_descriptor,
-                orig_vable_ptr_retrace,
                 loop_jitcell_token,
                 constants,
                 trace,
@@ -10976,6 +11228,7 @@ impl<M: Clone> MetaInterp<M> {
             )
         };
 
+        let _retrace_roots = self.publish_tree_loop(&mut trace);
         let partial_ops_before = partial.ops.len();
         // unroll.py `optimize_peeled_loop(trace.get_iter())` mints a fresh
         // ResOperation per `next()`. The recorder `OpRc` slice is that
@@ -11017,6 +11270,10 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_live_op_roots_slot = Some(
+            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
+                as usize,
+        );
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.compile_resume_memos_slot = Some(
@@ -11294,7 +11551,6 @@ impl<M: Clone> MetaInterp<M> {
             &mut combined_ops,
             &mut constants,
             driver_descriptor.as_ref(),
-            orig_vable_ptr_retrace,
         );
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
@@ -12063,6 +12319,9 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
             &mut self.compile_resume_memos,
+            &mut self.compile_vable_index,
+            &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
@@ -12085,10 +12344,12 @@ impl<M: Clone> MetaInterp<M> {
         // `patch_new_loop_to_load_virtualizable_fields` below can read the
         // heap object via `vinfo.get_array_length(vable, i)` without
         // consulting a separate trace-start cache.
-        let orig_vable_ptr = {
+        let orig_vable = {
             let ctx = self.compile_tracing.as_ref().unwrap();
-            self.orig_vable_ptr_from_trace_ctx(ctx, driver_descriptor.as_ref())
+            Self::orig_vable_from_trace_ctx(ctx, driver_descriptor.as_ref())
         };
+        // Before `recorder.finish` and the later `take` of `compile_tracing`.
+        self.publish_orig_vable(orig_vable);
         // pyjitpl.py compile_done_with_this_frame parity:
         // `store_token_in_vable` (SetfieldGc on vable_token + the
         // accompanying GUARD_NOT_FORCED_2) is recorded by the pyre
@@ -12154,10 +12415,16 @@ impl<M: Clone> MetaInterp<M> {
         self.jitlog_start_new_trace(true, green_key, &jd_name);
         let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         // resume.py ResumeDataLoopMemo.number consumes the encoded snapshot
-        // arrays without a materialized intermediate. Taking the parked ctx
-        // ends walk_active_trace_refs coverage; the recorder's `_refs` stay
+        // arrays without a materialized intermediate. `materialize_ops`
+        // copies `FrontendSlot.concrete` before `take` ends
+        // `walk_active_trace_refs` coverage. The recorder's `_refs` stay
         // rooted by their owner roots, and compile_snapshot_refs roots the
         // list recorder's maps below, before optimization can invoke the GC.
+        self.compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .materialize_into_ops();
         let mut ctx = self.compile_tracing.take().unwrap();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
         let number_from_recorder = ctx.recorder.has_byte_buffer();
@@ -12169,13 +12436,14 @@ impl<M: Clone> MetaInterp<M> {
         let mut recorder = ctx.recorder;
         // `snapshot_recorder` stays put until the optimizer has numbered
         // every guard; the feed holds a pointer to it.
-        let (trace, snapshot_recorder) = if number_from_recorder {
+        let (mut trace, snapshot_recorder) = if number_from_recorder {
             (recorder.to_tree_loop(), Some(recorder))
         } else {
             (recorder.get_trace(), None)
         };
         let (enable_opts, _disable_unrolling, _pureop_historylength) =
             self.snapshot_compiling_opt_params();
+        let _finish_roots = self.publish_tree_loop(&mut trace);
         let SimpleCompileViews {
             data: simple_data,
             trace_ops,
@@ -12444,7 +12712,6 @@ impl<M: Clone> MetaInterp<M> {
             &mut optimized_ops,
             &mut constants,
             driver_descriptor.as_ref(),
-            orig_vable_ptr,
         );
 
         let compiled_constants_typed =
@@ -12663,6 +12930,9 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
             &mut self.compile_resume_memos,
+            &mut self.compile_vable_index,
+            &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
@@ -12679,10 +12949,12 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:510 parity — capture orig_inpargs[idx].getref_base()
         // before `ctx.recorder` is moved. Used by the send_loop_to_backend
         // hook below.
-        let orig_vable_ptr_simple = {
+        let orig_vable_simple = {
             let ctx = self.compile_tracing.as_ref().unwrap();
-            self.orig_vable_ptr_from_trace_ctx(ctx, driver_descriptor.as_ref())
+            Self::orig_vable_from_trace_ctx(ctx, driver_descriptor.as_ref())
         };
+        // Before `take` detaches the ctx from `walk_active_trace_refs`.
+        self.publish_orig_vable(orig_vable_simple);
 
         let call_pure_results = self
             .compile_tracing
@@ -12693,6 +12965,12 @@ impl<M: Clone> MetaInterp<M> {
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
         // resume.py ResumeDataLoopMemo.number walks the encoded snapshot
         // of each surviving guard; only the list recorder needs maps.
+        // Copy `FrontendSlot.concrete` before `take` detaches the recorder.
+        self.compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .materialize_into_ops();
         let mut ctx = self.compile_tracing.take().unwrap();
         let number_from_recorder = ctx.recorder.has_byte_buffer();
         let snapshot_maps = if number_from_recorder {
@@ -12701,13 +12979,14 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_maps_from_ctx(&mut ctx, &mut constants)
         };
         let mut recorder = ctx.recorder;
-        let (trace, snapshot_recorder) = if number_from_recorder {
+        let (mut trace, snapshot_recorder) = if number_from_recorder {
             (recorder.to_tree_loop(), Some(recorder))
         } else {
             (recorder.get_trace(), None)
         };
         let (enable_opts, _disable_unrolling, _pureop_historylength) =
             self.snapshot_compiling_opt_params();
+        let _simple_roots = self.publish_tree_loop(&mut trace);
         let SimpleCompileViews {
             data: simple_data,
             trace_ops,
@@ -12912,7 +13191,6 @@ impl<M: Clone> MetaInterp<M> {
             &mut compiled_ops,
             &mut constants,
             driver_descriptor.as_ref(),
-            orig_vable_ptr_simple,
         );
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
@@ -15903,7 +16181,6 @@ impl<M: Clone> MetaInterp<M> {
         original_green_key: u64,
         meta: M,
         driver_descriptor: Option<crate::jitdriver::JitDriverStaticData>,
-        orig_vable_ptr_entry: *const u8,
         bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArgRc],
         jump_args: &[OpRef],
@@ -16129,6 +16406,7 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             }
         };
+        let _entry_live_pre_strip = self.publish_live_ops(&optimized_ops);
         let opt_time = Instant::now().saturating_duration_since(optimize_start);
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
@@ -16171,7 +16449,9 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
+        drop(_entry_live_pre_strip);
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let _entry_live_ops = self.publish_live_ops(&optimized_ops);
         let mut entry_inputargs: Vec<InputArgRc> = bridge_inputargs.to_vec();
         // compile.py -> send_loop_to_backend(..., orig_inputargs):
         // entry bridges are loops installed as an interpreter front door, so
@@ -16189,7 +16469,6 @@ impl<M: Clone> MetaInterp<M> {
             &mut optimized_ops,
             &mut constants,
             driver_descriptor.as_ref(),
-            orig_vable_ptr_entry,
         );
         let num_optimized_ops = optimized_ops.len();
         let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
@@ -17001,6 +17280,10 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             }
         };
+        // Folded ConstPtr indexes live on this vec until the backend
+        // re-interns them. Hold it across retrace, then again after strip
+        // moves the `Vec`.
+        let _live_pre_strip = self.publish_live_ops(&optimized_ops);
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
         // RPython-orthodox: no post-optimize cross-trace constant merge.
@@ -17056,7 +17339,9 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
+        drop(_live_pre_strip);
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let _live_ops = self.publish_live_ops(&optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants_typed =
@@ -17605,7 +17890,8 @@ impl<M: Clone> MetaInterp<M> {
         // forced virtuals fell back to NullAllocator entries and pending
         // heap writes were dropped on async forcing.
         let storage = exit_layout.storage.as_deref();
-        let rd_numb = storage.and_then(|s| s.rd_numb()).unwrap_or(&[]);
+        let numb_root = storage.and_then(|s| s.rd_numb_ref());
+        let rd_numb = numb_root.map(|n| n.as_slice()).unwrap_or(&[]);
         let rd_consts: &[Const] = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
         // resume.py _prepare(storage) parity: materialize rd_virtuals
         // entries before handling_async_forcing. The decoder needs the
@@ -17652,6 +17938,7 @@ impl<M: Clone> MetaInterp<M> {
                 vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo — pyre has no greenfield mechanism
                 allocator,
+                numb_root,
             );
         if crate::majit_log_enabled() {
             eprintln!(
@@ -24091,7 +24378,7 @@ mod portal_resume_rebuild_tests {
 
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::new_resume_storage(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(majit_ir::descr::make_size_descr(16)),
@@ -24180,7 +24467,7 @@ mod portal_resume_rebuild_tests {
 
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::new_resume_storage(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(majit_ir::descr::make_size_descr(16)),
@@ -24258,7 +24545,7 @@ mod portal_resume_rebuild_tests {
         );
         let mut tracing = crate::TraceCtx::for_test(0);
         let storage = crate::resume::new_resume_storage(
-            vec![],
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
             vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VirtualInfo {
                 descr: Some(size_descr),
@@ -30224,6 +30511,60 @@ mod tests {
     }
 
     #[test]
+    fn walk_active_trace_refs_forwards_carrier_recipe_ref() {
+        // `ReconstructRecipe::concrete_r` copies the resume ref. While the
+        // carrier is still on the trace, a minor has to move that word; a
+        // null slot and a non-ref stay put.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        trace_ctx.set_bridge_inline_carrier(crate::trace_ctx::BridgeInlineCarrier {
+            root_pc: 0,
+            root_jitcode_index: 0,
+            recipes: vec![crate::trace_ctx::ReconstructRecipe {
+                code_ptr: std::ptr::null(),
+                jitcode_index: 0,
+                jitcode_pc: 0,
+                nlocals: 1,
+                valuestackdepth: 3,
+                registers_i: Vec::new(),
+                registers_r: vec![OpRef::ref_op(1), OpRef::NONE, OpRef::ref_op(2)],
+                registers_f: Vec::new(),
+                concrete_r: vec![
+                    Value::Ref(GcRef(0xC000)),
+                    Value::Ref(GcRef::NULL),
+                    Value::Int(4),
+                ],
+                frame: OpRef::NONE,
+                nargs: 0,
+                return_substitute: None,
+                len_tail: false,
+                rebuilt_frame: None,
+                rebuilt_ec: None,
+            }],
+        });
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xC000 {
+                slot.0 = 0xD000;
+            }
+        });
+
+        let concrete = &meta
+            .tracing
+            .as_ref()
+            .unwrap()
+            .bridge_inline_carrier
+            .as_ref()
+            .unwrap()
+            .recipes[0]
+            .concrete_r;
+        assert!(matches!(concrete[0], Value::Ref(GcRef(0xD000))));
+        assert!(matches!(concrete[1], Value::Ref(GcRef::NULL)));
+        assert!(matches!(concrete[2], Value::Int(4)));
+    }
+
+    #[test]
     fn walk_active_trace_refs_forwards_inputarg_value_ref() {
         // `set_concrete_at` also stamps `Value::Ref` onto recorder
         // InputArgs (loop / bridge entry args), reached only through this
@@ -30248,8 +30589,8 @@ mod tests {
 
     #[test]
     fn walk_active_trace_refs_forwards_snapshot_const_ptr() {
-        // `get_list_of_active_snapshot_boxes` copies a constant ref register's
-        // gcref into a raw `SnapshotTagged::Const` word, and the vable / vref
+        // `get_list_of_active_snapshot_boxes` stores a constant ref as a
+        // const_ptr_table index (`history.py` `ConstPtr`). The vable / vref
         // lists can hold an inline `ConstPtr` operand. Both accumulate across
         // the whole trace, so a collection during tracing must forward them.
         let mut meta = MetaInterp::<()>::new(0);
@@ -30265,7 +30606,7 @@ mod tests {
                 jitcode_index: 0,
                 pc: 4,
                 boxes: vec![
-                    crate::recorder::SnapshotTagged::Const(0x91_0000_A000, Type::Ref),
+                    crate::recorder::SnapshotTagged::Const(i64::from(index), Type::Ref),
                     // Same bits, non-Ref type: an integer, not an address.
                     crate::recorder::SnapshotTagged::Const(0xA000, Type::Int),
                 ],
@@ -30288,9 +30629,10 @@ mod tests {
         });
 
         let snapshot = &meta.tracing.as_ref().unwrap().snapshots[0];
+        // The index does not move. The table slot does.
         assert_eq!(
             snapshot.frames[0].boxes[0],
-            crate::recorder::SnapshotTagged::Const(0x91_0000_B000, Type::Ref)
+            crate::recorder::SnapshotTagged::Const(i64::from(index), Type::Ref)
         );
         assert_eq!(
             majit_ir::const_ptr_table::resolve(index),
@@ -30318,10 +30660,8 @@ mod tests {
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
         let input = trace_ctx.recorder.inputargs()[0].opref();
         trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
-        let addr = GcRef(0x93_0000_A000);
-        let index = majit_ir::const_ptr_table::intern(addr);
-        let _restore = RestoreConstPtr { index, addr };
-        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (OpRef::const_ptr(addr), 0)];
+        let (const_ref, index, _restore) = intern_const_ptr(GcRef(0x93_0000_A000));
+        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (const_ref, 0)];
         meta.tracing = Some(trace_ctx);
 
         meta.walk_active_trace_refs(|slot| {
@@ -30339,7 +30679,12 @@ mod tests {
         assert_eq!(meta.tracing.as_ref().unwrap().box_bits(input), Some(0x8000));
         let boxes = &meta.tracing.as_ref().unwrap().virtualref_boxes;
         assert_eq!(boxes[0].1, 0x9100);
-        assert_eq!(boxes[1].0, OpRef::const_ptr(GcRef(0x93_0000_B000)));
+        // The index does not move. The table slot does.
+        assert_eq!(boxes[1].0, OpRef::ConstPtr(index));
+        assert_eq!(
+            majit_ir::const_ptr_table::resolve(index),
+            GcRef(0x93_0000_B000)
+        );
     }
 
     #[test]
@@ -30348,9 +30693,206 @@ mod tests {
         // pyjitpl.py only creates `History()` while tracing is
         // active.
         let mut meta = MetaInterp::<()>::new(0);
-        let mut visited = 0u32;
-        meta.walk_active_trace_refs(|_| visited += 1);
-        assert_eq!(visited, 0);
+        meta.walk_active_trace_refs(|_| {});
+        assert!(meta.tracing.is_none());
+    }
+
+    fn intern_const_ptr(addr: GcRef) -> (OpRef, u32, RestoreConstPtr) {
+        let const_ref = OpRef::const_ptr(addr);
+        let index = const_ref
+            .const_ptr_index()
+            .expect("non-null const ptr has an index");
+        assert_ne!(index, 0);
+        (const_ref, index, RestoreConstPtr { index, addr })
+    }
+
+    #[repr(C)]
+    struct VableLen {
+        len: usize,
+    }
+
+    #[repr(C)]
+    struct VableFrame {
+        arr: *mut VableLen,
+    }
+
+    fn vable_length_info() -> VirtualizableInfo {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_array_field(
+            "arr",
+            Type::Int,
+            std::mem::offset_of!(VableFrame, arr),
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
+        info
+    }
+
+    /// A pointer copied before `NUMBERING` allocation still names the
+    /// from-space frame after the table slot has moved and that frame's
+    /// length word has been overwritten. Resolving the index at the patch
+    /// reads the survivor.
+    #[test]
+    fn compile_vable_anchor_resolves_forwarded_frame_length() {
+        let dead_array = Box::leak(Box::new(VableLen { len: 4 }));
+        let live_array = Box::leak(Box::new(VableLen { len: 7 }));
+        let dead = Box::leak(Box::new(VableFrame { arr: dead_array }));
+        let live = Box::leak(Box::new(VableFrame { arr: live_array }));
+        let dead_addr = GcRef(dead as *mut VableFrame as usize);
+        let live_addr = GcRef(live as *mut VableFrame as usize);
+        // Private sentinel. The frames themselves are not intern keys:
+        // `intern` hashes the address, and a later `set_slot` is what a
+        // minor writes into the existing index.
+        let (const_ref, index, _restore) = intern_const_ptr(GcRef(0x96E2_4000));
+        majit_ir::const_ptr_table::set_slot(index, dead_addr);
+        let captured = majit_ir::const_ptr_table::resolve(index).0 as *const u8;
+        majit_ir::const_ptr_table::set_slot(index, live_addr);
+        dead_array.len = 99;
+
+        let info = vable_length_info();
+        let stale = unsafe { info.get_array_length(captured, 0) };
+        assert_eq!(stale, 99);
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut ctx = TraceCtx::for_test(1);
+        let driver = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        ctx.set_driver_descriptor(driver.clone());
+        ctx.initial_inputarg_consts = vec![const_ref];
+        let vable = meta.orig_vable_for_cut(None, &ctx, Some(&driver));
+        assert!(matches!(vable, OrigVable::Index(got) if got == index));
+        meta.publish_orig_vable(vable);
+        let live_len = unsafe { info.get_array_length(meta.current_orig_vable_ptr(), 0) };
+        assert_eq!(live_len, 7);
+    }
+
+    /// After `compile_tracing` is taken, `walk_active_trace_refs` no longer
+    /// reaches `initial_inputarg_consts`. The snapshot walker has to forward
+    /// the published index, and dropping the compile guard releases it.
+    #[test]
+    fn compile_vable_anchor_index_moves_only_on_snapshot_walk() {
+        let dead = GcRef(0x96E2_5000);
+        let live = GcRef(0x96E2_6000);
+        let (const_ref, index, _restore) = intern_const_ptr(dead);
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut ctx = TraceCtx::for_test(1);
+        let driver = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        ctx.set_driver_descriptor(driver.clone());
+        ctx.initial_inputarg_consts = vec![const_ref];
+        let vable = meta.orig_vable_for_cut(None, &ctx, Some(&driver));
+        meta.compile_tracing = Some(ctx);
+        {
+            let _guard = CompileSnapshotRootsGuard::new(
+                &mut meta.compile_snapshot_refs,
+                &mut meta.compile_short_preamble_producer,
+                &mut meta.compile_resume_memos,
+                &mut meta.compile_vable_index,
+                &mut meta.compile_vable_root,
+                &mut meta.compile_live_op_roots,
+            );
+            meta.publish_orig_vable(vable);
+            let _detached = meta.compile_tracing.take();
+            meta.walk_active_trace_refs(|slot| {
+                if slot.0 == dead.0 {
+                    slot.0 = live.0;
+                }
+            });
+            assert_eq!(majit_ir::const_ptr_table::resolve(index), dead);
+            meta.walk_compile_snapshot_refs(|slot| {
+                if slot.0 == dead.0 {
+                    slot.0 = live.0;
+                }
+            });
+            assert_eq!(majit_ir::const_ptr_table::resolve(index), live);
+            assert_eq!(meta.current_orig_vable_ptr(), live.0 as *const u8);
+        }
+        assert!(meta.compile_vable_index.is_none());
+        assert!(meta.compile_vable_root.is_null());
+        assert!(meta.current_orig_vable_ptr().is_null());
+    }
+
+    /// An index that lives only on an optimized op vec is invisible to the
+    /// recorder. Publishing that vec makes `walk_compile_snapshot_refs`
+    /// forward the slot; dropping the guard releases it.
+    #[test]
+    fn compile_live_op_vec_forwards_on_snapshot_walk() {
+        let dead = GcRef(0x96E2_9000);
+        let live = GcRef(0x96E2_A000);
+        let (const_ref, index, _restore) = intern_const_ptr(dead);
+        let op = majit_ir::OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::GuardTrue,
+            &[majit_ir::operand::Operand::from_opref(const_ref)],
+        ));
+        let ops = vec![op];
+        let mut meta = MetaInterp::<()>::new(0);
+        {
+            let _compile = CompileSnapshotRootsGuard::new(
+                &mut meta.compile_snapshot_refs,
+                &mut meta.compile_short_preamble_producer,
+                &mut meta.compile_resume_memos,
+                &mut meta.compile_vable_index,
+                &mut meta.compile_vable_root,
+                &mut meta.compile_live_op_roots,
+            );
+            let _published = meta.compile_live_op_roots.publish_vec(&ops);
+            meta.walk_compile_snapshot_refs(|slot| {
+                if slot.0 == dead.0 {
+                    slot.0 = live.0;
+                }
+            });
+            assert_eq!(majit_ir::const_ptr_table::resolve(index), live);
+            drop(_published);
+            majit_ir::const_ptr_table::set_slot(index, dead);
+            meta.walk_compile_snapshot_refs(|slot| {
+                if slot.0 == dead.0 {
+                    slot.0 = live.0;
+                }
+            });
+            assert_eq!(majit_ir::const_ptr_table::resolve(index), dead);
+        }
+        assert!(meta.compile_live_op_roots.is_empty());
+    }
+
+    /// A cut's merge point names the frame by address, not by `ConstPtr`.
+    /// That word lives in `compile_vable_root` so the same walker can move it.
+    #[test]
+    fn compile_vable_anchor_cut_addr_moves_on_snapshot_walk() {
+        let dead = GcRef(0x96E2_7000);
+        let live = GcRef(0x96E2_8000);
+        let mut meta = MetaInterp::<()>::new(0);
+        let ctx = TraceCtx::for_test(1);
+        let cut = crate::trace_ctx::MergePoint {
+            green_key: 1,
+            green_key_typed: None,
+            position: crate::recorder::TracePosition {
+                _pos: 0,
+                _count: 0,
+                _index: 0,
+                snapshot_data_len: 0,
+                snapshot_array_data_len: 0,
+            },
+            green_boxes: Vec::new(),
+            header_pc: 0,
+            vable_ptr: dead.0,
+        };
+        let vable = meta.orig_vable_for_cut(Some(&cut), &ctx, None);
+        assert!(matches!(vable, OrigVable::Addr(addr) if addr == dead));
+        meta.publish_orig_vable(vable);
+        meta.walk_compile_snapshot_refs(|slot| {
+            if slot.0 == dead.0 {
+                slot.0 = live.0;
+            }
+        });
+        assert_eq!(meta.current_orig_vable_ptr(), live.0 as *const u8);
+        assert!(meta.compile_vable_index.is_none());
     }
 
     #[test]
@@ -30651,6 +31193,7 @@ mod tests {
             .rd_consts_arc()
             .expect("pool")[0];
         meta.remember_compiled_graph_write();
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         meta.walk_rd_consts_refs(|slot| {
             seen += 1;
             if slot.0 == 0x96_0000_1000 {
@@ -30671,8 +31214,9 @@ mod tests {
         assert_eq!(seen, 1, "the publication barrier is consumed once");
 
         set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         meta.walk_rd_consts_refs(|_| seen += 1);
-        assert_eq!(seen, 2, "major marking always sees the compiled graph");
+        assert_eq!(seen, 2, "major marking traces the pool again");
     }
 
     /// `history.py TargetToken` is a GC object on
@@ -30764,6 +31308,82 @@ mod tests {
             vec![0x94_0000_4000],
             "a JUMP target kept only through keepalive_tokens is a root \
              the same way a previous_tokens predecessor is"
+        );
+    }
+
+    /// `ResumeDataDirectReader::decode_ref` reads `ConstPtr.getref_base`
+    /// off `ResumeGuardDescr.rd_consts`. A major that never
+    /// `trace_index`s that pool frees the slot (`sweep_untraced`).
+    /// `walk_rd_consts_refs` is the extra-root walk that stamps it.
+    #[test]
+    fn walk_rd_consts_refs_stamps_resume_storage_constptr() {
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+        use majit_ir::const_ptr_table::resolve;
+
+        let dead = GcRef(0x91_0000_C001);
+        let live = GcRef(0x91_0000_C002);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+        descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .set_rd_consts(Some(vec![majit_ir::Const::from_gcref(dead)]));
+        let stored = descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .rd_consts_arc()
+            .expect("pool")[0];
+        let majit_ir::Const::Ref(index) = stored else {
+            panic!("from_gcref interned a Ref");
+        };
+        let mut exit_layouts = crate::FxIndexMap::default();
+        exit_layouts.insert(
+            0,
+            StoredExitLayout {
+                source_op_index: None,
+                recovery_layout: None,
+                resume_layout: None,
+                descr: Some(descr.clone()),
+                op_arg_types_for_jump: None,
+            },
+        );
+        let mut traces = crate::FxIndexMap::default();
+        traces.insert(
+            1,
+            CompiledTrace {
+                inputargs: Vec::new(),
+                ops: Vec::new(),
+                constants: majit_ir::ConstMap::default(),
+                exit_layouts,
+                terminal_exit_layouts: crate::FxIndexMap::default(),
+            },
+        );
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.insert_compiled_loop(
+            7,
+            CompiledEntry {
+                token: std::sync::Weak::new(),
+                meta: std::sync::Arc::new(()),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces,
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        meta.walk_rd_consts_refs(|slot| {
+            if slot.0 == dead.0 {
+                *slot = live;
+            }
+        });
+        assert_eq!(
+            resolve(index),
+            live,
+            "walk_rd_consts_refs must trace_index the rd_consts holder"
         );
     }
 
@@ -30894,7 +31514,12 @@ mod tests {
             vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()].into(),
         );
         let pending_bridge_rd = PendingBridgeRd {
-            storage: crate::resume::new_resume_storage(vec![1, 2, 3], vec![], vec![], vec![]),
+            storage: crate::resume::new_resume_storage(
+                majit_ir::NumberingRef::from_bytes(&[1, 2, 3]),
+                vec![],
+                vec![],
+                vec![],
+            ),
             frontend_boxes: vec![11, 22],
             liveboxes: vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
             livebox_types: vec![Type::Int, Type::Ref],
@@ -31384,7 +32009,7 @@ mod tests {
                 descr: Some({
                     let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
                     let fd = descr.as_fail_descr().expect("resume guard");
-                    fd.set_rd_numb(Some(rd_numb));
+                    fd.set_rd_numb_arc(Some(rd_numb));
                     fd.set_rd_consts(Some(vec![]));
                     fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
                         majit_ir::RdVirtualInfo::VRawBufferInfo {
@@ -31458,7 +32083,7 @@ mod tests {
         backend: &majit_backend_dynasm::runner::DynasmBackend,
         token: &std::sync::Weak<JitCellToken>,
         fail_index: u32,
-        rd_numb: Vec<u8>,
+        rd_numb: majit_ir::NumberingRef,
         rd_consts: Vec<majit_ir::Const>,
     ) {
         // `CompiledEntry.token` is `Weak`; upgrade for the
@@ -31500,7 +32125,7 @@ mod tests {
         let descr_fd = descr_ref
             .as_fail_descr()
             .expect("descr must implement FailDescr");
-        descr_fd.set_rd_numb(Some(rd_numb));
+        descr_fd.set_rd_numb_arc(Some(rd_numb));
         descr_fd.set_rd_consts(Some(rd_consts));
         descr_fd.set_rd_virtuals(Some(vec![]));
         descr_fd.set_rd_pendingfields(Some(vec![]));
@@ -33448,7 +34073,6 @@ mod tests {
             original_green_key,
             (),
             None,
-            std::ptr::null(),
             &bridge_ops,
             &bridge_inputargs,
             &[],
@@ -34828,7 +35452,8 @@ mod tests {
         rec.close_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(2)]);
         let (inputargs, ops) = rec.clone_materialized_parts();
         let trace = crate::history::TreeLoop::from_oprc(inputargs, ops, Vec::new());
-        let prepared = prepare_retrace_snapshot(trace);
+        let mut roots = crate::optimizeopt::CompileLiveOpRoots::default();
+        let prepared = prepare_retrace_snapshot(trace, &mut roots);
         assert_eq!(
             prepared.ops[0].arg(1).to_opref(),
             prepared.inputargs[1].opref(),
@@ -35161,7 +35786,7 @@ mod loop_side_table_tests {
                 descr: Some({
                     let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
                     let fd = descr.as_fail_descr().expect("resume guard");
-                    fd.set_rd_numb(Some(rd_numb));
+                    fd.set_rd_numb_arc(Some(rd_numb));
                     fd.set_rd_consts(Some(vec![]));
                     fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
                         majit_ir::RdVirtualInfo::VRawBufferInfo {

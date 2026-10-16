@@ -148,6 +148,12 @@ impl Forwarded {
                     crate::const_ptr_table::trace_index(index, visitor);
                 }
             }
+            // `info.py` `AbstractStructPtrInfo._fields` live on `_forwarded`.
+            Forwarded::Info(info) => {
+                if let Some(ptr) = info.get_ptr_info() {
+                    ptr.borrow_mut().walk_const_ptr_refs_mut(visitor);
+                }
+            }
             _ => {}
         }
     }

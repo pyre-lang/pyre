@@ -172,6 +172,21 @@ pub struct ConstRRelocDescriptor {
     pub kind: ConstIRelocKind,
 }
 
+/// A zero-length array constant whose runtime `GcArray` is materialized
+/// at jitcode-load time. `Assembler.emit_const` stores the prebuilt
+/// zero-length `GcArray` pointer (`_ll_prebuilt_empty_array`); the
+/// translator cannot allocate that block, so the `constants_r` slot
+/// holds a non-canonical sentinel until the load pass writes one
+/// immortal empty array per item type.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct EmptyArrayConstDescriptor {
+    /// Position in [`JitCodeBody::constants_r`] holding the sentinel.
+    pub constants_r_index: usize,
+    /// Shaped-array class name (`Array<PyObjectRef;0>`, `Array<u8;0>`, …),
+    /// the runtime dedup key: one immortal empty `GcArray` per item type.
+    pub type_name: String,
+}
+
 /// Body of a `JitCode` — populated once by the assembler after
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
@@ -327,6 +342,11 @@ pub struct JitCodeBody {
     /// named here so the runtime rewrites them by provenance.
     #[serde(default)]
     pub reloc_consts_r: Vec<ConstRRelocDescriptor>,
+    /// Zero-length array constants deferred to runtime materialization —
+    /// [`Self::str_consts`]' shape for `_ll_prebuilt_empty_array`.
+    /// Default empty.
+    #[serde(default)]
+    pub empty_array_consts: Vec<EmptyArrayConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// The one-byte carrier is part of the JitCode format; both
     /// `JitCode.setup` and `Assembler.check_result` reject values that do not

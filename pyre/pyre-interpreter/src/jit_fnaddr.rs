@@ -3836,6 +3836,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_int2dec",
         pyre_object::lowlevel_string::jit_ll_int2dec,
     );
+    cpa1(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_str_from_rust_string",
+        "pyre_object::jit_ll_str_from_rust_string",
+        pyre_object::lowlevel_string::jit_ll_str_from_rust_string,
+    );
     // `rgc.ll_shrink_array` residual target for the StringBuilder `build` tree
     // (`_handle_rgc_call` rewrites the oopspec residual to `["jit_ll_shrink_array"]`).
     // The non-virtual shrink reallocs a raw low-level string down to its final
@@ -6209,6 +6215,14 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         (
             "gil_ready::GIL_READY_STATE",
             &raw const pyre_object::gil_ready::GIL_READY_STATE as *const _ as i64,
+        ),
+        // `rsiphash.py seed`: a prebuilt 16-byte secret. The Global is a
+        // `OnceLock`; the refs row is the initialized `[u8; 16]`
+        // `hash_secret` / `get_or_init` return (`bookkeeper.py
+        // immutablevalue` of that object).
+        (
+            "builtins::HASH_SECRET",
+            crate::builtins::hash_secret() as *const [u8; 16] as i64,
         ),
     ]
 }

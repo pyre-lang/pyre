@@ -20,6 +20,7 @@
 //! `_call_header_shadowstack`.
 use parking_lot::RwLock;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -357,6 +358,7 @@ thread_local! {
 /// be mutably accessed by its owner during a walk.
 struct MutatorEntry {
     thread_id: std::thread::ThreadId,
+    generation: u64,
     shadow_stack: *const ShadowStack,
     owner_roots: *const RefCell<Vec<Option<GcRef>>>,
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
@@ -367,6 +369,8 @@ struct MutatorEntry {
     pruners: Vec<MutatorPruner>,
     young_reconcilers: Vec<MutatorYoungReconciler>,
 }
+
+static NEXT_MUTATOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Walker for one opaque root area owned by a registered mutator.
 ///
@@ -403,12 +407,17 @@ pub fn current_extra_area() -> &'static str {
 /// is skipped when the area's walk panics, which leaves the finished area's
 /// label installed and makes the next validation failure name the wrong
 /// registrar -- the opposite of what the label exists for.
-struct ExtraAreaLabel(&'static str);
+pub struct ExtraAreaLabel(&'static str);
 
 impl Drop for ExtraAreaLabel {
     fn drop(&mut self) {
         CURRENT_EXTRA_AREA.with(|cell| cell.set(self.0));
     }
+}
+
+/// Stamp [`current_extra_area`] until the guard drops.
+pub fn extra_area_scope(name: &'static str) -> ExtraAreaLabel {
+    ExtraAreaLabel(CURRENT_EXTRA_AREA.with(|cell| cell.replace(name)))
 }
 
 /// Run one area's walk with [`current_extra_area`] naming it.
@@ -504,6 +513,7 @@ pub fn register_mutator() {
     );
     registry.push(MutatorEntry {
         thread_id,
+        generation: NEXT_MUTATOR_GENERATION.fetch_add(1, AtomicOrdering::Relaxed),
         shadow_stack,
         owner_roots,
         jf_root_stack,
@@ -514,6 +524,18 @@ pub fn register_mutator() {
         pruners: Vec::new(),
         young_reconcilers: Vec::new(),
     });
+}
+
+/// Whether this thread has a [`register_mutator`] entry.
+///
+/// Scoped extra areas panic without one. Callers that root only when a
+/// moving collector can see them use this to skip the area in tests that
+/// never register.
+pub fn mutator_is_registered() -> bool {
+    let thread_id = std::thread::current().id();
+    lock_mutator_registry()
+        .iter()
+        .any(|entry| entry.thread_id == thread_id)
 }
 
 /// Append an opaque root area to the current registered mutator.
@@ -529,7 +551,7 @@ pub unsafe fn register_mutator_extra_area(
     data: *const (),
     name: &'static str,
 ) {
-    register_extra_area(walk, data, name, false);
+    let _ = register_extra_area(walk, data, name, false);
 }
 
 fn register_extra_area(
@@ -537,7 +559,7 @@ fn register_extra_area(
     data: *const (),
     name: &'static str,
     scoped: bool,
-) -> usize {
+) -> (usize, u64) {
     let thread_id = std::thread::current().id();
     let mut registry = lock_mutator_registry();
     let entry = registry
@@ -545,13 +567,14 @@ fn register_extra_area(
         .find(|entry| entry.thread_id == thread_id)
         .expect("register_mutator_extra_area called before register_mutator");
     let index = entry.extra_areas.len();
+    let generation = entry.generation;
     entry.extra_areas.push(Some(MutatorExtraArea {
         walk,
         data,
         name,
         scoped,
     }));
-    index
+    (index, generation)
 }
 
 /// Scoped translated-root publication, corresponding to
@@ -560,6 +583,8 @@ fn register_extra_area(
 /// Slots stay fixed so independently owned frames may retire out of order.
 pub struct MutatorExtraAreaGuard {
     index: usize,
+    generation: u64,
+    scoped: bool,
     // An area belongs to its acquiring mutator; prevent Send/Sync.
     _owner: std::marker::PhantomData<*const ()>,
 }
@@ -570,8 +595,34 @@ impl MutatorExtraAreaGuard {
     /// must obey MutatorExtraWalkFn's STW/owner-thread contract, including
     /// Rust aliasing rules. Drop the guard before unregistering the mutator.
     pub unsafe fn new(walk: MutatorExtraWalkFn, data: *const (), name: &'static str) -> Self {
+        let (index, generation) = register_extra_area(walk, data, name, true);
         Self {
-            index: register_extra_area(walk, data, name, true),
+            index,
+            generation,
+            scoped: true,
+            _owner: std::marker::PhantomData,
+        }
+    }
+
+    /// Mutator-lifetime extra area with RAII unregistration.
+    ///
+    /// [`Self::new`] is the frame-owned path and must drop before
+    /// [`unregister_mutator`]. `TargetToken.virtual_state` (and the short
+    /// preamble's exported state) stays reachable until the compiled-loop
+    /// token is discarded, which is after `thread_die` runs the mutator
+    /// destructor. Those walks are mutator roots: [`unregister_mutator`]
+    /// allows them to still be live, and `Drop` is a no-op once the mutator
+    /// entry is gone.
+    ///
+    /// # Safety
+    /// Same as [`Self::new`], except `data` must remain valid until this
+    /// guard is dropped *or* [`unregister_mutator`] runs, whichever is first.
+    pub unsafe fn permanent(walk: MutatorExtraWalkFn, data: *const (), name: &'static str) -> Self {
+        let (index, generation) = register_extra_area(walk, data, name, false);
+        Self {
+            index,
+            generation,
+            scoped: false,
             _owner: std::marker::PhantomData,
         }
     }
@@ -581,18 +632,27 @@ impl Drop for MutatorExtraAreaGuard {
     fn drop(&mut self) {
         let thread_id = std::thread::current().id();
         let mut registry = lock_mutator_registry();
-        let entry = registry
+        let Some(entry) = registry
             .iter_mut()
             .find(|entry| entry.thread_id == thread_id)
-            .expect("scoped root area outlived its registered mutator");
+        else {
+            assert!(
+                !self.scoped,
+                "scoped root area outlived its registered mutator"
+            );
+            return;
+        };
+        if entry.generation != self.generation {
+            return;
+        }
         let area = entry
             .extra_areas
             .get_mut(self.index)
             .and_then(Option::take)
             .expect("releasing an inactive scoped root area");
-        assert!(
-            area.scoped,
-            "releasing a permanent root area through a scope"
+        assert_eq!(
+            area.scoped, self.scoped,
+            "releasing a root area through the wrong scope"
         );
         while entry.extra_areas.last().is_some_and(Option::is_none) {
             entry.extra_areas.pop();
@@ -775,13 +835,16 @@ pub fn unregister_mutator() {
         .iter()
         .position(|entry| entry.thread_id == thread_id)
         .expect("unregistering an unregistered mutator thread");
+    let live_scoped: Vec<&'static str> = registry[index]
+        .extra_areas
+        .iter()
+        .flatten()
+        .filter(|area| area.scoped)
+        .map(|area| area.name)
+        .collect();
     assert!(
-        registry[index]
-            .extra_areas
-            .iter()
-            .flatten()
-            .all(|area| !area.scoped),
-        "unregistering a mutator with live scoped root areas"
+        live_scoped.is_empty(),
+        "unregistering a mutator with live scoped root areas: {live_scoped:?}"
     );
     registry.swap_remove(index);
 }
@@ -1028,6 +1091,9 @@ pub fn get(index: usize) -> GcRef {
 
 /// Acquire a fixed translated-livevar root slot.
 pub fn acquire_owner_root(root: GcRef) -> usize {
+    if crate::diag_p92_enabled() && !root.is_null() {
+        crate::diag_stale_gcref(root.0, "acquire_owner_root");
+    }
     OWNER_ROOTS.with(|roots| {
         let mut roots = roots.borrow_mut();
         let reused = OWNER_ROOTS_FREE.with(|free| free.borrow_mut().pop());
@@ -1348,6 +1414,45 @@ pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
 #[inline]
 pub fn depth() -> usize {
     SHADOW_STACK.with(|ss| ss.len())
+}
+
+/// P92 diagnostic: name whether `slot_addr` sits in the GcRef shadow stack
+/// buffer or in `OWNER_ROOTS`. Both walks share `extra_area=shadow_stack`.
+pub fn describe_root_slot(slot_addr: usize) -> String {
+    let ss = SHADOW_STACK.with(|ss| {
+        let base = ss.base.get() as usize;
+        let top = ss.top.get() as usize;
+        let limit = ss.limit.get() as usize;
+        let len = ss.len();
+        let in_ss = base != 0 && slot_addr >= base && slot_addr < top;
+        let idx = if in_ss {
+            (slot_addr - base) / std::mem::size_of::<GcRef>()
+        } else {
+            usize::MAX
+        };
+        let val = if in_ss {
+            // SAFETY: `idx` is inside the live prefix.
+            Some(unsafe { *ss.base.get().add(idx) }.0)
+        } else {
+            None
+        };
+        format!(
+            "ss_base={base:#x} ss_top={top:#x} ss_limit={limit:#x} ss_len={len} \
+             ss_contains={in_ss} ss_idx={idx} ss_val={val:#x?}"
+        )
+    });
+    // `walk_roots` already holds `OWNER_ROOTS.borrow_mut()` on this path, so
+    // do not `borrow()` here. `as_ptr` is the same raw view `walk_all_roots`
+    // uses under STW.
+    let oroot = OWNER_ROOTS.with(|roots| {
+        let roots = unsafe { &*roots.as_ptr() };
+        let ptr = roots.as_ptr() as usize;
+        let len = roots.len();
+        let bytes = len.saturating_mul(std::mem::size_of::<Option<GcRef>>());
+        let in_or = ptr != 0 && slot_addr >= ptr && slot_addr < ptr.saturating_add(bytes);
+        format!("or_ptr={ptr:#x} or_len={len} or_bytes={bytes} or_contains={in_or}")
+    });
+    format!("{ss} {oroot}")
 }
 
 /// rpython/memory/gctransform/shadowstack.py increase_root_stack_depth
@@ -2200,8 +2305,9 @@ pub fn walk_rescan_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Invoke every registered extra root walker with the given visitor.
 ///
-/// Called by `MiniMarkGC::do_collect_nursery` (Phase 1e). The label stored
-/// beside each walker is not read here.
+/// Called by `MiniMarkGC::do_collect_nursery` (Phase 1e). Each walker's
+/// label is stamped on [`current_extra_area`] so a root that fails
+/// validation names the registrar, not the bare default.
 pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
     // Snapshot the walker list under a read guard so a walker that
     // triggers further allocation (and recursively a collection) does
@@ -2210,7 +2316,8 @@ pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
         let guard = EXTRA_ROOT_WALKERS.read();
         *guard
     };
-    for (walker, _) in walkers.iter().flatten() {
+    for (walker, label) in walkers.iter().flatten() {
+        let _label = extra_area_scope(*label);
         walker(&mut visitor);
     }
 }
@@ -2656,6 +2763,66 @@ mod tests {
         }));
         assert!(result.is_err());
         walk_my_extra_areas(|_| panic!("retired root still visible"));
+        unregister_mutator();
+    }
+
+    #[test]
+    fn permanent_extra_area_survives_unregister() {
+        unsafe fn walk_cell(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+            let slot = unsafe { &*(data as *const Cell<GcRef>) };
+            let mut value = slot.get();
+            visitor(&mut value);
+            slot.set(value);
+        }
+        let _lock = TEST_MUTEX.lock();
+        let cell = Cell::new(GcRef(0x1000));
+        register_mutator();
+        let guard = unsafe {
+            MutatorExtraAreaGuard::permanent(
+                walk_cell,
+                &cell as *const _ as *const (),
+                "permanent_cell",
+            )
+        };
+        walk_my_extra_areas(|root| root.0 += 1);
+        assert_eq!(cell.get(), GcRef(0x1001));
+        unregister_mutator();
+        drop(guard);
+    }
+
+    #[test]
+    fn permanent_extra_area_drop_does_not_steal_a_later_registration() {
+        unsafe fn walk_cell(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+            let slot = unsafe { &*(data as *const Cell<GcRef>) };
+            let mut value = slot.get();
+            visitor(&mut value);
+            slot.set(value);
+        }
+        let _lock = TEST_MUTEX.lock();
+        let old_cell = Cell::new(GcRef(0x1000));
+        let new_cell = Cell::new(GcRef(0x2000));
+        register_mutator();
+        let old_guard = unsafe {
+            MutatorExtraAreaGuard::permanent(
+                walk_cell,
+                &old_cell as *const _ as *const (),
+                "old_permanent_cell",
+            )
+        };
+        unregister_mutator();
+        register_mutator();
+        let new_guard = unsafe {
+            MutatorExtraAreaGuard::permanent(
+                walk_cell,
+                &new_cell as *const _ as *const (),
+                "new_permanent_cell",
+            )
+        };
+        drop(old_guard);
+        let mut seen = Vec::new();
+        walk_my_extra_areas(|root| seen.push(root.0));
+        assert_eq!(seen, [0x2000]);
+        drop(new_guard);
         unregister_mutator();
     }
 

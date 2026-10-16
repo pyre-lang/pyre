@@ -311,10 +311,29 @@ fn host_object_ref_bits(
             "raise/r: exception instance {name} must be a load-time descriptor, not identity_id"
         );
     }
-    if let Some(addr) = exception_class_addr(obj, callcontrol, "raise/r") {
+    if let Some(addr) = exception_class_addr(obj, callcontrol, "Assembler.emit_const") {
         return addr;
     }
-    obj.identity_id() as i64
+    // `rtuple.TUPLE_TYPE` of an empty field list is Void — no register,
+    // so a `Tuple<>` HostObject that still reaches here is interned as
+    // a live call argument and has no GC object. `Array<T;0>` is a
+    // prebuilt `GcArray` and is handled in `emit_const_r` before this
+    // function runs (`_ll_prebuilt_empty_array`).
+    if let Some(class) = obj.instance_class() {
+        let name = class.simple_name();
+        if crate::translator::rtyper::unit_variant_fold::is_zero_length_shaped_array(name) {
+            panic!(
+                "Assembler.emit_const: empty array {name} must go through emit_empty_array_const_r"
+            );
+        }
+        if crate::translator::rtyper::unit_variant_fold::is_zero_length_shaped_aggregate(name) {
+            return 0;
+        }
+    }
+    panic!(
+        "Assembler.emit_const: HostObject {} has no runtime counterpart",
+        obj.qualname()
+    );
 }
 
 /// The graph-reading half of `assembler.py` `Assembler`.
@@ -491,6 +510,8 @@ trait AssemblerEncode {
 
     fn emit_type_static_const_r(&mut self, name: String, state: &mut AssemblyState) -> u8;
 
+    fn emit_empty_array_const_r(&mut self, type_name: String, state: &mut AssemblyState) -> u8;
+
     fn emit_const_f(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8;
 }
 
@@ -572,6 +593,7 @@ impl AssemblerExt for Assembler {
             type_static_consts: Vec::new(),
             reloc_consts_i: Vec::new(),
             reloc_consts_r: Vec::new(),
+            empty_array_consts: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -697,6 +719,7 @@ impl AssemblerExt for Assembler {
             type_static_consts: state.type_static_consts,
             reloc_consts_i: state.reloc_consts_i,
             reloc_consts_r: state.reloc_consts_r,
+            empty_array_consts: state.empty_array_consts,
             c_num_regs_i: num_regs_i as u8,
             c_num_regs_r: num_regs_r as u8,
             c_num_regs_f: num_regs_f as u8,
@@ -1561,14 +1584,13 @@ impl AssemblerEncode for Assembler {
             }
 
             // Ref-constant materialization mirrors `ConstInt`: the
-            // `HostObject`'s `identity_id()` goes through
-            // `emit_const_r` (the shared `'r'` constant pool) and the
-            // pool-region register index is moved into the SSA
-            // destination via `ref_copy`.  Emitted only for
+            // HostObject goes through `emit_const_r` (the shared `'r'`
+            // constant pool) and the pool-region register index is moved
+            // into the SSA destination via `ref_copy`.  Emitted only for
             // unit-variant `SyntheticTransparentCtor` results that the
             // pre-jtransform fold (`translator/rtyper/unit_variant_fold.rs`)
-            // rewrote from `OpKind::Call { args: [] }` (PyPy
-            // `rtyper/rpbc.py::SingleFrozenPBCRepr` parity).
+            // rewrote from `OpKind::Call { args: [] }` (`rpbc.py`
+            // `SingleFrozenPBCRepr`).
             OpKind::ConstRef(obj) => {
                 let const_value = crate::flowspace::model::ConstValue::HostObject(obj.clone());
                 let idx = self.emit_const_r(&const_value, state, callcontrol);
@@ -3862,6 +3884,11 @@ impl AssemblerEncode for Assembler {
                 return self.emit_type_static_const_r(name, state);
             }
         }
+        if let ConstValue::HostObject(obj) = value
+            && let Some(name) = empty_array_host_object_name(obj)
+        {
+            return self.emit_empty_array_const_r(name, state);
+        }
         let bits = match value {
             // assembler.py::Assembler.emit_const casts ref constants to
             // GCREF and gives every typed nullptr the same None pool key.
@@ -4031,6 +4058,35 @@ impl AssemblerEncode for Assembler {
         reg
     }
 
+    /// Record a zero-length array constant for runtime materialization
+    /// and pool its sentinel — [`Self::emit_str_const_r`]'s shape for
+    /// `_ll_prebuilt_empty_array`. Identical type names share one
+    /// descriptor and one sentinel.
+    fn emit_empty_array_const_r(&mut self, type_name: String, state: &mut AssemblyState) -> u8 {
+        if let Some(ordinal) = state
+            .empty_array_consts
+            .iter()
+            .position(|d| d.type_name == type_name)
+        {
+            return self.emit_const_r_bits(empty_array_const_sentinel(ordinal), state);
+        }
+        let ordinal = state.empty_array_consts.len();
+        let constants_r_index = state.constants_r.len();
+        let reg = self.emit_const_r_bits(empty_array_const_sentinel(ordinal), state);
+        debug_assert_eq!(
+            state.constants_r.len(),
+            constants_r_index + 1,
+            "a fresh empty-array sentinel must push a new constants_r slot"
+        );
+        state
+            .empty_array_consts
+            .push(super::jitcode::EmptyArrayConstDescriptor {
+                constants_r_index,
+                type_name,
+            });
+        reg
+    }
+
     fn emit_const_r_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
         for (i, &existing) in state.constants_r.iter().enumerate() {
             if existing == bits && !state.slot_r_is_reloc(i) {
@@ -4149,6 +4205,15 @@ fn exc_instance_const_sentinel(ordinal: usize) -> i64 {
     EXC_INSTANCE_CONST_SENTINEL_BASE | ordinal as i64
 }
 
+/// Class name of a zero-length shaped-array HostObject instance
+/// (`Array<T;0>`), interned by `fold_unit_variant_ctors`.
+fn empty_array_host_object_name(obj: &crate::flowspace::model::HostObject) -> Option<String> {
+    let class = obj.instance_class()?;
+    let name = class.simple_name();
+    crate::translator::rtyper::unit_variant_fold::is_zero_length_shaped_array(name)
+        .then(|| name.to_string())
+}
+
 /// Per-assembly state (RPython: Assembler.setup() fields).
 struct AssemblyState {
     code: Vec<u8>,
@@ -4173,6 +4238,9 @@ struct AssemblyState {
     /// Relocatable `constants_r` slots, committed to
     /// [`JitCodeBody::reloc_consts_r`].
     reloc_consts_r: Vec<ConstRRelocDescriptor>,
+    /// Zero-length array constants recorded while assembling,
+    /// committed to [`JitCodeBody::empty_array_consts`].
+    empty_array_consts: Vec<super::jitcode::EmptyArrayConstDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -5991,10 +6059,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // shared `constants_f` pool, then a `float_copy` op moves it into
         // the SSA destination register.
         OpKind::ConstFloat(_) => "float_copy".into(),
-        // Ref-bank analog of `ConstInt`. The singleton HostObject's
-        // `identity_id()` enters the shared `constants_r` pool via
-        // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
-        // SSA destination register.
+        // Ref-bank analog of `ConstInt`. `emit_const_r` pools the
+        // runtime address or a load-time sentinel, then a `ref_copy/r>r`
+        // op moves it into the SSA destination register.
         OpKind::ConstStr(_)
         | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
@@ -7431,6 +7498,7 @@ mod tests {
             type_static_consts: Vec::new(),
             reloc_consts_i: Vec::new(),
             reloc_consts_r: Vec::new(),
+            empty_array_consts: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -8255,6 +8323,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Assembler.emit_const: HostObject hello has no runtime counterpart")]
     fn assemble_ref_return_with_host_object_constant() {
         let module = HostObject::new_module("hello");
         let mut flat = SSARepr {
@@ -8268,10 +8337,52 @@ mod tests {
 
         let regallocs = empty_regallocs();
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble(&mut flat, &regallocs);
+    }
 
-        assert_eq!(body.constants_r, vec![module.identity_id() as i64]);
-        assert!(asm.insns.contains_key("ref_return/r"));
+    #[test]
+    fn empty_shaped_array_instance_emits_sentinel() {
+        let class = HostObject::new_class("Array<u8;0>", Vec::new());
+        let inst = class
+            .reusable_prebuilt_instance()
+            .expect("empty array instance");
+        let mut flat = SSARepr {
+            name: "empty_array".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(inst)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(body.empty_array_consts.len(), 1);
+        assert_eq!(body.empty_array_consts[0].type_name, "Array<u8;0>");
+        let idx = body.empty_array_consts[0].constants_r_index;
+        assert_eq!(body.constants_r[idx], empty_array_const_sentinel(0));
+    }
+
+    #[test]
+    fn empty_object_array_instance_emits_sentinel() {
+        let class = HostObject::new_class("Array<PyObjectRef;0>", Vec::new());
+        let inst = class
+            .reusable_prebuilt_instance()
+            .expect("empty array instance");
+        let mut flat = SSARepr {
+            name: "empty_object_array".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(inst)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(body.empty_array_consts[0].type_name, "Array<PyObjectRef;0>");
+        assert_eq!(
+            body.constants_r[body.empty_array_consts[0].constants_r_index],
+            empty_array_const_sentinel(0)
+        );
     }
 
     fn cc_with_exc_rows(pytypes: &[(&str, i64)]) -> crate::call::CallControl {

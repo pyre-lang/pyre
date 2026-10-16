@@ -13,9 +13,41 @@ pub use header::{
 /// Idempotent: `register_extra_root_walker` dedups by function address.
 pub fn install_const_ptr_table_walker() {
     shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
+    majit_ir::set_gcref_diag(Some(diag_stale_gcref));
+    majit_ir::set_gc_current_object_address(Some(gc_current_object_address));
 }
 
 fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
+
+/// Temporary P92 diagnostic. `PYRE_DIAG_P92` classifies a GC word at intern /
+/// ConstPtr construction / recorder decode: nursery, forwarded, header valid.
+/// Panics with a backtrace at the first stale address. Remove after the fix.
+static DIAG_P92: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn diag_p92_enabled() -> bool {
+    let v = DIAG_P92.load(std::sync::atomic::Ordering::Relaxed);
+    if v != 0 {
+        return v == 2;
+    }
+    let on = std::env::var_os("PYRE_DIAG_P92").is_some();
+    DIAG_P92.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+/// Blackhole/intern eprints. Off: those I/O paths Heisenbug the 6-box numbering.
+pub fn diag_p92_trace_io() -> bool {
+    false
+}
+
+pub fn diag_stale_gcref(addr: usize, site: &'static str) {
+    if !diag_p92_trace_io() || addr == 0 {
+        return;
+    }
+    if !gc_sync::is_initialized() {
+        return;
+    }
+    gc_sync::gc_query_reentrant(|gc| gc.diag_stale_gcref(addr, site));
+}
 
 /// GC traits and interfaces for the JIT.
 ///
@@ -292,6 +324,67 @@ pub fn gc_nursery_poison_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some());
     *ENABLED
+}
+
+/// `MAJIT_GC_STRESS_TRACE_ALLOC` — minor-collect before a Trace-pool malloc.
+///
+/// Read once. The gate sits on the Trace pool allocator (`opencoder.py`
+/// `Trace._ops` and the other pools in `trace_bufs`), and
+/// `std::env::var_os` takes the environment lock on every call. Presence,
+/// matching [`gc_lifetime_log_enabled`]: any value, including empty, opts in.
+/// `malloc_fast` (`framework.py`, `inline=True`) does not consult this:
+/// rbigint digit arrays share that entry.
+#[inline]
+pub fn gc_stress_trace_alloc_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_STRESS_TRACE_ALLOC").is_some());
+    *ENABLED
+}
+
+/// Minor before a Trace-pool malloc when [`gc_stress_trace_alloc_enabled`].
+///
+/// `opencoder.py` `Trace._ops` and `trace_bufs` are the callers. A young
+/// address copied into a Rust local and used after the append then dies
+/// at that use. `malloc_fast` does not take this call.
+#[inline]
+pub fn stress_trace_pool_alloc(roots: *mut GcRef, root_count: usize) {
+    if !gc_stress_trace_alloc_enabled() {
+        return;
+    }
+    if !gc_sync::is_initialized() || gc_sync::in_gc_op() {
+        return;
+    }
+    gc_sync::gc_op(|gc| gc.stress_trace_alloc_minor(roots, root_count));
+}
+
+/// Panic when `addr` is a nursery word that is not a live object start
+/// allocated since the last minor.
+///
+/// Recorder stamp sites (`history.py` `*FrontendOp.value`) call this
+/// before writing a `Value::Ref`. A Rust `Copy` held across
+/// `record_bytes` / `stress_trace_pool_alloc` is already from-space
+/// when it is stamped; no later extra-area walk can repair it.
+/// [`gc_stress_trace_alloc_enabled`] is the gate, read once: unset is
+/// one cached bool load.
+#[inline]
+#[track_caller]
+pub fn assert_stamped_ref_is_live_object(addr: usize) {
+    if !gc_stress_trace_alloc_enabled() {
+        return;
+    }
+    assert_stamped_ref_is_live_object_slow(addr, std::panic::Location::caller());
+}
+
+#[cold]
+#[inline(never)]
+fn assert_stamped_ref_is_live_object_slow(addr: usize, location: &'static std::panic::Location) {
+    if addr == 0 {
+        return;
+    }
+    if !gc_sync::is_initialized() || !rgil::am_i_holding_the_gil() {
+        return;
+    }
+    gc_sync::gc_query_reentrant(|gc| gc.assert_stamped_ref_is_live_object(addr, location));
 }
 
 /// `have_debug_prints_for("gc")` for the collector's own per-collection
@@ -1146,6 +1239,14 @@ pub trait GcAllocator: Send {
         obj_addr
     }
 
+    /// `id_or_identityhash` without allocating a shadow.
+    ///
+    /// A root walk already holds the collector. `MiniMarkGC` reads an
+    /// existing shadow or forwarding pointer. A stub returns `obj_addr`.
+    fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        obj_addr
+    }
+
     /// `gc.py self.write_barrier_descr = WriteBarrierDescr(self)`:
     /// the descriptor for the write barrier check. Defaulting to `None` is
     /// `gc.py GcLLDescr_boehm.write_barrier_descr = None` — a collector
@@ -1971,6 +2072,9 @@ impl GcAllocator for GcHandle {
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
         gc_sync::gc_op(|gc| gc.id_or_identityhash(obj_addr))
     }
+    fn id_or_identityhash_reentrant(&self, obj_addr: usize) -> usize {
+        gc_sync::gc_query_reentrant(|gc| gc.id_or_identityhash_reentrant(obj_addr))
+    }
     fn get_write_barrier_descr(&self) -> Option<WriteBarrierDescr> {
         gc_sync::gc_query_reentrant(|gc| gc.get_write_barrier_descr())
     }
@@ -2583,6 +2687,12 @@ pub fn supports_guard_gc_type() -> bool {
 /// also serves embedders whose complete managed heap is execution-context
 /// local and never shares object identity across threads.
 ///
+/// Two live boxes at once is not a supported configuration: `ConstPtr`
+/// `MAJOR_LIVE` / the intern table and `TRACE_OPS_GC_TYPE_ID` are
+/// process-global indexes into one collector. Sequential install on one
+/// thread (replace, then drop) is the test shape; production is one
+/// `gc_sync` singleton.
+///
 /// Set-only, never cleared: a backend can drop one thread's box while another
 /// thread still owns one, and clearing the flag would route past that live box.
 ///
@@ -2873,6 +2983,40 @@ pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
 /// (`rpython/memory/gc/incminimark.py`), which raises MemoryError.
 pub fn gc_allocator_installed() -> bool {
     ACTIVE_ALLOC_NURSERY_TYPED.get().is_some()
+}
+
+/// Whether this thread can satisfy a collecting nursery allocation.
+///
+/// [`gc_allocator_installed`] is process-global: installing a backend hook
+/// on any thread makes it true for the whole process. A collecting nursery
+/// alloc still needs this thread's collector — the `gc_sync` singleton, or a
+/// box stored in this thread's TLS. `install_jitframe_gc` (and
+/// `install_gc_box`) install a box once per execution thread; a thread
+/// without either falls through the dynasm trampoline into
+/// `standalone_alloc_*`, which panics on an uninitialized singleton.
+pub type CurrentThreadHasGcBoxFn = fn() -> bool;
+
+global_hook!(static ACTIVE_THREAD_HAS_GC_BOX: CurrentThreadHasGcBoxFn);
+
+/// Install the active backend's "this thread holds a GC box" query.
+/// Pass `None` to clear. Backends register `gc_box::present`.
+pub fn set_active_thread_has_gc_box(hook: Option<CurrentThreadHasGcBoxFn>) {
+    ACTIVE_THREAD_HAS_GC_BOX.set(hook);
+}
+
+pub fn current_thread_gc_available() -> bool {
+    gc_sync::is_initialized() || ACTIVE_THREAD_HAS_GC_BOX.get().map(|f| f()).unwrap_or(false)
+}
+
+static MINOR_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped once at the end of each minor (`minor_collection_body`).
+pub fn minor_epoch() -> u64 {
+    MINOR_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn bump_minor_epoch() {
+    MINOR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// What an allocation answered, with the two non-pointer states kept apart.
@@ -3826,6 +3970,14 @@ pub fn set_active_gc_id_or_identityhash(hook: Option<GcIdOrIdentityHashFn>) {
     majit_ir::set_gc_id_or_identityhash(hook);
 }
 
+/// Live-address hook. `intern` follows a nursery forwarding stub through
+/// this so a from-space intern cannot `stamp_reuse` dest with a gap corpse.
+pub type GcCurrentObjectAddressFn = majit_ir::value::GcCurrentObjectAddressFn;
+
+pub fn set_active_gc_current_object_address(hook: Option<GcCurrentObjectAddressFn>) {
+    majit_ir::set_gc_current_object_address(hook);
+}
+
 /// Return a GC-move-stable address for identity hashing.
 /// Falls back to `addr` when no backend is installed.
 #[inline]
@@ -3842,6 +3994,16 @@ pub fn gc_owns_object(addr: usize) -> bool {
         Some(f) => f(addr),
         None => false,
     }
+}
+
+/// Whether a backend has installed [`gc_owns_object`].
+///
+/// [`gc_owns_object`] is `false` both when no collector exists and when a
+/// collector exists but does not own `addr`. Callers that write into host
+/// frames (`PyFrame::new` in tests) need the first case to proceed and the
+/// second to refuse.
+pub fn gc_owns_object_hook_installed() -> bool {
+    ACTIVE_GC_OWNS_OBJECT.get().is_some()
 }
 
 /// `llop.shrink_array(Bool, p, smallerlength)`: record that the varsize object

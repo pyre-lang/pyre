@@ -340,6 +340,7 @@ mod frame_replacement_tests {
                 frame: old,
                 w_code: 0,
                 last_instruction: 7,
+                w_code_pin: None,
             };
             let tail = ctx.trace_ctx.const_ref(0);
             let guards_before = ctx.trace_ctx.num_guards();
@@ -581,6 +582,58 @@ pub(super) fn vable_effective_value_concrete<Sym: WalkSym>(
         vable_value_concrete(code, op, operand_offset, ctx, bank, effective_value)
     } else {
         ctx.trace_ctx.concrete_of_opref(effective_value)
+    }
+}
+
+/// Pin a Ref store's concrete across a collecting call (`walker_promote_vable_array_index`
+/// / `record_op` Trace-pool append / `set_ref`). The captured `Value` is not a
+/// root; `push_roots` / `pin_root` keep it, and `live` re-reads the slot the
+/// way `consume_boxes` keeps the decoded GCREF in a traced local.
+struct VableStoreRoot {
+    _scope: pyre_object::gc_roots::RootScope,
+    slot: Option<usize>,
+}
+
+impl VableStoreRoot {
+    fn capture(captured: Value) -> Self {
+        let scope = pyre_object::gc_roots::push_roots();
+        let slot = match captured {
+            Value::Ref(r) if !r.is_null() && r != majit_ir::GcRef::NO_CONCRETE => {
+                let base = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(r.as_usize() as pyre_object::PyObjectRef);
+                Some(base)
+            }
+            _ => None,
+        };
+        Self {
+            _scope: scope,
+            slot,
+        }
+    }
+
+    fn recapture(&mut self, captured: Value) {
+        if let Value::Ref(r) = captured
+            && !r.is_null()
+            && r != majit_ir::GcRef::NO_CONCRETE
+        {
+            let base = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(r.as_usize() as pyre_object::PyObjectRef);
+            self.slot = Some(base);
+        }
+    }
+
+    fn live(&self, fallback: Value) -> Value {
+        match self.slot {
+            Some(idx) => {
+                let p = pyre_object::gc_roots::shadow_stack_get(idx);
+                if (p as usize) == 0 {
+                    fallback
+                } else {
+                    Value::Ref(majit_ir::GcRef(p as usize))
+                }
+            }
+            None => fallback,
+        }
     }
 }
 
@@ -1490,8 +1543,16 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                 'f' => read_float_reg(code, op, 2, ctx)?,
                 _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
             };
-            let concrete = vable_value_concrete(code, op, 2, ctx, value_bank, value)
+            let captured = vable_value_concrete(code, op, 2, ctx, value_bank, value)
                 .unwrap_or(majit_ir::Value::Void);
+            // `set_ref` can collect. Pin the captured GCREF first and store
+            // the live word (`store_reconstructed_callee_array_image`).
+            let store_root = VableStoreRoot::capture(captured);
+            let concrete = if value_bank == 'r' {
+                store_root.live(captured)
+            } else {
+                captured
+            };
             if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(fold_frame_reg, slot, concrete);
@@ -1525,7 +1586,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                     crate::state::store_live_frame_array_slot(
                         concrete_frame,
                         slot as usize,
-                        concrete,
+                        store_root.live(concrete),
                     );
                 }
             }
@@ -1556,6 +1617,36 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
         }
     };
+    let encoded_value = match value_bank {
+        'i' => read_int_reg(code, op, 2, ctx)?,
+        'r' => read_ref_reg(code, op, 2, ctx)?,
+        'f' => read_float_reg(code, op, 2, ctx)?,
+        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+    };
+    // `walker_promote_vable_array_index` records a guard and can append to a
+    // nursery-backed Trace pool. Pin the value first so the store below
+    // reloads a live GCREF (`write_box_at` / `vable_write_array_item_at`).
+    // `try_set_opref_concrete` skips Const OpRefs and InputArg holes.
+    let encoded_captured =
+        vable_value_concrete(code, op, 2, ctx, value_bank, encoded_value).unwrap_or(Value::Void);
+    let mut store_root = VableStoreRoot::capture(encoded_captured);
+    // TOS recovery runs after `walker_promote_vable_array_index`. Pin that
+    // box's concrete now; recapturing the stamp after the promote is a
+    // from-space copy (`fwd=false free=true`).
+    if encoded_value.is_none()
+        && value_bank == 'r'
+        && ctx.vstack_valid
+        && let Some(&tos) = ctx.frame_state.borrow().vstack_boxes.last()
+        && !tos.is_none()
+    {
+        if let Some(tos_c) = ctx
+            .trace_ctx
+            .lookup_opref_concrete(tos)
+            .or_else(|| ctx.trace_ctx.concrete_of_opref(tos))
+        {
+            store_root.recapture(tos_c);
+        }
+    }
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
     // As in the read path, only the standard virtualizable leg promotes the
     // array index and needs the full walker-owned resume snapshot.
@@ -1566,12 +1657,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         index
     } else {
         walker_promote_vable_array_index(ctx, op.pc, index, index_value)?
-    };
-    let encoded_value = match value_bank {
-        'i' => read_int_reg(code, op, 2, ctx)?,
-        'r' => read_ref_reg(code, op, 2, ctx)?,
-        'f' => read_float_reg(code, op, 2, ctx)?,
-        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
     let mut value = encoded_value;
     // A STORE_FAST (`index < nlocals`) pops the operand-stack TOS and writes
@@ -1598,9 +1683,14 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     {
         value = tos;
     }
-    let concrete =
+    let captured =
         vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
             .unwrap_or(Value::Void);
+    let concrete = if value_bank == 'r' {
+        store_root.live(captured)
+    } else {
+        captured
+    };
     let is_stack_push = value_bank == 'r' && vable_store_is_stack_push(ctx, index_value);
     let _write = match ctx.trace_ctx.vable_setarrayitem_checked(
         nonstandard,

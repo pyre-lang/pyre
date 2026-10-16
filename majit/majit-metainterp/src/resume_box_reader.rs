@@ -162,7 +162,9 @@ impl<'a> BridgeVirtualCache<'a> {
         // (`materialize_concrete_virtual_ptr`). resume.py keeps each virtual
         // in `virtuals_cache` before filling its fields, because the next
         // allocation can collect. Register the same fixed slice the applying
-        // reader uses; `Drop` unregisters it.
+        // reader uses; `Drop` unregisters it. Seed from `all_virtuals` after
+        // that registration: this `vec!` can collect, and the source slice
+        // is the direct reader's rooted cache.
         let mut cache = Self {
             virtuals_ptr_cache: vec![None; size],
             virtuals_int_cache: vec![None; size],
@@ -288,7 +290,8 @@ impl<'a> BridgeVirtualCache<'a> {
 
     /// The address a ref failarg currently lives at, read back through the
     /// rooted copy so a collection since the guard failed is accounted for.
-    fn fail_ref_root(&self, index: usize) -> Option<i64> {
+    /// `resume.py` `cpu.get_ref_value(self.deadframe, num)`.
+    pub fn fail_ref_root(&self, index: usize) -> Option<i64> {
         self.fail_ref_roots.get(index).copied()
     }
 
@@ -686,6 +689,44 @@ fn apply_setarrayitem(
     true
 }
 
+/// resume.py `virtuals_cache.set_ptr`: fill the cache as soon as the object
+/// exists, before filling its fields. The `bh_new` result is a raw local
+/// until the root slot holds it; `record_op*` can collect (Trace-pool
+/// append). Record with no stamp, then stamp from the root the collector
+/// maintains — a copy taken before `record_op*` is a from-space address.
+fn publish_new_virtual(
+    ctx: &mut crate::TraceCtx,
+    cache: &mut BridgeVirtualCache<'_>,
+    vidx: usize,
+    allocated: Option<i64>,
+    opcode: majit_ir::OpCode,
+    args: &[OpRef],
+    descr: majit_ir::DescrRef,
+) -> OpRef {
+    if let Some(ptr) = allocated.filter(|&p| p != 0) {
+        cache.set_concrete_root(vidx, ptr);
+    }
+    let pin = cache.get_concrete_ptr(vidx).and_then(|g| {
+        if g.is_null() || g == majit_ir::GcRef::NO_CONCRETE {
+            None
+        } else {
+            Some(majit_gc::shadow_stack::OwnerRootGuard::new(g))
+        }
+    });
+    let new_op = ctx.record_op_with_descr_value(opcode, args, descr, None);
+    ctx.heap_cache_mut().new_object(new_op);
+    cache.set_ptr(vidx, new_op);
+    ctx.remember_bridge_virtual_op(vidx, new_op);
+    let live = pin
+        .as_ref()
+        .map(|g| g.get())
+        .or_else(|| cache.get_concrete_ptr(vidx));
+    if let Some(gcref) = live {
+        ctx.try_set_opref_concrete(new_op, majit_ir::Value::Ref(gcref));
+    }
+    new_op
+}
+
 pub fn materialize_bridge_virtual(
     ctx: &mut crate::TraceCtx,
     vidx: usize,
@@ -839,25 +880,18 @@ pub fn materialize_bridge_virtual(
                 }
                 None => None,
             };
-            let value = allocated
-                .filter(|&ptr| ptr != 0)
-                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            let new_op = ctx.record_op_with_descr_value(
+            if allocated == Some(0) {
+                return OpRef::NONE;
+            }
+            let new_op = publish_new_virtual(
+                ctx,
+                cache,
+                vidx,
+                allocated,
                 OpCode::NewWithVtable,
                 &[],
                 size_descr.clone(),
-                value,
             );
-            ctx.heap_cache_mut().new_object(new_op);
-            // resume.py decoder.virtuals_cache.set_ptr(index, struct)
-            cache.set_ptr(vidx, new_op);
-            ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(ptr) = allocated {
-                if ptr == 0 {
-                    return OpRef::NONE;
-                }
-                cache.set_concrete_root(vidx, ptr);
-            }
             // resume.py self.setfields(decoder, struct)
             if !setfields(
                 ctx,
@@ -902,24 +936,22 @@ pub fn materialize_bridge_virtual(
             let allocated = cache
                 .allocator()
                 .map(|allocator| allocator.bh_new(&struct_descr));
-            let value = allocated
-                .filter(|&ptr| ptr != 0)
-                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            let new_op =
-                ctx.record_op_with_descr_value(OpCode::New, &[], struct_descr.clone(), value);
-            ctx.heap_cache_mut().new_object(new_op);
+            if allocated == Some(0) {
+                return OpRef::NONE;
+            }
             // resume.py decoder.virtuals_cache.set_ptr(index, struct), which
             // its own comment requires BEFORE the fields are filled: the cache
             // is what keeps the object reachable across the allocations
             // `setfields` may itself perform.
-            cache.set_ptr(vidx, new_op);
-            ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(ptr) = allocated {
-                if ptr == 0 {
-                    return OpRef::NONE;
-                }
-                cache.set_concrete_root(vidx, ptr);
-            }
+            let new_op = publish_new_virtual(
+                ctx,
+                cache,
+                vidx,
+                allocated,
+                OpCode::New,
+                &[],
+                struct_descr.clone(),
+            );
             // resume.py self.setfields(decoder, struct)
             if !setfields(
                 ctx,
@@ -983,25 +1015,19 @@ pub fn materialize_bridge_virtual(
                     allocator.bh_new_array(length, &array_descr)
                 }
             });
-            let value = allocated
-                .filter(|&ptr| ptr != 0)
-                .map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
-            let new_op = ctx.record_op_with_descr_value(
+            if allocated == Some(0) {
+                return OpRef::NONE;
+            }
+            // resume.py decoder.virtuals_cache.set_ptr(index, array)
+            let new_op = publish_new_virtual(
+                ctx,
+                cache,
+                vidx,
+                allocated,
                 alloc_opcode,
                 &[len_ref],
                 array_descr.clone(),
-                value,
             );
-            ctx.heap_cache_mut().new_object(new_op);
-            // resume.py decoder.virtuals_cache.set_ptr(index, array)
-            cache.set_ptr(vidx, new_op);
-            ctx.remember_bridge_virtual_op(vidx, new_op);
-            if let Some(ptr) = allocated {
-                if ptr == 0 {
-                    return OpRef::NONE;
-                }
-                cache.set_concrete_root(vidx, ptr);
-            }
             // resume.py:656-670 element loop: dispatch by arraydescr kind
             // NB. the check for the kind of array elements is moved out of the loop
             let set_opcode = match kind {
@@ -1074,25 +1100,27 @@ pub fn materialize_bridge_virtual(
                 .count_ops(OpCode::NewArrayClear, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::NewArrayClear, crate::counters::RECORDED_OPS);
-            let new_op =
-                ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
-            ctx.heap_cache_mut().new_object(new_op);
-            // resume.py: decoder.virtuals_cache.set_ptr(index, array)
-            cache.set_ptr(vidx, new_op);
-            ctx.remember_bridge_virtual_op(vidx, new_op);
             // resume.py `allocate_array(..., clear=True)` is
             // `execute_new_array_clear` for this reader: the array the trace
             // names and the array the interpreter resumes against are the
-            // same object. Recording the NEW without the address leaves the
-            // register with no concrete, and the bridge declines.
-            if let Some(allocator) = cache.allocator() {
-                let ptr = allocator.bh_new_array_clear(*size, array_descr);
-                if ptr == 0 {
-                    return OpRef::NONE;
-                }
-                cache.set_concrete_root(vidx, ptr);
-                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            // same object. Pin the `bh_new` result before `record_op*`
+            // (`publish_new_virtual`): the Trace-pool append can collect.
+            let allocated = match cache.allocator() {
+                Some(allocator) => Some(allocator.bh_new_array_clear(*size, array_descr)),
+                None => None,
+            };
+            if allocated == Some(0) {
+                return OpRef::NONE;
             }
+            let new_op = publish_new_virtual(
+                ctx,
+                cache,
+                vidx,
+                allocated,
+                OpCode::NewArrayClear,
+                &[len_ref],
+                array_descr.clone(),
+            );
             // resume.py:752-759:
             //   p = 0
             //   for i in range(self.size):
@@ -2101,7 +2129,7 @@ mod tests {
         let tagged = ((majit_ir::resumedata::TAG_CONST_OFFSET << 2)
             | majit_ir::resumedata::TAGCONST as i32) as i16;
         let storage = crate::resume::new_resume_storage(
-            Vec::new(),
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![Const::from_gcref(GcRef(0x1111))],
             Vec::new(),
             Vec::new(),
@@ -2247,7 +2275,7 @@ mod tests {
         let tag0 = ((0 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
         let tag1 = ((1 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
         let storage = crate::resume::new_resume_storage(
-            Vec::new(),
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![
                 Const::from_gcref(GcRef(0x1111)),
                 Const::from_gcref(GcRef(0x2222)),
@@ -2316,7 +2344,7 @@ mod tests {
         let tag0 = ((0 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
         let tag1 = ((1 << 2) | majit_ir::resumedata::TAGCONST as i32) as i16;
         let storage = crate::resume::new_resume_storage(
-            Vec::new(),
+            majit_ir::NumberingRef::from_bytes(&[]),
             vec![
                 Const::from_gcref(GcRef(0x1111)),
                 Const::from_gcref(GcRef(0x2222)),

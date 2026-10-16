@@ -18,6 +18,9 @@ use crate::recorder::SnapshotTagged;
 /// inline (`ConstInt.getint` / `ConstPtr.getref_base` /
 /// `ConstFloat.getfloat_storage`); a value op / inputarg is TAGBOX
 /// (`FrontendOp.get_position()`).
+///
+/// `ConstPtr.getref_base` reads the intern table. Call this after any
+/// earlier `_encode` / `new_array` that may have minor-collected.
 #[inline]
 fn register_to_box(opref: OpRef) -> OpBox {
     match opref.inline_const_to_value() {
@@ -179,8 +182,8 @@ impl MIFrame {
     /// `MIFrame.registers_r`.
     ///
     /// The symbolic register is the owner, just as the Box is upstream.  A
-    /// `ConstPtr` carries its GC-traced value inline and
-    /// `MetaInterp::walk_active_trace_refs` forwards that field in place.
+    /// `ConstPtr` carries its GC-traced value in `const_ptr_table` and
+    /// `MetaInterp::walk_active_trace_refs` forwards that slot.
     /// Non-constant boxes are rewritten to `ConstPtr` at abort
     /// (`freeze_values_into_const_boxes`) so this read does not need the
     /// recorder after `abort_trace`.
@@ -220,7 +223,8 @@ impl MIFrame {
     /// Publish a forwarding update into a Ref register's ConstPtr box.
     ///
     /// The packed blackhole-entry root array can itself be forwarded before
-    /// `_copy_data_from_miframe` runs.  `ConstPtr.value` is the owner.
+    /// `_copy_data_from_miframe` runs.  `ConstPtr.value` lives in
+    /// `const_ptr_table`; this writes that slot (`history.py` `ConstPtr`).
     pub fn set_forwarded_ref_value(&mut self, index: usize, value: i64) {
         if let Some(OpRef::ConstPtr(slot)) = self.ref_regs[index] {
             majit_ir::const_ptr_table::set_slot(slot, majit_ir::GcRef(value as usize));
@@ -681,6 +685,78 @@ impl MIFrame {
         }
     }
 
+    /// `pyjitpl.py` `add_box_to_storage(self.registers_r[index])`.
+    ///
+    /// `copy_constants` interned the constants-area slots as `ConstPtr`
+    /// (`history.py` `ConstPtr.value`). Re-resolve that intern after
+    /// `new_array` / an earlier `_encode`. A raw `constants_r` word is
+    /// only the fallback when `copy_constants` did not fill the slot.
+    fn ref_liveness_to_box(&self, idx: usize, num_regs_r: usize) -> OpBox {
+        if idx < num_regs_r {
+            return match self.ref_regs[idx] {
+                Some(opref) => register_to_box(opref),
+                None => OpBox::ConstPtr(0),
+            };
+        }
+        if let Some(opref) = self.ref_regs.get(idx).copied().flatten() {
+            return register_to_box(opref);
+        }
+        OpBox::ConstPtr(self.jitcode.constants_r[idx - num_regs_r].get() as u64)
+    }
+
+    /// `pyjitpl.py` `self.registers_i[index]` after `copy_constants`.
+    fn int_liveness_to_box(&self, idx: usize, num_regs_i: usize) -> OpBox {
+        if idx < num_regs_i {
+            let opref =
+                self.int_regs[idx].expect("get_list_of_active_boxes: int register uninitialized");
+            return register_to_box(opref);
+        }
+        if let Some(opref) = self.int_regs.get(idx).copied().flatten() {
+            return register_to_box(opref);
+        }
+        OpBox::ConstInt(self.jitcode.constants_i[idx - num_regs_i])
+    }
+
+    /// `pyjitpl.py` `self.registers_f[index]` after `copy_constants`.
+    fn float_liveness_to_box(&self, idx: usize, num_regs_f: usize) -> OpBox {
+        if idx < num_regs_f {
+            let opref = self.float_regs[idx]
+                .expect("get_list_of_active_boxes: float register uninitialized");
+            return register_to_box(opref);
+        }
+        if let Some(opref) = self.float_regs.get(idx).copied().flatten() {
+            return register_to_box(opref);
+        }
+        OpBox::ConstFloat(self.jitcode.constants_f[idx - num_regs_f] as u64)
+    }
+
+    /// Side-table counterpart of [`Self::ref_liveness_to_box`].
+    ///
+    /// `history.py` `ConstPtr` — the snapshot stores the table index.
+    /// `snapshot_tagged_to_box` resolves at use. A raw `constants_r`
+    /// word is interned when the slot is empty.
+    fn ref_liveness_to_tagged(&self, idx: usize, num_regs_r: usize) -> SnapshotTagged {
+        let opref = if idx < num_regs_r {
+            match self.ref_regs[idx] {
+                Some(op) => op,
+                None => return SnapshotTagged::Const(0, Type::Ref),
+            }
+        } else if let Some(op) = self.ref_regs.get(idx).copied().flatten() {
+            op
+        } else {
+            return SnapshotTagged::const_ref(
+                self.jitcode.constants_r[idx - num_regs_r].get() as usize
+            );
+        };
+        if let Some(index) = opref.const_ptr_index() {
+            SnapshotTagged::Const(i64::from(index), Type::Ref)
+        } else if let Some(v) = opref.inline_const_to_value() {
+            SnapshotTagged::const_ref(v.as_raw_i64() as usize)
+        } else {
+            SnapshotTagged::Box(opref, Type::Ref)
+        }
+    }
+
     pub fn finished(&self) -> bool {
         self.code_cursor >= self.bytecode().len()
     }
@@ -959,6 +1035,14 @@ impl MIFrame {
 
         // pyjitpl.py:209-214 — pre-allocate the storage array.
         let total = (length_i + length_r + length_f) as usize;
+        if majit_gc::diag_p92_enabled() && total != 4 && (self.pc == 836 || pc == 836) {
+            eprintln!(
+                "P92_ACTIVE_BOXES jc={:?} frame_pc={} live_pc={pc} in_a_call={in_a_call} after_residual={after_residual_call} total={total} li={length_i} lr={length_r} lf={length_f}",
+                self.jitcode.try_index(),
+                self.pc
+            );
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         let storage = trace.new_array(total);
 
         let num_regs_i = self.jitcode.c_num_regs_i as usize;
@@ -982,25 +1066,17 @@ impl MIFrame {
                 let b = if Some(idx) == clear_int_idx {
                     // pyjitpl.py:184-185 history.CONST_FALSE clearing.
                     OpBox::ConstInt(0)
-                } else if idx < num_regs_i {
-                    let opref = self.int_regs[idx]
-                        .expect("get_list_of_active_boxes: int register uninitialized");
-                    register_to_box(opref)
                 } else {
-                    // pyjitpl.py `copy_constants(..., constants_i, ...,
-                    // ConstInt)` — constants live in the `[num_regs_i ..
-                    // num_regs_and_consts_i)` back slots.
-                    OpBox::ConstInt(self.jitcode.constants_i[idx - num_regs_i])
+                    self.int_liveness_to_box(idx, num_regs_i)
                 };
                 trace._add_box_to_storage_box(b);
             }
             offset = it.offset;
         }
 
-        // pyjitpl.py:222-227 — push live ref registers.  Constants
-        // area mirror of the int path above;
-        // `jitcode.constants_r[i]` stores raw GC addresses as i64 so
-        // we cast through `u64` for `Box::ConstPtr`.
+        // pyjitpl.py `get_list_of_active_boxes` — push live ref registers.
+        // `add_box_to_storage(self.registers_r[index])`: constants live
+        // in the same file after `copy_constants`.
         if length_r > 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for index in it.by_ref() {
@@ -1008,23 +1084,8 @@ impl MIFrame {
                 let b = if Some(idx) == clear_ref_idx {
                     // pyjitpl.py:186-187 CONST_NULL clearing.
                     OpBox::ConstPtr(0)
-                } else if idx < num_regs_r {
-                    // pyjitpl.py `add_box_to_storage(self.registers_r[index])`.
-                    // The box is `ref_regs[i]`. `register_to_box_ref` reads
-                    // ConstPtr from that OpRef (`history.py ConstPtr.value`);
-                    // the `ref_values` mirror is optional.
-                    // A raising residual leaves the result slot empty. The
-                    // in-call clear stores CONST_NULL there; record the same
-                    // null when the slot was never written.
-                    match self.ref_regs[idx] {
-                        Some(opref) => register_to_box(opref),
-                        None => OpBox::ConstPtr(0),
-                    }
                 } else {
-                    // pyjitpl.py `copy_constants(..., constants_r, ...,
-                    // ConstPtrJitCode)` — constants_r store raw GC
-                    // addresses; we cast through u64 for `Box::ConstPtr`.
-                    OpBox::ConstPtr(self.jitcode.constants_r[idx - num_regs_r].get() as u64)
+                    self.ref_liveness_to_box(idx, num_regs_r)
                 };
                 trace._add_box_to_storage_box(b);
             }
@@ -1039,15 +1100,8 @@ impl MIFrame {
                 let b = if Some(idx) == clear_float_idx {
                     // pyjitpl.py:188-189 history.CONST_FZERO clearing.
                     OpBox::ConstFloat(0)
-                } else if idx < num_regs_f {
-                    let opref = self.float_regs[idx]
-                        .expect("get_list_of_active_boxes: float register uninitialized");
-                    register_to_box(opref)
                 } else {
-                    // pyjitpl.py `copy_constants(..., constants_f,
-                    // ..., ConstFloat)` — `constants_f[i]` stores the
-                    // raw bits of the f64.
-                    OpBox::ConstFloat(self.jitcode.constants_f[idx - num_regs_f] as u64)
+                    self.float_liveness_to_box(idx, num_regs_f)
                 };
                 trace._add_box_to_storage_box(b);
             }
@@ -1135,6 +1189,14 @@ impl MIFrame {
         offset += 3;
 
         let total = (length_i + length_r + length_f) as usize;
+        if majit_gc::diag_p92_enabled() && total != 4 && (self.pc == 836 || pc == 836) {
+            eprintln!(
+                "P92_ACTIVE_SNAP_BOXES jc={:?} frame_pc={} live_pc={pc} in_a_call={in_a_call} after_residual={after_residual_call} total={total} li={length_i} lr={length_r} lf={length_f}",
+                self.jitcode.try_index(),
+                self.pc
+            );
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         let mut boxes = Vec::with_capacity(total);
 
         let num_regs_i = self.jitcode.c_num_regs_i as usize;
@@ -1254,21 +1316,8 @@ impl MIFrame {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_ref_idx {
                     SnapshotTagged::Const(0, Type::Ref)
-                } else if idx < num_regs_r {
-                    let Some(opref) = self.ref_regs[idx] else {
-                        boxes.push(SnapshotTagged::Const(0, Type::Ref));
-                        continue;
-                    };
-                    if let Some(v) = opref.inline_const_to_value() {
-                        SnapshotTagged::Const(v.as_raw_i64(), Type::Ref)
-                    } else {
-                        SnapshotTagged::Box(opref, Type::Ref)
-                    }
                 } else {
-                    SnapshotTagged::Const(
-                        self.jitcode.constants_r[idx - num_regs_r].get(),
-                        Type::Ref,
-                    )
+                    self.ref_liveness_to_tagged(idx, num_regs_r)
                 };
                 boxes.push(tagged);
             }
@@ -1595,10 +1644,13 @@ mod tests {
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xBEEF));
         assert_eq!(frame.ref_value_for_blackhole(1), None);
 
+        let kept = frame.ref_regs[0];
         frame.set_forwarded_ref_value(0, 0xF00D);
+        // The register keeps its table index. `set_slot` writes the address.
+        assert_eq!(frame.ref_regs[0], kept);
         assert_eq!(
-            frame.ref_regs[0],
-            Some(OpRef::const_ptr(majit_ir::GcRef(0xF00D)))
+            frame.ref_regs[0].and_then(|r| r.as_const_ptr()),
+            Some(majit_ir::GcRef(0xF00D))
         );
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xF00D));
     }
@@ -2014,6 +2066,72 @@ mod tests {
         // `ConstInt(1234)` — fits in SMALL_INT range so TAGINT with
         // shifted value.  `tag(TAGINT, 1234) = 1234 << 2 = 4936`.
         assert_eq!(tag0, 1234 << 2);
+    }
+
+    /// `copy_constants` interned the constants-area slot as `ConstPtr`.
+    /// `get_list_of_active_boxes` must encode that intern, not the raw
+    /// `constants_r` word, after a later encode-window forward.
+    #[test]
+    fn get_list_of_active_boxes_encodes_interned_constants_r_after_forward() {
+        use crate::opencoder::TraceRecordBuffer;
+        use majit_ir::GcRef;
+
+        struct Restore {
+            index: u32,
+            addr: GcRef,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                majit_ir::const_ptr_table::set_slot(self.index, self.addr);
+            }
+        }
+
+        const OP_LIVE: u8 = 0x42;
+        let original = GcRef(0x96E2_A000);
+        let forwarded = GcRef(0x96E2_B000);
+        let interned = OpRef::const_ptr(original);
+        let index = interned.const_ptr_index().expect("non-null const ptr");
+        let _restore = Restore {
+            index,
+            addr: original,
+        };
+
+        let jitcode_arc = {
+            let mut jc = make_jitcode_with_regs(0, 1, 0);
+            let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
+            jc_mut.body_mut().code = vec![OP_LIVE, 0x00, 0x00];
+            jc_mut.body_mut().constants_r = vec![original.0 as i64]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            jc
+        };
+        let current_pc = majit_jitcode::codewriter::liveness::OFFSET_SIZE + 1;
+        // Liveness lists register index `1` — constants area after
+        // `num_regs_r == 1`. bitset byte 0b0000_0010 lights up bit 1.
+        let all_liveness: Vec<u8> = vec![0, 1, 0, 0b0000_0010];
+
+        let mut frame = MIFrame::new(jitcode_arc, current_pc);
+        assert_eq!(frame.ref_regs.len(), 2);
+        frame.ref_regs[1] = Some(interned);
+        majit_ir::const_ptr_table::set_slot(index, forwarded);
+        assert_eq!(
+            frame.jitcode.constants_r[0].get() as usize,
+            original.0,
+            "constants_r still holds the from-space word"
+        );
+
+        let sd = Arc::new(crate::MetaInterpStaticData::new());
+        let mut trace = TraceRecordBuffer::new(1, sd);
+        let _storage = frame.get_list_of_active_boxes(
+            /* in_a_call */ false,
+            &mut trace,
+            /* clear_result_register */ false,
+            OP_LIVE,
+            &all_liveness,
+            false,
+        );
+        assert_eq!(trace.current_ref(1), forwarded.0 as u64);
     }
 
     #[test]

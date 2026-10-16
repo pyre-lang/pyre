@@ -2721,7 +2721,7 @@ mod tests {
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
-            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_numb_arc(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
         }
         guard.setdescr(descr);
@@ -2837,7 +2837,7 @@ mod tests {
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 0)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
-            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_numb_arc(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
         }
         guard.setdescr(descr);
@@ -2894,7 +2894,7 @@ mod tests {
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 0)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
-            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_numb_arc(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
         }
         guard.setdescr(descr);
@@ -3682,6 +3682,12 @@ impl FailDescr for ResumeAtPositionDescr {
     fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
+    fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        self.inner.payload.visit_rd_numb(visitor);
+    }
+    fn rd_numb_ref(&self) -> Option<&majit_ir::NumberingRef> {
+        self.inner.payload.rd_numb_ref()
+    }
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.payload.rd_consts()
     }
@@ -4106,6 +4112,12 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
     }
+    fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        self.inner.payload.visit_rd_numb(visitor);
+    }
+    fn rd_numb_ref(&self) -> Option<&majit_ir::NumberingRef> {
+        self.inner.payload.rd_numb_ref()
+    }
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.payload.rd_consts()
     }
@@ -4363,6 +4375,12 @@ impl FailDescr for ResumeGuardExcDescr {
     }
     fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
+    }
+    fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        self.inner.payload.visit_rd_numb(visitor);
+    }
+    fn rd_numb_ref(&self) -> Option<&majit_ir::NumberingRef> {
+        self.inner.payload.rd_numb_ref()
     }
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.payload.rd_consts()
@@ -4793,6 +4811,14 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.prev().as_fail_descr().and_then(|fd| fd.rd_numb_arc())
     }
+    fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if let Some(fd) = self.prev().as_fail_descr() {
+            fd.visit_rd_numb(visitor);
+        }
+    }
+    fn rd_numb_ref(&self) -> Option<&majit_ir::NumberingRef> {
+        self.prev().as_fail_descr().and_then(|fd| fd.rd_numb_ref())
+    }
     fn set_rd_numb(&self, _value: Option<Vec<u8>>) {
         panic!(
             "set_rd_numb invoked on a ResumeGuardCopiedDescr — \
@@ -5124,6 +5150,12 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     }
     fn rd_numb_arc(&self) -> Option<majit_ir::NumberingRef> {
         self.inner.rd_numb_arc()
+    }
+    fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        self.inner.visit_rd_numb(visitor);
+    }
+    fn rd_numb_ref(&self) -> Option<&majit_ir::NumberingRef> {
+        self.inner.rd_numb_ref()
     }
     fn set_rd_numb(&self, value: Option<Vec<u8>>) {
         self.inner.set_rd_numb(value)
@@ -5586,6 +5618,12 @@ impl FailDescr for CompileLoopVersionDescr {
     }
     fn set_rd_numb_arc(&self, value: Option<majit_ir::NumberingRef>) {
         self.inner.payload.set_rd_numb_arc(value)
+    }
+    fn visit_rd_numb(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        self.inner.payload.visit_rd_numb(visitor);
+    }
+    fn rd_numb_ref(&self) -> Option<&majit_ir::NumberingRef> {
+        self.inner.payload.rd_numb_ref()
     }
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.payload.rd_consts()

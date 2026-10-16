@@ -22,6 +22,7 @@
 use std::cell::Cell;
 use std::ops::Deref;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use indexmap::IndexSet;
 
@@ -428,6 +429,134 @@ impl VirtualStateInfo {
     }
 }
 
+/// Heap list of `ConstPtr` indexes kept alive with a loop token, plus the
+/// virtual-state nodes that store copies of those addresses.
+///
+/// The extra-area pointer is `Box::into_raw` provenance, so moving the
+/// `Arc` does not stale it. The node pointers are `Rc` payloads: they stay
+/// put while any clone of the virtual state holds them.
+struct RetainedConstPtrIndexes {
+    indexes: Vec<u32>,
+    nodes: Vec<*const VirtualStateInfoNode>,
+}
+
+/// One extra-area registration shared by every clone of a loop token's
+/// virtual state. Mutator-lifetime: `TargetToken.virtual_state` outlives
+/// `thread_die`. The last `Arc` drop unregisters if the mutator is still
+/// live, then frees the list.
+struct RetainedConstPtrRoot {
+    area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
+    indexes: *mut RetainedConstPtrIndexes,
+}
+
+impl std::fmt::Debug for RetainedConstPtrRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = if self.indexes.is_null() {
+            0
+        } else {
+            unsafe { (*self.indexes).indexes.len() }
+        };
+        f.debug_struct("RetainedConstPtrRoot")
+            .field("len", &len)
+            .finish()
+    }
+}
+
+impl Drop for RetainedConstPtrRoot {
+    fn drop(&mut self) {
+        // Unregister before freeing. A walk in between would use the list.
+        self.area.take();
+        if !self.indexes.is_null() {
+            unsafe { drop(Box::from_raw(self.indexes)) };
+            self.indexes = std::ptr::null_mut();
+        }
+    }
+}
+
+/// # Safety
+/// `data` is the `Box<RetainedConstPtrIndexes>` from
+/// [`VirtualState::retain_const_ptr_indexes`]. Drop unregisters this walk
+/// before freeing that box. `nodes` stay allocated until
+/// [`VirtualState`]'s drop clears the `Arc`, which runs before `state`.
+unsafe fn walk_retained_const_ptr_indexes(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+    let roots = unsafe { &*(data as *const RetainedConstPtrIndexes) };
+    // The table slot and the `Constant(Value::Ref)` copy are different
+    // holders. `trace_index` forwards only the slot. A minor before the
+    // token is published on `CompiledEntry::front_target_tokens` has no
+    // other walker for the in-flight virtual state, so forward the copies
+    // here too. `trace_index` is idempotent inside one wave.
+    for &index in &roots.indexes {
+        majit_ir::const_ptr_table::trace_index(index, visitor);
+    }
+    let mut seen: Vec<*const VirtualStateInfoNode> = Vec::new();
+    for &node in &roots.nodes {
+        visit_info_node(node, visitor, &mut seen);
+    }
+}
+
+fn visit_const_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
+    if let Value::Ref(gcref) = value {
+        visitor(gcref);
+    }
+}
+
+fn visit_info_node(
+    ptr: *const VirtualStateInfoNode,
+    visitor: &mut dyn FnMut(&mut GcRef),
+    seen: &mut Vec<*const VirtualStateInfoNode>,
+) {
+    if ptr.is_null() || seen.contains(&ptr) {
+        return;
+    }
+    seen.push(ptr);
+    // SAFETY: `ptr` is an `Rc<VirtualStateInfoNode>` payload held by a
+    // `VirtualState` that still owns the extra-area registration. The walk
+    // is stop-the-world. RPython mutates `TargetToken.virtual_state` in
+    // place; this writes the shared node so every clone sees the new address.
+    let node_mut = unsafe { &mut *(ptr as *mut VirtualStateInfoNode) };
+    visit_state_info(&mut node_mut.info, visitor, seen);
+}
+
+fn visit_state_info(
+    info: &mut VirtualStateInfo,
+    visitor: &mut dyn FnMut(&mut GcRef),
+    seen: &mut Vec<*const VirtualStateInfoNode>,
+) {
+    match info {
+        VirtualStateInfo::Constant(value) => visit_const_value(value, visitor),
+        VirtualStateInfo::Virtual { fields, .. } => {
+            // known_class is an immortal vtable integer, not a traced ref.
+            for (_, child) in fields {
+                visit_info_node(Rc::as_ptr(child), visitor, seen);
+            }
+        }
+        VirtualStateInfo::VArray { items, .. } => {
+            for child in items.iter_mut().flatten() {
+                visit_info_node(Rc::as_ptr(child), visitor, seen);
+            }
+        }
+        VirtualStateInfo::VStruct { fields, .. } => {
+            for (_, child) in fields {
+                visit_info_node(Rc::as_ptr(child), visitor, seen);
+            }
+        }
+        VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+            for fields in element_fields {
+                for (_, child) in fields {
+                    if let Some(child) = child {
+                        visit_info_node(Rc::as_ptr(child), visitor, seen);
+                    }
+                }
+            }
+        }
+        // KnownClass.class_ptr is an immortal vtable integer, not a traced ref.
+        VirtualStateInfo::KnownClass { .. }
+        | VirtualStateInfo::NonNull
+        | VirtualStateInfo::IntBounded(_)
+        | VirtualStateInfo::Unknown(_) => {}
+    }
+}
+
 /// A complete snapshot of abstract state at a loop boundary.
 ///
 /// The `state` vector has one entry per loop-carried variable (matching the
@@ -451,6 +580,12 @@ pub struct VirtualState {
     /// virtualstate.py `VirtualState.info_counter`. Increments through
     /// `enum_into` to assign per-instance positions.
     info_counter: i32,
+    /// `ExportedState::publish_const_ptr_root`'s extra area dies with the
+    /// optimizer. A later bridge snapshot still re-interns `ConstPtr` slots
+    /// the token's virtual state and short preamble still hold, so those
+    /// indexes stay registered here until the token is dropped. Partial-trace
+    /// ops are not part of that graph and must not be.
+    const_ptr_root: Option<Arc<RetainedConstPtrRoot>>,
 }
 
 impl VirtualState {
@@ -462,73 +597,9 @@ impl VirtualState {
     /// a stop-the-world GC walk we mutate the node payloads in place so all
     /// shared references observe the forwarded address.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        fn visit_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Value::Ref(gcref) = value {
-                visitor(gcref);
-            }
-        }
-
-        fn visit_node(
-            node: &Rc<VirtualStateInfoNode>,
-            visitor: &mut dyn FnMut(&mut GcRef),
-            seen: &mut Vec<*const VirtualStateInfoNode>,
-        ) {
-            let ptr = Rc::as_ptr(node);
-            if seen.contains(&ptr) {
-                return;
-            }
-            seen.push(ptr);
-            // SAFETY: GC root walking is stop-the-world in pyre. RPython mutates
-            // the same object-graph fields in place; this mirrors that by
-            // updating the shared Rc node payload so every alias sees the
-            // forwarded GcRef.
-            let node_mut = unsafe { &mut *(ptr as *mut VirtualStateInfoNode) };
-            visit_info(&mut node_mut.info, visitor, seen);
-        }
-
-        fn visit_info(
-            info: &mut VirtualStateInfo,
-            visitor: &mut dyn FnMut(&mut GcRef),
-            seen: &mut Vec<*const VirtualStateInfoNode>,
-        ) {
-            match info {
-                VirtualStateInfo::Constant(value) => visit_value(value, visitor),
-                VirtualStateInfo::Virtual { fields, .. } => {
-                    // known_class is an immortal vtable integer, not a traced ref.
-                    for (_, child) in fields {
-                        visit_node(child, visitor, seen);
-                    }
-                }
-                VirtualStateInfo::VArray { items, .. } => {
-                    for child in items.iter_mut().flatten() {
-                        visit_node(child, visitor, seen);
-                    }
-                }
-                VirtualStateInfo::VStruct { fields, .. } => {
-                    for (_, child) in fields {
-                        visit_node(child, visitor, seen);
-                    }
-                }
-                VirtualStateInfo::VArrayStruct { element_fields, .. } => {
-                    for fields in element_fields {
-                        for (_, child) in fields {
-                            if let Some(child) = child {
-                                visit_node(child, visitor, seen);
-                            }
-                        }
-                    }
-                }
-                // KnownClass.class_ptr is an immortal vtable integer, not a traced ref.
-                VirtualStateInfo::KnownClass { .. }
-                | VirtualStateInfo::NonNull
-                | VirtualStateInfo::IntBounded(_)
-                | VirtualStateInfo::Unknown(_) => {}
-            }
-        }
-
         let mut seen: Vec<*const VirtualStateInfoNode> = Vec::new();
         for node in &self.state {
-            visit_node(node, visitor, &mut seen);
+            visit_info_node(Rc::as_ptr(node), visitor, &mut seen);
         }
     }
 
@@ -549,9 +620,52 @@ impl VirtualState {
             state,
             numnotvirtuals: 0,
             info_counter: -1,
+            const_ptr_root: None,
         };
         vs.enum_top_level();
         vs
+    }
+
+    /// Register `indexes` until the last clone of this virtual state drops.
+    ///
+    /// A thread with no registered mutator skips the registration, matching
+    /// `ExportedState::publish_const_ptr_root`. An empty index list still
+    /// registers when this state has info nodes, so those `Constant` refs
+    /// are forwarded. Replaces any previous root on this state.
+    /// `trace_index` is idempotent inside one wave, so a second registration
+    /// beside the optimizer's short-lived root is safe.
+    pub(crate) fn retain_const_ptr_indexes(&mut self, indexes: &[u32]) {
+        self.const_ptr_root = None;
+        if !majit_gc::shadow_stack::mutator_is_registered() {
+            return;
+        }
+        // Top-level nodes. The walk follows children from these payloads.
+        // An empty index list still has to walk them: a `Constant` ref is
+        // not always an interned table slot, and skipping the registration
+        // leaves that copy unforwarded.
+        let nodes: Vec<*const VirtualStateInfoNode> = self.state.iter().map(Rc::as_ptr).collect();
+        if indexes.is_empty() && nodes.is_empty() {
+            return;
+        }
+        let mut indexes = indexes.to_vec();
+        indexes.sort_unstable();
+        indexes.dedup();
+        let indexes = Box::into_raw(Box::new(RetainedConstPtrIndexes { indexes, nodes }));
+        // SAFETY: `indexes` stays allocated until `RetainedConstPtrRoot`'s
+        // drop, which unregisters `area` first. The `Arc` shares one
+        // registration across clones. The walk reads the index list and
+        // writes forwarded addresses into the shared info nodes.
+        let area = unsafe {
+            majit_gc::shadow_stack::MutatorExtraAreaGuard::permanent(
+                walk_retained_const_ptr_indexes,
+                indexes.cast(),
+                "loop_virtual_state",
+            )
+        };
+        self.const_ptr_root = Some(Arc::new(RetainedConstPtrRoot {
+            area: Some(area),
+            indexes,
+        }));
     }
 
     /// virtualstate.py `VirtualState.__init__` per-state walk:
@@ -2361,6 +2475,14 @@ impl VirtualState {
     }
 }
 
+impl Drop for VirtualState {
+    fn drop(&mut self) {
+        // Field order drops `state` before `const_ptr_root`. Clear the
+        // registration first so a walk cannot read nodes this drop frees.
+        self.const_ptr_root = None;
+    }
+}
+
 impl Clone for VirtualState {
     /// Share the `AbstractVirtualStateInfo` graph. RPython `VirtualState`
     /// is one object; assignment (`TargetToken.virtual_state = vs`,
@@ -2374,6 +2496,7 @@ impl Clone for VirtualState {
             state: self.state.clone(),
             numnotvirtuals: self.numnotvirtuals,
             info_counter: self.info_counter,
+            const_ptr_root: self.const_ptr_root.clone(),
         }
     }
 }
@@ -3773,6 +3896,54 @@ mod tests {
         assert!(Rc::ptr_eq(&vs.state[0], &cloned.state[0]));
         assert_eq!(vs.num_boxes(), cloned.num_boxes());
         assert_eq!(vs.state[0].position.get(), cloned.state[0].position.get());
+    }
+
+    /// The extra-area walk forwards `Constant` refs stored in the state,
+    /// including a nested field, and leaves a vtable integer alone.
+    #[test]
+    fn retained_walk_forwards_constant_refs_in_the_state() {
+        let descr = test_descr(3);
+        let state = VirtualState::new(vec![
+            VirtualStateInfo::Constant(Value::Ref(GcRef(0x1000))),
+            VirtualStateInfo::VStruct {
+                descr,
+                fields: vec![(
+                    0,
+                    VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Ref(GcRef(
+                        0x2000,
+                    )))),
+                )],
+                field_descrs: Vec::new(),
+            },
+            VirtualStateInfo::KnownClass { class_ptr: 7 },
+        ]);
+        let nodes: Vec<*const VirtualStateInfoNode> =
+            state.state.iter().map(std::rc::Rc::as_ptr).collect();
+        let held = Box::into_raw(Box::new(RetainedConstPtrIndexes {
+            indexes: Vec::new(),
+            nodes,
+        }));
+        unsafe {
+            walk_retained_const_ptr_indexes(held.cast(), &mut |gcref| {
+                gcref.0 += 0x10;
+            });
+            drop(Box::from_raw(held));
+        }
+        match &state.state[0].info {
+            VirtualStateInfo::Constant(Value::Ref(gcref)) => assert_eq!(gcref.0, 0x1010),
+            other => panic!("top-level constant became {other:?}"),
+        }
+        match &state.state[1].info {
+            VirtualStateInfo::VStruct { fields, .. } => match &fields[0].1.info {
+                VirtualStateInfo::Constant(Value::Ref(gcref)) => assert_eq!(gcref.0, 0x2010),
+                other => panic!("nested constant became {other:?}"),
+            },
+            other => panic!("struct became {other:?}"),
+        }
+        match &state.state[2].info {
+            VirtualStateInfo::KnownClass { class_ptr } => assert_eq!(*class_ptr, 7),
+            other => panic!("known class became {other:?}"),
+        }
     }
 
     #[test]

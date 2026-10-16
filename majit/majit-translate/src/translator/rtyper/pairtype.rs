@@ -623,6 +623,21 @@ fn dispatch_rtype_op(
         (ListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
         // `ll_vec_getitem_fast` on a Rust `Vec` header.
         (RustVecRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
+        // rlist.py — `pairtype(AbstractListRepr, AbstractListRepr).rtype_eq`
+        // / `rtype_ne` → `ll_listeq(l1, l2, eqfn)`. Fixed and resized
+        // lists share it (`AbstractBaseListRepr` parent).
+        (FixedSizeListRepr, FixedSizeListRepr, "eq")
+        | (ListRepr, ListRepr, "eq")
+        | (FixedSizeListRepr, ListRepr, "eq")
+        | (ListRepr, FixedSizeListRepr, "eq") => {
+            committed(super::rlist::pair_list_list_rtype_eq(r1, r2, hop))
+        }
+        (FixedSizeListRepr, FixedSizeListRepr, "ne")
+        | (ListRepr, ListRepr, "ne")
+        | (FixedSizeListRepr, ListRepr, "ne")
+        | (ListRepr, FixedSizeListRepr, "ne") => {
+            committed(super::rlist::pair_list_list_rtype_ne(r1, r2, hop))
+        }
         // rordereddict.py — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`.
         // The second receiver is never read in the upstream body (only
         // `r_dict.key_repr` is), so this wildcards `_` on the key repr class,
