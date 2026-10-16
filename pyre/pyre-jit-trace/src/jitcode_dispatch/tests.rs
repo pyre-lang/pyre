@@ -1818,9 +1818,13 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
     };
 
     // Inline route: `emit_walker_loop_callee_call_assembler` always
-    // passes `Some((dst_bank, dst))`. `dst = None` is the bridge-resume
-    // route (`leave_callee_ec = false`) and declines before any op when
-    // the paused callers cannot take the result.
+    // passes `Some((dst_bank, dst))` and `leave_callee_ec = false` so the
+    // portal pair (`record_ec_enter_virtual_ref` /
+    // `record_ec_leave_virtual_ref`) owns leave. This test passes
+    // `leave_callee_ec = true` to keep `execute_frame`'s finally restore
+    // when the GUARD_NOT_FORCED snapshot aborts. `dst = None` is the
+    // bridge-resume route and declines before any op when the paused
+    // callers cannot take the result.
     let recorded = super::inline_call::record_walker_loop_callee_portal_call(
         &mut wc,
         0,
