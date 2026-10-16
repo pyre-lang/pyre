@@ -691,15 +691,6 @@ pub struct JitCode {
     /// read. An empty memo still scans, which is the path `JitCodeBuilder`
     /// bodies take.
     reachable_symbolic_residuals: std::sync::OnceLock<ReachableSymbolicResiduals>,
-    /// Nested FBW replay-scan result for this graph.
-    ///
-    /// `GraphAnalyzer._analyzed_calls` / `effectinfo_from_writeanalyze`
-    /// compute the write set once per graph and keep it on the analyzer
-    /// keyed by that graph (and then on the calldescr). Storing the
-    /// `(clean, returned_fresh)` pair here is that cache on the jitcode
-    /// itself — not a process-wide side table keyed by index, which would
-    /// collide PerFn slot 0 across unrelated bodies.
-    nested_replay_scan: std::sync::OnceLock<(bool, bool)>,
 }
 
 /// The static residual-call refusal facts reachable from one JitCode.
@@ -731,7 +722,6 @@ impl JitCode {
             exec: JitCodeExecState::default(),
             uses_global_descr_pool: false,
             reachable_symbolic_residuals: std::sync::OnceLock::new(),
-            nested_replay_scan: std::sync::OnceLock::new(),
         }
     }
 
@@ -762,7 +752,6 @@ impl JitCode {
             },
             uses_global_descr_pool: true,
             reachable_symbolic_residuals: std::sync::OnceLock::new(),
-            nested_replay_scan: std::sync::OnceLock::new(),
         }
     }
 
@@ -824,7 +813,6 @@ impl Clone for JitCode {
             exec: self.exec.clone(),
             uses_global_descr_pool: self.uses_global_descr_pool,
             reachable_symbolic_residuals: self.reachable_symbolic_residuals.clone(),
-            nested_replay_scan: self.nested_replay_scan.clone(),
         }
     }
 }
@@ -854,18 +842,6 @@ impl JitCode {
             .set(residuals)
             .unwrap_or_else(|_| panic!("reachable symbolic residuals already installed"));
         self
-    }
-
-    /// `GraphAnalyzer.get_cached_result` for the nested FBW replay scan.
-    /// `(clean, returned_fresh)`: empty write set, and every `ref_return`
-    /// names a malloc of this graph (`FreshMallocs.is_fresh_malloc`).
-    pub fn nested_replay_scan(&self) -> Option<(bool, bool)> {
-        self.nested_replay_scan.get().copied()
-    }
-
-    /// `DependencyTracker.leave_with`: record the completed analysis.
-    pub fn set_nested_replay_scan(&self, clean: bool, returned_fresh: bool) {
-        let _ = self.nested_replay_scan.set((clean, returned_fresh));
     }
 }
 

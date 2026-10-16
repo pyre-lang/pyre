@@ -18003,13 +18003,6 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             dst_bank,
             "residualize_inline_call_via_fnaddr",
         );
-    super::residual_call::walker_abort_if_mayforce_null_ref_arg(
-        call_opcode,
-        &allboxes,
-        call_descr,
-        ctx,
-        pc,
-    )?;
     if emit_guard_not_forced {
         super::residual_call::maybe_walker_vable_and_vrefs_before_residual_call(ctx, pc);
     }

@@ -103,6 +103,7 @@ pub(crate) mod saturating_add;
 pub(crate) mod saturating_mul;
 pub(crate) mod saturating_sub;
 pub mod semantic;
+pub(crate) mod slice_ascii;
 pub(crate) mod slice_first;
 pub(crate) mod slice_get;
 pub(crate) mod slice_index;

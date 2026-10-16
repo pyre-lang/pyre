@@ -5665,6 +5665,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 !return_niche && tyref_option_nonzero_scalar(&fd.signature.output, lo.llbc);
             let return_narrow_root = lo.option_niche_payload_class_root(&fd.signature.output);
             let return_niche_null_cast = lo.option_niche_null_cast(&fd.signature.output);
+            let return_int_null = lo.option_niche_int_null(&fd.signature.output);
             crate::front::option_try::rewire_option_try_call_sites(
                 &mut lo.graph,
                 &lo.option_try_sites,
@@ -5673,6 +5674,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 return_scalar_niche,
                 return_narrow_root.as_deref(),
                 return_niche_null_cast.as_ref(),
+                return_int_null.as_ref(),
             )
         };
         // Non-carrier `Result` `?` is the same ControlFlow diamond as
@@ -5725,6 +5727,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             0
         } else {
             crate::front::slice_get::rewire_slice_get_call_sites(&mut lo.graph, &lo.slice_get_sites)
+        };
+        // The `<[u8]>::is_ascii(slice)` rewrite (`front::slice_ascii`)
+        // replaces the residual with `first_non_ascii_char(s) < 0`
+        // (`rutf8.check_ascii`).  The scan loop lives in the helper graph,
+        // not the caller; gate the reachability sweep on an actual rewrite.
+        let slice_is_ascii_rewritten = if lo.slice_is_ascii_sites.is_empty() {
+            0
+        } else {
+            crate::front::slice_ascii::rewire_slice_is_ascii_call_sites(
+                &mut lo.graph,
+                &lo.slice_is_ascii_sites,
+            )
         };
         // Header-view `slice::from_raw_parts{,_mut}` (`front::from_raw_parts`)
         // aliases the residual fat slice to the length-prefixed GC string
@@ -5932,6 +5946,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
+            || slice_is_ascii_rewritten > 0
             || saturating_sub_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
@@ -9004,6 +9019,11 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_get::SliceGetSite`]).
     slice_get_sites: Vec<crate::front::slice_get::SliceGetSite>,
+    /// `<[u8]>::is_ascii(slice)` call sites recorded for the
+    /// `rutf8.check_ascii` rewrite (`first_non_ascii_char(s) < 0`) the
+    /// `front::slice_ascii` post-pass applies after body lowering (see
+    /// [`crate::front::slice_ascii::SliceIsAsciiSite`]).
+    slice_is_ascii_sites: Vec<crate::front::slice_ascii::SliceIsAsciiSite>,
     /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
     /// diamond (`if a < b { 0 } else { a - b }`) the
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
@@ -9842,6 +9862,7 @@ impl<'a> Lowering<'a> {
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),
+            slice_is_ascii_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
             saturating_add_sites: Vec::new(),
             saturating_mul_sites: Vec::new(),
@@ -23157,7 +23178,9 @@ impl<'a> Lowering<'a> {
     /// makes about the read half: the translated graph already carries that
     /// reference in a slot the backend root map rewrites when the object
     /// moves.  `get(base + k)` / `get(len + k)` answers with the value the
-    /// `k`-th pin published, for the same reason.
+    /// `k`-th pin published, for the same reason. A [`RootSlotGetter`]
+    /// closure is that read with the callee as the closure `call`:
+    /// `get_sites` names the pin, and the capture temps bind no Variable.
     fn lower_erased_root_bracket_call(
         &mut self,
         mir_bb: usize,
@@ -23175,7 +23198,28 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         };
         if !path.split("::").any(|s| s == "gc_roots") {
-            return Ok(false);
+            // A RootSlotGetter closure: `analyze_root_brackets` records the
+            // call in `get_sites` and the capture temps bind no Variable.
+            // The callee is the closure `call`, so the gc_roots leaf match
+            // below would miss it and the skipped receiver would read as an
+            // uninitialised local.
+            let Some(value) = self.root_bracket.get_answer(mir_bb) else {
+                return Ok(false);
+            };
+            let bound = self.local_var[value]
+                .as_ref()
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
+                    ))
+                })?
+                .one()?;
+            self.local_var[dest_local] = Some(LocalValue::One(bound));
+            let bb_id = self.emit_bb(mir_bb);
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
         }
         let leaf = path.rsplit("::").next().unwrap_or("");
         let receiver_scope = operand_local(call.args.first())
@@ -23762,8 +23806,22 @@ impl<'a> Lowering<'a> {
                 // Option enum class, even when `tyref_to_value_type` names
                 // a split-eligible instantiation. Prefer the payload class
                 // the niche arm below already uses.
+                //
+                // A string/list niche has no instance ClassDef
+                // (`option_niche_payload_class_root` is `None`); keep the
+                // split `Option<String>` / `Option<Vec<_>>` spelling so
+                // `project_struct_field_type` unions the payload with
+                // `s_None` (`Bookkeeper.project_struct_field_type` Option
+                // arm, `model.py` `noneify`). Dropping the cast left a
+                // residual host call as a classdef-less instance, and
+                // `if let Some(s)` then could not return a `SomeString`.
                 if self.tyref_is_niche_option_ptr(dest_class_ty) {
                     self.option_niche_payload_class_root(dest_class_ty)
+                        .or_else(|| {
+                            self.option_niche_null_cast(dest_class_ty)
+                                .is_some()
+                                .then(|| root.clone())
+                        })
                 } else {
                     Some(root.clone())
                 }
@@ -28477,28 +28535,28 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // `<Option<P> as PartialEq>::eq` / `ne` on a niche nullable
-                // pointer whose payload compares by address (`*mut T` /
-                // `*const T`, `NonNull<T>`, function pointer). `None` is
-                // null and `Some(p)` is `p`, so derived equality is address
-                // identity of the two words — the same `BinOp` `rclass.py`
-                // `rtype_eq` / `rtype_ne` lower to `ptr_eq` / `ptr_ne`.
-                // The payload gate keeps `&T` (pointee by value), `Box<T>`
-                // (by value), strings, and a non-niche aggregate Option
-                // residual. Operands arrive as `&Option<P>`; peel that one
+                // Option. Operands arrive as `&Option<P>`; peel that one
                 // reference. `Rvalue::Ref` aliases the borrow to the niche
-                // word.
+                // word (`Some(p)` is `p`). Two payload families share this
+                // `BinOp`:
+                //
+                // * Address identity (`*mut T` / `*const T`, `NonNull<T>`,
+                //   function pointer) — `rclass.py` `rtype_eq` / `rtype_ne`
+                //   → `ptr_eq` / `ptr_ne`.
+                // * String-family (`node_is_string_value`, including
+                //   `Option<&str>` / `Option<String>`) — `rstr.py`
+                //   `AbstractStringRepr.rtype_eq` / `rtype_ne` →
+                //   `ll_streq`, which already treats a null operand
+                //   (`if not s1 or not s2: return s1 == s2`).
+                //
+                // `&T` (pointee by value), `Box<T>` (by value), and a
+                // non-niche aggregate Option stay residual.
                 if args.len() == 2
                     && (fmt_path_ends_with(&segments, &["option", "Option", "eq"])
                         || fmt_path_ends_with(&segments, &["option", "Option", "ne"]))
                     && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
                         .iter()
-                        .all(|ty| {
-                            ty.is_some_and(|ty| {
-                                self.tyref_peel_ref_to_pointee(ty).is_some_and(|peeled| {
-                                    self.option_niche_payload_compares_by_address(&peeled)
-                                })
-                            })
-                        })
+                        .all(|ty| ty.is_some_and(|ty| self.option_niche_eq_ne_operand(ty)))
                 {
                     let leaf = if fmt_path_ends_with(&segments, &["option", "Option", "ne"]) {
                         "ne"
@@ -30089,7 +30147,17 @@ impl<'a> Lowering<'a> {
             // assumed unconditionally before this was carried, so an
             // unreadable type keeps today's behaviour instead of inventing a
             // new one.
-            let enumerate_next = crate::front::iter_adapter::is_enumerate_next_target(target);
+            let enumerate_next = crate::front::iter_adapter::is_enumerate_next_target(target)
+                || first_arg_ty.as_ref().is_some_and(|receiver| {
+                    self.tyref_ref_adt_path(receiver)
+                        .or_else(|| {
+                            self.tyref_peel_ref_to_pointee(receiver)
+                                .and_then(|ty| adt_path_of_tyref(&ty, self.llbc))
+                        })
+                        .is_some_and(|path| {
+                            crate::front::iter_adapter::is_enumerate_adapter_path(&path)
+                        })
+                });
             let iterator_added_a_reference = if enumerate_next {
                 // `Enumerate<I>::next` yields `(usize, I::Item)`; the native
                 // `next` runs on `I`, so the reference-peel follows I, not
@@ -30690,6 +30758,28 @@ impl<'a> Lowering<'a> {
         {
             site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_get_sites.push(site);
+        }
+        // Capture `<[u8]>::is_ascii(slice)` sites for the
+        // `rutf8.check_ascii` rewrite (`first_non_ascii_char(s) < 0`).
+        // `is_ascii` is a foreign leaf on the primitive `[u8]` (FunDecl
+        // `core::slice::ascii::<Impl>::is_ascii`), residualized as an
+        // unregistered callee the rtyper census Skips; a resolution miss
+        // leaves the residual call.  The receiver's `as_bytes()` mark
+        // picks the StringRepr helper vs the `[u8]` GcArray helper.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && crate::front::slice_ascii::is_slice_is_ascii_segments(segments)
+        {
+            let string_byte_view = self.slice_receiver_is_string_byte_view(&arg_locals);
+            self.slice_is_ascii_sites
+                .push(crate::front::slice_ascii::SliceIsAsciiSite {
+                    result_var: result_var.clone(),
+                    string_byte_view,
+                });
         }
         // `<[T]>::get(slice, start..)` returns an Option subslice.  Preserve
         // that Option shape with the same guarded diamond as scalar `get`, but
@@ -35834,8 +35924,9 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the unary llop
-    /// `rewrite_op_cast_ptr_to_int` keeps, not a residual call.
+    /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the host call
+    /// `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr` accept.
+    /// `normalize_unary_op_name` rejects a unary op of either name.
     fn emit_host_cast_llop(
         &mut self,
         mir_bb: usize,
@@ -37083,7 +37174,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
-            fn_ptr: self.option_payload_is_fn_ptr(recv_ty),
+            int_null: self.option_niche_int_null(recv_ty),
             niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
         })
@@ -37122,7 +37213,7 @@ impl<'a> Lowering<'a> {
             is_some,
             niche,
             niche_null_cast: self.option_niche_null_cast(&pointee),
-            fn_ptr: self.option_payload_is_fn_ptr(&pointee),
+            int_null: self.option_niche_int_null(&pointee),
             scalar_niche,
         })
     }
@@ -37179,6 +37270,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
+            int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -37220,6 +37312,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -37689,6 +37782,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+            int_null: self.option_niche_int_null(&recv_ty_owned),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(&recv_ty_owned),
         })
@@ -38010,6 +38104,7 @@ impl<'a> Lowering<'a> {
             recv_niche: false,
             result_niche: false,
             niche_null_cast: None,
+            int_null: None,
         };
 
         if is_option {
@@ -38021,6 +38116,7 @@ impl<'a> Lowering<'a> {
             site.payload1_class = self.option_payload_instance_class_root(&recv_ty);
             site.recv_niche = self.tyref_is_niche_option_ptr(&recv_ty);
             site.niche_null_cast = self.option_niche_null_cast(&recv_ty);
+            site.int_null = self.option_niche_int_null(&recv_ty);
         } else {
             let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
                 self.resolve_result_owners(&recv_ty)?;
@@ -38264,6 +38360,7 @@ impl<'a> Lowering<'a> {
             result_ty,
             args_tuple_suffix,
             niche,
+            int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
             niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
@@ -38727,11 +38824,9 @@ impl<'a> Lowering<'a> {
             result_option_owner,
             result_some_owner,
             result_niche,
-            result_fn_ptr: matches!(kind, ClosureCombinator::Map | ClosureCombinator::AndThen)
-                && tyref_option_payload_is_fn_ptr(dest_ty, self.llbc),
-            result_fn_ptr_spelling: match kind {
+            result_int_null: match kind {
                 ClosureCombinator::Map | ClosureCombinator::AndThen => {
-                    tyref_fn_ptr_spelling(dest_ty, self.llbc)
+                    self.option_niche_int_null(dest_ty)
                 }
                 _ => None,
             },
@@ -38745,7 +38840,7 @@ impl<'a> Lowering<'a> {
             call_result_ty,
             args_tuple_suffix,
             niche,
-            fn_ptr: self.option_payload_is_fn_ptr(&recv_ty),
+            int_null: self.option_niche_int_null(&recv_ty),
             niche_null_cast,
             fieldless_none_tag,
             call_once_result_exc,
@@ -38804,24 +38899,50 @@ impl<'a> Lowering<'a> {
             .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
-    /// `Option<fn>` payload — the null arm is `null_fn` (`SomePtr`), not
-    /// `null_mut` (`SomeInstance`).
-    fn option_payload_is_fn_ptr(&self, option_ty: &TyRef) -> bool {
-        if !crate::front::result_exc::tyref_is_option(option_ty, self.llbc) {
+    /// Niche `Option` whose remaining word is an int-bank address.
+    ///
+    /// `rnone.py` `rtype_is_None` compares an operand against a null of its
+    /// own lltype (`Ptr` → `ptr_iszero`, Address / non-GC funcptr →
+    /// `int_is_zero`); `rmodel.py` `rtype_is_` never mixes a GC pointer with
+    /// an Address. [`tyref_to_value_type_with`] already puts `Option<fn>` and
+    /// a raw-address niche ([`ty_is_raw_address`], e.g. `Option<&RawEnum>`)
+    /// in `Int`; a GC pointer / `SomeString` niche stays `Ref`.
+    fn option_niche_is_int_bank(&self, option_ty: &TyRef) -> bool {
+        if !self.tyref_is_niche_option_ptr(option_ty) {
             return false;
         }
-        let Some(payload) = tyref_node(option_ty, self.llbc)
-            .and_then(|node| node.as_object())
-            .and_then(|m| m.get("Adt"))
-            .and_then(|a| a.as_object())
-            .and_then(|a| type_decl_ref_generics(a, self.llbc))
-            .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-            .and_then(|t| t.first())
-        else {
-            return false;
-        };
-        type_node_is_fn_ptr(payload, self.llbc)
+        matches!(
+            tyref_to_value_type_with(
+                option_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+            ),
+            ValueType::Int | ValueType::Unsigned
+        )
+    }
+
+    /// Int-bank null of a niche `Option`: `null_fn` with the `fn(..)`
+    /// spelling, or `null_raw` with the raw pointee's class root
+    /// (`lltype.nullptr` / `llmemory.NULL`). `None` when the niche is
+    /// ref-banked (`push_niche_null`).
+    fn option_niche_int_null(&self, option_ty: &TyRef) -> Option<crate::model::NicheIntNull> {
+        if !self.option_niche_is_int_bank(option_ty) {
+            return None;
+        }
+        if tyref_option_payload_is_fn_ptr(option_ty, self.llbc)
+            || tyref_node(option_ty, self.llbc)
+                .is_some_and(|node| type_node_is_fn_ptr(node, self.llbc))
+        {
+            return Some(crate::model::NicheIntNull::FnPtr(tyref_fn_ptr_spelling(
+                option_ty, self.llbc,
+            )));
+        }
+        let seed = crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
+            .unwrap_or_else(|| option_ty.clone());
+        Some(crate::model::NicheIntNull::RawAddress(
+            raw_address_owner_root(&seed, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+        ))
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option` in
@@ -38830,8 +38951,9 @@ impl<'a> Lowering<'a> {
     /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
     /// thin nominal ADT. It also includes the exact Rust container spellings
     /// that translate to one RPython GC pointer: `Option<Vec<T>>` becomes a
-    /// nullable `SomeList`, and `Option<&str>` becomes a nullable
-    /// `SomeString`.
+    /// nullable `SomeList`, and `Option<&str>` / `Option<String>` (and the
+    /// other string-family payloads [`node_is_string_value`] already
+    /// projects) become a nullable `SomeString`.
     /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
     /// the non-null payload pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -39060,6 +39182,16 @@ impl<'a> Lowering<'a> {
         let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
             return false;
         };
+        // The same projection as `Option<Vec<T>>` below applies to the
+        // string family: `String` / `Wtf8Buf` / `BytesBlock` / builtin
+        // `str` are already [`node_is_string_value`] (`SomeString`).
+        // `Option<String>` is the nullable form (`s is None` /
+        // `s is not None`; `pairtype(SomeObject, SomeObject).is_`,
+        // `rtype_is_` / `ptr_iszero`), and `Some` is the string itself —
+        // there is no `__discriminant` / `__pos_0` field.
+        if node_is_string_value(payload, self.llbc) {
+            return true;
+        }
         let Some(def_id) = adt_node_def_id(payload) else {
             return false;
         };
@@ -39133,6 +39265,50 @@ impl<'a> Lowering<'a> {
             .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull")
     }
 
+    /// `true` when `option_ty` is a niche nullable `Option<P>` and `P` is
+    /// string-family ([`node_is_string_value`]): builtin `str`, `String`,
+    /// `Wtf8` / `Wtf8Buf` / `BytesBlock` / `Utf8Str`, including a shared
+    /// reference to those (`Option<&str>`). Under the niche model `None`
+    /// is the null string and `Some(c)` is the string `c` itself, so
+    /// derived equality is string contents — `rstr.py`
+    /// `AbstractStringRepr.rtype_eq` / `rtype_ne` → `ll_streq`.
+    fn option_niche_payload_compares_as_string(&self, option_ty: &TyRef) -> bool {
+        if !self.tyref_is_niche_option_ptr(option_ty) {
+            return false;
+        }
+        let Some(payload) = tyref_node(option_ty, self.llbc)
+            .and_then(|node| node.as_object())
+            .and_then(|m| m.get("Adt"))
+            .and_then(|a| a.as_object())
+            .and_then(|a| type_decl_ref_generics(a, self.llbc))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+        else {
+            return false;
+        };
+        // Same unique trait-projection peel as
+        // [`Self::option_niche_payload_compares_by_address`].
+        let resolved_assoc = trait_payload_node(payload, self.llbc)
+            .and_then(|node| trait_assoc_projection_target(node, self.llbc));
+        let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
+        let payload = resolved_body.unwrap_or(payload);
+        let Some(node) = strip_ty_wrappers(payload, self.llbc) else {
+            return false;
+        };
+        node_is_string_value(node, self.llbc)
+    }
+
+    /// Operand of `<Option<P> as PartialEq>::eq` / `ne`: `&Option<P>`
+    /// peeled to the niche Option, whose payload compares by address or
+    /// as a string.
+    fn option_niche_eq_ne_operand(&self, ty: &TyRef) -> bool {
+        self.tyref_peel_ref_to_pointee(ty).is_some_and(|peeled| {
+            self.option_niche_payload_compares_by_address(&peeled)
+                || self.option_niche_payload_compares_as_string(&peeled)
+        })
+    }
+
     /// Emit a null pointer for a nullable `Option` (`None`) as a
     /// `core::ptr::null_mut()` call, returning its result `Variable`. A Rust
     /// container projected to an RPython string/list is then narrowed to that
@@ -39151,15 +39327,15 @@ impl<'a> Lowering<'a> {
     /// one repr-adaptive source.
     fn push_niche_null_ptr(&mut self, mir_bb: usize, option_ty: &TyRef) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
-        // `Option<fn>` is a null function pointer (`SomePtr(FuncType)`),
-        // not a nullable GC instance. `null_mut()` annotates as
-        // classdef-less `SomeInstance` and then cannot union with the
-        // `fn` field read (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
-        if self.option_payload_is_fn_ptr(option_ty) {
-            return self.graph.push_null_fn_ptr_with_spelling(
-                bb_id,
-                tyref_fn_ptr_spelling(option_ty, self.llbc).as_deref(),
-            );
+        // Int-banked niche (`Option<fn>` / raw Address): `rnone.py`
+        // `rtype_is_None` compares against a null of the operand's own
+        // lltype (`ptr_iszero` / `int_is_zero` / `adr_eq`). `null_mut()`
+        // is a GC ref and would emit `is_` on mixed `ir` operands.
+        // `Option<fn>` keeps `null_fn` with the `fn(..)` spelling; a
+        // raw-address niche uses `null_raw` of the pointee (`lltype.nullptr`)
+        // or `llmemory.NULL` when the payload has no named type.
+        if let Some(int_null) = self.option_niche_int_null(option_ty) {
+            return int_null.push(&mut self.graph, bb_id);
         }
         self.graph
             .push_niche_null(bb_id, self.option_niche_null_cast(option_ty).as_ref())
@@ -69043,6 +69219,10 @@ struct DiscCombinatorSite {
     /// `None` narrowed to the payload class, when the null must share it
     /// (`option_niche_null_cast`).
     niche_null_cast: Option<(String, ValueType)>,
+    /// Int-banked niche (`Option<fn>` / raw Address): `Some` is that
+    /// int-bank null (`null_fn` / `null_raw`; `rnone.py` `rtype_is_None`).
+    /// `None` is a ref-bank niche (`push_niche_null`).
+    int_null: Option<crate::model::NicheIntNull>,
 }
 
 #[derive(Clone)]
@@ -69632,7 +69812,12 @@ fn rewire_option_filter_diamond(
     // A niche result is the pointer or null. An aggregate `None` would make
     // the caller's null test read a live object.
     let none = if site.result_niche {
-        emit_niche_null(graph, none_bb, &site.niche_null_cast)
+        emit_niche_null(
+            graph,
+            none_bb,
+            site.int_null.as_ref(),
+            &site.niche_null_cast,
+        )
     } else {
         emit_option_variant(graph, none_bb, &site.result_owner, 0, None)
     };
@@ -69699,7 +69884,12 @@ fn rewire_option_filter_diamond(
         )
     };
     let drop_none = if site.result_niche {
-        emit_niche_null(graph, drop_bb, &site.niche_null_cast)
+        emit_niche_null(
+            graph,
+            drop_bb,
+            site.int_null.as_ref(),
+            &site.niche_null_cast,
+        )
     } else {
         emit_option_variant(graph, drop_bb, &site.result_owner, 0, None)
     };
@@ -69748,7 +69938,13 @@ fn rewire_option_filter_diamond(
     // Niche tag is `ptr` is not null (`Some` = 1). A `__discriminant`
     // field read loads the object header.
     let disc = if site.recv_niche {
-        emit_niche_some_tag(graph, a_id, recv, &site.niche_null_cast)
+        emit_niche_some_tag(
+            graph,
+            a_id,
+            recv,
+            site.int_null.as_ref(),
+            &site.niche_null_cast,
+        )
     } else {
         emit_enum_disc_read(graph, a_id, recv, &site.recv_owner)
     };
@@ -70522,57 +70718,31 @@ fn drop_rebuilt_receiver_shell(
 ///
 /// `is_` is the null test. `ne` compares string and list values, so it is
 /// not a discriminant. The `None` null shares the payload class when
-/// `null_cast` is set (`push_niche_null_ptr`).
+/// `null_cast` is set (`push_niche_null_ptr`). `int_null` is the int-bank
+/// null (`rnone.py` `rtype_is_None`); every other niche uses
+/// [`FunctionGraph::push_niche_null`].
 fn emit_niche_some_tag(
     graph: &mut FunctionGraph,
     block: BlockId,
     recv: Variable,
+    int_null: Option<&crate::model::NicheIntNull>,
     null_cast: &Option<(String, ValueType)>,
 ) -> Variable {
-    let null = emit_niche_null(graph, block, null_cast);
-    let is_none = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(is_none.clone()),
-        kind: OpKind::BinOp {
-            op: "is_".to_string(),
-            lhs: recv,
-            rhs: null,
-            result_ty: ValueType::Int,
-        },
-    });
-    let false_var = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(false_var.clone()),
-        kind: OpKind::ConstBool(false),
-    });
     let disc = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(disc.clone()),
-        kind: OpKind::BinOp {
-            op: "eq".to_string(),
-            lhs: is_none,
-            rhs: false_var,
-            result_ty: ValueType::Int,
-        },
-    });
+    graph.push_niche_is_some(block, recv, int_null, null_cast.as_ref(), disc.clone());
     disc
 }
 
 fn emit_niche_null(
     graph: &mut FunctionGraph,
     block: BlockId,
+    int_null: Option<&crate::model::NicheIntNull>,
     null_cast: &Option<(String, ValueType)>,
 ) -> Variable {
-    let null = graph.push_null_mut_ptr(block);
-    let Some((root, ty)) = null_cast else {
-        return null;
-    };
-    let narrowed = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(narrowed.clone()),
-        kind: crate::model::cast_instance_call_result(root.clone(), null, ty.clone()),
-    });
-    narrowed
+    match int_null {
+        Some(int_null) => int_null.push(graph, block),
+        None => graph.push_niche_null(block, null_cast.as_ref()),
+    }
 }
 
 fn emit_enum_disc_read(
@@ -77801,6 +77971,7 @@ mod tests {
             recv_niche: false,
             result_niche: false,
             niche_null_cast: None,
+            int_null: None,
         };
         let live_before: std::collections::HashSet<_> =
             graph.blocks.iter().map(|block| block.id).collect();
@@ -95026,6 +95197,10 @@ mod tests {
         );
         assert_eq!(plan.pins.get(&3), Some(&vec![1]));
         assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
+        // Callee 9 is `fixture::len_reload::call`, not a `gc_roots` leaf.
+        // `lower_erased_root_bracket_call` answers that block through
+        // `get_answer` so the skipped capture temps are never resolved.
+        assert_eq!(plan.get_answer(3), Some(1usize));
         assert_eq!(plan.slot_temps.get(&4), Some(&3), "the len result");
         assert!(
             plan.slot_temps.get(&5).is_none(),
@@ -97087,24 +97262,32 @@ mod tests {
     /// arm, so the resulting graph directly exposes whether the classifier
     /// chose aggregate construction or the nullable-pointer identities.
     fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-        lower_option_source_retyped(payload, false, false)
+        lower_option_fn_retyped("option_source", payload, false, false, false)
     }
 
     fn lower_option_source_with_payload_ext(
         payload: serde_json::Value,
         inject_layoutless_nominal: bool,
     ) -> FunctionGraph {
-        lower_option_source_retyped(payload, false, inject_layoutless_nominal)
+        lower_option_fn_retyped(
+            "option_source",
+            payload,
+            false,
+            inject_layoutless_nominal,
+            false,
+        )
     }
 
     fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
-        lower_option_source_retyped(payload, true, false)
+        lower_option_fn_retyped("option_source", payload, true, false, false)
     }
 
-    fn lower_option_source_retyped(
+    fn lower_option_fn_retyped(
+        fn_name: &str,
         mut payload: serde_json::Value,
         through_alias: bool,
         inject_layoutless_nominal: bool,
+        inject_string: bool,
     ) -> FunctionGraph {
         fn replace_dedup(
             value: &mut serde_json::Value,
@@ -97262,6 +97445,46 @@ mod tests {
             }
             retarget(&mut payload, hole as u64);
         }
+        if inject_string {
+            let decls = translated
+                .get_mut("type_decls")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("corpus type_decls");
+            let hole = decls
+                .iter()
+                .position(serde_json::Value::is_null)
+                .expect("corpus type_decls has a null hole");
+            // `SomeRawStruct` is a sized nominal struct; rename the copy to
+            // `alloc::string::String` so [`node_is_string_value`] admits it.
+            let mut copy = decls
+                .iter()
+                .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(5))
+                .expect("sized nominal def-id 5")
+                .clone();
+            copy["def_id"] = serde_json::json!(hole);
+            if let Some(meta) = copy.get_mut("item_meta").and_then(|m| m.as_object_mut()) {
+                meta.insert(
+                    "name".to_string(),
+                    serde_json::json!([
+                        {"Ident": ["alloc", 0]},
+                        {"Ident": ["string", 0]},
+                        {"Ident": ["String", 0]}
+                    ]),
+                );
+            }
+            decls[hole] = copy;
+            payload = serde_json::json!({
+                "Adt": {
+                    "id": hole,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            });
+        }
 
         let fun = translated
             .get_mut("fun_decls")
@@ -97275,26 +97498,26 @@ mod tests {
                         .and_then(|seg| seg.get("Ident"))
                         .and_then(|ident| ident.get(0))
                         .and_then(serde_json::Value::as_str)
-                        == Some("option_source")
+                        == Some(fn_name)
                 })
             })
-            .expect("option_source declaration in corpus");
+            .unwrap_or_else(|| panic!("{fn_name} declaration in corpus"));
         let signature = fun
             .get("signature")
             .and_then(serde_json::Value::as_object)
-            .expect("option_source signature");
+            .unwrap_or_else(|| panic!("{fn_name} signature"));
         let payload_id = signature
             .get("inputs")
             .and_then(serde_json::Value::as_array)
             .and_then(|inputs| inputs.get(1))
             .and_then(|ty| ty.get("Deduplicated"))
             .and_then(serde_json::Value::as_u64)
-            .expect("option_source payload dedup id");
+            .unwrap_or_else(|| panic!("{fn_name} payload dedup id"));
         let output_id = signature
             .get("output")
             .and_then(|ty| ty.get("Deduplicated"))
             .and_then(serde_json::Value::as_u64)
-            .expect("option_source output dedup id");
+            .unwrap_or_else(|| panic!("{fn_name} output dedup id"));
         let option_ty = serde_json::json!({
             "Adt": {
                 "id": option_def_id ,
@@ -97309,16 +97532,23 @@ mod tests {
         replace_dedup(fun, payload_id, output_id, &payload, &option_ty);
 
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-        super::lower_function(&llbc, "option_source").expect("lower retyped option_source")
+        super::lower_function(&llbc, fn_name)
+            .unwrap_or_else(|e| panic!("lower retyped {fn_name}: {e}"))
     }
 
     fn niche_ctor_shape(graph: &FunctionGraph) -> (usize, usize) {
         let ops = graph.blocks.iter().flat_map(|block| &block.operations);
-        let null_muts = ops
+        // `rnone.py` `rtype_is_None`: a GC Ptr None is `null_mut` (ref
+        // bank); `Option<fn>` is `null_fn` and a raw-address niche is
+        // `null_raw` (int bank).
+        let nulls = ops
             .clone()
             .filter(|op| {
                 matches!(&op.kind, OpKind::Call { target, .. }
-                    if target.to_string() == "core::ptr::null_mut")
+                if matches!(
+                    target.to_string().as_str(),
+                    "core::ptr::null_mut" | "core::ptr::null_fn" | "core::ptr::null_raw"
+                ))
             })
             .count();
         let transparent_ctors = ops
@@ -97332,7 +97562,7 @@ mod tests {
                 )
             })
             .count();
-        (null_muts, transparent_ctors)
+        (nulls, transparent_ctors)
     }
 
     #[test]
@@ -98183,6 +98413,201 @@ mod tests {
             assert_eq!(null_muts, 0, "case {name}: {none_msg}");
             assert!(transparent_ctors >= 2, "case {name}: {agg_msg}");
         }
+    }
+
+    /// `Option<String>` match is RPython's nullable `SomeString`:
+    /// `s is None` (`pairtype(SomeObject, SomeObject).is_`, rtyped by
+    /// `rtype_is_` / `ptr_iszero`), and the `Some` payload is the string
+    /// itself. The corpus `option_question_mark` `?` is a `Try::branch`
+    /// match; injecting `alloc::string::String` as the Option payload
+    /// pins that the front does not emit `getattr('__discriminant')`.
+    #[test]
+    fn niche_option_string_match_is_none_identity() {
+        use crate::model::OpKind;
+        let graph = lower_option_fn_retyped(
+            "option_question_mark",
+            serde_json::Value::Null,
+            false,
+            false,
+            true,
+        );
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert!(
+            null_muts >= 1,
+            "Option<String> None must lower to a null string pointer, got {null_muts}"
+        );
+        assert_eq!(
+            transparent_ctors, 0,
+            "Option<String> Some must be the string identity, with no Option aggregate"
+        );
+        let discriminant_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+            })
+            .count();
+        assert_eq!(
+            discriminant_reads, 0,
+            "Option<String> match must not read an aggregate __discriminant"
+        );
+        let some_payload_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "__pos_0"
+                            && field.owner_root.as_deref().is_some_and(|owner| {
+                                owner.contains("Option") && owner.ends_with("::Some")
+                            })
+                )
+            })
+            .count();
+        assert_eq!(
+            some_payload_reads, 0,
+            "Option<String> Some payload must be the string itself"
+        );
+        let has_is = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"));
+        assert!(
+            has_is,
+            "Option<String> match must contain an identity null-test"
+        );
+    }
+
+    /// `<Option<&str> as PartialEq>::ne` on two niche nullable strings
+    /// (`opt != Some(c)`). `trait_default_call_segments` rewrites
+    /// `PartialEq::ne` to `["option", "Option", "ne"]`; the fold emits
+    /// string `BinOp("ne")` (`rstr.py` `AbstractStringRepr.rtype_ne` →
+    /// `ll_streq`) instead of leaving that FunctionPath residual.
+    #[test]
+    fn niche_option_str_ne_lowers_to_string_binop() {
+        use crate::model::{CallTarget, OpKind};
+
+        let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span, "source_text": null, "is_local": true,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let str_ty = serde_json::json!({
+            "Adt": {"builtin": "Str", "generics": generics}
+        });
+        let str_ref = serde_json::json!({"Ref": ["Erased", str_ty, "Shared"]});
+        let option_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [str_ref],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let option_ref = serde_json::json!({"Ref": ["Erased", option_ty, "Shared"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let place =
+            |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "option", "Option"]),
+                    "kind": "Opaque"
+                }],
+                "fun_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(&["fixture", "cmp_option_str"]),
+                        "signature": {
+                            "is_unsafe": false,
+                            "inputs": [option_ref.clone(), option_ref.clone()],
+                            "output": bool_ty.clone()
+                        },
+                        "body": {"Unstructured": {"span": span,
+                            "locals": {"arg_count": 2, "locals": [
+                                {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                                {"index": 1, "name": "lhs", "span": span, "ty": option_ref.clone()},
+                                {"index": 2, "name": "rhs", "span": span, "ty": option_ref.clone()},
+                                {"index": 3, "name": null, "span": span, "ty": bool_ty.clone()}
+                            ]},
+                            "body": [
+                                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                                    "call": {
+                                        "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                        "args": [
+                                            {"Copy": place(1, &option_ref)},
+                                            {"Copy": place(2, &option_ref)}
+                                        ],
+                                        "dest": place(3, &bool_ty)
+                                    },
+                                    "target": 1, "on_unwind": 2
+                                }}}},
+                                {"statements": [{
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(0, &bool_ty),
+                                        {"Use": [{"Copy": place(3, &bool_ty)}, "Yes"]}
+                                    ]}
+                                }], "terminator": {"span": span, "kind": "Return"}},
+                                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                            ]
+                        }}
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(&["core", "option", "Option", "ne"]),
+                        "signature": {
+                            "is_unsafe": false,
+                            "inputs": [option_ref.clone(), option_ref.clone()],
+                            "output": bool_ty
+                        },
+                        "body": "Opaque"
+                    }
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc =
+            Llbc::from_slice(file.to_string().as_bytes()).expect("option-str fixture parses");
+        let graph = super::lower_function(&llbc, "cmp_option_str").expect("lower cmp_option_str");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                    _ => false,
+                })
+                .count(),
+            0,
+            "no residual `Option::ne` call survives the string-niche fold"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
+            "the comparison lowers to a string `BinOp(ne)`"
+        );
     }
 
     /// `gettypeobject` (`gettypefor(..).map_or(PY_NULL, |p| p.as_ptr())`)
@@ -104689,6 +105114,7 @@ mod tests {
             recv_niche: false,
             result_niche: false,
             niche_null_cast: None,
+            int_null: None,
         }
     }
 

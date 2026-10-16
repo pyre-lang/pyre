@@ -2828,8 +2828,8 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // captures this frame virtual and numbers its array — an unwritten operand
     // slot numbers to `NULLREF`, which `reconstruct_inline_recipe`
     // (state.rs, semantic-slot-ordered `arr[k]` read) decodes to a
-    // concrete-NULL Ref box, aborting the reconstructed middle at its next
-    // `CALL_MAY_FORCE` (`MayForceNullRefArgUnsupported`).  Materialize the live
+    // concrete-NULL Ref box.  The reconstructed middle would then consume that
+    // hole at its next residual.  Materialize the live
     // operand boxes into the frame array now — at the point we pause this frame to
     // enter the nested inline — mirroring the locals seed at `helpers.rs`
     // (`virtualizable.py` write_boxes writes the frame's field boxes into

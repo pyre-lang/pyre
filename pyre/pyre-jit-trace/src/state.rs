@@ -8872,9 +8872,8 @@ fn reconstruct_inline_recipe(
         // exactly that shape, and reading the image there yields NULL (the
         // stale pre-call array entry for a forced frame, the never-stored
         // `NewArrayClear` entry for a virtual one), so the next residual
-        // consuming it folds its Ref arg to concrete NULL
-        // (`walker_abort_if_mayforce_null_ref_arg`) and no bridge is ever
-        // built.  Invert color -> slot with the same `pcdep` map the encoder
+        // consuming it would take that hole in place of the live value.
+        // Invert color -> slot with the same `pcdep` map the encoder
         // used and take those slots from the stream instead.
         let mut stream_slots: Vec<(usize, usize)> = Vec::new();
         let mut stream_covered = vec![false; valuestackdepth];
@@ -11576,9 +11575,8 @@ impl JitState for PyreJitState {
                                 // held in a register at an interior guard reads NULL
                                 // from `locals_cells_stack_w` because it was never
                                 // written back.  Stamping that hole poisons the real
-                                // vable box with concrete NULL, folding a later
-                                // residual's Ref arg to NULL →
-                                // `MayForceNullRefArgUnsupported`.  Leaving the box
+                                // vable box with concrete NULL, so a later residual
+                                // would consume the hole.  Leaving the box
                                 // unstamped keeps it symbolic so the residual reads
                                 // the runtime value.
                                 if let Some(&cv) = live_local_values.get(s) {
@@ -11792,10 +11790,9 @@ impl JitState for PyreJitState {
                                 // (`DUP_TOP` / `ROT_THREE`), one slot may carry the real
                                 // value and its sibling the NULL hole; both stamp the
                                 // SAME opref, so a NULL stamp would clobber the real one
-                                // (last write wins) and fold the residual's Ref arg to
-                                // concrete NULL → `MayForceNullRefArgUnsupported`. A real
-                                // frame Ref is never NULL here, so skipping NULL only
-                                // drops the unmaterialized-hole case.
+                                // (last write wins) and a later residual would consume
+                                // the hole. A real frame Ref is never NULL here, so
+                                // skipping NULL only drops the unmaterialized-hole case.
                                 if !matches!(
                                     cv,
                                     majit_ir::Value::Void
@@ -16766,10 +16763,9 @@ pub(crate) fn publish_carrier_recipe_refs(
 /// `registers_r` are the paused root's OpRefs, whose trace concrete can still
 /// read as a stale NULL once reused as the reconstructed callee's locals,
 /// while `concrete_r[k]` holds the value captured at guard failure. A
-/// residual call consuming such a local folds its Ref arg to concrete NULL
-/// and the walk stops on `MayForceNullRefArgUnsupported`, so no bridge is
-/// ever built and the guard re-deopts forever. Restamp each local from its
-/// captured value; a NULL/Void capture is an unmaterialized hole and is left
+/// residual call consuming such a local would fold its Ref arg to that hole
+/// instead of the captured live value. Restamp each local from its captured
+/// value; a NULL/Void capture is an unmaterialized hole and is left
 /// alone, matching how `setup_bridge_sym` seeds the root frame's slots.
 /// A ref the recorder already holds is that cell, not the recipe copy: the
 /// copy is not a root.

@@ -8156,6 +8156,33 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
     }
 }
 
+/// Int-bank null of a niche `Option` (`rnone.py` `rtype_is_None`).
+///
+/// `Option<fn>` is `lltype.nullptr(FuncType)` (`null_fn`). A raw-address
+/// niche (`Option<&Raw>`, `Option<NonNull<Raw>>`, `ty_is_raw_address`) is
+/// `lltype.nullptr(T)` of that raw pointer (`null_raw`); the `None` spelling
+/// is `llmemory.NULL` (`SomeAddress`) when the payload has no named pointee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NicheIntNull {
+    FnPtr(Option<String>),
+    RawAddress(Option<String>),
+}
+
+impl NicheIntNull {
+    pub(crate) fn push(
+        &self,
+        graph: &mut FunctionGraph,
+        block: BlockId,
+    ) -> crate::flowspace::model::Variable {
+        match self {
+            Self::FnPtr(spelling) => {
+                graph.push_null_fn_ptr_with_spelling(block, spelling.as_deref())
+            }
+            Self::RawAddress(root) => graph.push_null_raw_ptr_with_spelling(block, root.as_deref()),
+        }
+    }
+}
+
 impl FunctionGraph {
     /// `flowcontext.py` `fixeggblocks`: `del block.framestate` after the
     /// graph is built ("memory saver"). The MIR front stores that
@@ -8462,20 +8489,21 @@ impl FunctionGraph {
     /// The discriminant of the niche `Option` `opt` into `result` (`Some` = 1):
     /// `not (opt is None)`, spelled `eq(is_(opt, None), False)`.  A `ne` would
     /// be value inequality on a `StringRepr` / `ListRepr` payload
-    /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `fn_ptr` selects
-    /// `null_fn` (`ll_ptrtype`); every other niche uses [`Self::push_niche_null`].
+    /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `int_null` is
+    /// the int-bank null (`rnone.py` `rtype_is_None`; `null_fn` for
+    /// `Option<fn>`, `null_raw` for a raw-address niche). Every other niche
+    /// uses [`Self::push_niche_null`].
     pub fn push_niche_is_some(
         &mut self,
         block: BlockId,
         opt: crate::flowspace::model::Variable,
-        fn_ptr: bool,
+        int_null: Option<&NicheIntNull>,
         cast: Option<&(String, ValueType)>,
         result: crate::flowspace::model::Variable,
     ) {
-        let nullc = if fn_ptr {
-            self.push_null_fn_ptr_with_spelling(block, None)
-        } else {
-            self.push_niche_null(block, cast)
+        let nullc = match int_null {
+            Some(int_null) => int_null.push(self, block),
+            None => self.push_niche_null(block, cast),
         };
         let is_none = self.alloc_value_var();
         let false_var = self.alloc_value_var();
@@ -8531,6 +8559,34 @@ impl FunctionGraph {
             result: Some(res.clone()),
             kind: OpKind::Call {
                 target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                args,
+                result_ty: ValueType::Int,
+            },
+        });
+        res
+    }
+
+    /// Null of a raw-address niche (`Option<&Raw>`, `Option<NonNull<Raw>>`).
+    ///
+    /// `spelling` is the Raw pointee's class root so the annotator yields
+    /// `lltype.nullptr(T)` (`SomePtr(Ptr(T))`, flavor raw; `rnone.py`
+    /// `rtype_is_None` → `ptr_iszero`, `jtransform.py` `_rewrite_nongc_ptrs`).
+    /// `None` is `llmemory.NULL` (`SomeAddress`, `int_is_zero`) when the
+    /// payload has no named pointee.
+    pub fn push_null_raw_ptr_with_spelling(
+        &mut self,
+        block: BlockId,
+        spelling: Option<&str>,
+    ) -> crate::flowspace::model::Variable {
+        let res = self.alloc_value_var();
+        let args = match spelling {
+            Some(s) if !s.is_empty() => vec![LinkArg::from(ConstValue::byte_str(s))],
+            _ => crate::model::call_args(vec![]),
+        };
+        self.block_mut(block).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["core", "ptr", "null_raw"]),
                 args,
                 result_ty: ValueType::Int,
             },

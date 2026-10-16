@@ -22,7 +22,7 @@
 //! graph the legacy walker already handled regresses.
 
 use crate::flowspace::model::Variable;
-use crate::model::{CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType};
+use crate::model::{FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `Option::is_none(opt)` / `Option::is_some(opt)` call site
 /// captured during body lowering (`front::mir` `recognize_is_none_site`).
@@ -43,10 +43,12 @@ pub(crate) struct IsNoneSite {
     /// container projected to an RPython string/list repr. The null operand
     /// must enter that same repr before comparison.
     pub niche_null_cast: Option<(String, ValueType)>,
-    /// `Option<fn>`: the null arm is `core.ptr.null_fn` (`ValueType::Int`),
-    /// the same bank as the function pointer. `null_mut` is a GC ref and
-    /// would emit `is_` on mixed `ir` operands.
-    pub fn_ptr: bool,
+    /// Int-banked niche (`Option<fn>` / raw Address): `Some` is that
+    /// int-bank null (`ValueType::Int`; `null_fn` / `null_raw`). `None`
+    /// is a ref-bank niche (`push_niche_null`). `null_mut` is a GC ref
+    /// and would emit `is_` on mixed `ir` operands (`rnone.py`
+    /// `rtype_is_None`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// `Option<NonZero<_>>`: the word itself is the tag. `None` is 0, so
     /// the predicate compares that integer and does not read `__discriminant`.
     pub scalar_niche: bool,
@@ -97,34 +99,13 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
     // Structural validation passed; mutate the graph.
     let new_ops = if site.niche {
         let mut ops = Vec::new();
-        let rhs = if site.fn_ptr {
-            let null = graph.alloc_value_var();
-            ops.push(SpaceOperation {
-                result: Some(null.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::function_path(["core", "ptr", "null_fn"]),
-                    args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Int,
-                },
-            });
-            if let Some((root, result_ty)) = &site.niche_null_cast {
-                let narrowed = graph.alloc_value_var();
-                ops.push(SpaceOperation {
-                    result: Some(narrowed.clone()),
-                    kind: crate::model::cast_instance_call_result(
-                        root.clone(),
-                        null,
-                        result_ty.clone(),
-                    ),
-                });
-                narrowed
-            } else {
-                null
-            }
-        } else {
+        let rhs = {
             let block_id = graph.blocks[a].id;
             let before = graph.block(block_id).operations.len();
-            let rhs = graph.push_niche_null(block_id, site.niche_null_cast.as_ref());
+            let rhs = match site.int_null.as_ref() {
+                Some(int_null) => int_null.push(graph, block_id),
+                None => graph.push_niche_null(block_id, site.niche_null_cast.as_ref()),
+            };
             ops.extend(graph.block_mut(block_id).operations.split_off(before));
             rhs
         };
@@ -226,6 +207,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CallTarget;
 
     fn is_none_target(name: &str) -> CallTarget {
         CallTarget::method(name, Some("core::option::Option".to_string()))
@@ -238,7 +220,7 @@ mod tests {
             is_some,
             niche: false,
             niche_null_cast: None,
-            fn_ptr: false,
+            int_null: None,
             scalar_niche: false,
         }
     }
@@ -344,7 +326,7 @@ mod tests {
                 is_some: true,
                 niche: true,
                 niche_null_cast: None,
-                fn_ptr: false,
+                int_null: None,
                 scalar_niche: false,
             }],
         );
@@ -427,6 +409,129 @@ mod tests {
                 .iter()
                 .any(|op| matches!(&op.kind, OpKind::Call { .. })),
             "residual call survives on decline"
+        );
+    }
+
+    /// A raw-address niche `is None` compares against `null_raw` of the
+    /// pointee (`lltype.nullptr(T)`), not `null_fn`'s empty `FuncType`.
+    #[test]
+    fn rewrite_niche_raw_address_is_none_uses_null_raw() {
+        let mut g = FunctionGraph::new("test_raw_address_is_none");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: is_none_target("is_none"),
+                    args: crate::model::call_args(vec![opt.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, None);
+        let rewritten = rewire_is_none_call_sites(
+            &mut g,
+            &[IsNoneSite {
+                result_var: result.clone(),
+                option_owner: "core::option::Option".into(),
+                is_some: false,
+                niche: true,
+                niche_null_cast: None,
+                int_null: Some(crate::model::NicheIntNull::RawAddress(Some(
+                    "mmap::MappedObj".into(),
+                ))),
+                scalar_niche: false,
+            }],
+        );
+        assert_eq!(rewritten, 1);
+        let null = g.blocks[a.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target,
+                    result_ty,
+                    args,
+                    ..
+                } if target.to_string() == "core::ptr::null_raw"
+                    && *result_ty == ValueType::Int =>
+                {
+                    assert_eq!(args.len(), 1, "raw pointee spelling is the nullptr(T) type");
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("null_raw Int");
+        let is_none = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&result))
+            .expect("is_none producer");
+        match &is_none.kind {
+            OpKind::BinOp { op, lhs, rhs, .. } => {
+                assert_eq!(op, "is_");
+                assert_eq!(lhs, &opt);
+                assert_eq!(rhs, &null);
+            }
+            other => panic!("is_none is not is_ on the raw null: {other:?}"),
+        }
+        assert!(
+            !g.blocks[a.0].operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_fn"
+            )),
+            "raw-address niche must not emit null_fn"
+        );
+    }
+
+    /// `Option<fn>` keeps `null_fn`.
+    #[test]
+    fn rewrite_niche_fn_is_none_uses_null_fn() {
+        let mut g = FunctionGraph::new("test_fn_is_none");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: is_none_target("is_none"),
+                    args: crate::model::call_args(vec![opt]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, None);
+        let rewritten = rewire_is_none_call_sites(
+            &mut g,
+            &[IsNoneSite {
+                result_var: result,
+                option_owner: "core::option::Option".into(),
+                is_some: false,
+                niche: true,
+                niche_null_cast: None,
+                int_null: Some(crate::model::NicheIntNull::FnPtr(Some(
+                    "fn() -> Result<(), PyError>".into(),
+                ))),
+                scalar_niche: false,
+            }],
+        );
+        assert_eq!(rewritten, 1);
+        assert!(
+            g.blocks[a.0].operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_fn"
+            )),
+            "Option<fn> keeps null_fn"
+        );
+        assert!(
+            !g.blocks[a.0].operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_raw"
+            )),
+            "Option<fn> must not emit null_raw"
         );
     }
 }

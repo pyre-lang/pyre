@@ -2891,6 +2891,12 @@ fn residual_payload(
 /// error. The caller resolves `From::from` and
 /// [`apply_foreign_from_residuals`] inserts it before the raise deletes
 /// the tail.
+///
+/// Only `FromResidual<Result<Infallible, E>>` (Result `?`) is a foreign
+/// From site: that impl is `Err(From::from(e))`, the raise path
+/// `exceptiontransform.py` `create_exception_handling` uses for
+/// `OperationError`. `FromResidual<Option<Infallible>>` (Option `?`)
+/// returns `None` and is left for [`crate::front::option_try`].
 pub(crate) fn foreign_from_residual_sites(
     graph: &FunctionGraph,
     spec: crate::ErrorCarrierSpec<'_>,
@@ -2921,6 +2927,9 @@ pub(crate) fn foreign_from_residual_sites(
             let ResidualPayload::Foreign { error_ty, shell } = payload else {
                 continue;
             };
+            if !from_residual_is_result_residual(&op.kind, &error_ty) {
+                continue;
+            }
             sites.push(ForeignFromSite {
                 block: bi,
                 op_idx: oi,
@@ -2931,6 +2940,33 @@ pub(crate) fn foreign_from_residual_sites(
         }
     }
     sites
+}
+
+/// `FromResidual<Result<Infallible, E>>::from_residual` (Result `?`), as
+/// opposed to `FromResidual<Option<Infallible>>` (Option `?`).
+///
+/// Decided from the call target (`CallTarget::Method.receiver_root` /
+/// `FunctionPath` segments) and the residual type [`residual_payload`]
+/// already peeled. `peel_infallible_result` only peels
+/// `Result<Infallible, E>`; an Option residual stays `Option<…>`
+/// (`Option<??scalar>` when Charon renders `Never`).
+fn from_residual_is_result_residual(kind: &OpKind, error_ty: &str) -> bool {
+    if type_leaf(error_ty) == "Option" {
+        return false;
+    }
+    match kind {
+        OpKind::Call {
+            target: CallTarget::Method { receiver_root, .. },
+            ..
+        } => receiver_root
+            .as_deref()
+            .is_none_or(|root| type_leaf(root) != "Option"),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => !segments.iter().any(|seg| type_leaf(seg) == "Option"),
+        _ => true,
+    }
 }
 
 /// Insert each resolved `From::from` immediately before its
@@ -13448,6 +13484,14 @@ mod from_residual_conversion_tests {
     }
 
     fn from_residual_tail_through_copies(owner: &str, copies: usize) -> (FunctionGraph, Variable) {
+        from_residual_tail_with(owner, "FromResidual", copies)
+    }
+
+    fn from_residual_tail_with(
+        owner: &str,
+        receiver_root: &str,
+        copies: usize,
+    ) -> (FunctionGraph, Variable) {
         let mut graph = FunctionGraph::new("from_residual_tail");
         let base = graph.alloc_value_var();
         graph.blocks[graph.startblock.0].inputargs = vec![base.clone()];
@@ -13480,7 +13524,7 @@ mod from_residual_conversion_tests {
             .push_op_var(
                 graph.startblock,
                 OpKind::Call {
-                    target: CallTarget::method("from_residual", Some("FromResidual".into())),
+                    target: CallTarget::method("from_residual", Some(receiver_root.into())),
                     args: crate::model::call_args(vec![payload]),
                     result_ty: ValueType::Ref(None),
                 },
@@ -13670,6 +13714,28 @@ mod from_residual_conversion_tests {
         assert!(
             foreign_from_residual_sites(&graph, boxed_spec).is_empty(),
             "a boxed carrier is a reraise, not From::from"
+        );
+    }
+
+    #[test]
+    fn option_from_residual_is_not_a_foreign_from_site() {
+        // `FromResidual<Option<Infallible>>`: Option `?` returns None.
+        // Charon spells that uninhabited ok as `??scalar`.
+        for owner in [
+            "ControlFlow<Option<??scalar>,i64>::Break",
+            "ControlFlow<Option<Infallible>,i64>::Break",
+        ] {
+            let (graph, _) = from_residual_tail(owner);
+            assert!(
+                foreign_from_residual_sites(&graph, spec()).is_empty(),
+                "{owner}: Option residual is return None, not From::from"
+            );
+        }
+        let (graph, _) =
+            from_residual_tail_with("ControlFlow<BytecodeCorruption,i64>::Break", "Option", 0);
+        assert!(
+            foreign_from_residual_sites(&graph, spec()).is_empty(),
+            "Option FromResidual target is return None, not From::from"
         );
     }
 

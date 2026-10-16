@@ -101,6 +101,10 @@ pub(crate) struct MapOrSite {
     /// discriminant is then `opt != null` and the payload is the base pointer
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
+    /// Int-banked niche (`Option<fn>` / raw Address): `Some` is that
+    /// int-bank null (`null_fn` / `null_raw`; `rnone.py` `rtype_is_None`).
+    /// `None` is a ref-bank niche (`push_niche_null`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// True when the receiver is `Option<NonZero<_>>`. `None` is the integer
     /// 0 the payload excludes, so the discriminant is `opt != 0` and the
     /// payload is that same word.
@@ -365,21 +369,17 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     }
     let disc = graph.alloc_value_var();
     if site.niche {
-        // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
-        // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
-        // `ptr_ne` with an `Int` result matching the aggregate read.  The null
-        // is a repr-adaptive `null_mut()` call, not a fixed-GCREF
-        // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(disc.clone()),
-            kind: OpKind::BinOp {
-                op: "ne".to_string(),
-                lhs: opt.clone().into_variable(),
-                rhs: nullc,
-                result_ty: ValueType::Int,
-            },
-        });
+        // Niche `Option`: the discriminant is `not (opt is None)`
+        // (`None` = null = 0, `Some` = non-null = 1).  `ne` on a
+        // `StringRepr` / `ListRepr` payload is value inequality
+        // (`rstr.py` / `rlist.py` `rtype_ne`), not this null test.
+        graph.push_niche_is_some(
+            a_id,
+            opt.clone().into_variable(),
+            site.int_null.as_ref(),
+            site.niche_null_cast.as_ref(),
+            disc.clone(),
+        );
     } else if site.scalar_niche {
         // `Option<NonZero<_>>`: `None` is 0, `Some` is the integer itself.
         let zero = graph.alloc_value_var();
@@ -458,6 +458,7 @@ mod tests {
             result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
+            int_null: None,
             scalar_niche: false,
             niche_null_cast: None,
         }
@@ -695,5 +696,149 @@ mod tests {
                 .any(|op| matches!(&op.kind, OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "map_or")),
             "residual call survives on decline"
         );
+    }
+
+    /// An `Option<fn>` receiver is an int-bank address: its null test
+    /// compares against `null_fn`, never the ref-bank `null_mut()`.
+    #[test]
+    fn rewrite_niche_fn_option_tests_against_null_fn() {
+        let mut g = FunctionGraph::new("test_map_or_niche_fn");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(42), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map_or", Some("core::option::Option".into())),
+                    args: crate::model::call_args(vec![opt, default, env]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+
+        let mut site = map_or_site(result);
+        site.niche = true;
+        site.int_null = Some(crate::model::NicheIntNull::FnPtr(None));
+        site.payload_ty = ValueType::Int;
+        assert_eq!(rewire_map_or_call_sites(&mut g, &[site]), 1);
+
+        let nulls: Vec<String> = g.blocks[a.0]
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } if args.is_empty() => Some(target.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nulls, vec!["core::ptr::null_fn".to_string()]);
+    }
+
+    /// `mmap_get_attr_i64` `map_or`s on `Option<&MappedObj>`: a raw-enum
+    /// borrow is an int-bank Address (`ty_is_raw_address`), so the niche
+    /// null must share that bank (`rnone.py` `rtype_is_None`). The
+    /// assembler maps `is_` only for `rr` / `ii` / `i`; mixed `ir` falls
+    /// through to `int_is_`.
+    #[test]
+    fn rewrite_niche_raw_address_option_is_operands_agree() {
+        let mut g = FunctionGraph::new("test_map_or_niche_raw_addr");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(42), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map_or", Some("core::option::Option".into())),
+                    args: crate::model::call_args(vec![opt, default, env]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+
+        let mut site = map_or_site(result);
+        site.niche = true;
+        site.int_null = Some(crate::model::NicheIntNull::RawAddress(Some(
+            "mmap::MappedObj".into(),
+        )));
+        site.payload_ty = ValueType::Int;
+        assert_eq!(rewire_map_or_call_sites(&mut g, &[site]), 1);
+
+        fn producer_ty(graph: &FunctionGraph, var: &Variable) -> ValueType {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    if op.result.as_ref() != Some(var) {
+                        continue;
+                    }
+                    return match &op.kind {
+                        OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstBool(_) => {
+                            ValueType::Int
+                        }
+                        OpKind::Call { result_ty, .. } => result_ty.clone(),
+                        OpKind::BinOp { result_ty, .. } => result_ty.clone(),
+                        OpKind::FieldRead { ty, .. } => ty.clone(),
+                        other => panic!("unexpected is_ operand producer: {other:?}"),
+                    };
+                }
+            }
+            panic!("no producer for is_ operand");
+        }
+        fn bank(ty: &ValueType) -> char {
+            match ty {
+                ValueType::Int | ValueType::Unsigned | ValueType::Bool => 'i',
+                ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 'r',
+                ValueType::Float => 'f',
+                _ => 'v',
+            }
+        }
+
+        let mut saw_is = 0usize;
+        for block in &g.blocks {
+            for op in &block.operations {
+                let OpKind::BinOp {
+                    op: name, lhs, rhs, ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if name != "is_" {
+                    continue;
+                }
+                saw_is += 1;
+                let lhs_ty = producer_ty(&g, lhs);
+                let rhs_ty = producer_ty(&g, rhs);
+                assert_eq!(
+                    bank(&lhs_ty),
+                    bank(&rhs_ty),
+                    "is_ mixed kinds {lhs_ty:?} vs {rhs_ty:?}"
+                );
+                assert_eq!(bank(&lhs_ty), 'i', "raw-address niche opt is int-banked");
+            }
+        }
+        assert_eq!(saw_is, 1, "niche map_or emits one is_ null test");
+
+        let nulls: Vec<String> = g.blocks[a.0]
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. }
+                    if target.to_string().starts_with("core::ptr::null") =>
+                {
+                    Some(target.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nulls, vec!["core::ptr::null_raw".to_string()]);
     }
 }

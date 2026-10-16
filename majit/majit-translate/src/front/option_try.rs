@@ -63,6 +63,10 @@ pub(crate) struct OptionTrySite {
     /// tag switch is then a pointer null-test (`opt != null`) and the `Some`-arm
     /// payload is the base pointer itself (identity).
     pub niche: bool,
+    /// Int-banked niche (`Option<fn>` / raw Address): `Some` is that
+    /// int-bank null (`null_fn` / `null_raw`; `rnone.py` `rtype_is_None`).
+    /// `None` is a ref-bank niche (`push_niche_null`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// `Option<NonZero<_>>`: `None` is 0 and `Some` is the word.
     pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
@@ -78,12 +82,13 @@ pub(crate) struct OptionTryStats {
 /// Rewrite every recorded `Option` `Try::branch` site.  `return_option_owner`
 /// is the enclosing function's declared `Option<U>` root; `None` means the
 /// function is not Option-returning, so all sites decline. `return_niche`,
-/// `return_narrow_root`, and `return_niche_null_cast` describe the enclosing
-/// return Option independently of the branched Option: a niche return builds
-/// a narrowed null instead of an enum `Option::None` aggregate. The receiver
-/// null-test uses [`OptionTrySite::niche_null_cast`]; the returned `None`
-/// uses `return_niche_null_cast`, because recording only has the branched
-/// `Option` and the return `Option` is the function signature's output.
+/// `return_narrow_root`, `return_niche_null_cast`, and `return_int_null`
+/// describe the enclosing return Option independently of the branched Option:
+/// a niche return builds a narrowed null instead of an enum `Option::None`
+/// aggregate. The receiver null-test uses [`OptionTrySite::int_null`]; the
+/// returned `None` uses `return_int_null` / `return_niche_null_cast`, because
+/// recording only has the branched `Option` and the return `Option` is the
+/// function signature's output.
 pub(crate) fn rewire_option_try_call_sites(
     graph: &mut FunctionGraph,
     sites: &[OptionTrySite],
@@ -92,6 +97,7 @@ pub(crate) fn rewire_option_try_call_sites(
     return_scalar_niche: bool,
     return_narrow_root: Option<&str>,
     return_niche_null_cast: Option<&(String, ValueType)>,
+    return_int_null: Option<&crate::model::NicheIntNull>,
 ) -> OptionTryStats {
     let mut stats = OptionTryStats::default();
     for site in sites {
@@ -103,6 +109,7 @@ pub(crate) fn rewire_option_try_call_sites(
             return_scalar_niche,
             return_narrow_root,
             return_niche_null_cast,
+            return_int_null,
         ) {
             Ok(()) => stats.rewritten += 1,
             Err(decline) => {
@@ -127,6 +134,7 @@ fn rewire_one_option_try_site(
     return_scalar_niche: bool,
     return_narrow_root: Option<&str>,
     return_niche_null_cast: Option<&(String, ValueType)>,
+    return_int_null: Option<&crate::model::NicheIntNull>,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let Some(return_option_owner) = return_option_owner else {
@@ -369,7 +377,11 @@ fn rewire_one_option_try_site(
             )
             .expect("scalar None produces a value")
     } else if return_niche {
-        let null = graph.push_niche_null(none_bb, return_niche_null_cast);
+        let null = if let Some(int_null) = return_int_null {
+            int_null.push(graph, none_bb)
+        } else {
+            graph.push_niche_null(none_bb, return_niche_null_cast)
+        };
         let narrow_root = return_narrow_root.map(str::to_owned);
         crate::front::option_map_or::emit_narrow(graph, none_bb, null, &narrow_root)
     } else {
@@ -403,22 +415,17 @@ fn rewire_one_option_try_site(
             },
         });
     } else if site.niche {
-        // Niche `Option<NonNull>`: the switch value is the pointer null-test
-        // `opt != null` (`None` = null = 0, `Some` = non-null = 1) — a `ne` on
-        // two `Ref` operands lowers to `ptr_ne` with an `Int` result, feeding
-        // the `{1 => Some, 0 => None}` switch exactly as the aggregate read.
-        // The null is a repr-adaptive `null_mut()` call, not a fixed-GCREF
-        // `ConstRefNull`, so `ptr_ne` sees the receiver's `InstanceRepr`.
-        let nullc = graph.push_niche_null(a_id, site.niche_null_cast.as_ref());
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(opt_disc.clone()),
-            kind: OpKind::BinOp {
-                op: "ne".to_string(),
-                lhs: opt_a.clone(),
-                rhs: nullc,
-                result_ty: ValueType::Int,
-            },
-        });
+        // Niche `Option`: the switch value is `not (opt is None)`
+        // (`None` = null = 0, `Some` = non-null = 1).  `ne` on a
+        // `StringRepr` / `ListRepr` payload is value inequality
+        // (`rstr.py` / `rlist.py` `rtype_ne`), not this null test.
+        graph.push_niche_is_some(
+            a_id,
+            opt_a.clone(),
+            site.int_null.as_ref(),
+            site.niche_null_cast.as_ref(),
+            opt_disc.clone(),
+        );
     } else {
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(opt_disc.clone()),
@@ -633,5 +640,128 @@ fn verify_forwards_to_returnblock(
         Err(format!(
             "{name}: None-return forwarding chain did not reach returnblock"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `Option<fn>` receiver is an int-bank address: its null test
+    /// compares against `null_fn`, never the ref-bank `null_mut()`.
+    #[test]
+    fn rewrite_niche_fn_option_tests_against_null_fn() {
+        let mut g = FunctionGraph::new("test_option_try_niche_fn");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+
+        let (b, b_args) = g.create_block_with_arg_vars(1);
+        let cf = g
+            .push_op_var(
+                b,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::ops::Try".into())),
+                    args: crate::model::call_args(vec![b_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_goto(a, b, vec![opt]);
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let cf_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: cf_c.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (cont, _) = g.create_block_with_arg_vars(0);
+        g.set_return(cont, None);
+
+        let (brk, brk_args) = g.create_block_with_arg_vars(1);
+        let residual_payload = g
+            .push_op_var(
+                brk,
+                OpKind::FieldRead {
+                    base: brk_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Break".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        let residual = g
+            .push_op_var(
+                brk,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "from_residual",
+                        Some("core::ops::FromResidual".into()),
+                    ),
+                    args: crate::model::call_args(vec![residual_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(brk, Some(residual));
+
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(Vec::new(), cont, Some(ExitCase::Const(ConstValue::Int(0)))),
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_c)],
+                brk,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        g.set_goto(b, c, vec![cf.clone()]);
+
+        let stats = rewire_option_try_call_sites(
+            &mut g,
+            &[OptionTrySite {
+                branch_result_var: cf,
+                option_owner: "core::option::Option".into(),
+                some_owner: "core::option::Option::Some".into(),
+                payload_ty: ValueType::Int,
+                niche: true,
+                int_null: Some(crate::model::NicheIntNull::FnPtr(None)),
+                scalar_niche: false,
+                niche_null_cast: None,
+            }],
+            Some("core::option::Option"),
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(stats.rewritten, 1, "the niche Option `?` site is rewritten");
+
+        let nulls: Vec<String> = g.blocks[a.0]
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } if args.is_empty() => Some(target.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nulls, vec!["core::ptr::null_fn".to_string()]);
     }
 }

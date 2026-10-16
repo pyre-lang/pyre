@@ -525,6 +525,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("std.ptr", "null", rtype_ptr_null),
         // Null `Option<fn>` — `SomePtr(FuncType)`, `lltype.nullptr`.
         ("core.ptr", "null_fn", rtype_null_fn),
+        // Raw-address niche `None` — `lltype.nullptr(T)` or `llmemory.NULL`.
+        ("core.ptr", "null_raw", rtype_null_raw),
         // `core.ptr` shares the `std.ptr` attr instance (model.rs), so
         // one entry covers both spellings.
         ("std.ptr", "eq", rtype_ptr_eq),
@@ -4338,6 +4340,45 @@ fn rtype_null_fn(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeRe
     Ok(Some(Hlvalue::Constant(
         crate::flowspace::model::Constant::with_concretetype(ConstValue::LLPtr(Box::new(null)), ll),
     )))
+}
+
+/// `core.ptr.null_raw` — `lltype.nullptr(T)` of a raw `Ptr` (`rptr.py`
+/// `PtrRepr`), or `llmemory.NULL` when the result is `Address`
+/// (`raddress.py` `AddressRepr`). A constant class-root argument is
+/// consumed at annotation (`raw_ptr_null_constant`); `r_result` already
+/// carries that `Ptr` / `Address`.
+fn rtype_null_raw(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, nullptr};
+
+    hop.exception_cannot_occur()?;
+    let r_result_borrow = hop.r_result.borrow();
+    let r_result = r_result_borrow
+        .as_ref()
+        .ok_or_else(|| TyperError::message("rtype_null_raw: r_result missing".to_string()))?;
+    let ll = r_result.lowleveltype().clone();
+    match &ll {
+        LowLevelType::Ptr(ptr) => {
+            let null = nullptr(LowLevelType::from(ptr.TO.clone())).map_err(TyperError::message)?;
+            Ok(Some(Hlvalue::Constant(
+                crate::flowspace::model::Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(null)),
+                    ll,
+                ),
+            )))
+        }
+        LowLevelType::Address => Ok(Some(Hlvalue::Constant(
+            crate::flowspace::model::Constant::with_concretetype(
+                ConstValue::LLAddress(
+                    crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+                ),
+                ll,
+            ),
+        ))),
+        _ => Err(TyperError::message(format!(
+            "rtype_null_raw: result is not a raw pointer or Address, got {ll:?}"
+        ))),
+    }
 }
 
 /// Empty-string constructors — `String::new()` / `String::with_capacity(n)`

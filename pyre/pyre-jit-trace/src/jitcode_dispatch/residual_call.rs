@@ -3744,16 +3744,14 @@ pub(crate) fn record_result_of_executed_pure_call<Sym: WalkSym>(
 
 /// Whether Ref argument `arg_index` of a may-force CALL to `helper` is a
 /// **checked** `PY_NULL` sentinel — a slot the helper tests before use, so a
-/// concrete NULL there is the operand's normal shape rather than the broken
-/// baked-NULL shape [`DispatchError::MayForceNullRefArgUnsupported`] exists to
-/// catch.  `nargs` is the callee's argument count, for the trailing-slot entry.
+/// concrete NULL there is the operand's normal shape.  `nargs` is the callee's
+/// argument count, for the trailing-slot entry.
 ///
-/// One table, read by both `walker_abort_if_mayforce_null_ref_arg` (which
-/// aborts the walk) and `try_execute_residual_call_via_executor` (which leaves
-/// the call symbolic).  They have to agree: an exemption in only the gate lets
-/// the walk continue past a call the executor then declines, and a
-/// `declined_symbolic` drops the recording iteration's call exactly once
-/// (`g(i, d=4)` in a hot loop summed to n-1, with the callee run n-1 times).
+/// Read by `try_execute_residual_call_via_executor`, which leaves a
+/// non-sentinel NULL-Ref call symbolic rather than invoking it.  A sentinel
+/// NULL is executed: declining it drops the recording iteration's call exactly
+/// once (`g(i, d=4)` in a hot loop summed to n-1, with the callee run n-1
+/// times).
 ///
 /// * `CallFn` / `CallKw` arg 1 — `null_or_self`: `bh_call_fn_impl` /
 ///   `bh_call_kw_N` prepend it as arg0 only when non-null, so NULL is the
@@ -3770,8 +3768,8 @@ pub(crate) fn record_result_of_executed_pure_call<Sym: WalkSym>(
 ///   already ran concretely.
 /// * `WithExceptStart` arg 1 — `exit_self`: `with_except_start_values` prepends
 ///   it as arg0 only when non-null, and `LOAD_SPECIAL` leaves it NULL for every
-///   already-bound `__exit__`, which is the common `with` shape.  Aborting on it
-///   refuses every bridge out of a `with` handler.
+///   already-bound `__exit__`, which is the common `with` shape.  Declining it
+///   as symbolic refuses every bridge out of a `with` handler.
 /// * `LoadGlobal` arg 0 — `namespace_ptr`: the helper discards it and resolves
 ///   the namespace from the executing frame or the callee's own promoted
 ///   `w_code`, because an inlined / chained callee's frame register aliases an
@@ -3859,82 +3857,6 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                     }
                 })
         })
-}
-
-/// Abort the walk when a result-bearing may-force CALL is recorded with a
-/// concrete-NULL Ref argument — the specialized direct-call shape whose
-/// baked `ptr(0x0)` (the `PUSH_NULL` self-slot) makes the runtime call pass
-/// NULL where the callee entry expects its globals/closure, yielding a NULL
-/// result (closures / locals-bound callees called in a loop). See
-/// [`DispatchError::MayForceNullRefArgUnsupported`].
-pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
-    call_opcode: OpCode,
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    ctx: &WalkContext<'_, '_, Sym>,
-    pc: usize,
-) -> Result<(), DispatchError> {
-    if !matches!(
-        call_opcode,
-        OpCode::CallMayForceR | OpCode::CallMayForceI | OpCode::CallMayForceF
-    ) {
-        return Ok(());
-    }
-    // `allboxes[0]` is the funcbox; `allboxes[1 + i]` aligns with
-    // `arg_types[i]` (see `build_allboxes`).  A Ref arg folded to the
-    // NULL constant (`GcRef(0)`) is the broken self-slot; the sentinel
-    // `GcRef(usize::MAX)` means "no concrete known" and is left alone.
-    //
-    // Exemption: `bh_call_fn_N(callable, null_or_self, args...)`'s
-    let helper = call_descr.get_extra_info().runtime_helper;
-    let nargs = call_descr.arg_types().len();
-    for (i, &ty) in call_descr.arg_types().iter().enumerate() {
-        if ty != majit_ir::Type::Ref {
-            continue;
-        }
-        let Some(&b) = allboxes.get(1 + i) else {
-            continue;
-        };
-        if !matches!(
-            ctx.trace_ctx.box_value(b),
-            Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
-        ) {
-            continue;
-        }
-        // The checked-sentinel table, shared with
-        // `try_execute_residual_call_via_executor` so the two cannot drift.
-        // Its funcbox coordinate names a leaf the effect info gives no
-        // `RuntimeHelperKind` for, and is resolved on this arm alone.
-        let target = match allboxes.first().and_then(|&f| ctx.trace_ctx.box_value(f)) {
-            Some(majit_ir::Value::Int(addr)) => addr,
-            _ => 0,
-        };
-        if mayforce_null_ref_arg_is_checked_sentinel(helper, target, i, nargs) {
-            continue;
-        }
-        // Phase-1 diagnostic (gh#343 depth-2): pinpoint which Ref arg
-        // folded to concrete NULL and its provenance.  Gated on
-        // `PYRE_P2_DIAG` (the depth-2 framestack-walk diag flag) and
-        // computed only on the abort path, so the default trace path
-        // pays nothing.
-        if p2_diag_enabled() {
-            eprintln!(
-                "[p2-mayforce] NULL Ref arg: pc={pc} call_opcode={call_opcode:?} \
-                 helper={helper:?} arg_index={i} nargs={nargs} funcbox={:?}(={:?})",
-                allboxes.first(),
-                allboxes.first().and_then(|&f| ctx.trace_ctx.box_value(f)),
-            );
-            for (j, &aty) in call_descr.arg_types().iter().enumerate() {
-                let ab = allboxes.get(1 + j).copied();
-                eprintln!(
-                    "[p2-mayforce]   arg[{j}] ty={aty:?} opref={ab:?} val={:?}",
-                    ab.and_then(|b| ctx.trace_ctx.box_value(b)),
-                );
-            }
-        }
-        return Err(DispatchError::MayForceNullRefArgUnsupported { pc });
-    }
-    Ok(())
 }
 
 /// Diagnostic (`PYRE_FBW_DEBUG_ABORT`): dump the Python coordinate and per-arg
@@ -4660,20 +4582,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // NULL-Ref-arg refusal: same SEGV-avoidance contract as the pure
     // fast path (see `try_fold_pure_call_via_executor`'s NULL guard).  Pyre's
     // optimizer emits `guard_nonnull` after this walker fold, so a NULL
-    // receiver dereferences before that guard exists; fall through to
-    // recording the call op and let the optimizer's guard emission
-    // handle it at compile time.
-    // Exemption: `bh_call_fn_N(callable, null_or_self, args...)`'s
-    // `null_or_self` (arg index 1) is a checked sentinel — `PY_NULL`
-    // means "no receiver" and is never dereferenced (`bh_call_fn_impl`
-    // prepends it as arg0 only when non-null), so a concrete-NULL there
-    // is the normal plain-call shape.  The exemptions are read out of the
-    // same `mayforce_null_ref_arg_is_checked_sentinel` table
-    // `walker_abort_if_mayforce_null_ref_arg` consults, because they MUST
-    // agree — a gate-only exemption leaves a normal no-receiver
-    // keyword/star call declined as symbolic here, which drops the
-    // recording iteration's call exactly once (`g(i, d=4)` in a hot loop
-    // summed to n-1, callee ran n-1 times).
+    // receiver dereferences before that guard exists; leave the call
+    // recorded and let the optimizer's guard emission handle it at compile
+    // time.  `mayforce_null_ref_arg_is_checked_sentinel` names slots the
+    // helper tests before use (`bh_call_fn_N`'s `null_or_self`, …), so a
+    // concrete NULL there is executed.
     let helper = call_descr.get_extra_info().runtime_helper;
     // `bh_load_method_self_fn` dereferences `attr` (`is_method`) before it
     // looks at `obj`. A null or unaligned word is not a PyObject — a
@@ -9270,13 +9183,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iRd_kind");
-        // The abort gate is static (EI flags) and must run BEFORE the
-        // concrete executor below: `do_residual_call` (pyjitpl.py)
-        // executes the helper only on a path that keeps recording — it has
-        // no execute-then-abandon shape.  Aborting after execution would
-        // leave the helper's heap/exception effects standing while the
-        // declined retrace re-runs the same bytecode, double-applying them.
-        walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
 
         // pyjitpl.py `vable_and_vrefs_before_residual_call` — fires
         // unconditionally on the forces branch.  Records FORCE_TOKEN +
@@ -10852,7 +10758,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRd_kind");
-        walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
 
         // pyjitpl.py `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
@@ -11180,7 +11085,6 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRFd_kind");
-        walker_abort_if_mayforce_null_ref_arg(call_opcode, &allboxes, call_descr, ctx, op.pc)?;
 
         // pyjitpl.py `vable_and_vrefs_before_residual_call` —
         // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations

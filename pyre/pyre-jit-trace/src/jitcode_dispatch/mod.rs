@@ -3368,19 +3368,6 @@ pub enum DispatchError {
     /// abort that the production driver maps to `TraceAction::AbortPermanent`
     /// (never trace this location again).
     AbortPermanentMarkerReached { pc: usize },
-    /// A result-bearing may-force CALL (`CallMayForce{R,I,F}`, a Python
-    /// function-entry call) was recorded with a concrete-NULL Ref
-    /// argument. This is the specialized direct-call shape: the callee
-    /// was folded to its entry address and the `PUSH_NULL` self-slot is
-    /// baked as `ptr(0x0)`. `try_execute_residual_call_via_executor` skips
-    /// such a call (its NULL-receiver SEGV guard), so the result stays
-    /// unresolved, and the baked NULL arg makes the compiled call pass
-    /// NULL where the entry needs the callee's globals/closure — yielding
-    /// a NULL result at runtime (closures / functions bound to a local
-    /// and called in a loop). The walker surfaces a typed abort so the
-    /// driver maps it to `TraceAction::Abort` and the loop falls back to
-    /// the interpreter instead of compiling a wrong trace.
-    MayForceNullRefArgUnsupported { pc: usize },
     /// The virtualizable escaped during a concrete-executed may-force
     /// residual call: `vinfo.tracing_after_residual_call(virtualizable)`
     /// found the token cleared by the callee's force path
@@ -3609,7 +3596,6 @@ impl DispatchError {
             Self::FunctionCodeRacedRecord { .. } => "FunctionCodeRacedRecord",
             Self::ConcreteShadowAllocationFailed { .. } => "ConcreteShadowAllocationFailed",
             Self::AbortPermanentMarkerReached { .. } => "AbortPermanentMarkerReached",
-            Self::MayForceNullRefArgUnsupported { .. } => "MayForceNullRefArgUnsupported",
             Self::VableEscapedDuringResidualCall { .. } => "VableEscapedDuringResidualCall",
             Self::GuardSnapshotVableUntyped { .. } => "GuardSnapshotVableUntyped",
             Self::GuardResumeCoordinateUnavailable { .. } => "GuardResumeCoordinateUnavailable",
@@ -3694,7 +3680,6 @@ impl DispatchError {
             | Self::AbortPermanentMarkerReached { pc, .. }
             | Self::KwonlyDefaultsMappingRacedRecord { pc, .. }
             | Self::FunctionCodeRacedRecord { pc, .. }
-            | Self::MayForceNullRefArgUnsupported { pc, .. }
             | Self::VableEscapedDuringResidualCall { pc, .. }
             | Self::GuardSnapshotVableUntyped { pc, .. }
             | Self::GuardResumeCoordinateUnavailable { pc, .. }
@@ -3746,7 +3731,6 @@ impl DispatchError {
                 | Self::UnsupportedOpname { .. }
                 | Self::OrthodoxSubWalkTraceUnsupported { .. }
                 | Self::UnfoldableListAppendResidualUnsupported { .. }
-                | Self::MayForceNullRefArgUnsupported { .. }
                 | Self::InplaceContainerMutationUnsupported { .. }
                 | Self::InlineCallArityMismatch { .. }
                 | Self::InlineCallIntArityMismatch { .. }

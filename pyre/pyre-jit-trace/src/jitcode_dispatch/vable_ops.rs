@@ -1385,10 +1385,9 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // box that may already carry a live concrete. A frame whose array slot is
     // still an unmaterialized hole reads NULL while the real Ref lives in the
     // guard's register file, so stamping that NULL would clobber the live value
-    // (last write wins) and fold a downstream may-force residual's Ref arg to
-    // NULL -> `MayForceNullRefArgUnsupported`. Skip ONLY that clobber: a NULL
-    // read onto a box with no live Ref still stamps, keeping NULL a real
-    // concrete for the slots that genuinely hold one.
+    // (last write wins) and a downstream residual would consume the hole. Skip
+    // ONLY that clobber: a NULL read onto a box with no live Ref still stamps,
+    // keeping NULL a real concrete for the slots that genuinely hold one.
     let clobbers_live_ref = matches!(shadow_value, Value::Ref(majit_ir::GcRef(0)))
         && matches!(
             ctx.trace_ctx.box_value(result),

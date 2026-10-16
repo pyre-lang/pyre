@@ -375,6 +375,10 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // pointer's null is `SomePtr(FuncType)` (`fn_null_constant`), the
     // same `ll_ptrtype` as the matching `fn` value so the two arms union.
     analyzer_for(&mut reg, "core.ptr.null_fn", fn_null_constant);
+    // Raw-address niche `None` (`Option<&Raw>`, `Option<NonNull<Raw>>`).
+    // A spelled class root is `lltype.nullptr(T)` (`SomePtr` of that raw
+    // `Struct`); no argument is `llmemory.NULL` (`SomeAddress`).
+    analyzer_for(&mut reg, "core.ptr.null_raw", raw_ptr_null_constant);
     // Rust `std::mem::size_of::<T>() -> usize` — compile-time type-size
     // constant called by `lltype::malloc_typed` /
     // `object_array::items_block_layout`.  Returns `SomeInteger`.
@@ -1578,6 +1582,47 @@ fn fn_null_constant(
     }
 }
 
+/// Null of a raw-address niche — `lltype.nullptr(T)` as `SomePtr` of
+/// that raw `Struct` (`rnone.py` `rtype_is_None` → `ptr_iszero`), or
+/// `llmemory.NULL` as `SomeAddress` (`int_is_zero`) when the payload
+/// has no named pointee. A `null_fn` empty `FuncType` does not union
+/// with `Ptr(Struct)` (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
+fn raw_ptr_null_constant(
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() {
+        return Err(AnnotatorError::new("ptr::null_raw() takes no keywords"));
+    }
+    match args_s {
+        [] => {
+            let mut s = SomeValue::Address(super::model::SomeAddress::new());
+            s.set_const_box(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::LLAddress(
+                    crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+                ),
+            ));
+            Ok(s)
+        }
+        [Some(s_ty)] => {
+            let Some(spelling) = s_ty.const_().and_then(|c| c.as_pystr()) else {
+                return Err(AnnotatorError::new(
+                    "ptr::null_raw() type argument must be a constant string",
+                ));
+            };
+            bk.raw_struct_ptr_annotation(spelling).ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "ptr::null_raw() type argument is not a raw pointer: {spelling}"
+                ))
+            })
+        }
+        _ => Err(AnnotatorError::new(
+            "ptr::null_raw() takes an optional raw-pointer type argument",
+        )),
+    }
+}
+
 /// Analyzer for `std::mem::size_of::<T>() -> usize` — compile-time
 /// type-size constant.  Registered against the
 /// `HostObject::new_builtin_callable("std.mem.size_of")` stub.
@@ -1781,7 +1826,13 @@ fn cast_instance_intrinsic(
     };
     let with_nullability = |mut projected: SomeValue| {
         if let SomeValue::String(str_) = &mut projected {
-            str_.inner.can_be_none = operand_can_be_none;
+            // `project_struct_field_type("Option<String>")` already
+            // `noneify`s (`union(s_str0, s_None)`). A residual host
+            // call shells as a classdef-less instance with
+            // `can_be_none=false`; copying that onto the projection
+            // would undo the Option's nullability and make `s is None`
+            // (`pairtype(SomeObject, SomeObject).is_`) a constant false.
+            str_.inner.can_be_none = operand_can_be_none || str_.inner.can_be_none;
         }
         projected
     };
@@ -3104,6 +3155,97 @@ mod tests {
         assert!(
             matches!(merged, SomeValue::Ptr(_)),
             "typed null_fn must stay SomePtr, got {merged:?}"
+        );
+    }
+
+    fn raw_mapped_obj_bk() -> (Rc<Bookkeeper>, parking_lot::MutexGuard<'static, ()>) {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let inner = "mmap::MappedObj";
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (inner.to_string(), Some(inner_id)),
+            ]));
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        // Discriminant-only base plus a payload variant: a fieldless enum
+        // stays the integer tag (`rclass.py` `getinstancerepr`).
+        reg.fields.insert(
+            inner.to_string(),
+            vec![("__discriminant".into(), "u8".into())],
+        );
+        reg.fields.insert(
+            format!("{inner}::Mapped"),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "mmap::PosixMap",
+            )],
+        );
+        reg.raw_word_owners.insert(inner.to_string());
+        bk.set_struct_fields(Rc::new(reg));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            inner_id,
+            crate::call::StructLayout {
+                size: 24,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+        (bk, ids)
+    }
+
+    /// `lltype.nullptr(T)` of a raw struct is `SomePtr(Ptr(Struct))`, not
+    /// `FuncType`. It unions with the matching field-read annotation
+    /// (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
+    #[test]
+    fn typed_null_raw_unions_with_raw_struct_pointer() {
+        use crate::annotator::model::{SomeValue, unionof};
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let (bk, _ids) = raw_mapped_obj_bk();
+        let s_ptr = bk
+            .raw_struct_ptr_annotation("mmap::MappedObj")
+            .expect("raw struct ptr");
+        let mut s_ty = crate::annotator::model::s_str0();
+        s_ty.set_const_box(Constant::new(ConstValue::byte_str("mmap::MappedObj")));
+        let s_null = raw_ptr_null_constant(&bk, &[Some(s_ty)], &std::collections::HashMap::new())
+            .expect("typed null_raw");
+        let SomeValue::Ptr(ptr) = &s_null else {
+            panic!("null_raw of a named raw pointee must be SomePtr, got {s_null:?}");
+        };
+        assert!(
+            matches!(ptr.ll_ptrtype.TO, PtrTarget::Struct(_)),
+            "raw-address null must be Ptr(Struct), got {:?}",
+            ptr.ll_ptrtype.TO
+        );
+        assert!(
+            !matches!(ptr.ll_ptrtype.TO, PtrTarget::Func(_)),
+            "raw-address null must not be FuncType"
+        );
+        let merged = unionof([&s_ptr, &s_null]).expect("raw None unions with Some of T");
+        assert!(
+            matches!(merged, SomeValue::Ptr(_)),
+            "typed null_raw must stay SomePtr, got {merged:?}"
+        );
+    }
+
+    /// No pointee type is `llmemory.NULL` (`SomeAddress`).
+    #[test]
+    fn untyped_null_raw_is_some_address() {
+        let s_null =
+            raw_ptr_null_constant(&bk(), &[], &std::collections::HashMap::new()).expect("null_raw");
+        assert!(
+            matches!(s_null, SomeValue::Address(_)),
+            "untyped null_raw must be SomeAddress, got {s_null:?}"
         );
     }
 

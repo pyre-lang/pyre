@@ -11483,7 +11483,7 @@ mod tests {
                 is_some: false,
                 niche: true,
                 niche_null_cast: None,
-                fn_ptr: true,
+                int_null: Some(crate::model::NicheIntNull::FnPtr(None)),
                 scalar_niche: false,
             }],
         );

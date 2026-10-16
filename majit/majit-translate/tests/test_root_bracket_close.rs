@@ -691,6 +691,32 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
     }
 }
 
+/// `|| shadow_stack_get(len)` after `pin_root` is a RootSlotGetter
+/// closure. Publishing other crates' root-stack effects lets
+/// `analyze_root_brackets` erase the bracket; the callee is the closure
+/// `call`, not a `gc_roots` leaf, so lowering answers it from `get_sites`.
+#[test]
+fn a_captured_len_getter_lowers_once_root_stack_effects_are_published() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load object llbc");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load interpreter llbc");
+    let mut crates = vec![object.crate_name().to_string()];
+    let mut touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    crates.push(interpreter.crate_name().to_string());
+    touching.extend(majit_translate::front::mir::harvest_root_stack_touching_paths(&interpreter));
+    interpreter.set_root_stack_effects(crates, touching);
+    let context = LowerContext::new(&interpreter);
+    let graph = lower_fun(&interpreter, &context, "type_get_annotations");
+    assert!(
+        !graph.blocks.is_empty(),
+        "a captured-len getter must lower once root-stack effects are published"
+    );
+}
+
 /// `ll_listslice_new_int_list` pins source and dest around `newlist` +
 /// `ll_arraycopy`. The native RootScope is scalar-replaced so a
 /// BINARY_SLICE sub-walk records the copy, not residual `pin_root`.
