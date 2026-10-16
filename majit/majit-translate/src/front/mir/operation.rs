@@ -662,18 +662,24 @@ impl<'a> Lowering<'a> {
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let mut field = FieldDescriptor::new(field_name, Some(owner_root.to_string()))
+            .with_owner_id(*owner_id)
+            .with_base_is_deref(true)
+            .with_inline_vec(
+                field_ty_is_inline_vec(field_ty, self.llbc)
+                    || field_ty_is_inline_vec(place_ty, self.llbc),
+            );
+        if tyref_rust_vec_item_kind(field_ty, self.llbc).is_some()
+            || tyref_rust_vec_item_kind(place_ty, self.llbc).is_some()
+        {
+            field = field.with_taken_by_address(true);
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::InteriorFieldRead {
                 base,
                 index,
-                field: FieldDescriptor::new(field_name, Some(owner_root.to_string()))
-                    .with_owner_id(*owner_id)
-                    .with_base_is_deref(true)
-                    .with_inline_vec(
-                        field_ty_is_inline_vec(field_ty, self.llbc)
-                            || field_ty_is_inline_vec(place_ty, self.llbc),
-                    ),
+                field,
                 item_ty,
                 array_type_id: Some(alias.array_type_id.clone()),
                 array: None,
@@ -3218,7 +3224,11 @@ impl<'a> Lowering<'a> {
             // The result is the list object (`newlist` / `OpKind::NewList`
             // is `ValueType::Ref`). `rtype_alloc_and_set` concretetypes
             // that pointer `GcRef`. Declaring `Int` makes the legacy
-            // walker `Signed` on the same variable.
+            // walker `Signed` on the same variable. The dest's
+            // `Array<T;N>` is the ARRAY identity `fixed_repeat_identity`
+            // reads; `Ref(None)` leaves the rewrite to `LinkClasses`
+            // matching a later index of the same SSA, which address-of
+            // (`&mut mapping`) splits.
             Rvalue::Repeat {
                 operand: elem,
                 count,
@@ -3240,7 +3250,7 @@ impl<'a> Lowering<'a> {
                             specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
-                        result_ty: ValueType::Ref(None),
+                        result_ty: repeat_array_result_ty(dest_ty, self.llbc),
                     }),
                     res,
                 ))
@@ -4235,15 +4245,10 @@ impl<'a> Lowering<'a> {
                         res,
                     ));
                 }
-                let disc_owner_gc = container_declared_gc(
-                    &place.ty,
-                    self.llbc,
-                    self.gc_struct_ids,
-                    self.immutable_fields,
-                    &self.raw_alloc_flavor_structs,
-                );
+                let disc_owner_gc = self.container_owner_declared_gc(&place, true);
                 let recast_tagged_sum =
-                    crate::front::result_exc::tyref_is_option(&place.ty, self.llbc);
+                    crate::front::result_exc::tyref_is_option(&place.ty, self.llbc)
+                        && disc_owner_gc != Some(false);
                 let mut base = self.resolve_place(mir_bb, place)?;
                 // A tagged split Option intern's a BASE class with
                 // `__discriminant` (`register_ref_enum_instantiation_rows`).
@@ -4257,6 +4262,8 @@ impl<'a> Lowering<'a> {
                 // Option class: recasting them inserts a `cast_instance`
                 // the Result-match rewriter does not
                 // attribute to the forwarded scrutinee.
+                // A raw-address `&Enum` stays in the int bank; recasting
+                // that word to a GC instance restamps `getfield_gc`.
                 if let Some(root) = owner_root.as_ref()
                     && root.contains('<')
                     && recast_tagged_sum
@@ -4297,6 +4304,40 @@ impl<'a> Lowering<'a> {
                 rvalue_variant_name(&other)
             ))),
         }
+    }
+
+    /// Declared gckind of a field/discriminant owner.
+    ///
+    /// `*p` of a raw-address `&Enum` / `*const Enum` (`ty_is_raw_address`)
+    /// is an interior of a raw container (`rewrite_op_getsubstruct`
+    /// `int_add`). An integer/discriminant read off that address is
+    /// `getfield_raw_i`; `promote_gc_field_bases` must not restamp the
+    /// int base. A GC-pointer payload load keeps [`container_declared_gc`]
+    /// of the pointee so `getfield_gc_r` still restamps.
+    pub(in crate::front::mir) fn container_owner_declared_gc(
+        &self,
+        container: &Place,
+        field_is_int_bank: bool,
+    ) -> Option<bool> {
+        if field_is_int_bank
+            && let PlaceKind::Projection(pre, ProjectionElem::Atom(name)) = &container.kind
+            && name == "Deref"
+            && ty_is_raw_address(
+                &pre.ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+        {
+            return Some(false);
+        }
+        container_declared_gc(
+            &container.ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
+        )
     }
 
     /// Address of `*p` when `p` is one raw pointer. `None` for any other place.
@@ -7144,11 +7185,11 @@ impl<'a> Lowering<'a> {
                         });
                         return Ok(res);
                     }
-                    let owner_declared_gc = container_declared_gc(
-                        &inner.ty,
+                    let field_vt = tyref_to_value_type_with(
+                        &place_ty,
                         self.llbc,
+                        self.tombstoned_leaves,
                         self.gc_struct_ids,
-                        self.immutable_fields,
                         &self.raw_alloc_flavor_structs,
                     );
                     // Captured before `resolve_place` moves `inner`. A
@@ -7177,6 +7218,8 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             &self.raw_alloc_flavor_structs,
                         ));
+                    let owner_declared_gc =
+                        self.container_owner_declared_gc(&inner, value_type_is_int_bank(&field_vt));
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
@@ -7300,6 +7343,14 @@ impl<'a> Lowering<'a> {
                                 && (field_ty_is_inline_vec(&field_ty, self.llbc)
                                     || field_ty_is_inline_vec(&place_ty, self.llbc)),
                         );
+                    // `RustVecRepr`: a one-word-item `Vec` is the header
+                    // address (`rewrite_op_getsubstruct`). `with_vec_part`
+                    // later clears this for Buf/Len so `.len()` stays a load.
+                    if tyref_rust_vec_item_kind(&field_ty, self.llbc).is_some()
+                        || tyref_rust_vec_item_kind(&place_ty, self.llbc).is_some()
+                    {
+                        field = field.with_taken_by_address(true);
+                    }
                     if dyn_vtable {
                         field = field.with_vec_part(crate::model::VecFieldPart::FatVtable);
                     }

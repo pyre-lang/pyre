@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::object_array::{
     TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock, alloc_typed_items_block,
-    dealloc_typed_items_block, gc_float_array_gc_type_id, grow_float_items_block,
+    dealloc_typed_items_block, gc_float_array_gc_type_id, grow_float_items_block, jit_ll_arraymove,
     try_alloc_typed_items_block, typed_items_block_capacity,
 };
 
@@ -278,12 +278,17 @@ impl FloatArray {
 
     pub fn remove(&mut self, index: usize) -> f64 {
         assert!(index < self.len_relaxed());
+        // rlist.py `ll_pop_nonneg` / `ll_delitem_nonneg`. Float items have
+        // no GC null to store (`ll_null_item` is None).
         let value = self.as_slice()[index];
-        unsafe {
-            let p = self.base().add(index);
-            std::ptr::copy(p.add(1), p, self.len_relaxed() - index - 1);
-        }
-        self.set_len_relaxed(self.len_relaxed() - 1);
+        let newlength = self.len_relaxed() - 1;
+        jit_ll_arraymove(
+            self.block as crate::PyObjectRef,
+            (index + 1) as i64,
+            index as i64,
+            (newlength - index) as i64,
+        );
+        self.set_len_relaxed(newlength);
         value
     }
 

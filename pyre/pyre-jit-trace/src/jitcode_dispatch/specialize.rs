@@ -8150,7 +8150,12 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
             _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         };
     if boxed_out.is_some() {
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        // `finishframe` writes dest only when `resultbox is not None`.
+        // Void-bank `boxed_out` is that None case: the caller writes the
+        // CALL dest later, so this must not set `residual_dest_written`.
+        if dst_bank != 'v' {
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        }
     } else {
         write_no_driver_finishframe_dest(
             ctx,
@@ -8197,11 +8202,10 @@ fn orthodox_helper_boxed<Sym: WalkSym>(
         Some(&mut boxed),
     )? {
         Some(DispatchOutcome::Continue) => {
-            helper_blackhole_after_no_driver_finishframe(
-                ctx,
-                no_driver_finishframe_latch(ctx, op_pc),
-                op_pc,
-            )?;
+            // `finishframe(None)` pops and does not `make_result_of_lastop`.
+            // The enclosing Python CALL dest is still unwritten, so abort
+            // convert resumes at that CALL (`op_pc`), not `residual_call_next_pc`.
+            helper_blackhole_after_no_driver_finishframe(ctx, op_pc, op_pc)?;
             if allow_void {
                 Ok(Some(boxed))
             } else {

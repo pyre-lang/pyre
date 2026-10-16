@@ -1695,15 +1695,17 @@ pub(in crate::front::mir) fn trait_impl_trait_path_for_fundecl(
         .get("id")?
         .as_u64()?;
     let td = llbc.trait_by_id(trait_id)?;
-    // Only source-local traits participate: std/core trait impls
-    // (`FnOnce` closure shims, `Destruct`/`Drop` glue, `PartialEq`, …)
-    // are host machinery, not translated-program classes, and keep
-    // their inherent classification.
-    if !td.item_meta.is_local {
-        return None;
-    }
     let trait_path = td.item_meta.name_path();
     if trait_path.is_empty() {
+        return None;
+    }
+    // Charon's `is_local` is per extracted crate. `DictStrategy` is local
+    // in `pyre-object.ullbc` and external in `pyre-interpreter.ullbc`, but
+    // `MapDictStrategy` / `ClassDictStrategySlot` still belong to that
+    // trait's PBC family (`CallControl.graphs_from` / `row_of_graphs`).
+    // Std/core traits stay peeled: their crate is not a loaded LLBC root.
+    let trait_crate = trait_path.split("::").next().unwrap_or("");
+    if !td.item_meta.is_local && !crate::local_crates::is_crate_alias_root(trait_crate) {
         return None;
     }
     Some(trait_path)
@@ -2279,8 +2281,11 @@ pub(in crate::front::mir) fn one_word_pointer_bank_pointee<'l>(
 ///
 /// `None` when `ty` is not a struct or enum. A `GcType` seed is Gc. An owner
 /// the raw-address classifier rejects (exception carrier, a GC-pointer field)
-/// stays a GC base: the pointer bank already kept it as `Ref`. Only an owner
-/// [`declared_raw_adt_node`] accepts is Raw.
+/// stays a GC base: the pointer bank already kept it as `Ref`. An owner
+/// [`declared_raw_adt_node`] accepts is Raw. Harvested `_alloc_flavor_ = raw`
+/// (`rclass.py getgcflavor`) is also Raw: a Vec field fails storage-raw
+/// and would otherwise stamp GC, then `promote_gc_field_bases` would restamp
+/// the Signed address into the ref bank.
 pub(in crate::front::mir) fn container_declared_gc(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2297,15 +2302,7 @@ pub(in crate::front::mir) fn container_declared_gc(
     // determines STRUCT._gckind even when the struct contains GC-shaped
     // fields. Use the same declaration as the argument/calldescr classifier;
     // jtransform.py rewrite_op_getfield must not promote its Int base to Ref.
-    if adt_node_def_id(pointee)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            crate::front::llbc_hints::alloc_flavor_raw_contains(
-                raw_alloc_flavor_structs,
-                td.item_meta.name_path_str(),
-            )
-        })
-    {
+    if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
         return Some(false);
     }
     // The same raw-storage test as the dest overlay: a GC pointer field
@@ -2930,7 +2927,7 @@ pub(in crate::front::mir) fn operand_is_declared_raw(
     }
 }
 
-/// Whether `ty` is one pointer word to a storage-raw struct or enum.
+/// Whether `ty` is one pointer word to a Raw struct or enum.
 ///
 /// `history.getkind` classifies `Ptr(TO)` from `TO._gckind`
 /// (`rewrite_op_getfield`). Storage-raw (`declared_raw_adt_node`) answers
@@ -2938,6 +2935,11 @@ pub(in crate::front::mir) fn operand_is_declared_raw(
 /// getgcflavor`) stays a front `Ref`: `crosses_raw_ref` must not emit
 /// `cast_ptr_to_int` for it. A borrow of a storage-raw struct
 /// (`rffi.py` `CStruct`) stays `Ref`.
+///
+/// `&Enum` / `*const Enum` of a non-GC tagged enum is an address even
+/// when a payload field is not storage-raw ([`pointee_is_raw_word`]: a
+/// fat pointer or GC word inside `TO` does not change `TO._gckind`).
+/// A fieldless enum is the tag integer; that borrow is not an address.
 pub(in crate::front::mir) fn ty_is_raw_address(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2968,14 +2970,14 @@ pub(in crate::front::mir) fn ty_is_raw_address(
         {
             return true;
         }
-        // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
-        // struct borrow stays `Ref`. A fieldless enum is the tag integer
-        // (`type_decl_is_fieldless_enum`); `Rvalue::Ref` is the identity
-        // on that word, so the borrow is not an address (`rclass.py` has
-        // no `cast_pointer` of an int).
-        if is_borrow
-            && borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids, raw_alloc_flavor_structs)
-        {
+        // `&mut Enum` / `&Enum` / `*const Enum` of a non-GC tagged enum is
+        // one address word (`pointee_is_raw_word`). A raw struct borrow
+        // stays `Ref`. Classifying it as an address makes `RootScope::get`
+        // a `[Ref, Int]` signature called with `[Int, Int]`. A fieldless
+        // enum is the tag integer (`type_decl_is_fieldless_enum`);
+        // `Rvalue::Ref` is the identity on that word, so the borrow is not
+        // an address (`rclass.py` has no `cast_pointer` of an int).
+        if borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
             return true;
         }
         // Arc/Rc of a flavor-raw ADT: the handle word is one raw (non-GC)
@@ -3024,16 +3026,26 @@ pub(in crate::front::mir) fn borrowed_pointee_is_raw_enum(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
-    matches!(td.kind, TypeDeclKind::Enum(_))
-        && !type_decl_is_fieldless_enum(td, llbc)
-        && declared_raw_adt_node(
-            pointee,
-            llbc,
-            gc_struct_ids,
-            no_immutable_fields(),
-            raw_alloc_flavor_structs,
-        )
-        .is_some()
+    if !matches!(td.kind, TypeDeclKind::Enum(_)) || type_decl_is_fieldless_enum(td, llbc) {
+        return false;
+    }
+    // A one-word niche (`None` = null) is identity on the payload word;
+    // `&Option<P>` peels to that word. A tagged aggregate is a real
+    // pointer. Recursing into payload fields (`declared_raw_adt_node`)
+    // would reject a non-GC enum whose variant holds a fat pointer or a
+    // GC word (`pointee_is_raw_word`: `TO._gckind` does not follow those).
+    let ty = TyRef::Other(pointee.clone());
+    if tyref_is_niche_option(&ty, llbc) || tyref_enum_layout_is_pointer_niche(&ty, llbc) {
+        return false;
+    }
+    pointee_is_raw_word(
+        pointee,
+        llbc,
+        gc_struct_ids,
+        no_immutable_fields(),
+        raw_alloc_flavor_structs,
+        &mut Vec::new(),
+    )
 }
 
 /// Class-root leaf of the Raw pointee behind one pointer word.
@@ -3366,14 +3378,17 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
-    // `is_none` / `is_some` take `&self`. The borrow is identity on the
-    // Option word (null pointer or tagged enum), so `&Option<P>` uses
-    // the same paint as `Option<P>`. `Option<NonZero<_>>` is an integer
-    // niche: an ordinary `&Option<NonZero<_>>` parameter stays a
-    // pointer (`option_nonzero_word_kind_deref_receiver` peels only
-    // the Discriminant place).
+    // `is_none` / `is_some` take `&self`. The borrow is identity on a
+    // one-word Option (null pointer / niche), so that `&Option<P>` uses
+    // the same paint as `Option<P>`. A tagged multi-word Option is an
+    // aggregate: `&Option<P>` is a real pointer (`ty_is_raw_address`).
+    // `Option<NonZero<_>>` is an integer niche: an ordinary
+    // `&Option<NonZero<_>>` parameter stays a pointer
+    // (`option_nonzero_word_kind_deref_receiver` peels only the
+    // Discriminant place).
     if let Some(option_ty) = tyref_shared_borrow_option_pointee(ty, llbc)
         && option_nonzero_word_kind(&option_ty, llbc).is_none()
+        && !ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
     {
         return tyref_to_value_type_with(
             &option_ty,
@@ -5079,6 +5094,12 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     if is_unit_type(kind_src, llbc) {
         return Some("()".to_string());
     }
+    // A stored `fn` pointer (`get_eval_fn` → `EvalFn`) is `Ptr(FuncType)`.
+    // `history.getkind` banks it as int; the stub shell must stay `SomePtr`
+    // so a caller `simple_call` of the result is callable.
+    if let Some(spelling) = tyref_fn_ptr_spelling(kind_src, llbc) {
+        return Some(format!("fn:{spelling}"));
+    }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
     // A byte pointer stays on the `ref` arm below.
@@ -5599,10 +5620,12 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
-    // Matching [`tyref_to_value_type`]: a shared borrow of `Option<P>`
-    // is the Option word. `Option<NonZero<_>>` stays a pointer param.
+    // Matching [`tyref_to_value_type`]: a shared borrow of a one-word
+    // `Option<P>` is the Option word. A tagged aggregate stays a pointer
+    // (`ty_is_raw_address`). `Option<NonZero<_>>` stays a pointer param.
     if let Some(option_ty) = tyref_shared_borrow_option_pointee(ty, llbc)
         && option_nonzero_word_kind(&option_ty, llbc).is_none()
+        && !ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
     {
         return tyref_to_attr_value_type_with(
             &option_ty,
@@ -13656,15 +13679,23 @@ pub fn slice_array_type_id(spelling: &str) -> Option<String> {
 
 /// `local[i]` versus `(*p)[i]`. A deref's type is the pointee, so the
 /// borrow spelling is the parent's (`&[T; N]`, `*const [T; N]`).
+///
+/// `tyref_to_ast_string` strips `&T` / `&mut T` for nominal lookup.
+/// `fixed_array_index_identity` keys the length-prefixed ctor reader
+/// on that prefix (`borrowed_fixed_list_is_gcarray`); without it
+/// `(*mapping)[i]` of `&mut [i64; N]` is spelled `[i64; N]` and shares
+/// the headerless inline-field descr, so a later `mapping[j]` of the
+/// owned ctor value still sees the `-1` init.
 pub(in crate::front::mir) fn index_identity_inputs(place: &Place, llbc: &Llbc) -> (bool, String) {
-    let (value_local, ty) = match &place.kind {
-        PlaceKind::Local(_) => (true, &place.ty),
+    match &place.kind {
+        PlaceKind::Local(_) => (true, tyref_to_ast_string(&place.ty, llbc)),
         PlaceKind::Projection(parent, ProjectionElem::Atom(name)) if name == "Deref" => {
-            (false, &parent.ty)
+            let spelling = tyref_reference_layout_string(&parent.ty, llbc)
+                .unwrap_or_else(|| tyref_to_ast_string(&parent.ty, llbc));
+            (false, spelling)
         }
-        _ => (false, &place.ty),
-    };
-    (value_local, tyref_to_ast_string(ty, llbc))
+        _ => (false, tyref_to_ast_string(&place.ty, llbc)),
+    }
 }
 
 /// Pointee spelling and whether a borrow or pointer prefix was peeled.
@@ -15211,6 +15242,30 @@ pub(in crate::front::mir) fn tyref_positional_aggregate_root(
     node.as_object()
         .is_some_and(|body| body.contains_key("Array"))
         .then(|| format!("Array{suffix}"))
+}
+
+/// ARRAY identity of a `[T; N]` Repeat destination.
+///
+/// `fixed_repeat_identity` recovers ARRAY from a shaped `Array<T;N>`
+/// result. A `Ref(None)` marker depends on `LinkClasses` matching a
+/// later `ArrayRead` / `ArrayWrite` of the same SSA; taking the address
+/// of the local (`&mut mapping`) splits that class and the marker stays
+/// residual. Stamp the dest shape here so the rewrite does not need
+/// that alias.
+pub(in crate::front::mir) fn repeat_array_result_ty(dest_ty: &TyRef, llbc: &Llbc) -> ValueType {
+    if let Some(owner) = tyref_positional_aggregate_root(dest_ty, llbc)
+        && majit_ir::descr::is_shaped_array_name(&owner)
+    {
+        return ValueType::Ref(Some(owner));
+    }
+    let spelling = tyref_to_ast_string(dest_ty, llbc);
+    if let Some((item, n)) = shaped_array_parts(&spelling) {
+        let owner = format!("Array<{item};{n}>");
+        if majit_ir::descr::is_shaped_array_name(&owner) {
+            return ValueType::Ref(Some(owner));
+        }
+    }
+    ValueType::Ref(None)
 }
 
 /// The `TypeDeclRef` (`{"id", "generics", …}`) of a TyRef's ADT, after

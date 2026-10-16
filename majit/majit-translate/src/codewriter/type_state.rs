@@ -1255,6 +1255,17 @@ pub(crate) fn field_owner_is_gc(
     if field.is_vtable_method_slot() {
         return false;
     }
+    // `rclass.py getgcflavor`: harvested `_alloc_flavor_ = raw` is
+    // `_gckind == 'raw'` even when the front stamped `owner_declared_gc`
+    // from storage-raw only (`declared_raw_adt_node` rejects a Vec field).
+    // `history.getkind` of that Ptr is int; `promote_gc_field_bases` must
+    // not restamp the address into the ref bank.
+    if let Some(owner) = field.owner_root.as_deref()
+        && let Some(cc) = callcontrol
+        && crate::front::llbc_hints::alloc_flavor_raw_contains(&cc.raw_alloc_flavor_structs, owner)
+    {
+        return false;
+    }
     // The embedding's `struct_storage` row is `STRUCT._gckind` itself; the
     // front's structural stamp is used only when no row exists.
     let Some(owner) = field.owner_root.as_deref() else {
@@ -2088,6 +2099,98 @@ mod tests {
         assert!(
             field_owner_is_gc(&unnamed, None),
             "a descriptor with no owner_root is treated as GC"
+        );
+    }
+
+    #[test]
+    fn field_owner_is_gc_flavor_raw_is_raw_even_when_declared_gc() {
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("fixture::RawFlavor".to_string());
+        let field = FieldDescriptor::new("n", Some("fixture::RawFlavor".into()))
+            .with_owner_declared_gc(Some(true));
+        assert!(
+            !field_owner_is_gc(&field, Some(&cc)),
+            "rclass.py getgcflavor raw is not a GC owner"
+        );
+        let gc_field =
+            FieldDescriptor::new("n", Some("Point".into())).with_owner_declared_gc(Some(true));
+        assert!(
+            field_owner_is_gc(&gc_field, Some(&cc)),
+            "a declared-GC owner without a raw harvest stays GC"
+        );
+    }
+
+    #[test]
+    fn field_owner_is_gc_declared_gc_wins_over_layout_raw() {
+        use crate::call::{CallControl, StructLayout};
+
+        let owner = "fixture::GcHandle";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let field =
+            FieldDescriptor::new("0", Some(owner.into())).with_owner_declared_gc(Some(true));
+        assert!(
+            field_owner_is_gc(&field, Some(&cc)),
+            "a GC handle that is not a GcType seed keeps owner_declared_gc"
+        );
+        let raw_field = FieldDescriptor::new("__discriminant", Some(owner.into()))
+            .with_owner_declared_gc(Some(false));
+        assert!(
+            !field_owner_is_gc(&raw_field, Some(&cc)),
+            "the front's Some(false) is a raw owner"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_leaves_flavor_raw_signed() {
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("fixture::RawFlavor".to_string());
+        let mut graph = FunctionGraph::new("raw_flavor_getfield");
+        let base = push_input(
+            &mut graph,
+            "raw",
+            ValueType::Ref(Some("fixture::RawFlavor".into())),
+        );
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("n", Some("fixture::RawFlavor".into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+
+        promote_gc_field_bases(&mut graph, Some(&cc));
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "a flavor-raw FieldRead base stays int even when owner_declared_gc is Some(true)"
         );
     }
 

@@ -2680,3 +2680,13 @@ fn int_pow_trampoline_residual_is_canraise_with_catch_to_ovf2long() {
         }
     }
 }
+
+/// `argument.py _match_signature` returns `ArgErr` or `OperationError`.
+/// pyre keeps those as `MatchOutcome` (`parse_into_scope` catches `ArgErr`).
+/// The carrier rewrite must not demand `From<MatchSignatureError> for PyError`
+/// — that enum is the function's own error arm.
+#[test]
+fn match_signature_lowers_as_its_own_error() {
+    lower_function(interp(), "match_signature")
+        .unwrap_or_else(|err| panic!("match_signature must lower: {err}"));
+}
