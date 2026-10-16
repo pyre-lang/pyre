@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=15
+# pyre-check: max-pypy-ratio=9
 # Locals for except-as stop the module-dict `version?` revoke storm
 # (`celldict.py notify_version_watchers`), so pypy compiles the
 # driving loops. `run()`'s `for` re-raises through `except E as e`,
@@ -10,7 +10,9 @@
 # resumes at the opcode that emitted it
 # (`abort_permanent_py_pc_by_jit_pc`), not at the floor segment's
 # trailing `RERAISE`, so the live frame is not left on `END_FOR`.
-# The ceiling stays 15.
+# Readings 2.4x-5.1x (macOS dynasm 2.4x-2.9x, Linux cranelift 4.5x-5.1x,
+# Windows up to 7.3x); the floor, a fourth of the ceiling, sits under the
+# fastest.
 # JIT-stress twin of exception_reraise_tb_depth_hot: `pypyjit.set_param`
 # lowers the trace/function thresholds to 1 so trace recording fires on the
 # earliest iterations rather than only after the ~1600-iteration warmup. That

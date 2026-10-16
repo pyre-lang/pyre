@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=36
-# Widest reading 31.3x (Windows dynasm; macOS 25.6x-27.7x, Linux 15.7x); the
-# ceiling is 15% over that. pypy exec is ~0.05s, so the reading moves with it.
+# pyre-check: max-pypy-ratio=30
+# Readings 7.8x-18.8x (Linux 7.8x-18.3x, macOS 11.9x-16.0x; Windows 33.4x
+# once); the floor, a fourth of the ceiling, sits under the fastest. pypy exec
+# is ~0.05s, so the reading moves with it.
 # A list item stored just before an `append` that grows the list.
 #
 # `lst[k] = v` stays a lazy SETARRAYITEM_GC in the optimizer, and the

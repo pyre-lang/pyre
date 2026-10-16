@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=12
+# pyre-check: max-pypy-ratio=5.6
+# Readings 1.7x-2.9x (macOS 1.7x-2.8x, Linux 2.2x-2.9x, Windows 2.1x-4.5x);
+# the floor, a fourth of the ceiling, sits under the fastest.
 # Guard-failure blackhole resume across a LOAD_ATTR (issue #143 guard-12
 # class).  The rare branch fails its guard until the bridge threshold, and
 # each failure resumes the rest of the iteration through `c.v` — a jitcode

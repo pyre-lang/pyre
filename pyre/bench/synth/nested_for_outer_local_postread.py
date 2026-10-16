@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=9
+# Readings 2.1x-5.7x (macOS dynasm 2.1x-3.1x, Linux cranelift 4.2x-4.9x,
+# Windows up to 8.7x); the floor, a fourth of the ceiling, sits under the fastest.
 # pyre-check: spec-folds=for_iter_next
 # pyre-check: trace-shape=three_levels:absent=CallMayForceR
 # The iteration fold, 487 firings across the corpus and undeclared. 22 here.

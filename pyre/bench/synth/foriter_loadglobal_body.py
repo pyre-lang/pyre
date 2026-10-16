@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=5.8
-# Widest reading 5.4x; the ceiling is 15% over that.
+# pyre-check: max-pypy-ratio=4.4
+# Readings 1.3x-2.5x (macOS 1.3x-1.5x, Linux 1.9x-2.5x, Windows up to 2.9x);
+# the floor, a fourth of the ceiling, sits under the fastest.
 # FOR_ITER body with LOAD_GLOBAL: the JIT must handle module-global
 # reads inside for-loop bodies correctly.
 
