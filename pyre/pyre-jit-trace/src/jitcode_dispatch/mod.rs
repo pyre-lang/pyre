@@ -12892,7 +12892,7 @@ fn guarded_branch_core<Sym: WalkSym>(
         // When the mirror does NOT cover a kept slot,
         // `mirror_covers_kept` is `false` and the hazard checks below
         // still run — but with the flat maps deleted they decline only
-        // for an unrestorable-Ref arm (Hazard 1) or an INVALID mirror
+        // for an unrestorable-Ref arm (kept operands) or an INVALID mirror
         // (undermodeled walk); a VALID mirror with a NONE hole (an
         // edge-materialized merge temp) compiles, its slot sourced from
         // the decoded trampoline recovery (`resolved_recovered`).  That
