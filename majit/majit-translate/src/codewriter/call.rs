@@ -2180,10 +2180,14 @@ impl StoreCore {
 
     /// `(alias path, shared graph)` for every registered spelling, each
     /// graph built.  The same graph appears once per alias, mirroring the
-    /// old per-path map.
+    /// old per-path map. Ordered by `CallPath.segments` so
+    /// `populate_call_registry_from_call_graphs` mints `DescKey`s
+    /// (`alloc_desc_key`) and first-alias-wins in a stable order,
+    /// matching `Bookkeeper.getdesc` insertion.
     pub(crate) fn iter(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
         self.register_declared();
-        let paths: Vec<CallPath> = self.path_to_key.borrow().keys().cloned().collect();
+        let mut paths: Vec<CallPath> = self.path_to_key.borrow().keys().cloned().collect();
+        paths.sort_by(|a, b| a.segments.cmp(&b.segments));
         paths
             .into_iter()
             .filter_map(|path| {
@@ -2196,17 +2200,20 @@ impl StoreCore {
     /// `(alias path, declaration)` for every registered spelling, without
     /// building a graph: the `code` object each `FunctionDesc` is made
     /// from (`bookkeeper.py getdesc`), its graph built at `cachedgraph`.
+    /// Same `CallPath.segments` order as [`Self::iter`].
     pub(crate) fn iter_declared(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
         self.register_declared();
         let path_to_key = self.path_to_key.borrow();
         let graphs = self.graphs.borrow();
-        path_to_key
+        let mut entries: Vec<_> = path_to_key
             .iter()
             .filter_map(|(path, key)| {
                 let declared = self.slot_declaration(graphs.get(key)?)?;
                 Some((path.clone(), declared))
             })
-            .collect()
+            .collect();
+        entries.sort_by(|a, b| a.0.segments.cmp(&b.0.segments));
+        entries
     }
 
     /// Remove one built graph so a caller can mutate it while still
@@ -2248,10 +2255,13 @@ impl StoreCore {
         let Some(key) = map.get(path) else {
             return vec![path.clone()];
         };
-        map.iter()
+        let mut aliases: Vec<CallPath> = map
+            .iter()
             .filter(|(_, stored)| *stored == key)
             .map(|(alias, _)| alias.clone())
-            .collect()
+            .collect();
+        aliases.sort_by(|a, b| a.segments.cmp(&b.segments));
+        aliases
     }
 
     /// Register `path` as another spelling of the funcobj `existing` names,
@@ -12812,6 +12822,38 @@ mod tests {
             .hints;
         assert!(hints.iter().any(|h| h == "elidable"));
         assert!(hints.iter().any(|h| h == "unroll_safe"));
+    }
+
+    #[test]
+    fn graph_store_iter_is_sorted_by_path_segments() {
+        // `populate_call_registry_from_call_graphs` mints DescKeys and
+        // first-alias-wins from this order (`Bookkeeper.getdesc`).
+        let mut store = GraphStore::new();
+        store.insert(
+            CallPath::from_segments(["z", "f"]),
+            FunctionGraph::new("zf"),
+        );
+        store.insert(
+            CallPath::from_segments(["a", "f"]),
+            FunctionGraph::new("af"),
+        );
+        store.insert(
+            CallPath::from_segments(["m", "f"]),
+            FunctionGraph::new("mf"),
+        );
+        let iterated: Vec<Vec<String>> = store
+            .iter()
+            .into_iter()
+            .map(|(path, _)| path.segments)
+            .collect();
+        assert_eq!(
+            iterated,
+            vec![
+                vec!["a".to_string(), "f".to_string()],
+                vec!["m".to_string(), "f".to_string()],
+                vec!["z".to_string(), "f".to_string()],
+            ]
+        );
     }
 
     /// Harvested hints registered after a hint-less first insert must land

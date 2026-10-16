@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
+use indexmap::IndexMap;
+
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::annotator::bookkeeper::PositionKey;
 use crate::annotator::model::{SomeObjectTrait, SomeValue};
@@ -405,7 +407,9 @@ pub struct RPythonTyper {
     self_weak: RefCell<Weak<Self>>,
     /// RPython `self.already_seen = {}` assigned in `specialize()`
     /// (rtyper.py). Membership is queried by `simplify.py`.
-    pub already_seen: RefCell<HashMap<BlockKey, bool>>,
+    /// [`IndexMap`] is the Python dict `RPythonTyper.specialize_more_blocks`
+    /// walks.
+    pub already_seen: RefCell<IndexMap<BlockKey, bool>>,
     /// RPython `self.concrete_calltables = {}` assigned in `__init__`
     /// (rtyper.py).
     pub concrete_calltables: RefCell<HashMap<usize, (LLCallTable, usize)>>,
@@ -519,7 +523,7 @@ impl RPythonTyper {
             gcrefreprcache: RefCell::new(HashMap::new()),
             exceptiondata: RefCell::new(None),
             self_weak: RefCell::new(Weak::new()),
-            already_seen: RefCell::new(HashMap::new()),
+            already_seen: RefCell::new(IndexMap::new()),
             concrete_calltables: RefCell::new(HashMap::new()),
             cache_dummy_values: RefCell::new(HashMap::new()),
             reprs: RefCell::new(HashMap::new()),
@@ -1936,7 +1940,9 @@ impl RPythonTyper {
     ///
     /// Scope deviations from upstream:
     /// - No `seed`-based shuffle (pyre lacks the translator-level seed
-    ///   knob; block ordering falls out of HashMap iteration).
+    ///   knob; pending follows `annotator.annotated` insertion,
+    ///   `RPythonAnnotator.complete_pending_blocks` /
+    ///   `RPythonTyper.specialize_more_blocks`).
     /// - No progress-bar log events.
     /// - `BlockKey → BlockRef` materialisation reads from
     ///   `annotator.all_blocks`, the Rust-side reverse index that keeps

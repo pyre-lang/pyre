@@ -463,16 +463,28 @@ fn unpoison_failed_subject_callees(
     let Some((annotator, rtyper)) = call_registry.session_if_started() else {
         return;
     };
-    let stale_graphs: HashMap<
+    let mut stale_graphs: Vec<(
         crate::flowspace::model::GraphKey,
         crate::flowspace::model::GraphRef,
-    > = annotator
+    )> = annotator
         .fixed_graphs
         .borrow()
         .iter()
         .filter(|(k, _)| !session_at_entry.fixed_graphs.contains(*k))
         .map(|(k, g)| (k.clone(), g.clone()))
         .collect();
+    // GraphKey is a pointer. Sort by graph name so the re-lift of
+    // failed-subject callees is the same run to run.
+    stale_graphs.sort_by(|a, b| {
+        let ga = a.1.borrow();
+        let gb = b.1.borrow();
+        ga.name.cmp(&gb.name).then_with(|| {
+            ga.func
+                .as_ref()
+                .map(|f| f.name.as_str())
+                .cmp(&gb.func.as_ref().map(|f| f.name.as_str()))
+        })
+    });
 
     for (gkey, stale) in stale_graphs {
         annotator.fixed_graphs.borrow_mut().shift_remove(&gkey);
@@ -487,7 +499,7 @@ fn unpoison_failed_subject_callees(
             annotator.all_blocks.borrow_mut().shift_remove(&bkey);
             annotator.blocked_blocks.borrow_mut().shift_remove(&bkey);
             annotator.failed_blocks.borrow_mut().shift_remove(&bkey);
-            rtyper.already_seen.borrow_mut().remove(&bkey);
+            rtyper.already_seen.borrow_mut().shift_remove(&bkey);
         }
         for generation in annotator.genpendingblocks.borrow_mut().iter_mut() {
             generation.retain(|bkey, _| !stale_block_keys.contains(bkey));
@@ -2623,10 +2635,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             .expect("a declared path names a funcobj");
         pending.push((key, graph, entry, signature, body));
     }
-    // `function_graphs.iter_declared()` (`GraphStore` over `path_to_key:
-    // HashMap<CallPath, _>`) yields entries in `std::HashMap` order, which
-    // varies run-to-run; sorting by the path key makes the passes below
-    // reproducible.
+    // `function_graphs.iter_declared()` yields `CallPath.segments` order,
+    // so `alloc_desc_key` and first-alias-wins already follow that key.
+    // Sort pending as a defense for the lift/prefill passes below.
     pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
     // Point each AccessDirect path at the origin FunctionDesc
     // (`cachedgraph` stores both graphs on one desc). Skip when the
@@ -5729,7 +5740,7 @@ fn keep_legacy_kind_when_unfollowed_void(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotator::description::{CallFamily, DescKey};
+    use crate::annotator::description::{CallFamily, CallTableRow, DescKey};
     use crate::flowspace::argument::CallShape;
     use crate::flowspace::model::BlockKey;
     use crate::model::{Block, BlockId, LinkArg, ValueType};
@@ -5769,9 +5780,9 @@ mod tests {
             shape_keys: Vec::new(),
             shape_star: false,
         };
-        let mut none_row = HashMap::new();
+        let mut none_row = CallTableRow::new();
         none_row.insert(rowkey, none_graph.clone());
-        let mut ad_row = HashMap::new();
+        let mut ad_row = CallTableRow::new();
         ad_row.insert(rowkey, access_direct.clone());
         let family = Rc::new(RefCell::new(CallFamily::new(rowkey)));
         family
@@ -5783,7 +5794,7 @@ mod tests {
 
         replace_none_graph_in_calltables(&family, rowkey, Some(&none_graph), &stub);
 
-        let mut stub_row = HashMap::new();
+        let mut stub_row = CallTableRow::new();
         stub_row.insert(rowkey, stub.clone());
         let family = family.borrow();
         assert_eq!(
@@ -5796,7 +5807,7 @@ mod tests {
             Some(1),
             "AccessDirect row keeps its cachedgraph"
         );
-        let mut old_none_row = HashMap::new();
+        let mut old_none_row = CallTableRow::new();
         old_none_row.insert(rowkey, none_graph);
         assert!(
             family.calltable_lookup_row(&shape, &old_none_row).is_none(),

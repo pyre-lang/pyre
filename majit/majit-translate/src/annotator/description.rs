@@ -90,10 +90,12 @@ impl std::fmt::Display for NoStandardGraph {
 impl std::error::Error for NoStandardGraph {}
 
 /// Upstream `calltable_add_row` stores graph values keyed by
-/// `desc.rowkey()` (description.py). Once FunctionDesc lands,
-/// `rowkey()` returns the Desc itself (identity); for now we carry
-/// the identity via [`DescKey`].
-pub type CallTableRow = HashMap<DescKey, Rc<PyGraph>>;
+/// `desc.rowkey()` (description.py). `row.itervalues()` in
+/// `FunctionReprBase.call` and `row.values()` in
+/// `normalize_calltable_row_annotation` /
+/// `normalize_calltable_row_signature` walk insertion order;
+/// [`IndexMap`] is that Python dict.
+pub type CallTableRow = IndexMap<DescKey, Rc<PyGraph>>;
 
 /// Identity-based equality for two [`CallTableRow`]s. Upstream's
 /// dict-`__eq__` falls back to per-pair equality on `FunctionGraph`
@@ -3512,7 +3514,7 @@ mod tests {
     fn call_family_update_merges_descs_and_calltables() {
         let mut cf1 = CallFamily::new(desc_key(1));
         let mut cf2 = CallFamily::new(desc_key(2));
-        cf2.calltable_add_row(simple_shape(), HashMap::new());
+        cf2.calltable_add_row(simple_shape(), CallTableRow::new());
         cf1.update(&cf2);
         assert!(cf1.descs.contains_key(&desc_key(1)));
         assert!(cf1.descs.contains_key(&desc_key(2)));
@@ -3522,12 +3524,12 @@ mod tests {
     #[test]
     fn call_family_calltable_dedup() {
         let mut cf = CallFamily::new(desc_key(1));
-        cf.calltable_add_row(simple_shape(), HashMap::new());
-        cf.calltable_add_row(simple_shape(), HashMap::new());
+        cf.calltable_add_row(simple_shape(), CallTableRow::new());
+        cf.calltable_add_row(simple_shape(), CallTableRow::new());
         // Same row — add should dedup.
         assert_eq!(cf.total_calltable_size, 1);
         assert_eq!(
-            cf.calltable_lookup_row(&simple_shape(), &HashMap::new()),
+            cf.calltable_lookup_row(&simple_shape(), &CallTableRow::new()),
             Some(0)
         );
     }
@@ -3536,7 +3538,7 @@ mod tests {
     fn call_family_calltable_lookup_miss() {
         let cf = CallFamily::new(desc_key(1));
         assert!(
-            cf.calltable_lookup_row(&simple_shape(), &HashMap::new())
+            cf.calltable_lookup_row(&simple_shape(), &CallTableRow::new())
                 .is_none()
         );
     }
@@ -4232,6 +4234,22 @@ mod tests {
             defaults: std::cell::RefCell::new(defaults),
             access_directly: std::cell::Cell::new(false),
         })
+    }
+
+    #[test]
+    fn call_table_row_values_follow_insertion_order() {
+        // `rpbc.py` `FunctionReprBase.call` takes `row.itervalues().next()`;
+        // `normalizecalls.py` `normalize_calltable_row_annotation` unions
+        // columns in `row.values()` order.
+        let sig = int_sig(&["x"]);
+        let first = make_pygraph(sig.clone(), None);
+        let second = make_pygraph(sig, None);
+        let mut row = CallTableRow::new();
+        row.insert(desc_key(10), first.clone());
+        row.insert(desc_key(1), second.clone());
+        let mut values = row.values();
+        assert!(Rc::ptr_eq(values.next().unwrap(), &first));
+        assert!(Rc::ptr_eq(values.next().unwrap(), &second));
     }
 
     #[test]

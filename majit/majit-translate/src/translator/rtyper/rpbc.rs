@@ -95,10 +95,12 @@ fn graph_has_body(graph: &Rc<PyGraph>) -> bool {
 }
 
 /// `FunctionReprBase.call` witness (`rpbc.py` `anygraph = row_of_graphs.itervalues().next()`).
-/// Prefer a graph whose inputs are bound. An all-unbound row is a
-/// hole (`LLCallTable.lookup`); `select_call_family_row` then falls back
-/// to the first graph and [`seed_impossible_on_unbound_hop_void_args`]
-/// fills ZST/`Impossible` holes from the hop.
+/// `CallTableRow` is an `IndexMap`, so `values()` is insertion order
+/// matching Python dict `itervalues()`. Prefer a graph whose inputs are
+/// bound. An all-unbound row is a hole (`LLCallTable.lookup`);
+/// `select_call_family_row` then falls back to the first graph and
+/// [`seed_impossible_on_unbound_hop_void_args`] fills ZST/`Impossible`
+/// holes from the hop.
 fn pick_call_family_witness(row: &CallTableRow) -> Option<Rc<PyGraph>> {
     row.values()
         .find(|graph| {
@@ -1059,6 +1061,19 @@ pub(crate) mod tests {
         row.insert(DescKey(2), stub.clone());
         let picked = pick_call_family_witness(&row).expect("bound-return witness");
         assert!(Rc::ptr_eq(&picked.graph, &stub.graph));
+    }
+
+    #[test]
+    fn pick_call_family_witness_follows_row_insertion_order() {
+        // `rpbc.py` `anygraph = row.itervalues().next()`: equal candidates
+        // keep insertion order.
+        let first = make_pygraph("first");
+        let second = make_pygraph("second");
+        let mut row = CallTableRow::new();
+        row.insert(DescKey(10), first.clone());
+        row.insert(DescKey(1), second);
+        let picked = pick_call_family_witness(&row).expect("witness");
+        assert!(Rc::ptr_eq(&picked.graph, &first.graph));
     }
 
     #[test]

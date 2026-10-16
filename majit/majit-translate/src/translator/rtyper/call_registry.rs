@@ -889,14 +889,16 @@ impl CallRegistry {
     /// Every key resolving to `canonical`'s entry: the canonical key
     /// itself plus all registered aliases pointing at it.
     pub fn keys_for_entry(&self, canonical: &FunctionPathKey) -> Vec<FunctionPathKey> {
+        let mut aliases: Vec<FunctionPathKey> = self
+            .aliases
+            .borrow()
+            .iter()
+            .filter(|(_, c)| *c == canonical)
+            .map(|(a, _)| a.clone())
+            .collect();
+        aliases.sort_by(|a, b| a.segments().cmp(b.segments()));
         let mut keys = vec![canonical.clone()];
-        keys.extend(
-            self.aliases
-                .borrow()
-                .iter()
-                .filter(|(_, c)| *c == canonical)
-                .map(|(a, _)| a.clone()),
-        );
+        keys.extend(aliases);
         keys
     }
 
@@ -1808,8 +1810,10 @@ mod tests {
         let alias = FunctionPathKey::from_segments(["crate", "m", "f"]);
         registry.alias(alias.clone(), &canonical);
         let keys = registry.keys_for_entry(&canonical);
-        assert!(keys.contains(&canonical));
-        assert!(keys.contains(&alias));
-        assert_eq!(keys.len(), 2);
+        assert_eq!(keys, vec![canonical.clone(), alias.clone()]);
+        let earlier = FunctionPathKey::from_segments(["a", "m", "f"]);
+        registry.alias(earlier.clone(), &canonical);
+        let keys = registry.keys_for_entry(&canonical);
+        assert_eq!(keys, vec![canonical, earlier, alias]);
     }
 }
