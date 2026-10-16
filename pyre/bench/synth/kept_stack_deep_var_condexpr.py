@@ -12,4 +12,4 @@ def f(a, b, n):
     return s
 
 
-print(f(3, 7, 600000))
+print(f(3, 7, 3000000))

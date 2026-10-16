@@ -24,4 +24,4 @@ def run(n):
     return total
 
 
-print(run(200000))
+print(run(1000000))

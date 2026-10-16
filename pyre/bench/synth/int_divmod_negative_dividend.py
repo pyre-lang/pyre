@@ -11,7 +11,7 @@
 # The divisors are 7, 3 and 5: positive, none a power of two, so neither the
 # `x & (2**k - 1)` nor the `x >> k` arm claims them. Weighted so a sign error
 # in any one term moves the checksum.
-N = 800000
+N = 4000000
 
 
 def main():

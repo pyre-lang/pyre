@@ -43,5 +43,5 @@ def run_float(n):
     return total, obj.x
 
 
-print(run_int(100000))
-print(run_float(100000))
+print(run_int(300000))
+print(run_float(300000))

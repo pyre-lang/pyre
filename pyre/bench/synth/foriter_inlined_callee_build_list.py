@@ -15,4 +15,4 @@ def drive(n):
     return last
 
 
-print(drive(600000))
+print(drive(1800000))

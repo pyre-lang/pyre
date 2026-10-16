@@ -19,7 +19,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(450000))
+    print("warm", warm(2250000))
     # over-range exponent -> OverflowError from the int->float coercion
     m("2.0**huge", lambda: 2.0 ** (10**1000))
     m("pow(2.0,huge)", lambda: pow(2.0, 10**1000))

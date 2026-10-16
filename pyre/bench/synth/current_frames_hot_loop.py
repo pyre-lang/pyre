@@ -55,7 +55,7 @@ except ImportError:
 # Recording aborts and blacklists this shape after five attempts.  This count
 # clears the lowered threshold and the blacklist sequence without spending the
 # rest of the fixture on an already-interpreted path.
-N = 400
+N = 2800
 
 
 def hot(n):

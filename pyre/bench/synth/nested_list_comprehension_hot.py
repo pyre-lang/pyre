@@ -21,7 +21,7 @@ def pair_comp(n):
 def main():
     total = 0
     k = 0
-    while k < 500:
+    while k < 2000:
         xs = single_comp(1000)
         total += len(xs)
         total += xs[-1][0]

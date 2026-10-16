@@ -1,7 +1,7 @@
 # Loop body raises UnboundLocalError from a deleted local and counts
 # handler visits; the count must equal N. An abort that resumes past
 # the raising LOAD_FAST_CHECK silently drops one increment per abort.
-N = 20000
+N = 100000
 def run():
     c = 0
     e = 1

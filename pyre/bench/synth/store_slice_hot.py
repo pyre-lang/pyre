@@ -8,7 +8,7 @@
 # object through setitem on the peeked list) instead of an abort_permanent
 # marker, so the hot body JIT-compiles rather than declining to the trait leg.
 # Output is verified against CPython/PyPy.
-N = 400000
+N = 1200000
 
 
 def main():

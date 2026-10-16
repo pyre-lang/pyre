@@ -2,7 +2,7 @@
 # N/ITERS are sized to prove the opcode compiles and to drive the compiled
 # loop thousands of times, not to race pypy.
 N = 600
-ITERS = 500
+ITERS = 3000
 
 
 def run(n):

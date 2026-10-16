@@ -2,7 +2,7 @@
 # A __bool__ that raises surfaces the error exactly once; the interpreter does
 # not stash a duplicate pending exception that resurfaces on a later unrelated
 # statement. Output verified against CPython/PyPy.
-N = 40000
+N = 120000
 
 
 class Boom:

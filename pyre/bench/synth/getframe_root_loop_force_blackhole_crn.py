@@ -48,7 +48,7 @@ import sys
 def main():
     total = 0
     names = set()
-    for i in range(600000):
+    for i in range(1800000):
         fr = sys._getframe(0)
         names.add(fr.f_code.co_name)
         total += i

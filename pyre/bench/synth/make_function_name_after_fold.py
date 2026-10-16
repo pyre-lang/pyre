@@ -13,7 +13,7 @@ except ImportError:
 
 import gc
 
-N = 200000
+N = 600000
 EXPECTED = "add_one() requires a code object with 0 free vars, not 1"
 
 
@@ -50,4 +50,4 @@ def main():
 
 
 main()
-# Expected: 200000
+# Expected: 600000

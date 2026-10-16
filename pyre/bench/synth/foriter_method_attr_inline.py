@@ -14,4 +14,4 @@ def main(n):
     return acc
 
 
-print(main(600000))
+print(main(3600000))

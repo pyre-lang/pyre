@@ -803,6 +803,12 @@ pub struct TraceCtx {
     /// []` before `rebuild_from_resumedata` (pyjitpl.py). This makes a
     /// stale carrier leaking across bridges structurally impossible.
     pub(crate) bridge_inline_carrier: Option<BridgeInlineCarrier>,
+    /// The carrier `trace_bytecode` drained, kept here while the walk uses
+    /// it. Its recipes are the deferred `MIFrame`s of
+    /// `rebuild_from_resumedata` (resume.py): upstream those frames sit on
+    /// `metainterp.framestack`, so the collector reaches their register
+    /// boxes. `MetaInterp::walk_active_trace_refs` reads the boxes from here.
+    pub(crate) active_bridge_inline_carrier: Option<std::rc::Rc<BridgeInlineCarrier>>,
     /// resume.py consume_boxes parity: per-bank live register indices
     /// of the bridge's root (section 0) guard resume frame, stashed by
     /// `start_bridge_tracing` (which has the dispatch JitCode) so a
@@ -887,6 +893,7 @@ pub struct TraceCtx {
 /// NOT RPython regalloc colors, and align with LOAD_FAST's `nlocals +
 /// stack_idx`. `concrete_r` is parallel to `registers_r` and seeds the
 /// assembled frame's `locals_cells_stack_w`.
+#[derive(Clone)]
 pub struct ReconstructRecipe {
     /// Raw `CodeObject*` identity of the callee (NOT the PyCode wrapper).
     /// The globals-stamped wrapper is recovered on demand from the
@@ -2293,6 +2300,7 @@ impl TraceCtx {
             replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
+            active_bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_virtual_ops: Vec::new(),
             bridge_resume_data: None,
@@ -2390,6 +2398,7 @@ impl TraceCtx {
             replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
+            active_bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_virtual_ops: Vec::new(),
             bridge_resume_data: None,
@@ -2411,8 +2420,43 @@ impl TraceCtx {
     /// Take the decoded inline-callee carrier for the bridge about to be
     /// traced, leaving the field empty. Returns `None` for primary traces
     /// and single-frame bridges.
-    pub fn take_bridge_inline_carrier(&mut self) -> Option<BridgeInlineCarrier> {
-        self.bridge_inline_carrier.take()
+    pub fn take_bridge_inline_carrier(&mut self) -> Option<std::rc::Rc<BridgeInlineCarrier>> {
+        let carrier = std::rc::Rc::new(self.bridge_inline_carrier.take()?);
+        self.active_bridge_inline_carrier = Some(std::rc::Rc::clone(&carrier));
+        Some(carrier)
+    }
+
+    /// The drained carrier the walk is using, see
+    /// [`take_bridge_inline_carrier`](Self::take_bridge_inline_carrier).
+    pub(crate) fn active_bridge_inline_carrier(&self) -> Option<&BridgeInlineCarrier> {
+        self.active_bridge_inline_carrier.as_deref()
+    }
+
+    /// `box.getref_base()` of each Ref register of `recipe`: `concrete_r` was
+    /// read off the guard's deadframe when the carrier was decoded, and a
+    /// collection since then moved the objects it names. The register boxes
+    /// are roots while the carrier is active, so their `_resref` is current.
+    /// A slot whose box has no Ref concrete keeps the decoded value.
+    pub fn reconstruct_recipe_with_current_refs(
+        &self,
+        recipe: &ReconstructRecipe,
+    ) -> ReconstructRecipe {
+        let mut current = recipe.clone();
+        for (k, slot) in current.concrete_r.iter_mut().enumerate() {
+            if !matches!(slot, Value::Ref(_)) {
+                continue;
+            }
+            let Some(&opref) = recipe.registers_r.get(k) else {
+                continue;
+            };
+            if opref.is_none() {
+                continue;
+            }
+            if let Some(value @ Value::Ref(_)) = self.concrete_of_opref(opref) {
+                *slot = value;
+            }
+        }
+        current
     }
 
     /// Stash the bridge guard frame's per-bank live register indices (set by

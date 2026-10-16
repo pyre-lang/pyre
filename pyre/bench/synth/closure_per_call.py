@@ -8,7 +8,7 @@
 # code object is re-materialized per call instead, every closure instance gets
 # a fresh green key, the give-up never sticks, and tracing thrashes
 # super-linearly until this bench times out.
-N = 40000
+N = 120000
 
 
 def make(n):

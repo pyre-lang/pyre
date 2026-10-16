@@ -5,7 +5,7 @@
 
 expected = list(range(100))
 checksum = 0
-for outer in range(1000):
+for outer in range(4000):
     ints = [item for item in range(100)]
     assert ints == expected
     floats = [float(item) - 0.5 for item in range(100)]

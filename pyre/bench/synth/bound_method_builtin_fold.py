@@ -23,7 +23,7 @@ try:
 except ImportError:
     pass
 
-N = 10000
+N = 30000
 
 
 def build(n):

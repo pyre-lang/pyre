@@ -7,7 +7,7 @@
 # the next block's opcode arg (e.g. COMPARE_OP) with a too-large value aborts
 # JIT codegen (Arg::try_from -> InvalidBytecode). Output verified against
 # CPython/PyPy.
-N = 40000
+N = 120000
 
 
 def f(i, v2):

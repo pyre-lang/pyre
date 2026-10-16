@@ -40,7 +40,7 @@ def main():
     obj = Hooked()
     total = 0
     i = 0
-    while i < 50000:
+    while i < 100000:
         obj.value = i
         total += obj.value
         i += 1

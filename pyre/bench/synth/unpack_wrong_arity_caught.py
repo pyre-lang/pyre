@@ -8,7 +8,7 @@ MOD = 1000000007
 
 def main():
     acc = 0
-    for i in range(240000):
+    for i in range(480000):
         try:
             a, b = (i, i + 1, i + 2) if i % 13 == 0 else (i, i + 1)
             acc = (acc + a + b) % MOD

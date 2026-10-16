@@ -30,7 +30,7 @@ def main():
     hold = None
     count = 0
     outer = 0
-    while outer < 400:
+    while outer < 1200:
         gate = count > 5000
         s, hold = inner(outer, label, hold, gate)
         total += s

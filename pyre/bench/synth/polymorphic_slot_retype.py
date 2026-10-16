@@ -29,7 +29,7 @@ def main():
     b = None
     c = 0
     total = 0
-    n = 26000
+    n = 52000
     for i in range(n):
         a, b, c = step((a, b, c), i)
         if i > 6000:

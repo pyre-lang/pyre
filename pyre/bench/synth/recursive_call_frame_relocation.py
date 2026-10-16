@@ -31,6 +31,6 @@ def cat(n):
 
 
 total = 0
-for i in range(1000):
+for i in range(4000):
     total += cat(5)
 print(total)

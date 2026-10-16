@@ -11,7 +11,7 @@
 # exited.  Both tracers now answer 360000, matching the interpreter and CPython.
 import sys
 
-N = 60000
+N = 300000
 
 
 def classify(t):

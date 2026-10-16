@@ -10,7 +10,7 @@
 # No FOR_ITER: this is the shape that reaches the defect with no opcode gate
 # involved, so it stays a witness independently of what the FOR_ITER body scan
 # admits. Kept at module scope, where it was first reproduced.
-N = 240000
+N = 720000
 
 
 class Context:
@@ -37,4 +37,4 @@ while i < N:
     i += 1
 print(total, context.exits)
 # The line carries 3*N + sum(i for i in range(N) if i % 10), then N.
-# Expected: 25920720000 240000
+# Expected: 233282160000 720000

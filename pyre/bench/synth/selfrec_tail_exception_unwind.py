@@ -22,7 +22,7 @@ def recur(depth, accumulator):
 
 
 checksum = 0
-for iteration in range(17_000):
+for iteration in range(34_000):
     try:
         checksum = (checksum + recur(iteration % 8, 0)) % MODULUS
     except ZeroDivisionError:

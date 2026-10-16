@@ -24,7 +24,7 @@ import sys
 
 
 def inner(k):
-    if k > 2997:                       # two triggering calls, not one
+    if k > 17997:                       # two triggering calls, not one
         return sys._getframe(1).f_locals['base']
     return k
 
@@ -37,4 +37,4 @@ def outer(n):
     return acc, sorted(locals().keys())
 
 
-print(outer(3000))
+print(outer(18000))

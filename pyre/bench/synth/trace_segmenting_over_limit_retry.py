@@ -54,6 +54,6 @@ def body(a, b, c, d, e):
 
 
 s = 0
-for i in range(4000):
+for i in range(8000):
     s += body(i, i + 1, i + 2, i + 3, i + 4)
 print(s % 1000)

@@ -27,7 +27,7 @@ tracing instance would answer with the wrong `k` rather than merely deopt.
 """
 
 N_INSTANCES = 64
-N_CALLS = 200000
+N_CALLS = 1200000
 
 
 class Adder:

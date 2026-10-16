@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=1416
-N = 200000
+N = 1200000
 
 
 # A loop-callee that constructs a user object via a *type* call and reads

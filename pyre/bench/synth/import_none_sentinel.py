@@ -24,7 +24,7 @@ def blocked(name, statement):
 
 
 def main():
-    for _ in range(200):
+    for _ in range(1200):
         blocked("errno", "import errno")
         blocked("pyre_never_a_real_module", "import pyre_never_a_real_module")
         blocked("pyre_never_a_real_pkg", "from pyre_never_a_real_pkg import thing")

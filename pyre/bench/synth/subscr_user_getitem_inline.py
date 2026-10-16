@@ -78,11 +78,11 @@ def hot_rebind(o, n):
 
 
 def main():
-    print("plain", hot_plain(Seq(), 20000))
-    print("caught", hot_caught(Seq(), 20000))
-    print("override", hot_override(TupOverride([10, 20, 30]), 20000))
-    print("polymorphic", hot_polymorphic(Seq(), Neg(), 20000))
-    print("rebind", hot_rebind(Rebind(), 20000))
+    print("plain", hot_plain(Seq(), 60000))
+    print("caught", hot_caught(Seq(), 60000))
+    print("override", hot_override(TupOverride([10, 20, 30]), 60000))
+    print("polymorphic", hot_polymorphic(Seq(), Neg(), 60000))
+    print("rebind", hot_rebind(Rebind(), 60000))
 
     # A special method resolves on the type, so an instance-dict entry is not
     # consulted and the subscript still raises.

@@ -31,7 +31,7 @@
 # every frame it propagates over, so a level that already had a node from
 # somewhere else would show up twice.  Each line is a full chain, so a doubled
 # node is as visible as a missing one.
-N = 240000
+N = 1200000
 
 
 def leaf(i, n):

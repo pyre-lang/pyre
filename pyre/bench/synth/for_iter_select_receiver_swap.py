@@ -33,7 +33,7 @@ def run():
     o.c = 0
     p = Base()
     p.a = 0
-    for i in range(1, 313801):
+    for i in range(1, 1255204):
         q = o if (i & 1) else p
         q.a = (q.a + i) % 91
         if i == 238260:

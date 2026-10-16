@@ -13,7 +13,7 @@
 # at the outer FOR_ITER. Both the break-check-first and accumulate-first forms,
 # plus a compound `and` guard, are exercised. Output is verified against
 # CPython/PyPy.
-N = 18000
+N = 36000
 
 
 def break_check_first(n):

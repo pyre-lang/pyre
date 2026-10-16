@@ -45,4 +45,4 @@ def f(n, m):
     return s
 
 
-print(f(600, 100))
+print(f(3600, 100))

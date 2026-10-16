@@ -7,7 +7,7 @@ try:
 except ImportError:
     pass
 
-N = 260000
+N = 520000
 
 
 class C:

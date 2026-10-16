@@ -14,13 +14,13 @@ def main():
     s = 0
     k = 0
     n = 0
-    while n < 240000:
+    while n < 1200000:
         # Subscript first, on the loop-carried index `k`.  The first half runs
         # with k = 0 (specializes the subscript on a non-negative index); after
         # the flip, k = -1 must deopt to Python negative indexing, not OOB-read.
         s += t[k] + lst[k]
         n += 1
-        if n == 120000:
+        if n == 600000:
             k = -1
     print(s)
 

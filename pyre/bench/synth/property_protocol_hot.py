@@ -36,7 +36,7 @@ def main():
     counter = Counter()
     total = 0
     i = 0
-    while i < 200000:
+    while i < 800000:
         counter.value = i
         total += counter.value
         i += 1

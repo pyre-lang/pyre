@@ -24,7 +24,7 @@ def leaf(x):
 def main():
     seen = set()
     total = 0
-    for i in range(100000):
+    for i in range(300000):
         seen.add(leaf(i))
         total += i
     print(total, sorted(seen))

@@ -24,7 +24,7 @@ def drive():
     # ValueError count is compared (the message diverges 3.14 vs PyPy).
     hits = 0
     n = 0
-    while n < 20000:
+    while n < 100000:
         try:
             [1, 2, 3].index(9)
         except ValueError:

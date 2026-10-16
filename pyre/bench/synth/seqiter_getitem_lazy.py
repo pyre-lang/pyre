@@ -27,7 +27,7 @@ def main():
     total = 0
     order = 0
     n = 0
-    while n < 20000:
+    while n < 40000:
         step = 0
         for x in Seq():
             # Fold the visit order in so a batch-then-iterate path (which would

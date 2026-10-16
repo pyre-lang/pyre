@@ -8,7 +8,7 @@
 # failures are the two bridges' warm-up (trace_eagerness=200 each), not a
 # per-iteration bailout. `exception_with_exit_self_null_slot` is the same shape
 # written as a `while` loop.
-N = 40000
+N = 160000
 
 
 class Context:
@@ -37,4 +37,4 @@ def main():
 
 main()
 # The line carries 3*N + sum(i for i in range(N) if i % 10), then N.
-# Expected: 720120000 40000
+# Expected: 11520480000 160000

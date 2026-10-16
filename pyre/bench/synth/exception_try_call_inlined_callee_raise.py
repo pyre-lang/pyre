@@ -15,7 +15,7 @@
 # from completing a trace of its own, so `shape` is compiled as a func-entry
 # trace instead of being inlined into the caller.  The raise must also be
 # conditional, so the exception edge stays off the recorded path.
-N = 180000
+N = 720000
 
 
 def leaf(i):

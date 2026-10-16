@@ -26,7 +26,7 @@
 # 4.5x as often as the native backends on the identical trace. Nothing in the
 # bridge-decline census is nonzero on either side and the guest prints no
 # `mc_diag`, so that reading is recorded rather than explained.
-N = 120000
+N = 240000
 
 
 def frame_names(traceback):

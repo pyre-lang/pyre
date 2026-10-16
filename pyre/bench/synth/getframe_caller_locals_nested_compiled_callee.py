@@ -35,7 +35,7 @@ def inner(k):
     s = 0
     for j in range(3):        # callee's own hot loop -> its own compiled entry
         s += j * k
-    if k > 29990:
+    if k > 149990:
         g = sys._getframe(1)  # the CALLER's frame, mid-activation
         return s + g.f_locals['acc']
     return s
@@ -48,4 +48,4 @@ def outer(n):
     return acc
 
 
-print(outer(30000))
+print(outer(150000))

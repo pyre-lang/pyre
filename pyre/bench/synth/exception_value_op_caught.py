@@ -5,7 +5,7 @@
 # such a number gates noise; 175 of the 463 fixtures state none for the same
 # reason, and the ratio is still printed on every run.  This fixture's gates
 # are its three-backend jit-stats baselines.
-N = 100000
+N = 500000
 
 
 # Custom operands enter through the binary `+` and rich-compare `<` value

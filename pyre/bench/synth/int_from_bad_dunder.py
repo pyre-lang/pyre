@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=33
 # int() rejects a __int__ result that is not an int with TypeError (not an
 # internal RuntimeError). Output verified against CPython/PyPy.
-N = 80000
+N = 160000
 
 
 class BadInt:

@@ -10,7 +10,7 @@
 # The single-class `except A:` loop below is the control: same raise rate, a
 # match target that is loaded rather than built. Both loops must agree with the
 # interpreter and neither may accumulate side exits.
-N = 120000
+N = 600000
 
 
 def tuple_clause(n):

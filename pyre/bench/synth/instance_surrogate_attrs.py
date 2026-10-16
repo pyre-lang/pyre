@@ -6,7 +6,7 @@
 # the bound Method into its CALL, and inlines the property's Python getter.
 # Losing either path leaves a per-iteration CALL_MAY_FORCE and crosses this
 # ceiling; the folded dynasm path is about 6x faster than that residual path.
-N = 200000
+N = 1200000
 
 METH = '\udc81'   # lone surrogate naming a method on the class
 PROP = '\udc82'   # lone surrogate naming a property (data descriptor)

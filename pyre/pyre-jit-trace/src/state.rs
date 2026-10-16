@@ -16723,6 +16723,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     if !reconstructed_callee_recipe_is_portable(recipe) {
         return None;
     }
+    let recipe = &ctx.reconstruct_recipe_with_current_refs(recipe);
     let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
     let code_ref = unsafe { &*raw_code };
     let (stack_base, _frame_array_size) = callee_layout_for_call_assembler(code_ref);

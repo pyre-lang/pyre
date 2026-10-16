@@ -280,7 +280,7 @@ def warm(reps):
 
 
 def main():
-    print("warm", warm(200))
+    print("warm", warm(400))
     acc = 0
     for name, src in SOURCES:
         lines = both_ways(src)

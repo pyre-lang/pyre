@@ -1,6 +1,6 @@
 # CALL_FUNCTION_EX in a hot FOR_ITER body. The starred call is the same
 # MayForce boundary as CALL and CALL_KW for the whole-frame safety gate.
-N = 600000
+N = 3600000
 
 
 def add(a, b):
@@ -16,4 +16,4 @@ def main():
 
 
 main()
-# Expected: 180000300000
+# Expected: 6480001800000

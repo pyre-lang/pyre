@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=30
 # gh#495 guard: reflected-add residual mutation feeds the inlined branch result.
 # radd result feeds the branch condition; branch varies each iter -> sub-walk churn
-N = 80000
+N = 160000
 class Acc:
     def __init__(self): self.pos = 0
     def __radd__(self, o):

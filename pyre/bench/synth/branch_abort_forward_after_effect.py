@@ -25,5 +25,5 @@ def parse(encoding):
     return count, fp.tell()
 
 
-for run in range(12):
+for run in range(60):
     print(run, parse(None))

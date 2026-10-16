@@ -25,7 +25,7 @@ def leaf(x):
 def main():
     total = 0
     i = 0
-    while i < 480000:
+    while i < 2400000:
         total = leaf(total)
         i = i + 1
     return total

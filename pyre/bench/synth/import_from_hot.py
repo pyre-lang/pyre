@@ -7,7 +7,7 @@
 # residual's `__path__` probe runs suppressed (`_PyObject_LookupAttr`), so
 # the discarded miss skips the `__spec__` shadowing diagnosis.  Output is
 # verified against CPython/PyPy.
-N = 200000
+N = 400000
 
 
 def main():

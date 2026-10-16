@@ -41,4 +41,4 @@ def run(n):
     return acc
 
 
-print(run(30000))
+print(run(90000))

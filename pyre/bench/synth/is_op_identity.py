@@ -13,7 +13,7 @@
 # complex, tuple, bytes, str, frozenset.  An `int` subclass shares `INT_TYPE`
 # with a plain `int` and still answers by pointer identity; the exact-type
 # gate in `W_AbstractIntObject.is_w` is what separates them.
-N = 400000
+N = 800000
 
 
 class Plain:

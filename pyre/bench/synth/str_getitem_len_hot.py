@@ -66,7 +66,7 @@ def main():
     ascii_b = b"The quick brown fox jumps over the lazy dog 0123456789!?"
     short_b = b"abc"
 
-    n = 40000
+    n = 120000
     print("ascii", hot_checksum(n, ascii_s))
     print("latin1", hot_checksum(n, latin1_s))
     print("bmp", hot_checksum(n, bmp_s))
@@ -74,11 +74,11 @@ def main():
     print("len", hot_len(n, ascii_s), hot_len(n, bmp_s), hot_len(n, astral_s))
     # The descent census verifies the immutable bytes and mutable bytearray
     # length bodies directly; each leg only needs to stay hot enough to compile.
-    bn = 100000
+    bn = 300000
     print("blen", hot_len(bn, ascii_b), hot_len(bn, short_b))
-    ban = 100000
+    ban = 300000
     print("balen", hot_len(ban, bytearray(ascii_b)), hot_len(ban, bytearray(short_b)))
-    print("bamut", hot_mutating_len(40000, bytearray(short_b)))
+    print("bamut", hot_mutating_len(120000, bytearray(short_b)))
 
 
 main()

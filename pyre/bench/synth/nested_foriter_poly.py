@@ -7,7 +7,7 @@ def main():
     data = list(range(100)) + [0.5] + list(range(100))
     total = 0
     n = 0
-    while n < 10000:
+    while n < 40000:
         for x in data:
             total += x
         n += 1
@@ -15,5 +15,5 @@ def main():
 
 result = main()
 print(result)
-# Expected: 10000 * (sum(range(100)) + 0.5 + sum(range(100)))
-#         = 10000 * (4950 + 0.5 + 4950) = 10000 * 9900.5 = 99005000.0
+# Expected: 40000 * (sum(range(100)) + 0.5 + sum(range(100)))
+#         = 40000 * (4950 + 0.5 + 4950) = 40000 * 9900.5 = 396020000.0

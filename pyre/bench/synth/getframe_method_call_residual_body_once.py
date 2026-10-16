@@ -29,10 +29,10 @@
 # method body no longer forces a virtualizable escape.  The oracle is still
 # that the body runs once per iteration (`Force.hits == N`).
 #
-# Expected output: (40000, 40000, 40000)
+# Expected output: (160000, 160000, 160000)
 import sys
 
-N = 40000
+N = 160000
 
 
 class Force:

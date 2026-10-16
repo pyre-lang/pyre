@@ -30,7 +30,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(450000))
+    print("warm", warm(2250000))
     f = Foo()
     m("add", lambda: 1 + f)
     m("sub", lambda: 1 - f)

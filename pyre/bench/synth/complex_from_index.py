@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=82
 # complex() consults __index__ before __float__, matching
 # complexobject.py unpackcomplex. This loop only defines __index__.
-N = 640000
+N = 3840000
 
 
 class Idx:

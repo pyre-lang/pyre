@@ -1,6 +1,6 @@
 # pyre-check: max-pypy-ratio=16
 # gh#495 guard: mutating call that raises uncaught must deliver the exception once.
-N = 60000
+N = 300000
 class C:
     def __init__(self): self.pos = 0
     def tick(self):

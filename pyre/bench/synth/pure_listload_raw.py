@@ -9,13 +9,13 @@
 # the intervening `lst[0] = a + 1` write (mutable list body), so `b - a` would
 # collapse to 0 and the sum would print 0. Lists are mutable, so their element
 # loads MUST remain non-pure (heap-cache invalidated on SetarrayitemGc) and this
-# MUST print 1000.
+# MUST print 17000.
 
 
 def main():
     lst = [0]
     s = 0
-    for _ in range(1000):
+    for _ in range(17000):
         a = lst[0]
         lst[0] = a + 1
         b = lst[0]

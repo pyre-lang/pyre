@@ -48,7 +48,7 @@ def drive():
     # Drive the conversion hot so a compiled trace exercises the leak path.
     hot = 0
     n = 0
-    while n < 20000:
+    while n < 60000:
         try:
             list(g_raise())
         except RuntimeError:

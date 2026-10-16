@@ -27,7 +27,7 @@ def collect(*args):
 
 total = 0
 bad = 0
-for i in range(300):
+for i in range(5100):
     a = collect(*three())
     b = collect(*five())
     if a != (1, 2, 3):

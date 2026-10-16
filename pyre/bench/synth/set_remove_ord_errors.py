@@ -20,7 +20,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(450000))
+    print("warm", warm(1800000))
     m("remove_int", lambda: {1, 2}.remove(9))
     m("remove_str", lambda: {1, 2}.remove("x"))
     m("remove_tuple", lambda: {(1, 2)}.remove((3, 4)))

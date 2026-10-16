@@ -8,7 +8,7 @@
 # frame; `step_noexc` reaches the same result with a membership test and no
 # exception at all.  The counter must advance exactly once per iteration in
 # both: a replayed or dropped mutation shows up in `c.pos`.
-N = 120000
+N = 360000
 
 
 class Counter:

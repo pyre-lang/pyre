@@ -43,7 +43,7 @@ def pop(i):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(75000))
     m("ins_idx", lambda: ins(Idx(1)))
     m("ins_neg", lambda: ins(Idx(-1)))
     m("ins_float", lambda: ins(1.5))

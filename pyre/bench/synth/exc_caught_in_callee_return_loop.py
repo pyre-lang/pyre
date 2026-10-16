@@ -7,7 +7,7 @@
 # raised-call result and hand a NULL back to the caller — "call failed").  The
 # bridge tracer declines the caught-in-frame exception-guard case so the
 # blackhole resume routes the exception to the handler and returns the sentinel.
-N = 120000
+N = 360000
 
 
 def lookup(d, k):

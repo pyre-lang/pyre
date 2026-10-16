@@ -8,7 +8,7 @@
 #
 # Each flavour keeps its own driver loop so the closure stays a direct call
 # from the hot loop, as it was when these lived in separate files.
-N = 80000
+N = 240000
 
 
 def run_readonly():

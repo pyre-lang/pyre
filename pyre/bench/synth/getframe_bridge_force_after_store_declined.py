@@ -23,7 +23,7 @@ box = Box()
 def main():
     total = 0
     names = 0
-    for i in range(400000):
+    for i in range(2000000):
         if i % 97 == 0:
             box.n = i
             fr = _gf(0)

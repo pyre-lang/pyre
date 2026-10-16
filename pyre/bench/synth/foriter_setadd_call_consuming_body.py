@@ -14,7 +14,7 @@
 # would change the heap, not just the result.
 import heapq
 
-N = 300
+N = 600
 SIZE = 128
 
 

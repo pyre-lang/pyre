@@ -18,7 +18,7 @@ try:
 except ImportError:
     pass
 
-N = 40000
+N = 120000
 
 
 try:

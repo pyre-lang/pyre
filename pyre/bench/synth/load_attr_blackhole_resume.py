@@ -23,4 +23,4 @@ def run(c, n):
     return total
 
 
-print(run(C(), 10000000))
+print(run(C(), 40000000))

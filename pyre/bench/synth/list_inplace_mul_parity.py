@@ -54,7 +54,7 @@ def drive():
     # Drive a hot loop so a compiled trace exercises the in-place repeat.
     total = 0
     k = 0
-    while k < 20000:
+    while k < 80000:
         h = [k, k + 1]
         h *= 3
         total += len(h)

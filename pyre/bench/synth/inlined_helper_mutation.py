@@ -23,7 +23,7 @@
 # Both orderings compile and the two folds are censused directly.  Keeping
 # millions of list entries alive after those paths are established only turns
 # the regression guard into an allocation benchmark.
-N = 600000
+N = 1200000
 
 
 def push(a, v):

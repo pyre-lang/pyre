@@ -16,9 +16,9 @@
 # moment the loop compiled — 1242 of 4000 iterations still answered
 # `('i', 'marker')`, the rest `('i',)`.
 #
-# Expected output: 8000 ('i', 'marker')
+# Expected output: 32000 ('i', 'marker')
 
-N = 8000
+N = 32000
 
 
 def mid(i):

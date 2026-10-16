@@ -26,7 +26,7 @@ class MyInt(int):
 
 
 def main():
-    print("warm", warm(220000))
+    print("warm", warm(660000))
     # All-integer 3-arg forms compute the modular power.
     m("i_i_i", lambda: pow(2, 10, 100))
     # A base whose type overrides __pow__ is honoured for 3-arg pow (the

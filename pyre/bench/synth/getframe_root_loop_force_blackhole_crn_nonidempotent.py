@@ -25,7 +25,7 @@ import sys
 def main():
     total = 0
     seen = []
-    for i in range(600000):
+    for i in range(2400000):
         fr = sys._getframe(0)
         seen.append(fr.f_code.co_name)
         total += i

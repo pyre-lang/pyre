@@ -19,7 +19,7 @@ def s(x):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(75000))
 
     # operator in-place arithmetic / bitwise on ints
     print("iadd", operator.iadd(3, 4))

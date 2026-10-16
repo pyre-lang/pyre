@@ -10,7 +10,7 @@ def maybe_raise(step):
 
 def run():
     total = 0
-    for _ in range(21_781):
+    for _ in range(87_124):
         value = 0
         step = 0
         while step < 10:

@@ -11,7 +11,7 @@
 # surfaces for classify_attr): storing it into the instance dict leaves the
 # real type unchanged and obj.kind() keeps dispatching through the old class.  The
 # exact aggregate over the loop makes that silent miscompile observable.
-N = 400000
+N = 800000
 
 
 class A:

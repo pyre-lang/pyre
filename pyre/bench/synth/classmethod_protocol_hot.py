@@ -25,7 +25,7 @@ wrapper = Base.__dict__["calculate"]
 wrapper.offset = 3
 
 total = 0
-for i in range(20001):
+for i in range(100005):
     total += Derived.calculate(i) + wrapper.offset
 
 print(total)

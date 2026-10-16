@@ -4,7 +4,7 @@
 # MemoryError, and a count of 1 on an immutable exact sequence returns the
 # receiver unchanged while a mutable one copies. Output verified against
 # CPython/PyPy.
-N = 80000
+N = 240000
 BIG = 2**63
 
 

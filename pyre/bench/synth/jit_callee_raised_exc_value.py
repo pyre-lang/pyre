@@ -27,14 +27,14 @@ def echo(n):
 def run():
     h = 0
     # Callee helper raise: e.args[0] must track w each iteration.
-    for k in range(6000):
+    for k in range(12000):
         w = (k * 7 + 3) % M
         try:
             boom(w)
         except ValueError as e:
             h = (h * 31 + e.args[0]) & 0xFFFFFFFFFF
     # Exhausted-generator StopIteration: e.value must track the returned total.
-    for k in range(6000):
+    for k in range(12000):
         gg = echo(9)
         gg.send(None)
         i = 0

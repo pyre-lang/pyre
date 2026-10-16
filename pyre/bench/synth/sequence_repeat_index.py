@@ -32,7 +32,7 @@ def repeat(w_seq, w_count):
 
 
 def main():
-    print("warm", warm(450000))
+    print("warm", warm(900000))
     print("tuple three", repeat((7,), Three()))
     print("str three", repeat("ab", Three()))
     print("tuple big", repeat((7,), BigIndex()))

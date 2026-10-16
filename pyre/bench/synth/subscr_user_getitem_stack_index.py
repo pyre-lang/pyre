@@ -7,7 +7,7 @@
 # The abort rewind has no CALL coordinate there, so the flush resumed with the
 # operand stack one short and the index operand was replaced by an unrelated
 # live reference — the iterator, the iterated list, or a bound method.
-N = 6000
+N = 30000
 
 
 class Seq:

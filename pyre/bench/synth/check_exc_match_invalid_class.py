@@ -22,7 +22,7 @@ def f(n):
 
 
 def main():
-    cv, ct = f(500000)
+    cv, ct = f(3000000)
     print("final", cv, ct)
 
 

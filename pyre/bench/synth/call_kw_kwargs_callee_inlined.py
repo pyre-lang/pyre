@@ -55,4 +55,4 @@ def main(n):
         print(x)
 
 
-main(3000)
+main(9000)

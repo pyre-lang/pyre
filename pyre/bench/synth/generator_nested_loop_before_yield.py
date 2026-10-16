@@ -7,7 +7,7 @@
 # closed by the ENCLOSING loop's back edge, which stretched the region over the
 # yield and declined a body that never goes near one. A sibling loop was
 # unaffected, so nesting is the variable this fixture pins.
-ROUNDS = 300
+ROUNDS = 1800
 INNER = 400
 
 
@@ -31,5 +31,5 @@ def run(rounds, m):
 
 
 total = run(ROUNDS, INNER)
-assert total == 71820000, total
+assert total == 430920000, total
 print(total)

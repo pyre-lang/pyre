@@ -8,7 +8,7 @@
 def main():
     total = 0
     n = 0
-    while n < 10000:
+    while n < 50000:
         for x in range(100):
             total += x
         n += 1
@@ -18,7 +18,7 @@ def main():
 def outer_var():
     total = 0
     n = 0
-    while n < 1000:
+    while n < 5000:
         for i in range(200):
             total += i * n
         n += 1
@@ -26,7 +26,7 @@ def outer_var():
 
 
 print(main())
-# Expected: 10000 * sum(range(100)) = 10000 * 4950 = 49500000
+# Expected: 50000 * sum(range(100)) = 50000 * 4950 = 247500000
 print(outer_var())
-# Expected: sum(n for n in range(1000)) * sum(i for i in range(200))
-#         = 499500 * 19900 = 9940050000
+# Expected: sum(n for n in range(5000)) * sum(i for i in range(200))
+#         = 12497500 * 19900 = 248700250000

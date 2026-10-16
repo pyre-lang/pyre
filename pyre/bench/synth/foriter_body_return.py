@@ -13,7 +13,7 @@
 # probe in five, so the scan returns from inside the loop for the rest and
 # falls through to the exhaustion `return` for those.
 N = 64
-ITERS = 20000
+ITERS = 80000
 
 
 def first_at_least(xs, threshold):

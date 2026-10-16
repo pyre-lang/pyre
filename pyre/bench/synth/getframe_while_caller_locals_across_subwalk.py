@@ -23,7 +23,7 @@ def main():
     acc = 0
     tag = 7
     i = 0
-    while i < 660000:
+    while i < 3960000:
         total = leaf(total)
         acc = acc + total
         tag = tag ^ i

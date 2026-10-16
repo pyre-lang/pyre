@@ -3,7 +3,7 @@
 # compiled catching frame contributes its node before handler entry.
 #
 # Expected output: [('T', 'outer'), ('V', 'outer')]
-N = 120000
+N = 240000
 
 
 def leaf(i):

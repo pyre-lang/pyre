@@ -42,4 +42,4 @@ def f(n):
     return s
 
 
-print(f(1500000))
+print(f(9000000))

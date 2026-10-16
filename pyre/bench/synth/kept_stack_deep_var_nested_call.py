@@ -23,4 +23,4 @@ def f(n):
     return s
 
 
-print(f(240000))
+print(f(1440000))

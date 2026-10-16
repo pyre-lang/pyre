@@ -16,5 +16,5 @@ def unpack_sum(value, count):
     return total
 
 
-print(unpack_sum((1, 2, 3), 600000))
+print(unpack_sum((1, 2, 3), 3600000))
 print(unpack_sum(TupleSubclass((4, 5, 6)), 3))

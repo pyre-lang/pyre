@@ -20,4 +20,4 @@ def run(n):
     return total
 
 
-print(run(20000))
+print(run(100000))

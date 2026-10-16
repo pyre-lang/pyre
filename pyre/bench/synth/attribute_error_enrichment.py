@@ -13,7 +13,7 @@
 # A single access answers from the interpreter, so an assertion that runs once
 # proves nothing about the compiled trace.  Each loop below runs long enough
 # for the hook to be inlined and re-reads the pair on every iteration.
-N = 30000
+N = 60000
 
 
 class Miss:

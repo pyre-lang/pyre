@@ -16,7 +16,7 @@
 # Its `value0` is field 0, exactly where `W_TupleObject.wrappeditems` sits, so a
 # trace that reads `wrappeditems` off the live `defs_w` without proving the
 # class reads the raw integer instead of the items array.
-N = 600000
+N = 3000000
 
 
 def long_tail(n):

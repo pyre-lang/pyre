@@ -16,7 +16,7 @@ _gf = sys._getframe
 def main():
     total = 0
     names = 0
-    for i in range(400000):
+    for i in range(2000000):
         if i % 97 == 0:
             fr = _gf(0)
             names += len(fr.f_locals)

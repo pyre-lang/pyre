@@ -1912,6 +1912,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
     // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
     // is known.
+    let recipe = &ctx.reconstruct_recipe_with_current_refs(recipe);
     let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
     let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
     let local_concretes = &recipe.concrete_r[..nlocals];

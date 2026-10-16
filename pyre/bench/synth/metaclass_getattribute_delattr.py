@@ -6,7 +6,7 @@
 # receiver.  A __getattribute__ raising AttributeError falls back to the
 # metaclass __getattr__.  Ordinary classes (metaclass=type) are unaffected.
 # Output verified against CPython/PyPy.
-N = 10000
+N = 20000
 
 
 class Meta1(type):

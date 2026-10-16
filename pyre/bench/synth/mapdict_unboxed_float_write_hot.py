@@ -77,7 +77,7 @@ def special_values():
     return out
 
 
-print(write_float_hot(4000000, Cell(0.0)))
-print(write_int_hot(4000000, Cell(0)))
+print(write_float_hot(20000000, Cell(0.0)))
+print(write_int_hot(20000000, Cell(0)))
 print(revoked_shapes(20000))
 print(" ".join(special_values()))

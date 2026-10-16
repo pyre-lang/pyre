@@ -37,7 +37,7 @@ class Loop:
 
 loop = Loop()
 none_handles = 0
-for i in range(20000):
+for i in range(100000):
     h = loop._call_soon(int, (), None)
     if h is None:
         none_handles += 1

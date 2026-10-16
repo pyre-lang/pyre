@@ -16,7 +16,7 @@ def _hot(n, total):
     # STORE_NAME every iteration and revokes any trace that folded a
     # LOAD_GLOBAL from this module (`celldict.py notify_version_watchers`).
     i = 0
-    while i < 1600000:
+    while i < 9600000:
         total = total + n
         i = i + 1
     return total

@@ -15,7 +15,7 @@ try:
     n = 0
     acc = 0
     err = 0
-    while n < 20001:
+    while n < 160008:
         try:
             termios.tcdrain(slave)
         except termios.error as e:
@@ -24,7 +24,7 @@ try:
             break
         acc = acc + n
         n = n + 1
-        if n == 20000:
+        if n == 160007:
             os.close(slave)
     if err != errno.EBADF:
         raise SystemExit("errno %s" % err)

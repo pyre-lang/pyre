@@ -5,7 +5,7 @@
 # resumption bypassed the eval override, so nothing in a generator body was
 # ever offered to the tracer, yield in the loop or not.
 N = 800
-ROUNDS = 600
+ROUNDS = 3600
 
 
 def summer(m):
@@ -33,5 +33,5 @@ def run(rounds, m):
 
 
 total = run(ROUNDS, N)
-assert total == 1150560600, total
+assert total == 6903363600, total
 print(total)

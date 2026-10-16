@@ -93,7 +93,7 @@ def declined_callables(n):
 
 
 def main():
-    n = 1818182
+    n = 3636364
     print("render", hot_render(n))
     # Negative values exercise the sign digit and the widest decimal the fold
     # can be asked for; INT_MIN has no positive counterpart, so a render that

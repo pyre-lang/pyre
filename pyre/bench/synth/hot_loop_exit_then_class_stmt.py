@@ -10,7 +10,7 @@
 # `print` fired twice, `append` appended twice, `n` counted twice.
 #
 # Everything here runs at the default thresholds — no `pypyjit.set_param`.
-N = 180000
+N = 1080000
 
 log = []
 n = 0

@@ -27,7 +27,7 @@ def leaf_a(x):
 def part_a():
     total = 0
     i = 0
-    while i < 210000:
+    while i < 1050000:
         total = leaf_a(total)
         i = i + 1
     return total
@@ -45,7 +45,7 @@ def leaf_b(x):
 def part_b():
     total = 0
     i = 0
-    while i < 210000:
+    while i < 1050000:
         total = leaf_b(total)
         i = i + 1
     return total

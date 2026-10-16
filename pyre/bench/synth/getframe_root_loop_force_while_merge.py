@@ -16,7 +16,7 @@ def main():
     global kept
     total = 0
     i = 0
-    while i < 900000:
+    while i < 5400000:
         kept = _gf()
         total = total + 1
         i = i + 1

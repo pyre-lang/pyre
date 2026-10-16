@@ -2,7 +2,7 @@
 # layer never served these arms: canonical codewriter inline-calls prove that
 # the whole `pos` and `invert` interpreter bodies admit exact
 # W_LongObject operands instead of merely preserving former exact-int paths.
-N = 200000
+N = 1000000
 LONG = 1 << 70
 
 

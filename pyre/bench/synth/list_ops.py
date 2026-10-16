@@ -14,7 +14,7 @@ except ImportError:
 # the same list operation after its result and jitstats shape are fixed.
 
 # ── list_index_update ──
-list_index_update__N = 5000
+list_index_update__N = 10000
 
 def list_index_update__main():
     xs = [0] * 32
@@ -28,7 +28,7 @@ def list_index_update__main():
 list_index_update__main()
 
 # ── list_slicing ──
-list_slicing__N = 2000
+list_slicing__N = 4000
 
 def list_slicing__main():
     xs = [0, 1, 2, 3, 4, 5, 6, 7]
@@ -42,7 +42,7 @@ def list_slicing__main():
 list_slicing__main()
 
 # ── list_append_pop ──
-list_append_pop__N = 5000
+list_append_pop__N = 10000
 
 def list_append_pop__main():
     xs = []
@@ -60,7 +60,7 @@ def list_append_pop__main():
 list_append_pop__main()
 
 # ── list_obj_append_pop ──
-list_obj_append_pop__N = 5000
+list_obj_append_pop__N = 10000
 
 def list_obj_append_pop__main():
     xs = []
@@ -80,7 +80,7 @@ def list_obj_append_pop__main():
 list_obj_append_pop__main()
 
 # ── tuple_unpacking ──
-tuple_unpacking__N = 5000
+tuple_unpacking__N = 10000
 
 def tuple_unpacking__pair(i):
     return (i, i + 1)
@@ -97,7 +97,7 @@ def tuple_unpacking__main():
 tuple_unpacking__main()
 
 # ── build_list_large ──
-build_list_large__N = 5000
+build_list_large__N = 10000
 
 def build_list_large__main():
     i = 0
@@ -110,7 +110,7 @@ def build_list_large__main():
 build_list_large__main()
 
 # ── build_tuple_large ──
-build_tuple_large__N = 5000
+build_tuple_large__N = 10000
 
 def build_tuple_large__main():
     i = 0

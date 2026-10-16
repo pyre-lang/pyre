@@ -7,7 +7,7 @@
 # being an exact range says nothing about what its length slot holds, and the
 # hot small ranges below would otherwise let a bignum-length range take their
 # recorded exit and hand the bignum straight to `len()`.
-N = 1200000
+N = 7200000
 
 SMALL = range(10)
 HUGE = range(-4611686018427387904, 4611686018427387904)
@@ -26,4 +26,4 @@ def main():
 
 
 main()
-# Expected: 12000000 OverflowError
+# Expected: 72000000 OverflowError

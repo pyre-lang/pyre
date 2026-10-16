@@ -5,7 +5,7 @@ def callee(i):
 
 def main():
     bound = 0
-    for i in range(4000):
+    for i in range(20000):
         try:
             callee(i)
         except RuntimeError as exc:

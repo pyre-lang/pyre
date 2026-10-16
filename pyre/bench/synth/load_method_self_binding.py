@@ -26,7 +26,7 @@ try:
 except ImportError:
     pass
 
-N = 4000
+N = 8000
 
 
 def _name(self):

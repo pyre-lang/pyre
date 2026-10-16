@@ -21,7 +21,7 @@
 #
 # `foriter_call_body` covers the same fold from the loop-owning function; only
 # the callee position exercises the green key this fixture guards.
-N = 800000
+N = 4000000
 
 
 class Shared:

@@ -12,7 +12,7 @@
 # Each rebind happens INSIDE its loop: a read after the loop is interpreted and
 # would not consult what the trace baked.  The wrapped bodies are residual-free
 # so the folds stand rather than aborting.
-N = 800000
+N = 2400000
 SWITCH = N // 2
 
 

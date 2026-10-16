@@ -94,7 +94,7 @@ def build(n):
 
 total = 0
 k = 0
-while k < 400:
+while k < 1600:
     total += len(comp(1000))
     total += len(obj_comp(1000))
     total += len(build(1000))

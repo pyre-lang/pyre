@@ -25,7 +25,7 @@ seen.append("once")
 
 i = 0
 steps = 0
-while i < 400000:
+while i < 2400000:
     steps = steps + i
     i = i + 1
 

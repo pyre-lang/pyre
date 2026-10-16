@@ -11,7 +11,7 @@
 # frame.  Expected: no leak in either, and the sum of `i & 7` twice.
 import sys
 
-N = 4000
+N = 20000
 
 
 def escape_inner(i):

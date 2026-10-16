@@ -15,7 +15,7 @@
 def run(c):
     total = 0
     n = 0
-    while n < 600000:
+    while n < 3600000:
         total += c[0] + c[-1]
         n += 1
     return total

@@ -13,10 +13,10 @@
 
 def probe():
     seen = []
-    for i in range(200000):
+    for i in range(1000000):
         a = i * 2
         b = a + 1
-        if i == 5000 or i == 199999:
+        if i == 5000 or i == 999999:
             d = locals()
             seen.append((d.get("i"), d.get("a"), d.get("b")))
     return seen
@@ -24,9 +24,9 @@ def probe():
 
 def probe_vars():
     out = None
-    for i in range(200000):
+    for i in range(1000000):
         a = i * 2
-        if i == 199999:
+        if i == 999999:
             out = vars().get("a")
     return out
 

@@ -7,7 +7,7 @@
 # bridge — the bridge's entry flavor guard (GUARD_NO_EXCEPTION,
 # prepare_resume_from_failure) must deopt that entry to the blackhole instead
 # of running the recorded continuation on the NULL raised-call result.
-N = 1200000
+N = 4800000
 
 
 def f(i):

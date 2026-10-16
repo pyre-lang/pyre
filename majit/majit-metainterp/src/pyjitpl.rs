@@ -3912,6 +3912,20 @@ impl<M: Clone> MetaInterp<M> {
         for (op, _) in &trace_ctx.virtualref_boxes {
             Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
         }
+        // resume.py `rebuild_from_resumedata` puts every resumed frame on
+        // `metainterp.framestack`; the carrier's recipes are the frames still
+        // to be pushed, so their register boxes are roots like `registers_r`.
+        if let Some(carrier) = trace_ctx.active_bridge_inline_carrier() {
+            for recipe in &carrier.recipes {
+                for op in &recipe.registers_r {
+                    Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
+                }
+                Self::push_frontend_live_box(recipe.frame, &mut live_boxes, &mut visited);
+                for op in recipe.return_substitute.iter().chain(&recipe.rebuilt_frame) {
+                    Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
+                }
+            }
+        }
         // heapcache.py `CacheEntry` — keys (`from_ref_box`) and values
         // (`to_field_box`) plus `quasiimmut_seen` / `last_const_box` /
         // `loopinvariant_result`. Non-constant boxes reach the live set so
@@ -30448,6 +30462,56 @@ mod tests {
         let ctx = meta.tracing.as_ref().unwrap();
         assert_eq!(ctx.box_bits(b), Some(0x7200), "one-level dep B");
         assert_eq!(ctx.box_bits(c), Some(0x7300), "transitive dep C");
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_bridge_carrier_recipe_boxes() {
+        // resume.py `rebuild_from_resumedata` puts each resumed frame on
+        // `metainterp.framestack`. A drained carrier's recipes are those
+        // frames, so their register boxes are roots, and the recipe's
+        // `concrete_r` is reread from them.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let a = trace_ctx.recorder.inputargs()[0].opref();
+        let b = trace_ctx.recorder.record_op_with_value(
+            OpCode::SameAsR,
+            &[a],
+            Some(Value::Ref(GcRef(0x5c100))),
+        );
+        trace_ctx.set_bridge_inline_carrier(crate::trace_ctx::BridgeInlineCarrier {
+            root_pc: 0,
+            root_jitcode_index: 0,
+            recipes: vec![crate::trace_ctx::ReconstructRecipe {
+                code_ptr: std::ptr::null(),
+                jitcode_index: 0,
+                jitcode_pc: 0,
+                nlocals: 1,
+                valuestackdepth: 1,
+                registers_i: Vec::new(),
+                registers_r: vec![b],
+                registers_f: Vec::new(),
+                concrete_r: vec![Value::Ref(GcRef(0x5c100))],
+                frame: OpRef::NONE,
+                nargs: 0,
+                return_substitute: None,
+                len_tail: false,
+                rebuilt_frame: None,
+                rebuilt_ec: None,
+            }],
+        });
+        let carrier = trace_ctx.take_bridge_inline_carrier().expect("carrier");
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x5c100 {
+                slot.0 = 0x5d100;
+            }
+        });
+
+        let ctx = meta.tracing.as_ref().unwrap();
+        assert_eq!(ctx.box_bits(b), Some(0x5d100), "recipe register is a root");
+        let current = ctx.reconstruct_recipe_with_current_refs(&carrier.recipes[0]);
+        assert!(matches!(current.concrete_r[0], Value::Ref(GcRef(0x5d100))));
     }
 
     #[test]

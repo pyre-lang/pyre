@@ -3,7 +3,7 @@
 # The class entry is an ObjectMutableCell before the loop: the first store
 # builds the cell (`typeobject.py write_cell`) and the hot `__next__` has to
 # promote `ObjectMutableCell.w_value` instead of declining `next_fast_path`.
-N = 3557424
+N = 7114848
 
 
 class It:
