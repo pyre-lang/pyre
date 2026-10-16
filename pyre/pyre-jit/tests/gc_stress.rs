@@ -3314,7 +3314,6 @@ assert got.count(14) == 40, got
         "a compiled frame repr did not report the call lines",
     );
 }
-
 /// `f_generator_wref` is a strong edge to the WEAKREF box
 /// `initialize_as_generator` stores; `get_generator` dereferences its
 /// `weakptr`. Collecting must forward the box slot and let the collector
@@ -3672,5 +3671,71 @@ assert add(1, 2) == 3
         "intern_and_declaration_roots.py",
         "intern identity and declaration interior",
         "intern or declaration root did not survive collection",
+    );
+}
+
+/// `call_args_and_c_profile_args` pins `arguments_w` / `keywords_w` across
+/// `c_call_trace` / `c_return_trace`, then `refresh_arguments_from_roots`
+/// copies them back before `freeze_gc_arrays`. `keyword_names_w` is the
+/// third list `argument.py Arguments.__init__` keeps in GC storage; a
+/// profile callback that collects must not leave those name objects as
+/// stale native Vec words (`MAJIT_GC_NURSERY_POISON`).
+#[test]
+fn profiled_builtin_keyword_names_reload_after_hooks() {
+    const CHILD: &str = "PYRE_PROFILE_KW_NAMES_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "profiled_builtin_keyword_names_reload_after_hooks",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated profiled-keyword-name GC-root regression");
+        assert!(
+            output.status.success(),
+            "profiled builtin read a moved keyword name:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import gc
+import io
+import sys
+
+def profiler(frame, event, arg):
+    gc.collect()
+    n = 0
+    junk = []
+    while n < 40:
+        junk.append(object())
+        n = n + 1
+
+sys.setprofile(profiler)
+try:
+    i = 0
+    while i < 40:
+        buf = io.StringIO()
+        print("a", "b", file=buf, **{"".join(["se", "p"]): ","})
+        assert buf.getvalue() == "a,b\n", buf.getvalue()
+        got = sorted([3, 1, 2], **{"".join(["re", "verse"]): True})
+        assert got == [3, 2, 1], got
+        got = sorted([3, 1, 2], reverse=True)
+        assert got == [3, 2, 1], got
+        i = i + 1
+finally:
+    sys.setprofile(None)
+"#,
+        "profiled_builtin_keyword_names.py",
+        "profiled builtin keyword names",
+        "refresh_arguments_from_roots must copy keyword_names_w after the profile hooks",
     );
 }

@@ -18095,6 +18095,138 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
 }
 
 #[test]
+fn getfield_gc_i_heapcache_hit_serves_no_concrete_receiver() {
+    // A virtual NEW stamps `GcRef::NO_CONCRETE`. `_opimpl_getfield_gc_any_pureornot`
+    // (`pyjitpl.py`) still returns `upd.currfieldbox` on a heapcache hit.
+    let byte = *insns_opname_to_byte()
+        .get("getfield_gc_i/rd>i")
+        .expect("`getfield_gc_i/rd>i` must be in insns table");
+    let code = [byte, 0x02, 0x01, 0x00, 0x05];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
+    let obj = dummy_ptr_eq_box(&mut tc);
+    tc.set_opref_concrete(obj, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    regs_r[2] = obj;
+    let descr = field_descr_with_index(1);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let frame_done = done_descr_ref_for_tests();
+    let cached_field = tc.const_int(0xCAFE);
+    tc.heapcache_getfield_now_known(obj, 1, cached_field);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let _ = step(&code, 0, &mut wc).expect("heapcache hit must ignore NO_CONCRETE");
+    let dst_post = wc.registers_i.get(5).expect("int register in range");
+    drop(wc);
+    assert_eq!(tc.num_ops(), ops_before, "cache hit must not record");
+    assert_eq!(dst_post, cached_field);
+}
+
+#[test]
+fn getfield_gc_i_no_concrete_miss_declines_without_deref() {
+    // Miss path: `NO_CONCRETE` cannot run `execute_with_descr`.
+    let byte = *insns_opname_to_byte()
+        .get("getfield_gc_i/rd>i")
+        .expect("`getfield_gc_i/rd>i` must be in insns table");
+    let code = [byte, 0x02, 0x01, 0x00, 0x05];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_refs(&mut tc, 8);
+    let obj = dummy_ptr_eq_box(&mut tc);
+    tc.set_opref_concrete(obj, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    regs_r[2] = obj;
+    let descr = field_descr_with_index(1);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let frame_done = done_descr_ref_for_tests();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let err = step(&code, 0, &mut wc).expect_err("NO_CONCRETE miss cannot execute");
+    assert_eq!(
+        err,
+        DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 }
+    );
+}
+
+#[test]
 fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
     // GetfieldGcR variant — same flow as
     // GetfieldGcI but result lands in registers_r.
@@ -19128,6 +19260,75 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
 }
 
 #[test]
+fn getarrayitem_gc_r_heapcache_hit_serves_no_concrete_array() {
+    // Virtual array: `NO_CONCRETE` must not abort before
+    // `_do_getarrayitem_gc_any` (`pyjitpl.py`) returns the cached box.
+    let byte = *insns_opname_to_byte()
+        .get("getarrayitem_gc_r/rid>r")
+        .expect("`getarrayitem_gc_r/rid>r` must be in insns table");
+    let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_ints(&mut tc, 8);
+    let array = dummy_ptr_eq_box(&mut tc);
+    tc.set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    regs_r[2] = array;
+    let index = regs_i[3];
+    let descr = field_descr_with_index(1);
+    let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+    let frame_done = done_descr_ref_for_tests();
+    let cached = tc.const_ref(0xCAFE_F00D);
+    tc.heapcache_getarrayitem_now_known(array, index, 1, cached);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let _ = step(&code, 0, &mut wc).expect("heapcache hit must ignore NO_CONCRETE");
+    let dst_post = wc.registers_r.get(5).expect("ref register in range");
+    drop(wc);
+    assert_eq!(tc.num_ops(), ops_before, "cache hit must not record");
+    assert_eq!(dst_post, cached);
+}
+
+#[test]
 fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
     // `setarrayitem_gc_r/rird` records
     // SetarrayitemGc with [array, index, value] + descr and
@@ -20080,7 +20281,6 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
         other => panic!("expected CloseLoop from jit_merge_point, got {other:?}"),
     }
 }
-
 #[test]
 fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     let byte = *insns_opname_to_byte()

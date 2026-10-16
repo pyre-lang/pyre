@@ -571,9 +571,11 @@ pub const _immutable_fields_Signature: &str =
 /// the read a constant, the same way `co_code` and `co_varnames` are
 /// immutable on `PyCode`. The body's name tables and kind bytes are
 /// [`_immutable_fields_CodeObject`]. `source_path` stays mutable
-/// (`fix_code_filenames`).
+/// (`fix_code_filenames`). `_signature` is `pycode.py make_signature`,
+/// filled once in `w_code_new_owned` and never written again; listing it
+/// here makes the pointer a constant once the code object is.
 #[repr(C)]
-#[majit_macros::jit_immutable_fields("w_globals?", "code_ptr")]
+#[majit_macros::jit_immutable_fields("w_globals?", "code_ptr", "_signature")]
 pub struct PyCode {
     pub ob_header: PyObject,
     /// Permanently-live `CodeObject` address. Top-level bodies are owned via
@@ -836,6 +838,11 @@ pub struct PyCode {
     /// `pycode.py` keeps per-code JIT state on `PyCode` (`jit_cells`); this
     /// is the same owner for the pyre-only shape latch.
     pub jit_shape: std::sync::atomic::AtomicU8,
+    /// `pycode.py make_signature` stored as `Box::into_raw`. Null when
+    /// `code_ptr` is missing or `co_varnames` is shorter than the argument
+    /// header. Not a GC pointer: the names borrow the immortal `CodeObject`
+    /// `varnames`, and [`pycode_destructor`] drops the box.
+    pub _signature: *const crate::gateway::Signature,
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -1024,10 +1031,48 @@ pub fn unpack_text_tuple(_space: PyObjectRef, w_str_tuple: PyObjectRef) -> Vec<S
     Vec::new()
 }
 
-/// Compatibility API for building a signature-like object.
-pub fn make_signature(_code: &PyCode) -> PyObjectRef {
-    let _ = _code;
-    pyre_object::w_none()
+/// `pycode.py make_signature`.
+///
+/// Names are `'static` aliases of the code object's `co_varnames`. The body
+/// stays allocated for the process (`pycode_destructor` does not free
+/// `code_ptr`), which is what makes the borrow sound. A short `co_varnames`
+/// returns `None` instead of indexing off the end.
+pub fn make_signature(code: &crate::CodeObject) -> Option<Box<crate::gateway::Signature>> {
+    let kwonly = code.kwonlyarg_count as usize;
+    let mut argcount = code.arg_count as usize + kwonly;
+    if argcount > code.varnames.len() {
+        return None;
+    }
+    let mut argnames = Vec::with_capacity(argcount);
+    for name in &code.varnames[..argcount] {
+        argnames.push(immortal_varname(name.as_ref()));
+    }
+    let varargname = if code.flags.contains(crate::CodeFlags::VARARGS) {
+        let name = code.varnames.get(argcount)?;
+        argcount += 1;
+        Some(immortal_varname(name.as_ref()))
+    } else {
+        None
+    };
+    let kwargname = if code.flags.contains(crate::CodeFlags::VARKEYWORDS) {
+        let name = code.varnames.get(argcount)?;
+        Some(immortal_varname(name.as_ref()))
+    } else {
+        None
+    };
+    Some(Box::new(crate::gateway::Signature::new(
+        argnames,
+        varargname,
+        kwargname,
+        kwonly,
+        code.posonlyarg_count as usize,
+    )))
+}
+
+/// Extend a `co_varnames` borrow to `'static`. The string lives in the
+/// permanently-live `CodeObject` body `make_signature` read.
+fn immortal_varname(name: &str) -> &'static str {
+    unsafe { &*(name as *const str) }
 }
 
 /// pycode.py _compute_args_as_cellvars
@@ -1393,6 +1438,14 @@ fn w_code_new_owned(
             unsafe { realize_w_filename(std::ptr::null(), code_ptr as *const crate::CodeObject) };
         let _ = filename_roots.pin_root(w_filename);
     }
+    let signature = if !code_ptr_aligned {
+        std::ptr::null()
+    } else {
+        match make_signature(unsafe { &*(code_ptr as *const crate::CodeObject) }) {
+            Some(boxed) => Box::into_raw(boxed) as *const crate::gateway::Signature,
+            None => std::ptr::null(),
+        }
+    };
     let obj = PyCode {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
@@ -1422,6 +1475,7 @@ fn w_code_new_owned(
         loop_header_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         mutate_w_globals: pyre_object::quasiimmut::QuasiImmutField::new(),
         jit_shape: std::sync::atomic::AtomicU8::new(JIT_SHAPE_UNCOMPUTED),
+        _signature: signature,
     };
     // The raw-address JIT compatibility seam described above requires a
     // stable wrapper address. `malloc_typed_stable` is still a managed
@@ -4571,6 +4625,10 @@ fn live_code_wrappers() -> &'static parking_lot::Mutex<majit_gc::address_dict::A
 /// The frame/function field supplying `wrapper` is the authoritative GC edge.
 /// Refreshing an existing entry is required now that `PyCode` follows
 /// `pycode.py class PyCode(W_Root)` and can move between calls.
+///
+/// Process-global `AddressMap` under a mutex — the body is a walker, not a
+/// traced helper (`walk_w_globals_stamped_code_roots`).
+#[majit_macros::dont_look_inside]
 pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
     if code_ptr.is_null() || wrapper.is_null() {
         return;
@@ -4949,6 +5007,12 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
         drop(unsafe { Box::from_raw(code.co_code_bytes) });
         code.co_code_bytes = std::ptr::null_mut();
     }
+    if !code._signature.is_null() {
+        // The box owns the `Vec` of borrows. The `CodeObject` strings stay
+        // with `code_ptr`, which this destructor does not free.
+        drop(unsafe { Box::from_raw(code._signature as *mut crate::gateway::Signature) });
+        code._signature = std::ptr::null();
+    }
     // Last, so every side table this wrapper owns is already gone when the
     // graph's own bodies are released.
     detach_code_unit_wrapper(code.code_ptr as *const ());
@@ -4986,6 +5050,20 @@ fn compute_flatcall(code: &crate::CodeObject) -> u16 {
         }
     }
     BuiltinCodeFlags::FLATPYCALL.bits() | (code.arg_count as u16)
+}
+
+/// `pycode.py make_signature` pointer stored on `obj`.
+///
+/// Null when `obj` is null or the code object has no signature.
+///
+/// # Safety
+/// `obj` must be null or point to a valid `PyCode`.
+#[inline]
+pub unsafe fn w_code_signature(obj: PyObjectRef) -> *const crate::gateway::Signature {
+    if obj.is_null() {
+        return std::ptr::null();
+    }
+    unsafe { (*(obj as *const PyCode))._signature }
 }
 
 /// eval.py:16-23 — read `fast_natural_arity` from a PyCode.
@@ -5113,6 +5191,7 @@ pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
 /// # Safety
 /// `obj` must point to a valid `PyCode` (or be null).
 #[inline]
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_code_cell_family(obj: PyObjectRef, slot: usize) -> *const CellFamily {
     if obj.is_null() {
         return pyre_object::nestedscope::dummy_family();
@@ -5284,15 +5363,18 @@ fn mapdict_method_cache_codes() -> &'static parking_lot::Mutex<std::collections:
 /// object forwards a dangling pointer.  This registry makes the slot a root of
 /// its own for that family, as [`MAPDICT_METHOD_CACHE_CODES`] does.
 static W_GLOBALS_STAMPED_CODES: std::sync::OnceLock<
-    parking_lot::Mutex<std::collections::HashSet<usize>>,
+    parking_lot::Mutex<majit_gc::address_dict::AddressMap<usize>>,
 > = std::sync::OnceLock::new();
 
-fn w_globals_stamped_codes() -> &'static parking_lot::Mutex<std::collections::HashSet<usize>> {
+#[majit_macros::dont_look_inside]
+fn w_globals_stamped_codes()
+-> &'static parking_lot::Mutex<majit_gc::address_dict::AddressMap<usize>> {
     W_GLOBALS_STAMPED_CODES
-        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+        .get_or_init(|| parking_lot::Mutex::new(majit_gc::address_dict::AddressMap::default()))
 }
 
 /// Record `obj` as a code object holding a stamped `w_globals` slot.
+#[majit_macros::dont_look_inside]
 fn register_w_globals_stamped_code(obj: PyObjectRef) {
     // A managed PyCode's own custom trace owns this edge.  Only bootstrap
     // wrappers outside the collector need the compatibility registry; making
@@ -5301,7 +5383,9 @@ fn register_w_globals_stamped_code(obj: PyObjectRef) {
     if pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF) {
         return;
     }
-    w_globals_stamped_codes().lock().insert(obj as usize);
+    w_globals_stamped_codes()
+        .lock()
+        .insert(obj as usize, obj as usize);
 }
 
 /// Forward the stamped `w_globals` slot of every registered code object.
@@ -5318,7 +5402,7 @@ fn register_w_globals_stamped_code(obj: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub fn walk_w_globals_stamped_code_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     let codes = w_globals_stamped_codes().lock();
-    for &code in codes.iter() {
+    for &code in codes.keys() {
         let code = unsafe { &mut *(code as *mut PyCode) };
         if code.w_globals.is_null() {
             continue;

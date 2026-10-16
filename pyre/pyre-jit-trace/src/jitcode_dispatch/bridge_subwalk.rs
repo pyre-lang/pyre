@@ -947,6 +947,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         *regs.get_mut(color)? = cleared;
         Some(cleared)
     });
+
     let root_word = ((root_pc as i32) != majit_ir::resumedata::NO_JITCODE_PC
         && (root_pc as i32) >= 0)
         .then_some(root_pc);

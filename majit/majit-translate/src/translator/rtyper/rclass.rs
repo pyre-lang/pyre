@@ -4315,6 +4315,17 @@ impl Repr for InstanceRepr {
                 self.lowleveltype.clone(),
             ));
         }
+        // `PY_NULL` is a GCREF Null folded as `ConstValue::LLPtr` whose
+        // `_obj is None`. RPython's `value is None` is the same conversion.
+        if let ConstValue::LLPtr(ptr) = value {
+            if !ptr.nonzero() {
+                let null = self.null_instance()?;
+                return Ok(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(null)),
+                    self.lowleveltype.clone(),
+                ));
+            }
+        }
 
         // upstream: `isinstance(value, types.MethodType)` —
         //   bound method redirect to its `im_self`.
@@ -4813,9 +4824,21 @@ pub(super) fn pair_instance_instance_convert_from_to(
             (None, None) => true,
             _ => false,
         };
+    let same_struct = match (&r_ins1.classdef, &r_ins2.classdef) {
+        (Some(c1), Some(c2)) => {
+            crate::annotator::model::same_struct_identity(&c1.borrow().name, &c2.borrow().name)
+        }
+        _ => false,
+    };
     // Upstream's two arms (upcast to parent / downcast after a
     // successful isinstance check) both emit the same cast_pointer.
-    if classdef_eq(&basedef, &r_ins2.classdef) || classdef_eq(&basedef, &r_ins1.classdef) {
+    // Two frontend spellings of one struct (`Arguments` vs
+    // `argument::Arguments`) have no shared `basedef` Rc; they are
+    // still one type, so the same cast is identity.
+    if classdef_eq(&basedef, &r_ins2.classdef)
+        || classdef_eq(&basedef, &r_ins1.classdef)
+        || same_struct
+    {
         return Ok(llops
             .genop(
                 "cast_pointer",
@@ -6559,6 +6582,30 @@ mod tests {
     }
 
     #[test]
+    fn instance_repr_convert_const_null_llptr_returns_null_instance() {
+        // `PY_NULL` is a GCREF Null folded as `ConstValue::LLPtr` with
+        // `_obj is None`. RPython's `value is None` arm is the same
+        // `null_instance` conversion.
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("pkg.NullLlptr", None);
+        let inst = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr");
+        let null = inst.null_instance().expect("null_instance");
+        assert!(!null.nonzero());
+        let c = (inst.as_ref() as &dyn Repr)
+            .convert_const(&ConstValue::LLPtr(Box::new(null)))
+            .expect("convert_const(null LLPtr)");
+        assert_eq!(c.concretetype.as_ref(), Some(inst.lowleveltype()));
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!(
+                "convert_const(null LLPtr) must produce LLPtr, got {:?}",
+                c.value
+            );
+        };
+        assert!(!ptr.nonzero(), "null LLPtr must convert to null_instance");
+    }
+
+    #[test]
     fn instance_repr_convert_const_generic_unit_variant_uses_interned_variant_classdef() {
         // `InstanceRepr.convert_const` (`rclass.py`) does
         // `bk.getuniqueclassdef(value.__class__)`.  A folded unit-variant
@@ -7685,5 +7732,45 @@ mod tests {
         .expect("conversion does not error");
         assert!(converted.is_none());
         assert!(llops.ops.is_empty());
+    }
+
+    /// Bare-leaf vs `module::Leaf` of one struct convert by `cast_pointer`.
+    /// `same_struct_identity` unifies the spellings at annotation union
+    /// time; rtype convert must emit the same identity cast when the two
+    /// ClassDefs never shared an Rc (`Arguments` vs `argument::Arguments`).
+    #[test]
+    fn instance_repr_convert_same_struct_spellings_is_cast_pointer() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let bare = ClassDef::new_standalone("Arguments", None);
+        let qualified = ClassDef::new_standalone("argument::Arguments", None);
+        let r_bare = getinstancerepr(&rtyper, Some(&bare), Flavor::Gc).expect("bare");
+        let r_qual = getinstancerepr(&rtyper, Some(&qualified), Flavor::Gc).expect("qualified");
+        Repr::setup(r_bare.as_ref()).expect("setup bare");
+        Repr::setup(r_qual.as_ref()).expect("setup qualified");
+        let v = Variable::new();
+        v.set_concretetype(Some(r_bare.lowleveltype().clone()));
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let converted = super::super::pairtype::pair_convert_from_to(
+            r_bare.as_ref(),
+            r_qual.as_ref(),
+            &Hlvalue::Variable(v),
+            &mut llops,
+        )
+        .expect("conversion does not error")
+        .expect("same-struct spellings convert");
+        assert_eq!(llops.ops.len(), 1);
+        assert_eq!(llops.ops[0].opname, "cast_pointer");
+        let Hlvalue::Variable(v_converted) = converted else {
+            panic!("cast_pointer yields a Variable");
+        };
+        assert_eq!(
+            v_converted.concretetype().as_ref(),
+            Some(r_qual.lowleveltype())
+        );
     }
 }

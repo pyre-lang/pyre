@@ -1497,15 +1497,17 @@ pub(in crate::front::mir) fn trait_impl_trait_path_for_fundecl(
         .get("id")?
         .as_u64()?;
     let td = llbc.trait_by_id(trait_id)?;
-    // Only source-local traits participate: std/core trait impls
-    // (`FnOnce` closure shims, `Destruct`/`Drop` glue, `PartialEq`, …)
-    // are host machinery, not translated-program classes, and keep
-    // their inherent classification.
-    if !td.item_meta.is_local {
-        return None;
-    }
     let trait_path = td.item_meta.name_path();
     if trait_path.is_empty() {
+        return None;
+    }
+    // Charon's `is_local` is per extracted crate. `DictStrategy` is local
+    // in `pyre-object.ullbc` and external in `pyre-interpreter.ullbc`, but
+    // `MapDictStrategy` / `ClassDictStrategySlot` still belong to that
+    // trait's PBC family (`CallControl.graphs_from` / `row_of_graphs`).
+    // Std/core traits stay peeled: their crate is not a loaded LLBC root.
+    let trait_crate = trait_path.split("::").next().unwrap_or("");
+    if !td.item_meta.is_local && !crate::local_crates::is_crate_alias_root(trait_crate) {
         return None;
     }
     Some(trait_path)
@@ -3953,6 +3955,12 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
         return None;
+    }
+    // A stored `fn` pointer (`get_eval_fn` → `EvalFn`) is `Ptr(FuncType)`.
+    // `history.getkind` banks it as int; the stub shell must stay `SomePtr`
+    // so a caller `simple_call` of the result is callable.
+    if let Some(spelling) = tyref_fn_ptr_spelling(kind_src, llbc) {
+        return Some(format!("fn:{spelling}"));
     }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
@@ -9183,15 +9191,23 @@ pub fn slice_array_type_id(spelling: &str) -> Option<String> {
 
 /// `local[i]` versus `(*p)[i]`. A deref's type is the pointee, so the
 /// borrow spelling is the parent's (`&[T; N]`, `*const [T; N]`).
+///
+/// `tyref_to_ast_string` strips `&T` / `&mut T` for nominal lookup.
+/// `fixed_array_index_identity` keys the length-prefixed ctor reader
+/// on that prefix (`borrowed_fixed_list_is_gcarray`); without it
+/// `(*mapping)[i]` of `&mut [i64; N]` is spelled `[i64; N]` and shares
+/// the headerless inline-field descr, so a later `mapping[j]` of the
+/// owned ctor value still sees the `-1` init.
 pub(in crate::front::mir) fn index_identity_inputs(place: &Place, llbc: &Llbc) -> (bool, String) {
-    let (value_local, ty) = match &place.kind {
-        PlaceKind::Local(_) => (true, &place.ty),
+    match &place.kind {
+        PlaceKind::Local(_) => (true, tyref_to_ast_string(&place.ty, llbc)),
         PlaceKind::Projection(parent, ProjectionElem::Atom(name)) if name == "Deref" => {
-            (false, &parent.ty)
+            let spelling = tyref_reference_layout_string(&parent.ty, llbc)
+                .unwrap_or_else(|| tyref_to_ast_string(&parent.ty, llbc));
+            (false, spelling)
         }
-        _ => (false, &place.ty),
-    };
-    (value_local, tyref_to_ast_string(ty, llbc))
+        _ => (false, tyref_to_ast_string(&place.ty, llbc)),
+    }
 }
 
 /// Pointee spelling and whether a borrow or pointer prefix was peeled.
@@ -10110,6 +10126,30 @@ pub(in crate::front::mir) fn tyref_positional_aggregate_root(
     node.as_object()
         .is_some_and(|body| body.contains_key("Array"))
         .then(|| format!("Array{suffix}"))
+}
+
+/// ARRAY identity of a `[T; N]` Repeat destination.
+///
+/// `fixed_repeat_identity` recovers ARRAY from a shaped `Array<T;N>`
+/// result. A `Ref(None)` marker depends on `LinkClasses` matching a
+/// later `ArrayRead` / `ArrayWrite` of the same SSA; taking the address
+/// of the local (`&mut mapping`) splits that class and the marker stays
+/// residual. Stamp the dest shape here so the rewrite does not need
+/// that alias.
+pub(in crate::front::mir) fn repeat_array_result_ty(dest_ty: &TyRef, llbc: &Llbc) -> ValueType {
+    if let Some(owner) = tyref_positional_aggregate_root(dest_ty, llbc)
+        && majit_ir::descr::is_shaped_array_name(&owner)
+    {
+        return ValueType::Ref(Some(owner));
+    }
+    let spelling = tyref_to_ast_string(dest_ty, llbc);
+    if let Some((item, n)) = shaped_array_parts(&spelling) {
+        let owner = format!("Array<{item};{n}>");
+        if majit_ir::descr::is_shaped_array_name(&owner) {
+            return ValueType::Ref(Some(owner));
+        }
+    }
+    ValueType::Ref(None)
 }
 
 /// The `TypeDeclRef` (`{"id", "generics", …}`) of a TyRef's ADT, after

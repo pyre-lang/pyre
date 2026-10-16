@@ -129,6 +129,19 @@ pub fn annotation_to_lltype(
         }
     }
 
+    // `get_eval_fn` residual is `Ptr(FuncType)` (`SomePtr.call`). The
+    // stored evaluator is `fn(&mut PyFrame, Option<&mut FrameResumeArgs>)
+    // -> PyResult`; those arguments annotate as `SomeInstance` (the
+    // virtualizable frame, a classdef-less null for `None`). Upstream
+    // `frame.run` is a method, so `annotation_to_lltype` never sees an
+    // instance at a fn-ptr call. The instance's rtyper type is the
+    // object pointer `fn_ptr_arg_lltype` already put in `FuncType.ARGS`.
+    if info == Some("argument to ll function pointer call")
+        && matches!(s_val, SomeValue::Instance(_))
+    {
+        return Ok(crate::translator::rtyper::rclass::OBJECTPTR.clone());
+    }
+
     let prefix = info.map(|s| format!("{s}: ")).unwrap_or_default();
     Err(AnnotatorError::new(format!(
         "{prefix}should return a low-level type,\ngot instead {s_val:?}"
@@ -1036,6 +1049,20 @@ mod tests {
             annotation_to_lltype(&s_interior, None).unwrap(),
             lltype::LowLevelType::Ptr(_)
         ));
+    }
+
+    #[test]
+    fn annotation_to_lltype_fn_ptr_arg_accepts_instance() {
+        use crate::annotator::model::SomeInstance;
+        let inst = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        assert!(
+            annotation_to_lltype(&inst, None).is_err(),
+            "a high-level instance is not an lltype outside a fn-ptr call"
+        );
+        assert_eq!(
+            annotation_to_lltype(&inst, Some("argument to ll function pointer call")).unwrap(),
+            crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+        );
     }
 
     #[test]

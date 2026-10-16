@@ -1289,31 +1289,39 @@ impl ExecutionContext {
     }
 
     /// executioncontext.py — `c_call_trace(self, frame, w_func, args=None)`.
+    ///
+    /// `args.firstarg()` is read at the call site and passed as `w_firstarg`
+    /// (`PY_NULL` when `args` is None or empty). `Option<&Arguments>` has no
+    /// ClassDef, so a getattr of `firstarg` cannot annotate.
+    /// Residual: `_trace` is not in the CallRegistry as a method path.
+    #[majit_macros::dont_look_inside]
     pub fn c_call_trace(
         &mut self,
         frame: *mut PyFrame,
         w_func: PyObjectRef,
-        args: Option<&crate::argument::Arguments>,
+        w_firstarg: PyObjectRef,
     ) -> Result<(), crate::PyError> {
-        self._c_call_return_trace(frame, w_func, args, "c_call")
+        self._c_call_return_trace(frame, w_func, w_firstarg, "c_call")
     }
 
     /// executioncontext.py — `c_return_trace(self, frame, w_func, args=None)`.
+    #[majit_macros::dont_look_inside]
     pub fn c_return_trace(
         &mut self,
         frame: *mut PyFrame,
         w_func: PyObjectRef,
-        args: Option<&crate::argument::Arguments>,
+        w_firstarg: PyObjectRef,
     ) -> Result<(), crate::PyError> {
-        self._c_call_return_trace(frame, w_func, args, "c_return")
+        self._c_call_return_trace(frame, w_func, w_firstarg, "c_return")
     }
 
     /// executioncontext.py — `_c_call_return_trace`.
+    #[majit_macros::dont_look_inside]
     pub fn _c_call_return_trace(
         &mut self,
         frame: *mut PyFrame,
         mut w_func: PyObjectRef,
-        args: Option<&crate::argument::Arguments>,
+        w_firstarg: PyObjectRef,
         event: &str,
     ) -> Result<(), crate::PyError> {
         if self.profilefunc.is_none() {
@@ -1337,14 +1345,15 @@ impl ExecutionContext {
         // differently" (no descriptor rebinding).  Pyre's
         // `is_function_with_fixed_code` (FUNCTION_TYPE && !can_change_code)
         // is the line-by-line port of the isinstance check.
-        if let Some(args) = args {
+        // executioncontext.py:128-134 — `args.firstarg()` already resolved
+        // by the caller (`PY_NULL` means `args is None` or empty).
+        if !w_firstarg.is_null() {
             unsafe {
-                if crate::is_function_with_fixed_code(w_func)
-                    && let Some(w_firstarg) = args.firstarg()
-                    && !w_firstarg.is_null()
-                {
-                    let w_type = crate::typedef::r#type(w_firstarg)
-                        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+                if crate::is_function_with_fixed_code(w_func) {
+                    let w_type = match crate::typedef::r#type(w_firstarg) {
+                        Some(p) => p.as_ptr(),
+                        None => pyre_object::PY_NULL,
+                    };
                     w_func = crate::descr_function_get(w_func, w_firstarg, w_type);
                 }
             }
@@ -1352,6 +1361,7 @@ impl ExecutionContext {
         self._trace(frame, event, w_func, None)
     }
 
+    #[majit_macros::dont_look_inside]
     pub fn c_exception_trace(
         &mut self,
         frame: *mut PyFrame,
@@ -1886,6 +1896,7 @@ impl ExecutionContext {
     /// The normalization below memoizes the application exception on that same
     /// value; the class and traceback are then read from the normalized
     /// `W_BaseException`, where pyre stores their authoritative state.
+    #[majit_macros::dont_look_inside]
     pub fn _trace(
         &mut self,
         frame: *mut PyFrame,
@@ -1951,8 +1962,10 @@ impl ExecutionContext {
                     operr.reload(&_callback_roots, slot);
                 }
                 let w_value = operr.normalize_exception(space)?;
-                let w_type = crate::typedef::r#type(w_value)
-                    .map_or_else(pyre_object::w_none, |p| p.as_ptr());
+                let w_type = match crate::typedef::r#type(w_value) {
+                    Some(p) => p.as_ptr(),
+                    None => pyre_object::w_none(),
+                };
                 // `operr.get_w_traceback(space)` — the slot read, its escape
                 // mark, and the `w_None` for an empty chain.  The normalization
                 // above put the same instance on the carrier, so the carrier
@@ -1992,7 +2005,7 @@ impl ExecutionContext {
 
             // executioncontext.py:376 self.is_tracing += 1
             self.is_tracing += 1;
-            let mut call_result = (|| {
+            let mut call_result = {
                 unsafe {
                     let d = (*frame).getorcreatedebug(init_lineno);
                     if event == "line" {
@@ -2018,29 +2031,32 @@ impl ExecutionContext {
                 let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
                     arg_live_slot,
                 ));
-                let call_result = crate::call::call_function_impl_result(
+                match crate::call::call_function_impl_result(
                     pyre_object::gc_roots::shadow_stack_get(callback_slot),
                     &[
                         pyre_object::gc_roots::shadow_stack_get(frame_slot),
                         pyre_object::gc_roots::shadow_stack_get(event_slot),
                         pyre_object::gc_roots::shadow_stack_get(arg_slot),
                     ],
-                );
-                // The callback received the live frame, so its
-                // `frame.f_trace = local` / `frame.f_lineno = N` setattrs
-                // already landed on the frame's getsets — no writeback pass.
-                let w_result = call_result?;
-                let result_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_result);
-                let frame = frame_anchor.live();
-                let w_result = pyre_object::gc_roots::shadow_stack_get(result_slot);
-                if w_result != pyre_object::w_none() {
-                    unsafe {
-                        (*frame).getorcreatedebug(init_lineno).w_f_trace = w_result;
+                ) {
+                    Err(err) => Err(err),
+                    Ok(w_result) => {
+                        // The callback received the live frame, so its
+                        // `frame.f_trace = local` / `frame.f_lineno = N` setattrs
+                        // already landed on the frame's getsets — no writeback pass.
+                        let result_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(w_result);
+                        let frame = frame_anchor.live();
+                        let w_result = pyre_object::gc_roots::shadow_stack_get(result_slot);
+                        if w_result != pyre_object::w_none() {
+                            unsafe {
+                                (*frame).getorcreatedebug(init_lineno).w_f_trace = w_result;
+                            }
+                        }
+                        Ok(())
                     }
                 }
-                Ok::<(), crate::PyError>(())
-            })();
+            };
 
             if call_result.is_err() {
                 self.settrace(pyre_object::w_none());

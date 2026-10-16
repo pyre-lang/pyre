@@ -1,7 +1,7 @@
 use super::{
     adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
     json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
-    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    repeat_array_result_ty, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
     tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
     tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
@@ -2956,6 +2956,16 @@ fn fixed_array_suffix_separates_item_type_and_length() {
     assert_eq!(tyref_array_suffix(&array(i64_ty, "2"), &llbc), "<i64;2>");
     assert_eq!(tyref_array_suffix(&array(bool_ty, "1"), &llbc), "<bool;1>");
     assert_eq!(shaped_array_parts("Array<[i64;2];3>"), Some(("[i64;2]", 3)));
+    let i64_n = array(
+        serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+        "64",
+    );
+    assert_eq!(
+        repeat_array_result_ty(&i64_n, &llbc),
+        ValueType::Ref(Some("Array<i64;64>".to_string()))
+    );
+    let scalar = TyRef::Other(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}));
+    assert_eq!(repeat_array_result_ty(&scalar, &llbc), ValueType::Ref(None));
 }
 
 #[test]

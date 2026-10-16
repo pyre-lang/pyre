@@ -599,6 +599,13 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // — note the mixed bare/dotted spellings the census demands.
     analyzer_for(&mut reg, "Vec.new", foreign_container_ctor);
     analyzer_for(&mut reg, "vec.Vec.with_capacity", foreign_container_ctor);
+    analyzer_for(&mut reg, "vec.Vec.deref", foreign_container_ctor);
+    analyzer_for(&mut reg, "Vec.deref", foreign_container_ctor);
+    analyzer_for(
+        &mut reg,
+        "alloc.slice.<Impl>.to_vec",
+        foreign_container_ctor,
+    );
     analyzer_for(&mut reg, "indexmap.IndexMap.new", foreign_container_ctor);
     analyzer_for(&mut reg, "Box.new", foreign_container_ctor);
     // `Box::new_uninit` is the no-arg heap-box twin of `lltype.malloc`.
@@ -663,6 +670,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         &mut reg,
         "objectmodel.keepalive_until_here",
         robjmodel_keepalive_until_here,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_gc.add_memory_pressure",
+        gc_add_memory_pressure,
     );
     analyzer_for(
         &mut reg,
@@ -3281,6 +3293,15 @@ pub fn robjmodel_hlinvoke(
         .getrepr(&s_ret)
         .map_err(|e| AnnotatorError::new(e.to_string()))?;
     Ok(lltype_to_annotation(rresult.lowleveltype().clone()))
+}
+
+/// `rgc.add_memory_pressure` / `gc_add_memory_pressure`. Void.
+fn gc_add_memory_pressure(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(s_none())
 }
 
 /// Upstream `robjmodel_keepalive_until_here(*args_s)` (builtin.py).

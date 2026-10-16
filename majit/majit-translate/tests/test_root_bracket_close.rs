@@ -44,7 +44,7 @@ use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer}
 use majit_translate::front::mir::{
     LowerContext, erased_root_bracket_guards, lower_fun_decl, lower_fun_decl_with_static_addrs,
 };
-use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
+use majit_translate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
 fn fun_decl_named<'a>(llbc: &'a Llbc, leaf: &str) -> &'a majit_charon_reader::FunDecl {
     let suffix = format!("::{leaf}");
@@ -122,7 +122,12 @@ fn bracket_closes_for_each_caller_shape() {
             interpreter_llbc,
             "call_function_impl_result",
         ),
-        ("cffi", module_llbc, "do_call"),
+        // `do_call` now erases both arms (`n==1` incoming-elem pin and
+        // `n>1` `SliceIndex` of `pin_roots(args_w)`). `call_varargs` still
+        // opens a surviving bracket: `complete_argtypes` is param_slots so
+        // scalar replacement refuses, and RootBracketPlan needs a const
+        // slot for `get(args_base + i)`.
+        ("cffi", module_llbc, "call_varargs"),
     ];
     for (name, load, leaf) in cases {
         let Some(llbc) = load() else {
@@ -1036,10 +1041,10 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
     );
 }
 
-/// `do_call` `n == 1` pins `args_w[0]` with `base()` + `pin_root` + `get(base)`.
-/// The pin temporary is `StorageDead` before the get, so erasure has to
-/// rewrite the get as `getarrayitem` of the incoming list. `n > 1` still
-/// loops `get(args_slot + i)` with a non-const index, so that bracket stays.
+/// `do_call` pins the incoming `args_w`: `n > 1` is `pin_roots` plus
+/// `get(args_slot + i)` (`SliceIndex`), `n == 1` is `pin_root` of
+/// `args_w[0]`. Both arms alias that slice, so scalar replacement takes
+/// the whole body out of the jitcode.
 #[test]
 fn do_call_erases_the_n1_incoming_elem_bracket() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()
@@ -1063,8 +1068,13 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
     let graph = lower_fun(&module, &context, "do_call");
     assert_eq!(
         calls_to(&graph, "push_roots"),
-        1,
-        "n==1 push_roots must be erased; n>1 loop-index get stays"
+        0,
+        "n==1 pin_root and n>1 pin_roots(args_w) both erase"
+    );
+    assert_eq!(
+        calls_to(&graph, "pin_roots"),
+        0,
+        "n>1 pin_roots(args_w) must be erased as SliceBase"
     );
     assert_eq!(
         calls_to(&graph, "pin_root"),
@@ -1084,7 +1094,7 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
         .count();
     assert!(
         array_reads > 0,
-        "n==1 get(base) must rewrite to getarrayitem of args_w"
+        "n==1 get(base) / n>1 get(args_slot + i) must rewrite to getarrayitem of args_w"
     );
 }
 
@@ -1117,5 +1127,152 @@ fn isinstance_bracket_is_scalar_replaced() {
             0,
             "isinstance still calls {leaf} after the bracket was scalar-replaced"
         );
+    }
+}
+
+/// CALL_KW binder bodies must lose their interpreter root brackets so the
+/// walker traces ordinary locals.
+#[test]
+fn call_kw_binder_bodies_erase_root_brackets() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let context = LowerContext::new(&interpreter);
+    for leaf in ["match_signature", "arguments_from_call_kw"] {
+        let erase = majit_translate::front::mir::shadow_stack_erase_named(
+            &interpreter,
+            &format!("::{leaf}"),
+        );
+        assert_eq!(erase, "erased", "{leaf} erase={erase}");
+        let graph = lower_fun(&interpreter, &context, leaf);
+        if leaf == "match_signature" {
+            let repeat_tys: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        result_ty,
+                        ..
+                    } if segments.as_slice() == ["__array_repeat"] => Some(result_ty.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(!repeat_tys.is_empty(), "cap arm is [0i64; N] Repeat");
+            for ty in &repeat_tys {
+                assert!(
+                    matches!(ty, ValueType::Ref(Some(owner)) if owner.starts_with("Array<i64;")),
+                    "Repeat dest_ty stamps Array<i64;N>, got {ty:?}"
+                );
+            }
+            let mut cc = CallControl::new();
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+            let out = transformer.transform(&graph);
+            let leftover = out
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice() == ["__array_repeat"] => true,
+                    OpKind::ConstFnAddr { path, .. } if path == "__array_repeat" => true,
+                    _ => false,
+                });
+            assert!(
+                !leftover,
+                "jtransform rewrites zero Repeat to NewArrayClear"
+            );
+            assert!(
+                out.graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::NewArrayClear {
+                                array_type_id: Some(id),
+                                ..
+                            } if id == "[i64]"
+                        )
+                    }),
+                "cap arm [0i64; N] is NewArrayClear of [i64]"
+            );
+        }
+        assert_eq!(calls_to(&graph, "push_roots"), 0, "{leaf} push_roots");
+        assert_eq!(calls_to(&graph, "pin_roots"), 0, "{leaf} pin_roots");
+        assert_eq!(calls_to(&graph, "pin_root"), 0, "{leaf} pin_root");
+        assert_eq!(
+            calls_to(&graph, "pin_root_gcarray"),
+            0,
+            "{leaf} pin_root_gcarray"
+        );
+        assert_eq!(calls_to(&graph, "shadow_stack_len"), 0, "{leaf} len");
+        assert_eq!(calls_to(&graph, "shadow_stack_get"), 0, "{leaf} get");
+        assert_eq!(calls_to(&graph, "shadow_stack_set"), 0, "{leaf} set");
+        assert_eq!(
+            calls_to(&graph, "shadow_stack_copy_range"),
+            0,
+            "{leaf} copy_range"
+        );
+        assert_eq!(calls_to(&graph, "root_scope_close"), 0, "{leaf} close");
+    }
+}
+
+/// `match_keywords` stores into the cap mapping must use the same
+/// length-prefixed `[i64]` identity as `match_signature`'s Repeat /
+/// fill. A headerless `[i64; N]` write is a different descr, so the
+/// walker's heapcache keeps the `-1` init and the compiled CALL_KW
+/// loop fills the default instead of the keyword.
+#[test]
+fn match_keywords_mapping_stores_share_signature_array_identity() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let context = LowerContext::new(&interpreter);
+    let graph = lower_fun(&interpreter, &context, "_orig_match_keywords");
+    let writes: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayWrite {
+                array_type_id,
+                nolength,
+                item_ty: ValueType::Int,
+                ..
+            } => Some((
+                array_type_id.clone().unwrap_or_else(|| "<none>".into()),
+                *nolength,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !writes.is_empty(),
+        "_orig_match_keywords stores into the cap mapping"
+    );
+    for (id, nolength) in &writes {
+        assert_eq!(id, "[i64]", "mapping store identity {id}");
+        assert!(!nolength, "mapping store {id} is length-prefixed");
     }
 }
