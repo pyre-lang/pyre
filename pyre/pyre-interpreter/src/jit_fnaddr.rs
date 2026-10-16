@@ -250,6 +250,14 @@ extern "C" fn bh_w_type_is_cpython_immutabletype(w_type: pyre_object::PyObjectRe
     unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) as i64 }
 }
 
+/// `try_gc_owns_object` returns `bool`. Same widening as
+/// [`bh_w_type_issubtype`]: `descr.py CallDescr.create_call_stub` calls
+/// with the actual RESULT type then casts to Signed, and a raw `-> bool`
+/// target defines only `al` on SysV x86_64.
+extern "C" fn bh_try_gc_owns_object(addr: pyre_object::gc_hook::GCREF) -> i64 {
+    pyre_object::gc_hook::try_gc_owns_object(addr) as i64
+}
+
 /// `LoadAttr::name_idx` returns `u32`. Residual calls read an `i64` result.
 extern "C" fn bh_load_attr_name_idx(oparg: i64) -> i64 {
     i64::from(
@@ -4231,11 +4239,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::try_gc_write_barrier",
         pyre_object::gc_hook::try_gc_write_barrier,
     );
+    // `dont_look_inside` residual of the GC-ownership predicate
+    // (`dealloc_items_block`). Bind the word-ABI bridge, never the raw
+    // `-> bool` function: `goto_if_not` requires a 0/1 word and SysV x86_64
+    // leaves the bits above `al` undefined.
     cpa1(
         &mut entries,
         "pyre_object::gc_hook::try_gc_owns_object",
         "pyre_object::try_gc_owns_object",
-        pyre_object::gc_hook::try_gc_owns_object,
+        bh_try_gc_owns_object,
     );
     cpa1(
         &mut entries,
@@ -6746,6 +6758,33 @@ mod tests {
                     .map(|(_, addr)| *addr),
                 Some(target as *const () as usize as i64),
                 "{path} must widen the bool before the residual reads a word",
+            );
+        }
+    }
+
+    #[test]
+    fn gc_owns_object_residual_registers_the_word_abi() {
+        let target: extern "C" fn(pyre_object::gc_hook::GCREF) -> i64 =
+            super::bh_try_gc_owns_object;
+        let raw = pyre_object::gc_hook::try_gc_owns_object as *const () as usize as i64;
+        let entries = jit_trace_fnaddrs();
+        for path in [
+            "pyre_object::gc_hook::try_gc_owns_object",
+            "pyre_object::try_gc_owns_object",
+        ] {
+            let bound = entries
+                .iter()
+                .find(|(name, _)| *name == path)
+                .map(|(_, addr)| *addr);
+            assert_eq!(
+                bound,
+                Some(target as *const () as usize as i64),
+                "{path} must widen the bool before the residual reads a word",
+            );
+            assert_ne!(
+                bound,
+                Some(raw),
+                "{path} must not publish the raw -> bool target"
             );
         }
     }
