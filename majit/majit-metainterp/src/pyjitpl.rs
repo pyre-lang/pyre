@@ -12178,11 +12178,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// `warmstate.py bound_reached` finally `cell.flags &= ~JC_TRACING`
     /// on `jitdriver_sd.warmstate`'s cell.
-    pub(crate) fn abort_tracing_on_compiling_driver(
-        &mut self,
-        green_key: u64,
-        disable_noninlinable: bool,
-    ) {
+    fn abort_tracing_on_compiling_driver(&mut self, green_key: u64, disable_noninlinable: bool) {
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
         self.warm_state_for_driver(jd_no)
             .abort_tracing(green_key, disable_noninlinable);

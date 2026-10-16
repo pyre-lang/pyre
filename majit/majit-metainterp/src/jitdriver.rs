@@ -3927,23 +3927,15 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         let outcome = self.meta.compile_loop(jump_args, meta);
-        // pyjitpl.py `reached_loop_header`: `compile_loop` returning None
-        // either keeps tracing (history still owned) or raises
-        // `SwitchToBlackhole(ABORT_BAD_LOOP)`. After `tracing.take()` the
-        // history is spent, so a leftover `Cancelled` is that raise.
-        let outcome = match outcome {
-            crate::CompileOutcome::Cancelled if !self.meta.is_tracing() => {
-                if let Some(gk) = loop_green_key {
-                    if self.cell_is_tracing(gk) {
-                        self.meta.abort_tracing_on_compiling_driver(gk, false);
-                    }
-                }
-                crate::CompileOutcome::SwitchToBlackhole {
-                    reason: crate::pyjitpl::counters::ABORT_BAD_LOOP,
-                }
+        // warmstate.py `bound_reached` `finally: cell.flags &= ~JC_TRACING`.
+        // After `tracing.take()` leftover Cancelled still has JC_TRACING;
+        // finish_tracing clears it. Keep Cancelled (no abort_count).
+        if matches!(outcome, crate::CompileOutcome::Cancelled) && !self.meta.is_tracing() {
+            if let Some(gk) = loop_green_key {
+                let jd_no = self.meta.active_jitdriver_sd.unwrap_or(0);
+                self.meta.warm_state_for_driver(jd_no).finish_tracing(gk);
             }
-            other => other,
-        };
+        }
         if crate::closedbg_enabled() {
             eprintln!(
                 "@@@CLOSE LOOP-COMPILE outcome={:?}",
@@ -4826,10 +4818,10 @@ impl<S: JitState> JitDriver<S> {
                                 // compile_loop already drained tracing+session.
                             }
                             crate::CompileOutcome::Cancelled => {
-                                // pyjitpl.py `reached_loop_header`: early
-                                // cancel keeps `self.history` and tracing
-                                // continues. Post-take cancel is remapped to
-                                // SwitchToBlackhole in `compile_and_record_loop`.
+                                // warmstate.py `bound_reached` `finally: cell.flags &= ~JC_TRACING`.
+                                // Early cancel keeps tracing. Post-take cancel
+                                // is finished in `compile_and_record_loop` and
+                                // stays Cancelled.
                             }
                             crate::CompileOutcome::Aborted => {
                                 self.meta.abort_trace(false);
@@ -5057,10 +5049,10 @@ impl<S: JitState> JitDriver<S> {
                                 );
                             }
                             crate::CompileOutcome::Cancelled => {
-                                // pyjitpl.py `reached_loop_header`: early
-                                // cancel keeps tracing. Post-take cancel is
-                                // remapped to SwitchToBlackhole in
-                                // `compile_and_record_loop`.
+                                // warmstate.py `bound_reached` `finally: cell.flags &= ~JC_TRACING`.
+                                // Early cancel keeps tracing. Post-take cancel
+                                // is finished in `compile_and_record_loop` and
+                                // stays Cancelled.
                             }
                             crate::CompileOutcome::Aborted => {
                                 self.meta.abort_trace(false);
@@ -13706,10 +13698,10 @@ mod tests {
     }
 
     /// A root-loop HEADER-CLOSE that cancels after `tracing.take()` must
-    /// leave the cell without `JC_TRACING`. `pyjitpl.py reached_loop_header`
-    /// either keeps the same history or raises `SwitchToBlackhole(ABORT_BAD_LOOP)`;
-    /// discarding the tracer while leaving the cell tracing swallows every
-    /// later back-edge in `JitDriver::try_empty_chain_tick`.
+    /// leave the cell without `JC_TRACING`. `warmstate.py` `bound_reached`
+    /// `finally: cell.flags &= ~JC_TRACING`; discarding the tracer while
+    /// leaving the cell tracing swallows every later back-edge in
+    /// `JitDriver::try_empty_chain_tick`.
     #[test]
     fn close_loop_cancel_after_take_clears_tracing() {
         let mut driver = JitDriver::<AcceptCloseState>::new(1);
@@ -13728,6 +13720,13 @@ mod tests {
             driver.cell_is_tracing(key),
             "force_start_tracing marks JC_TRACING"
         );
+        let abort_count_before = driver
+            .meta
+            .warm_state_for_driver(0)
+            .cell_by_key(key)
+            .expect("force_start_tracing installs a cell")
+            .abort_count
+            .get();
         {
             let ctx = driver.meta.trace_ctx().expect("tracing");
             let i0 = OpRef::input_arg_int(0);
@@ -13753,8 +13752,24 @@ mod tests {
         );
         assert!(
             !driver.cell_is_tracing(key),
-            "WarmEnterState.abort_tracing must clear JC_TRACING"
+            "WarmEnterState.finish_tracing must clear JC_TRACING"
         );
+        {
+            let cell = driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key(key)
+                .expect("the cancelled cell remains");
+            assert_eq!(
+                cell.abort_count.get(),
+                abort_count_before,
+                "bound_reached finally does not bump abort_count"
+            );
+            assert!(
+                !driver.meta.warm_state_for_driver(0).is_dont_trace_here(key),
+                "bound_reached finally does not set JC_DONT_TRACE_HERE"
+            );
+        }
         assert!(!driver.meta.take_keep_tracing_after_close());
         driver.force_start_tracing(key, 0, &mut state, &());
         assert!(
