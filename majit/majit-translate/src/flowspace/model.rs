@@ -2103,7 +2103,8 @@ impl HostEnv {
         // Z2.5 Path C tail — Rust std lib module-qualified entry points
         // referenced by pyre-object / pyre-interpreter callsites
         // (`std::ptr::null_mut`, `std::ptr::copy_nonoverlapping`,
-        // `std::mem::align_of`, `std::alloc::dealloc`).  Branch 3b of
+        // `std::mem::align_of`, `std::alloc::alloc` / `alloc_zeroed` /
+        // `dealloc`).  Branch 3b of
         // `flowspace_adapter::translate_op` resolves
         // `["std", "ptr", "null_mut"]` by joining `segments[..-1]` with
         // `.` (→ `"std.ptr"`) and calling
@@ -2111,7 +2112,7 @@ impl HostEnv {
         // so the module key matches the join shape.  Analyzers that
         // exist for these callables are registered in
         // `annotator/builtin.rs` (`std_ptr_eq`, `ptr_null_constant`,
-        // `std_ptr_copy_nonoverlapping`).
+        // `std_ptr_copy_nonoverlapping`, `std_alloc_raw`).
         let std_ptr = HostObject::new_module("std.ptr");
         std_ptr.module_set(
             "null_mut",
@@ -2135,6 +2136,27 @@ impl HostEnv {
         std_alloc.module_set(
             "dealloc",
             HostObject::new_builtin_callable("std.alloc.dealloc"),
+        );
+        // `std::alloc::alloc` / `alloc_zeroed` re-export `alloc::alloc::*`.
+        // Bind both modules to the same callable so `std_alloc_raw` and
+        // the `BUILTIN_TYPER` row see one `HostObject`.
+        std_alloc.module_set("alloc", HostObject::new_builtin_callable("std.alloc.alloc"));
+        std_alloc.module_set(
+            "alloc_zeroed",
+            HostObject::new_builtin_callable("std.alloc.alloc_zeroed"),
+        );
+        let alloc_alloc = HostObject::new_module("alloc.alloc");
+        alloc_alloc.module_set(
+            "alloc",
+            std_alloc
+                .module_get("alloc")
+                .expect("std.alloc.alloc bound above"),
+        );
+        alloc_alloc.module_set(
+            "alloc_zeroed",
+            std_alloc
+                .module_get("alloc_zeroed")
+                .expect("std.alloc.alloc_zeroed bound above"),
         );
         // `std::slice::from_raw_parts(p, len)` and `_mut` — raw-pointer
         // -> slice constructors called from pyre-object string / bytes
@@ -2616,6 +2638,7 @@ impl HostEnv {
         mods.insert("std.ptr".into(), std_ptr);
         mods.insert("std.mem".into(), std_mem);
         mods.insert("std.alloc".into(), std_alloc);
+        mods.insert("alloc.alloc".into(), alloc_alloc);
         mods.insert("std.slice".into(), std_slice);
         mods.insert("BigInt".into(), bigint);
         mods.insert("longlong2float".into(), longlong2float);

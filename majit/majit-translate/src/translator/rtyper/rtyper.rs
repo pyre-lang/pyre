@@ -2319,17 +2319,23 @@ impl RPythonTyper {
                     GenopResult::LLType(LowLevelType::Bool),
                 ))
             }
-            // `_LLOpEntry.specialize_call` re-emits the same-named llop.
-            // `raw_load(addr, offset)` with `result.concretetype = T` is
-            // what `rewrite_op_raw_load` reads (`T = op.result.concretetype`);
-            // `raw_store(addr, offset, value)` takes T from the value.
-            // Addr/offset are the raw int address and byte offset; the
-            // value keeps its own repr (int or float).  Cannot raise.
+            // `_LLOpEntry.specialize_call` (`lloperation.py`) re-emits the
+            // same-named llop with `hop.inputarg(hop.args_r[i], i)` for each
+            // operand. `rewrite_op_raw_load` reads
+            // `T = op.result.concretetype`; `raw_store` takes T from the
+            // value. A raw `Ptr` (`CCHARP` / `CArrayPtr`) `getkind`s as
+            // `'int'` (`history.py` `TYPE.TO._gckind == 'raw'`), so the
+            // address may be `PtrRepr` rather than `Signed` —
+            // `mapdict.rs` `_get_mapdict_map` `raw_load`s `slots().0`
+            // after `rffi.cast` to `CCHARP`. `raddress.py`
+            // `TypedAddressAccessRepr.rtype_getitem` keeps `hop.args_r[0]`
+            // the same way. An Instance/Void address is not a pointer;
+            // those operands still convert to `Signed` (the llop
+            // int-address contract) so a classdef-less Instance is not
+            // relabelled as a pointer.
             "raw_load" => {
-                let vlist = hop.inputargs(vec![
-                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
-                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
-                ])?;
+                let v_addr = hop.inputarg_llop_intkind_or_signed(0)?;
+                let v_offs = hop.inputarg_llop_intkind_or_signed(1)?;
                 hop.exception_cannot_occur()?;
                 let result_lltype = hop
                     .r_result
@@ -2340,9 +2346,15 @@ impl RPythonTyper {
                     })?
                     .lowleveltype()
                     .clone();
-                Ok(hop.genop("raw_load", vlist, GenopResult::LLType(result_lltype)))
+                Ok(hop.genop(
+                    "raw_load",
+                    vec![v_addr, v_offs],
+                    GenopResult::LLType(result_lltype),
+                ))
             }
             "raw_store" => {
+                let v_addr = hop.inputarg_llop_intkind_or_signed(0)?;
+                let v_offs = hop.inputarg_llop_intkind_or_signed(1)?;
                 let r_value = hop
                     .args_r
                     .borrow()
@@ -2350,14 +2362,27 @@ impl RPythonTyper {
                     .cloned()
                     .flatten()
                     .ok_or_else(|| TyperError::message("raw_store: missing value repr"))?;
-                let v_addr = hop.inputarg(&LowLevelType::Signed, 0)?;
-                let v_offs = hop.inputarg(&LowLevelType::Signed, 1)?;
                 let v_value = hop.inputarg(&r_value, 2)?;
                 hop.exception_cannot_occur()?;
+                // `_LLOpEntry.specialize_call` passes
+                // `resulttype=hop.r_result.lowleveltype`. For Void that
+                // is still a typed result (`lltype_to_annotation(Void)`
+                // is `s_None`), so `genop` returns a Variable — not
+                // `resulttype=None`, which would hit
+                // `translate_no_return_value` and reject `s_None`.
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message("raw_store: r_result not populated before genop")
+                    })?
+                    .lowleveltype()
+                    .clone();
                 Ok(hop.genop(
                     "raw_store",
                     vec![v_addr, v_offs, v_value],
-                    GenopResult::Void,
+                    GenopResult::LLType(result_lltype),
                 ))
             }
             // rtyper.py — `translate_op_newtuple` calls the
@@ -2761,6 +2786,45 @@ impl HighLevelOp {
             vars.push(self.inputarg(converted_to, i)?);
         }
         Ok(vars)
+    }
+
+    /// `_LLOpEntry.specialize_call` (`lloperation.py`): each operand
+    /// keeps `hop.args_r[i]`.
+    pub fn inputargs_source_reprs(&self) -> Result<Vec<Hlvalue>, TyperError> {
+        let n = self.nb_args();
+        let mut vars = Vec::with_capacity(n);
+        for i in 0..n {
+            let r = self
+                .args_r
+                .borrow()
+                .get(i)
+                .cloned()
+                .flatten()
+                .ok_or_else(|| TyperError::message(format!("llop: missing args_r[{i}]")))?;
+            vars.push(self.inputarg(&r, i)?);
+        }
+        Ok(vars)
+    }
+
+    /// Address/offset of `llop.raw_load` / `raw_store`: keep a source
+    /// repr whose `getkind` is `'int'` (`history.py` — Signed, Address,
+    /// or a raw `Ptr`), matching `_LLOpEntry.specialize_call`. Any other
+    /// kind still converts to `Signed`, the previous llop contract.
+    pub fn inputarg_llop_intkind_or_signed(&self, arg: usize) -> Result<Hlvalue, TyperError> {
+        let r = self
+            .args_r
+            .borrow()
+            .get(arg)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| TyperError::message(format!("llop: missing args_r[{arg}]")))?;
+        let keep = crate::model::try_getkind(r.lowleveltype(), true, true, true)
+            == Ok(crate::model::ConcreteType::Signed);
+        if keep {
+            self.inputarg(&r, arg)
+        } else {
+            self.inputarg(&LowLevelType::Signed, arg)
+        }
     }
 
     /// RPython `HighLevelOp.genop(self, opname, args_v, resulttype=None)`

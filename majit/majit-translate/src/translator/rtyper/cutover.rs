@@ -2284,11 +2284,42 @@ fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
     if is_varsize_gc_header_alloc(canonical_strip) {
         return Some(SKIP_VARSIZE_GC_HEADER_ALLOC);
     }
+    // `std::alloc::alloc` / `alloc_zeroed` (and `alloc::alloc` re-export)
+    // are opaque foreign decls. A residual `ref` stub shells `*mut u8`
+    // as classdef-less `SomeInstance`; `ann_malloc` annotates the
+    // result as `SomePtr`. Declining the registry entry lets the
+    // callsite reach the HOST_ENV builtin (`std_alloc_raw`). The
+    // `alloc_zeroed` leaf is the alias `free_function_alias_paths`
+    // registers from `SemanticFunction.name`. The `alloc` leaf is
+    // left registered: too many other functions share that name.
+    if is_std_alloc_raw(canonical_strip) {
+        return Some(SKIP_STD_ALLOC_RAW);
+    }
+
     None
 }
 
 /// [`registration_decline`] reason for `ptr::copy_nonoverlapping`.
 const SKIP_PTR_COPY_NONOVERLAPPING: &str = "skip-ptr-copy-nonoverlapping";
+
+/// [`registration_decline`] reason for `std::alloc::alloc` / `alloc_zeroed`.
+const SKIP_STD_ALLOC_RAW: &str = "skip-std-alloc-raw";
+
+/// `std::alloc::alloc` / `alloc_zeroed` and the `alloc::alloc` re-export.
+/// The `alloc_zeroed` leaf is unique; the `alloc` leaf is not.
+fn is_std_alloc_raw(canonical_strip: &[String]) -> bool {
+    match canonical_strip {
+        [crate_or_std, module, leaf]
+            if (crate_or_std == "std" || crate_or_std == "alloc")
+                && module == "alloc"
+                && (leaf == "alloc" || leaf == "alloc_zeroed") =>
+        {
+            true
+        }
+        [leaf] if leaf == "alloc_zeroed" => true,
+        _ => false,
+    }
+}
 
 /// [`registration_decline`] reason for `rlib/jit.py ConditionalCallEntry`.
 const SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY: &str = "skip-jit-conditional-call-extregistry";
@@ -3354,21 +3385,19 @@ pub(crate) fn register_unsafe_fn_stubs(
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     for (segments, signature, return_token) in specs {
         // `collect_unsafe_fn_stubs_from_llbc` feeds opaque foreign decls
-        // (`core::ptr::copy_nonoverlapping`) here, before they ever become
-        // a `SemanticFunction`. Declining that path lets Layer-1
-        // `call_registry.lookup` miss, so the callsite reaches
-        // `host_env_callable`. The same carrier also holds the residual
-        // `allocate` / `allocate_stable` stubs from
+        // (`core::ptr::copy_nonoverlapping`, `std::alloc::alloc_zeroed`)
+        // here, before they ever become a `SemanticFunction`. Declining
+        // that path lets Layer-1 `call_registry.lookup` miss, so the
+        // callsite reaches `host_env_callable`. The same carrier also
+        // holds the residual `allocate` / `allocate_stable` stubs from
         // `collect_marked_class_ctor_stubs_from_llbc`.
         // `registration_decline` drops those as user graphs so this stub
         // can occupy the key; declining them here leaves the key empty.
         let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
-        if registration_decline(&canonical_dedup_key(&path)) == Some(SKIP_PTR_COPY_NONOVERLAPPING) {
-            crate::decline::record(
-                REGISTRY_GATE,
-                SKIP_PTR_COPY_NONOVERLAPPING,
-                format_args!("{path}"),
-            );
+        if let Some(reason) = registration_decline(&canonical_dedup_key(&path))
+            && (reason == SKIP_PTR_COPY_NONOVERLAPPING || reason == SKIP_STD_ALLOC_RAW)
+        {
+            crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
             continue;
         }
         let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
@@ -5759,6 +5788,116 @@ mod tests {
             family.calltable_lookup_row(&shape, &old_none_row).is_none(),
             "the skipped None graph is no longer a family row"
         );
+    }
+
+    #[test]
+    fn std_alloc_raw_is_declined_and_unregistered() {
+        for segments in [
+            vec!["std".into(), "alloc".into(), "alloc_zeroed".into()],
+            vec!["std".into(), "alloc".into(), "alloc".into()],
+            vec!["alloc".into(), "alloc".into(), "alloc_zeroed".into()],
+            vec!["alloc".into(), "alloc".into(), "alloc".into()],
+            vec!["alloc_zeroed".into()],
+        ] {
+            assert_eq!(
+                registration_decline(&segments),
+                Some(SKIP_STD_ALLOC_RAW),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["alloc".into()]),
+            None,
+            "the alloc leaf is shared with other functions"
+        );
+        assert_eq!(
+            registration_decline(&["std".into(), "alloc".into(), "dealloc".into()]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for segments in [
+            vec!["std", "alloc", "alloc_zeroed"],
+            vec!["alloc", "alloc", "alloc_zeroed"],
+            vec!["alloc_zeroed"],
+        ] {
+            let path = crate::parse::CallPath {
+                segments: segments.iter().map(|s| (*s).to_string()).collect(),
+            };
+            let mut graph = LegacyGraph::new("alloc_zeroed");
+            graph.set_return(graph.startblock.clone(), None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for segments in [
+            &["std", "alloc", "alloc_zeroed"][..],
+            &["alloc", "alloc", "alloc_zeroed"][..],
+            &["alloc_zeroed"][..],
+        ] {
+            let key = FunctionPathKey::from_segments(segments.iter().copied());
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {segments:?}"
+            );
+        }
+        let host = crate::flowspace::model::host_env_callable(
+            &["std", "alloc", "alloc_zeroed"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("std.alloc.alloc_zeroed resolves in HOST_ENV");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+        let alloc_host = crate::flowspace::model::host_env_callable(
+            &["alloc", "alloc", "alloc_zeroed"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("alloc.alloc.alloc_zeroed resolves in HOST_ENV");
+        assert_eq!(host, alloc_host);
+
+        let stub_registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        let mut specs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            Some("bool".to_string()),
+        )];
+        for segments in [
+            vec!["std", "alloc", "alloc_zeroed"],
+            vec!["std", "alloc", "alloc"],
+            vec!["alloc", "alloc", "alloc_zeroed"],
+            vec!["alloc_zeroed"],
+        ] {
+            specs.push((
+                segments.iter().map(|s| (*s).to_string()).collect(),
+                Signature::new(vec!["layout".to_string()], None, None),
+                Some("ref".to_string()),
+            ));
+        }
+        register_unsafe_fn_stubs(&stub_registry, &specs);
+        assert_eq!(
+            stub_registry.len(),
+            1,
+            "declined alloc/alloc_zeroed specs must not be registered"
+        );
+        for segments in [
+            &["std", "alloc", "alloc_zeroed"][..],
+            &["std", "alloc", "alloc"][..],
+            &["alloc", "alloc", "alloc_zeroed"][..],
+            &["alloc_zeroed"][..],
+        ] {
+            assert!(
+                stub_registry
+                    .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                    .is_none(),
+                "unsafe stub still registered for {segments:?}"
+            );
+        }
     }
 
     #[test]

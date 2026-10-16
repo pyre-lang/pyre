@@ -360,6 +360,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "std.ptr.copy_nonoverlapping",
         std_ptr_copy_nonoverlapping,
     );
+    // `std::alloc::alloc` / `alloc_zeroed` — `ann_malloc` (`lltype.py`)
+    // returns `SomePtr` for `lltype.malloc(..., flavor='raw')`. The
+    // `alloc::alloc` re-export shares the HOST_ENV callable, so this
+    // qualname covers both spellings.
+    analyzer_for(&mut reg, "std.alloc.alloc", std_alloc_raw);
+    analyzer_for(&mut reg, "std.alloc.alloc_zeroed", std_alloc_raw);
     // Rust `std::ptr::null_mut::<T>()` / `null::<T>()` — the null
     // pointer constant (also the value of
     // `pyre_object::pyobject::PY_NULL`, whose HOST_ENV attr binds to
@@ -1518,6 +1524,24 @@ fn std_ptr_copy_nonoverlapping(
     Ok(s_none())
 }
 
+/// Analyzer for `std::alloc::alloc` / `alloc_zeroed` (and the
+/// `alloc::alloc` re-export). `ann_malloc` (`lltype.py`) returns
+/// `SomePtr` for `lltype.malloc(..., flavor='raw')`. The result is
+/// `CCHARP` (`rffi.py`), a raw `char *`.
+fn std_alloc_raw(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "std.alloc.alloc/alloc_zeroed expects a Layout",
+        ));
+    }
+    let _ = arg_at(args_s, 0, "std.alloc.alloc");
+    Ok(raw_alloc_ptr_somevalue())
+}
+
 /// Analyzer for `std::ptr::null_mut::<T>()` / `std::ptr::null::<T>()`
 /// — the null pointer constant (`lltype.nullptr(T)` analogue;
 /// `rbuiltin.py` typer folds it to a null `Ptr` constant).  Pyre's
@@ -2441,10 +2465,6 @@ fn lltype_direct_ptradd(
     let s_p = arg_at(args_s, 0, "lltype.direct_ptradd");
     match s_p {
         SomeValue::Ptr(_) => Ok(s_p.clone()),
-        // `alloc_zeroed` returns `*mut u8`. That bank is `Ref(None)`,
-        // shelled as a classdef-less instance. The add result is a raw
-        // pointer.
-        SomeValue::Instance(inst) if inst.classdef.is_none() => Ok(raw_alloc_ptr_somevalue()),
         other => Err(AnnotatorError::new(format!(
             "direct_ptradd of non-pointer: {other:?}"
         ))),
@@ -2455,7 +2475,7 @@ fn raw_alloc_ptr_somevalue() -> SomeValue {
     use crate::annotator::model::SomePtr;
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
-    // `alloc_zeroed` / `<*mut u8>::add` is `CCHARP` (`lltype.py`).
+    // `ann_malloc` / `std::alloc::alloc_zeroed` is `CCHARP` (`rffi.py`).
     // `getkind` of a raw pointer is Signed (`history.py`
     // `TYPE.TO._gckind == 'raw'`), the int bank `push_direct_ptradd`
     // stamps on the result. A gc opaque would kind as GcRef and diverge.
@@ -2475,38 +2495,40 @@ fn raw_alloc_ptr_somevalue() -> SomeValue {
 ///     return SomePtr(ll_ptrtype=PtrT.const)
 /// ```
 ///
-/// TODO: the Rust frontend's
-/// `Expr::Cast { ValueType::Ref }` carries only the opaque high-level
-/// `Ref` (no concrete Ptr lltype is known at lowering time), so the
-/// frontend lowers `Int → Ref` to a **1-arg** `simple_call(lltype.\
-/// cast_int_to_ptr, v_int)` instead of upstream's 2-arg `simple_call\
-/// (lltype.cast_int_to_ptr, PTRTYPE, oddint)`.  Upstream's
-/// `ann_cast_int_to_ptr` asserts `PtrT.is_constant()` and returns
-/// `SomePtr(ll_ptrtype=PtrT.const)` (lltype.py), reading
-/// the concrete Ptr type from the first argument.  Pyre's analyzer
-/// cannot recover that concrete Ptr from `args_s[0]` because it
-/// isn't there.  We return `SomePtr` with a Gc-Opaque placeholder
-/// Ptr (mirroring the opaque Ref bank); the rtyper-phase
-/// `rtype_cast_int_to_ptr` recovers the caller-side concrete Ptr
-/// from `hop.r_result.lowleveltype()`.  The constant carrier already
-/// exists (`ConstValue::LowLevelType(Box<LowLevelType>)`, flowspace/
-/// model.rs, supports `LowLevelType::Ptr`); the blocker is the
-/// frontend not having the concrete Ptr available at `Expr::Cast`
-/// lowering time.  Graduating to the 2-arg form is blocked on
-/// threading the rtyper-side annotation back to the frontend (or a
-/// deferred 2-arg rewrite in jtransform / annotator once the Ptr is
-/// known).
+/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`) emits the 2-arg
+/// form with `PtrT` a `ConstValue::LowLevelType` of that array
+/// pointer. `getkind` of a raw `Ptr` is Signed (`history.py`
+/// `TYPE.TO._gckind == 'raw'`). The 1-arg `Int → Ref` lowering still
+/// has no concrete Ptr and keeps the Gc-Opaque placeholder; a gc
+/// opaque would kind as GcRef.
 fn lltype_cast_int_to_ptr(
     _bk: &Rc<Bookkeeper>,
-    _args_s: &[Option<SomeValue>],
+    args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, SomePtr};
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, OpaqueType, Ptr, SomePtr};
+    if args_s.len() == 2 {
+        let s_ptrt = arg_at(args_s, 0, "lltype.cast_int_to_ptr");
+        if !s_ptrt.is_constant() {
+            return Err(AnnotatorError::new(
+                "ann_cast_int_to_ptr: PtrT is not constant",
+            ));
+        }
+        let Some(ConstValue::LowLevelType(ll)) = s_ptrt.const_() else {
+            return Err(AnnotatorError::new(
+                "ann_cast_int_to_ptr: PtrT.const is not a LowLevelType",
+            ));
+        };
+        let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
+            return Err(AnnotatorError::new(
+                "ann_cast_int_to_ptr: PtrT.const is not a Ptr",
+            ));
+        };
+        return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
+    }
     let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
-    let placeholder_ptr = Ptr::from_container_type(
-        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Opaque(Box::new(opaque)),
-    )
-    .expect("Opaque container yields a valid Ptr");
+    let placeholder_ptr = Ptr::from_container_type(LowLevelType::Opaque(Box::new(opaque)))
+        .expect("Opaque container yields a valid Ptr");
     Ok(SomeValue::Ptr(SomePtr::new(placeholder_ptr)))
 }
 
@@ -3557,6 +3579,8 @@ mod tests {
         assert!(is_registered("rpython.rlib.objectmodel.hlinvoke"));
         assert!(is_registered("weakref.ref"));
         assert!(is_registered("pdb.set_trace"));
+        assert!(is_registered("std.alloc.alloc"));
+        assert!(is_registered("std.alloc.alloc_zeroed"));
     }
 
     #[test]
@@ -4730,16 +4754,9 @@ mod tests {
         assert_eq!(out, s_p);
 
         let s_shell = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
-        let shelled = lltype_direct_ptradd(&bk(), &[Some(s_shell), Some(s_n.clone())], &no_kwds())
-            .expect("classdef-less instance is the alloc_zeroed shell");
-        let SomeValue::Ptr(shelled_ptr) = &shelled else {
-            panic!("classdef-less direct_ptradd returns SomePtr, got {shelled:?}");
-        };
-        assert_eq!(
-            crate::model::getkind(&LowLevelType::Ptr(Box::new(shelled_ptr.ll_ptrtype.clone()))),
-            crate::model::ConcreteType::Signed,
-            "raw alloc pointer kinds as Signed"
-        );
+        let err = lltype_direct_ptradd(&bk(), &[Some(s_shell), Some(s_n.clone())], &no_kwds())
+            .expect_err("ann_direct_ptradd asserts SomePtr");
+        assert!(err.to_string().contains("non-pointer"), "got {err}");
 
         let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
         let s_inst =
@@ -4747,6 +4764,64 @@ mod tests {
         let err = lltype_direct_ptradd(&bk(), &[Some(s_inst), Some(s_n)], &no_kwds())
             .expect_err("ann_direct_ptradd asserts SomePtr");
         assert!(err.to_string().contains("non-pointer"), "got {err}");
+    }
+
+    #[test]
+    fn ann_cast_int_to_ptr_two_arg_carrayptr_is_raw_someptr() {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+
+        let ptr_ty = CArrayPtr(LowLevelType::Signed);
+        let mut s_ptrt = SomeValue::Type(super::super::model::SomeType::new());
+        s_ptrt.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            ptr_ty.clone(),
+        ))));
+        assert!(s_ptrt.is_constant());
+        let s_int = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let out = lltype_cast_int_to_ptr(&bk(), &[Some(s_ptrt), Some(s_int)], &no_kwds())
+            .expect("ann_cast_int_to_ptr 2-arg returns SomePtr");
+        let SomeValue::Ptr(ptr) = &out else {
+            panic!("expected SomePtr, got {out:?}");
+        };
+        assert_eq!(
+            crate::model::getkind(&LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone()))),
+            crate::model::ConcreteType::Signed,
+            "CArrayPtr kinds as Signed"
+        );
+        let s_n = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let added = lltype_direct_ptradd(&bk(), &[Some(out.clone()), Some(s_n)], &no_kwds())
+            .expect("ann_direct_ptradd of CArrayPtr");
+        assert_eq!(added, out);
+    }
+
+    #[test]
+    fn ann_alloc_zeroed_returns_someptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let layout = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let s_n = SomeValue::Integer(super::super::model::SomeInteger::default());
+        for name in ["std.alloc.alloc_zeroed", "std.alloc.alloc"] {
+            let out = call_builtin(&bk(), name, &[Some(layout.clone())], &no_kwds())
+                .unwrap_or_else(|err| panic!("{name} annotates as SomePtr: {err}"));
+            assert_eq!(out, raw_alloc_ptr_somevalue(), "{name}");
+            let SomeValue::Ptr(ptr) = &out else {
+                panic!("{name} returns SomePtr, got {out:?}");
+            };
+            assert_eq!(
+                crate::model::getkind(&LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone()))),
+                crate::model::ConcreteType::Signed,
+                "raw alloc pointer kinds as Signed"
+            );
+            let added =
+                lltype_direct_ptradd(&bk(), &[Some(out.clone()), Some(s_n.clone())], &no_kwds())
+                    .unwrap_or_else(|err| panic!("ann_direct_ptradd of {name} result: {err}"));
+            assert_eq!(added, out, "ann_direct_ptradd returns s_p");
+        }
+        let err = call_builtin(&bk(), "std.alloc.alloc_zeroed", &[], &no_kwds())
+            .expect_err("Layout argument is required");
+        assert!(err.to_string().contains("expects a Layout"), "got {err}");
     }
 
     #[test]

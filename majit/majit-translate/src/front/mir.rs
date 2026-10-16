@@ -3038,6 +3038,15 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
     {
         return ValueType::Int;
     }
+    // `history.py` `getkind` of a raw `Ptr` whose pointee is a non-byte
+    // primitive is `'int'`. `Tuple<*mut usize, …>` intern's `__pos_0` from
+    // this spelling (`rtuple.py` `TupleRepr`); a `Ref` seed makes
+    // `raw_load` see `SomeInstance` (`ann_direct_ptradd` needs a pointer,
+    // `rffi.py` `ptradd`). A byte pointer stays `Ref`: pyre erases a GC
+    // reference to `*mut u8`.
+    if let Some(raw) = spelling_raw_scalar_address_value_type(type_name) {
+        return raw;
+    }
     match type_name {
         "()" => ValueType::Void,
         "f64" => ValueType::Float,
@@ -3063,6 +3072,28 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `[hash, length, chars]`. Keep the layouts distinct.
         "BytesBlock" => ValueType::Ref(Some("BytesBlock".into())),
         _ => ValueType::Ref(None),
+    }
+}
+
+/// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive, keyed
+/// off the rendered spelling [`tuple_field_value_type`] sees.
+///
+/// Same bank [`raw_scalar_address_value_type`] reads off a `TyRef`. A byte
+/// pointer stays `None` (the caller keeps `Ref`): pyre erases a GC
+/// reference to `*mut u8`. A pointer to a pointer or an ADT stays `None`.
+fn spelling_raw_scalar_address_value_type(type_name: &str) -> Option<ValueType> {
+    let type_name = type_name.trim();
+    let pointee = type_name
+        .strip_prefix("*mut ")
+        .or_else(|| type_name.strip_prefix("*const "))?;
+    if pointee.starts_with("*mut ") || pointee.starts_with("*const ") || pointee.starts_with('&') {
+        return None;
+    }
+    match pointee {
+        "u8" | "i8" => None,
+        "bool" | "char" | "i16" | "i32" | "i64" | "isize" | "u16" | "u32" | "u64" | "usize"
+        | "f32" | "f64" => Some(ValueType::Int),
+        _ => None,
     }
 }
 
@@ -10936,7 +10967,9 @@ impl<'a> Lowering<'a> {
                 // value: emitting the const's nullary call leaves that path
                 // unregistered. `fold_op_list` keeps any operation it cannot
                 // prove safe, so a projected store, address-taking, or
-                // whole-value consumer leaves the aggregate.
+                // whole-value consumer leaves the aggregate. A whole-local
+                // copy is safe when that dest is itself only field-read
+                // (or copied onward the same way).
                 if !self.multi_assigned_locals.contains(&dest_local)
                     && !self.local_has_projected_store(dest_local)
                     && const_struct_uses_are_field_reads(self.llbc, self.body, dest_local)
@@ -14568,8 +14601,22 @@ impl<'a> Lowering<'a> {
                     // in the int bank. `history.py` `getkind` banks a raw
                     // `Ptr` as `int`, including `*mut f64`, so
                     // `usize as *const usize` aliases that word. A `Ref`
-                    // source still reaches [`Self::ptr_cast_marker`], and
-                    // `*mut u8 as *mut i64` keeps the GcArray narrow.
+                    // source still reaches [`Self::ptr_cast_marker`].
+                    // A function that *returns* `*mut i64` (`index_words_ptr`)
+                    // is `rffi.cast` onto `CArrayPtr`; aliasing would keep
+                    // `__cast_address_intrinsic`'s Instance for the caller's
+                    // `direct_ptradd`. An items-base accessor or a store
+                    // through the same spelling keeps the GcArray header.
+                    if matches!(src_kind, Some(ValueType::Ref(_)))
+                        && self.should_emit_rffi_cast_identity_to_raw_scalar(
+                            dest_ty,
+                            operand_tyref(&operand),
+                        )
+                    {
+                        let bb_id = self.block_id[mir_bb];
+                        let raw = self.emit_rffi_cast_to_raw_scalar_ptr(bb_id, arg, dest_ty);
+                        return Ok((None, raw));
+                    }
                     let dst_kind = if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
                         && let Some(raw) = raw_scalar_address_value_type(dest_ty, self.llbc)
                     {
@@ -20469,24 +20516,13 @@ impl<'a> Lowering<'a> {
                     // An unresolved projected type (a closure's `tupled_args`
                     // typed as the trait's `Args` parameter) falls back to
                     // the tuple's own element generics.
-                    let ty = match tyref_to_value_type_with(
+                    let ty = tuple_element_field_value_type(
                         &place_ty,
+                        tyref_tuple_element(&inner.ty, idx, self.llbc),
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
-                    ) {
-                        ValueType::Ref(None) => tyref_tuple_element(&inner.ty, idx, self.llbc)
-                            .map(|ty| {
-                                tyref_enum_payload_value_type(
-                                    &ty,
-                                    self.llbc,
-                                    self.tombstoned_leaves,
-                                    self.gc_struct_ids,
-                                )
-                            })
-                            .unwrap_or(ValueType::Ref(None)),
-                        ty => ty,
-                    };
+                    );
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -20599,24 +20635,13 @@ impl<'a> Lowering<'a> {
                         } else {
                             base
                         };
-                        let ty = match tyref_to_value_type_with(
+                        let ty = tuple_element_field_value_type(
                             &place_ty,
+                            element_ty,
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
-                        ) {
-                            ValueType::Ref(None) => element_ty
-                                .map(|ty| {
-                                    tyref_enum_payload_value_type(
-                                        &ty,
-                                        self.llbc,
-                                        self.tombstoned_leaves,
-                                        self.gc_struct_ids,
-                                    )
-                                })
-                                .unwrap_or(ValueType::Ref(None)),
-                            ty => ty,
-                        };
+                        );
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -26439,8 +26464,9 @@ impl<'a> Lowering<'a> {
                         self.gc_struct_ids,
                     ) && let Some(kind) = self.instance_narrow_for_type(&call.dest.ty, &args[0])
                     {
-                        let res = if let Some((base, offset)) =
-                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))
+                        let array_tail =
+                            self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?;
+                        let res = if let Some((base, offset)) = array_tail
                             && let Some(root) = tyref_class_root_with(
                                 &call.dest.ty,
                                 self.llbc,
@@ -26457,6 +26483,28 @@ impl<'a> Lowering<'a> {
                             });
                             res
                         };
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                    } else if self.should_emit_rffi_cast_identity_to_raw_scalar(
+                        &call.dest.ty,
+                        first_arg_ty.as_ref(),
+                    ) {
+                        // `index_words_ptr` is `typed_items_block_items_base
+                        // as *mut i64` and returns that address. The source
+                        // is the `*mut u8` Ref erasure. Aliasing keeps
+                        // `__cast_address_intrinsic`'s Instance, and the
+                        // caller's `direct_ptradd` (`rffi.py` `ptradd`) then
+                        // fails `ann_direct_ptradd`. `rffi.cast` onto the
+                        // raw `CArrayPtr` is `cast_ptr_to_int` then
+                        // `cast_int_to_ptr` (`lltype.py`). An already-int
+                        // raw scalar (`HashStateStorage::as_mut_ptr`) stays
+                        // in the int bank. `IntArray::base` and
+                        // `set_sizehint_state_value` keep the alias
+                        // (GcArray header).
+                        let res = self.emit_rffi_cast_to_raw_scalar_ptr(
+                            bb_id,
+                            args[0].clone(),
+                            &call.dest.ty,
+                        );
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
@@ -31257,9 +31305,10 @@ impl<'a> Lowering<'a> {
         self.spec_body = true;
     }
 
-    /// Specialized path for a direct call whose `generics.trait_refs` name
-    /// impls. The bare path is unchanged when the callee is not generic or
-    /// the call still carries a `Clause`.
+    /// Specialized path for a direct call whose type args are concrete,
+    /// or whose `generics.trait_refs` name impls. The bare path is
+    /// unchanged when the callee is not generic or the call still
+    /// carries a `Clause` / `TypeVar`.
     fn specialized_fun_segments(&self, fd: &FunDecl, reg: &RegularCall) -> Option<Vec<String>> {
         self.enqueue_spec(fd, &reg.generics)
     }
@@ -32126,15 +32175,18 @@ impl<'a> Lowering<'a> {
     /// `direct_arrayitems` (`lltype.py`) is that field's address. The
     /// header is the field-read base; the byte offset is the field's
     /// layout offset (`array_items_base` for a length-prefixed array).
-    /// `dest_ty` is the `.cast()` dest (`*mut Entry<i64, PyObjectRef>`):
-    /// the instantiated element type at this use, which the generic
-    /// `GcEntries` declaration does not carry.
+    /// `get_array_token` reads `carray.items.offset` off the actual
+    /// array, so element alignment comes from the source local and
+    /// header. `dest_ty` is the `.cast()` dest and is only the
+    /// instantiated element when those source types have no layout.
+    /// An address-taken array field with no recoverable items offset
+    /// stops translation rather than emit a different address.
     fn taken_array_field_address(
         &self,
         bb_id: BlockId,
         var: &Variable,
         dest_ty: Option<&TyRef>,
-    ) -> Option<(Variable, u64)> {
+    ) -> Result<Option<(Variable, u64)>, LowerError> {
         let found = {
             let block = self.graph.block(bb_id);
             let mut found = None;
@@ -32152,13 +32204,21 @@ impl<'a> Lowering<'a> {
                 break;
             }
             found
-        }?;
-        let instantiated_align = dest_ty
-            .and_then(|ty| self.instantiated_elem_align_from_tyref(ty, &found.2))
-            .or_else(|| self.instantiated_elem_align_of_var(var, &found.2))
-            .or_else(|| self.instantiated_elem_align_of_var(&found.0, &found.2));
-        let offset = self.array_field_tail_offset(&found.1, &found.2, instantiated_align)?;
-        Some((found.0, offset))
+        };
+        let Some(found) = found else {
+            return Ok(None);
+        };
+        let instantiated_align = Self::array_tail_instantiated_elem_align(
+            self.instantiated_elem_align_of_var(var, &found.2),
+            self.instantiated_elem_align_of_var(&found.0, &found.2),
+            dest_ty.and_then(|ty| self.instantiated_elem_align_from_tyref(ty, &found.2)),
+        );
+        let offset = Self::array_field_items_offset(
+            self.array_field_tail_offset(&found.1, &found.2, instantiated_align),
+            &found.1,
+            &found.2,
+        )?;
+        Ok(Some((found.0, offset)))
     }
 
     /// Alignment of the array element named by MIR local `var`.
@@ -32333,6 +32393,32 @@ impl<'a> Lowering<'a> {
         Some(crate::codewriter::call::array_items_base(word, align) as u64)
     }
 
+    /// `get_array_token` reads `carray.items.offset` off the actual array
+    /// type. Source local and header win over a `.cast()` dest so a
+    /// differently aligned reinterpret cannot change the items address.
+    fn array_tail_instantiated_elem_align(
+        source_local: Option<usize>,
+        source_header: Option<usize>,
+        dest: Option<usize>,
+    ) -> Option<usize> {
+        source_local.or(source_header).or(dest)
+    }
+
+    /// `direct_arrayitems` builds a pointer to item zero of the actual
+    /// array. Unknown items offset stops translation rather than select
+    /// a different address operation.
+    fn array_field_items_offset(
+        offset: Option<u64>,
+        owner: &str,
+        field: &str,
+    ) -> Result<u64, LowerError> {
+        offset.ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "direct_arrayitems: items offset of {owner}.{field} is unknown"
+            ))
+        })
+    }
+
     /// `direct_arrayitems` (`lltype.py`) as `cast_ptr_to_int` + add +
     /// `cast_int_to_ptr` + `cast_instance`. The integer is not recorded
     /// in `cast_ptr_to_int_src`: the round-trip fold would drop `offset`.
@@ -32401,6 +32487,65 @@ impl<'a> Lowering<'a> {
             kind: crate::model::cast_instance_call(root, raw),
         });
         res
+    }
+
+    /// True when `*mut u8 as *mut i64` (or `*mut f64`) must be `rffi.cast`
+    /// onto `CArrayPtr` rather than an alias of the GC header.
+    ///
+    /// `index_words_ptr` returns that raw address; look-inside of the
+    /// alias would feed `SomeInstance` to the caller's `direct_ptradd`
+    /// (`ann_direct_ptradd`, `rffi.py` `ptradd`). An already-int raw
+    /// scalar (`*const usize as *mut usize`, `HashStateStorage::as_mut_ptr`)
+    /// stays in the int bank. An items-base accessor (`IntArray::base`)
+    /// and a function that stores through the same spelling
+    /// (`set_sizehint_state_value`) keep the header so getarrayitem /
+    /// setarrayitem still fire.
+    fn should_emit_rffi_cast_identity_to_raw_scalar(
+        &self,
+        dest_ty: &TyRef,
+        src_ty: Option<&TyRef>,
+    ) -> bool {
+        if graph_is_items_block_base_accessor(&self.graph.name) {
+            return false;
+        }
+        if raw_scalar_address_value_type(dest_ty, self.llbc).is_none() {
+            return false;
+        }
+        if src_ty.is_some_and(|ty| raw_scalar_address_value_type(ty, self.llbc).is_some()) {
+            return false;
+        }
+        if !src_ty.is_some_and(|ty| {
+            matches!(
+                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+                ValueType::Ref(_)
+            )
+        }) {
+            return false;
+        }
+        self.body
+            .locals
+            .locals
+            .first()
+            .is_some_and(|ret| raw_scalar_address_value_type(&ret.ty, self.llbc).is_some())
+    }
+
+    /// `rffi.cast(CArrayPtr(T), p)` of a GC / erased byte pointer onto a
+    /// raw scalar address (`*mut i64`, `*mut f64`). `__cast_address_intrinsic`
+    /// (`p as *mut u8`) answers classdef-less `SomeInstance`; `ann_direct_ptradd`
+    /// needs `SomePtr` (`lltype.py` `ann_direct_ptradd`, `rffi.py` `ptradd`).
+    /// `cast_ptr_to_int` then `cast_int_to_ptr` is that cast (`lltype.py`).
+    fn emit_rffi_cast_to_raw_scalar_ptr(
+        &mut self,
+        bb_id: BlockId,
+        ptr: Variable,
+        dest_ty: &TyRef,
+    ) -> Variable {
+        let item = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)
+            .or_else(|| tyref_peel_one_ref_node(dest_ty, self.llbc))
+            .and_then(|pointee| json_ty_byte_size(pointee, self.llbc))
+            .map(item_lltype_for_size)
+            .unwrap_or(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed);
+        emit_rffi_cast_to_carray_ptr(&mut self.graph, bb_id, ptr, &item)
     }
 
     /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
@@ -34537,8 +34682,9 @@ impl<'a> Lowering<'a> {
 
     /// `(header as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` — `s.chars`
     /// (`rstr.py` `STR`). The add is on a `u8` pointer, the peeled base is
-    /// the low-level string header, and the dest is a `u8` pointer. `sub`
-    /// and any other pointee keep `rtype_direct_ptradd`.
+    /// the low-level string header (`*const Utf8Str` or `&Utf8Str`), and
+    /// the dest is a `u8` pointer. `sub` and any other pointee keep
+    /// `rtype_direct_ptradd`.
     fn is_string_header_chars_byte_ptr_add(
         &self,
         reg: &RegularCall,
@@ -44121,10 +44267,14 @@ fn is_lowlevel_string_header_adt_path(path: &str) -> bool {
     )
 }
 
-/// `*const Utf8Str` / `*mut Utf8Str` / `*const LowlevelStringHeader` — the
-/// rstr `STR` header (`rstr.py` `STR`).
+/// `*const Utf8Str` / `*mut Utf8Str` / `&Utf8Str` and the same shapes
+/// of `LowlevelStringHeader` — the rstr `STR` header (`rstr.py` `STR`).
+/// A reference-derived `(s as *const Utf8Str as *const u8)` peels to
+/// `&Utf8Str`; that is still `s.chars` (`ll_stritem_nonneg`).
 fn tyref_is_lowlevel_string_header_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
-    let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
+    let Some(pointee) =
+        tyref_peel_one_raw_ptr_node(ty, llbc).or_else(|| tyref_peel_one_ref_node(ty, llbc))
+    else {
         return false;
     };
     adt_node_def_id(pointee)
@@ -49141,7 +49291,10 @@ pub fn harvest_published_structs(llbc: &Llbc) -> Vec<PublishedStructBody> {
 /// Copy `rows` onto every `Opaque` or `Unknown` type decl whose
 /// instantiated identity matches. A crate-stripped identity is used only
 /// when it names exactly one published row; an ambiguous suffix stays
-/// opaque. An existing `Struct` is left alone. A path that does not
+/// opaque. Already-unprefixed identities count in that uniqueness
+/// bucket (`LowLevelType.__eq__` compares the whole type). Crate
+/// stripping applies to the declaration path, not to `::` inside
+/// generic arguments. An existing `Struct` is left alone. A path that does not
 /// resolve to a destination decl stays a `{"Path": ...}` id.
 pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
     if rows.is_empty() {
@@ -49156,10 +49309,10 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
         std::collections::HashMap::new();
     for (id, key) in &dest_identities {
         exact.entry(key.clone()).or_insert(*id);
-        let stripped = strip_crate_prefix(key);
-        if stripped != *key {
-            stripped_ids.entry(stripped).or_default().push(*id);
-        }
+        stripped_ids
+            .entry(strip_identity_crate_prefix(key))
+            .or_default()
+            .push(*id);
     }
     let stripped_unique = unique_stripped_values(stripped_ids);
     let mut by_identity: std::collections::HashMap<&str, &PublishedStructBody> =
@@ -49170,10 +49323,10 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
     let mut stripped_rows: std::collections::HashMap<String, Vec<&PublishedStructBody>> =
         std::collections::HashMap::new();
     for row in rows {
-        let stripped = strip_crate_prefix(&row.path);
-        if stripped != row.path {
-            stripped_rows.entry(stripped).or_default().push(row);
-        }
+        stripped_rows
+            .entry(strip_identity_crate_prefix(&row.path))
+            .or_default()
+            .push(row);
     }
     let stripped_unique_rows = unique_stripped_values(stripped_rows);
     let dest_key_by_id: std::collections::HashMap<u64, String> =
@@ -49188,7 +49341,7 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
             continue;
         };
         let row = by_identity.get(key.as_str()).copied().or_else(|| {
-            let stripped = strip_crate_prefix(key);
+            let stripped = strip_identity_crate_prefix(key);
             (stripped != *key)
                 .then(|| stripped_unique_rows.get(&stripped).copied())
                 .flatten()
@@ -49270,11 +49423,24 @@ fn lookup_published_type_path(
     if let Some(id) = exact.get(key) {
         return Some(*id);
     }
-    let stripped = strip_crate_prefix(key);
+    let stripped = strip_identity_crate_prefix(key);
     if stripped != key {
         return stripped_unique.get(&stripped).copied();
     }
     None
+}
+
+/// Drop a leading crate ident from an instantiated identity.
+///
+/// `strip_crate_prefix` is for `name_path`. Instantiated identity is
+/// `name<types>` / `name<types|consts>` (`format_instantiated_identity`);
+/// a `::` inside those arguments is part of an argument, not a crate
+/// segment. `LowLevelType.__eq__` compares the type class and attributes.
+fn strip_identity_crate_prefix(identity: &str) -> String {
+    match identity.split_once("::") {
+        Some((head, rest)) if !head.contains('<') => rest.to_string(),
+        _ => identity.to_string(),
+    }
 }
 
 /// Identities of local bodies that open a bracket and return its guard,
@@ -49498,6 +49664,12 @@ fn identity_type_value(llbc: &Llbc, value: &serde_json::Value, depth: usize) -> 
         }
         return "TypeVar".to_string();
     }
+    // `lltype.FuncType` stores ARGS and RESULT; `LowLevelType.__eq__`
+    // compares that dict, so two function-pointer instantiations stay
+    // distinct types.
+    if let Some(fnptr) = obj.get("FnPtr") {
+        return identity_fn_ptr(llbc, fnptr, depth);
+    }
     if let Some(array) = obj.get("Array").and_then(serde_json::Value::as_array)
         && !array.is_empty()
     {
@@ -49573,6 +49745,31 @@ fn identity_adt(
     format_instantiated_identity(&name, &args.join(","), &consts.join(","))
 }
 
+fn identity_fn_ptr(llbc: &Llbc, fnptr: &serde_json::Value, depth: usize) -> String {
+    let Some(sig) = fnptr.get("skip_binder").unwrap_or(fnptr).as_object() else {
+        return "fn".to_string();
+    };
+    let inputs = sig
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .map(|ty| identity_type_value(llbc, ty, depth + 1))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let output = sig
+        .get("output")
+        .map(|ty| identity_type_value(llbc, ty, depth + 1))
+        .unwrap_or_else(|| "()".to_string());
+    if sig.get("is_unsafe").and_then(serde_json::Value::as_bool) == Some(true) {
+        format!("unsafe fn({inputs}) -> {output}")
+    } else {
+        format!("fn({inputs}) -> {output}")
+    }
+}
+
 fn identity_const(llbc: &Llbc, value: &serde_json::Value) -> String {
     if let Some(id) = value
         .get("Deduplicated")
@@ -49600,6 +49797,17 @@ fn const_literal_text(body: &serde_json::Value) -> String {
     };
     if let Some(boolean) = literal.get("Bool").and_then(serde_json::Value::as_bool) {
         return boolean.to_string();
+    }
+    // A `char` const generic is a `ConstantExpr` literal
+    // (`Llbc::const_expr_literal`). `lltype.Char` / `lltype.UniChar` are
+    // distinct primitives; rendering Charon's `Char` as `?` collapsed
+    // every such instantiation onto one identity.
+    if let Some(ch) = literal.get("Char") {
+        return match ch {
+            serde_json::Value::String(s) => format!("char:{s}"),
+            serde_json::Value::Number(n) => format!("char:{n}"),
+            _ => "char:?".to_string(),
+        };
     }
     literal
         .get("Integer")
@@ -49855,8 +50063,19 @@ fn remap_portable_type_ids(
                     .map(str::to_string);
                 let generics = adt.get("generics").cloned();
                 if let Some(path) = path {
+                    // Instantiated identity first (`lltype.Struct.__init__`
+                    // names the concrete type). A `monomorphize:false`
+                    // template is keyed by bare `name_path`
+                    // (`ItemMeta::name_path` drops Instantiated); the
+                    // use-site TypeDeclRef still carries generics
+                    // (`type_decl_ref_generics`). `type_decl_ref_adt_id`
+                    // reads only a numeric id.
                     let key = type_path_identity(llbc, &path, generics.as_ref());
-                    if let Some(def_id) = lookup_published_type_path(exact, stripped_unique, &key) {
+                    let mut def_id = lookup_published_type_path(exact, stripped_unique, &key);
+                    if def_id.is_none() && key != path {
+                        def_id = lookup_published_type_path(exact, stripped_unique, &path);
+                    }
+                    if let Some(def_id) = def_id {
                         adt.insert("id".into(), serde_json::json!(def_id));
                     }
                 }
@@ -58164,6 +58383,44 @@ fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&Va
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
 }
 
+/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`): `cast_ptr_to_int` then
+/// `cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).
+/// `__cast_address_intrinsic` (`p as *mut u8`) and a classdef-less
+/// `*mut u8` input annotate as `SomeInstance`; `ann_direct_ptradd`
+/// needs `SomePtr`. The 2-arg form supplies `PtrT.const` so the
+/// analyzer returns a raw `CArrayPtr` (`getkind` Signed), not the
+/// 1-arg Gc-Opaque placeholder (GcRef).
+fn emit_rffi_cast_to_carray_ptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    ptr: Variable,
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    let addr = push_cast_ptr_to_int(graph, bb_id, ptr);
+    let ptr_ty = lltype_for_direct_ptradd_pointer(None, item);
+    let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    raw.set_concretetype(Some(ptr_ty.clone()));
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(raw.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_int_to_ptr",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(addr),
+            ],
+            result_ty: ValueType::Int,
+        },
+    });
+    raw
+}
+
 /// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the raw
 /// pointer.  `ann_direct_ptradd` returns `s_p`.  `n` is an unscaled item
 /// count.  `item` is `TO.OF`: a `Char` builds `CCHARP` (byte shift);
@@ -58180,26 +58437,33 @@ fn push_direct_ptradd(
     // `nolength`), and a byte pointer is `CCHARP`. An earlier cast may have
     // stamped `Signed` or a GC pointer; `rewrite_op_direct_ptradd` scales
     // from `TO.OF`, so the operand has to carry the array pointer.
-    // Stamp the array pointer on an int-kind value. A GC-pointer (or
-    // still-unstamped) operand keeps its own concretetype: overwriting
-    // it changes the register bank, and a later result-kind commit puts
-    // the ref back under an `int_add`. `cast_ptr_to_int` yields a fresh
-    // `Signed` that can carry `CArrayPtr` / `CCHARP`.
+    // Stamp the array pointer on an int-kind value. A GC / classdef-less
+    // Instance is not `SomePtr`: peel `__cast_address_intrinsic` and
+    // `rffi.cast` onto `CArrayPtr` (`lltype.py` `ann_direct_ptradd`,
+    // `rffi.py` `ptradd`). `cast_ptr_to_int` alone would make the operand
+    // `Integer`; `cast_int_to_ptr` after it is the pointer.
     let already_int = ptr
         .concretetype()
         .as_ref()
         .is_some_and(|ty| crate::model::getkind(ty) == crate::model::ConcreteType::Signed);
-    let ptr_ty = lltype_for_direct_ptradd_pointer(
-        if already_int {
-            ptr.concretetype()
-        } else {
-            None
-        },
-        item,
-    );
-    let ptr = if already_int && ptr.concretetype().as_ref() == Some(&ptr_ty) {
+    let ptr = if already_int {
         ptr
-    } else if already_int {
+    } else {
+        let peeled = direct_ptradd_pointer_operand(graph, ptr);
+        let peeled_int = peeled
+            .concretetype()
+            .as_ref()
+            .is_some_and(|ty| crate::model::getkind(ty) == crate::model::ConcreteType::Signed);
+        if peeled_int {
+            peeled
+        } else {
+            emit_rffi_cast_to_carray_ptr(graph, bb_id, peeled, item)
+        }
+    };
+    let ptr_ty = lltype_for_direct_ptradd_pointer(ptr.concretetype(), item);
+    let ptr = if ptr.concretetype().as_ref() == Some(&ptr_ty) {
+        ptr
+    } else {
         // `clone` shares the concretetype cell. A fresh `same_as` result
         // carries `TO.OF` without rewriting the caller's variable.
         let fresh = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
@@ -58213,42 +58477,6 @@ fn push_direct_ptradd(
             },
         });
         fresh
-    } else {
-        // `ann_direct_ptradd` requires `SomePtr` and returns that pointer.
-        // `cast_ptr_to_int` here makes the operand `Integer`, which is the
-        // `direct_ptradd of non-pointer` wall on `digits_item`. A
-        // `__cast_address_intrinsic` (`p as *mut u8`) is `SomeInstance`,
-        // also not `SomePtr`; use the pointer it erased.
-        let ptr = direct_ptradd_pointer_operand(graph, ptr);
-        if FunctionGraph::concretetype_of(&count) == crate::model::ConcreteType::Unknown {
-            FunctionGraph::set_concretetype_of_inline(&count, crate::model::ConcreteType::Signed);
-        }
-        // Result stays the raw-pointer int bank (`CArrayPtr` / `CCHARP`).
-        // The operand is the pointer `ann_direct_ptradd` checks, not an
-        // integer retype of it.
-        let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-        result.set_concretetype(Some(ptr_ty.clone()));
-        graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: [
-                        "rpython",
-                        "rtyper",
-                        "lltypesystem",
-                        "lltype",
-                        "direct_ptradd",
-                    ]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![ptr, count]),
-                result_ty: ValueType::Int,
-            },
-        });
-        return result;
     };
     // An unstamped count reads as ref (`Unknown` → `'r'`), and
     // `rewrite_op_direct_ptradd` then refuses the scale. The count is
@@ -58282,8 +58510,9 @@ fn push_direct_ptradd(
 }
 
 /// Operand `direct_ptradd` annotates. `__cast_address_intrinsic` drops the
-/// pointee class and answers `SomeInstance`; the erased pointer is the
-/// `SomePtr` the add has to see.
+/// pointee class and answers `SomeInstance`; peel it so `rffi.cast` sees
+/// the pointer that was erased. A GC header that remains an Instance is
+/// then `rffi.cast` onto `CArrayPtr` in [`push_direct_ptradd`].
 fn direct_ptradd_pointer_operand(graph: &FunctionGraph, ptr: Variable) -> Variable {
     let Some((block_id, idx)) = resolve_to_producer_op(graph, &ptr) else {
         return ptr;
@@ -59152,6 +59381,15 @@ fn adt_field_read_value_type(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> ValueType {
+    // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
+    // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
+    // adapter spells the same `*mut i64` and must stay the GC header
+    // (`typed_array_base_call_stays_ref`).
+    if let Some(raw) = raw_scalar_address_value_type(place_ty, llbc)
+        .or_else(|| raw_scalar_address_value_type(field_ty, llbc))
+    {
+        return raw;
+    }
     let declared = if container_is_enum {
         tyref_enum_payload_value_type(place_ty, llbc, tombstoned, gc_struct_ids)
     } else {
@@ -59176,6 +59414,34 @@ fn adt_field_read_value_type(
             tyref_to_value_type_with(field_ty, llbc, tombstoned, gc_struct_ids)
         }
         resolved => resolved,
+    }
+}
+
+/// Register-bank kind of a tuple `__pos_N` read.
+///
+/// `place_ty` is the post-projection element. A raw pointer to a non-byte
+/// primitive is the address (`history.py` `getkind` of a raw `Ptr`,
+/// [`raw_scalar_address_value_type`]); `Ref(None)` would make `raw_load`
+/// of `slots().0` (`*mut usize`) see `SomeInstance`.
+fn tuple_element_field_value_type(
+    place_ty: &TyRef,
+    element_ty: Option<TyRef>,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> ValueType {
+    if let Some(raw) = raw_scalar_address_value_type(place_ty, llbc).or_else(|| {
+        element_ty
+            .as_ref()
+            .and_then(|ty| raw_scalar_address_value_type(ty, llbc))
+    }) {
+        return raw;
+    }
+    match tyref_to_value_type_with(place_ty, llbc, tombstoned, gc_struct_ids) {
+        ValueType::Ref(None) => element_ty
+            .map(|ty| tyref_enum_payload_value_type(&ty, llbc, tombstoned, gc_struct_ids))
+            .unwrap_or(ValueType::Ref(None)),
+        ty => ty,
     }
 }
 
@@ -60375,6 +60641,16 @@ fn tyref_to_attr_value_type_with(
     }
     if ty_is_raw_address(ty, llbc, gc_struct_ids) {
         return ValueType::Int;
+    }
+    // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
+    // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
+    // adapter spells the same `*mut i64` and must stay the GC header
+    // (`typed_array_base_call_stays_ref`). FORCE of a named `*mut usize`
+    // field (and harvest of a Charon tuple TypeDecl) must match
+    // [`tuple_field_value_type`] so `_init_classdef` does not seed
+    // `Ref(None)` over the positional Int attr.
+    if let Some(raw) = raw_scalar_address_value_type(ty, llbc) {
+        return raw;
     }
     // A fieldless (C-like) enum field is represented by-value as its
     // discriminant integer, matching `tyref_to_value_type` which colors
@@ -66962,13 +67238,19 @@ enum ConstStructUse {
     Other,
 }
 
-fn operand_const_struct_use(op: &Operand, dest: usize) -> ConstStructUse {
+fn operand_const_struct_use(
+    op: &Operand,
+    aliases: &std::collections::HashSet<usize>,
+) -> ConstStructUse {
     let (Operand::Copy(place) | Operand::Move(place)) = op else {
         return ConstStructUse::None;
     };
-    if place_is_field_projection_of_local(place, dest) {
+    if aliases
+        .iter()
+        .any(|&d| place_is_field_projection_of_local(place, d))
+    {
         ConstStructUse::FieldRead
-    } else if place_references_local(place, dest) {
+    } else if aliases.iter().any(|&d| place_references_local(place, d)) {
         ConstStructUse::Other
     } else {
         ConstStructUse::None
@@ -66983,47 +67265,148 @@ fn bump_const_struct_use(use_kind: ConstStructUse, fields: &mut usize, other: &m
     }
 }
 
-fn scan_rvalue_const_struct(rvalue: &Rvalue, dest: usize, fields: &mut usize, other: &mut usize) {
+fn place_is_const_struct_alias(place: &Place, aliases: &std::collections::HashSet<usize>) -> bool {
+    aliases
+        .iter()
+        .any(|&d| place_is_field_projection_of_local(place, d) || place_references_local(place, d))
+}
+
+fn rvalue_is_const_struct_alias_copy(
+    rvalue: &Rvalue,
+    place: &Place,
+    aliases: &std::collections::HashSet<usize>,
+) -> bool {
+    matches!(place.kind, PlaceKind::Local(j) if j != 0 && aliases.contains(&(j as usize)))
+        && matches!(
+            rvalue,
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _)
+                if matches!(src.kind, PlaceKind::Local(i) if aliases.contains(&(i as usize)))
+        )
+}
+
+fn scan_rvalue_const_struct(
+    rvalue: &Rvalue,
+    aliases: &std::collections::HashSet<usize>,
+    fields: &mut usize,
+    other: &mut usize,
+) {
     match rvalue {
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
         | Rvalue::Cast(_, op, _)
         | Rvalue::Repeat(op, _, _, _)
         | Rvalue::ShallowInitBox(op, _) => {
-            bump_const_struct_use(operand_const_struct_use(op, dest), fields, other);
+            bump_const_struct_use(operand_const_struct_use(op, aliases), fields, other);
         }
         Rvalue::BinaryOp(_, lhs, rhs) => {
-            bump_const_struct_use(operand_const_struct_use(lhs, dest), fields, other);
-            bump_const_struct_use(operand_const_struct_use(rhs, dest), fields, other);
+            bump_const_struct_use(operand_const_struct_use(lhs, aliases), fields, other);
+            bump_const_struct_use(operand_const_struct_use(rhs, aliases), fields, other);
         }
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
-            if place_references_local(place, dest) {
+            if aliases.iter().any(|&d| place_references_local(place, d)) {
                 *other += 1;
             }
         }
         Rvalue::Len(place) | Rvalue::Discriminant(place) => {
-            if place_is_field_projection_of_local(place, dest) {
+            if aliases
+                .iter()
+                .any(|&d| place_is_field_projection_of_local(place, d))
+            {
                 *fields += 1;
-            } else if place_references_local(place, dest) {
+            } else if aliases.iter().any(|&d| place_references_local(place, d)) {
                 *other += 1;
             }
         }
         Rvalue::Aggregate(_, operands) => {
             for op in operands {
-                bump_const_struct_use(operand_const_struct_use(op, dest), fields, other);
+                bump_const_struct_use(operand_const_struct_use(op, aliases), fields, other);
             }
         }
         Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
     }
 }
 
+fn local_assignment_counts(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
+    let mut counts = vec![0usize; body.locals.locals.len()];
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let PlaceKind::Local(i) = place.kind
+            {
+                if let Some(count) = counts.get_mut(i as usize) {
+                    *count += 1;
+                }
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
+            && let PlaceKind::Local(i) = call.dest.kind
+        {
+            if let Some(count) = counts.get_mut(i as usize) {
+                *count += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Whole-local copies of `dest` that are themselves single-assignment.
+/// The return place is a whole-value consumer and is never an alias.
+fn const_struct_copy_aliases(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    let counts = local_assignment_counts(llbc, body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    let mut aliases = HashSet::from([dest]);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(j) = place.kind else {
+                    continue;
+                };
+                let j = j as usize;
+                if j == 0 || aliases.contains(&j) || counts.get(j).copied() != Some(1) {
+                    continue;
+                }
+                let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = rvalue else {
+                    continue;
+                };
+                let PlaceKind::Local(i) = src.kind else {
+                    continue;
+                };
+                if aliases.contains(&(i as usize)) {
+                    aliases.insert(j);
+                    grew = true;
+                }
+            }
+        }
+    }
+    aliases
+}
+
 /// `fold_op_list` keeps any operation it cannot prove safe. Fold a
-/// const-struct local only when every use is a field read: a projected
-/// store, address-taking, or whole-value consumer leaves the aggregate.
+/// const-struct local only when every use is a field read, including
+/// through single-assignment whole-local copies: a projected store,
+/// address-taking, or whole-value consumer leaves the aggregate.
 fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
     if dest == 0 {
         return false;
     }
+    let aliases = const_struct_copy_aliases(llbc, body, dest);
     let mut fields = 0usize;
     let mut other = 0usize;
     let forward_blocks = forward_reachable_mask(llbc, body);
@@ -67034,16 +67417,18 @@ fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usi
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_const_struct(&rvalue, dest, &mut fields, &mut other);
-                    if matches!(place.kind, PlaceKind::Local(i) if i as usize == dest) {
-                    } else if place_is_field_projection_of_local(&place, dest)
-                        || place_references_local(&place, dest)
+                    if rvalue_is_const_struct_alias_copy(&rvalue, &place, &aliases) {
+                        continue;
+                    }
+                    scan_rvalue_const_struct(&rvalue, &aliases, &mut fields, &mut other);
+                    if matches!(place.kind, PlaceKind::Local(i) if aliases.contains(&(i as usize)))
                     {
+                    } else if place_is_const_struct_alias(&place, &aliases) {
                         other += 1;
                     }
                 }
                 Ok(StmtKind::Assert(assert)) => bump_const_struct_use(
-                    operand_const_struct_use(&assert.cond, dest),
+                    operand_const_struct_use(&assert.cond, &aliases),
                     &mut fields,
                     &mut other,
                 ),
@@ -67052,34 +67437,33 @@ fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usi
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_const_struct_use(
-                operand_const_struct_use(&discr, dest),
+                operand_const_struct_use(&discr, &aliases),
                 &mut fields,
                 &mut other,
             ),
             Ok(TermKind::Call { call, .. }) => {
                 if let CallFunc::Dynamic(op) = &call.func {
                     bump_const_struct_use(
-                        operand_const_struct_use(op, dest),
+                        operand_const_struct_use(op, &aliases),
                         &mut fields,
                         &mut other,
                     );
                 }
                 for arg in &call.args {
                     bump_const_struct_use(
-                        operand_const_struct_use(arg, dest),
+                        operand_const_struct_use(arg, &aliases),
                         &mut fields,
                         &mut other,
                     );
                 }
-                if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
-                } else if place_is_field_projection_of_local(&call.dest, dest)
-                    || place_references_local(&call.dest, dest)
+                if matches!(call.dest.kind, PlaceKind::Local(i) if aliases.contains(&(i as usize)))
                 {
+                } else if place_is_const_struct_alias(&call.dest, &aliases) {
                     other += 1;
                 }
             }
             Ok(TermKind::Assert { assert, .. }) => bump_const_struct_use(
-                operand_const_struct_use(&assert.cond, dest),
+                operand_const_struct_use(&assert.cond, &aliases),
                 &mut fields,
                 &mut other,
             ),
@@ -69352,11 +69736,7 @@ fn emit_aggregate_ctor_with_pairs(
             }
             None => value.clone(),
         };
-        let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
-            &ctor.result_owner,
-            &field.name,
-            ValueType::Ref(None),
-        );
+        let ty = positional_ctor_field_value_type(&ctor.result_owner, &field.name);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -69413,11 +69793,7 @@ fn emit_aggregate_ctor(
             }
             None => value.clone(),
         };
-        let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
-            &ctor.result_owner,
-            &field.name,
-            ValueType::Ref(None),
-        );
+        let ty = positional_ctor_field_value_type(&ctor.result_owner, &field.name);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -69442,6 +69818,26 @@ fn emit_aggregate_ctor(
         });
     }
     res
+}
+
+/// `TupleRepr` field bank of a positional ctor write (`rtuple.py`).
+///
+/// [`positional_shape_metadata`] intern's `__pos_N` from the shape
+/// spelling; a raw `*mut usize` item is `int` (`history.py` `getkind`).
+/// The write has to use that same bank so setattr and getattr agree.
+fn positional_ctor_field_value_type(result_owner: &str, field_name: &str) -> ValueType {
+    crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+        result_owner,
+        field_name,
+        positional_shape_metadata(result_owner)
+            .and_then(|(_, attrs)| {
+                attrs
+                    .into_iter()
+                    .find(|(name, _)| name == field_name)
+                    .map(|(_, vt)| vt)
+            })
+            .unwrap_or(ValueType::Ref(None)),
+    )
 }
 
 /// Build `shape` in `block` from operand values already in hand — a call of
@@ -75513,6 +75909,37 @@ mod tests {
         );
     }
 
+    /// `get_array_token` uses the actual array type. An 8-aligned source
+    /// tail must not pick up a 16-aligned `.cast()` dest.
+    #[test]
+    fn array_tail_elem_align_prefers_source_array_over_cast_dest() {
+        assert_eq!(
+            super::Lowering::array_tail_instantiated_elem_align(Some(8), None, Some(16)),
+            Some(8)
+        );
+        assert_eq!(
+            super::Lowering::array_tail_instantiated_elem_align(None, Some(8), Some(16)),
+            Some(8)
+        );
+        assert_eq!(
+            super::Lowering::array_tail_instantiated_elem_align(None, None, Some(8)),
+            Some(8)
+        );
+    }
+
+    /// `direct_arrayitems` constructs a pointer to item zero. Unknown
+    /// items offset stops translation rather than emit a different op.
+    #[test]
+    fn unknown_array_items_offset_stops_direct_arrayitems() {
+        let err = super::Lowering::array_field_items_offset(None, "GcEntries", "items")
+            .expect_err("unknown items offset must stop translation");
+        assert!(err.to_string().contains("direct_arrayitems"), "{err}");
+        assert_eq!(
+            super::Lowering::array_field_items_offset(Some(8), "GcEntries", "items").unwrap(),
+            8
+        );
+    }
+
     /// `entries_item_ptr` of `GcEntries<i64, PyObjectRef>` is
     /// `addr_of_mut!((*header).items).cast()`. The generic `GcEntries`
     /// declaration has no Charon layout and unresolved type variables,
@@ -75622,6 +76049,18 @@ mod tests {
         );
     }
 
+    /// The unsubstituted generic `entries_item_ptr` has TypeVars and no
+    /// Charon layout. Translation stops rather than guess the items
+    /// offset (`array_field_items_offset`).
+    #[test]
+    fn unsubstituted_entries_item_ptr_stops_without_guessing_offset() {
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let err = super::lower_function(&llbc, "entries_item_ptr")
+            .expect_err("generic entries_item_ptr has no items offset");
+        assert!(err.to_string().contains("direct_arrayitems"), "{err}");
+    }
+
     /// A one-word-item Vec header pointer is int-banked, matching
     /// `descr.py get_type_flag` of a raw Ptr and `rrustvec.rs rust_vec_lltype`.
     #[test]
@@ -75631,6 +76070,27 @@ mod tests {
             assert_eq!(
                 super::tuple_field_value_type(spelling),
                 ValueType::Int,
+                "{spelling}"
+            );
+        }
+    }
+
+    /// `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
+    /// `'int'`. A byte pointer stays `Ref` (GC erasure to `*mut u8`).
+    #[test]
+    fn raw_scalar_pointer_tuple_field_is_int_banked() {
+        use crate::model::ValueType;
+        for spelling in ["*mut usize", "*const usize", "*mut i64", "*mut f64"] {
+            assert_eq!(
+                super::tuple_field_value_type(spelling),
+                ValueType::Int,
+                "{spelling}"
+            );
+        }
+        for spelling in ["*mut u8", "*const u8", "*mut *mut usize"] {
+            assert_eq!(
+                super::tuple_field_value_type(spelling),
+                ValueType::Ref(None),
                 "{spelling}"
             );
         }
@@ -89645,6 +90105,144 @@ mod tests {
         );
     }
 
+    /// `(s as *const Utf8Str as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)`
+    /// for `s: &Utf8Str` is still `s.chars` (`ll_stritem_nonneg`).
+    fn header_ref_as_u8_add_chars_offset_fun(header_path: &[&str]) -> Llbc {
+        let u8_ptr = u8_raw_ptr_ty("Const");
+        let header_adt_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": empty_generics()
+            }
+        });
+        let header_ptr = serde_json::json!({
+            "RawPtr": [header_adt_ty, "Const"]
+        });
+        let header_ref = serde_json::json!({
+            "Ref": ["Erased", header_adt_ty, "Shared"]
+        });
+        let usize_t = usize_ty();
+        let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+        let header_adt = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(header_path, "", true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": isize_t, "attr_info": null},
+                {"name": "length", "ty": usize_t, "attr_info": null}
+            ]},
+            "layout": null
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "header_chars_view"], "", true),
+            "signature": {"is_unsafe": true, "inputs": [header_ref], "output": u8_ptr},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": u8_ptr},
+                    {"index": 1, "name": "s", "span": span_json(), "ty": header_ref},
+                    {"index": 2, "name": null, "span": span_json(), "ty": header_ptr},
+                    {"index": 3, "name": null, "span": span_json(), "ty": u8_ptr}
+                ]},
+                "body": [
+                    {
+                        "statements": [
+                            {
+                                "span": span_json(),
+                                "kind": {"Assign": [
+                                    {"kind": {"Local": 2}, "ty": header_ptr},
+                                    {"UnaryOp": [
+                                        {"Cast": {"RawPtr": [header_ref, header_ptr]}},
+                                        {"Move": {"kind": {"Local": 1}, "ty": header_ref}}
+                                    ]}
+                                ]}
+                            },
+                            {
+                                "span": span_json(),
+                                "kind": {"Assign": [
+                                    {"kind": {"Local": 3}, "ty": u8_ptr},
+                                    {"UnaryOp": [
+                                        {"Cast": {"RawPtr": [header_ptr, u8_ptr]}},
+                                        {"Move": {"kind": {"Local": 2}, "ty": header_ptr}}
+                                    ]}
+                                ]}
+                            }
+                        ],
+                        "terminator": {"span": span_json(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Move": {"kind": {"Local": 3}, "ty": u8_ptr}},
+                                {"Copy": {"kind": {"Global": {
+                                    "generics": empty_generics(),
+                                    "id": 1
+                                }}, "ty": usize_t}}
+                            ],
+                            "dest": {"kind": {"Local": 0}, "ty": u8_ptr}
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span_json(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(
+                &["core", "ptr", "const_ptr", "<Impl>", "add"],
+                "",
+                false
+            ),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [u8_ptr, usize_t],
+                "output": u8_ptr
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [header_adt],
+                "fun_decls": [caller, callee],
+                "global_decls": [null, chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET")],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes())
+            .expect("header-ref-as-u8 chars-offset add fixture parses")
+    }
+
+    #[test]
+    fn utf8str_ref_as_u8_add_of_chars_offset_aliases_the_header() {
+        let llbc =
+            header_ref_as_u8_add_chars_offset_fun(&["pyre_object", "unicodeobject", "Utf8Str"]);
+        let graph = super::lower_function(&llbc, "header_chars_view").expect(
+            "lower (&Utf8Str as *const Utf8Str as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)",
+        );
+        assert!(
+            !graph_has_direct_ptradd(&graph),
+            "s.chars from &Utf8Str is the STR, not a displaced byte pointer; graph={graph:#?}"
+        );
+        assert!(
+            !call_leafs(&graph_ops(&graph))
+                .iter()
+                .any(|leaf| *leaf == "add"),
+            "the header-ref chars add must not residualize; graph={graph:#?}"
+        );
+    }
+
     #[test]
     fn other_module_utf8str_as_u8_add_of_chars_offset_stays_direct_ptradd() {
         let llbc = header_as_u8_add_chars_offset_fun(&["other_crate", "Utf8Str"]);
@@ -91512,10 +92110,12 @@ mod tests {
         }
     }
 
-    /// A GC pointer fed to `direct_ptradd` stays a pointer. `cast_ptr_to_int`
-    /// would make `ann_direct_ptradd` see `Integer`.
+    /// A GC / classdef-less pointer fed to `direct_ptradd` is `rffi.cast`
+    /// onto `CArrayPtr` (`cast_ptr_to_int` then `cast_int_to_ptr`) so
+    /// `ann_direct_ptradd` sees `SomePtr`. `cast_ptr_to_int` alone would
+    /// make the operand `Integer`.
     #[test]
-    fn push_direct_ptradd_keeps_a_gc_pointer_operand() {
+    fn push_direct_ptradd_rffi_casts_a_gc_pointer_operand() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let ptr = graph
@@ -91531,30 +92131,68 @@ mod tests {
             count,
             &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
         );
-        let call = graph.block(entry).operations.last().unwrap();
+        let ops = &graph.block(entry).operations;
+        let leaves: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            leaves.contains(&"cast_ptr_to_int"),
+            "rffi.cast starts at cast_ptr_to_int, got {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&"cast_int_to_ptr"),
+            "rffi.cast ends at cast_int_to_ptr, got {leaves:?}"
+        );
+        let raw = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("cast_int_to_ptr") => {
+                    assert_eq!(
+                        args.len(),
+                        2,
+                        "rffi.cast emits cast_int_to_ptr(PTRTYPE, int)"
+                    );
+                    assert!(
+                        matches!(
+                            &args[0],
+                            crate::model::LinkArg::Const(c)
+                                if matches!(
+                                    c.value,
+                                    crate::flowspace::model::ConstValue::LowLevelType(_)
+                                )
+                        ),
+                        "PtrT is the CArrayPtr constant, got {:?}",
+                        args[0]
+                    );
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("cast_int_to_ptr result");
+        let call = ops.last().unwrap();
         match &call.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
                 result_ty: ValueType::Int,
             } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
-                assert_eq!(args[0], crate::model::LinkArg::Value(ptr));
+                assert_eq!(args[0], crate::model::LinkArg::Value(raw));
+                assert_ne!(args[0], crate::model::LinkArg::Value(ptr));
                 assert_eq!(call.result.as_ref(), Some(&result));
             }
             other => panic!("expected pointer direct_ptradd, got {other:?}"),
         }
-        assert!(
-            graph.block(entry).operations.iter().all(|op| {
-                !matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments.iter().any(|s| s == "cast_ptr_to_int")
-                )
-            }),
-            "direct_ptradd must not integerize its pointer"
-        );
     }
 
     #[test]
@@ -108719,9 +109357,30 @@ mod tests {
         assert!(!accepts(&address, 1), "address-taking");
 
         let whole = body_of(vec![stmt(serde_json::json!({
-            "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+            "Assign": [place_local(2), {"Discriminant": place_local(1)}]
         }))]);
         assert!(!accepts(&whole, 1), "whole-value consumer");
+
+        let copy_then_field = body_of(vec![
+            stmt(serde_json::json!({
+                "Assign": [place_local(2), {"Use": [{"Copy": place_local(1)}, "No"]}]
+            })),
+            stmt(serde_json::json!({
+                "Assign": [place_local(0), {"Use": [{"Copy": field_place(2, 0)}, "No"]}]
+            })),
+        ]);
+        assert!(
+            accepts(&copy_then_field, 1),
+            "single-assignment copy then field read"
+        );
+
+        let copy_to_ret = body_of(vec![stmt(serde_json::json!({
+            "Assign": [place_local(0), {"Use": [{"Copy": place_local(1)}, "No"]}]
+        }))]);
+        assert!(
+            !accepts(&copy_to_ret, 1),
+            "copy to the return place is a whole-value consumer"
+        );
 
         assert!(
             !accepts(&reads, 0),
@@ -108817,6 +109476,55 @@ mod tests {
         ])
     }
 
+    fn identity_crate_item(crate_name: &str, item: &str) -> serde_json::Value {
+        serde_json::json!([
+            {"Ident": [crate_name, 0]},
+            {"Ident": [item, 0]}
+        ])
+    }
+
+    fn identity_bare_item(item: &str) -> serde_json::Value {
+        serde_json::json!([{"Ident": [item, 0]}])
+    }
+
+    fn identity_unqualified_instantiated_name(
+        item: &str,
+        types: serde_json::Value,
+        consts: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!([
+            {"Ident": [item, 0]},
+            {"Instantiated": {"params": {}, "kind": "Other", "skip_binder": {
+                "regions": [],
+                "types": types,
+                "const_generics": consts,
+                "trait_refs": []
+            }}}
+        ])
+    }
+
+    fn identity_fn_ptr_ty(
+        inputs: Vec<serde_json::Value>,
+        output: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": inputs,
+                    "output": output,
+                    "is_unsafe": false
+                }
+            }
+        })
+    }
+
+    fn identity_char_const(value: &str) -> serde_json::Value {
+        serde_json::json!([[
+            {"Char": value},
+            {"Scalar": "Char"}
+        ]])
+    }
+
     fn identity_signed(kind: &str) -> serde_json::Value {
         serde_json::json!({"Scalar": {"Integer": {"Signed": kind}}})
     }
@@ -108899,6 +109607,21 @@ mod tests {
                 }),
             _ => None,
         }
+    }
+
+    fn published_field_adt_id<'a>(
+        llbc: &'a Llbc,
+        id: u64,
+        field: &str,
+    ) -> Option<&'a serde_json::Value> {
+        published_field_ty(llbc, id, field)?.get("Adt")?.get("id")
+    }
+
+    fn dest_kind_is_opaque(llbc: &Llbc, id: u64) -> bool {
+        matches!(
+            llbc.type_by_id(id).map(|td| &td.kind),
+            Some(majit_charon_reader::ullbc::TypeDeclKind::Opaque)
+        )
     }
 
     /// Two monomorphizations of one generic struct keep their own field
@@ -109116,6 +109839,352 @@ mod tests {
         assert_ne!(
             nested_four_id, nested_eight_id,
             "nested const generics must distinguish Outer<Container<T,4>> from Outer<Container<T,8>>: {nested_four_id} vs {nested_eight_id}"
+        );
+    }
+
+    /// A `monomorphize:false` field `Generic<T>` is keyed by the template
+    /// path; the use-site TypeDeclRef still carries the arguments.
+    #[test]
+    fn published_field_generic_adt_falls_back_to_template_path() {
+        let i32_ty = identity_signed("I32");
+        let defining = llbc_with_types(
+            "crate_a",
+            vec![
+                identity_struct_decl(
+                    0,
+                    identity_crate_item("crate_a", "Generic"),
+                    "mark",
+                    i32_ty.clone(),
+                ),
+                identity_struct_decl(
+                    1,
+                    identity_crate_item("crate_a", "Outer"),
+                    "inner",
+                    identity_adt_use(
+                        0,
+                        serde_json::json!([i32_ty.clone()]),
+                        serde_json::json!([]),
+                    ),
+                ),
+            ],
+            vec![],
+        );
+        let rows = super::harvest_published_structs(&defining);
+        let mut dest = llbc_with_types(
+            "crate_c",
+            vec![
+                identity_opaque_decl(0, identity_crate_item("crate_a", "Generic")),
+                identity_opaque_decl(1, identity_crate_item("crate_a", "Outer")),
+            ],
+            vec![],
+        );
+        super::apply_published_structs(&mut dest, &rows);
+        let inner_id = published_field_adt_id(&dest, 1, "inner");
+        assert_eq!(
+            inner_id.and_then(serde_json::Value::as_u64),
+            Some(0),
+            "Generic<i32> must remap onto the dest template Generic: {inner_id:?}"
+        );
+    }
+
+    /// `lltype.FuncType` ARGS/RESULT distinguish two function-pointer
+    /// instantiations of one wrapper.
+    #[test]
+    fn published_structs_fn_ptr_args_keep_distinct_identities() {
+        let i32_ty = identity_signed("I32");
+        let i64_ty = identity_signed("I64");
+        let fn_i32 = identity_fn_ptr_ty(vec![i32_ty.clone()], i32_ty.clone());
+        let fn_i64 = identity_fn_ptr_ty(vec![], i64_ty.clone());
+        let defining = llbc_with_types(
+            "crate_a",
+            vec![
+                identity_struct_decl(
+                    0,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Wrapper",
+                        serde_json::json!([fn_i32.clone()]),
+                        serde_json::json!([]),
+                    ),
+                    "from_i32",
+                    i32_ty.clone(),
+                ),
+                identity_struct_decl(
+                    1,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Wrapper",
+                        serde_json::json!([fn_i64.clone()]),
+                        serde_json::json!([]),
+                    ),
+                    "from_i64",
+                    i64_ty.clone(),
+                ),
+            ],
+            vec![],
+        );
+        let rows = super::harvest_published_structs(&defining);
+        let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(paths.len(), 2, "both wrappers must publish: {paths:?}");
+        assert_ne!(
+            paths[0], paths[1],
+            "fn-pointer arguments must distinguish the identities: {paths:?}"
+        );
+
+        let mut dest = llbc_with_types(
+            "crate_c",
+            vec![
+                identity_opaque_decl(
+                    0,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Wrapper",
+                        serde_json::json!([fn_i32]),
+                        serde_json::json!([]),
+                    ),
+                ),
+                identity_opaque_decl(
+                    1,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Wrapper",
+                        serde_json::json!([fn_i64]),
+                        serde_json::json!([]),
+                    ),
+                ),
+            ],
+            vec![],
+        );
+        super::apply_published_structs(&mut dest, &rows);
+        assert_eq!(
+            published_field_ty(&dest, 0, "from_i32"),
+            Some(&i32_ty),
+            "Wrapper<fn(i32) -> i32> must keep its own field"
+        );
+        assert_eq!(
+            published_field_ty(&dest, 1, "from_i64"),
+            Some(&i64_ty),
+            "Wrapper<fn() -> i64> must keep its own field"
+        );
+    }
+
+    /// A bare `Foo` row makes the `Foo` suffix ambiguous with `crate_a::Foo`.
+    #[test]
+    fn published_structs_unprefixed_identity_counts_in_suffix_uniqueness() {
+        let i32_ty = identity_signed("I32");
+        let i64_ty = identity_signed("I64");
+        let defining_a = llbc_with_types(
+            "crate_a",
+            vec![
+                identity_struct_decl(
+                    0,
+                    identity_crate_item("crate_a", "Foo"),
+                    "from_a",
+                    i32_ty.clone(),
+                ),
+                identity_struct_decl(
+                    1,
+                    identity_crate_item("crate_a", "Wrapper"),
+                    "inner",
+                    identity_adt_use(0, serde_json::json!([]), serde_json::json!([])),
+                ),
+            ],
+            vec![],
+        );
+        let defining_bare = llbc_with_types(
+            "bare",
+            vec![identity_struct_decl(
+                0,
+                identity_bare_item("Foo"),
+                "from_bare",
+                i64_ty.clone(),
+            )],
+            vec![],
+        );
+        let mut rows = super::harvest_published_structs(&defining_a);
+        rows.extend(super::harvest_published_structs(&defining_bare));
+        let mut dest = llbc_with_types(
+            "crate_b",
+            vec![
+                identity_opaque_decl(0, identity_bare_item("Foo")),
+                identity_opaque_decl(1, identity_crate_item("crate_b", "Foo")),
+                identity_opaque_decl(2, identity_crate_item("crate_a", "Wrapper")),
+            ],
+            vec![],
+        );
+        super::apply_published_structs(&mut dest, &rows);
+        assert_eq!(
+            published_field_ty(&dest, 0, "from_bare"),
+            Some(&i64_ty),
+            "the exact unprefixed Foo identity still matches"
+        );
+        assert!(
+            dest_kind_is_opaque(&dest, 1),
+            "crate_b::Foo must stay opaque when Foo and crate_a::Foo both publish"
+        );
+        let inner_id = published_field_adt_id(&dest, 2, "inner");
+        assert!(
+            inner_id.and_then(|id| id.get("Path")).is_some(),
+            "an ambiguous Foo dest must leave the nested ADT as Path: {inner_id:?}"
+        );
+    }
+
+    /// `lltype.Char` is a distinct primitive; two char const instantiations
+    /// keep their own bodies.
+    #[test]
+    fn published_structs_char_const_args_keep_distinct_identities() {
+        let i32_ty = identity_signed("I32");
+        let i64_ty = identity_signed("I64");
+        let defining = llbc_with_types(
+            "crate_a",
+            vec![
+                identity_struct_decl(
+                    0,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Outer",
+                        serde_json::json!([]),
+                        identity_char_const("a"),
+                    ),
+                    "from_a",
+                    i32_ty.clone(),
+                ),
+                identity_struct_decl(
+                    1,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Outer",
+                        serde_json::json!([]),
+                        identity_char_const("b"),
+                    ),
+                    "from_b",
+                    i64_ty.clone(),
+                ),
+            ],
+            vec![],
+        );
+        let rows = super::harvest_published_structs(&defining);
+        let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(
+            paths.len(),
+            2,
+            "both Outer instantiations must publish: {paths:?}"
+        );
+        assert_ne!(
+            paths[0], paths[1],
+            "char const arguments must distinguish the identities: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|path| path.contains("char:a"))
+                && paths.iter().any(|path| path.contains("char:b")),
+            "identities must carry the char const: {paths:?}"
+        );
+
+        let mut dest = llbc_with_types(
+            "crate_c",
+            vec![
+                identity_opaque_decl(
+                    0,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Outer",
+                        serde_json::json!([]),
+                        identity_char_const("a"),
+                    ),
+                ),
+                identity_opaque_decl(
+                    1,
+                    identity_instantiated_name(
+                        "crate_a",
+                        "Outer",
+                        serde_json::json!([]),
+                        identity_char_const("b"),
+                    ),
+                ),
+            ],
+            vec![],
+        );
+        super::apply_published_structs(&mut dest, &rows);
+        assert_eq!(
+            published_field_ty(&dest, 0, "from_a"),
+            Some(&i32_ty),
+            "Outer<'a'> must keep its own field"
+        );
+        assert_eq!(
+            published_field_ty(&dest, 1, "from_b"),
+            Some(&i64_ty),
+            "Outer<'b'> must keep its own field"
+        );
+    }
+
+    /// `LowLevelType.__eq__` compares the outer type; a `::` inside a
+    /// generic argument is not a crate prefix.
+    #[test]
+    fn published_structs_crate_prefix_does_not_split_inside_generic_args() {
+        let i32_ty = identity_signed("I32");
+        let t_use = identity_adt_use(0, serde_json::json!([]), serde_json::json!([]));
+        let defining = llbc_with_types(
+            "crate_a",
+            vec![
+                identity_struct_decl(
+                    0,
+                    identity_crate_item("dep", "T"),
+                    "payload",
+                    i32_ty.clone(),
+                ),
+                identity_struct_decl(
+                    1,
+                    identity_unqualified_instantiated_name(
+                        "WrapA",
+                        serde_json::json!([t_use.clone()]),
+                        serde_json::json!([]),
+                    ),
+                    "from_a",
+                    i32_ty.clone(),
+                ),
+            ],
+            vec![],
+        );
+        let rows = super::harvest_published_structs(&defining);
+        assert!(
+            rows.iter()
+                .any(|row| row.path.starts_with("WrapA<") && row.path.contains("dep::T")),
+            "WrapA identity must keep the qualified argument: {:?}",
+            rows.iter().map(|row| &row.path).collect::<Vec<_>>()
+        );
+
+        let mut dest = llbc_with_types(
+            "crate_c",
+            vec![
+                identity_opaque_decl(0, identity_crate_item("dep", "T")),
+                identity_opaque_decl(
+                    1,
+                    identity_unqualified_instantiated_name(
+                        "WrapA",
+                        serde_json::json!([t_use.clone()]),
+                        serde_json::json!([]),
+                    ),
+                ),
+                identity_opaque_decl(
+                    2,
+                    identity_unqualified_instantiated_name(
+                        "WrapB",
+                        serde_json::json!([t_use]),
+                        serde_json::json!([]),
+                    ),
+                ),
+            ],
+            vec![],
+        );
+        super::apply_published_structs(&mut dest, &rows);
+        assert_eq!(
+            published_field_ty(&dest, 1, "from_a"),
+            Some(&i32_ty),
+            "WrapA<dep::T> must still receive its published fields"
+        );
+        assert!(
+            dest_kind_is_opaque(&dest, 2),
+            "WrapB<dep::T> must not take WrapA's body via a suffix split inside the argument"
         );
     }
 }
