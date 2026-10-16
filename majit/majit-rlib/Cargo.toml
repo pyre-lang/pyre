@@ -24,8 +24,17 @@ rustpython-host_env = { workspace = true, optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = { workspace = true }
 
+# `libffi = { version = "5", features = ["system"] }` maps `system` onto
+# `libffi-sys/system`. libffi-sys finds/links the system libffi (or builds
+# the bundled copy on MSVC); clibffi's ECI therefore has no `libraries`.
+[target.'cfg(any(unix, windows))'.dependencies]
+libffi-sys = { version = "4.2.0", features = ["system"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ctor = { workspace = true }
 
 [dev-dependencies]
 malachite-bigint = { workspace = true }
+
+[build-dependencies]
+cc = "1.2"

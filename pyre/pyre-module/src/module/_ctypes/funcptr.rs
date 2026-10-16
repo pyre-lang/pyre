@@ -3,29 +3,33 @@
 //! `__new__` resolves and stores a function-pointer address (`"_ptr"`) from a
 //! `(name, dll)` pair, a bare integer address, or nothing (NULL).  `__call__`
 //! marshals scalar Python arguments into libffi values and performs the call
-//! through `host_env`, then decodes the scalar result.
+//! through [`super::callproc`], then decodes the scalar result.
 //!
-//! All host/FFI work is delegated to `rustpython_host_env::ctypes`.  Arguments
-//! are marshalled into `CallArg`s and the return type into a `CallRet`, then the
-//! call runs through the single `call` entry point, which performs the libffi
-//! call and decodes the result.  By-reference arguments — `byref()` carriers,
-//! `_Pointer`/`Array` instances, and pointer-typed cdata — lower to
-//! `CallArg::Pointer(addr)`; by-value struct/union arguments and returns lower
-//! to `CallArg::Aggregate` / `CallRet::Aggregate`; a pointer-typed `restype`
-//! wraps the returned address in a fresh instance.
+//! Arguments are marshalled into `CallArg`s and the return type into a
+//! `CallRet`, then the call runs through `_call_function_pointer`.  By-reference
+//! arguments — `byref()` carriers, `_Pointer`/`Array` instances, and
+//! pointer-typed cdata — lower to `CallArg::Pointer(addr)`; by-value
+//! struct/union arguments and returns lower to `CallArg::Aggregate` /
+//! `CallRet::Aggregate`; a pointer-typed `restype` wraps the returned address
+//! in a fresh instance.
 
+use super::callproc::{
+    self, CTypeLayout, CallArg, CallError, CallOptions, CallRet, CallValue, PreparedFuncPtr,
+};
 use super::cdata::{self, TypeCode};
 use super::stginfo::{self, ParamFunc};
 use pyre_object::PyObjectRef;
-use rustpython_host_env::ctypes as host_ctypes;
+
+use super::cfield;
+use super::ctypes_h;
 
 /// `_flags_ & FUNCFLAG_USE_ERRNO` — swap the ctypes-local errno around the call.
-pub(super) const FUNCFLAG_USE_ERRNO: i64 = host_ctypes::FUNCFLAG_USE_ERRNO as i64;
+pub(super) const FUNCFLAG_USE_ERRNO: i64 = ctypes_h::FUNCFLAG_USE_ERRNO as i64;
 
 /// `_flags_ & FUNCFLAG_USE_LASTERROR` — swap the ctypes-local last error
 /// around the call, so `ctypes.get_last_error()` reports what the callee set
 /// and no call made since can have overwritten it.
-pub(super) const FUNCFLAG_USE_LASTERROR: i64 = host_ctypes::FUNCFLAG_USE_LASTERROR as i64;
+pub(super) const FUNCFLAG_USE_LASTERROR: i64 = ctypes_h::FUNCFLAG_USE_LASTERROR as i64;
 
 /// The `restype` a CDLL function has when none is declared: `c_int`.
 const DEFAULT_RESTYPE_CODE: TypeCode = TypeCode::from_char('i');
@@ -40,6 +44,8 @@ const PARAMFLAGS_KEY: &str = "_paramflags";
 /// Reserved instance-dict key holding what the declarations have settled about
 /// this function's calls — see [`Settled`].
 const PLAN_KEY: &str = "_plan";
+/// Reserved instance-dict key holding the prepared `RawFuncPtr` (`W_FuncPtr.func`).
+const FUNC_KEY: &str = "_func";
 #[cfg(windows)]
 const INDEX_KEY: &str = "_index";
 #[cfg(windows)]
@@ -75,6 +81,7 @@ pub(super) fn cfuncptr_type() -> PyObjectRef {
         );
         unsafe {
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            pyre_object::w_type_set_weakrefable(tp, true);
             // PyPy `function.py:CFuncPtr.__metaclass__ = CFuncPtrType`.
             pyre_object::typeobject::w_type_set_w_class(
                 tp,
@@ -186,6 +193,21 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
         "__bool__",
         pyre_interpreter::make_builtin_function("__bool__", cfuncptr_bool)
     );
+    pyre_interpreter::__pyre_store!(
+        ns,
+        "__del__",
+        pyre_interpreter::make_builtin_function("__del__", cfuncptr_del)
+    );
+}
+
+fn cfuncptr_del(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    if let Some(&obj) = args.first() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = _roots.pin_roots(&[obj]);
+        super::callbacks::free_thunk(_roots.get(obj_slot));
+        free_prepared(_roots.get(obj_slot));
+    }
+    Ok(pyre_object::w_none())
 }
 
 /// A COM method says which vtable slot it is; everything else reports the
@@ -321,7 +343,7 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     };
     let obj = cdata::new_cdata_obj_from_bytes(
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        host_ctypes::pointer_size(),
+        cfield::pointer_size(),
         &[],
     )?;
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -376,35 +398,150 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
 
 /// The borrow a marshalled argument is handed to the call as; the borrow ends
 /// with the call, and `owned` outlives it.
-fn owned_arg_as_call_arg(arg: &OwnedArg) -> host_ctypes::CallArg<'_> {
+fn owned_arg_as_call_arg(arg: &OwnedArg) -> CallArg<'_> {
     match arg {
-        OwnedArg::Typed(code, buf) => host_ctypes::CallArg::Typed {
+        OwnedArg::Typed(code, buf) => CallArg::Typed {
             code: code.as_str(),
             buffer: buf.as_slice(),
         },
-        OwnedArg::Int(v) => host_ctypes::CallArg::Int(*v),
-        OwnedArg::Double(v) => host_ctypes::CallArg::Double(*v),
-        OwnedArg::Pointer(v) => host_ctypes::CallArg::Pointer(*v),
-        OwnedArg::Aggregate(layout, buf) => host_ctypes::CallArg::Aggregate {
+        OwnedArg::Int(v) => CallArg::Int(*v),
+        OwnedArg::Double(v) => CallArg::Double(*v),
+        OwnedArg::Pointer(v) => CallArg::Pointer(*v),
+        OwnedArg::Aggregate(layout, buf) => CallArg::Aggregate {
             layout,
             buffer: buf.as_slice(),
         },
     }
 }
 
-fn call_error(e: host_ctypes::CallError) -> pyre_interpreter::PyError {
+fn call_error(e: CallError) -> pyre_interpreter::PyError {
     match e {
-        host_ctypes::CallError::NullFunctionPointer => {
+        CallError::NullFunctionPointer => {
             pyre_interpreter::PyError::value_error("NULL function pointer")
         }
-        host_ctypes::CallError::UnknownTypeCode(c) => {
+        CallError::UnknownTypeCode(c) => {
             pyre_interpreter::PyError::type_error(format!("unsupported type code {c:?}"))
         }
-        host_ctypes::CallError::BufferTooSmall { expected, got } => {
-            pyre_interpreter::PyError::value_error(format!(
-                "aggregate argument buffer too small: expected {expected}, got {got}"
-            ))
+        CallError::BufferTooSmall { expected, got } => pyre_interpreter::PyError::value_error(
+            format!("aggregate argument buffer too small: expected {expected}, got {got}"),
+        ),
+        CallError::LibFFI(err) => pyre_interpreter::PyError::runtime_error(err.call_message()),
+    }
+}
+
+pub(super) fn call_error_to_py(e: CallError) -> pyre_interpreter::PyError {
+    call_error(e)
+}
+
+pub(super) fn clear_thunk_ptr(obj: PyObjectRef) {
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, "_thunk") };
+}
+
+/// Native owner of the prepared `RawFuncPtr` (`interp_funcptr.py W_FuncPtr.func`).
+/// Stored as an integer in the instance dict, the same way `_thunk` is.
+struct NativeFuncState {
+    prepared: Option<PreparedFuncPtr>,
+}
+
+fn native_func_state_ptr(dict: PyObjectRef) -> Option<*mut NativeFuncState> {
+    let stored = unsafe { pyre_object::w_dict_getitem_str(dict, FUNC_KEY) }?;
+    if !unsafe { pyre_object::is_int(stored) } {
+        return None;
+    }
+    let ptr = unsafe { pyre_object::w_int_get_value(stored) } as usize;
+    (ptr != 0).then_some(ptr as *mut NativeFuncState)
+}
+
+/// `function.py CFuncPtr._setargtypes` / `_setrestype` — drop the kept cif.
+fn clear_prepared_in_dict(dict: PyObjectRef) {
+    if let Some(ptr) = native_func_state_ptr(dict) {
+        unsafe { (*ptr).prepared = None };
+    }
+}
+
+fn free_prepared(obj: PyObjectRef) {
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return;
+    }
+    let Some(ptr) = native_func_state_ptr(d) else {
+        return;
+    };
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, FUNC_KEY) };
+    unsafe { drop(Box::from_raw(ptr)) };
+}
+
+fn store_native_func_state(obj: PyObjectRef, ptr: usize) -> Result<(), pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let w_ptr = pyre_object::w_int_new(ptr as i64);
+    let ptr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_ptr);
+    let d = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    );
+    if d.is_null() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "CFuncPtr instance has no instance dict",
+        ));
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            d,
+            FUNC_KEY,
+            pyre_object::gc_roots::shadow_stack_get(ptr_slot),
+        )
+    };
+    Ok(())
+}
+
+/// Take the kept cif out of the instance (`function.py CFuncPtr._ptr` lives in
+/// the caller's frame for the duration of the call).
+fn take_prepared(obj: PyObjectRef) -> Result<Option<PreparedFuncPtr>, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let current = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let d = pyre_interpreter::baseobjspace::getdict_native(current());
+    if d.is_null() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "CFuncPtr instance has no instance dict",
+        ));
+    }
+    let ptr = match native_func_state_ptr(d) {
+        Some(ptr) => ptr,
+        None => {
+            let ptr = Box::into_raw(Box::new(NativeFuncState { prepared: None }));
+            if let Err(err) = store_native_func_state(current(), ptr as usize) {
+                unsafe { drop(Box::from_raw(ptr)) };
+                return Err(err);
+            }
+            pyre_interpreter::executioncontext::register_finalizer(current());
+            ptr
         }
+    };
+    Ok(unsafe { (*ptr).prepared.take() })
+}
+
+/// Store the kept cif back through a fresh dict lookup: `__del__` may have
+/// dropped the box during the call (`function.py CFuncPtr._ptr`).
+fn put_prepared(obj: PyObjectRef, prepared: Option<PreparedFuncPtr>) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    );
+    if d.is_null() {
+        return;
+    }
+    if let Some(ptr) = native_func_state_ptr(d) {
+        unsafe { (*ptr).prepared = prepared };
     }
 }
 
@@ -487,6 +624,8 @@ fn instance_set(obj: PyObjectRef, key: &str, mut value: PyObjectRef) {
             pyre_object::gc_roots::shadow_stack_get(value_slot),
         );
         drop_settled(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        // `function.py CFuncPtr._setargtypes` / `_setrestype` drop `self._ptr`.
+        clear_prepared_in_dict(pyre_object::gc_roots::shadow_stack_get(dict_slot));
     }
 }
 
@@ -839,6 +978,7 @@ fn instance_del(obj: PyObjectRef, key: &str) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_delitem_str(d, key);
         drop_settled(d);
+        clear_prepared_in_dict(d);
     }
 }
 
@@ -958,11 +1098,11 @@ fn wrap_pointer_result(
     let _ = pyre_object::gc_roots::pin_root(d);
     let obj_slot = dict_slot + 1;
     let _ = pyre_object::gc_roots::pin_root(obj);
-    let psize = host_ctypes::pointer_size();
+    let psize = cfield::pointer_size();
     let ba = pyre_object::w_bytearray_new(psize);
-    let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
+    let bytes = cfield::simple_storage_value_to_bytes_endian(
         "P",
-        host_ctypes::SimpleStorageValue::Pointer(p),
+        cfield::SimpleStorageValue::Pointer(p),
         false,
     );
     let n = bytes.len().min(psize);
@@ -1161,9 +1301,9 @@ pub(super) fn store_funcptr_addr(
         // The address a plan calls through is the one being replaced here.
         drop_settled(pyre_object::gc_roots::shadow_stack_get(dict_slot));
     };
-    let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
+    let bytes = cfield::simple_storage_value_to_bytes_endian(
         "P",
-        host_ctypes::SimpleStorageValue::Pointer(addr),
+        cfield::SimpleStorageValue::Pointer(addr),
         false,
     );
     cdata::cdata_write(pyre_object::gc_roots::shadow_stack_get(obj_slot), 0, &bytes);
@@ -1178,7 +1318,7 @@ enum OwnedArg {
     Double(f64),
     Pointer(usize),
     /// A by-value aggregate: its recursive layout and a copy of its bytes.
-    Aggregate(host_ctypes::CTypeLayout, Vec<u8>),
+    Aggregate(CTypeLayout, Vec<u8>),
 }
 
 pub(super) fn is_simple_subclass(ty: PyObjectRef) -> bool {
@@ -1462,7 +1602,15 @@ fn cfuncptr_call_from(
 
     let ret = resolve_restype(pyre_object::gc_roots::shadow_stack_get(self_slot))?;
     let flags = funcptr_flags(pyre_object::gc_roots::shadow_stack_get(self_slot));
-    let result = invoke(call_address(addr, com), &owned, ret, flags)?;
+    let argtypecount = argtypes.as_ref().map(|a| a.len()).unwrap_or(0);
+    let result = invoke(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        call_address(addr, com),
+        &owned,
+        ret,
+        flags,
+        argtypecount,
+    )?;
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
     // A COM method constructed with an interface id answers the plain status,
@@ -1574,11 +1722,15 @@ fn plan_of_call(
 /// Hand the marshalled arguments to the foreign function and answer its raw
 /// result.
 fn invoke(
+    self_obj: PyObjectRef,
     addr: usize,
     owned: &[OwnedArg],
     ret: Ret,
     flags: i64,
-) -> Result<host_ctypes::CallValue, pyre_interpreter::PyError> {
+    argtypecount: usize,
+) -> Result<CallValue, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = _roots.pin_roots(&[self_obj]);
     // Build the aggregate return layout (if any) up front so it outlives the
     // borrowed `CallRet` handed to the call.
     let ret_layout = match &ret {
@@ -1586,20 +1738,20 @@ fn invoke(
         _ => None,
     };
     let restype = match &ret {
-        Ret::Void => host_ctypes::CallRet::Void,
-        Ret::Code(c) => host_ctypes::CallRet::Code(c.as_str()),
-        Ret::Pointer(_) => host_ctypes::CallRet::Code("P"),
-        Ret::Aggregate(_) => host_ctypes::CallRet::Aggregate(
-            ret_layout.as_ref().expect("aggregate restype has a layout"),
-        ),
+        Ret::Void => CallRet::Void,
+        Ret::Code(c) => CallRet::Code(c.as_str()),
+        Ret::Pointer(_) => CallRet::Code("P"),
+        Ret::Aggregate(_) => {
+            CallRet::Aggregate(ret_layout.as_ref().expect("aggregate restype has a layout"))
+        }
     };
 
     // Borrow the owned data as `CallArg`s; these borrows end with the call.
     // A signature no wider than the inline row is handed over without a heap
     // allocation of its own, which is otherwise a whole allocation per call.
-    let mut inline = [host_ctypes::CallArg::Int(0); INLINE_CALL_ARGS];
-    let mut spilled: Vec<host_ctypes::CallArg> = Vec::new();
-    let host_args: &[host_ctypes::CallArg] = if owned.len() <= INLINE_CALL_ARGS {
+    let mut inline = [CallArg::Int(0); INLINE_CALL_ARGS];
+    let mut spilled: Vec<CallArg> = Vec::new();
+    let host_args: &[CallArg] = if owned.len() <= INLINE_CALL_ARGS {
         for (slot, arg) in inline.iter_mut().zip(owned) {
             *slot = owned_arg_as_call_arg(arg);
         }
@@ -1609,22 +1761,31 @@ fn invoke(
         &spilled
     };
 
-    let options = host_ctypes::CallOptions {
+    let options = CallOptions {
         use_errno: flags & FUNCFLAG_USE_ERRNO != 0,
         use_last_error: flags & FUNCFLAG_USE_LASTERROR != 0,
+        flags,
+        argtypecount,
     };
-    // `clibffi.py:350-352` declares `ffi_call` with the default
+    // `clibffi.py c_ffi_call` declares `ffi_call` with the default
     // `releasegil='auto'`, i.e. released: the callee is arbitrary foreign code
     // and may block on another Python thread's progress.  The caller's `owned`
     // / `keepalive` hold the marshalled buffers across the released window.
     // Being arbitrary foreign code is also why the call goes inside
     // `seh::guard`, which is what stands between a faulting callee and the
     // process.
+    let local = take_prepared(_roots.get(obj_slot))?;
     let result = {
         let _blocked = pyre_interpreter::module::thread::before_external_block();
-        super::seh::guard(|| host_ctypes::call(addr, host_args, restype, options))
+        super::seh::guard(|| callproc::call_with_prepared(addr, host_args, restype, options, local))
     };
-    result?.map_err(call_error)
+    match result {
+        Ok((call_result, returned)) => {
+            put_prepared(_roots.get(obj_slot), returned);
+            call_result.map_err(call_error)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// `__call__` for a function whose declarations have already settled into a
@@ -1648,10 +1809,11 @@ fn call_settled(
     // marshalling an argument can collect, so each is read from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
     let inargs_base = _roots.pin_roots(inargs);
+    let self_slot = _roots.pin_roots(&[self_obj]);
     // Only a pointer argtype is still wanted as an object; a simple one is
     // fully described by the code the plan carries.
     let argtypes = if kinds.contains(&ArgKind::Pointer) {
-        let argtypes = resolve_argtypes(self_obj);
+        let argtypes = resolve_argtypes(_roots.get(self_slot));
         if argtypes.as_ref().is_none_or(|at| at.len() < kinds.len()) {
             return Ok(None);
         }
@@ -1674,7 +1836,14 @@ fn call_settled(
             None => marshal_default_arg(arg, &mut keepalive)?,
         });
     }
-    let result = invoke(plan.addr, &owned, plan.ret, plan.flags)?;
+    let result = invoke(
+        _roots.get(self_slot),
+        plan.addr,
+        &owned,
+        plan.ret,
+        plan.flags,
+        kinds.len(),
+    )?;
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
     build_return_value(plan.ret, result).map(Some)
@@ -1683,9 +1852,9 @@ fn call_settled(
 /// The status word a returned scalar carries.  A COM method answers an
 /// `HRESULT` whatever its declared restype would otherwise make of the bytes.
 #[allow(dead_code)]
-fn scalar_int_result(result: &host_ctypes::CallValue) -> i32 {
+fn scalar_int_result(result: &CallValue) -> i32 {
     let mut word = [0u8; 4];
-    if let host_ctypes::CallValue::Scalar(bytes) = result {
+    if let CallValue::Scalar(bytes) = result {
         let n = bytes.len().min(word.len());
         word[..n].copy_from_slice(&bytes[..n]);
     }
@@ -1703,7 +1872,7 @@ fn scalar_int_result(result: &host_ctypes::CallValue) -> i32 {
 fn com_status(
     obj: PyObjectRef,
     com: Option<(usize, usize)>,
-    result: &host_ctypes::CallValue,
+    result: &CallValue,
 ) -> Option<Result<PyObjectRef, pyre_interpreter::PyError>> {
     let (this_ptr, iid) = com_error_iid(obj, com)?;
     let hresult = scalar_int_result(result);
@@ -1718,7 +1887,7 @@ fn com_status(
 fn com_status(
     _obj: PyObjectRef,
     _com: Option<(usize, usize)>,
-    _result: &host_ctypes::CallValue,
+    _result: &CallValue,
 ) -> Option<Result<PyObjectRef, pyre_interpreter::PyError>> {
     None
 }
@@ -1980,35 +2149,35 @@ fn from_outparam(value: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::Py
 /// The Python value a returned `CallValue` becomes under return type `ret`.
 fn build_return_value(
     ret: Ret,
-    result: host_ctypes::CallValue,
+    result: CallValue,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     match ret {
         Ret::Pointer(rt) => {
             let p = match result {
-                host_ctypes::CallValue::Pointer(p) => p,
-                host_ctypes::CallValue::Scalar(b) => host_ctypes::read_pointer_from_buffer(&b),
+                CallValue::Pointer(p) => p,
+                CallValue::Scalar(b) => cfield::read_pointer_from_buffer(&b),
                 _ => 0,
             };
             wrap_pointer_result(rt, p)
         }
         Ret::Aggregate(ty) => {
             let bytes = match result {
-                host_ctypes::CallValue::Aggregate(b) => b,
+                CallValue::Aggregate(b) => b,
                 _ => Vec::new(),
             };
             make_aggregate_instance(ty, &bytes)
         }
-        Ret::Void => Ok(cdata::decoded_to_pyobject(host_ctypes::DecodedValue::None)),
+        Ret::Void => Ok(cdata::decoded_to_pyobject(cfield::DecodedValue::None)),
         Ret::Code(c) => {
             // Reconstruct the raw result bytes and read them as a slot of that
             // type: a scalar carries its register image, a pointer-code result
             // its address bytes.
             let bytes = match result {
-                host_ctypes::CallValue::Void => {
-                    return Ok(cdata::decoded_to_pyobject(host_ctypes::DecodedValue::None));
+                CallValue::Void => {
+                    return Ok(cdata::decoded_to_pyobject(cfield::DecodedValue::None));
                 }
-                host_ctypes::CallValue::Scalar(b) | host_ctypes::CallValue::Aggregate(b) => b,
-                host_ctypes::CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
+                CallValue::Scalar(b) | CallValue::Aggregate(b) => b,
+                CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
             };
             Ok(cdata::decode_slot(&c, &bytes))
         }
@@ -2034,12 +2203,12 @@ fn argument_address(mut obj: PyObjectRef) -> Result<usize, pyre_interpreter::PyE
             && pyre_object::with_roots!(cls, obj => stginfo::stginfo_paramfunc(info))
                 == ParamFunc::Pointer
         {
-            return Ok(host_ctypes::read_pointer_from_buffer(
+            return Ok(cfield::read_pointer_from_buffer(
                 cdata::cdata_bytes(obj).unwrap_or(&[]),
             ));
         }
         if cdata::type_code_of(cls).is_some_and(|tc| cdata::is_pointer_code(&tc)) {
-            return Ok(host_ctypes::read_pointer_from_buffer(
+            return Ok(cfield::read_pointer_from_buffer(
                 cdata::cdata_bytes(obj).unwrap_or(&[]),
             ));
         }
@@ -2092,9 +2261,9 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
             address,
         )?;
     } else {
-        let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
+        let bytes = cfield::simple_storage_value_to_bytes_endian(
             "P",
-            host_ctypes::SimpleStorageValue::Pointer(address),
+            cfield::SimpleStorageValue::Pointer(address),
             false,
         );
         cdata::cdata_write(
@@ -2170,11 +2339,11 @@ fn internal_string_at(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpre
     // `_string_at = PYFUNCTYPE(py_object, c_void_p, c_int)(_string_at_addr)`,
     // so the read runs as an ordinary foreign call and the `__try` around
     // `ffi_call` is what stands between a bad address and the process.
-    let read = super::seh::guard(|| host_ctypes::string_at(address, size as isize))?;
+    let read = super::seh::guard(|| cfield::string_at(address, size as isize))?;
     let value = match read {
         Ok(value) => value,
-        Err(host_ctypes::StringAtError::NullPointer) => return Err(declined_read(address)),
-        Err(host_ctypes::StringAtError::TooLong) => {
+        Err(cfield::StringAtError::NullPointer) => return Err(declined_read(address)),
+        Err(cfield::StringAtError::TooLong) => {
             return Err(pyre_interpreter::PyError::memory_error("size too large"));
         }
     };
@@ -2216,11 +2385,11 @@ fn internal_wstring_at(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpr
             ));
         }
     }
-    let read = super::seh::guard(|| host_ctypes::wstring_at(address, size as isize))?;
+    let read = super::seh::guard(|| cfield::wstring_at(address, size as isize))?;
     let value = match read {
         Ok(value) => value,
-        Err(host_ctypes::StringAtError::NullPointer) => return Err(declined_read(address)),
-        Err(host_ctypes::StringAtError::TooLong) => {
+        Err(cfield::StringAtError::NullPointer) => return Err(declined_read(address)),
+        Err(cfield::StringAtError::TooLong) => {
             return Err(pyre_interpreter::PyError::overflow_error("size too large"));
         }
     };
@@ -2348,25 +2517,20 @@ pub(super) fn call_function(
         .into_iter()
         .map(|arg| marshal_default_arg(arg, &mut keepalive))
         .collect::<Result<Vec<_>, _>>()?;
-    let host_args: Vec<host_ctypes::CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
+    let host_args: Vec<CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
     let result = {
         let _blocked = pyre_interpreter::module::thread::before_external_block();
         super::seh::guard(|| {
-            host_ctypes::call(
-                addr,
-                &host_args,
-                host_ctypes::CallRet::Code("i"),
-                host_ctypes::CallOptions::default(),
-            )
+            callproc::call(addr, &host_args, CallRet::Code("i"), CallOptions::default())
         })
     };
     drop(keepalive);
     let bytes = match result?.map_err(call_error)? {
-        host_ctypes::CallValue::Scalar(b) => b,
-        host_ctypes::CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
+        CallValue::Scalar(b) => b,
+        CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
         _ => Vec::new(),
     };
-    Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
+    Ok(cdata::decoded_to_pyobject(cfield::decode_type_code(
         "i", &bytes,
     )))
 }
@@ -2543,13 +2707,11 @@ fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, pyre_interpret
 /// Build the recursive `CTypeLayout` of a ctypes type, driven by its `StgInfo`
 /// `paramfunc`: simple → code, pointer → `Pointer`, array → element layout +
 /// length, struct/union → per-field layouts from `_fields_`.
-pub(super) fn build_layout(
-    mut t: PyObjectRef,
-) -> Result<host_ctypes::CTypeLayout, pyre_interpreter::PyError> {
-    use host_ctypes::CTypeLayout;
+pub(super) fn build_layout(mut t: PyObjectRef) -> Result<CTypeLayout, pyre_interpreter::PyError> {
     let mut info = stginfo::stginfo_of(t)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("type has no ctypes layout info"))?;
     let size = pyre_object::with_roots!(info, t => stginfo::stginfo_size(info));
+    let align = pyre_object::with_roots!(info, t => stginfo::stginfo_align(info));
     let paramfunc = pyre_object::with_roots!(info, t => stginfo::stginfo_paramfunc(info));
     match paramfunc {
         ParamFunc::Simple => {
@@ -2572,6 +2734,7 @@ pub(super) fn build_layout(
                 element: Box::new(element),
                 length: stginfo::stginfo_length(info),
                 size,
+                align,
             })
         }
         ParamFunc::Struct | ParamFunc::Union => {
@@ -2580,12 +2743,20 @@ pub(super) fn build_layout(
                 fields.push(build_layout(ft)?);
             }
             if paramfunc == ParamFunc::Union {
-                Ok(CTypeLayout::Union { fields, size })
+                Ok(CTypeLayout::Union {
+                    fields,
+                    size,
+                    align,
+                })
             } else {
-                Ok(CTypeLayout::Struct { fields, size })
+                Ok(CTypeLayout::Struct {
+                    fields,
+                    size,
+                    align,
+                })
             }
         }
-        _ => Ok(CTypeLayout::Opaque { size }),
+        _ => Ok(CTypeLayout::Opaque { size, align }),
     }
 }
 
@@ -2601,7 +2772,7 @@ fn marshal_aggregate_arg(
             "by-value aggregate argument is not a ctypes instance",
         )
     })?;
-    let buf = host_ctypes::copy_to_sized_bytes(bytes, layout.size());
+    let buf = cfield::copy_to_sized_bytes(bytes, layout.size());
     Ok(OwnedArg::Aggregate(layout, buf))
 }
 
@@ -2690,7 +2861,7 @@ fn marshal_default_arg(
     if cdata::is_cdata_instance(arg) {
         match cdata_paramfunc(arg) {
             ParamFunc::Pointer => {
-                return Ok(OwnedArg::Pointer(host_ctypes::read_pointer_from_buffer(
+                return Ok(OwnedArg::Pointer(cfield::read_pointer_from_buffer(
                     cdata::cdata_bytes(arg).unwrap_or(&[]),
                 )));
             }
@@ -2763,7 +2934,7 @@ pub(super) fn resolve_pointer_addr(
     }
     if cdata::is_simplecdata_instance(arg) {
         // A pointer-typed scalar stores the target address in its buffer.
-        return Ok(host_ctypes::read_pointer_from_buffer(
+        return Ok(cfield::read_pointer_from_buffer(
             cdata::cdata_bytes(arg).unwrap_or(&[]),
         ));
     }
@@ -2771,7 +2942,7 @@ pub(super) fn resolve_pointer_addr(
         // `_Pointer` → stored address; `Array`/`Structure` → buffer address.
         return Ok(match cdata_paramfunc(arg) {
             ParamFunc::Pointer => {
-                host_ctypes::read_pointer_from_buffer(cdata::cdata_bytes(arg).unwrap_or(&[]))
+                cfield::read_pointer_from_buffer(cdata::cdata_bytes(arg).unwrap_or(&[]))
             }
             _ => cdata::cdata_addr(arg).unwrap_or(0),
         });
@@ -2795,7 +2966,7 @@ pub(super) fn resolve_pointer_addr(
 /// address of the copy.
 fn bytes_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
     let raw = unsafe { pyre_object::bytesobject::w_bytes_data(arg) };
-    keepalive.push(host_ctypes::clone_as_null_terminated(raw));
+    keepalive.push(cfield::clone_as_null_terminated(raw));
     // The inner Vec's heap buffer is stable even if `keepalive` reallocates.
     keepalive.last().unwrap().as_ptr() as usize
 }
@@ -2808,6 +2979,6 @@ fn bytes_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
 /// `Z` arm) spells the copy the same way.
 fn wstr_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
     let raw = unsafe { pyre_object::w_str_get_wtf8(arg) };
-    keepalive.push(host_ctypes::clone_wchar_null_terminated(raw));
+    keepalive.push(cfield::clone_wchar_null_terminated(raw));
     keepalive.last().unwrap().as_ptr() as usize
 }

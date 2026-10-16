@@ -74,7 +74,7 @@ pub fn compute_extra_text(fargs: &[PyObjectRef], ellipsis: bool, abi: i64) -> (S
 /// 32-bit Windows has.
 #[cfg(all(windows, target_arch = "x86"))]
 pub fn stdcall_abi() -> Option<i64> {
-    Some(libffi::raw::ffi_abi_FFI_STDCALL as i64)
+    Some(majit_rlib::clibffi::FFI_STDCALL as i64)
 }
 
 #[cfg(not(all(windows, target_arch = "x86")))]
@@ -394,19 +394,12 @@ fn release_arguments(w_fargs: PyObjectRef, cif: usize, buffer: usize, mustfree_m
 
 // ── the CIF_DESCRIPTION block ───────────────────────────────────────────
 
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 pub(crate) mod cif {
     use super::super::jit_libffi::{CifDescription, SIZE_OF_FFI_ARG, exchange_args, header};
     use super::{PyError, PyObjectRef, W_CType, ctypeobj};
-    use libffi::low::{ffi_abi, ffi_type, type_tag, types};
+    use majit_rlib::clibffi::{self, FFI_OK, FFI_TYPE_P, FFI_TYPE_STRUCT, ffi_type};
+    use majit_rlib::rffi::UINT;
 
     /// `CifDescrBuilder` — the two-pass bump allocator that measures the block
     /// and then fills it.
@@ -419,8 +412,8 @@ pub(crate) mod cif {
         fresult_slot: usize,
         nb_bytes: usize,
         bufferp: *mut u8,
-        atypes: *mut *mut ffi_type,
-        rtype: *mut ffi_type,
+        atypes: *mut FFI_TYPE_P,
+        rtype: FFI_TYPE_P,
     }
 
     impl Builder {
@@ -444,8 +437,8 @@ pub(crate) mod cif {
             self.alloc(
                 std::mem::size_of::<CifDescription>() + nargs * std::mem::size_of::<usize>(),
             );
-            let atypes = self.alloc(nargs * std::mem::size_of::<*mut ffi_type>());
-            self.atypes = atypes.cast::<*mut ffi_type>();
+            let atypes = self.alloc(nargs * std::mem::size_of::<FFI_TYPE_P>());
+            self.atypes = atypes.cast::<FFI_TYPE_P>();
             self.rtype = self.fill_type(
                 ctypeobj::ctype_arg(pyre_object::gc_roots::shadow_stack_get(self.fresult_slot))?,
                 true,
@@ -464,17 +457,17 @@ pub(crate) mod cif {
 
         /// `CifDescrBuilder.fb_fill_type` and the `_get_ffi_type` each ctype
         /// class is given at the bottom of `ctypefunc.py`.
-        fn fill_type(&mut self, ct: &W_CType, is_result: bool) -> Result<*mut ffi_type, PyError> {
-            let by_size = |signed: bool| -> Option<*mut ffi_type> {
-                let t: *mut ffi_type = match (ct.size, signed) {
-                    (1, true) => &raw mut types::sint8,
-                    (2, true) => &raw mut types::sint16,
-                    (4, true) => &raw mut types::sint32,
-                    (8, true) => &raw mut types::sint64,
-                    (1, false) => &raw mut types::uint8,
-                    (2, false) => &raw mut types::uint16,
-                    (4, false) => &raw mut types::uint32,
-                    (8, false) => &raw mut types::uint64,
+        fn fill_type(&mut self, ct: &W_CType, is_result: bool) -> Result<FFI_TYPE_P, PyError> {
+            let by_size = |signed: bool| -> Option<FFI_TYPE_P> {
+                let t: FFI_TYPE_P = match (ct.size, signed) {
+                    (1, true) => clibffi::ffi_type_sint8(),
+                    (2, true) => clibffi::ffi_type_sint16(),
+                    (4, true) => clibffi::ffi_type_sint32(),
+                    (8, true) => clibffi::ffi_type_sint64(),
+                    (1, false) => clibffi::ffi_type_uint8(),
+                    (2, false) => clibffi::ffi_type_uint16(),
+                    (4, false) => clibffi::ffi_type_uint32(),
+                    (8, false) => clibffi::ffi_type_uint64(),
                     _ => return None,
                 };
                 Some(t)
@@ -500,11 +493,11 @@ pub(crate) mod cif {
                     by_size(false).ok_or_else(|| missing_ffi_type(ct, is_result))
                 }
                 ctypeobj::KIND_PRIM_FLOAT => match ct.size {
-                    4 => Ok(&raw mut types::float),
-                    8 => Ok(&raw mut types::double),
+                    4 => Ok(clibffi::ffi_type_float()),
+                    8 => Ok(clibffi::ffi_type_double()),
                     _ => Err(missing_ffi_type(ct, is_result)),
                 },
-                ctypeobj::KIND_PRIM_LONGDOUBLE => Ok(long_double_ffi_type()),
+                ctypeobj::KIND_PRIM_LONGDOUBLE => Ok(clibffi::ffi_type_longdouble()),
                 ctypeobj::KIND_PRIM_COMPLEX => Err(PyError::not_implemented(format!(
                     "ctype '{}' (size {}) not supported as {} (the support for complex types inside libffi is mostly missing at this point, so CFFI only supports complex types as arguments or return value in API-mode functions)",
                     ct.name(),
@@ -513,8 +506,8 @@ pub(crate) mod cif {
                 ))),
                 // `W_CTypePtrBase._get_ffi_type` — a pointer or a function
                 // pointer.  A plain array is not one of them.
-                ctypeobj::KIND_POINTER | ctypeobj::KIND_FUNC => Ok(&raw mut types::pointer),
-                ctypeobj::KIND_VOID if is_result => Ok(&raw mut types::void),
+                ctypeobj::KIND_POINTER | ctypeobj::KIND_FUNC => Ok(clibffi::ffi_type_pointer()),
+                ctypeobj::KIND_VOID if is_result => Ok(clibffi::ffi_type_void()),
                 _ => Err(missing_ffi_type(ct, is_result)),
             }
         }
@@ -524,7 +517,7 @@ pub(crate) mod cif {
             &mut self,
             ct: &W_CType,
             is_result: bool,
-        ) -> Result<*mut ffi_type, PyError> {
+        ) -> Result<FFI_TYPE_P, PyError> {
             ct.force_lazy_struct()?;
             // A struct completed from an incomplete declaration may be laid
             // out differently from the one the C compiler saw, and the calling
@@ -555,8 +548,8 @@ pub(crate) mod cif {
                 nflat += flatten(ct, w_field, is_result)?.1;
             }
             let elements = self
-                .alloc((nflat + 1) * std::mem::size_of::<*mut ffi_type>())
-                .cast::<*mut ffi_type>();
+                .alloc((nflat + 1) * std::mem::size_of::<FFI_TYPE_P>())
+                .cast::<FFI_TYPE_P>();
             let mut written = 0usize;
             for &w_field in &fields {
                 let (base, flat) = flatten(ct, w_field, is_result)?;
@@ -579,7 +572,7 @@ pub(crate) mod cif {
                     ffistruct.write(ffi_type {
                         size: ct.size as usize,
                         alignment: ct.alignof()? as u16,
-                        type_: type_tag::STRUCT,
+                        type_: FFI_TYPE_STRUCT,
                         elements,
                     })
                 };
@@ -633,24 +626,6 @@ pub(crate) mod cif {
     }
 
     /// `ctypefunc.py _missing_ffi_type` and `_notimplemented_ffi_type`.
-    /// The `ffi_type` for `long double`.
-    ///
-    /// libffi defines `ffi_type_longdouble` only where its configure saw
-    /// `sizeof(long double) != sizeof(double)`; where it did not, the two are
-    /// the same type and `ffi_type_double` describes both.  The build script
-    /// asks the target's own compiler that question and sets the cfg, because
-    /// naming the symbol on a target that has none is a link error rather than
-    /// a call that fails.
-    #[cfg(pyre_ffi_type_longdouble)]
-    fn long_double_ffi_type() -> *mut ffi_type {
-        &raw mut types::longdouble
-    }
-
-    #[cfg(not(pyre_ffi_type_longdouble))]
-    fn long_double_ffi_type() -> *mut ffi_type {
-        &raw mut types::double
-    }
-
     fn missing_ffi_type(ct: &W_CType, is_result: bool) -> PyError {
         if ct.size < 0 {
             return PyError::type_error(format!("ctype '{}' has incomplete type", ct.name()));
@@ -746,7 +721,7 @@ pub(crate) mod cif {
 
         // `CifDescrBuilder.fb_extra_fields`, then `jit_ffi_prep_cif`.
         let descr = unsafe { header(rawmem as usize) };
-        descr.abi = abi as ffi_abi;
+        descr.abi = abi as clibffi::FFI_ABI;
         descr.nargs = nargs;
         descr.rtype = builder.rtype;
         descr.atypes = builder.atypes;
@@ -755,16 +730,16 @@ pub(crate) mod cif {
         let (abi, rtype, atypes) = (descr.abi, descr.rtype, descr.atypes);
         // A target whose variadic arguments do not travel the way its fixed
         // ones do -- aarch64 Darwin passes them on the stack -- needs the
-        // fixed count, which is what `clibffi.py:503` hands `ffi_prep_cif_var`
-        // whenever `variadic_args > 0`.
+        // fixed count, which is what `clibffi.py AbstractFuncPtr.__init__`
+        // hands `c_ffi_prep_cif_var` whenever `variadic_args > 0`.
         let cif = &raw mut descr.cif;
-        let prepared = match nfixedargs {
+        let res = match nfixedargs {
             Some(nfixed) => unsafe {
-                libffi::low::prep_cif_var(cif, abi, nfixed, nargs, rtype, atypes)
+                clibffi::c_ffi_prep_cif_var(cif, abi, nfixed as UINT, nargs as UINT, rtype, atypes)
             },
-            None => unsafe { libffi::low::prep_cif(cif, abi, nargs, rtype, atypes) },
+            None => unsafe { clibffi::c_ffi_prep_cif(cif, abi, nargs as UINT, rtype, atypes) },
         };
-        if prepared.is_err() {
+        if res != FFI_OK {
             unsafe { libc::free(rawmem as *mut libc::c_void) };
             return Err(PyError::system_error(
                 "libffi failed to build this function type",
@@ -782,15 +757,7 @@ pub(crate) mod cif {
     }
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) mod cif {
     use super::{PyError, PyObjectRef};
 

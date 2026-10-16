@@ -18,6 +18,8 @@ extern crate self as majit_rlib;
 pub mod _rsocket_rffi;
 
 pub mod cache;
+#[cfg(any(unix, windows))]
+pub mod clibffi;
 pub mod debug;
 pub mod jit;
 pub mod lltypesystem;

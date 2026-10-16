@@ -10,9 +10,8 @@
 //! (see [`super::metaclass`]); the metaclasses compute each type's layout and
 //! the buffer-view machinery aliases nested/pointed-to memory.
 //!
-//! All host/FFI work is delegated to `rustpython_host_env::ctypes`; the module
-//! contains no direct `libc::` FFI.  Windows `LoadLibrary` is
-//! `host_ctypes::load_library_ex_w`, so the flags reach `LoadLibraryExW`.
+//! Dynamic loading on posix is `rdynload` (`dlopen`/`dlsym`/`dlclose`).
+//! Windows `LoadLibrary` is `LoadLibraryExW`.
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -31,36 +30,36 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ns);
-    use rustpython_host_env::ctypes as host_ctypes;
+    use super::cfield;
+    use super::ctypes_h;
 
     // ── dlopen flags ──
     //
     // `ctypes/__init__.py` imports `RTLD_LOCAL`/`RTLD_GLOBAL` before it
     // branches on `os.name`, so both names have to exist wherever the module
-    // is real; where there is no `dlfcn.h` they are 0, which is the value
-    // `host_env`'s own pair carries.  `RTLD_LAZY`/`RTLD_NOW` have no such
-    // caller and stay with the platform that defines them.
+    // is real; where there is no `dlfcn.h` they are 0.  `RTLD_LAZY`/`RTLD_NOW`
+    // have no such caller and stay with the platform that defines them.
     #[cfg(unix)]
     {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "RTLD_LOCAL",
-            pyre_object::w_int_new(libc::RTLD_LOCAL as i64)
+            pyre_object::w_int_new(ctypes_h::RTLD_LOCAL as i64)
         );
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "RTLD_GLOBAL",
-            pyre_object::w_int_new(libc::RTLD_GLOBAL as i64)
+            pyre_object::w_int_new(ctypes_h::RTLD_GLOBAL as i64)
         );
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "RTLD_LAZY",
-            pyre_object::w_int_new(libc::RTLD_LAZY as i64)
+            pyre_object::w_int_new(majit_rlib::rdynload::RTLD_LAZY as i64)
         );
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "RTLD_NOW",
-            pyre_object::w_int_new(libc::RTLD_NOW as i64)
+            pyre_object::w_int_new(majit_rlib::rdynload::RTLD_NOW as i64)
         );
     }
     #[cfg(not(unix))]
@@ -68,12 +67,12 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "RTLD_LOCAL",
-            pyre_object::w_int_new(host_ctypes::RTLD_LOCAL as i64)
+            pyre_object::w_int_new(ctypes_h::RTLD_LOCAL as i64)
         );
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "RTLD_GLOBAL",
-            pyre_object::w_int_new(host_ctypes::RTLD_GLOBAL as i64)
+            pyre_object::w_int_new(ctypes_h::RTLD_GLOBAL as i64)
         );
     }
     pyre_interpreter::__pyre_put_new!(
@@ -86,7 +85,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             }
             #[cfg(not(unix))]
             {
-                host_ctypes::dlopen_mode(None) as i64
+                0
             }
         })
     );
@@ -227,11 +226,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         "get_errno",
         pyre_interpreter::make_builtin_function_with_arity(
             "get_errno",
-            |_| {
-                Ok(pyre_object::w_int_new(
-                    rustpython_host_env::ctypes::get_errno() as i64,
-                ))
-            },
+            |_| { Ok(pyre_object::w_int_new(super::callproc::get_errno() as i64,)) },
             0,
         )
     );
@@ -247,7 +242,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let v = pyre_interpreter::baseobjspace::int_w(args[0])? as i32;
-                let prev = rustpython_host_env::ctypes::set_errno(v);
+                let prev = super::callproc::set_errno(v);
                 Ok(pyre_object::w_int_new(prev as i64))
             },
             1,
@@ -267,7 +262,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let code = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?.to_string();
-                match rustpython_host_env::ctypes::simple_type_size(&code) {
+                match cfield::simple_type_size(&code) {
                     Some(n) => Ok(pyre_object::w_int_new(n as i64)),
                     None => Err(pyre_interpreter::PyError::value_error(format!(
                         "unknown type code: {code}"
@@ -289,7 +284,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let code = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?.to_string();
-                match rustpython_host_env::ctypes::simple_type_align(&code) {
+                match cfield::simple_type_align(&code) {
                     Some(n) => Ok(pyre_object::w_int_new(n as i64)),
                     None => Err(pyre_interpreter::PyError::value_error(format!(
                         "unknown type code: {code}"
@@ -322,10 +317,9 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             };
             // The address comes from the caller, so the read faults as
             // readily as any foreign call's does and needs the same fence.
-            let read =
-                super::seh::guard(|| rustpython_host_env::ctypes::string_at(ptr, size as isize))?;
+            let read = super::seh::guard(|| cfield::string_at(ptr, size as isize))?;
             let bytes = read.map_err(|e| {
-                use rustpython_host_env::ctypes::StringAtError as S;
+                use super::cfield::StringAtError as S;
                 let msg = match e {
                     S::NullPointer => "NULL pointer access",
                     S::TooLong => "size too large",
@@ -339,7 +333,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "SIZEOF_TIME_T",
-        pyre_object::w_int_new(rustpython_host_env::ctypes::SIZEOF_TIME_T as i64)
+        pyre_object::w_int_new(ctypes_h::SIZEOF_TIME_T as i64)
     );
 
     // The callable `_CData.__reduce__` names.  It has to be reachable by name
@@ -352,27 +346,27 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_CDECL",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_CDECL))
+        pyre_object::w_int_new(i64::from(ctypes_h::FUNCFLAG_CDECL))
     );
     pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_PYTHONAPI",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_PYTHONAPI))
+        pyre_object::w_int_new(i64::from(ctypes_h::FUNCFLAG_PYTHONAPI))
     );
     pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_USE_ERRNO",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_USE_ERRNO))
+        pyre_object::w_int_new(i64::from(ctypes_h::FUNCFLAG_USE_ERRNO))
     );
     pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_USE_LASTERROR",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_USE_LASTERROR))
+        pyre_object::w_int_new(i64::from(ctypes_h::FUNCFLAG_USE_LASTERROR))
     );
     pyre_interpreter::__pyre_store!(
         ns,
         "CTYPES_MAX_ARGCOUNT",
-        pyre_object::w_int_new(host_ctypes::CTYPES_MAX_ARGCOUNT as i64)
+        pyre_object::w_int_new(ctypes_h::CTYPES_MAX_ARGCOUNT as i64)
     );
 
     #[cfg(target_os = "macos")]
@@ -392,7 +386,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 ));
             }
             let path = pyre_interpreter::baseobjspace::str_utf8_w(path)?;
-            let found = host_ctypes::dyld_shared_cache_contains_path(path)
+            let found = super::callproc::dyld_shared_cache_contains_path(path)
                 .map_err(|_| pyre_interpreter::PyError::value_error("path contains null byte"))?;
             Ok(pyre_object::w_bool_from(found))
         })
@@ -405,12 +399,12 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "_memmove_addr",
-        pyre_object::w_int_new(host_ctypes::memmove_addr() as i64)
+        pyre_object::w_int_new(cfield::memmove_addr() as i64)
     );
     pyre_interpreter::__pyre_store!(
         ns,
         "_memset_addr",
-        pyre_object::w_int_new(host_ctypes::memset_addr() as i64)
+        pyre_object::w_int_new(cfield::memset_addr() as i64)
     );
     // RustPython's internal non-FFI targets.  CFuncPtr.__call__ recognizes
     // these values before entering libffi, exactly like function.rs.
@@ -579,12 +573,12 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_STDCALL",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_STDCALL))
+        pyre_object::w_int_new(i64::from(super::ctypes_h::FUNCFLAG_STDCALL))
     );
     pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_HRESULT",
-        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_HRESULT))
+        pyre_object::w_int_new(i64::from(super::ctypes_h::FUNCFLAG_HRESULT))
     );
 
     // ── LoadLibrary(name, load_flags=0) → HMODULE ──
@@ -709,7 +703,9 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
         "get_last_error",
         pyre_interpreter::make_builtin_function_with_arity(
             "get_last_error",
-            |_| Ok(pyre_object::w_int_new(host_ctypes::get_last_error() as i64)),
+            |_| Ok(pyre_object::w_int_new(
+                super::callproc::get_last_error() as i64
+            )),
             0,
         )
     );
@@ -724,9 +720,9 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
                         "set_last_error() needs value",
                     ));
                 };
-                let previous = host_ctypes::set_last_error(pyre_interpreter::baseobjspace::int_w(
-                    value,
-                )? as u32);
+                let previous = super::callproc::set_last_error(
+                    pyre_interpreter::baseobjspace::int_w(value)? as u32,
+                );
                 Ok(pyre_object::w_int_new(previous as i64))
             },
             1,
@@ -797,8 +793,8 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
                             host_ctypes::HRESULT_E_POINTER as i64,
                         ));
                     };
-                    let buffer = unsafe { host_ctypes::borrow_memory(addr as *const u8, len) };
-                    host_ctypes::read_pointer_from_buffer(buffer)
+                    let buffer = unsafe { super::cfield::borrow_memory(addr as *const u8, len) };
+                    super::cfield::read_pointer_from_buffer(buffer)
                 } else {
                     return Ok(pyre_object::w_int_new(
                         host_ctypes::HRESULT_E_POINTER as i64,
@@ -913,8 +909,7 @@ fn ctypes_sizeof(
 fn ctypes_alignment(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    use super::{cdata, stginfo};
-    use rustpython_host_env::ctypes as host_ctypes;
+    use super::{cdata, cfield, stginfo};
     let obj = *args
         .first()
         .ok_or_else(|| pyre_interpreter::PyError::type_error("alignment() missing argument"))?;
@@ -929,7 +924,7 @@ fn ctypes_alignment(
         return Ok(pyre_object::w_int_new(stginfo::stginfo_align(info) as i64));
     }
     match cdata::type_code_of(target) {
-        Some(tc) => match host_ctypes::simple_type_align(&tc) {
+        Some(tc) => match cfield::simple_type_align(&tc) {
             Some(a) => Ok(pyre_object::w_int_new(a as i64)),
             None => Err(cdata::invalid_type_code_error()),
         },
@@ -959,8 +954,7 @@ fn ctypes_addressof(
 fn ctypes_byref(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    use super::cdata;
-    use rustpython_host_env::ctypes as host_ctypes;
+    use super::{cdata, cfield};
     let mut obj = *args
         .first()
         .ok_or_else(|| pyre_interpreter::PyError::type_error("byref() missing argument"))?;
@@ -976,7 +970,7 @@ fn ctypes_byref(
     };
     let base = pyre_object::with_roots!(obj => cdata::cdata_addr(obj))
         .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
-    let addr = host_ctypes::offset_address(base, offset);
+    let addr = cfield::offset_address(base, offset);
     Ok(make_carg(addr, obj))
 }
 
@@ -984,8 +978,7 @@ fn ctypes_byref(
 fn ctypes_resize(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    use super::{cdata, stginfo};
-    use rustpython_host_env::ctypes as host_ctypes;
+    use super::{cdata, cfield, stginfo};
     if args.len() < 2 {
         return Err(pyre_interpreter::PyError::type_error(
             "resize() needs (obj, size)",
@@ -1016,7 +1009,7 @@ fn ctypes_resize(
     };
     let min = stginfo::stginfo_of(cls)
         .map(stginfo::stginfo_size)
-        .or_else(|| cdata::type_code_of(cls).and_then(|tc| host_ctypes::simple_type_size(&tc)))
+        .or_else(|| cdata::type_code_of(cls).and_then(|tc| cfield::simple_type_size(&tc)))
         .unwrap_or(0);
     if requested < min as i64 {
         return Err(pyre_interpreter::PyError::value_error(format!(

@@ -34,9 +34,15 @@ fn finish_cpython_type(
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod callbacks;
 #[cfg(all(any(unix, windows), feature = "host_env"))]
+pub mod callproc;
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod cdata;
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+mod cfield;
 #[cfg(all(windows, feature = "host_env"))]
 mod com;
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+mod ctypes_h;
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod funcptr;
 #[cfg(all(any(unix, windows), feature = "host_env"))]

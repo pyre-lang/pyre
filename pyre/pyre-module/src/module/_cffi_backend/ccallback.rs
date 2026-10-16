@@ -9,38 +9,24 @@ use super::ctypeobj::{self, W_CType};
 
 /// The libffi surface a callback needs, which is a dependency only where the
 /// crate declares it; `ctypefunc.rs` splits its `cif` module the same way.
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 mod ffi {
+    use majit_rlib::clibffi::{self, ffi_arg};
+
     /// The width libffi widens a return value narrower than a word to.
-    pub const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<libffi::low::ffi_arg>();
+    pub const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<ffi_arg>();
 
     /// # Safety
-    /// `ptr` is null or a closure `ffi_closure_alloc` returned and nothing
+    /// `ptr` is null or a closure `c_ffi_closure_alloc` returned and nothing
     /// else holds it.
     pub unsafe fn closure_free(ptr: *mut libc::c_void) {
         if !ptr.is_null() {
-            unsafe { libffi::raw::ffi_closure_free(ptr) };
+            unsafe { clibffi::c_ffi_closure_free(ptr) };
         }
     }
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
+#[cfg(not(any(unix, windows)))]
 mod ffi {
     /// `ffi_arg` is a machine word on every target libffi defines it for, and
     /// the result encoder below is shared with those targets.
@@ -95,15 +81,7 @@ impl Drop for UnpublishedClosure {
 }
 
 /// `ccallback.py make_callback` and `W_CDataCallback.__init__`.
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 pub fn make_callback(
     w_ctype: PyObjectRef,
     w_callable: PyObjectRef,
@@ -118,14 +96,14 @@ pub fn make_callback(
 
     let mut raw_code = std::ptr::null_mut();
     let raw_closure = unsafe {
-        libffi::raw::ffi_closure_alloc(
-            std::mem::size_of::<libffi::raw::ffi_closure>(),
+        majit_rlib::clibffi::c_ffi_closure_alloc(
+            std::mem::size_of::<majit_rlib::clibffi::ffi_closure>(),
             &mut raw_code,
         )
     };
     if raw_closure.is_null() || raw_code.is_null() {
         if !raw_closure.is_null() {
-            unsafe { libffi::raw::ffi_closure_free(raw_closure) };
+            unsafe { majit_rlib::clibffi::c_ffi_closure_free(raw_closure) };
         }
         return Err(PyError::new(
             PyErrorKind::MemoryError,
@@ -201,22 +179,21 @@ pub fn make_callback(
     }
     let userdata = super::hide_reveal::hide_callback(roots.get(callback_slot));
     let status = unsafe {
-        libffi::raw::ffi_prep_closure_loc(
-            raw_closure.cast::<libffi::raw::ffi_closure>(),
-            functype.cif_descr as *mut libffi::raw::ffi_cif,
-            Some(invoke_callback),
-            userdata.cast::<libc::c_void>(),
+        majit_rlib::clibffi::c_ffi_prep_closure_loc(
+            raw_closure.cast(),
+            functype.cif_descr as majit_rlib::clibffi::FFI_CIFP,
+            invoke_callback,
+            userdata.cast(),
             raw_code,
         )
     };
-    if status != libffi::raw::ffi_status_FFI_OK {
+    if status != majit_rlib::clibffi::FFI_OK {
         return Err(PyError::system_error(
             "libffi failed to build this callback",
         ));
     }
     if unsafe {
-        (*raw_closure.cast::<libffi::raw::ffi_closure>()).user_data
-            != userdata.cast::<libc::c_void>()
+        (*raw_closure.cast::<majit_rlib::clibffi::ffi_closure>()).user_data != userdata.cast()
     } {
         return Err(PyError::system_error(
             "ffi_prep_closure(): bad user_data (it seems that the version of the libffi library seen at runtime is different from the 'ffi.h' file seen at compile-time)",
@@ -225,15 +202,7 @@ pub fn make_callback(
     Ok(roots.get(callback_slot))
 }
 
-#[cfg(not(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-)))]
+#[cfg(not(any(unix, windows)))]
 pub fn make_callback(
     _w_ctype: PyObjectRef,
     _w_callable: PyObjectRef,
@@ -538,20 +507,12 @@ unsafe fn do_invoke(w_callback: PyObjectRef, ll_res: *mut u8, ll_args: *mut *mut
     }
 }
 
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "android"
-    ),
-    not(any(target_env = "musl", target_env = "sgx"))
-))]
+#[cfg(any(unix, windows))]
 unsafe extern "C" fn invoke_callback(
-    _ffi_cif: *mut libffi::raw::ffi_cif,
-    ll_res: *mut libc::c_void,
-    ll_args: *mut *mut libc::c_void,
-    ll_userdata: *mut libc::c_void,
+    _ffi_cif: majit_rlib::clibffi::FFI_CIFP,
+    ll_res: majit_rlib::rffi::VOIDP,
+    ll_args: majit_rlib::clibffi::VOIDPP,
+    ll_userdata: majit_rlib::rffi::VOIDP,
 ) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 

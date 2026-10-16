@@ -2108,9 +2108,11 @@ dependencies = [
 name = "majit-rlib"
 version = "0.0.2"
 dependencies = [
+ "cc",
  "ctor",
  "indexmap",
  "libc",
+ "libffi-sys",
  "linkme",
  "majit-gc",
  "majit-ir",
@@ -2781,7 +2783,6 @@ dependencies = [
  "getrandom 0.4.3",
  "indexmap",
  "libc",
- "libffi",
  "linkme",
  "majit-gc",
  "majit-ir",
@@ -2898,7 +2899,6 @@ dependencies = [
  "cc",
  "ctor",
  "libc",
- "libffi",
  "linkme",
  "majit-gc",
  "majit-ir",
