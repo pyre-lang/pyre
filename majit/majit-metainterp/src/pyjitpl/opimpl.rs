@@ -239,6 +239,7 @@ where
         table[jitcode::insns::BC_NEWLIST_CLEAR as usize] = Self::opimpl_newlist_clear;
         table[jitcode::insns::BC_INT_ISCONSTANT as usize] = Self::opimpl_int_isconstant;
         table[jitcode::insns::BC_REF_ISCONSTANT as usize] = Self::opimpl_ref_isconstant;
+        table[jitcode::insns::BC_INT_ISVIRTUAL as usize] = Self::opimpl_int_isvirtual;
         table[jitcode::insns::BC_REF_ISVIRTUAL as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_STRLEN as usize] = Self::opimpl_strlen;
         table[jitcode::insns::BC_STRGETITEM as usize] = Self::opimpl_strgetitem;
@@ -9145,6 +9146,32 @@ where
         };
         let (opref, _) = self.read_ref_reg(ctx, src);
         let value = opref.is_constant() as i64;
+        let dest_box = ctx.const_int(value);
+        self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
+        TraceAction::Continue
+    }
+
+    // pyjitpl.py `_opimpl_isvirtual`: `return ConstInt(
+    // heapcache.is_likely_virtual(box))`.  No IR op.  The int-kind
+    // spelling is `jtransform.py` `jit.isvirtual` on a raw header
+    // address; a non-ref box is never virtual.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_int_isvirtual(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let (src, dest) = {
+            let frame = self.frames.current_mut();
+            let src = frame.next_reg() as usize;
+            let dest = frame.next_reg() as usize;
+            (src, dest)
+        };
+        let (opref, _) = self.read_int_reg(ctx, src);
+        let value = ctx.is_likely_virtual(opref) as i64;
         let dest_box = ctx.const_int(value);
         self.set_int_reg(ctx, dest, Some(dest_box), Some(value));
         TraceAction::Continue

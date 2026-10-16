@@ -126,6 +126,13 @@ pub const BC_GETFIELD_RAW_F: u8 = 251;
 /// `rlist.py ll_alloc_and_set` clamps `count` with this unary.
 /// Next byte above [`BC_SETFIELD_RAW_I`].
 pub const BC_INT_FORCE_GE_ZERO: u8 = 253;
+/// `jtransform.py` `jit.isvirtual` on an int-kind operand (`%s_isvirtual`
+/// % kind). `pyjitpl.py` only aliases `opimpl_ref_isvirtual`; a raw
+/// `Vec` header is an address word, so the same `_opimpl_isvirtual`
+/// box test runs on an int register.
+/// Next free high-water byte after [`BC_INT_FORCE_GE_ZERO`].
+/// (`assembler.py` `setdefault(key, len(self.insns))` never reuses a byte).
+pub const BC_INT_ISVIRTUAL: u8 = 254;
 
 /// "This cached control opcode is absent" sentinel for the
 /// `blackhole.py:72-74` fields (`op_live`, `op_catch_exception`,
@@ -1198,6 +1205,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_isconstant/i>i", BC_INT_ISCONSTANT);
     m.insert("ref_isconstant/r>i", BC_REF_ISCONSTANT);
     m.insert("ref_isvirtual/r>i", BC_REF_ISVIRTUAL);
+    m.insert("int_isvirtual/i>i", BC_INT_ISVIRTUAL);
     m.insert("record_exact_class/ri", BC_RECORD_EXACT_CLASS);
     // `guard_class` — `blackhole.py bhimpl_guard_class`; see `BC_GUARD_CLASS`.
     m.insert("guard_class/r>i", BC_GUARD_CLASS);
@@ -1468,7 +1476,9 @@ mod tests {
     /// arm shadows the later const, `names[byte] = key` is last-wins).  The
     /// USE_C_FORM bytes once collided here (`int_copy/c>i`↔`new/d>r` @217,
     /// `int_return/c`↔`new_array/...` @218, `setfield_gc_i/rcd`↔
-    /// `new_with_vtable/d>r` @219).
+    /// `new_with_vtable/d>r` @219); `int_isvirtual/i>i` later collided
+    /// with `setfield_raw_f/ifd` at 250, then with `int_force_ge_zero/i>i`
+    /// at 253.
     #[test]
     fn opcode_bytes_are_one_to_one() {
         let src = include_str!("insns.rs");

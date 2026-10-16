@@ -1267,6 +1267,13 @@ pub struct MiniMarkGC {
     stress_collect: bool,
 }
 
+/// Action for [`MiniMarkGC::walk_owned_young_const_ptrs`].
+#[derive(Clone, Copy)]
+enum YoungConstPtrWalk {
+    DragOut,
+    Seed(&'static str),
+}
+
 impl MiniMarkGC {
     /// Create a new GC with default configuration.
     pub fn new() -> Self {
@@ -1629,6 +1636,69 @@ impl MiniMarkGC {
     #[inline]
     pub fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
+    }
+
+    /// Whether this MiniMark allocated `gcref`.
+    ///
+    /// `incminimark.py` `collect_oldrefs_to_nursery` walks this collector's
+    /// `old_objects_pointing_to_young`, not every MiniMark in the process.
+    /// `const_ptr_table` is process-global because `OpRef` is `Copy`; a
+    /// parallel test's collector must leave a foreign intern queued.
+    #[inline]
+    fn owns_const_ptr_referent(&self, gcref: GcRef) -> bool {
+        let addr = gcref.0;
+        self.is_managed_heap_object(addr) || self.is_young_rawmalloced(addr)
+    }
+
+    /// `collect_oldrefs_to_nursery` for interned `ConstPtr`: drain and
+    /// forward slots this MiniMark owns, requeue the rest.
+    fn drag_out_owned_young_const_ptrs(&mut self) {
+        self.walk_owned_young_const_ptrs(true, YoungConstPtrWalk::DragOut);
+    }
+
+    /// Major seed / rescan of interned `ConstPtr` that this MiniMark owns.
+    /// Does not drain the remembered set; [`drag_out_owned_young_const_ptrs`]
+    /// / the pre-sweep drain does.
+    fn seed_owned_young_const_ptrs(&mut self, site: &'static str) {
+        self.walk_owned_young_const_ptrs(false, YoungConstPtrWalk::Seed(site));
+    }
+
+    /// Pre-sweep drain of interned `ConstPtr` this MiniMark owns.
+    fn collect_owned_young_const_ptrs_for_presweep(&mut self) {
+        self.walk_owned_young_const_ptrs(
+            true,
+            YoungConstPtrWalk::Seed("presweep_young_const_ptrs"),
+        );
+    }
+
+    fn walk_owned_young_const_ptrs(&mut self, drain: bool, action: YoungConstPtrWalk) {
+        let young = if drain {
+            majit_ir::const_ptr_table::take_owned_young(&mut |gcref| {
+                self.owns_const_ptr_referent(gcref)
+            })
+        } else {
+            majit_ir::const_ptr_table::young_indexes()
+                .into_iter()
+                .filter(|&idx| {
+                    let addr = majit_ir::const_ptr_table::resolve(idx);
+                    !addr.is_null() && self.owns_const_ptr_referent(addr)
+                })
+                .collect()
+        };
+        for idx in young {
+            match action {
+                YoungConstPtrWalk::DragOut => {
+                    majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
+                        self.drag_out_root(gcref);
+                    });
+                }
+                YoungConstPtrWalk::Seed(site) => {
+                    majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
+                        self.seed_major_extra_root(*gcref, site);
+                    });
+                }
+            }
+        }
     }
 
     /// Resolve a PyObject header without asking the nursery/oldgen allocators.
@@ -3681,12 +3751,12 @@ impl MiniMarkGC {
             });
         }
         // `history.py` `ConstPtr` intern-to-holder window. A minor before
-        // extra-area `trace_index` still forwards the table slot.
+        // extra-area `trace_index` still forwards the table slot. The
+        // walk is per MiniMark (`collect_oldrefs_to_nursery`); a foreign
+        // intern stays queued for the collector that owns it.
         {
             let _const_label = crate::shadow_stack::extra_area_scope("young_const_ptrs");
-            majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
-                self.drag_out_root(gcref);
-            });
+            self.drag_out_owned_young_const_ptrs();
         }
         crate::shadow_stack::set_extra_root_walk_kind(
             crate::shadow_stack::ExtraRootWalkKind::Major,
@@ -6429,9 +6499,15 @@ impl MiniMarkGC {
         majit_ir::resumecode::trace_live_numberings(&mut |gcref| {
             result.push((*gcref, "numbering"));
         });
-        majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
-            result.push((*gcref, "young_const_ptrs"));
-        });
+        for idx in majit_ir::const_ptr_table::young_indexes() {
+            let addr = majit_ir::const_ptr_table::resolve(idx);
+            if addr.is_null() || !self.owns_const_ptr_referent(addr) {
+                continue;
+            }
+            majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
+                result.push((*gcref, "young_const_ptrs"));
+            });
+        }
         // Monotone: the hint only ever grows, so a collection that happens to
         // see fewer roots does not send the next one back through the ladder.
         self.root_snapshot_capacity
@@ -6537,10 +6613,18 @@ impl MiniMarkGC {
             seed(self, *gcref, "numbering", true);
         });
         // Intern during this major still sits in the young list. Do not
-        // drain: `collect_young_const_ptrs` runs at pre-sweep.
-        majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
-            seed(self, *gcref, "young_const_ptrs", true);
-        });
+        // drain: the pre-sweep walk runs `collect_owned_young_const_ptrs`.
+        // Only this MiniMark's referents: `collect_oldrefs_to_nursery` is
+        // per collector.
+        for idx in majit_ir::const_ptr_table::young_indexes() {
+            let addr = majit_ir::const_ptr_table::resolve(idx);
+            if addr.is_null() || !self.owns_const_ptr_referent(addr) {
+                continue;
+            }
+            majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
+                seed(self, *gcref, "young_const_ptrs", true);
+            });
+        }
         // Objects already moved to a death queue remain ordinary roots until
         // app-level code pops them. Registered live finalizers are deliberately
         // absent here; incminimark's finalization-order pass decides whether
@@ -7192,9 +7276,7 @@ impl MiniMarkGC {
             majit_ir::resumecode::trace_live_numberings(&mut |gcref| {
                 self.seed_major_extra_root(*gcref, "rescan_numbering");
             });
-            majit_ir::const_ptr_table::trace_young_const_ptrs(&mut |gcref| {
-                self.seed_major_extra_root(*gcref, "rescan_young_const_ptrs");
-            });
+            self.seed_owned_young_const_ptrs("rescan_young_const_ptrs");
         }
         // TLS exception cells live on the per-mutator frame area for the
         // first pass. Upstream's second `collect_nonstack_roots` still
@@ -8787,9 +8869,7 @@ impl MiniMarkGC {
         // a ConstPtr the earlier rescan did not see. Seed those extra roots
         // before the last drain so `visit_all_objects` empties gray_stack
         // (`major_collection_step` STATE_MARKING) before `sweep_prepare`.
-        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
-            self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
-        });
+        self.collect_owned_young_const_ptrs_for_presweep();
         // Finalizers and destructors run while still MARKING and may store
         // into a live black object. The write barrier re-greys it onto
         // `more_gray_stack`; drain that work before the sweep freezes
@@ -8817,10 +8897,10 @@ impl MiniMarkGC {
             }
         }
         self.oldgen_nonmoving_marked = self.oldgen_nonmoving_active;
-        // Extra-root walkers stamp live `ConstPtr` slots. Interns seeded
-        // above already ran `trace_index`. Sweep only when this major's
-        // extra-area walk was a complete census: STW walks every mutator
-        // (`mutators_quiesced`), and a single-mutator process
+        // Extra-root walkers stamp live `ConstPtr` slots this MiniMark owns.
+        // Interns seeded above already ran `trace_index`. Sweep only when
+        // this major's extra-area walk was a complete census: STW walks
+        // every mutator (`mutators_quiesced`), and a single-mutator process
         // (`!foreign_mutator_seen`) has only this thread's extra areas.
         // Two live `install_gc_box` collectors at once is not a supported
         // configuration (`MAJOR_LIVE` and the intern table are
@@ -8832,11 +8912,12 @@ impl MiniMarkGC {
         // in production.
         #[cfg(test)]
         let _const_ptr_table = CONST_PTR_TABLE_TEST_LOCK.lock();
-        majit_ir::const_ptr_table::collect_young_const_ptrs(&mut |gcref| {
-            self.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
-        });
+        // A foreign intern is another collector's box and stays queued.
+        self.collect_owned_young_const_ptrs_for_presweep();
         if crate::gc_sync::mutators_quiesced() || !crate::gc_sync::foreign_mutator_seen() {
-            majit_ir::const_ptr_table::sweep_untraced();
+            majit_ir::const_ptr_table::sweep_untraced_if(&mut |gcref| {
+                self.owns_const_ptr_referent(gcref)
+            });
         }
         // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
         // the candidate sets have been frozen and before the state changes.
@@ -11302,12 +11383,40 @@ impl GcAllocator for MiniMarkGC {
     }
 }
 
+impl Drop for MiniMarkGC {
+    fn drop(&mut self) {
+        // `history.py` `ConstPtr` lives in this heap. Drop intern slots
+        // this MiniMark still owns before the nursery and oldgen mappings
+        // go away, so a later MiniMark whose nursery reuses the VA does
+        // not `drag_out` a leftover as `collect_oldrefs_to_nursery`.
+        majit_ir::const_ptr_table::drop_slots_if(&mut |gcref| self.owns_const_ptr_referent(gcref));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     static SHADOW_STACK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     static SUPPLIED_ENV_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn interned_const_ptr_slots_die_with_the_minimark() {
+        let idx;
+        let obj;
+        {
+            let mut gc = MiniMarkGC::with_config(GcConfig {
+                nursery_size: 4096,
+                large_object_threshold: 1024,
+                ..GcConfig::default()
+            });
+            gc.register_type(TypeInfo::simple(16));
+            obj = gc.alloc_with_type(0, 16);
+            idx = majit_ir::const_ptr_table::intern(obj);
+            assert_eq!(majit_ir::const_ptr_table::resolve(idx), obj);
+        }
+        assert_ne!(majit_ir::const_ptr_table::resolve(idx), obj);
+    }
 
     /// A supplied environment answers a name the process does not define, and
     /// yields to one it does. The absent name is not in [`GC_ENV_NAMES`], so a

@@ -3382,15 +3382,17 @@ impl TraceCtx {
         let mut duplicates: indexmap::IndexSet<OpRef, rustc_hash::FxBuildHasher> =
             indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher);
         self.remove_consts_and_duplicates_with(redboxes, &mut duplicates);
-        let mut live: Vec<(OpRef, Type)> = redboxes.to_vec();
         if let Some(mut typed) = self.collect_virtualizable_typed_boxes()
             && let Some(end) = typed.len().checked_sub(1)
         {
             self.remove_consts_and_duplicates_with(&mut typed[..end], &mut duplicates);
             let elements: Vec<OpRef> = typed[..end].iter().map(|(opref, _)| *opref).collect();
             self.adopt_normalized_virtualizable_elements(&elements);
-            live.extend_from_slice(&typed[..end]);
         }
+        // One list per visit: the same concatenation `compile_loop` /
+        // `current_merge_points.append` / the closing JUMP read
+        // (`pyjitpl.py` `reached_loop_header` `live_arg_boxes`).
+        let live = self.live_arg_boxes_from_reds(redboxes);
         self.close_jump_boxes = Some(live.clone());
         live
     }
@@ -3743,9 +3745,44 @@ impl TraceCtx {
             boxes
                 .iter()
                 .enumerate()
-                .map(|(i, &opref)| (opref, self.virtualizable_slot_type(i).unwrap_or(Type::Int)))
+                .map(|(i, &opref)| {
+                    // history.py Box.type on the box; virtualizable.py
+                    // `static_extra_types` / `arrayitem_extra_types` on the
+                    // field. wrap() mints a box of the field type, so the
+                    // two agree. An empty pointer slot is ConstPtr(null)
+                    // (`type == 'r'`), never an int.
+                    let ty = opref.ty().or_else(|| self.virtualizable_slot_type(i));
+                    let ty = match ty {
+                        Some(ty) => ty,
+                        None if opref.is_none() => Type::Ref,
+                        None => panic!(
+                            "virtualizable_boxes[{i}] has no box.type and no \
+                             vinfo field type (virtualizable.py wrap / \
+                             static_extra_types / arrayitem_extra_types)"
+                        ),
+                    };
+                    (opref, ty)
+                })
                 .collect(),
         )
+    }
+
+    /// pyjitpl.py `reached_loop_header` `live_arg_boxes[num_green_args:]`.
+    ///
+    /// `live_arg_boxes = greenboxes + redboxes` then
+    /// `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`.
+    /// `compile_loop` slices greens off (`original_boxes[num_green_args:]`)
+    /// so the LABEL/JUMP are the reds plus every virtualizable field except
+    /// the trailing identity. First-visit registration and the closing JUMP
+    /// both have to build this list the same way
+    /// (`assert len(original_boxes) == len(live_arg_boxes)`).
+    pub fn live_arg_boxes_from_reds(&self, redboxes: &[(OpRef, Type)]) -> Vec<(OpRef, Type)> {
+        let mut boxes = redboxes.to_vec();
+        if let Some(vable) = self.collect_virtualizable_typed_boxes() {
+            let n = vable.len().saturating_sub(1);
+            boxes.extend_from_slice(&vable[..n]);
+        }
+        boxes
     }
 
     /// The walk-final concrete values of the virtualizable's array elements, in
@@ -8587,6 +8624,50 @@ mod tests {
         ctx.remove_consts_and_duplicates(&mut again);
         assert_eq!(again, boxes, "a normalized list is unchanged");
         assert_eq!(ctx.num_ops(), ops_after, "and records nothing");
+    }
+
+    #[test]
+    fn live_arg_boxes_from_reds_appends_vable_fields_and_drops_identity() {
+        // pyjitpl.py reached_loop_header:
+        //   live_arg_boxes = greenboxes + redboxes
+        //   live_arg_boxes += virtualizable_boxes; live_arg_boxes.pop()
+        let mut recorder = Trace::new();
+        let frame = recorder.record_input_arg(Type::Ref);
+        let ec = recorder.record_input_arg(Type::Ref);
+        let local = recorder.record_input_arg(Type::Ref);
+        let identity = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.virtualizable_boxes = Some(vec![local, identity]);
+        let reds = vec![(frame, Type::Ref), (ec, Type::Ref)];
+        let live = ctx.live_arg_boxes_from_reds(&reds);
+        let live_refs: Vec<OpRef> = live.iter().map(|(o, _)| *o).collect();
+        assert_eq!(live_refs, vec![frame, ec, local]);
+        assert!(
+            !live_refs.contains(&identity),
+            "virtualizable identity is popped"
+        );
+        assert_eq!(live[2].1, Type::Ref);
+    }
+
+    #[test]
+    fn collect_virtualizable_typed_boxes_empty_pointer_slot_is_ref() {
+        // virtualizable.py wrap() of a nullptr is ConstPtr, type 'r'.
+        // An empty array item must not become InputArgInt (`q[i] =` then
+        // sees an int).
+        let recorder = Trace::new();
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.virtualizable_boxes = Some(vec![OpRef::NONE, OpRef::NONE]);
+        let typed = ctx.collect_virtualizable_typed_boxes().unwrap();
+        assert_eq!(typed[0].1, Type::Ref);
+        assert_eq!(typed[1].1, Type::Ref);
     }
 
     #[test]

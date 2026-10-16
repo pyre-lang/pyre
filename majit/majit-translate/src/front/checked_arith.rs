@@ -187,6 +187,43 @@ fn int_const(i: i64) -> LinkArg {
     LinkArg::Const(Constant::new(ConstValue::Int(i)))
 }
 
+/// `_ovf2long` (`_int_add_ovf` and twins) is a `dont_look_inside`
+/// residual that returns a wrapped long and does not raise
+/// (`intobject.py` `_make_ovf2long`). `result_exc` stamps
+/// `LastException` on every Result tail-forward
+/// (`exceptiontransform.py` `create_exception_handling`), which would
+/// put that residual's undefined etype/evalue in the overflow `-live-`
+/// list (`flatten.py` `catch_exception`). Collapse the dead exception
+/// edge so the overflow handler is the residual call + return.
+fn collapse_dead_overflow_tail_forward_exception(
+    graph: &mut FunctionGraph,
+    none_target: crate::model::BlockId,
+) {
+    if !matches!(
+        graph.blocks[none_target.0].exitswitch,
+        Some(ExitSwitch::LastException)
+    ) {
+        return;
+    }
+    let none_block = &graph.blocks[none_target.0];
+    let Some(normal) = none_block
+        .exits
+        .iter()
+        .find(|link| link.exitcase.is_none())
+        .cloned()
+    else {
+        return;
+    };
+    if !none_block
+        .exits
+        .iter()
+        .any(|link| link.exitcase.is_some() && link.target == graph.exceptblock)
+    {
+        return;
+    }
+    graph.set_control_flow_metadata(none_target, None, vec![normal]);
+}
+
 /// `true` iff `var` is read — as an op operand or an `ExitSwitch::Value`
 /// discriminator — by any block reachable from `start` (inclusive).
 /// Forwarding `var` in a `Link.args` slot is NOT a read: framestate
@@ -360,7 +397,6 @@ fn rewire_one_checked_arith_site(
             ovf_opname,
             ok_or_else_sites,
         )
-        .map(|()| true)
         .map_err(|reason| {
             format!("{name}: block {c} lacks the Option __discriminant read; {reason}")
         });
@@ -463,6 +499,7 @@ fn rewire_one_checked_arith_site(
     }
 
     // All structural validation passed; mutate the graph.
+    collapse_dead_overflow_tail_forward_exception(graph, none_target);
 
     // The Some target reads the payload via `opt.__pos_0`; with the `_ovf`
     // result flowing directly, that read collapses to the carried value.
@@ -550,11 +587,14 @@ fn find_ok_or_else_continuation(
 }
 
 /// Rewrite the signed-arithmetic `checked_*(lhs, rhs).ok_or_else(env)` shape.
-/// The `Option` is only an intermediate encoding: normal execution rebuilds
-/// `Result::Ok(sum)`, while the overflow edge invokes the existing niladic
-/// closure and rebuilds `Result::Err(error)`.  This is the same `*_ovf`
-/// exception edge as the direct-match route above, with the `ok_or_else`
-/// select fused into its two continuations.
+/// The `Option` is only an intermediate encoding. A plain-goto continuation
+/// still rebuilds `Result::Ok(sum)` / `Result::Err(closure())`. After
+/// `result_exc` stamps `LastException` the continuation is already `T`:
+/// the normal edge forwards the sum, and the overflow edge invokes the
+/// closure then raises (`exc_from_raise` / `flowcontext.py`).  Both shapes
+/// keep the `*_ovf` OverflowError link of the direct-match route
+/// (`operation.py` `_add_except_ovf`), with live operands on that link
+/// (`flatten.py` `-live-` + `catch_exception`).
 #[allow(clippy::too_many_arguments)]
 fn rewire_checked_arith_ok_or_else(
     graph: &mut FunctionGraph,
@@ -567,7 +607,7 @@ fn rewire_checked_arith_ok_or_else(
     rhs: Variable,
     ovf_opname: &str,
     sites: &[CheckedArithOkOrElseSite],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let Some((site, ok_idx)) = find_ok_or_else_continuation(graph, c, opt_c, sites) else {
         return Err("no recorded Option::ok_or_else continuation".to_string());
     };
@@ -641,32 +681,61 @@ fn rewire_checked_arith_ok_or_else(
         }
     }
 
-    if graph.blocks[c].exitswitch.is_some() {
-        return Err("ok_or_else continuation has an exitswitch".to_string());
-    }
-    let [c_exit] = graph.blocks[c].exits.as_slice() else {
-        return Err("ok_or_else continuation does not have one exit".to_string());
-    };
-    if c_exit.exitcase.is_some()
-        || c_exit.last_exception.is_some()
-        || c_exit.last_exc_value.is_some()
-    {
-        return Err("ok_or_else continuation exit is not a plain goto".to_string());
-    }
     // After remint the Call produces the payload Variable, not the
     // recorded Result identity; the continuation forwards that live result.
     let live_result = graph.blocks[c].operations[ok_idx]
         .result
         .clone()
         .ok_or_else(|| "ok_or_else continuation has no result".to_string())?;
-    if c_exit
+    // `result_exc` tail-forwards a returned `ok_or_else` Result with
+    // `LastException` (normal → returnblock with the payload, exception →
+    // exceptblock).  That continuation is already `T`; wrapping `Ok`/`Err`
+    // again would put a GC ref next to the payload phi (`unionof` colours
+    // the return `GcRef` against `FUNC.RESULT=i`).  Take the normal exit
+    // and replace the exception edge with OverflowError from `*_ovf`
+    // (`operation.py` `_add_except_ovf`).  A plain goto is the
+    // pre-`result_exc` shape, which still rebuilds the Result shells.
+    let continuation_is_last_exception =
+        matches!(graph.blocks[c].exitswitch, Some(ExitSwitch::LastException));
+    let saved_c_exit = if continuation_is_last_exception {
+        let normal = graph.blocks[c]
+            .exits
+            .iter()
+            .find(|link| link.exitcase.is_none())
+            .cloned()
+            .ok_or_else(|| "ok_or_else LastException block has no normal exit".to_string())?;
+        if !graph.blocks[c]
+            .exits
+            .iter()
+            .any(|link| link.target == graph.exceptblock)
+        {
+            return Err(
+                "ok_or_else LastException exception exit is not the exceptblock".to_string(),
+            );
+        }
+        normal
+    } else {
+        if graph.blocks[c].exitswitch.is_some() {
+            return Err("ok_or_else continuation has an exitswitch".to_string());
+        }
+        let [c_exit] = graph.blocks[c].exits.as_slice() else {
+            return Err("ok_or_else continuation does not have one exit".to_string());
+        };
+        if c_exit.exitcase.is_some()
+            || c_exit.last_exception.is_some()
+            || c_exit.last_exc_value.is_some()
+        {
+            return Err("ok_or_else continuation exit is not a plain goto".to_string());
+        }
+        c_exit.clone()
+    };
+    if saved_c_exit
         .args
         .iter()
         .any(|arg| matches!(arg, LinkArg::Value(value) if *value != live_result))
     {
         return Err("ok_or_else continuation forwards a non-result value".to_string());
     }
-    let saved_c_exit = c_exit.clone();
     let [a_exit] = graph.blocks[a].exits.as_slice() else {
         return Err("checked-arith block does not have one exit".to_string());
     };
@@ -700,22 +769,28 @@ fn rewire_checked_arith_ok_or_else(
 
     // All structural validation passed; mutate the graph.
 
-    // Normal edge: the raising op's result is the sum, wrapped as `Ok(sum)`.
+    // Normal edge. A LastException continuation is already `T` (the
+    // reminted payload); wrapping `Ok` would union a GC ref into that
+    // return phi. A plain goto still rebuilds `Ok(sum)`.
     let (normal_id, normal_inputs) = graph.create_block_with_arg_vars(1);
-    let ok_shell = crate::front::result_exc::build_shell(
-        graph,
-        normal_id,
-        "Ok",
-        normal_inputs[0].clone(),
-        site.ok_payload_ty.clone(),
-        &site.result_suffix,
-    );
+    let normal_value = if continuation_is_last_exception {
+        normal_inputs[0].clone()
+    } else {
+        crate::front::result_exc::build_shell(
+            graph,
+            normal_id,
+            "Ok",
+            normal_inputs[0].clone(),
+            site.ok_payload_ty.clone(),
+            &site.result_suffix,
+        )
+    };
     let normal_exit_args = saved_c_exit
         .args
         .iter()
         .map(|arg| match arg {
             LinkArg::Const(value) => LinkArg::Const(value.clone()),
-            LinkArg::Value(_) => LinkArg::Value(ok_shell.clone()),
+            LinkArg::Value(_) => LinkArg::Value(normal_value.clone()),
         })
         .collect();
     graph.set_control_flow_metadata(
@@ -724,8 +799,12 @@ fn rewire_checked_arith_ok_or_else(
         vec![Link::new_mixed(normal_exit_args, saved_c_exit.target, None)],
     );
 
-    // Overflow edge: retain the captured closure aggregate, invoke it, and
-    // replace the opaque `ok_or_else` result with `Err(closure())`.
+    // Overflow edge: keep the live operands (`flatten.py` `-live-` +
+    // `catch_exception`), invoke the captured closure, then either wrap
+    // `Err(closure())` (pre-`result_exc` goto) or raise it
+    // (`exc_from_raise`).  Jumping straight to exceptblock with the
+    // `_ovf` link's undefined etype/evalue slots would feed garbage GC
+    // pointers into the function-level handler.
     graph.blocks[c].operations.remove(ok_idx);
     let err_value = crate::front::option_closure_select::emit_call_once(
         graph,
@@ -736,31 +815,35 @@ fn rewire_checked_arith_ok_or_else(
         site.err_payload_ty.clone(),
         "",
     );
-    let err_shell = crate::front::result_exc::build_shell(
-        graph,
-        graph.blocks[c].id,
-        "Err",
-        err_value,
-        site.err_payload_ty,
-        &site.result_suffix,
-    );
-    let overflow_exit_args = saved_c_exit
-        .args
-        .iter()
-        .map(|arg| match arg {
-            LinkArg::Const(value) => LinkArg::Const(value.clone()),
-            LinkArg::Value(_) => LinkArg::Value(err_shell.clone()),
-        })
-        .collect();
-    graph.set_control_flow_metadata(
-        graph.blocks[c].id,
-        None,
-        vec![Link::new_mixed(
-            overflow_exit_args,
-            saved_c_exit.target,
+    if continuation_is_last_exception {
+        crate::front::exc_from_raise::set_raise_from_instance(graph, graph.blocks[c].id, err_value);
+    } else {
+        let err_shell = crate::front::result_exc::build_shell(
+            graph,
+            graph.blocks[c].id,
+            "Err",
+            err_value,
+            site.err_payload_ty,
+            &site.result_suffix,
+        );
+        let overflow_exit_args = saved_c_exit
+            .args
+            .iter()
+            .map(|arg| match arg {
+                LinkArg::Const(value) => LinkArg::Const(value.clone()),
+                LinkArg::Value(_) => LinkArg::Value(err_shell.clone()),
+            })
+            .collect();
+        graph.set_control_flow_metadata(
+            graph.blocks[c].id,
             None,
-        )],
-    );
+            vec![Link::new_mixed(
+                overflow_exit_args,
+                saved_c_exit.target,
+                None,
+            )],
+        );
+    }
 
     graph.blocks[a].operations[call_idx].kind = OpKind::BinOp {
         op: ovf_opname.to_string(),
@@ -793,7 +876,7 @@ fn rewire_checked_arith_ok_or_else(
             overflow_link,
         ],
     );
-    Ok(())
+    Ok(!continuation_is_last_exception)
 }
 
 #[cfg(test)]
@@ -988,6 +1071,114 @@ mod tests {
             exits[1].last_exception.is_some() && exits[1].last_exc_value.is_some(),
             "overflow link carries the last_exception / last_exc_value pair"
         );
+    }
+
+    /// `_int_add`'s None arm is `return _int_add_ovf(...)`: a Result
+    /// tail-forward that `result_exc` stamps `LastException` on. The
+    /// residual does not raise (`intobject.py` `_make_ovf2long`); the
+    /// overflow handler must be that call + return, not a live list
+    /// carrying undefined etype/evalue.
+    #[test]
+    fn rewrite_strips_lastexception_from_the_ovf2long_tail_forward() {
+        let mut g = FunctionGraph::new("test_checked_add_ovf2long");
+        let a = g.startblock;
+        let va = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let vb = g.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: checked_target(),
+                    args: crate::model::call_args(vec![va.clone(), vb.clone()]),
+                    result_ty: ValueType::Ref(Some("core::option::Option".into())),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: opt_c.clone(),
+                    field: FieldDescriptor::new("__discriminant", None),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (some_t, some_args) = g.create_block_with_arg_vars(1);
+        let some_opt = some_args[0].clone();
+        g.push_op_var(
+            some_t,
+            OpKind::FieldRead {
+                base: some_opt,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        g.set_return(some_t, None);
+
+        let (none_t, _none_inputs) = g.create_block_with_arg_vars(1);
+        let long_obj = g
+            .push_op_var(
+                none_t,
+                OpKind::Call {
+                    target: CallTarget::function_path(["descroperation", "_int_add_ovf"]),
+                    args: crate::model::call_args(vec![va.clone(), vb.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(none_t, Some(long_obj.clone()));
+        let etype = g.alloc_value_var();
+        let evalue = g.alloc_value_var();
+        let mut exc = Link::new_mixed(
+            vec![
+                LinkArg::Value(etype.clone()),
+                LinkArg::Value(evalue.clone()),
+            ],
+            g.exceptblock,
+            Some(crate::model::exception_exitcase()),
+        );
+        exc.last_exception = Some(LinkArg::Value(etype));
+        exc.last_exc_value = Some(LinkArg::Value(evalue));
+        let normal = g.blocks[none_t.0].exits[0].clone();
+        g.set_control_flow_metadata(none_t, Some(ExitSwitch::LastException), vec![normal, exc]);
+
+        g.set_goto(a, c, vec![opt.clone()]);
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c.clone())],
+                none_t,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            )
+            .with_prevblock(c),
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c.clone())],
+                some_t,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            )
+            .with_prevblock(c),
+        ];
+
+        let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[]);
+        assert_eq!(rewritten.total, 1);
+        assert_eq!(g.blocks[a.0].exits[1].target, none_t);
+        assert!(
+            g.blocks[none_t.0].exitswitch.is_none(),
+            "ovf2long tail-forward must not keep LastException"
+        );
+        assert_eq!(g.blocks[none_t.0].exits.len(), 1);
+        assert_eq!(g.blocks[none_t.0].exits[0].target, g.returnblock);
     }
 
     #[test]
@@ -1284,7 +1475,10 @@ mod tests {
         let rewritten =
             rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
         assert_eq!(rewritten.total, 1);
-        assert_eq!(rewritten.result_shells, 1);
+        // `rewire_one_call_site` already stamped LastException on the
+        // reminted tail-forward, so the continuation is `T`. Rebuilding
+        // Ok/Err shells would union a GC ref into that payload phi.
+        assert_eq!(rewritten.result_shells, 0);
         assert!(matches!(
             &g.blocks[a.0].operations.last().unwrap().kind,
             OpKind::BinOp { op, .. } if op == "add_ovf"
@@ -1293,21 +1487,120 @@ mod tests {
             g.blocks[a.0].exitswitch,
             Some(ExitSwitch::LastException)
         ));
+        let overflow = g.blocks[a.0]
+            .exits
+            .iter()
+            .find(|exit| exit.exitcase.as_ref() == Some(&overflowerror_exitcase()))
+            .expect("OverflowError exit");
+        // Overflow keeps the live operands and the closure block; the
+        // closure result is raised (`exc_from_raise`), not stuffed into
+        // exceptblock as the `_ovf` link's undefined etype/evalue.
+        assert_eq!(overflow.target, c);
+        assert_eq!(g.blocks[c.0].exits.len(), 1);
+        assert_eq!(g.blocks[c.0].exits[0].target, g.exceptblock);
+    }
+
+    /// After the callee rule stamps `LastException` on the reminted
+    /// `ok_or_else` tail-forward, the continuation is already `T`. The
+    /// fold must not rebuild `Ok`/`Err` shells into that returnblock.
+    #[test]
+    fn rewrite_lifts_ok_or_else_last_exception_without_rebuilding_shells() {
+        let mut g = FunctionGraph::new("test_checked_add_ok_or_else_last_exception");
+        let a = g.startblock;
+        let lhs = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let rhs = g.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: checked_target(),
+                    args: crate::model::call_args(vec![lhs.clone(), rhs.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_inputs) = g.create_block_with_arg_vars(3);
+        let opt_c = c_inputs[2].clone();
+        let env = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["test".into()],
+                        "closure",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("test::closure".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let payload = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: CallTarget::method("ok_or_else", Some("Option".into())),
+                    args: crate::model::call_args(vec![opt_c, env.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_goto(a, c, vec![lhs, rhs, opt.clone()]);
+        g.set_return(c, Some(payload.clone()));
+        let etype = g.alloc_value_var();
+        let evalue = g.alloc_value_var();
+        let mut exc = Link::new_mixed(
+            vec![
+                LinkArg::Value(etype.clone()),
+                LinkArg::Value(evalue.clone()),
+            ],
+            g.exceptblock,
+            Some(crate::model::exception_exitcase()),
+        );
+        exc.last_exception = Some(LinkArg::Value(etype));
+        exc.last_exc_value = Some(LinkArg::Value(evalue));
+        let normal = g.blocks[c.0].exits[0].clone();
+        g.set_control_flow_metadata(c, Some(ExitSwitch::LastException), vec![normal, exc]);
+
+        let paired = CheckedArithOkOrElseSite {
+            result_var: payload,
+            closure_arg: env,
+            call_once_owner: "test::closure".into(),
+            result_suffix: String::new(),
+            ok_payload_ty: ValueType::Int,
+            err_payload_ty: ValueType::Ref(None),
+        };
+        let rewritten =
+            rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
+        assert_eq!(rewritten.total, 1);
+        assert_eq!(rewritten.result_shells, 0);
+        assert!(matches!(
+            &g.blocks[a.0].operations.last().unwrap().kind,
+            OpKind::BinOp { op, .. } if op == "add_ovf"
+        ));
+        let overflow = g.blocks[a.0]
+            .exits
+            .iter()
+            .find(|exit| exit.exitcase.as_ref() == Some(&overflowerror_exitcase()))
+            .expect("OverflowError exit");
+        assert_eq!(overflow.target, c);
+        assert_eq!(g.blocks[c.0].exits.len(), 1);
+        assert_eq!(g.blocks[c.0].exits[0].target, g.exceptblock);
         assert!(
             !g.blocks
                 .iter()
                 .flat_map(|block| &block.operations)
                 .any(|op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::Method { name, .. }, .. }
-                if name == "ok_or_else")
-                })
-        );
-        assert!(
-            g.blocks[a.0]
-                .exits
-                .iter()
-                .any(|exit| exit.exitcase.as_ref() == Some(&overflowerror_exitcase())),
-            "the overflow link must carry the OverflowError exitcase"
+                    crate::front::result_exc::result_ctor_kind(match &op.kind {
+                        OpKind::Call { target, .. } => target,
+                        _ => return false,
+                    })
+                    .is_some()
+                }),
+            "LastException continuation must not rebuild Ok/Err shells"
         );
     }
 

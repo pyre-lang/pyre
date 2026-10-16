@@ -58,11 +58,13 @@ struct Table {
     live: Vec<u32>,
     /// Reclaimed indexes `intern` reuses. Index 0 is never queued.
     free: Vec<u32>,
-    /// Indexes interned since the last [`collect_young_const_ptrs`].
-    /// `resumecode.py` `YOUNG_NUMBERINGS` for `ConstPtr`: the intern-to-holder
-    /// window. An `OpRef` Copy index is not a GCREF root; extra-area
-    /// `trace_index` is registered later. A minor in that window must still
-    /// forward the slot (`incminimark.py` `collect_oldrefs_to_nursery`).
+    /// Indexes interned since the last [`collect_young_const_ptrs`] that
+    /// owned the referent. `resumecode.py` `YOUNG_NUMBERINGS` for `ConstPtr`:
+    /// the intern-to-holder window. An `OpRef` Copy index is not a GCREF
+    /// root; extra-area `trace_index` is registered later. A minor in that
+    /// window must still forward the slot (`incminimark.py`
+    /// `collect_oldrefs_to_nursery`). That walk is per MiniMark; a collector
+    /// that does not own the referent requeues the index.
     young: Vec<u32>,
     /// `1` while `idx` sits in [`Table::young`]. Cleared when the list drains.
     young_mark: Vec<u8>,
@@ -558,9 +560,10 @@ pub fn walk(visitor: &mut dyn FnMut(&mut GcRef)) {
 
 /// Drain [`Table::young`] and `trace_index` each slot.
 ///
-/// `incminimark.py` `collect_oldrefs_to_nursery` for interned `ConstPtr`.
-/// The list is the intern-to-holder remembered set. Clearing it is this
-/// minor's end for these slots; a later intern re-queues.
+/// Tests and a collector that owns every interned referent use this.
+/// A MiniMark that shares the process-global table with another collector
+/// uses [`take_owned_young`]: `incminimark.py` `collect_oldrefs_to_nursery`
+/// walks one MiniMark's remembered set.
 pub fn collect_young_const_ptrs(visitor: &mut dyn FnMut(&mut GcRef)) {
     let young = take_young();
     for idx in young {
@@ -574,16 +577,18 @@ pub fn collect_young_const_ptrs(visitor: &mut dyn FnMut(&mut GcRef)) {
 /// in the remembered set until the pre-sweep drain. `trace_live_numberings`
 /// is the NUMBERING counterpart that does not clear `YOUNG_NUMBERINGS`.
 pub fn trace_young_const_ptrs(visitor: &mut dyn FnMut(&mut GcRef)) {
-    let young = {
-        let guard = table();
-        guard.young.clone()
-    };
-    for idx in young {
+    for idx in young_indexes() {
         trace_index(idx, visitor);
     }
 }
 
-fn take_young() -> Vec<u32> {
+/// Snapshot [`Table::young`] without draining it.
+pub fn young_indexes() -> Vec<u32> {
+    table().young.clone()
+}
+
+/// Drain [`Table::young`].
+pub fn take_young() -> Vec<u32> {
     let mut guard = table();
     take_young_under(&mut guard)
 }
@@ -597,6 +602,45 @@ fn take_young_under(guard: &mut Table) -> Vec<u32> {
         }
     }
     taken
+}
+
+/// Remove from [`Table::young`] the indexes whose current value `belongs`
+/// accepts. The rest stay queued. Holds the intern lock across the
+/// partition so a concurrent MiniMark cannot drain a foreign intern
+/// (`incminimark.py` `collect_oldrefs_to_nursery` is per collector).
+///
+/// `belongs` must not intern, trace, or collect: it runs under the intern lock.
+pub fn take_owned_young(belongs: &mut dyn FnMut(GcRef) -> bool) -> Vec<u32> {
+    let mut guard = table();
+    let taken = take_young_under(&mut guard);
+    let mut mine = Vec::new();
+    for idx in taken {
+        let addr = guard
+            .slots
+            .get(idx as usize)
+            .copied()
+            .unwrap_or(GcRef::NULL);
+        if addr.is_null() {
+            continue;
+        }
+        if belongs(addr) {
+            mine.push(idx);
+        } else {
+            note_young(&mut guard, idx);
+        }
+    }
+    mine
+}
+
+/// Return indexes to the intern-to-holder remembered set.
+pub fn requeue_young(indexes: &[u32]) {
+    if indexes.is_empty() {
+        return;
+    }
+    let mut guard = table();
+    for &idx in indexes {
+        note_young(&mut guard, idx);
+    }
 }
 
 fn note_young(guard: &mut Table, idx: u32) {
@@ -620,11 +664,39 @@ fn note_young(guard: &mut Table, idx: u32) {
 /// Call only after a complete holder census. A major that walked one
 /// thread's extra areas would recycle another thread's live indexes.
 pub fn sweep_untraced() {
+    sweep_untraced_if(&mut |_| true);
+}
+
+/// [`sweep_untraced`] limited to referents `belongs` accepts.
+///
+/// A MiniMark major must not free another collector's interned slot.
+/// `history.py` `ConstPtr` lives in that heap; the process-global table
+/// is the `Copy` stand-in for the box field.
+pub fn sweep_untraced_if(belongs: &mut dyn FnMut(GcRef) -> bool) {
     let live = current_live();
     let mut guard = table();
     let mut idx = 1usize;
     while idx < guard.slots.len() {
-        if !guard.slots[idx].is_null() && guard.live[idx] != live {
+        if !guard.slots[idx].is_null() && guard.live[idx] != live && belongs(guard.slots[idx]) {
+            free_slot(&mut guard, idx);
+        }
+        idx += 1;
+    }
+}
+
+/// Drop intern slots whose live word `belongs` accepts.
+///
+/// `history.py` `ConstPtr` lives in the MiniMark heap that interned it.
+/// The process-global table is the `Copy` stand-in for the box field, so
+/// destroying that heap must drop those slots. A later MiniMark whose
+/// nursery reuses the mapping would otherwise `drag_out` a leftover as
+/// `collect_oldrefs_to_nursery`. Does not bump [`begin_major_live`] and
+/// does not drain [`Table::young`] of other slots.
+pub fn drop_slots_if(belongs: &mut dyn FnMut(GcRef) -> bool) {
+    let mut guard = table();
+    let mut idx = 1usize;
+    while idx < guard.slots.len() {
+        if !guard.slots[idx].is_null() && belongs(guard.slots[idx]) {
             free_slot(&mut guard, idx);
         }
         idx += 1;
@@ -873,6 +945,18 @@ mod tests {
     }
 
     #[test]
+    fn drop_slots_if_frees_matching_slots_and_leaves_the_rest() {
+        let _serial = TEST_SERIAL.lock();
+        let keep = intern(GcRef(0x6E6D_0000));
+        let drop_me = intern(GcRef(0x6E6D_1000));
+        drop_slots_if(&mut |g| g.0 == 0x6E6D_1000);
+        assert_eq!(resolve(keep), GcRef(0x6E6D_0000));
+        assert!(resolve(drop_me).is_null());
+        intern(GcRef(0x6E6D_1000));
+        drop_slots_if(&mut |g| (0x6E6D_0000..0x6E6D_2000).contains(&g.0));
+    }
+
+    #[test]
     fn walk_forwards_the_slot_the_index_names() {
         let _serial = TEST_SERIAL.lock();
         let addr = GcRef(0x3333_0000);
@@ -1027,6 +1111,32 @@ mod tests {
         sweep_untraced();
         assert_eq!(resolve(idx), addr);
         assert_eq!(intern(addr), idx);
+        reclaim_unheld();
+    }
+
+    /// `collect_oldrefs_to_nursery` is per MiniMark. A collector that
+    /// does not own the referent must leave the intern queued for the
+    /// MiniMark that allocated it.
+    #[test]
+    fn collect_young_leaves_slots_the_collector_does_not_own() {
+        let _serial = TEST_SERIAL.lock();
+        reclaim_unheld();
+        let mine = intern(GcRef(0x6E6C_0010));
+        let other = intern(GcRef(0x6E6C_0020));
+        let mine_idxs = take_owned_young(&mut |g| g.0 == 0x6E6C_0010);
+        for idx in mine_idxs {
+            trace_index(idx, &mut |slot| {
+                if slot.0 == 0x6E6C_0010 {
+                    *slot = GcRef(0x6E6C_0018);
+                }
+            });
+        }
+        assert_eq!(resolve(mine), GcRef(0x6E6C_0018));
+        assert_eq!(resolve(other), GcRef(0x6E6C_0020));
+        assert!(
+            young_indexes().contains(&other),
+            "the foreign intern must stay in the remembered set"
+        );
         reclaim_unheld();
     }
 
