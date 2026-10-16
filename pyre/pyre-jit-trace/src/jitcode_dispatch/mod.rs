@@ -12794,18 +12794,12 @@ fn guarded_branch_core<Sym: WalkSym>(
     other_pc: usize,
     result_write: Option<(usize, OpRef)>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Resume-data capture (`capture_resumedata(resumepc=orgpc)` at
-    // `pyjitpl.py`) is threaded via
-    // `walker_capture_snapshot_for_last_guard(other_target)`.
-    // Branch guards resume at the runtime jump destination — the
-    // branch NOT taken in the trace — not the `goto_if_not` opcode
-    // itself (`trace_opcode.rs`, `resume_pc =
-    // other_target`).  The trace took the `switchcase` direction;
-    // a guard failure flips to the other arm, where the Python
-    // interpreter has already popped the comparison truth, so the
-    // blackhole must re-enter past `POP_JUMP_IF_*`.  GuardTrue
-    // (trace fell through to `op.next_pc`) → resume at `target`;
-    // GuardFalse (trace jumped to `target`) → resume at `op.next_pc`.
+    // `pyjitpl.py` `opimpl_goto_if_not` / `generate_guard(resumepc=orgpc)`:
+    // a branch guard resumes AT the conditional jump, and blackhole
+    // `bhimpl_goto_if_not` re-evaluates the restored condition.
+    // `other_target` is still the not-taken arm (kept-stack trampoline
+    // decode, depth gate, unrestorable-arm decline). Depth-0 capture
+    // below keys the jump itself rather than this destination.
     let other_target = resolve_branch_target_through_trampoline(code, other_pc);
     {
         // #124/#281: a branch guard whose resume target still holds a
@@ -13168,11 +13162,6 @@ fn guarded_branch_core<Sym: WalkSym>(
         // operand-stack values from the guard-pc register file (the
         // resume coordinate `other_target` names a merge point whose
         // live colors the walk has not written at the guard point).
-        // A depth-0 branch resumes losslessly at `other_target` via
-        // the baseline `py_pc → jitcode` resume-translation path;
-        // routing it through the
-        // guard-pc carrier would resume one opcode early (re-running
-        // `goto_if_not`) and desync the decoded box layout.
         // Feed the snapshot encoder the SAME resolved set the gate
         // checked (resolved above, before `record_guard`): each
         // `(dst, live guard value)`, sources already filtered to live
@@ -13183,9 +13172,23 @@ fn guarded_branch_core<Sym: WalkSym>(
         } else {
             Vec::new()
         };
+        // Depth-0: `pyjitpl.py` `opimpl_goto_if_not` /
+        // `generate_guard(resumepc=orgpc)`. Capture at the jump's
+        // `-live-` BEFORE (`ctx.live_before_jit_pc`), the same
+        // coordinate JUMP_BACKWARD already publishes, so the snapshot
+        // boxes are the live set before `goto_if_not` (condition
+        // included) and blackhole re-evaluates the branch. Kept-stack
+        // (depth>0 trampoline) still snapshots `other_target`.
+        let capture_pc = if kept_stack {
+            other_target
+        } else if ctx.live_before_jit_pc != usize::MAX {
+            ctx.live_before_jit_pc
+        } else {
+            op.pc
+        };
         walker_capture_snapshot_for_last_guard_scoped(
             ctx,
-            other_target,
+            capture_pc,
             GuardCaptureScope {
                 branch_guard_jitcode_pc: kept_stack.then_some(op.pc),
                 branch_guard_kept_recovered: &kept,
