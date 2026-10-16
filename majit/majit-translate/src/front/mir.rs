@@ -39183,13 +39183,15 @@ impl<'a> Lowering<'a> {
             return false;
         };
         // The same projection as `Option<Vec<T>>` below applies to the
-        // string family: `String` / `Wtf8Buf` / `BytesBlock` / builtin
-        // `str` are already [`node_is_string_value`] (`SomeString`).
+        // string family: rstr `STR` wrappers and rust-heap
+        // `alloc::string::String` ([`tyref_is_string_family`], `SomeString`).
+        // `node_is_string_value` excludes the rust-heap header; the family
+        // predicate is what `option_niche_null_cast` already uses.
         // `Option<String>` is the nullable form (`s is None` /
         // `s is not None`; `pairtype(SomeObject, SomeObject).is_`,
         // `rtype_is_` / `ptr_iszero`), and `Some` is the string itself —
         // there is no `__discriminant` / `__pos_0` field.
-        if node_is_string_value(payload, self.llbc) {
+        if tyref_is_string_family(&TyRef::Other(payload.clone()), self.llbc) {
             return true;
         }
         let Some(def_id) = adt_node_def_id(payload) else {
@@ -39266,7 +39268,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// `true` when `option_ty` is a niche nullable `Option<P>` and `P` is
-    /// string-family ([`node_is_string_value`]): builtin `str`, `String`,
+    /// string-family ([`tyref_is_string_family`]): builtin `str`, `String`,
     /// `Wtf8` / `Wtf8Buf` / `BytesBlock` / `Utf8Str`, including a shared
     /// reference to those (`Option<&str>`). Under the niche model `None`
     /// is the null string and `Some(c)` is the string `c` itself, so
@@ -39296,7 +39298,7 @@ impl<'a> Lowering<'a> {
         let Some(node) = strip_ty_wrappers(payload, self.llbc) else {
             return false;
         };
-        node_is_string_value(node, self.llbc)
+        tyref_is_string_family(&TyRef::Other(node.clone()), self.llbc)
     }
 
     /// Operand of `<Option<P> as PartialEq>::eq` / `ne`: `&Option<P>`
