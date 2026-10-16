@@ -495,105 +495,111 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     crate::__pyre_put_new!(
         ns_slot,
         "enable",
-        pyre_interpreter::make_builtin_function_with_signature(
-            "enable",
-            |args| {
-                // `handler.py enable` — file=None, all_threads=True.
-                // Resolving the argument runs a user `fileno()` and `flush()`;
-                // keep those side effects behind the support gate, so a build
-                // that can only answer NotImplementedError does not run them
-                // first.
-                #[cfg(all(any(unix, windows), feature = "host_env"))]
-                {
-                    let all_threads = args
-                        .get(1)
-                        .copied()
-                        .filter(|a| !a.is_null())
-                        .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                        .transpose()?
-                        .unwrap_or(1);
-                    let (fd, w_file) = faulthandler_get_fileno_and_file(
-                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    )?;
-                    // Nothing else names the resolved file between here and the
-                    // owner store below, so keep it rooted across the install.
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let file_slot = (!w_file.is_null()).then(|| {
-                        let _ = pyre_object::gc_roots::pin_root(w_file);
-                        pyre_object::gc_roots::shadow_stack_len() - 1
-                    });
-                    let _state = lock_faulthandler_state();
-                    #[cfg(unix)]
+        // `handler.py enable(space, w_file=None, all_threads=0)`; clinic also
+        // takes `c_stack=True`.
+        pyre_interpreter::gateway::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature(
+                "enable",
+                |args| {
+                    // `handler.py enable` — file=None, all_threads=True.
+                    // Resolving the argument runs a user `fileno()` and `flush()`;
+                    // keep those side effects behind the support gate, so a build
+                    // that can only answer NotImplementedError does not run them
+                    // first.
+                    #[cfg(all(any(unix, windows), feature = "host_env"))]
                     {
-                        check_err(super::cintf::pypy_faulthandler_setup())?;
-                        check_err(super::cintf::pypy_faulthandler_enable(
-                            fd,
-                            all_threads as libc::c_int,
-                        ))?;
-                        set_fatal_error_file(file_slot.map_or(
-                            pyre_object::PY_NULL,
-                            pyre_object::gc_roots::shadow_stack_get,
-                        ));
-                        return Ok(pyre_object::w_none());
-                    }
-                    #[cfg(windows)]
-                    {
-                        let _ = all_threads;
-                        // `pypy_faulthandler_enable(fileno, all_threads)` takes
-                        // the descriptor as an argument, so the handler never
-                        // observes a descriptor the install did not commit to.
-                        let previous_fd = HANDLER.fd.swap(fd, std::sync::atomic::Ordering::Relaxed);
-                        let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
-                            faulthandler_signal_handler,
-                            0,
-                        );
-                        if ok {
-                            if HANDLER
-                                .exc_handler
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                                == 0
-                            {
-                                HANDLER.exc_handler.store(
-                                    rustpython_host_env::faulthandler::add_vectored_exception_handler(
-                                        Some(faulthandler_exc_handler),
-                                    ),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                            HANDLER
-                                .enabled
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let all_threads = args
+                            .get(1)
+                            .copied()
+                            .filter(|a| !a.is_null())
+                            .map(pyre_interpreter::baseobjspace::gateway_int_w)
+                            .transpose()?
+                            .unwrap_or(1);
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(
+                            args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                        )?;
+                        // Nothing else names the resolved file between here and the
+                        // owner store below, so keep it rooted across the install.
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let file_slot = (!w_file.is_null()).then(|| {
+                            let _ = pyre_object::gc_roots::pin_root(w_file);
+                            pyre_object::gc_roots::shadow_stack_len() - 1
+                        });
+                        let _state = lock_faulthandler_state();
+                        #[cfg(unix)]
+                        {
+                            check_err(super::cintf::pypy_faulthandler_setup())?;
+                            check_err(super::cintf::pypy_faulthandler_enable(
+                                fd,
+                                all_threads as libc::c_int,
+                            ))?;
                             set_fatal_error_file(file_slot.map_or(
                                 pyre_object::PY_NULL,
                                 pyre_object::gc_roots::shadow_stack_get,
                             ));
                             return Ok(pyre_object::w_none());
                         }
-                        HANDLER
-                            .fd
-                            .store(previous_fd, std::sync::atomic::Ordering::Relaxed);
-                        Err(pyre_interpreter::PyError::runtime_error(
-                            "faulthandler.enable: sigaction failed",
+                        #[cfg(windows)]
+                        {
+                            let _ = all_threads;
+                            // `pypy_faulthandler_enable(fileno, all_threads)` takes
+                            // the descriptor as an argument, so the handler never
+                            // observes a descriptor the install did not commit to.
+                            let previous_fd =
+                                HANDLER.fd.swap(fd, std::sync::atomic::Ordering::Relaxed);
+                            let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
+                                faulthandler_signal_handler,
+                                0,
+                            );
+                            if ok {
+                                if HANDLER
+                                    .exc_handler
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    == 0
+                                {
+                                    HANDLER.exc_handler.store(
+                                    rustpython_host_env::faulthandler::add_vectored_exception_handler(
+                                        Some(faulthandler_exc_handler),
+                                    ),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                }
+                                HANDLER
+                                    .enabled
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                set_fatal_error_file(file_slot.map_or(
+                                    pyre_object::PY_NULL,
+                                    pyre_object::gc_roots::shadow_stack_get,
+                                ));
+                                return Ok(pyre_object::w_none());
+                            }
+                            HANDLER
+                                .fd
+                                .store(previous_fd, std::sync::atomic::Ordering::Relaxed);
+                            Err(pyre_interpreter::PyError::runtime_error(
+                                "faulthandler.enable: sigaction failed",
+                            ))
+                        }
+                    }
+                    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+                    {
+                        let _ = args;
+                        Err(pyre_interpreter::PyError::not_implemented(
+                            "faulthandler.enable requires host_env feature",
                         ))
                     }
-                }
-                #[cfg(not(all(any(unix, windows), feature = "host_env")))]
-                {
-                    let _ = args;
-                    Err(pyre_interpreter::PyError::not_implemented(
-                        "faulthandler.enable requires host_env feature",
-                    ))
-                }
-            },
-            // `enable(file=sys.stderr, all_threads=True, c_stack=True)` —
-            // `c_stack` (3.14) selects C-stack dumping; accept and ignore it.
-            pyre_interpreter::Signature::new(
-                vec!["file", "all_threads", "c_stack"],
-                None,
-                None,
-                0,
-                0,
+                },
+                // `enable(file=sys.stderr, all_threads=True, c_stack=True)` —
+                // `c_stack` (3.14) selects C-stack dumping; accept and ignore it.
+                pyre_interpreter::Signature::new(
+                    vec!["file", "all_threads", "c_stack"],
+                    None,
+                    None,
+                    0,
+                    0,
+                ),
             ),
+            3,
         )
     );
     crate::__pyre_put_new!(
@@ -654,50 +660,54 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     crate::__pyre_put_new!(
         ns_slot,
         "dump_traceback",
-        pyre_interpreter::make_builtin_function_with_signature(
-            "dump_traceback",
-            |args| {
-                // `handler.py dump_traceback`. The C dump walks with
-                // `vmprof_get_traceback`; without it the Python entry still
-                // resolves the file and writes a placeholder.
-                #[cfg(all(unix, feature = "host_env"))]
-                {
-                    let all_threads = args
-                        .get(1)
-                        .copied()
-                        .filter(|a| !a.is_null())
-                        .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                        .transpose()?
-                        .unwrap_or(1);
-                    let (fd, w_file) = faulthandler_get_fileno_and_file(
-                        args.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    )?;
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    if !w_file.is_null() {
-                        let _ = pyre_object::gc_roots::pin_root(w_file);
+        // `handler.py dump_traceback(space, w_file=None, all_threads=0)`
+        pyre_interpreter::gateway::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature(
+                "dump_traceback",
+                |args| {
+                    // `handler.py dump_traceback`. The C dump walks with
+                    // `vmprof_get_traceback`; without it the Python entry still
+                    // resolves the file and writes a placeholder.
+                    #[cfg(all(unix, feature = "host_env"))]
+                    {
+                        let all_threads = args
+                            .get(1)
+                            .copied()
+                            .filter(|a| !a.is_null())
+                            .map(pyre_interpreter::baseobjspace::gateway_int_w)
+                            .transpose()?
+                            .unwrap_or(1);
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(
+                            args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                        )?;
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        if !w_file.is_null() {
+                            let _ = pyre_object::gc_roots::pin_root(w_file);
+                        }
+                        check_err(super::cintf::pypy_faulthandler_setup())?;
+                        super::cintf::pypy_faulthandler_dump_traceback(
+                            fd,
+                            all_threads as libc::c_int,
+                            std::ptr::null_mut(),
+                        );
+                        super::cintf::pypy_faulthandler_write(
+                            fd,
+                            b"<faulthandler: pyre has no Python-level traceback yet>\n",
+                        );
+                        Ok(pyre_object::w_none())
                     }
-                    check_err(super::cintf::pypy_faulthandler_setup())?;
-                    super::cintf::pypy_faulthandler_dump_traceback(
-                        fd,
-                        all_threads as libc::c_int,
-                        std::ptr::null_mut(),
-                    );
-                    super::cintf::pypy_faulthandler_write(
-                        fd,
-                        b"<faulthandler: pyre has no Python-level traceback yet>\n",
-                    );
-                    Ok(pyre_object::w_none())
-                }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = args;
-                    pyre_interpreter::host_seam::emit_stderr(
-                        b"<faulthandler: pyre has no Python-level traceback yet>\n",
-                    );
-                    Ok(pyre_object::w_none())
-                }
-            },
-            pyre_interpreter::Signature::new(vec!["file", "all_threads"], None, None, 0, 0),
+                    #[cfg(not(all(unix, feature = "host_env")))]
+                    {
+                        let _ = args;
+                        pyre_interpreter::host_seam::emit_stderr(
+                            b"<faulthandler: pyre has no Python-level traceback yet>\n",
+                        );
+                        Ok(pyre_object::w_none())
+                    }
+                },
+                pyre_interpreter::Signature::new(vec!["file", "all_threads"], None, None, 0, 0),
+            ),
+            2,
         )
     );
     crate::__pyre_put_new!(
@@ -734,91 +744,95 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     crate::__pyre_put_new!(
         ns_slot,
         "register",
-        pyre_interpreter::make_builtin_function_with_signature(
-            "register",
-            |args| {
-                let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                if w_signum.is_null() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "register() missing signal",
-                    ));
-                }
-                let signum = (unsafe { pyre_object::w_int_get_value(w_signum) }) as libc::c_int;
-                // handler.py:174 `@unwrap_spec(all_threads=int, chain=int)`
-                // with defaults `all_threads=1, chain=0`: the arguments are
-                // coerced as integers (`gateway_int_w`, raising on a non-int),
-                // not by truthiness; `register` then tests `if all_threads:`.  An
-                // omitted keyword leaves a null slot from the signature binding, so
-                // treat null as the default.
-                let all_threads = args
-                    .get(2)
-                    .copied()
-                    .filter(|a| !a.is_null())
-                    .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                    .transpose()?
-                    .unwrap_or(1)
-                    != 0;
-                let chain = args
-                    .get(3)
-                    .copied()
-                    .filter(|a| !a.is_null())
-                    .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                    .transpose()?
-                    .unwrap_or(0)
-                    != 0;
-                #[cfg(all(unix, feature = "host_env"))]
-                {
-                    // Resolving the file runs a user `fileno()` and `flush()`.
-                    // `register(signum, file, all_threads, chain)` parses and
-                    // coerces the two integer arguments before touching the
-                    // file, and a build that can only answer NotImplementedError
-                    // must not run those side effects at all — so this sits
-                    // after the coercions above and inside the support gate.
-                    check_signum(signum)?;
-                    let (fd, w_file) = faulthandler_get_fileno_and_file(
-                        args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
-                    )?;
-                    // Nothing else names the resolved file between here and the
-                    // owner store below, so keep it rooted across the install.
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let file_slot = (!w_file.is_null()).then(|| {
-                        let _ = pyre_object::gc_roots::pin_root(w_file);
-                        pyre_object::gc_roots::shadow_stack_len() - 1
-                    });
-                    let _state = lock_faulthandler_state();
-                    check_err(super::cintf::pypy_faulthandler_setup())?;
-                    check_err(super::cintf::pypy_faulthandler_register(
-                        signum,
-                        fd,
-                        all_threads as libc::c_int,
-                        chain as libc::c_int,
-                    ))?;
-                    // `handler.py` `self.user_w_files[signum] = w_file`,
-                    // after `check_err` — a register that failed owns nothing.
-                    set_user_signal_file(
-                        signum,
-                        file_slot.map_or(
-                            pyre_object::PY_NULL,
-                            pyre_object::gc_roots::shadow_stack_get,
-                        ),
-                    );
-                    Ok(pyre_object::w_none())
-                }
-                #[cfg(not(all(unix, feature = "host_env")))]
-                {
-                    let _ = (signum, all_threads, chain);
-                    Err(pyre_interpreter::PyError::not_implemented(
-                        "faulthandler.register requires host_env feature",
-                    ))
-                }
-            },
-            pyre_interpreter::Signature::new(
-                vec!["signum", "file", "all_threads", "chain"],
-                None,
-                None,
-                0,
-                0,
+        // `handler.py register(space, signum, w_file=None, all_threads=1, chain=0)`
+        pyre_interpreter::gateway::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature(
+                "register",
+                |args| {
+                    let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    if w_signum.is_null() {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "register() missing signal",
+                        ));
+                    }
+                    let signum = (unsafe { pyre_object::w_int_get_value(w_signum) }) as libc::c_int;
+                    // `handler.py register` `@unwrap_spec(all_threads=int, chain=int)`
+                    // with defaults `all_threads=1, chain=0`: the arguments are
+                    // coerced as integers (`gateway_int_w`, raising on a non-int),
+                    // not by truthiness; `register` then tests `if all_threads:`.  An
+                    // omitted keyword leaves a null slot from the signature binding, so
+                    // treat null as the default.
+                    let all_threads = args
+                        .get(2)
+                        .copied()
+                        .filter(|a| !a.is_null())
+                        .map(pyre_interpreter::baseobjspace::gateway_int_w)
+                        .transpose()?
+                        .unwrap_or(1)
+                        != 0;
+                    let chain = args
+                        .get(3)
+                        .copied()
+                        .filter(|a| !a.is_null())
+                        .map(pyre_interpreter::baseobjspace::gateway_int_w)
+                        .transpose()?
+                        .unwrap_or(0)
+                        != 0;
+                    #[cfg(all(unix, feature = "host_env"))]
+                    {
+                        // Resolving the file runs a user `fileno()` and `flush()`.
+                        // `register(signum, file, all_threads, chain)` parses and
+                        // coerces the two integer arguments before touching the
+                        // file, and a build that can only answer NotImplementedError
+                        // must not run those side effects at all — so this sits
+                        // after the coercions above and inside the support gate.
+                        check_signum(signum)?;
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(
+                            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+                        )?;
+                        // Nothing else names the resolved file between here and the
+                        // owner store below, so keep it rooted across the install.
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let file_slot = (!w_file.is_null()).then(|| {
+                            let _ = pyre_object::gc_roots::pin_root(w_file);
+                            pyre_object::gc_roots::shadow_stack_len() - 1
+                        });
+                        let _state = lock_faulthandler_state();
+                        check_err(super::cintf::pypy_faulthandler_setup())?;
+                        check_err(super::cintf::pypy_faulthandler_register(
+                            signum,
+                            fd,
+                            all_threads as libc::c_int,
+                            chain as libc::c_int,
+                        ))?;
+                        // `handler.py` `self.user_w_files[signum] = w_file`,
+                        // after `check_err` — a register that failed owns nothing.
+                        set_user_signal_file(
+                            signum,
+                            file_slot.map_or(
+                                pyre_object::PY_NULL,
+                                pyre_object::gc_roots::shadow_stack_get,
+                            ),
+                        );
+                        Ok(pyre_object::w_none())
+                    }
+                    #[cfg(not(all(unix, feature = "host_env")))]
+                    {
+                        let _ = (signum, all_threads, chain);
+                        Err(pyre_interpreter::PyError::not_implemented(
+                            "faulthandler.register requires host_env feature",
+                        ))
+                    }
+                },
+                pyre_interpreter::Signature::new(
+                    vec!["signum", "file", "all_threads", "chain"],
+                    None,
+                    None,
+                    0,
+                    0,
+                ),
             ),
+            3,
         )
     );
     #[cfg(unix)]
@@ -1008,5 +1022,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             0,
         )
     );
+    // `handler.py enable(w_file=None, all_threads=0)` and
+    // `register(signum, file=None, all_threads=1, chain=0)`: trailing
+    // omitted slots take `Function.defs_w` (`interp2app._getdefaults`).
+    if let Some(mut function) = unsafe {
+        pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), "enable")
+    } {
+        function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 3);
+        pyre_interpreter::__pyre_put_new!(ns_slot, "enable", function);
+    }
+    #[cfg(unix)]
+    if let Some(mut function) = unsafe {
+        pyre_object::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "register",
+        )
+    } {
+        function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 3);
+        pyre_interpreter::__pyre_put_new!(ns_slot, "register", function);
+    }
     Ok(())
 }

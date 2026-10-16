@@ -3182,19 +3182,31 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
     type_ns_store(
         ns_slot,
         "hex",
-        crate::make_builtin_function_with_signature(
-            "hex",
-            memoryview_hex,
-            crate::gateway::Signature::new(vec!["self", "sep", "bytes_per_sep"], None, None, 0, 1),
+        crate::gateway::function_set_null_positional_defaults(
+            crate::make_builtin_function_with_signature(
+                "hex",
+                memoryview_hex,
+                crate::gateway::Signature::new(
+                    vec!["self", "sep", "bytes_per_sep"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
+            ),
+            2,
         ),
     );
     type_ns_store(
         ns_slot,
         "tobytes",
-        crate::make_builtin_function_with_signature(
-            "tobytes",
-            memoryview_tobytes,
-            crate::gateway::Signature::new(vec!["self", "order"], None, None, 0, 1),
+        crate::gateway::function_set_null_positional_defaults(
+            crate::make_builtin_function_with_signature(
+                "tobytes",
+                memoryview_tobytes,
+                crate::gateway::Signature::new(vec!["self", "order"], None, None, 0, 1),
+            ),
+            1,
         ),
     );
     type_ns_store(ns_slot, "cast", {
@@ -3204,10 +3216,13 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
             Some("Cast a memoryview to a new format or shape."),
             crate::gateway::Signature::new(vec!["self", "format", "shape"], None, None, 0, 1),
         );
-        crate::function_new_with_fixed_code(
-            code as *const (),
-            "cast".to_string(),
-            pyre_object::PY_NULL,
+        crate::gateway::function_set_null_positional_defaults(
+            crate::function_new_with_fixed_code(
+                code as *const (),
+                "cast".to_string(),
+                pyre_object::PY_NULL,
+            ),
+            1,
         )
     });
     // memoryobject.py:777-788 — `format` / `itemsize` / … are
@@ -3387,17 +3402,25 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "print",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "print",
-                builtin_print,
-                0,
-                crate::gateway::Signature::new(
-                    vec!["sep", "end", "file", "flush"],
-                    Some("args"),
-                    None,
-                    4,
+            crate::gateway::function_set_kwonly_default_pairs(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "print",
+                    builtin_print,
                     0,
+                    crate::gateway::Signature::new(
+                        vec!["sep", "end", "file", "flush"],
+                        Some("args"),
+                        None,
+                        4,
+                        0,
+                    ),
                 ),
+                &[
+                    ("sep", pyre_object::w_none()),
+                    ("end", pyre_object::w_none()),
+                    ("file", pyre_object::w_none()),
+                    ("flush", pyre_object::w_bool_from(false)),
+                ],
             )
         },
     );
@@ -3547,11 +3570,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         || {
             // operation.py `getattr(space, w_obj, w_name, w_default)` — three
             // positional-only slots; `w_default` omitted is `PY_NULL`.
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "getattr",
-                builtin_getattr,
-                3,
-                crate::gateway::Signature::new(vec!["object", "name", "default"], None, None, 0, 3),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "getattr",
+                    builtin_getattr,
+                    3,
+                    crate::gateway::Signature::new(
+                        vec!["object", "name", "default"],
+                        None,
+                        None,
+                        0,
+                        3,
+                    ),
+                ),
+                1,
             )
         },
     );
@@ -3649,11 +3681,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "iter",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "iter",
-                __majit_wrap_builtin_iter,
-                2,
-                crate::gateway::Signature::new(vec!["object", "sentinel"], None, None, 0, 2),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "iter",
+                    __majit_wrap_builtin_iter,
+                    2,
+                    crate::gateway::Signature::new(vec!["object", "sentinel"], None, None, 0, 2),
+                ),
+                1,
             )
         },
     );
@@ -3661,11 +3696,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "next",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "next",
-                builtin_next,
-                2,
-                crate::gateway::Signature::new(vec!["iterator", "default"], None, None, 0, 2),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "next",
+                    builtin_next,
+                    2,
+                    crate::gateway::Signature::new(vec!["iterator", "default"], None, None, 0, 2),
+                ),
+                1,
             )
         },
     );
@@ -3689,11 +3727,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "anext",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "anext",
-                crate::async_operation::builtin_anext,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(vec!["aiterator", "default"], None, None, 0, 2),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "anext",
+                    crate::async_operation::builtin_anext,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(vec!["aiterator", "default"], None, None, 0, 2),
+                ),
+                1,
             )
         },
     );
@@ -3717,11 +3758,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "vars",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "vars",
-                builtin_vars,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(vec!["object"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "vars",
+                    builtin_vars,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(vec!["object"], None, None, 0, 1),
+                ),
+                1,
             )
         },
     );
@@ -3729,11 +3773,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "dir",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "dir",
-                builtin_dir,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(vec!["object"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "dir",
+                    builtin_dir,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(vec!["object"], None, None, 0, 1),
+                ),
+                1,
             )
         },
     );
@@ -3825,17 +3872,23 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "exec",
         || {
             // `exec(source, /, globals=None, locals=None, *, closure=None)`.
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "exec",
-                builtin_exec,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(
-                    vec!["source", "globals", "locals", "closure"],
-                    None,
-                    None,
-                    1,
-                    1,
+            crate::gateway::function_set_kwonly_default_pairs(
+                crate::gateway::function_set_null_positional_defaults(
+                    crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                        "exec",
+                        builtin_exec,
+                        crate::HOPELESS,
+                        crate::gateway::Signature::new(
+                            vec!["source", "globals", "locals", "closure"],
+                            None,
+                            None,
+                            1,
+                            1,
+                        ),
+                    ),
+                    2,
                 ),
+                &[("closure", pyre_object::w_none())],
             )
         },
     );
@@ -3844,17 +3897,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "eval",
         || {
             // `eval(source, /, globals=None, locals=None)` — Signature bind.
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "eval",
-                builtin_eval,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(
-                    vec!["source", "globals", "locals"],
-                    None,
-                    None,
-                    0,
-                    1,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "eval",
+                    builtin_eval,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(
+                        vec!["source", "globals", "locals"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                2,
             )
         },
     );
@@ -3864,25 +3920,31 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         || {
             // `compile(source, filename, mode, flags=0, dont_inherit=False,
             // optimize=-1, *, _feature_version=-1)` — Signature bind.
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "compile",
-                builtin_compile,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(
-                    vec![
-                        "source",
-                        "filename",
-                        "mode",
-                        "flags",
-                        "dont_inherit",
-                        "optimize",
-                        "_feature_version",
-                    ],
-                    None,
-                    None,
-                    1,
-                    0,
+            crate::function_set_kwonly_defaults!(
+                crate::gateway::function_set_null_positional_defaults(
+                    crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                        "compile",
+                        builtin_compile,
+                        crate::HOPELESS,
+                        crate::gateway::Signature::new(
+                            vec![
+                                "source",
+                                "filename",
+                                "mode",
+                                "flags",
+                                "dont_inherit",
+                                "optimize",
+                                "_feature_version",
+                            ],
+                            None,
+                            None,
+                            1,
+                            0,
+                        ),
+                    ),
+                    3,
                 ),
+                "_feature_version" => pyre_object::w_int_new(-1),
             )
         },
     );
@@ -3900,11 +3962,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "input",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "input",
-                builtin_input,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(vec!["prompt"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "input",
+                    builtin_input,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(vec!["prompt"], None, None, 0, 1),
+                ),
+                1,
             )
         },
     );
@@ -3912,26 +3977,29 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "open",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "open",
-                builtin_open,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(
-                    vec![
-                        "file",
-                        "mode",
-                        "buffering",
-                        "encoding",
-                        "errors",
-                        "newline",
-                        "closefd",
-                        "opener",
-                    ],
-                    None,
-                    None,
-                    0,
-                    0,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "open",
+                    builtin_open,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(
+                        vec![
+                            "file",
+                            "mode",
+                            "buffering",
+                            "encoding",
+                            "errors",
+                            "newline",
+                            "closefd",
+                            "opener",
+                        ],
+                        None,
+                        None,
+                        0,
+                        0,
+                    ),
                 ),
+                7,
             )
         },
     );
@@ -4671,11 +4739,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "sum",
         || {
             // `sum(iterable, /, start=0)` — interp body, Signature bind.
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "sum",
-                builtin_sum,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(vec!["iterable", "start"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "sum",
+                    builtin_sum,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(vec!["iterable", "start"], None, None, 0, 1),
+                ),
+                1,
             )
         },
     );
@@ -4684,13 +4755,15 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "round",
         || {
             // `operation.round(space, w_number, w_ndigits=None)` — both
-            // positional-or-keyword; a `BuiltinCode2`, so two positionals call
-            // it directly and any other shape binds the Signature.
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "round",
-                builtin_round,
-                2,
-                crate::gateway::Signature::new(vec!["number", "ndigits"], None, None, 0, 0),
+            // positional-or-keyword; Signature bind.
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "round",
+                    builtin_round,
+                    2,
+                    crate::gateway::Signature::new(vec!["number", "ndigits"], None, None, 0, 0),
+                ),
+                1,
             )
         },
     );
@@ -4714,14 +4787,15 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "pow",
         || {
             // `operation.pow(space, w_base, w_exp, w_mod)` with omitted
-            // modulus as `WrappedDefault(None)`.  `WrappedDefault` unwraps as
-            // `W_Root`, so `make_fastfunc` makes this a `BuiltinCode3`: three
-            // positionals call it directly, any other shape binds the Signature.
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "pow",
-                __majit_wrap_builtin_pow,
-                3,
-                crate::gateway::Signature::new(vec!["base", "exp", "mod"], None, None, 0, 0),
+            // modulus as `WrappedDefault(None)`; Signature bind.
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "pow",
+                    __majit_wrap_builtin_pow,
+                    3,
+                    crate::gateway::Signature::new(vec!["base", "exp", "mod"], None, None, 0, 0),
+                ),
+                1,
             )
         },
     );
@@ -4765,11 +4839,14 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "format",
         || {
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "format",
-                builtin_format,
-                2,
-                crate::gateway::Signature::new(vec!["value", "format_spec"], None, None, 0, 2),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "format",
+                    builtin_format,
+                    2,
+                    crate::gateway::Signature::new(vec!["value", "format_spec"], None, None, 0, 2),
+                ),
+                1,
             )
         },
     );
@@ -4788,17 +4865,20 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             // `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
             // binds by name at the call site; the wrap's 5-slot positional path
             // is unchanged.
-            let w_import = crate::gateway::make_module_builtin_function_with_arity_and_sig(
-                "__import__",
-                __majit_wrap_builtin_dunder_import,
-                crate::HOPELESS,
-                crate::gateway::Signature::new(
-                    vec!["name", "globals", "locals", "fromlist", "level"],
-                    None,
-                    None,
-                    0,
-                    0,
+            let w_import = crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "__import__",
+                    __majit_wrap_builtin_dunder_import,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(
+                        vec!["name", "globals", "locals", "fromlist", "level"],
+                        None,
+                        None,
+                        0,
+                        0,
+                    ),
                 ),
+                4,
             );
             crate::importing::set_default_importlib_import(w_import);
             w_import

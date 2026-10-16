@@ -689,20 +689,8 @@ mod context_methods {
         #[staticmethod]
         fn __new__(
             mut cls: PyObjectRef,
-            args: &[PyObjectRef],
+            protocol_obj: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let positional = args;
-            let protocol_obj = positional.get(1).copied().ok_or_else(|| {
-                pyre_interpreter::PyError::type_error(
-                    "_SSLContext.__new__() missing required argument 'protocol'",
-                )
-            })?;
-            if positional.len() != 2 {
-                return Err(pyre_interpreter::PyError::type_error(format!(
-                    "_SSLContext.__new__() takes 2 arguments ({} given)",
-                    positional.len()
-                )));
-            }
             pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
             let protocol = pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::int_w(protocol_obj))?;
             let protocol = i32::try_from(protocol).map_err(|_| {
@@ -1508,16 +1496,7 @@ mod memory_bio_methods {
     #[pyre_interpreter::pyre_methods(doc = "Memory BIO for TLS protocol data.")]
     impl W_MemoryBIO {
         #[staticmethod]
-        fn __new__(
-            cls: PyObjectRef,
-            args: &[PyObjectRef],
-        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let positional = args;
-            if positional.len() != 1 {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "MemoryBIO() takes no arguments",
-                ));
-            }
+        fn __new__(cls: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
             let _roots = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(cls);
@@ -3337,6 +3316,15 @@ pyre_interpreter::py_module! {
         // below can reload (`ShadowStackFrameworkGCTransformer.pop_roots`).
         let ns_here = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(ns);
+        if let Some(mut function) = unsafe {
+            pyre_object::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(ns_here),
+                "txt2obj",
+            )
+        } {
+            function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+            pyre_interpreter::__pyre_put_new!(ns_here, "txt2obj", function);
+        }
         // [3.14-spec] CPython 3.14 rejects each of these immutable module
         // heap types as a base.  PyPy's shared public pair, `MemoryBIO` and
         // `SSLSession`, remain app-level classes in `_cffi_ssl._stdssl`;

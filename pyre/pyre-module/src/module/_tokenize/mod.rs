@@ -211,11 +211,12 @@ impl W_TokenizerIter {
         readline: PyObjectRef,
         #[kwonly] extra_tokens: PyObjectRef,
         #[kwonly]
-        #[default(pyre_object::PY_NULL)]
+        #[default(pyre_object::w_none())]
         encoding: PyObjectRef,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        // Bound scope: `cls`/`readline`, kw-only `extra_tokens`/`encoding`
-        // (`PY_NULL` omitted).
+        // Bound scope: `cls`/`readline`, kw-only `extra_tokens`/`encoding`.
+        // `encoding=None` is the declared default (`w_kw_defs` cannot store
+        // PY_NULL; `w_dict_store` rejects a null value).
         if readline.is_null() {
             return Err(pyre_interpreter::PyError::type_error(
                 "tokenizeriter() takes exactly 1 positional argument (0 given)",
@@ -237,7 +238,7 @@ impl W_TokenizerIter {
         let extra_tokens = pyre_object::with_roots!(
             readline, encoding_root, extra_root => pyre_interpreter::baseobjspace::is_true(extra_root)
         )?;
-        let encoding = if encoding_root.is_null() {
+        let encoding = if encoding_root.is_null() || unsafe { is_none(encoding_root) } {
             None
         } else {
             unsafe {

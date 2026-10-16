@@ -999,16 +999,28 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr_with_signature(
-            |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "mmap() requires fileno + length",
-                    ));
+        pyre_interpreter::gateway::function_set_null_positional_defaults(
+            pyre_interpreter::typedef::make_new_descr_with_signature(
+                |args| {
+                    if args.is_empty() {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "mmap() requires fileno + length",
+                        ));
+                    }
+                    mmap_construct(args[0], &args[1..])
+                },
+                mmap_new_sig,
+            ),
+            {
+                #[cfg(unix)]
+                {
+                    5
                 }
-                mmap_construct(args[0], &args[1..])
+                #[cfg(windows)]
+                {
+                    3
+                }
             },
-            mmap_new_sig,
         )
     );
 

@@ -3199,14 +3199,9 @@ pub fn parse_builtin_signature(
             .collect()
     });
     let arguments = crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
-    let pad;
-    let defaults = match defaults_now.as_deref() {
-        Some(d) => Some(d),
-        None => {
-            pad = vec![pyre_object::PY_NULL; sig.num_argnames()];
-            Some(pad.as_slice())
-        }
-    };
+    // `interp2app._getdefaults` → `Function.defs_w`. Required slots stay
+    // absent so `_match_signature` raises `ArgErrMissing` (`argument.py`).
+    let defaults = defaults_now.as_deref();
     // Clinic `_PyArg_UnpackKeywords` names a method by its function, not
     // `Type.function`.  All-posonly descriptors keep the qualified
     // parse_obj spelling (`dict.get() takes no keyword arguments`).
@@ -3271,14 +3266,28 @@ pub fn parse_builtin_signature(
             {
                 return Err(crate::PyError::type_error(msg));
             }
-            return Err(rewrite_builtin_keyword_error(sig, fname, &names_now, err));
+            if matches!(
+                err,
+                crate::argument::ArgErr::TooMany { .. }
+                    | crate::argument::ArgErr::TooManyMethod { .. }
+            ) && sig.num_argnames() == sig.posonlyargcount
+                && !sig.has_vararg()
+                && (sig.num_kwonlyargnames() > 0 || sig.has_kwarg())
+            {
+                let skip =
+                    usize::from(signature_cls_constructor(sig) || signature_method_self(sig));
+                if sig.num_argnames() <= skip {
+                    return Err(crate::PyError::type_error(format!(
+                        "{fname}() takes no positional arguments"
+                    )));
+                }
+            }
+            return Err(rewrite_builtin_keyword_error(
+                sig, fname, npos, &names_now, err,
+            ));
         }
         Err(crate::argument::MatchSignatureError::Py(err)) => return Err(err),
     };
-    let names_now: Vec<PyObjectRef> = (0..nkw)
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
-        .collect();
-    rewrite_omitted_kwonly_none_to_null(sig, &mut scope_w, &names_now);
     Ok(scope_w)
 }
 
@@ -3297,11 +3306,12 @@ fn signature_method_self(sig: &crate::Signature) -> bool {
     sig.argnames.first().copied() == Some("self") && sig.posonlyargcount >= 1
 }
 
-/// Clinic METH_KEYWORDS method wrappers report the function name
-/// (`expandtabs()`, `tobytes()`).  `Arguments.parse_obj` otherwise
-/// prefixes `Function.name`, which for a descriptor is `Type.function`.
+/// Clinic METH_KEYWORDS wrappers report the function name
+/// (`expandtabs()`, `compile()`, `_sre.compile` as `compile()`).
+/// `Arguments.parse_obj` otherwise prefixes `Function.name`, which for a
+/// descriptor is `Type.function` and for a module builtin is `mod.fn`.
 fn clinic_method_bind_name<'a>(sig: &crate::Signature, fname: &'a str) -> &'a str {
-    if signature_accepts_keywords(sig) && sig.argnames.first().copied() == Some("self") {
+    if signature_accepts_keywords(sig) {
         fname
             .rsplit_once('.')
             .map(|(_, name)| name)
@@ -3373,12 +3383,13 @@ fn clinic_first_unfilled_required(
 fn rewrite_builtin_keyword_error(
     sig: &crate::Signature,
     fname: &str,
+    npos: usize,
     keyword_names_w: &[PyObjectRef],
     err: crate::argument::ArgErr,
 ) -> crate::PyError {
     match &err {
         crate::argument::ArgErr::MultipleValues { argname } if signature_accepts_keywords(sig) => {
-            let skip = usize::from(signature_cls_constructor(sig));
+            let skip = usize::from(signature_cls_constructor(sig) || signature_method_self(sig));
             let idx = sig.find_argname(argname);
             let pos = if idx >= 0 {
                 (idx as usize + 1).saturating_sub(skip)
@@ -3400,6 +3411,41 @@ fn rewrite_builtin_keyword_error(
                     "'",
                 )),
                 None => format_parse_obj_argerr(fname, sig, err),
+            }
+        }
+        crate::argument::ArgErr::Missing {
+            missing,
+            positional: true,
+        } if !missing.is_empty() => {
+            // Clinic `_PyArg_UnpackKeywords` names the first empty
+            // positional-or-keyword slot (`compile() missing required
+            // argument 'source' (pos 1)`). Required positional-only
+            // slots keep `ArgErrMissing.getmsg`.
+            let skip = usize::from(signature_cls_constructor(sig) || signature_method_self(sig));
+            let first = missing[0].as_str();
+            let idx = sig.find_argname(first);
+            if idx >= 0 && (idx as usize) >= sig.posonlyargcount {
+                let pos = (idx as usize + 1).saturating_sub(skip);
+                crate::PyError::type_error(format!(
+                    "{fname}() missing required argument '{first}' (pos {pos})"
+                ))
+            } else if signature_cls_constructor(sig)
+                && idx >= 0
+                && (idx as usize) < sig.posonlyargcount
+                && !sig.has_vararg()
+            {
+                // Clinic `_PyArg_UnpackKeywords` with minpos == maxpos:
+                // `ContextVar()` is "takes exactly 1 positional argument
+                // (0 given)". Required pos-or-kw slots keep the named
+                // missing form above. `skip` drops `cls`.
+                let n = sig.posonlyargcount.saturating_sub(skip);
+                let m = npos.saturating_sub(skip);
+                let argword = if n == 1 { "argument" } else { "arguments" };
+                crate::PyError::type_error(format!(
+                    "{fname}() takes exactly {n} positional {argword} ({m} given)"
+                ))
+            } else {
+                format_parse_obj_argerr(fname, sig, err)
             }
         }
         _ => format_parse_obj_argerr(fname, sig, err),
@@ -3444,8 +3490,7 @@ fn first_unexpected_keyword_name(
     None
 }
 
-/// Residual `BuiltinCodePassThroughArguments0.funcrun`.
-#[majit_macros::dont_look_inside]
+/// `BuiltinCodePassThroughArguments0.funcrun` (`gateway.py`).
 fn call_passthrough0(
     func_args: crate::gateway::BuiltinCodePassThroughFn0,
     arguments: &crate::argument::Arguments,
@@ -3453,8 +3498,7 @@ fn call_passthrough0(
     func_args(arguments)
 }
 
-/// Residual `BuiltinCodePassThroughArguments1.funcrun_obj`.
-#[majit_macros::dont_look_inside]
+/// `BuiltinCodePassThroughArguments1.funcrun_obj` (`gateway.py`).
 fn call_passthrough1(
     func_args: crate::gateway::BuiltinCodePassThroughFn1,
     w_obj: PyObjectRef,
@@ -3463,8 +3507,8 @@ fn call_passthrough1(
     func_args(w_obj, arguments)
 }
 
-/// Residual `W_PyCWrapperObject.descr_call(..., w_self, __args__)`.
-#[majit_macros::dont_look_inside]
+/// `W_PyCWrapperObject.descr_call(..., w_self, __args__)`
+/// (`cpyext/methodobject.py`).
 fn call_passthrough_wrapper(
     call_args: crate::gateway::WrapperCallArgsFn,
     slot: *const std::ffi::c_void,
@@ -3529,30 +3573,6 @@ fn call_passthrough_maybe_profile(
     }
 }
 
-/// Wrappers that still test `is_null()` for an omitted kw-only slot get
-/// `PY_NULL` when `_match_signature` filled the registered `None` default.
-/// A non-None `w_kw_defs` entry (`isclose` `rel_tol=1e-09`) is left alone.
-fn rewrite_omitted_kwonly_none_to_null(
-    sig: &crate::Signature,
-    scope_w: &mut [PyObjectRef],
-    keyword_names_w: &[PyObjectRef],
-) {
-    let n_pos = sig.num_argnames();
-    for i in 0..sig.num_kwonlyargnames() {
-        let name = sig.argnames[n_pos + i];
-        let provided = keyword_names_w
-            .iter()
-            .any(|&w_name| keyword_name_utf8(&keyword_name_text(w_name)) == Some(name));
-        if provided {
-            continue;
-        }
-        let slot = n_pos + i;
-        if slot < scope_w.len() && unsafe { pyre_object::is_none(scope_w[slot]) } {
-            scope_w[slot] = pyre_object::PY_NULL;
-        }
-    }
-}
-
 /// [`call_with_kwargs_in_ctx`] reached from a frame.  The caller frame is
 /// already rooted the way [`call_args_in_frame`] is, and like it carries
 /// no C-profile arm: every caller is an interpreter-level forward — a builtin
@@ -3578,6 +3598,11 @@ pub fn call_args(callable: PyObjectRef, args: &crate::argument::Arguments) -> Py
     let values = args.keywords_w.as_deref().unwrap_or(&[]);
     if names.is_empty() {
         return call_function_impl_result(callable, pos);
+    }
+    for &name in names {
+        if unsafe { !pyre_object::is_str(name) } {
+            return Err(PyError::type_error("keywords must be strings"));
+        }
     }
     call_with_kwargs_in_ctx_impl(
         getexecutioncontext(),
@@ -3814,6 +3839,24 @@ fn call_with_kwargs_in_ctx_impl(
             // out of band on `Arguments`.  A no-keyword call never reaches
             // here, so the positional slice ABI (`func`) is unchanged.
             let code_obj = code as pyre_object::PyObjectRef;
+            // `descr_check` / `tp_new_wrapper` run before any passthrough
+            // body (`gateway.py` `BuiltinCode.funcrun_obj`).
+            if npos == 0
+                && (unsafe { crate::gateway::builtin_code_wrapper_call_args(code_obj) }.is_some()
+                    || unsafe { crate::gateway::builtin_code_passthrough1(code_obj) }.is_some())
+            {
+                return Err(PyError::type_error(format!(
+                    "{}() missing 1 required positional argument",
+                    unsafe { crate::gateway::builtin_code_name(code_obj) }
+                )));
+            }
+            let pos_for_check = rooted_pos();
+            unsafe {
+                crate::gateway::builtin_code_check_receiver(
+                    code as *const crate::gateway::BuiltinCode,
+                    &pos_for_check,
+                )
+            }?;
             // `W_PyCWrapperObject.descr_call(..., w_self, __args__)`.
             // `__init__`/`__call__` are retagged `SLOT_WRAPPER_TYPE`;
             // `__new__` stays a Function with `new_self` (`function_set_new_self`)
@@ -3822,12 +3865,6 @@ fn call_with_kwargs_in_ctx_impl(
             if let Some((slot, call_args)) =
                 unsafe { crate::gateway::builtin_code_wrapper_call_args(code_obj) }
             {
-                if npos == 0 {
-                    return Err(PyError::type_error(format!(
-                        "{}() missing 1 required positional argument",
-                        unsafe { crate::gateway::builtin_code_name(code_obj) }
-                    )));
-                }
                 return call_passthrough_maybe_profile(
                     profile_anchor.live(),
                     current_callable,
@@ -3858,12 +3895,6 @@ fn call_with_kwargs_in_ctx_impl(
             }
             if let Some(func_args) = unsafe { crate::gateway::builtin_code_passthrough1(code_obj) }
             {
-                if npos == 0 {
-                    return Err(PyError::type_error(format!(
-                        "{}() missing 1 required positional argument",
-                        unsafe { crate::gateway::builtin_code_name(code_obj) }
-                    )));
-                }
                 return call_passthrough_maybe_profile(
                     profile_anchor.live(),
                     current_callable,
@@ -3882,16 +3913,6 @@ fn call_with_kwargs_in_ctx_impl(
             if let Some(sig) =
                 unsafe { crate::builtin_code_get_signature(code as pyre_object::PyObjectRef) }
             {
-                // `descr_check` before the binder, as above: a keyword that
-                // names nothing is reported only once the receiver stands.
-                // The receiver check collects, so the binder reads the slots.
-                let pos_for_check = rooted_pos();
-                unsafe {
-                    crate::gateway::builtin_code_check_receiver(
-                        code as *const crate::gateway::BuiltinCode,
-                        &pos_for_check,
-                    )
-                }?;
                 let code =
                     unsafe { crate::getcode(current_callable()) } as pyre_object::PyObjectRef;
                 let pos_now = rooted_pos();
@@ -4965,16 +4986,11 @@ fn type_call_vectorcall(
     if !unsafe { pyre_object::typeobject::w_type_has_vectorcall(w_type) } {
         return None;
     }
-    // The C call boundary takes host strings. `text_w` of each wrapped name
-    // is copied here; the object itself stays on `keyword_names_w` for every
-    // other caller.
-    let keywords: Vec<(String, PyObjectRef)> = keyword_names_w
+    // `w_kwargs_from_args` keeps the original wrapped names.
+    let keywords: Vec<(PyObjectRef, PyObjectRef)> = keyword_names_w
         .iter()
         .zip(keywords_w.iter())
-        .map(|(&name, &value)| {
-            let text = unsafe { pyre_object::w_str_get_wtf8(name) };
-            (text.to_string_lossy().into_owned(), value)
-        })
+        .map(|(&name, &value)| (name, value))
         .collect();
     Some(crate::cpyext::typeobject::type_vectorcall(
         w_type, args, &keywords,

@@ -1979,37 +1979,36 @@ pub fn make_builtin_function_as_builtin_with_doc(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
-/// `interp2app._getdefaults` / `GatewayCache.build`: copy keyword-only
-/// defaults onto `Function.w_kw_defs` at registration.  Names without a
-/// recorded default map to `None`.  A non-None default is installed later
-/// through [`function_set_kwonly_default_pairs`].
+/// `interp2app._getdefaults` / `GatewayCache.build`: keyword-only defaults
+/// live on `Function.w_kw_defs`. Required kw-only names stay absent so
+/// `_match_signature` raises `ArgErrMissing`. Declared defaults are
+/// installed by [`function_set_kwonly_default_pairs`].
 pub(crate) fn with_registered_kwonly_defaults(function: PyObjectRef) -> PyObjectRef {
-    let code = unsafe { crate::function::getcode(function) };
-    let Some(sig) = (unsafe { builtin_code_get_signature(code) }) else {
-        return function;
-    };
-    if sig.num_kwonlyargnames() == 0 {
+    function
+}
+
+/// Store positional defaults on `function` (`interp2app._getdefaults` →
+/// `Function.defs_w`). Trailing omitted slots take these values;
+/// required slots stay absent so `_match_signature` raises `ArgErrMissing`.
+///
+/// Allocating default words (`w_int_new`) must already be live; pin the
+/// function first and push each value through `RootedItems` before calling.
+pub fn function_set_positional_defaults(
+    function: PyObjectRef,
+    defaults: &[PyObjectRef],
+) -> PyObjectRef {
+    if defaults.is_empty() {
         return function;
     }
-    let n_pos = sig.num_argnames();
-    let n_kwonly = sig.num_kwonlyargnames();
     let roots = pyre_object::gc_roots::push_roots();
     let fn_slot = roots.publish(&[function]);
-    let dict_slot = roots.publish(&[pyre_object::w_dict_new()]);
-    for i in 0..n_kwonly {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str(
-                roots.get(dict_slot),
-                sig.argnames[n_pos + i],
-                pyre_object::w_none(),
-            );
-        }
-    }
+    let def_base = roots.publish(defaults);
+    let values: Vec<PyObjectRef> = (0..defaults.len())
+        .map(|i| roots.get(def_base + i))
+        .collect();
+    let defs_slot = roots.publish(&[pyre_object::w_tuple_new(values)]);
     unsafe {
-        crate::function::function_set_kwdefaults_from_definition(
-            roots.get(fn_slot),
-            roots.get(dict_slot),
-        );
+        crate::function::function_set_defaults(roots.get(fn_slot), roots.get(defs_slot));
     }
     roots.get(fn_slot)
 }
@@ -2024,17 +2023,18 @@ pub fn function_set_null_positional_defaults(function: PyObjectRef, n: usize) ->
     if n == 0 {
         return function;
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let fn_slot = roots.publish(&[function]);
-    let defs_slot = roots.publish(&[pyre_object::w_tuple_new(vec![pyre_object::PY_NULL; n])]);
-    unsafe {
-        crate::function::function_set_defaults(roots.get(fn_slot), roots.get(defs_slot));
-    }
-    roots.get(fn_slot)
+    function_set_positional_defaults(function, &vec![pyre_object::PY_NULL; n])
 }
 
 /// Replace `Function.w_kw_defs` with `pairs` (`init_kwdefaults_dict`).
 /// Used when a kw-only default is not `None` (`isclose` `rel_tol=1e-09`).
+///
+/// Each value must already be live (an immortal singleton such as
+/// `w_none` / `w_bool_from`, or a word still on the shadow stack).
+/// A slice that allocates (`w_int_new`, `w_float_new`, `w_tuple_new`,
+/// `w_str_new_managed`) can move an earlier word before this function
+/// publishes it; store those through [`function_set_kwonly_default_pair`]
+/// with the function already in a root slot.
 pub fn function_set_kwonly_default_pairs(
     function: PyObjectRef,
     pairs: &[(&'static str, PyObjectRef)],
@@ -2063,6 +2063,40 @@ pub fn function_set_kwonly_default_pairs(
         );
     }
     roots.get(fn_slot)
+}
+
+/// Store one keyword-only default on the function already published at
+/// `fn_slot`. Pins `value` before any further allocation, then writes it
+/// into `Function.w_kw_defs` (`interp2app._getdefaults` /
+/// `function.py init_kwdefaults_dict`).
+pub fn function_set_kwonly_default_pair(fn_slot: usize, name: &'static str, value: PyObjectRef) {
+    let roots = pyre_object::gc_roots::push_roots();
+    let val_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(value);
+    let function = pyre_object::gc_roots::shadow_stack_get(fn_slot);
+    let existing = unsafe { crate::function::function_get_kwdefaults(function) };
+    let created = existing.is_null() || unsafe { pyre_object::is_none(existing) };
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(if created {
+        pyre_object::w_dict_new()
+    } else {
+        existing
+    });
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            roots.get(dict_slot),
+            name,
+            roots.get(val_slot),
+        );
+    }
+    if created {
+        unsafe {
+            crate::function::function_set_kwdefaults_from_definition(
+                pyre_object::gc_roots::shadow_stack_get(fn_slot),
+                roots.get(dict_slot),
+            );
+        }
+    }
 }
 
 /// Signature-aware [`make_builtin_function_as_builtin`].  Builtin `__new__`
@@ -2510,28 +2544,6 @@ pub fn make_module_builtin_function_with_arity_and_sig(
         } else {
             arity
         };
-    let sig: *const Signature = Box::into_raw(Box::new(signature));
-    let code = builtin_code_new_full(name, func, None, arity, sig);
-    with_registered_kwonly_defaults(crate::function_new_builtin(
-        code as *const (),
-        name.to_string(),
-        pyre_object::PY_NULL,
-    ))
-}
-
-/// Like [`make_module_builtin_function_with_arity_and_sig`], but keep
-/// `arity` as `fast_natural_arity` even when the signature has kw-only
-/// names.  A no-keyword call of exactly that many positionals stays on
-/// `fastcall_N` (`function.py` `nargs == fast_natural_arity`); keywords
-/// still bind through `parse_obj`.  `isclose(a, b, *, rel_tol, abs_tol)`
-/// is that shape: two positionals, kw-only tolerances, and the JIT wrapper
-/// folds the two-arg call.
-pub fn make_module_builtin_function_with_fast_arity_and_sig(
-    name: &'static str,
-    func: BuiltinCodeFn,
-    arity: u16,
-    signature: Signature,
-) -> PyObjectRef {
     let sig: *const Signature = Box::into_raw(Box::new(signature));
     let code = builtin_code_new_full(name, func, None, arity, sig);
     with_registered_kwonly_defaults(crate::function_new_builtin(

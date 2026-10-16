@@ -251,11 +251,12 @@ impl Poll {
 fn selectable_fd(fd: i32, _index: usize) -> Result<i32, pyre_interpreter::PyError> {
     // `_build_fd_set`: `MAX_FD_SIZE is not None and fd >= MAX_FD_SIZE`.
     if let Some(max) = majit_rlib::_rsocket_rffi::MAX_FD_SIZE
-        && fd >= max {
-            return Err(pyre_interpreter::PyError::value_error(
-                "file descriptor out of range in select()",
-            ));
-        }
+        && fd >= max
+    {
+        return Err(pyre_interpreter::PyError::value_error(
+            "file descriptor out of range in select()",
+        ));
+    }
     Ok(fd)
 }
 
@@ -367,229 +368,241 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // stores this object directly as its `_select` class attribute; a
         // descriptor-shaped builtin would bind the selector instance and
         // shift the three fd-set arguments.
-        pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
-            "select",
-            |args| {
-            #[cfg(all(any(unix, windows), feature = "host_env"))]
-            {
-                if args.len() < 3
-                    || args[0].is_null()
-                    || args[1].is_null()
-                    || args[2].is_null()
-                {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "select() takes at least 3 arguments",
-                    ));
-                }
-
-                // `interp_select.py:226` — `space.unpackiterable` accepts any
-                // iterable (list, tuple, generator, …); each item is an int
-                // fd or an object exposing fileno().
-                //
-                // `list_w` is a GC list upstream; the items come back here as
-                // native copies, and every later `fileno()`, `__float__` and
-                // the blocking `select` itself collect. Each item is pinned on
-                // the caller's root bracket and named by its slot.
-                fn collect_fds(
-                    seq: pyre_object::PyObjectRef,
-                ) -> Result<Vec<(usize, i32)>, pyre_interpreter::PyError> {
-                    let items = pyre_interpreter::baseobjspace::unpackiterable(seq, -1)?;
-                    let base = pyre_object::gc_roots::pin_roots(&items);
-                    let mut out = Vec::with_capacity(items.len());
-                    for slot in base..base + items.len() {
-                        // `interp_select.py _build_fd_set` — each item is
-                        // resolved through `space.c_filedescriptor_w`, then
-                        // checked against what this platform's fd_set holds.
-                        let fd = filedescriptor_w(pyre_object::gc_roots::shadow_stack_get(slot))?;
-                        out.push((slot, selectable_fd(fd, out.len())?));
-                    }
-                    Ok(out)
-                }
-
-                // `args` is a native slice the gateway copied out of its own
-                // slots: it keeps the arguments alive but cannot rewrite this
-                // copy, and each `collect_fds` runs Python twice — the
-                // iteration protocol and `fileno()`.  The three fd sequences
-                // are usually lists, whose header moves, so reading the second
-                // and third out of the slice after the first was collected
-                // hands `unpackiterable` a pre-move address.  Pin them here and
-                // read each back at its own call.  All four are published
-                // before the first forwarding query.
-                let arg_roots = pyre_object::gc_roots::push_roots();
-                let args_base = arg_roots.pin_roots(&[
-                    args[0],
-                    args[1],
-                    args[2],
-                    args.get(3).copied().unwrap_or(pyre_object::PY_NULL),
-                ]);
-                let rfds = collect_fds(arg_roots.get(args_base))?;
-                let wfds = collect_fds(arg_roots.get(args_base + 1))?;
-                let xfds = collect_fds(arg_roots.get(args_base + 2))?;
-
-                // The first `select()` argument: POSIX scans descriptors
-                // `0..nfds`, so it must exceed the highest one.
-                #[cfg(unix)]
-                let nfds: i32 = {
-                    let mut highest: i32 = -1;
-                    for fds in [&rfds, &wfds, &xfds] {
-                        for &(_, fd) in fds {
-                            if fd > highest {
-                                highest = fd;
-                            }
-                        }
-                    }
-                    highest + 1
-                };
-                // WinSock ignores it: each fd_set carries its own count.
-                #[cfg(windows)]
-                let nfds: i32 = 0;
-
-                // `interp_select.py:230-235` — `None` blocks forever, else
-                // `space.float_w` (applies `__float__`); a negative count is
-                // a ValueError.
-                let w_timeout = arg_roots.get(args_base + 3);
-                let timeout_secs: Option<f64> = match (!w_timeout.is_null()).then_some(w_timeout) {
-                    None => None,
-                    Some(t) if unsafe { pyre_object::is_none(t) } => None,
-                    Some(t) => {
-                        let secs = pyre_interpreter::baseobjspace::float_w(t)?;
-                        if secs < 0.0 {
-                            return Err(pyre_interpreter::PyError::value_error(
-                                "timeout must be non-negative",
+        pyre_interpreter::gateway::function_set_positional_defaults(
+            pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+                "select",
+                |args| {
+                    #[cfg(all(any(unix, windows), feature = "host_env"))]
+                    {
+                        if args.len() < 3
+                            || args[0].is_null()
+                            || args[1].is_null()
+                            || args[2].is_null()
+                        {
+                            return Err(pyre_interpreter::PyError::type_error(
+                                "select() takes at least 3 arguments",
                             ));
                         }
-                        Some(secs)
-                    }
-                };
 
-                // `_call_select` builds each fd_set once, then retries on
-                // EINTR without rebuilding. POSIX leaves the sets unmodified
-                // when `select` fails. The first pass writes the caller's
-                // timeout. After EINTR only a positive timeout is replaced
-                // with the time left until the deadline taken here; a zero
-                // timeout stays zero. A non-finite timeout, or one `Duration`
-                // cannot represent, is a ValueError: `float_w` accepts it,
-                // and it is not a finite timeval.
-                let mut timeout_left = timeout_secs;
-                let end_time = if let Some(s) = timeout_secs.filter(|s| *s > 0.0) {
-                    Some(
-                        std::time::Duration::try_from_secs_f64(s)
-                            .ok()
-                            .and_then(|d| std::time::Instant::now().checked_add(d))
-                            .ok_or_else(|| {
-                                pyre_interpreter::PyError::value_error("timeout is too large")
-                            })?,
-                    )
-                } else if timeout_secs.is_some_and(|s| !s.is_finite()) {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "timeout is too large",
-                    ));
-                } else {
-                    None
-                };
-                let mut rset = prepare_fd_set(&rfds);
-                let mut wset = prepare_fd_set(&wfds);
-                let mut xset = prepare_fd_set(&xfds);
-                let mut tv = OsTimeval {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                };
-                let res = loop {
-                    let tv_ptr = match timeout_left {
-                        None => std::ptr::null_mut(),
-                        Some(t) => {
-                            fill_timeval(t, &mut tv);
-                            &raw mut tv
+                        // `interp_select.py select` — `space.unpackiterable` accepts any
+                        // iterable (list, tuple, generator, …); each item is an int
+                        // fd or an object exposing fileno().
+                        //
+                        // `list_w` is a GC list upstream; the items come back here as
+                        // native copies, and every later `fileno()`, `__float__` and
+                        // the blocking `select` itself collect. Each item is pinned on
+                        // the caller's root bracket and named by its slot.
+                        fn collect_fds(
+                            seq: pyre_object::PyObjectRef,
+                        ) -> Result<Vec<(usize, i32)>, pyre_interpreter::PyError>
+                        {
+                            let items = pyre_interpreter::baseobjspace::unpackiterable(seq, -1)?;
+                            let base = pyre_object::gc_roots::pin_roots(&items);
+                            let mut out = Vec::with_capacity(items.len());
+                            for slot in base..base + items.len() {
+                                // `interp_select.py _build_fd_set` — each item is
+                                // resolved through `space.c_filedescriptor_w`, then
+                                // checked against what this platform's fd_set holds.
+                                let fd = filedescriptor_w(
+                                    pyre_object::gc_roots::shadow_stack_get(slot),
+                                )?;
+                                out.push((slot, selectable_fd(fd, out.len())?));
+                            }
+                            Ok(out)
                         }
-                    };
-                    // `_rsocket_rffi.select` releases the GIL and stashes errno.
-                    let res = unsafe {
-                        majit_rlib::_rsocket_rffi::select(
-                            nfds,
-                            fd_set_ptr(&mut rset),
-                            fd_set_ptr(&mut wset),
-                            fd_set_ptr(&mut xset),
-                            tv_ptr,
-                        )
-                    };
-                    if res >= 0 {
-                        break res;
-                    }
-                    let errno = majit_rlib::_rsocket_rffi::geterrno();
-                    // A retryable failure returns `Ok`, having delivered any
-                    // pending signal. `_call_select` then updates `timeout`
-                    // only when it was positive.
-                    select_failure(std::io::Error::from_raw_os_error(errno))?;
-                    if let (Some(t), Some(dl)) = (timeout_left, end_time)
-                        && t > 0.0 {
-                            let now = std::time::Instant::now();
-                            let remaining = if now >= dl {
-                                0.0
-                            } else {
-                                (dl - now).as_secs_f64()
+
+                        // `args` is a native slice the gateway copied out of its own
+                        // slots: it keeps the arguments alive but cannot rewrite this
+                        // copy, and each `collect_fds` runs Python twice — the
+                        // iteration protocol and `fileno()`.  The three fd sequences
+                        // are usually lists, whose header moves, so reading the second
+                        // and third out of the slice after the first was collected
+                        // hands `unpackiterable` a pre-move address.  Pin them here and
+                        // read each back at its own call.  All four are published
+                        // before the first forwarding query.
+                        let arg_roots = pyre_object::gc_roots::push_roots();
+                        let args_base = arg_roots.pin_roots(&[
+                            args[0],
+                            args[1],
+                            args[2],
+                            args.get(3).copied().unwrap_or(pyre_object::PY_NULL),
+                        ]);
+                        let rfds = collect_fds(arg_roots.get(args_base))?;
+                        let wfds = collect_fds(arg_roots.get(args_base + 1))?;
+                        let xfds = collect_fds(arg_roots.get(args_base + 2))?;
+
+                        // The first `select()` argument: POSIX scans descriptors
+                        // `0..nfds`, so it must exceed the highest one.
+                        #[cfg(unix)]
+                        let nfds: i32 = {
+                            let mut highest: i32 = -1;
+                            for fds in [&rfds, &wfds, &xfds] {
+                                for &(_, fd) in fds {
+                                    if fd > highest {
+                                        highest = fd;
+                                    }
+                                }
+                            }
+                            highest + 1
+                        };
+                        // WinSock ignores it: each fd_set carries its own count.
+                        #[cfg(windows)]
+                        let nfds: i32 = 0;
+
+                        // `interp_select.py select` — `None` blocks forever, else
+                        // `space.float_w` (applies `__float__`); a negative count is
+                        // a ValueError.
+                        let w_timeout = arg_roots.get(args_base + 3);
+                        let timeout_secs: Option<f64> =
+                            match (!w_timeout.is_null()).then_some(w_timeout) {
+                                None => None,
+                                Some(t) if unsafe { pyre_object::is_none(t) } => None,
+                                Some(t) => {
+                                    let secs = pyre_interpreter::baseobjspace::float_w(t)?;
+                                    if secs < 0.0 {
+                                        return Err(pyre_interpreter::PyError::value_error(
+                                            "timeout must be non-negative",
+                                        ));
+                                    }
+                                    Some(secs)
+                                }
                             };
-                            timeout_left = Some(remaining);
+
+                        // `_call_select` builds each fd_set once, then retries on
+                        // EINTR without rebuilding. POSIX leaves the sets unmodified
+                        // when `select` fails. The first pass writes the caller's
+                        // timeout. After EINTR only a positive timeout is replaced
+                        // with the time left until the deadline taken here; a zero
+                        // timeout stays zero. A non-finite timeout, or one `Duration`
+                        // cannot represent, is a ValueError: `float_w` accepts it,
+                        // and it is not a finite timeval.
+                        let mut timeout_left = timeout_secs;
+                        let end_time = if let Some(s) = timeout_secs.filter(|s| *s > 0.0) {
+                            Some(
+                                std::time::Duration::try_from_secs_f64(s)
+                                    .ok()
+                                    .and_then(|d| std::time::Instant::now().checked_add(d))
+                                    .ok_or_else(|| {
+                                        pyre_interpreter::PyError::value_error(
+                                            "timeout is too large",
+                                        )
+                                    })?,
+                            )
+                        } else if timeout_secs.is_some_and(|s| !s.is_finite()) {
+                            return Err(pyre_interpreter::PyError::value_error(
+                                "timeout is too large",
+                            ));
+                        } else {
+                            None
+                        };
+                        let mut rset = prepare_fd_set(&rfds);
+                        let mut wset = prepare_fd_set(&wfds);
+                        let mut xset = prepare_fd_set(&xfds);
+                        let mut tv = OsTimeval {
+                            tv_sec: 0,
+                            tv_usec: 0,
+                        };
+                        let res = loop {
+                            let tv_ptr = match timeout_left {
+                                None => std::ptr::null_mut(),
+                                Some(t) => {
+                                    fill_timeval(t, &mut tv);
+                                    &raw mut tv
+                                }
+                            };
+                            // `_rsocket_rffi.select` releases the GIL and stashes errno.
+                            let res = unsafe {
+                                majit_rlib::_rsocket_rffi::select(
+                                    nfds,
+                                    fd_set_ptr(&mut rset),
+                                    fd_set_ptr(&mut wset),
+                                    fd_set_ptr(&mut xset),
+                                    tv_ptr,
+                                )
+                            };
+                            if res >= 0 {
+                                break res;
+                            }
+                            let errno = majit_rlib::_rsocket_rffi::geterrno();
+                            // A retryable failure returns `Ok`, having delivered any
+                            // pending signal. `_call_select` then updates `timeout`
+                            // only when it was positive.
+                            select_failure(std::io::Error::from_raw_os_error(errno))?;
+                            if let (Some(t), Some(dl)) = (timeout_left, end_time)
+                                && t > 0.0
+                            {
+                                let now = std::time::Instant::now();
+                                let remaining = if now >= dl {
+                                    0.0
+                                } else {
+                                    (dl - now).as_secs_f64()
+                                };
+                                timeout_left = Some(remaining);
+                            }
+                        };
+
+                        fn build_ready(
+                            set: &mut Option<Box<OsFdSet>>,
+                            inputs: &[(usize, i32)],
+                        ) -> pyre_object::PyObjectRef {
+                            // `_unbuild_fd_set` runs only when `res > 0`. A timeout
+                            // (`res == 0`) returns three empty lists.
+                            let Some(set) = set.as_mut() else {
+                                return pyre_object::w_list_new(Vec::new());
+                            };
+                            let items: Vec<_> = inputs
+                                .iter()
+                                .filter(|&&(_, fd)| unsafe {
+                                    majit_rlib::_rsocket_rffi::FD_ISSET(
+                                        fd,
+                                        set.as_mut() as *mut OsFdSet,
+                                    ) != 0
+                                })
+                                .map(|&(slot, _)| pyre_object::gc_roots::shadow_stack_get(slot))
+                                .collect();
+                            pyre_object::w_list_new(items)
                         }
-                };
 
-                fn build_ready(
-                    set: &mut Option<Box<OsFdSet>>,
-                    inputs: &[(usize, i32)],
-                ) -> pyre_object::PyObjectRef {
-                    // `_unbuild_fd_set` runs only when `res > 0`. A timeout
-                    // (`res == 0`) returns three empty lists.
-                    let Some(set) = set.as_mut() else {
-                        return pyre_object::w_list_new(Vec::new());
-                    };
-                    let items: Vec<_> = inputs
-                        .iter()
-                        .filter(|&&(_, fd)| unsafe {
-                            majit_rlib::_rsocket_rffi::FD_ISSET(fd, set.as_mut() as *mut OsFdSet)
-                                != 0
-                        })
-                        .map(|&(slot, _)| pyre_object::gc_roots::shadow_stack_get(slot))
-                        .collect();
-                    pyre_object::w_list_new(items)
-                }
-
-                // Each list is freshly minted and a list header moves, so the
-                // allocation the next `build_ready` performs can relocate the
-                // previous one and leave its pre-move address in the local.
-                // Pin each at its mint and read all three back where the tuple
-                // is built. `_unbuild_fd_set` runs only when `res > 0`.
-                let roots = pyre_object::gc_roots::push_roots();
-                let ready_base = roots.base();
-                if res > 0 {
-                    let _ = roots.pin_root(build_ready(&mut rset, &rfds));
-                    let _ = roots.pin_root(build_ready(&mut wset, &wfds));
-                    let _ = roots.pin_root(build_ready(&mut xset, &xfds));
-                } else {
-                    let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
-                    let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
-                    let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
-                }
-                Ok(pyre_object::w_tuple_new(vec![
-                    roots.get(ready_base),
-                    roots.get(ready_base + 1),
-                    roots.get(ready_base + 2),
-                ]))
-            }
-            #[cfg(not(all(any(unix, windows), feature = "host_env")))]
-            {
-                let _ = args;
-                Err(pyre_interpreter::PyError::not_implemented(
-                    "select.select requires host_env feature on a Unix or Windows platform",
-                ))
-            }
-            },
-            pyre_interpreter::HOPELESS,
-            pyre_interpreter::gateway::Signature::new(
-                vec!["rlist", "wlist", "xlist", "timeout"],
-                None,
-                None,
-                0,
-                0,
+                        // Each list is freshly minted and a list header moves, so the
+                        // allocation the next `build_ready` performs can relocate the
+                        // previous one and leave its pre-move address in the local.
+                        // Pin each at its mint and read all three back where the tuple
+                        // is built. `_unbuild_fd_set` runs only when `res > 0`.
+                        let roots = pyre_object::gc_roots::push_roots();
+                        let ready_base = roots.base();
+                        if res > 0 {
+                            let _ = roots.pin_root(build_ready(&mut rset, &rfds));
+                            let _ = roots.pin_root(build_ready(&mut wset, &wfds));
+                            let _ = roots.pin_root(build_ready(&mut xset, &xfds));
+                        } else {
+                            let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
+                            let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
+                            let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
+                        }
+                        Ok(pyre_object::w_tuple_new(vec![
+                            roots.get(ready_base),
+                            roots.get(ready_base + 1),
+                            roots.get(ready_base + 2),
+                        ]))
+                    }
+                    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+                    {
+                        let _ = args;
+                        Err(pyre_interpreter::PyError::not_implemented(
+                            "select.select requires host_env feature on a Unix or Windows platform",
+                        ))
+                    }
+                },
+                pyre_interpreter::HOPELESS,
+                pyre_interpreter::gateway::Signature::new(
+                    vec!["rlist", "wlist", "xlist", "timeout"],
+                    None,
+                    None,
+                    0,
+                    4,
+                ),
             ),
+            &[pyre_object::w_none()],
         )
     );
 

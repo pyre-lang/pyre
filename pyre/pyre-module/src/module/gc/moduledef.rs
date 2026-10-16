@@ -76,11 +76,15 @@ pyre_interpreter::py_module! {
             func: pyre_interpreter::BuiltinCodeFn,
             arity: u16,
             sig: Option<pyre_interpreter::Signature>,
+            ndef: usize,
         ) -> PyObjectRef {
             let mut value = pyre_object::with_roots!(ns => pyre_interpreter::gateway::with_module(
                 "gc",
-                pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
-                    name, func, arity, sig,
+                pyre_interpreter::function_set_null_positional_defaults(
+                    pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
+                        name, func, arity, sig,
+                    ),
+                    ndef,
                 ),
             ));
             pyre_interpreter::__pyre_store!(ns, name, value);
@@ -92,6 +96,7 @@ pyre_interpreter::py_module! {
             interp_gc::collect,
             interp_gc::collect_pyre_arity(),
             interp_gc::collect_pyre_sig(),
+            interp_gc::collect_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -99,6 +104,7 @@ pyre_interpreter::py_module! {
             interp_gc::collect_step,
             interp_gc::collect_step_pyre_arity(),
             interp_gc::collect_step_pyre_sig(),
+            interp_gc::collect_step_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -106,6 +112,7 @@ pyre_interpreter::py_module! {
             interp_gc::enable_finalizers,
             interp_gc::enable_finalizers_pyre_arity(),
             interp_gc::enable_finalizers_pyre_sig(),
+            interp_gc::enable_finalizers_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -113,6 +120,7 @@ pyre_interpreter::py_module! {
             interp_gc::disable_finalizers,
             interp_gc::disable_finalizers_pyre_arity(),
             interp_gc::disable_finalizers_pyre_sig(),
+            interp_gc::disable_finalizers_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -120,6 +128,7 @@ pyre_interpreter::py_module! {
             referents::get_objects,
             referents::get_objects_pyre_arity(),
             referents::get_objects_pyre_sig(),
+            referents::get_objects_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -127,6 +136,7 @@ pyre_interpreter::py_module! {
             referents::get_stats,
             referents::get_stats_pyre_arity(),
             referents::get_stats_pyre_sig(),
+            referents::get_stats_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -134,6 +144,7 @@ pyre_interpreter::py_module! {
             app_referents::get_stats,
             app_referents::get_stats_pyre_arity(),
             app_referents::get_stats_pyre_sig(),
+            app_referents::get_stats_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -141,6 +152,7 @@ pyre_interpreter::py_module! {
             app_referents::dump_rpy_heap,
             app_referents::dump_rpy_heap_pyre_arity(),
             app_referents::dump_rpy_heap_pyre_sig(),
+            app_referents::dump_rpy_heap_pyre_ndef(),
         );
         let _ = ns;
     },

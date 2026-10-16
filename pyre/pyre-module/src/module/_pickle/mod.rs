@@ -835,6 +835,50 @@ pyre_interpreter::py_module! {
             call_meth(unpickler, "load", &[])
         }
     },
+    extra_init: |ns| {
+        // `dump`/`dumps` `fix_imports=True, buffer_callback=None` and
+        // `load`/`loads` `fix_imports=True, encoding/errors/buffers=None`.
+        // `_match_signature` requires `Function.w_kw_defs` for those
+        // declared defaults (`interp2app._getdefaults`).
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(ns);
+        for name in ["dump", "dumps"] {
+            if let Some(mut function) = unsafe {
+                pyre_object::w_dict_getitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    name,
+                )
+            } {
+                function = pyre_interpreter::function_set_kwonly_default_pairs(
+                    function,
+                    &[
+                        ("fix_imports", pyre_object::boolobject::w_bool_from(true)),
+                        ("buffer_callback", pyre_object::w_none()),
+                    ],
+                );
+                pyre_interpreter::__pyre_put_new!(ns_slot, name, function);
+            }
+        }
+        for name in ["load", "loads"] {
+            if let Some(mut function) = unsafe {
+                pyre_object::w_dict_getitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    name,
+                )
+            } {
+                function = pyre_interpreter::function_set_kwonly_default_pairs(
+                    function,
+                    &[
+                        ("fix_imports", pyre_object::boolobject::w_bool_from(true)),
+                        ("encoding", pyre_object::w_none()),
+                        ("errors", pyre_object::w_none()),
+                        ("buffers", pyre_object::w_none()),
+                    ],
+                );
+                pyre_interpreter::__pyre_put_new!(ns_slot, name, function);
+            }
+        }
+    },
 }
 
 /// The GC types this module owns, in `build_gc` registration order.

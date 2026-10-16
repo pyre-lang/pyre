@@ -27,24 +27,30 @@ pub(crate) fn context_var_type() -> PyObjectRef {
             crate::__pyre_put_new!(
                 ns_slot,
                 "__new__",
-                pyre_interpreter::typedef::make_new_descr_with_signature(
-                    context_var_new,
-                    signature.clone()
+                pyre_interpreter::function_set_kwonly_defaults!(
+                    pyre_interpreter::typedef::make_new_descr_with_signature(
+                        context_var_new,
+                        signature.clone()
+                    ),
+                    "default" => context_var_no_default(),
                 )
             );
             crate::__pyre_put_new!(
                 ns_slot,
                 "__init__",
-                pyre_interpreter::make_builtin_function_with_signature(
-                    "__init__",
-                    |_| Ok(w_none()),
-                    pyre_interpreter::gateway::Signature::new(
-                        vec!["self", "name", "default"],
-                        None,
-                        None,
-                        1,
-                        2,
-                    )
+                pyre_interpreter::function_set_kwonly_defaults!(
+                    pyre_interpreter::make_builtin_function_with_signature(
+                        "__init__",
+                        |_| Ok(w_none()),
+                        pyre_interpreter::gateway::Signature::new(
+                            vec!["self", "name", "default"],
+                            None,
+                            None,
+                            1,
+                            2,
+                        )
+                    ),
+                    "default" => context_var_no_default(),
                 )
             );
             crate::__pyre_put_new!(
@@ -106,10 +112,19 @@ pub(crate) fn context_var_type() -> PyObjectRef {
     })
 }
 
+fn context_var_no_default() -> PyObjectRef {
+    static NO_DEFAULT: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    NO_DEFAULT.get_or_init(|| {
+        // lib_pypy/_contextvars.py `_NO_DEFAULT = object()`
+        w_instance_new(pyre_interpreter::typedef::w_object())
+    })
+}
+
 fn context_var_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // PyPy lib_pypy/_contextvars.py ContextVar.__init__(name, *,
     // default=_NO_DEFAULT): the signature-aware gateway supplies
-    // [cls, name, default], with PY_NULL for an omitted default.
+    // [cls, name, default], with the unique sentinel for an omitted default.
     if args.len() < 2 || args[1].is_null() {
         return Err(pyre_interpreter::PyError::type_error(
             "ContextVar() takes exactly 1 positional argument (0 given)",
@@ -132,7 +147,7 @@ fn context_var_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
     pyre_interpreter::baseobjspace::setattr_str(obj(), "_name", name())?;
     if args.len() > 2 {
         let default = pyre_object::gc_roots::shadow_stack_get(args_base + 2);
-        if !default.is_null() {
+        if !default.is_null() && !std::ptr::eq(default, context_var_no_default()) {
             pyre_interpreter::baseobjspace::setattr_str(obj(), "_default", default)?;
         }
     }

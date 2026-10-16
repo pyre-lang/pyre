@@ -294,10 +294,7 @@ fn sysconf_names() -> &'static [(&'static str, i32)] {
         ("SC_PASS_MAX", libc::_SC_PASS_MAX),
         ("SC_PHYS_PAGES", libc::_SC_PHYS_PAGES),
         ("SC_PRIORITIZED_IO", libc::_SC_PRIORITIZED_IO),
-        (
-            "SC_PRIORITY_SCHEDULING",
-            libc::_SC_PRIORITY_SCHEDULING,
-        ),
+        ("SC_PRIORITY_SCHEDULING", libc::_SC_PRIORITY_SCHEDULING),
         ("SC_REALTIME_SIGNALS", libc::_SC_REALTIME_SIGNALS),
         ("SC_RE_DUP_MAX", libc::_SC_RE_DUP_MAX),
         ("SC_RTSIG_MAX", libc::_SC_RTSIG_MAX),
@@ -305,22 +302,13 @@ fn sysconf_names() -> &'static [(&'static str, i32)] {
         ("SC_SEMAPHORES", libc::_SC_SEMAPHORES),
         ("SC_SEM_NSEMS_MAX", libc::_SC_SEM_NSEMS_MAX),
         ("SC_SEM_VALUE_MAX", libc::_SC_SEM_VALUE_MAX),
-        (
-            "SC_SHARED_MEMORY_OBJECTS",
-            libc::_SC_SHARED_MEMORY_OBJECTS,
-        ),
+        ("SC_SHARED_MEMORY_OBJECTS", libc::_SC_SHARED_MEMORY_OBJECTS),
         ("SC_SIGQUEUE_MAX", libc::_SC_SIGQUEUE_MAX),
         ("SC_STREAM_MAX", libc::_SC_STREAM_MAX),
         ("SC_SYNCHRONIZED_IO", libc::_SC_SYNCHRONIZED_IO),
         ("SC_THREADS", libc::_SC_THREADS),
-        (
-            "SC_THREAD_ATTR_STACKADDR",
-            libc::_SC_THREAD_ATTR_STACKADDR,
-        ),
-        (
-            "SC_THREAD_ATTR_STACKSIZE",
-            libc::_SC_THREAD_ATTR_STACKSIZE,
-        ),
+        ("SC_THREAD_ATTR_STACKADDR", libc::_SC_THREAD_ATTR_STACKADDR),
+        ("SC_THREAD_ATTR_STACKSIZE", libc::_SC_THREAD_ATTR_STACKSIZE),
         (
             "SC_THREAD_DESTRUCTOR_ITERATIONS",
             libc::_SC_THREAD_DESTRUCTOR_ITERATIONS,
@@ -330,22 +318,10 @@ fn sysconf_names() -> &'static [(&'static str, i32)] {
             "SC_THREAD_PRIORITY_SCHEDULING",
             libc::_SC_THREAD_PRIORITY_SCHEDULING,
         ),
-        (
-            "SC_THREAD_PRIO_INHERIT",
-            libc::_SC_THREAD_PRIO_INHERIT,
-        ),
-        (
-            "SC_THREAD_PRIO_PROTECT",
-            libc::_SC_THREAD_PRIO_PROTECT,
-        ),
-        (
-            "SC_THREAD_PROCESS_SHARED",
-            libc::_SC_THREAD_PROCESS_SHARED,
-        ),
-        (
-            "SC_THREAD_SAFE_FUNCTIONS",
-            libc::_SC_THREAD_SAFE_FUNCTIONS,
-        ),
+        ("SC_THREAD_PRIO_INHERIT", libc::_SC_THREAD_PRIO_INHERIT),
+        ("SC_THREAD_PRIO_PROTECT", libc::_SC_THREAD_PRIO_PROTECT),
+        ("SC_THREAD_PROCESS_SHARED", libc::_SC_THREAD_PROCESS_SHARED),
+        ("SC_THREAD_SAFE_FUNCTIONS", libc::_SC_THREAD_SAFE_FUNCTIONS),
         ("SC_THREAD_STACK_MIN", libc::_SC_THREAD_STACK_MIN),
         ("SC_THREAD_THREADS_MAX", libc::_SC_THREAD_THREADS_MAX),
         ("SC_TIMERS", libc::_SC_TIMERS),
@@ -458,12 +434,38 @@ fn run_fork_callbacks(kind: &str) {
 }
 
 fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Bound scope: kw-only `before`/`after_in_parent`/`after_in_child`
-    // (`PY_NULL` omitted).
-    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
-    let before = bound(0);
-    let parent = bound(1);
-    let child = bound(2);
+    // Bound scope: `**kwds` (`interp_posix.py register_at_fork` unpacks
+    // `__args__`). Named kw-only slots cannot carry a PY_NULL default
+    // (`w_dict_store` rejects null values); omitted vs explicit None is
+    // dict absence vs a wrapped None (`kwargs_w.pop("before", None)`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(args);
+    let n_bound = args.len();
+    let kwds = || {
+        if n_bound == 0 {
+            pyre_object::PY_NULL
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(root_base)
+        }
+    };
+    let kw = kwds();
+    if !kw.is_null() {
+        crate::builtins::kwarg_reject_unknown(
+            Some(kw),
+            &["before", "after_in_parent", "after_in_child"],
+            "register_at_fork",
+        )?;
+    }
+    let get = |name: &str| -> Option<PyObjectRef> {
+        let kw = kwds();
+        if kw.is_null() {
+            return None;
+        }
+        unsafe { pyre_object::w_dict_getitem_str(kw, name) }
+    };
+    let before = get("before");
+    let parent = get("after_in_parent");
+    let child = get("after_in_child");
     if before.is_none() && parent.is_none() && child.is_none() {
         return Err(crate::PyError::type_error(
             "At least one argument is required.",
@@ -1650,11 +1652,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "_create_environ",
-        crate::make_builtin_function_with_arity(
-            "_create_environ",
-            |_args| Ok(create_environ()),
-            0,
-        )
+        crate::make_builtin_function_with_arity("_create_environ", |_args| Ok(create_environ()), 0,)
     );
 
     // ── posix.putenv(name, value) / posix.unsetenv(name) ──
@@ -2469,13 +2467,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_signature(
             "register_at_fork",
             register_at_fork,
-            crate::gateway::Signature::new(
-                vec!["before", "after_in_parent", "after_in_child"],
-                None,
-                None,
-                3,
-                0,
-            ),
+            crate::gateway::Signature::new(vec![], None, Some("kwds"), 0, 0),
         )
     );
 
@@ -3014,10 +3006,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// reported, so a wrongly typed one is a TypeError even on a build that
     /// carries no `*at` call to honour it.
     fn dir_fd_kwarg(
-        kwargs: Option<pyre_object::PyObjectRef>,
+        value: Option<pyre_object::PyObjectRef>,
         have: bool,
     ) -> Result<Option<i32>, crate::PyError> {
-        match crate::builtins::kwarg_get(kwargs, "dir_fd") {
+        match value {
             Some(v) if !unsafe { pyre_object::is_none(v) } => {
                 let fd = unwrap_fd(v, "integer or None")?;
                 if !have {
@@ -3029,46 +3021,87 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
     }
 
-    /// Keyword-only tail of a bound `Signature` scope, rebuilt as a dict so
-    /// existing `kwarg_get` / `dir_fd_kwarg` readers keep working.
-    ///
-    /// `w_dict_new` / `w_dict_setitem_str` collect, so the bound slice and
-    /// the dict are published first and read back at each store, matching
-    /// `collect_keyword_args`.
-    fn kwargs_from_bound_kwonly_at(
+    /// Keyword-only tail of a bound `Signature` scope, as filled slots
+    /// (`interp_posix.py` `stat` receives `dir_fd` / `follow_symlinks`
+    /// as bound args). `PY_NULL` / missing is `None`.
+    fn bound_kwonly_at(
         args_base: usize,
         args_len: usize,
         start: usize,
-        names: &[&str],
-    ) -> Option<pyre_object::PyObjectRef> {
-        let mut dict_slot = None;
-        for (index, name) in names.iter().enumerate() {
-            let slot = start + index;
-            if slot >= args_len {
-                continue;
-            }
-            let value = pyre_object::gc_roots::shadow_stack_get(args_base + slot);
-            if value.is_null() {
-                continue;
-            }
-            let dict = match dict_slot {
-                Some(pinned) => pyre_object::gc_roots::shadow_stack_get(pinned),
-                None => {
-                    let pinned = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
-                    dict_slot = Some(pinned);
-                    pyre_object::gc_roots::shadow_stack_get(pinned)
+        count: usize,
+    ) -> Vec<Option<pyre_object::PyObjectRef>> {
+        (0..count)
+            .map(|index| {
+                let slot = start + index;
+                if slot >= args_len {
+                    None
+                } else {
+                    let value = pyre_object::gc_roots::shadow_stack_get(args_base + slot);
+                    if value.is_null() { None } else { Some(value) }
                 }
-            };
-            unsafe {
-                pyre_object::w_dict_setitem_str(
-                    dict,
-                    name,
-                    pyre_object::gc_roots::shadow_stack_get(args_base + slot),
-                );
-            }
+            })
+            .collect()
+    }
+
+    fn bound_kwonly_named(
+        values: &[Option<pyre_object::PyObjectRef>],
+        names: &[&str],
+        name: &str,
+    ) -> Option<pyre_object::PyObjectRef> {
+        names
+            .iter()
+            .position(|&n| n == name)
+            .and_then(|i| values.get(i).copied().flatten())
+    }
+
+    fn pin_bound_kwonly(values: &[Option<pyre_object::PyObjectRef>]) -> (usize, usize) {
+        let words: Vec<pyre_object::PyObjectRef> = values
+            .iter()
+            .map(|v| v.unwrap_or(pyre_object::PY_NULL))
+            .collect();
+        let n = words.len();
+        if n == 0 {
+            (0, 0)
+        } else {
+            (pyre_object::gc_roots::pin_roots(&words), n)
         }
-        dict_slot.map(pyre_object::gc_roots::shadow_stack_get)
+    }
+
+    fn reload_bound_kwonly(base: usize, n: usize) -> Vec<Option<pyre_object::PyObjectRef>> {
+        (0..n)
+            .map(|i| {
+                let value = pyre_object::gc_roots::shadow_stack_get(base + i);
+                if value.is_null() { None } else { Some(value) }
+            })
+            .collect()
+    }
+
+    /// `interp2app._getdefaults` for posix kw-only names.
+    fn with_posix_kwonly_defaults(
+        function: pyre_object::PyObjectRef,
+        kwonly: &[&'static str],
+    ) -> pyre_object::PyObjectRef {
+        if kwonly.is_empty() {
+            return function;
+        }
+        let roots = pyre_object::gc_roots::push_roots();
+        let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(function);
+        for &name in kwonly {
+            let value = match name {
+                "follow_symlinks" => pyre_object::w_bool_from(true),
+                "effective_ids" | "resetids" | "setsid" => pyre_object::w_bool_from(false),
+                // `posixmodule.c` clinic: `file_actions=()`, `setsigmask=()`,
+                // `setsigdef=()`. Binding None here made omitted
+                // `os.posix_spawn` iterate None (`test_close_fds`).
+                "file_actions" | "setsigmask" | "setsigdef" => {
+                    pyre_object::w_tuple_new(Vec::new())
+                }
+                _ => pyre_object::w_none(),
+            };
+            crate::gateway::function_set_kwonly_default_pair(fn_slot, name, value);
+        }
+        roots.get(fn_slot)
     }
 
     fn posix_sig(params: &[&'static str], kwonly: &[&'static str]) -> crate::gateway::Signature {
@@ -3094,7 +3127,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         params: &[&'static str],
         kwonly: &[&'static str],
     ) -> pyre_object::PyObjectRef {
-        crate::make_builtin_function_with_signature(name, func, posix_sig(params, kwonly))
+        posix_builtin_ndef(name, func, params, kwonly, 0)
+    }
+
+    fn posix_builtin_ndef(
+        name: &'static str,
+        func: crate::gateway::BuiltinCodeFn,
+        params: &[&'static str],
+        kwonly: &[&'static str],
+        ndef: usize,
+    ) -> pyre_object::PyObjectRef {
+        with_posix_kwonly_defaults(
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(name, func, posix_sig(params, kwonly)),
+                ndef,
+            ),
+            kwonly,
+        )
     }
 
     fn posix_posonly_builtin(
@@ -3103,7 +3152,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         params: &[&'static str],
         kwonly: &[&'static str],
     ) -> pyre_object::PyObjectRef {
-        crate::make_builtin_function_with_signature(name, func, posix_posonly_sig(params, kwonly))
+        posix_posonly_builtin_ndef(name, func, params, kwonly, 0)
+    }
+
+    fn posix_posonly_builtin_ndef(
+        name: &'static str,
+        func: crate::gateway::BuiltinCodeFn,
+        params: &[&'static str],
+        kwonly: &[&'static str],
+        ndef: usize,
+    ) -> pyre_object::PyObjectRef {
+        with_posix_kwonly_defaults(
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    name,
+                    func,
+                    posix_posonly_sig(params, kwonly),
+                ),
+                ndef,
+            ),
+            kwonly,
+        )
     }
 
     /// Bind an entry point whose positional parameters all sit before the
@@ -3120,11 +3189,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         qualname: &str,
         total: usize,
         required: usize,
-        kwonly: &[&'static str],
+        kwonly: &'static [&'static str],
     ) -> Result<
         (
             Vec<Option<pyre_object::PyObjectRef>>,
-            Option<pyre_object::PyObjectRef>,
+            Vec<Option<pyre_object::PyObjectRef>>,
+            &'static [&'static str],
         ),
         crate::PyError,
     > {
@@ -3156,9 +3226,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             };
             return Err(crate::PyError::type_error(text));
         }
-        let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), total, kwonly);
+        let kwargs = bound_kwonly_at(args_base, args.len(), total, kwonly.len());
         let bound: Vec<Option<pyre_object::PyObjectRef>> = (0..total).map(bound_at).collect();
-        Ok((bound, kwargs))
+        Ok((bound, kwargs, kwonly))
     }
 
     /// Bind the positional-or-keyword prefix of a path-taking entry point.
@@ -3180,11 +3250,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         name: &str,
         params: &[&'static str],
         required: usize,
-        kwonly: &[&'static str],
+        kwonly: &'static [&'static str],
     ) -> Result<
         (
             Vec<Option<pyre_object::PyObjectRef>>,
-            Option<pyre_object::PyObjectRef>,
+            Vec<Option<pyre_object::PyObjectRef>>,
+            &'static [&'static str],
         ),
         crate::PyError,
     > {
@@ -3212,45 +3283,42 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 )));
             }
         }
-        let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), params.len(), kwonly);
+        let kwargs = bound_kwonly_at(args_base, args.len(), params.len(), kwonly.len());
         let bound: Vec<Option<pyre_object::PyObjectRef>> =
             (0..params.len()).map(bound_at).collect();
-        Ok((bound, kwargs))
+        Ok((bound, kwargs, kwonly))
     }
 
     // ── posix.open(path, flags, mode=0o777, *, dir_fd=None) → fd ──
     crate::__pyre_put_new!(
         ns_slot,
         "open",
-        posix_builtin(
+        posix_builtin_ndef(
             "open",
             |args| {
-                let (bound, mut kwargs) =
+                let (bound, mut kwargs, _kwonly) =
                     bind_path_args(args, "open", &["path", "flags", "mode"], 2, &["dir_fd"])?;
                 let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                 let path = crate::gateway::fsencode_path_or_fd_w(
                     bound[0].expect("path is required"),
                     "open",
                     false,
                 );
-                let w = roots.get(base);
-                kwargs = if w.is_null() { None } else { Some(w) };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let path = path?;
                 let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                 let flags = crate::baseobjspace::c_int_w(bound[1].expect("flags is required"));
-                let w = roots.get(base);
-                kwargs = if w.is_null() { None } else { Some(w) };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 drop(roots);
                 let flags = flags? as libc::c_int;
                 let mode: u32 = match bound[2] {
                     Some(value) => {
                         let roots = pyre_object::gc_roots::push_roots();
-                        let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                         let r = crate::baseobjspace::c_int_w(value);
-                        let w = roots.get(base);
-                        kwargs = if w.is_null() { None } else { Some(w) };
+                        kwargs = reload_bound_kwonly(kw_base, kw_n);
                         drop(roots);
                         r? as u32
                     }
@@ -3260,7 +3328,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // (`interp_posix.py`). Only the `openat` arm below reads it;
                 // every other build has already turned a descriptor away, because
                 // `HAVE_OPENAT` is what those builds do not claim.
-                let _dir_fd = dir_fd_kwarg(kwargs, HAVE_OPENAT)?;
+                let _dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_OPENAT)?;
                 #[cfg(not(feature = "sandbox"))]
                 let fd = {
                     // Open the fd non-inheritable (PEP 446) so the descriptor does
@@ -3353,6 +3421,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             },
             &["path", "flags", "mode"],
             &["dir_fd"],
+            1,
         )
     );
 
@@ -3758,16 +3827,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         args: &[pyre_object::PyObjectRef],
         name: &str,
     ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-        let (bound, mut kwargs) = bind_path_args(args, name, &["path"], 1, &["dir_fd"])?;
+        let (bound, mut kwargs, kwonly) = bind_path_args(args, name, &["path"], 1, &["dir_fd"])?;
         let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
         let path =
             crate::gateway::fsencode_path_or_fd_w(bound[0].expect("path is required"), name, false);
-        let w = roots.get(base);
-        kwargs = if w.is_null() { None } else { Some(w) };
+        kwargs = reload_bound_kwonly(kw_base, kw_n);
         let path = path?;
         // Both take `DirFD(rposix.HAVE_UNLINKAT)` (`interp_posix.py`).
-        let _dir_fd = dir_fd_kwarg(kwargs, HAVE_UNLINKAT)?;
+        let _dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_UNLINKAT)?;
         // `DeleteFileW`, except on a directory symlink, which `RemoveDirectoryW`
         // unlinks without following (`os_unlink_impl`).
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -3845,9 +3913,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         posix_builtin(
             "readlink",
             |args| {
-                let (bound, kwargs) = bind_path_args(args, "readlink", &["path"], 1, &["dir_fd"])?;
+                let (bound, kwargs, kwonly) =
+                    bind_path_args(args, "readlink", &["path"], 1, &["dir_fd"])?;
                 // `readlink` types `dir_fd` as `DirFD(rposix.HAVE_READLINKAT)`.
-                let _dir_fd = dir_fd_kwarg(kwargs, HAVE_READLINKAT)?;
+                let _dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_READLINKAT)?;
                 let path = crate::gateway::fsencode_path_named_w(
                     bound[0].expect("path is required"),
                     "readlink",
@@ -3942,28 +4011,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "mkdir",
-        posix_builtin(
+        posix_builtin_ndef(
             "mkdir",
             |args| {
-                let (bound, mut kwargs) =
+                let (bound, mut kwargs, _kwonly) =
                     bind_path_args(args, "mkdir", &["path", "mode"], 1, &["dir_fd"])?;
                 let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                 let path = crate::gateway::fsencode_path_or_fd_w(
                     bound[0].expect("path is required"),
                     "mkdir",
                     false,
                 );
-                let w = roots.get(base);
-                kwargs = if w.is_null() { None } else { Some(w) };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let path = path?;
                 let _mode: u32 = match bound[1] {
                     Some(value) => {
                         let roots = pyre_object::gc_roots::push_roots();
-                        let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                         let r = crate::baseobjspace::c_int_w(value);
-                        let w = roots.get(base);
-                        kwargs = if w.is_null() { None } else { Some(w) };
+                        kwargs = reload_bound_kwonly(kw_base, kw_n);
                         drop(roots);
                         r? as u32
                     }
@@ -3971,7 +4038,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 // `mkdir` types `dir_fd` as `DirFD(rposix.HAVE_MKDIRAT)`
                 // (`interp_posix.py`).
-                let _dir_fd = dir_fd_kwarg(kwargs, HAVE_MKDIRAT)?;
+                let _dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_MKDIRAT)?;
                 // `CreateDirectoryW`; a mode of 0o700 is served by the security
                 // descriptor that denies everyone but the owner (`os_mkdir_impl`).
                 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -4029,6 +4096,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             },
             &["path", "mode"],
             &["dir_fd"],
+            1,
         )
     );
 
@@ -4042,21 +4110,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         posix_builtin(
             "rmdir",
             |args| {
-                let (bound, mut kwargs) = bind_path_args(args, "rmdir", &["path"], 1, &["dir_fd"])?;
+                let (bound, mut kwargs, kwonly) =
+                    bind_path_args(args, "rmdir", &["path"], 1, &["dir_fd"])?;
                 let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                 let path = crate::gateway::fsencode_path_or_fd_w(
                     bound[0].expect("path is required"),
                     "rmdir",
                     false,
                 );
-                let w = roots.get(base);
-                kwargs = if w.is_null() { None } else { Some(w) };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let path = path?;
                 // Removing a directory is the same call as removing a file, so
                 // `rmdir` reads the same bit: `DirFD(rposix.HAVE_UNLINKAT)`
                 // (`interp_posix.py`).
-                let _dir_fd = dir_fd_kwarg(kwargs, HAVE_UNLINKAT)?;
+                let _dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_UNLINKAT)?;
                 // `RemoveDirectoryW`, which is what `std::fs::remove_dir` is on
                 // Windows (`os_rmdir_impl`).
                 #[cfg(windows)]
@@ -4122,7 +4190,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         args: &[PyObjectRef],
         name: &'static str,
     ) -> Result<PyObjectRef, crate::PyError> {
-        let (bound, mut kwargs) = bind_path_args(
+        let (bound, mut kwargs, kwonly) = bind_path_args(
             args,
             name,
             &["src", "dst"],
@@ -4133,20 +4201,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // declarations there, so the rejected argument is named after whichever
         // of the two the caller reached.
         let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.publish(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
         let pos_base = roots.publish(&[
             bound[0].expect("src is required"),
             bound[1].expect("dst is required"),
         ]);
-        roots.normalize(base, 3);
+        if kw_n > 0 {
+            roots.normalize(kw_base, kw_n + 2);
+        } else {
+            roots.normalize(pos_base, 2);
+        }
         let src = crate::gateway::fsencode_path_named_w(roots.get(pos_base), name, "src")?;
-        let w = roots.get(base);
-        kwargs = if w.is_null() { None } else { Some(w) };
+        kwargs = reload_bound_kwonly(kw_base, kw_n);
         let dst = crate::gateway::fsencode_path_named_w(roots.get(pos_base + 1), name, "dst")?;
-        let w = roots.get(base);
-        kwargs = if w.is_null() { None } else { Some(w) };
+        kwargs = reload_bound_kwonly(kw_base, kw_n);
         let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
-            match crate::builtins::kwarg_get(kwargs, name) {
+            match bound_kwonly_named(&kwargs, kwonly, name) {
                 // interp_posix.py `_unwrap_dirfd` — a non-`None` value
                 // goes through `unwrap_fd` with `allowed_types="integer or
                 // None"`.
@@ -4296,7 +4366,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `(atime, mtime)` pair in seconds; `ns` the same pair in integer
     // nanoseconds; the two are mutually exclusive.  Both `None` means "now".
     fn utime_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (bound, mut kwargs) = bind_path_args(
+        let (bound, mut kwargs, kwonly) = bind_path_args(
             args,
             "utime",
             &["path", "times"],
@@ -4313,17 +4383,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // rposix.HAVE_FUTIMES)`.
         let npos = pos.len();
         let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.publish(&[
-            kwargs.unwrap_or(pyre_object::PY_NULL),
-            w_times.unwrap_or(pyre_object::PY_NULL),
-        ]);
+        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+        let times_slot = roots.publish(&[w_times.unwrap_or(pyre_object::PY_NULL)]);
         let pos_base = roots.publish(&pos);
-        roots.normalize(base, 2 + npos);
+        roots.normalize(if kw_n > 0 { kw_base } else { times_slot }, kw_n + 1 + npos);
         let path =
             crate::gateway::fsencode_path_or_fd_w(roots.get(pos_base), "utime", HAVE_FUTIMENS);
-        let w = roots.get(base);
-        kwargs = if w.is_null() { None } else { Some(w) };
-        let w = roots.get(base + 1);
+        kwargs = reload_bound_kwonly(kw_base, kw_n);
+        let w = roots.get(times_slot);
         w_times = if w.is_null() { None } else { Some(w) };
         let mut pos_buf = vec![pyre_object::PY_NULL; npos];
         pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
@@ -4331,28 +4398,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         let present = |v: PyObjectRef| (!unsafe { pyre_object::is_none(v) }).then_some(v);
         let mut times = pos_buf.get(1).copied().or(w_times).and_then(present);
-        let mut ns = crate::builtins::kwarg_get(kwargs, "ns").and_then(present);
-        let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+        let mut ns = bound_kwonly_named(&kwargs, kwonly, "ns").and_then(present);
+        let follow_symlinks = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
             Some(v) => {
                 let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[
-                    kwargs.unwrap_or(pyre_object::PY_NULL),
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                let extra = roots.pin_roots(&[
                     ns.unwrap_or(pyre_object::PY_NULL),
                     times.unwrap_or(pyre_object::PY_NULL),
                 ]);
                 let r = crate::baseobjspace::is_true(v);
-                let w = roots.get(base);
-                kwargs = if w.is_null() { None } else { Some(w) };
-                let w = roots.get(base + 1);
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
+                let w = roots.get(extra);
                 ns = if w.is_null() { None } else { Some(w) };
-                let w = roots.get(base + 2);
+                let w = roots.get(extra + 1);
                 times = if w.is_null() { None } else { Some(w) };
                 drop(roots);
                 r?
             }
             None => true,
         };
-        let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd").and_then(present) {
+        let dir_fd = match bound_kwonly_named(&kwargs, kwonly, "dir_fd").and_then(present) {
             // interp_posix.py types `dir_fd` as `DirFD(...)`, whose
             // `unwrap` is `_unwrap_dirfd` (:274-278).
             Some(v) => {
@@ -4634,12 +4700,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ))
         }
     }
-    crate::__pyre_put_new!(ns_slot, "utime", posix_builtin(
+    crate::__pyre_put_new!(
+        ns_slot,
+        "utime",
+        posix_builtin_ndef(
             "utime",
             utime_impl,
             &["path", "times"],
             &["ns", "dir_fd", "follow_symlinks"],
-        ));
+            1,
+        )
+    );
 
     // ── posix._path_splitroot(path) → (root, tail) ──
     // Registered only where `sys.platform` is `win32`, the same condition
@@ -4652,7 +4723,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "_path_splitroot",
             "path",
             |args| {
-                let (bound, _) = bind_path_args(args, "_path_splitroot", &["path"], 1, &[])?;
+                let (bound, _, _) = bind_path_args(args, "_path_splitroot", &["path"], 1, &[])?;
                 let path = crate::gateway::fsencode_path_named_w(
                     bound[0].expect("path is required"),
                     "_path_splitroot",
@@ -4686,7 +4757,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "_path_splitroot_ex",
             "p",
             |args| {
-                let (bound, _) = bind_path_args(args, "_path_splitroot_ex", &["p"], 1, &[])?;
+                let (bound, _, _) = bind_path_args(args, "_path_splitroot_ex", &["p"], 1, &[])?;
                 let (wide, as_bytes) =
                     nonstrict_wide_path(bound[0].expect("p is required"), "_path_splitroot_ex")?;
                 let units = &wide[..wide.len() - 1];
@@ -4713,7 +4784,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "_path_normpath",
             "path",
             |args| {
-                let (bound, _) = bind_path_args(args, "_path_normpath", &["path"], 1, &[])?;
+                let (bound, _, _) = bind_path_args(args, "_path_normpath", &["path"], 1, &[])?;
                 let (mut wide, as_bytes) =
                     nonstrict_wide_path(bound[0].expect("path is required"), "_path_normpath")?;
                 let norm_len = normpath_and_size(&mut wide, HOST_SEPS);
@@ -4745,7 +4816,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_path_isdir",
                 "s",
                 |args| {
-                    let (bound, _) = bind_path_args(args, "_path_isdir", &["s"], 1, &[])?;
+                    let (bound, _, _) = bind_path_args(args, "_path_isdir", &["s"], 1, &[])?;
                     win_nt::test_file_type(
                         bound[0].expect("s is required"),
                         "_path_isdir",
@@ -4763,7 +4834,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_path_isfile",
                 "path",
                 |args| {
-                    let (bound, _) = bind_path_args(args, "_path_isfile", &["path"], 1, &[])?;
+                    let (bound, _, _) = bind_path_args(args, "_path_isfile", &["path"], 1, &[])?;
                     win_nt::test_file_type(
                         bound[0].expect("path is required"),
                         "_path_isfile",
@@ -4781,7 +4852,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_path_islink",
                 "path",
                 |args| {
-                    let (bound, _) = bind_path_args(args, "_path_islink", &["path"], 1, &[])?;
+                    let (bound, _, _) = bind_path_args(args, "_path_islink", &["path"], 1, &[])?;
                     win_nt::test_file_type(
                         bound[0].expect("path is required"),
                         "_path_islink",
@@ -4799,7 +4870,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_path_isjunction",
                 "path",
                 |args| {
-                    let (bound, _) = bind_path_args(args, "_path_isjunction", &["path"], 1, &[])?;
+                    let (bound, _, _) =
+                        bind_path_args(args, "_path_isjunction", &["path"], 1, &[])?;
                     win_nt::test_file_type(
                         bound[0].expect("path is required"),
                         "_path_isjunction",
@@ -4817,7 +4889,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_path_exists",
                 "path",
                 |args| {
-                    let (bound, _) = bind_path_args(args, "_path_exists", &["path"], 1, &[])?;
+                    let (bound, _, _) = bind_path_args(args, "_path_exists", &["path"], 1, &[])?;
                     win_nt::test_file_exists(
                         bound[0].expect("path is required"),
                         "_path_exists",
@@ -4835,7 +4907,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_getvolumepathname",
                 "path",
                 |args| {
-                    let (bound, _) = bind_path_args(args, "_getvolumepathname", &["path"], 1, &[])?;
+                    let (bound, _, _) =
+                        bind_path_args(args, "_getvolumepathname", &["path"], 1, &[])?;
                     win_nt::_getvolumepathname(&[bound[0].expect("path is required")])
                 },
                 "($module, /, path)",
@@ -4849,7 +4922,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_path_isdevdrive",
                 "path",
                 |args| {
-                    let (bound, _) = bind_path_args(args, "_path_isdevdrive", &["path"], 1, &[])?;
+                    let (bound, _, _) =
+                        bind_path_args(args, "_path_isdevdrive", &["path"], 1, &[])?;
                     win_nt::_path_isdevdrive(&[bound[0].expect("path is required")])
                 },
                 "($module, /, path)",
@@ -4863,7 +4937,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_path_lexists",
                 "path",
                 |args| {
-                    let (bound, _) = bind_path_args(args, "_path_lexists", &["path"], 1, &[])?;
+                    let (bound, _, _) = bind_path_args(args, "_path_lexists", &["path"], 1, &[])?;
                     win_nt::test_file_exists(
                         bound[0].expect("path is required"),
                         "_path_lexists",
@@ -5007,10 +5081,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "listdir",
-        posix_builtin(
+        posix_builtin_ndef(
             "listdir",
             |args| {
-                let (bound, _kwargs) = bind_path_args(args, "listdir", &["path"], 0, &[])?;
+                let (bound, _, _) = bind_path_args(args, "listdir", &["path"], 0, &[])?;
                 // One resolution yields both the path and its bytes-ness, so
                 // `__fspath__` runs exactly once. The omitted argument is the same
                 // `None` the signature names, which resolves to `"."` there.
@@ -5083,6 +5157,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             },
             &["path"],
             &[],
+            1,
         )
     );
 
@@ -5134,11 +5209,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "_inputhook",
-        crate::make_builtin_function_with_arity(
-            "_inputhook",
-            |_| Ok(pyre_object::w_int_new(0)),
-            0,
-        )
+        crate::make_builtin_function_with_arity("_inputhook", |_| Ok(pyre_object::w_int_new(0)), 0,)
     );
     crate::__pyre_put_new!(
         ns_slot,
@@ -5296,7 +5367,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "get_terminal_size",
-        posix_posonly_builtin(
+        posix_posonly_builtin_ndef(
             "get_terminal_size",
             |args| {
                 // `($module, fd=<unrepresentable>, /)` — the descriptor is
@@ -5309,7 +5380,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 } else {
                     "posix.get_terminal_size"
                 };
-                let (bound, _kwargs) =
+                let (bound, _, _) =
                     bind_posonly_args(args, "get_terminal_size", qualname, 1, 0, &[])?;
                 let fd = match bound[0] {
                     Some(w) => crate::baseobjspace::c_int_w(w)?,
@@ -5364,6 +5435,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             },
             &["fd"],
             &[],
+            1,
         )
     );
     // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.
@@ -5634,12 +5706,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         default_follow: bool,
     ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
         let name = if default_follow { "stat" } else { "lstat" };
-        let kwonly: &[&str] = if default_follow {
+        let kwonly: &'static [&'static str] = if default_follow {
             &["dir_fd", "follow_symlinks"]
         } else {
             &["dir_fd"]
         };
-        let (bound, mut kwargs) = bind_path_args(args, name, &["path"], 1, kwonly)?;
+        let (bound, mut kwargs, kwonly) = bind_path_args(args, name, &["path"], 1, kwonly)?;
         let path = bound[0].expect("path is required");
         // The three arguments are unwrapped in signature order — `path`,
         // `dir_fd`, `follow_symlinks` (`interp_posix.py:610-614`) — because
@@ -5651,23 +5723,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // and `lstat` takes `allow_fd=False`, which is also what makes their
         // type errors name different allowed types.
         let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
         let path = crate::gateway::fsencode_path_or_fd_w(path, name, default_follow);
-        let w = roots.get(base);
-        kwargs = if w.is_null() { None } else { Some(w) };
+        kwargs = reload_bound_kwonly(kw_base, kw_n);
         let path = path?;
         // `stat`/`lstat` type `dir_fd` as `DirFD(rposix.HAVE_FSTATAT)`
         // (`interp_posix.py`), whose `unwrap` is `_unwrap_dirfd`
         // (:274-278).
-        let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd")
+        let dir_fd = match bound_kwonly_named(&kwargs, kwonly, "dir_fd")
             .filter(|&v| !unsafe { pyre_object::is_none(v) })
         {
             Some(v) => {
                 let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                 let fd = unwrap_fd(v, "integer or None");
-                let w = roots.get(base);
-                kwargs = if w.is_null() { None } else { Some(w) };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 drop(roots);
                 let fd = fd?;
                 // `DirFD(available=False)` is `_DirFD_Unavailable`
@@ -5682,7 +5752,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             None => None,
         };
-        let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+        let follow_symlinks = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
             Some(v) => crate::baseobjspace::is_true(v)?,
             None => default_follow,
         };
@@ -6510,7 +6580,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     crate::PyError::type_error("expected a 'posix.DirEntry' object")
                 })?;
                 de.w_lstat = result;
-                unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF) };
+                unsafe {
+                    pyre_object::gc_hook::try_gc_write_barrier(
+                        self_obj as pyre_object::gc_hook::GCREF,
+                    )
+                };
                 return Ok(result);
             }
         }
@@ -6520,7 +6594,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let de = W_DirEntry::from_obj(self_obj)
             .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
         de.w_lstat = result;
-        unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF) };
+        unsafe {
+            pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF)
+        };
         Ok(result)
     }
     fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6555,7 +6631,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         de.w_stat = result;
         // `result` may be a nursery object stored into the stable entry; join
         // the remembered set so the next minor collection forwards it.
-        unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF) };
+        unsafe {
+            pyre_object::gc_hook::try_gc_write_barrier(self_obj as pyre_object::gc_hook::GCREF)
+        };
         Ok(result)
     }
     fn dir_entry_fspath(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6640,10 +6718,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                                 ns,
                                 name,
-                                crate::make_builtin_function_with_signature(
-                                    name,
-                                    f,
-                                    posix_posonly_sig(&["self"], &["follow_symlinks"]),
+                                with_posix_kwonly_defaults(
+                                    crate::make_builtin_function_with_signature(
+                                        name,
+                                        f,
+                                        posix_posonly_sig(&["self"], &["follow_symlinks"]),
+                                    ),
+                                    &["follow_symlinks"],
                                 ),
                             )
                         };
@@ -6779,7 +6860,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
     /// One enumeration step, with the step already claimed.
     fn scandir_iter_next_entry(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        
         with_scandir_iter(self_obj, |iterator| {
             let idx = iterator.index;
             let entries = iterator.entries;
@@ -6828,7 +6908,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // is the same answer the prompt-finalization census needs so a
         // consumer still holding the iterator (`os.fwalk` after its
         // `for entry` loop) does not pay a whole-heap collect on `gen.close()`.
-        
+
         match result {
             Err(error) => {
                 let _stop_roots = pyre_object::gc_roots::push_roots();
@@ -6987,7 +7067,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         obj
     }
     fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (bound, _kwargs) = bind_path_args(args, "scandir", &["path"], 0, &[])?;
+        let (bound, _, _) = bind_path_args(args, "scandir", &["path"], 0, &[])?;
         // One resolution yields both the path and its bytes-ness, so
         // `__fspath__` runs exactly once. The omitted argument is the same
         // `None` the signature names, which resolves to `"."` there.
@@ -7157,7 +7237,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         drop(_list_scope);
         Ok(it)
     }
-    crate::__pyre_put_new!(ns_slot, "scandir", posix_builtin("scandir", scandir_fn, &["path"], &[]));
+    crate::__pyre_put_new!(
+        ns_slot,
+        "scandir",
+        posix_builtin_ndef("scandir", scandir_fn, &["path"], &[], 1)
+    );
     crate::__pyre_put_new!(ns_slot, "DirEntry", dir_entry_type());
 
     // os.uname() — returns structseq (sysname, nodename, release, version, machine).
@@ -7211,11 +7295,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "stat",
-        crate::gateway::make_builtin_function_with_text_signature_and_sig(
-            "stat",
-            |args| stat_entry(args, true),
-            "(path, *, dir_fd=None, follow_symlinks=True)",
-            Some(posix_sig(&["path"], &["dir_fd", "follow_symlinks"])),
+        with_posix_kwonly_defaults(
+            crate::gateway::make_builtin_function_with_text_signature_and_sig(
+                "stat",
+                |args| stat_entry(args, true),
+                "(path, *, dir_fd=None, follow_symlinks=True)",
+                Some(posix_sig(&["path"], &["dir_fd", "follow_symlinks"])),
+            ),
+            &["dir_fd", "follow_symlinks"],
         )
     );
     crate::__pyre_put_new!(
@@ -8768,12 +8855,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "memfd_create",
-            posix_builtin(
+            posix_builtin_ndef(
                 "memfd_create",
                 |args| {
                     // interp_posix.py `@unwrap_spec(name='text', flags=int)`.
                     let (mut w_name, mut w_flags) = {
-                        let (bound, _kwargs) =
+                        let (bound, _, _) =
                             bind_path_args(args, "memfd_create", &["name", "flags"], 1, &[])?;
                         (
                             bound[0].expect("name is required"),
@@ -8807,6 +8894,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["name", "flags"],
                 &[],
+                1,
             )
         );
 
@@ -8826,7 +8914,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "getxattr",
                     |args| {
                         let (mut w_path, mut w_attribute, mut w_follow) = {
-                            let (bound, kwargs) = bind_path_args(
+                            let (bound, kwargs, kwonly) = bind_path_args(
                                 args,
                                 "getxattr",
                                 &["path", "attribute"],
@@ -8836,7 +8924,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             let w_path = bound[0].expect("path is required");
                             let w_attribute = bound[1].expect("attribute is required");
                             drop(bound);
-                            let w_follow = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                            let w_follow = bound_kwonly_named(&kwargs, kwonly, "follow_symlinks")
                                 .unwrap_or(pyre_object::PY_NULL);
                             (w_path, w_attribute, w_follow)
                         };
@@ -8936,11 +9024,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::__pyre_put_new!(
                 ns_slot,
                 "setxattr",
-                posix_builtin(
+                posix_builtin_ndef(
                     "setxattr",
                     |args| {
                         let (mut w_path, mut w_attribute, mut w_value, mut w_flags, mut w_follow) = {
-                            let (bound, kwargs) = bind_path_args(
+                            let (bound, kwargs, kwonly) = bind_path_args(
                                 args,
                                 "setxattr",
                                 &["path", "attribute", "value", "flags"],
@@ -8952,7 +9040,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             let w_value = bound[2].expect("value is required");
                             let w_flags = bound[3].unwrap_or(pyre_object::PY_NULL);
                             drop(bound);
-                            let w_follow = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                            let w_follow = bound_kwonly_named(&kwargs, kwonly, "follow_symlinks")
                                 .unwrap_or(pyre_object::PY_NULL);
                             (w_path, w_attribute, w_value, w_flags, w_follow)
                         };
@@ -9070,6 +9158,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     },
                     &["path", "attribute", "value", "flags"],
                     &["follow_symlinks"],
+                    1,
                 )
             );
 
@@ -9080,7 +9169,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "removexattr",
                     |args| {
                         let (mut w_path, mut w_attribute, mut w_follow) = {
-                            let (bound, kwargs) = bind_path_args(
+                            let (bound, kwargs, kwonly) = bind_path_args(
                                 args,
                                 "removexattr",
                                 &["path", "attribute"],
@@ -9090,7 +9179,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             let w_path = bound[0].expect("path is required");
                             let w_attribute = bound[1].expect("attribute is required");
                             drop(bound);
-                            let w_follow = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                            let w_follow = bound_kwonly_named(&kwargs, kwonly, "follow_symlinks")
                                 .unwrap_or(pyre_object::PY_NULL);
                             (w_path, w_attribute, w_follow)
                         };
@@ -9158,7 +9247,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "listxattr",
                     |args| {
                         let (mut w_path, mut w_follow) = {
-                            let (bound, kwargs) = bind_path_args(
+                            let (bound, kwargs, kwonly) = bind_path_args(
                                 args,
                                 "listxattr",
                                 &["path"],
@@ -9167,7 +9256,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             )?;
                             let w_path = bound[0].expect("path is required");
                             drop(bound);
-                            let w_follow = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                            let w_follow = bound_kwonly_named(&kwargs, kwonly, "follow_symlinks")
                                 .unwrap_or(pyre_object::PY_NULL);
                             (w_path, w_follow)
                         };
@@ -9982,8 +10071,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         }
 
-        fn wait_with_rusage(pid: Option<libc::pid_t>, options: i32) -> Result<PyObjectRef, crate::PyError>
-        {
+        fn wait_with_rusage(
+            pid: Option<libc::pid_t>,
+            options: i32,
+        ) -> Result<PyObjectRef, crate::PyError> {
             loop {
                 let mut status: i32 = 0;
                 let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
@@ -10080,28 +10171,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // Wait-status decoding macros (WIFEXITED/WEXITSTATUS/...): override
         // the noop stubs registered above with the libc bit-math.
         macro_rules! reg_wstatus {
-            ($name:literal, |$s:ident| $body:expr) => {crate::__pyre_put_new!(
-                ns_slot,
-                $name,
-                crate::make_builtin_function_with_arity(
+            ($name:literal, |$s:ident| $body:expr) => {
+                crate::__pyre_put_new!(
+                    ns_slot,
                     $name,
-                    |args| {
-                        let $s = match args.first() {
-                            // interp_posix.py `declare_new_w_star`
-                            // types every wait macro `@unwrap_spec(status=c_int)`.
-                            Some(&o) => crate::baseobjspace::c_int_w(o)?,
-                            None => {
-                                return Err(crate::PyError::type_error(concat!(
-                                    $name,
-                                    "() requires 1 argument"
-                                )));
-                            }
-                        };
-                        Ok($body)
-                    },
-                    1,
-                )
-            );};
+                    crate::make_builtin_function_with_arity(
+                        $name,
+                        |args| {
+                            let $s = match args.first() {
+                                // interp_posix.py `declare_new_w_star`
+                                // types every wait macro `@unwrap_spec(status=c_int)`.
+                                Some(&o) => crate::baseobjspace::c_int_w(o)?,
+                                None => {
+                                    return Err(crate::PyError::type_error(concat!(
+                                        $name,
+                                        "() requires 1 argument"
+                                    )));
+                                }
+                            };
+                            Ok($body)
+                        },
+                        1,
+                    )
+                );
+            };
         }
         reg_wstatus!("WIFEXITED", |s| pyre_object::w_bool_from(libc::WIFEXITED(
             s
@@ -10125,8 +10218,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // Wait option flags — override the `0` placeholders registered above
         // with their real libc values (os.WNOHANG must be non-zero for
         // subprocess.poll()).
-        crate::__pyre_put_new!(ns_slot, "WNOHANG", pyre_object::w_int_new(libc::WNOHANG as i64));
-        crate::__pyre_put_new!(ns_slot, "WUNTRACED", pyre_object::w_int_new(libc::WUNTRACED as i64));
+        crate::__pyre_put_new!(
+            ns_slot,
+            "WNOHANG",
+            pyre_object::w_int_new(libc::WNOHANG as i64)
+        );
+        crate::__pyre_put_new!(
+            ns_slot,
+            "WUNTRACED",
+            pyre_object::w_int_new(libc::WUNTRACED as i64)
+        );
         crate::__pyre_put_new!(
             ns_slot,
             "WCONTINUED",
@@ -10317,11 +10418,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "dup2",
-            crate::make_builtin_function_with_arity_and_maybe_sig(
-                "dup2",
-                dup2,
-                dup2_pyre_arity(),
-                dup2_pyre_sig(),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_arity_and_maybe_sig(
+                    "dup2",
+                    dup2,
+                    dup2_pyre_arity(),
+                    dup2_pyre_sig(),
+                ),
+                dup2_pyre_ndef(),
             )
         );
 
@@ -10610,29 +10714,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "mkfifo",
-            posix_builtin(
+            posix_builtin_ndef(
                 "mkfifo",
                 |args| {
-                    let (bound, mut kwargs) =
+                    let (bound, mut kwargs, _kwonly) =
                         bind_path_args(args, "mkfifo", &["path", "mode"], 1, &["dir_fd"])?;
                     let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                     let path = crate::gateway::fsencode_path_or_fd_w(
                         bound[0].expect("path is required"),
                         "mkfifo",
                         false,
                     );
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     let path = path?;
                     // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
                     let mode = match bound[1] {
                         Some(value) => {
                             let roots = pyre_object::gc_roots::push_roots();
-                            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                             let r = crate::baseobjspace::c_int_w(value);
-                            let w = roots.get(base);
-                            kwargs = if w.is_null() { None } else { Some(w) };
+                            kwargs = reload_bound_kwonly(kw_base, kw_n);
                             drop(roots);
                             r? as libc::mode_t
                         }
@@ -10640,7 +10742,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     // `mkfifo` types `dir_fd` as `DirFD(rposix.HAVE_MKFIFOAT)`
                     // (`interp_posix.py`).
-                    let dir_fd = dir_fd_kwarg(kwargs, HAVE_MKFIFOAT)?;
+                    let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_MKFIFOAT)?;
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     // `mkfifoat` resolves the name against the descriptor
@@ -10673,6 +10775,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["path", "mode"],
                 &["dir_fd"],
+                1,
             )
         );
 
@@ -10685,30 +10788,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "mknod",
-            posix_builtin(
+            posix_builtin_ndef(
                 "mknod",
                 |args| {
-                    let (bound, mut kwargs) =
+                    let (bound, mut kwargs, _kwonly) =
                         bind_path_args(args, "mknod", &["path", "mode", "device"], 1, &["dir_fd"])?;
                     let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                     let path = crate::gateway::fsencode_path_or_fd_w(
                         bound[0].expect("path is required"),
                         "mknod",
                         false,
                     );
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     let path = path?;
                     // interp_posix.py `@unwrap_spec(mode=c_int, device=c_int,
                     // ...)`.
                     let mode = match bound[1] {
                         Some(value) => {
                             let roots = pyre_object::gc_roots::push_roots();
-                            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                             let r = crate::baseobjspace::c_int_w(value);
-                            let w = roots.get(base);
-                            kwargs = if w.is_null() { None } else { Some(w) };
+                            kwargs = reload_bound_kwonly(kw_base, kw_n);
                             drop(roots);
                             r? as libc::mode_t
                         }
@@ -10721,10 +10822,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let device = match bound[2] {
                         Some(value) => {
                             let roots = pyre_object::gc_roots::push_roots();
-                            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                             let r = crate::baseobjspace::c_int_w(value);
-                            let w = roots.get(base);
-                            kwargs = if w.is_null() { None } else { Some(w) };
+                            kwargs = reload_bound_kwonly(kw_base, kw_n);
                             drop(roots);
                             r?
                         }
@@ -10732,7 +10832,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     // `mknod` types `dir_fd` as `DirFD(rposix.HAVE_MKNODAT)`
                     // (`interp_posix.py`).
-                    let dir_fd = dir_fd_kwarg(kwargs, HAVE_MKNODAT)?;
+                    let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_MKNODAT)?;
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                     // `mknodat` resolves the name against the descriptor
@@ -10775,6 +10875,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["path", "mode", "device"],
                 &["dir_fd"],
+                2,
             )
         );
 
@@ -10814,7 +10915,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 } else {
                     &["path", "flags"]
                 };
-                let (bound, _) = bind_path_args(args, name, params, 2, &[])?;
+                let (bound, _, _) = bind_path_args(args, name, params, 2, &[])?;
                 let path = crate::gateway::fsencode_path_or_fd_w(
                     bound[0].expect("path is required"),
                     name,
@@ -10851,11 +10952,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::__pyre_put_new!(
                 ns_slot,
                 "chflags",
-                posix_builtin(
+                posix_builtin_ndef(
                     "chflags",
                     |args| chflags_entry(args, "chflags", true),
                     &["path", "flags", "follow_symlinks"],
                     &[],
+                    1,
                 )
             );
             crate::__pyre_put_new!(
@@ -11169,10 +11271,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "symlink",
-            posix_builtin(
+            posix_builtin_ndef(
                 "symlink",
                 |args| {
-                    let (bound, mut kwargs) = bind_path_args(
+                    let (bound, mut kwargs, kwonly) = bind_path_args(
                         args,
                         "symlink",
                         &["src", "dst", "target_is_directory"],
@@ -11186,17 +11288,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let _target_is_directory = match bound[2] {
                         Some(value) => {
                             let roots = pyre_object::gc_roots::push_roots();
-                            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                             let r = crate::baseobjspace::is_true(value);
-                            let w = roots.get(base);
-                            kwargs = if w.is_null() { None } else { Some(w) };
+                            kwargs = reload_bound_kwonly(kw_base, kw_n);
                             drop(roots);
                             r?
                         }
                         None => false,
                     };
                     // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`.
-                    let _dir_fd = dir_fd_kwarg(kwargs, HAVE_SYMLINKAT)?;
+                    let _dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_SYMLINKAT)?;
                     let src = crate::gateway::fsencode_path_named_w(
                         bound[0].expect("src is required"),
                         "symlink",
@@ -11236,6 +11337,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["src", "dst", "target_is_directory"],
                 &["dir_fd"],
+                1,
             )
         );
 
@@ -11248,7 +11350,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             posix_builtin(
                 "link",
                 |args| {
-                    let (bound, mut kwargs) = bind_path_args(
+                    let (bound, mut kwargs, kwonly) = bind_path_args(
                         args,
                         "link",
                         &["src", "dst"],
@@ -11256,23 +11358,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         &["src_dir_fd", "dst_dir_fd", "follow_symlinks"],
                     )?;
                     let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.publish(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                     let args_base = roots.publish(&[
                         bound[0].expect("src is required"),
                         bound[1].expect("dst is required"),
                     ]);
-                    roots.normalize(base, 3);
+                    if kw_n > 0 {
+                        roots.normalize(kw_base, kw_n + 2);
+                    } else {
+                        roots.normalize(args_base, 2);
+                    }
                     let src =
                         crate::gateway::fsencode_path_named_w(roots.get(args_base), "link", "src")?;
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     let dst = crate::gateway::fsencode_path_named_w(
                         roots.get(args_base + 1),
                         "link",
                         "dst",
                     )?;
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     let c_src = std::ffi::CString::new(src.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
                     let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
@@ -11281,32 +11385,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // descriptor the platform can honour resolves the name against
                     // it, and one it cannot is refused rather than silently
                     // resolved against the process's own directory.
-                    let dir_fd =
-                        |kwargs: Option<PyObjectRef>, name: &str| -> Result<i32, crate::PyError> {
-                            match crate::builtins::kwarg_get(kwargs, name)
-                                .filter(|&w| !unsafe { pyre_object::is_none(w) })
-                            {
-                                Some(w) => unwrap_fd(w, "integer or None"),
-                                None => Ok(libc::AT_FDCWD),
-                            }
-                        };
+                    let dir_fd = |kwargs: &[Option<pyre_object::PyObjectRef>],
+                                  name: &str|
+                     -> Result<i32, crate::PyError> {
+                        match bound_kwonly_named(kwargs, kwonly, name)
+                            .filter(|&w| !unsafe { pyre_object::is_none(w) })
+                        {
+                            Some(w) => unwrap_fd(w, "integer or None"),
+                            None => Ok(libc::AT_FDCWD),
+                        }
+                    };
                     let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-                    let src_dir_fd = dir_fd(kwargs, "src_dir_fd");
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                    let src_dir_fd = dir_fd(&kwargs, "src_dir_fd");
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     drop(roots);
                     let src_dir_fd = src_dir_fd?;
                     let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-                    let dst_dir_fd = dir_fd(kwargs, "dst_dir_fd");
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                    let dst_dir_fd = dir_fd(&kwargs, "dst_dir_fd");
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     drop(roots);
                     let dst_dir_fd = dst_dir_fd?;
                     // `os_link_impl` follows the final symlink of `src` by
                     // default, which is `AT_SYMLINK_FOLLOW`.
-                    let follow = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                    let follow = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
                         Some(w) => crate::baseobjspace::is_true(w)?,
                         None => true,
                     };
@@ -11358,47 +11461,46 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // `lchmod(path, mode)` is `chmod(path, mode,
             // follow_symlinks=False)` under another name and declares no
             // keyword of its own.
-            let kwonly: &[&str] = if default_follow {
+            let kwonly: &'static [&'static str] = if default_follow {
                 &["dir_fd", "follow_symlinks"]
             } else {
                 &[]
             };
-            let (bound, mut kwargs) = bind_path_args(args, name, &["path", "mode"], 2, kwonly)?;
+            let (bound, mut kwargs, kwonly) =
+                bind_path_args(args, name, &["path", "mode"], 2, kwonly)?;
             let path_obj = bound[0].expect("path is required");
             let mut mode_obj = bound[1].expect("mode is required");
             // interp_posix.py reads a `chmod` whose path did not
             // fsencode as a descriptor and answers it with `os.fchmod`.
             // `lchmod` names no descriptor form.
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[mode_obj, kwargs.unwrap_or(pyre_object::PY_NULL)]);
+            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+            let mode_slot = roots.pin_roots(&[mode_obj]);
             let path = crate::gateway::fsencode_path_or_fd_w(
                 path_obj,
                 name,
                 default_follow && HAVE_FCHMOD,
             );
-            mode_obj = roots.get(base);
-            let w = roots.get(base + 1);
-            kwargs = if w.is_null() { None } else { Some(w) };
+            mode_obj = roots.get(mode_slot);
+            kwargs = reload_bound_kwonly(kw_base, kw_n);
             let path = path?;
             // `posix.chmod` unwraps `mode` as `c_int`, so a non-integer raises
             // TypeError instead of reinterpreting its layout.
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
             let mode = crate::baseobjspace::c_int_w(mode_obj);
-            let w = roots.get(base);
-            kwargs = if w.is_null() { None } else { Some(w) };
+            kwargs = reload_bound_kwonly(kw_base, kw_n);
             drop(roots);
             let mode = mode? as u32;
             // `chmod` types `dir_fd` as `DirFD(rposix.HAVE_FCHMODAT)`
             // (`interp_posix.py`).
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-            let dir_fd = dir_fd_kwarg(kwargs, HAVE_FCHMODAT);
-            let w = roots.get(base);
-            kwargs = if w.is_null() { None } else { Some(w) };
+            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+            let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_FCHMODAT);
+            kwargs = reload_bound_kwonly(kw_base, kw_n);
             drop(roots);
             let dir_fd = dir_fd?;
-            let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+            let follow_symlinks = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
                 Some(v) => crate::baseobjspace::is_true(v)?,
                 None => default_follow,
             };
@@ -11550,12 +11652,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             name: &str,
             default_follow: bool,
         ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-            let kwonly: &[&str] = if default_follow {
+            let kwonly: &'static [&'static str] = if default_follow {
                 &["dir_fd", "follow_symlinks"]
             } else {
                 &[]
             };
-            let (bound, mut kwargs) =
+            let (bound, mut kwargs, kwonly) =
                 bind_path_args(args, name, &["path", "uid", "gid"], 3, kwonly)?;
             let path_obj = bound[0].expect("path is required");
             let mut uid_obj = bound[1].expect("uid is required");
@@ -11567,11 +11669,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // swallow the `UnicodeEncodeError` a lone surrogate produces.
             // The path owns a bracket of its own, above this one; this one
             // stays open until the path is gone.
-            let has_kwargs = kwargs.is_some();
             let id_roots = pyre_object::gc_roots::push_roots();
             let id_base = id_roots.publish(&[gid_obj, uid_obj]);
-            let kwargs_slot = id_roots.publish(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-            id_roots.normalize(id_base, 3);
+            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+            id_roots.normalize(id_base, 2 + kw_n);
             let path = crate::gateway::fsencode_path_or_fd_w(
                 path_obj,
                 name,
@@ -11581,7 +11682,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             );
             gid_obj = id_roots.get(id_base);
             uid_obj = id_roots.get(id_base + 1);
-            kwargs = has_kwargs.then(|| id_roots.get(kwargs_slot));
+            kwargs = reload_bound_kwonly(kw_base, kw_n);
             let path = path?;
             // `_Py_Uid_Converter` / `_Py_Gid_Converter`: `uid_t` is unsigned, yet
             // -1 is always accepted as the "leave unchanged" sentinel.  Only
@@ -11617,31 +11718,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     Ok(Some(narrowed))
                 };
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[gid_obj, kwargs.unwrap_or(pyre_object::PY_NULL)]);
+            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+            let gid_slot = roots.pin_roots(&[gid_obj]);
             let uid = id_of(uid_obj, "uid");
-            gid_obj = roots.get(base);
-            let w = roots.get(base + 1);
-            kwargs = if w.is_null() { None } else { Some(w) };
+            gid_obj = roots.get(gid_slot);
+            kwargs = reload_bound_kwonly(kw_base, kw_n);
             drop(roots);
             let uid = uid?;
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
             let gid = id_of(gid_obj, "gid");
-            let w = roots.get(base);
-            kwargs = if w.is_null() { None } else { Some(w) };
+            kwargs = reload_bound_kwonly(kw_base, kw_n);
             drop(roots);
             let gid = gid?;
             // `chown` types `dir_fd` as `DirFD(rposix.HAVE_FCHOWNAT)`
             // (`interp_posix.py`); `lchown` declares no keyword at
             // all, so `allowed` above has already rejected it.
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-            let dir_fd = dir_fd_kwarg(kwargs, HAVE_FCHOWNAT);
-            let w = roots.get(base);
-            kwargs = if w.is_null() { None } else { Some(w) };
+            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+            let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_FCHOWNAT);
+            kwargs = reload_bound_kwonly(kw_base, kw_n);
             drop(roots);
             let dir_fd = dir_fd?;
-            let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+            let follow_symlinks = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
                 Some(v) => crate::baseobjspace::is_true(v)?,
                 None => default_follow,
             };
@@ -11891,7 +11990,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |args| {
                     // `access` names three keyword-only modifiers, so a third
                     // positional is an error rather than a `dir_fd`.
-                    let (bound, mut kwargs) = bind_path_args(
+                    let (bound, mut kwargs, kwonly) = bind_path_args(
                         args,
                         "access",
                         &["path", "mode"],
@@ -11903,21 +12002,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // before `mode`, `mode` before `dir_fd`, and both before either
                     // flag's `__bool__` is called at all.
                     let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                     let path = crate::gateway::fsencode_path_named_w(
                         bound[0].expect("path is required"),
                         "access",
                         "path",
                     );
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     let path = path?.as_bytes;
                     // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
                     let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                     let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"));
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     drop(roots);
                     let mode = mode?;
                     // interp_posix.py `access` types `dir_fd` as
@@ -11925,26 +12022,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // turns the descriptor away instead of resolving the name
                     // against the working directory as though none had been given.
                     let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-                    let dir_fd = dir_fd_kwarg(kwargs, HAVE_FACCESSAT);
-                    let w = roots.get(base);
-                    kwargs = if w.is_null() { None } else { Some(w) };
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                    let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_FACCESSAT);
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     drop(roots);
                     let dir_fd = dir_fd?;
-                    let effective_ids = match crate::builtins::kwarg_get(kwargs, "effective_ids") {
+                    let effective_ids = match bound_kwonly_named(&kwargs, kwonly, "effective_ids") {
                         Some(v) => {
                             let roots = pyre_object::gc_roots::push_roots();
-                            let base = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
+                            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                             let r = crate::baseobjspace::is_true(v);
-                            let w = roots.get(base);
-                            kwargs = if w.is_null() { None } else { Some(w) };
+                            kwargs = reload_bound_kwonly(kw_base, kw_n);
                             drop(roots);
                             r?
                         }
                         None => false,
                     };
                     let follow_symlinks =
-                        match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                        match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
                             Some(v) => crate::baseobjspace::is_true(v)?,
                             None => true,
                         };
@@ -12207,7 +12302,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "sendfile",
-            posix_builtin(
+            posix_builtin_ndef(
                 "sendfile",
                 |args| {
                     // Every parameter is positional-or-keyword. `headers`,
@@ -12225,11 +12320,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // is not live across `rposix.c_sendfile`.
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     let (mut w_out_fd, mut w_in_fd, mut w_offset, mut w_count) = {
-                        let (bound, _kwargs) = bind_path_args(
+                        let (bound, _, _) = bind_path_args(
                             args,
                             "sendfile",
                             &[
-                                "out_fd", "in_fd", "offset", "count", "headers", "trailers", "flags",
+                                "out_fd", "in_fd", "offset", "count", "headers", "trailers",
+                                "flags",
                             ],
                             4,
                             &[],
@@ -12251,11 +12347,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         mut w_trailers,
                         mut w_flags,
                     ) = {
-                        let (bound, _kwargs) = bind_path_args(
+                        let (bound, _, _) = bind_path_args(
                             args,
                             "sendfile",
                             &[
-                                "out_fd", "in_fd", "offset", "count", "headers", "trailers", "flags",
+                                "out_fd", "in_fd", "offset", "count", "headers", "trailers",
+                                "flags",
                             ],
                             4,
                             &[],
@@ -12383,7 +12480,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     #[cfg(target_os = "macos")]
                     {
-                        let flags = if w_flags.is_null() || unsafe { pyre_object::is_none(w_flags) } {
+                        let flags = if w_flags.is_null() || unsafe { pyre_object::is_none(w_flags) }
+                        {
                             0
                         } else {
                             pyre_object::with_roots!(
@@ -12398,7 +12496,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let (header_buffers, trailer_buffers) = {
                             let _roots = pyre_object::gc_roots::push_roots();
                             let base = pyre_object::gc_roots::pin_roots(&[
-                                w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags,
+                                w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers,
+                                w_flags,
                             ]);
                             w_out_fd = pyre_object::gc_roots::shadow_stack_get(base);
                             w_in_fd = pyre_object::gc_roots::shadow_stack_get(base + 1);
@@ -12440,7 +12539,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 for index in 0..items.len() {
                                     let item =
                                         pyre_object::gc_roots::shadow_stack_get(items_base + index);
-                                    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(item)?
+                                    let Some(buffer) =
+                                        crate::baseobjspace::simple_buffer_bytes(item)?
                                     else {
                                         return Err(crate::PyError::type_error(format!(
                                             "sendfile() {name} items must be bytes-like"
@@ -12536,7 +12636,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             Some(buffers) if count_raw != 0 => {
                                 buffers.iter().try_fold(count_raw, |count, buffer| {
                                     count.checked_add(buffer.len() as i64).ok_or_else(|| {
-                                        crate::PyError::overflow_error("sendfile() count is too large")
+                                        crate::PyError::overflow_error(
+                                            "sendfile() count is too large",
+                                        )
                                     })
                                 })?
                             }
@@ -12581,13 +12683,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "out_fd", "in_fd", "offset", "count", "headers", "trailers", "flags",
                 ],
                 &[],
+                3,
             )
         );
 
-        // os.posix_spawn(path, argv, env, *, file_actions=None, setpgroup=None,
+        // os.posix_spawn(path, argv, env, /, *, file_actions=(), setpgroup=None,
         // resetids=False, setsid=False, setsigmask=(), setsigdef=(),
         // scheduler=None) -> pid
-        // os.posix_spawnp(file, argv, env, *, file_actions=None, ...) -> pid
+        // os.posix_spawnp(file, argv, env, /, *, file_actions=(), ...) -> pid
         #[cfg(all(
             any(target_os = "linux", target_os = "freebsd", target_os = "macos"),
             not(feature = "sandbox")
@@ -12667,7 +12770,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let mut pid: libc::pid_t = 0;
                 let mut actions = unsafe { std::mem::zeroed::<libc::posix_spawn_file_actions_t>() };
                 let mut attr = unsafe { std::mem::zeroed::<libc::posix_spawnattr_t>() };
-                let err = unsafe { majit_rlib::rposix::c_posix_spawn_file_actions_init(&mut actions) };
+                let err =
+                    unsafe { majit_rlib::rposix::c_posix_spawn_file_actions_init(&mut actions) };
                 if err != 0 {
                     return Err(err);
                 }
@@ -12698,12 +12802,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             },
                             PosixSpawnFileAction::Close { fd } => unsafe {
                                 majit_rlib::rposix::c_posix_spawn_file_actions_addclose(
-                                    &mut actions, *fd,
+                                    &mut actions,
+                                    *fd,
                                 )
                             },
                             PosixSpawnFileAction::Dup2 { fd, newfd } => unsafe {
                                 majit_rlib::rposix::c_posix_spawn_file_actions_adddup2(
-                                    &mut actions, *fd, *newfd,
+                                    &mut actions,
+                                    *fd,
+                                    *newfd,
                                 )
                             },
                         };
@@ -12817,7 +12924,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     if err != 0 { Err(err) } else { Ok(pid) }
                 })();
-                let _ = unsafe { majit_rlib::rposix::c_posix_spawn_file_actions_destroy(&mut actions) };
+                let _ =
+                    unsafe { majit_rlib::rposix::c_posix_spawn_file_actions_destroy(&mut actions) };
                 let _ = unsafe { majit_rlib::rposix::c_posix_spawnattr_destroy(&mut attr) };
                 result
             }
@@ -12838,7 +12946,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // names are positional-only and everything else is
                 // keyword-only, so there is no positional-or-keyword slot at
                 // all.
-                let (bound, kwargs) = bind_posonly_args(
+                let (bound, mut kwargs, kwonly) = bind_posonly_args(
                     args,
                     func,
                     func,
@@ -12865,15 +12973,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     bound[1].expect("argv is required"),
                     bound[2].expect("env is required"),
                 ]);
-                let kwargs_slot =
-                    kwargs.map(|kwargs| pyre_object::gc_roots::publish_roots(&[kwargs]));
-                pyre_object::gc_roots::normalize_roots(
-                    positional_base,
-                    3 + usize::from(kwargs_slot.is_some()),
-                );
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                pyre_object::gc_roots::normalize_roots(positional_base, 3 + kw_n);
                 let positional =
                     |index: usize| pyre_object::gc_roots::shadow_stack_get(positional_base + index);
-                let kwargs = || kwargs_slot.map(pyre_object::gc_roots::shadow_stack_get);
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let path = crate::gateway::fsencode_path_named_w(positional(0), func, "path")?;
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
                     crate::PyError::value_error("posix_spawn: embedded null in path")
@@ -12883,7 +12987,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // snapshot used by execve, then filesystem-encodes paired
                 // elements into `key=value`.
                 let env = collect_spawn_env(positional(2))?;
-                let setpgroup = match crate::builtins::kwarg_get(kwargs(), "setpgroup") {
+                let setpgroup = match bound_kwonly_named(&kwargs, kwonly, "setpgroup") {
                     Some(value) if !unsafe { pyre_object::is_none(value) } => {
                         let value = crate::baseobjspace::space_index(value)?;
                         let value = crate::baseobjspace::int_w(value)?;
@@ -12895,27 +12999,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     _ => None,
                 };
-                let resetids = crate::builtins::kwarg_get(kwargs(), "resetids")
+                let resetids = bound_kwonly_named(&kwargs, kwonly, "resetids")
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
-                let setsid = crate::builtins::kwarg_get(kwargs(), "setsid")
+                let setsid = bound_kwonly_named(&kwargs, kwonly, "setsid")
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
                 if setsid && !supports_posix_spawn_setsid() {
                     return Err(argument_unavailable(func, "setsid"));
                 }
-                let setsigmask = match crate::builtins::kwarg_get(kwargs(), "setsigmask") {
+                let setsigmask = match bound_kwonly_named(&kwargs, kwonly, "setsigmask") {
                     Some(value) => Some(sigset_arg(value)?),
                     None => None,
                 };
-                let setsigdef = match crate::builtins::kwarg_get(kwargs(), "setsigdef") {
+                let setsigdef = match bound_kwonly_named(&kwargs, kwonly, "setsigdef") {
                     Some(value) => Some(sigset_arg(value)?),
                     None => None,
                 };
-                let _scheduler = parse_spawn_scheduler(func, kwargs())?;
-                let file_actions_obj = crate::builtins::kwarg_get(kwargs(), "file_actions");
+                let _scheduler =
+                    parse_spawn_scheduler(func, bound_kwonly_named(&kwargs, kwonly, "scheduler"))?;
+                let file_actions_obj = bound_kwonly_named(&kwargs, kwonly, "file_actions");
                 let actions: Vec<PosixSpawnFileAction> = if let Some(fa) = file_actions_obj {
                     if unsafe { pyre_object::is_none(fa) } {
                         Vec::new()
@@ -13155,9 +13260,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
             fn parse_spawn_scheduler(
                 func: &str,
-                kwargs: Option<PyObjectRef>,
+                value: Option<PyObjectRef>,
             ) -> Result<Option<SpawnScheduler>, crate::PyError> {
-                let Some(value) = crate::builtins::kwarg_get(kwargs, "scheduler") else {
+                let Some(value) = value else {
                     return Ok(None);
                 };
                 if unsafe { pyre_object::is_none(value) } {
@@ -13366,10 +13471,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     #[cfg(not(target_os = "freebsd"))]
                     type PriorityWhoType = u32;
                     let which = pyre_object::with_roots!(w_who => crate::baseobjspace::int_w(w_which))?
-                        as PriorityWhichType
-                        as libc::c_int;
-                    let who = crate::baseobjspace::int_w(w_who)? as PriorityWhoType
-                        as libc::id_t;
+                        as PriorityWhichType as libc::c_int;
+                    let who = crate::baseobjspace::int_w(w_who)? as PriorityWhoType as libc::id_t;
                     let prio = unsafe { majit_rlib::rposix::c_getpriority(which, who) };
                     let errno = majit_rlib::rposix::get_saved_errno();
                     if errno != 0 {
@@ -13408,11 +13511,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     type PriorityWhoType = u32;
                     let which = pyre_object::with_roots!(w_who, w_prio =>
                         crate::baseobjspace::int_w(w_which))?
-                        as PriorityWhichType
-                        as libc::c_int;
+                        as PriorityWhichType as libc::c_int;
                     let who = pyre_object::with_roots!(w_prio => crate::baseobjspace::int_w(w_who))?
-                        as PriorityWhoType
-                        as libc::id_t;
+                        as PriorityWhoType as libc::id_t;
                     let prio = crate::baseobjspace::int_w(w_prio)? as i32;
                     // `rposix.c_setpriority` releases the GIL and saves errno.
                     // `-1` is the failure.
@@ -13434,8 +13535,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "PRIO_PROCESS",
             pyre_object::w_int_new(libc::PRIO_PROCESS as i64)
         );
-        crate::__pyre_put_new!(ns_slot, "PRIO_PGRP", pyre_object::w_int_new(libc::PRIO_PGRP as i64));
-        crate::__pyre_put_new!(ns_slot, "PRIO_USER", pyre_object::w_int_new(libc::PRIO_USER as i64));
+        crate::__pyre_put_new!(
+            ns_slot,
+            "PRIO_PGRP",
+            pyre_object::w_int_new(libc::PRIO_PGRP as i64)
+        );
+        crate::__pyre_put_new!(
+            ns_slot,
+            "PRIO_USER",
+            pyre_object::w_int_new(libc::PRIO_USER as i64)
+        );
 
         // `posixmodule.c` `pathconf_names` — the `_PC_*` table
         // `conv_path_confname` resolves a string `name` argument through.
@@ -14189,11 +14298,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "dup2",
-            crate::make_builtin_function_with_arity_and_maybe_sig(
-                "dup2",
-                dup2,
-                dup2_pyre_arity(),
-                dup2_pyre_sig(),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_arity_and_maybe_sig(
+                    "dup2",
+                    dup2,
+                    dup2_pyre_arity(),
+                    dup2_pyre_sig(),
+                ),
+                dup2_pyre_ndef(),
             )
         );
 
@@ -14319,7 +14431,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |args| {
                     // The three modifiers are keyword-only, so a third positional
                     // is an error rather than a `dir_fd`.
-                    let (bound, kwargs) = bind_path_args(
+                    let (bound, kwargs, kwonly) = bind_path_args(
                         args,
                         "access",
                         &["path", "mode"],
@@ -14338,13 +14450,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // the mode as far as the answer goes.
                     let mode =
                         crate::baseobjspace::c_int_w(bound[1].expect("mode is required"))? as u8;
-                    dir_fd_kwarg(kwargs, false)?;
-                    if let Some(v) = crate::builtins::kwarg_get(kwargs, "effective_ids")
+                    dir_fd_kwarg(kwargs.first().copied().flatten(), false)?;
+                    if let Some(v) = bound_kwonly_named(&kwargs, kwonly, "effective_ids")
                         && crate::baseobjspace::is_true(v)?
                     {
                         return Err(argument_unavailable("access", "effective_ids"));
                     }
-                    if let Some(v) = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                    if let Some(v) = bound_kwonly_named(&kwargs, kwonly, "follow_symlinks")
                         && !crate::baseobjspace::is_true(v)?
                     {
                         return Err(argument_unavailable("access", "follow_symlinks"));
@@ -14681,7 +14793,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             posix_builtin(
                 "chmod",
                 |args| {
-                    let (bound, kwargs) = bind_path_args(
+                    let (bound, kwargs, kwonly) = bind_path_args(
                         args,
                         "chmod",
                         &["path", "mode"],
@@ -14691,7 +14803,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `_DirFD_Unavailable.unwrap` (`interp_posix.py`)
                     // converts first and reports the platform second, so a wrongly
                     // typed value is a TypeError here as well.
-                    if let Some(w) = crate::builtins::kwarg_get(kwargs, "dir_fd")
+                    if let Some(w) = bound_kwonly_named(&kwargs, kwonly, "dir_fd")
                         .filter(|&w| !unsafe { pyre_object::is_none(w) })
                     {
                         unwrap_fd(w, "integer or None")?;
@@ -14720,7 +14832,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         };
                     }
                     let follow_symlinks =
-                        match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+                        match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
                             Some(w) => crate::baseobjspace::is_true(w)?,
                             // `CHMOD_DEFAULT_FOLLOW_SYMLINKS` is 0 here, which the
                             // clinic spells `follow_symlinks=(os.name != 'nt')`: an
@@ -14816,7 +14928,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             posix_builtin(
                 "link",
                 |args| {
-                    let (bound, kwargs) = bind_path_args(
+                    let (bound, kwargs, kwonly) = bind_path_args(
                         args,
                         "link",
                         &["src", "dst"],
@@ -14828,7 +14940,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // names both arguments, the way `argument_unavailable_error`
                     // spells this one.
                     if ["src_dir_fd", "dst_dir_fd"].iter().any(|name| {
-                        crate::builtins::kwarg_get(kwargs, name)
+                        bound_kwonly_named(&kwargs, kwonly, name)
                             .is_some_and(|w| !unsafe { pyre_object::is_none(w) })
                     }) {
                         return Err(crate::PyError::not_implemented(
@@ -14839,7 +14951,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // what it points at, so asking for the other behaviour is
                     // refused.  Leaving the argument out is not asking: the
                     // default is the unspecified one.
-                    if let Some(w) = crate::builtins::kwarg_get(kwargs, "follow_symlinks")
+                    if let Some(w) = bound_kwonly_named(&kwargs, kwonly, "follow_symlinks")
                         && crate::baseobjspace::is_true(w)?
                     {
                         return Err(crate::PyError::not_implemented(
@@ -14876,10 +14988,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "symlink",
-            posix_builtin(
+            posix_builtin_ndef(
                 "symlink",
                 |args| {
-                    let (bound, kwargs) = bind_path_args(
+                    let (bound, kwargs, kwonly) = bind_path_args(
                         args,
                         "symlink",
                         &["src", "dst", "target_is_directory"],
@@ -14889,7 +15001,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`,
                     // and `CreateSymbolicLinkW` resolves a relative name against
                     // the working directory alone.
-                    dir_fd_kwarg(kwargs, false)?;
+                    dir_fd_kwarg(kwargs.first().copied().flatten(), false)?;
                     let src = crate::gateway::fsencode_path_named_w(
                         bound[0].expect("src is required"),
                         "symlink",
@@ -14921,6 +15033,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["src", "dst", "target_is_directory"],
                 &["dir_fd"],
+                1,
             )
         );
 
@@ -15036,7 +15149,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "startfile",
-            posix_builtin(
+            posix_builtin_ndef(
                 "startfile",
                 |args| {
                     // Every optional argument is positional-or-keyword, so the
@@ -15046,17 +15159,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // this entry point exists only here, so the wording it should
                     // name itself with is unmeasured on this host. See the
                     // follow-up task.
-                    let (bound, _) = bind_path_args(
+                    let (bound, _, _) = bind_path_args(
                         args,
                         "startfile",
                         &["filepath", "operation", "arguments", "cwd", "show_cmd"],
                         1,
                         &[],
                     )?;
-                    let path =
-                        crate::gateway::fsencode_path_w(bound[0].expect("filepath is required"))?;
+                    // `filepath` converts through `os.fspath` (`fsencode_path_w`);
+                    // pin the bound optionals across that call (`open` / `link`).
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let (pos_base, pos_n) = pin_bound_kwonly(&bound);
+                    let path = crate::gateway::fsencode_path_w(
+                        pyre_object::gc_roots::shadow_stack_get(pos_base),
+                    )?;
+                    let mut bound = reload_bound_kwonly(pos_base, pos_n);
                     let wide_file = wide_path(&path.as_bytes)?;
-                    let given = |index: usize| -> Option<pyre_object::PyObjectRef> {
+                    let given = |bound: &[Option<pyre_object::PyObjectRef>],
+                                 index: usize|
+                     -> Option<pyre_object::PyObjectRef> {
                         bound
                             .get(index)
                             .copied()
@@ -15066,8 +15187,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // A missing optional argument is spelled `None`, which stands
                     // for the null the call takes for "no operation", "no
                     // arguments", "the process's own directory".
-                    let wide_arg = |index: usize| -> Result<Option<_>, crate::PyError> {
-                        match given(index) {
+                    let wide_arg = |bound: &[Option<pyre_object::PyObjectRef>],
+                                    index: usize|
+                     -> Result<Option<_>, crate::PyError> {
+                        match given(bound, index) {
                             Some(w) => {
                                 let text = crate::baseobjspace::text_w(w)?;
                                 Ok(Some(widestring::WideCString::from_str(text).map_err(
@@ -15077,13 +15200,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             None => Ok(None),
                         }
                     };
-                    let operation = wide_arg(1)?;
-                    let arguments = wide_arg(2)?;
-                    let cwd = match given(3) {
+                    let operation = wide_arg(&bound, 1)?;
+                    bound = reload_bound_kwonly(pos_base, pos_n);
+                    let arguments = wide_arg(&bound, 2)?;
+                    bound = reload_bound_kwonly(pos_base, pos_n);
+                    let cwd = match given(&bound, 3) {
                         Some(w) => Some(wide_path(&crate::gateway::fsencode_path_w(w)?.as_bytes)?),
                         None => None,
                     };
-                    let show_cmd = match given(4) {
+                    bound = reload_bound_kwonly(pos_base, pos_n);
+                    let show_cmd = match given(&bound, 4) {
                         Some(w) => crate::baseobjspace::c_int_w(w)?,
                         None => rustpython_host_env::winapi::SW_SHOWNORMAL,
                     };
@@ -15099,6 +15225,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["filepath", "operation", "arguments", "cwd", "show_cmd"],
                 &[],
+                4,
             )
         );
 

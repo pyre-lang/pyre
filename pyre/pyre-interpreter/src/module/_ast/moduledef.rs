@@ -721,10 +721,8 @@ fn ast_replace_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> cr
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_);
-    ast_replace_from(
-        pyre_object::gc_roots::shadow_stack_get(self_slot),
-        crate::builtins::arguments_as_kwargs_dict(args)?,
-    )
+    let kwargs = crate::builtins::arguments_as_kwargs_dict(args)?;
+    ast_replace_from(pyre_object::gc_roots::shadow_stack_get(self_slot), kwargs)
 }
 
 fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {

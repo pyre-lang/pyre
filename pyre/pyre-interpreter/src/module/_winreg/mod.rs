@@ -1524,6 +1524,7 @@ mod imp {
         ] {
             let function = match name {
                 "OpenKey" | "OpenKeyEx" | "CreateKeyEx" => {
+                    // `OpenKey`/`CreateKeyEx`: reserved=0, access=KEY_READ/KEY_WRITE
                     let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
                         name,
                         func,
@@ -1536,13 +1537,17 @@ mod imp {
                             0,
                         ),
                     );
-                    pyre_interpreter::function_new_with_fixed_code(
-                        code as *const (),
-                        name.to_string(),
-                        pyre_object::PY_NULL,
+                    pyre_interpreter::gateway::function_set_null_positional_defaults(
+                        pyre_interpreter::function_new_with_fixed_code(
+                            code as *const (),
+                            name.to_string(),
+                            pyre_object::PY_NULL,
+                        ),
+                        2,
                     )
                 }
                 "DeleteKeyEx" => {
+                    // `DeleteKeyEx`: access=KEY_WOW64_64KEY, reserved=0
                     let code = pyre_interpreter::gateway::builtin_code_new_with_signature(
                         name,
                         func,
@@ -1555,10 +1560,13 @@ mod imp {
                             0,
                         ),
                     );
-                    pyre_interpreter::function_new_with_fixed_code(
-                        code as *const (),
-                        name.to_string(),
-                        pyre_object::PY_NULL,
+                    pyre_interpreter::gateway::function_set_null_positional_defaults(
+                        pyre_interpreter::function_new_with_fixed_code(
+                            code as *const (),
+                            name.to_string(),
+                            pyre_object::PY_NULL,
+                        ),
+                        2,
                     )
                 }
                 "CloseKey"

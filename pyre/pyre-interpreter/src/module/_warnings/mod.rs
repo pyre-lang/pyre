@@ -977,7 +977,7 @@ crate::py_module! {
             // `source` is positional-or-keyword; only `skip_file_prefixes`
             // sits behind the clinic's `*`.
             #[default(pyre_object::PY_NULL)] mut source: PyObjectRef,
-            #[kwonly] #[default(pyre_object::PY_NULL)] skip_file_prefixes: PyObjectRef,
+            #[kwonly] #[default(pyre_object::w_tuple_new(Vec::new()))] skip_file_prefixes: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
             // CPython 3.14 `_warnings.warn`: `skip_file_prefixes` is a
             // tuple-only fast-path argument.  Its frame walk is the current
@@ -1111,6 +1111,13 @@ crate::py_module! {
         crate::__pyre_put_new!(ns_slot, "_onceregistry", w_dict_new());
         crate::__pyre_put_new!(ns_slot, "_defaultaction", w_str_new("default"));
         crate::__pyre_put_new!(ns_slot, VERSION_ATTR, new_version());
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns(), "warn") } {
+            function = crate::function_set_kwonly_defaults!(
+                function,
+                "skip_file_prefixes" => pyre_object::w_tuple_new(Vec::new()),
+            );
+            crate::__pyre_put_new!(ns_slot, "warn", function);
+        }
         STATE_NS.store(ns() as usize, std::sync::atomic::Ordering::Release);
     },
 }

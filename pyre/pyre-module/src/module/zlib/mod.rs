@@ -262,7 +262,10 @@ fn init_compress_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr_maybe_sig(compress_new, Some(new_sig))
+        pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::typedef::make_new_descr_maybe_sig(compress_new, Some(new_sig)),
+            6,
+        )
     );
     unsafe {
         pyre_interpreter::__pyre_put_new!(
@@ -548,7 +551,10 @@ fn init_decompress_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr_maybe_sig(decompress_new, Some(new_sig))
+        pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::typedef::make_new_descr_maybe_sig(decompress_new, Some(new_sig)),
+            2,
+        )
     );
     let decompress_sig = {
         let mut b = pyre_interpreter::SignatureBuilder::default();
@@ -561,10 +567,13 @@ fn init_decompress_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "decompress",
-        pyre_interpreter::make_builtin_function_maybe_sig(
-            "decompress",
-            decompress_decompress,
-            Some(decompress_sig),
+        pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_maybe_sig(
+                "decompress",
+                decompress_decompress,
+                Some(decompress_sig),
+            ),
+            1,
         )
     );
     for name in ["copy", "__copy__"] {
@@ -875,7 +884,10 @@ fn init_zdecompress_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr_maybe_sig(zdecompress_new, Some(new_sig))
+        pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::typedef::make_new_descr_maybe_sig(zdecompress_new, Some(new_sig)),
+            2,
+        )
     );
     for name in ["__reduce__", "__reduce_ex__"] {
         pyre_interpreter::__pyre_put_new!(
@@ -899,10 +911,13 @@ fn init_zdecompress_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "decompress",
-        pyre_interpreter::make_builtin_function_maybe_sig(
-            "decompress",
-            zdecompress_decompress,
-            Some(decompress_sig),
+        pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_maybe_sig(
+                "decompress",
+                zdecompress_decompress,
+                Some(decompress_sig),
+            ),
+            1,
         )
     );
     zdecompress_getset(

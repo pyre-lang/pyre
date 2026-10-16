@@ -35,6 +35,16 @@ pyre_interpreter::py_module! {
         // Install the TypeDef before allocation so the generated allocator
         // can stamp the canonical Python class in `w_class`.
         let mut ns = ns;
+        // Optional `default` is a trailing positional (`UCD.digit` /
+        // `interp2app._getdefaults`). Omitted slots stay `PY_NULL` so
+        // `char_and_default` still distinguishes absence from `None`.
+        for name in ["digit", "decimal", "numeric", "name"] {
+            if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, name) } {
+                function =
+                    pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+                pyre_interpreter::__pyre_store!(ns, name, function);
+            }
+        }
         let ucd_type = pyre_object::with_roots!(ns => interp_ucd::type_object());
         // `interp_ucd.py UCD.typedef` declares no `__new__`, so the two
         // database instances the module exports are the only ones that exist;

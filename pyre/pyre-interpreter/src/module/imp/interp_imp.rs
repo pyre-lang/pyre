@@ -1169,6 +1169,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         }));
     crate::__pyre_store!(ns, "find_frozen", // `withdata` is keyword-only, so no call shape fills every parameter
         // positionally and there is no fixed natural arity to fast-path on.
+        crate::gateway::function_set_kwonly_default_pairs(
         crate::make_builtin_function_with_signature(
             "find_frozen",
             |args| {
@@ -1209,6 +1210,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 ]))
             },
             crate::gateway::Signature::new(vec!["name", "withdata"], None, None, 1, 1),
+        ),
+            &[("withdata", pyre_object::w_bool_from(false))],
         ));
     crate::__pyre_store!(ns, "_override_frozen_modules_for_tests", crate::make_builtin_function("_override_frozen_modules_for_tests", |args| {
             let Some(&value) = args.first() else {
@@ -1354,6 +1357,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // `_imp_create_dynamic_impl`. Raising ImportError (rather than being
         // absent) matches the meta-path `hasattr` probe while still letting
         // `except ImportError` fall back to a pure-Python module.
+        crate::gateway::function_set_null_positional_defaults(
         crate::make_builtin_function_with_signature(
             "create_dynamic",
             |args| {
@@ -1393,6 +1397,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             },
             crate::Signature::new(vec!["spec", "file"], None, None, 0, 0),
+        ),
+        1,
         ));
     crate::__pyre_store!(ns, "acquire_lock", crate::make_builtin_function_with_arity(
             "acquire_lock",

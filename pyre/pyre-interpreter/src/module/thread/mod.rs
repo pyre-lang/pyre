@@ -2478,8 +2478,8 @@ fn start_joinable_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             "can't create new thread at interpreter shutdown",
         ));
     }
-    // Bound scope: pos-only `function`, kw-only `handle`/`daemon` (`PY_NULL`
-    // omitted).
+    // Bound scope: `function` required; `handle=None` / `daemon=True`
+    // from `Function.defs_w`.
     let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
     let mut callable =
         bound(0).ok_or_else(|| crate::PyError::type_error("missing function argument"))?;
@@ -3072,11 +3072,29 @@ crate::py_module! {
                 ident
             }))
         },
-        "start_joinable_thread"  / * = start_joinable_thread; crate::Signature::new(vec!["function", "handle", "daemon"], None, None, 2, 1),
-        "start_new_thread"       / * = start_new_thread; crate::Signature::new(vec!["function", "args", "kwargs"], None, None, 0, 0),
-        "start_new"              / * = start_new_thread; crate::Signature::new(vec!["function", "args", "kwargs"], None, None, 0, 0),
+        "start_joinable_thread"  / * = start_joinable_thread; crate::Signature::new(vec!["function", "handle", "daemon"], None, None, 0, 0),
+        "start_new_thread"       / * = start_new_thread; crate::Signature::new(vec!["function", "args", "kwargs"], None, None, 0, 3),
+        "start_new"              / * = start_new_thread; crate::Signature::new(vec!["function", "args", "kwargs"], None, None, 0, 3),
     },
     extra_init: |ns| {
+        // `start_joinable_thread($module, /, function, handle=None, daemon=True)`:
+        // function/handle/daemon are positional-or-keyword; trailing defaults
+        // live on `Function.defs_w` (`interp2app._getdefaults`).
+        if let Some(mut function) =
+            unsafe { pyre_object::w_dict_getitem_str(ns, "start_joinable_thread") }
+        {
+            function = crate::gateway::function_set_positional_defaults(
+                function,
+                &[pyre_object::w_none(), pyre_object::w_bool_from(true)],
+            );
+            crate::__pyre_store!(ns, "start_joinable_thread", function);
+        }
+        for name in ["start_new_thread", "start_new"] {
+            if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, name) } {
+                function = crate::gateway::function_set_null_positional_defaults(function, 1);
+                crate::__pyre_store!(ns, name, function);
+            }
+        }
         // `set_name`, `_get_name` and `_NAME_MAXLEN` are published only where
         // the platform has the calls behind them - `HAVE_PTHREAD_GETNAME_NP`
         // or `MS_WINDOWS` - and a ceiling to name.  Their absence is what

@@ -43,6 +43,23 @@ pyre_interpreter::py_module! {
         "isfinite" / 1 = m::isfinite,
         "isinf"    / 1 = m::isinf,
         "isnan"    / 1 = m::isnan,
-        "isclose"  / * = m::isclose; pyre_interpreter::Signature::new(vec!["a", "b", "rel_tol", "abs_tol"], None, None, 2, 2),
+        "isclose"  / * = m::isclose; pyre_interpreter::Signature::new(vec!["a", "b", "rel_tol", "abs_tol"], None, None, 2, 0),
+    },
+    extra_init: |ns| {
+        // `cmath.log(z, base=<unrepresentable>, /)`: optional base is a
+        // trailing positional default (`interp2app._getdefaults`).
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "log") } {
+            function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+            pyre_interpreter::__pyre_store!(ns, "log", function);
+        }
+        // `cmath.isclose($module, /, a, b, *, rel_tol=1e-09, abs_tol=0.0)`.
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "isclose") } {
+            function = pyre_interpreter::function_set_kwonly_defaults!(
+                function,
+                "rel_tol" => pyre_object::floatobject::w_float_new(1e-9),
+                "abs_tol" => pyre_object::floatobject::w_float_new(0.0),
+            );
+            pyre_interpreter::__pyre_store!(ns, "isclose", function);
+        }
     },
 }

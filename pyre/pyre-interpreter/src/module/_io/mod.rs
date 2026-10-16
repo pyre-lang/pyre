@@ -1674,16 +1674,19 @@ pub(crate) fn fileio_type() -> PyObjectRef {
         let ns_slot = tp_base + 1;
         crate::builtins::init_file_wrapper_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
         crate::builtins::init_fileio_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
-        let init_fn = crate::make_builtin_function_with_signature(
-            "__init__",
-            crate::builtins::fileio_init,
-            crate::gateway::Signature::new(
-                vec!["self", "file", "mode", "closefd", "opener"],
-                None,
-                None,
-                0,
-                1,
+        let init_fn = crate::gateway::function_set_null_positional_defaults(
+            crate::make_builtin_function_with_signature(
+                "__init__",
+                crate::builtins::fileio_init,
+                crate::gateway::Signature::new(
+                    vec!["self", "file", "mode", "closefd", "opener"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
             ),
+            3,
         );
         let init_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(init_fn);
@@ -1821,6 +1824,10 @@ crate::py_module! {
         let extra_ns_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(ns);
         ns = pyre_object::gc_roots::shadow_stack_get(extra_ns_slot);
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "open") } {
+            function = crate::gateway::function_set_null_positional_defaults(function, 7);
+            crate::__pyre_store!(ns, "open", function);
+        }
         // `Modules/_io/_iomodule.c`:
         //   UnsupportedOperation = class UnsupportedOperation(OSError, ValueError)
         // A real exception class so `raise`/`except` and io.py's

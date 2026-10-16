@@ -106,10 +106,8 @@ fn structseq_replace_args(
     let _roots = pyre_object::gc_roots::push_roots();
     let inst_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(inst);
-    structseq_replace_from(
-        pyre_object::gc_roots::shadow_stack_get(inst_slot),
-        crate::builtins::arguments_as_kwargs_dict(args)?,
-    )
+    let kwargs = crate::builtins::arguments_as_kwargs_dict(args)?;
+    structseq_replace_from(pyre_object::gc_roots::shadow_stack_get(inst_slot), kwargs)
 }
 
 fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
@@ -562,9 +560,12 @@ fn make_struct_seq_impl(
     }
     store(
         "__new__",
-        crate::typedef::make_new_descr_with_signature(
-            structseq_descr_new,
-            crate::gateway::Signature::new(vec!["cls", "sequence", "dict"], None, None, 0, 1),
+        crate::gateway::function_set_null_positional_defaults(
+            crate::typedef::make_new_descr_with_signature(
+                structseq_descr_new,
+                crate::gateway::Signature::new(vec!["cls", "sequence", "dict"], None, None, 0, 1),
+            ),
+            1,
         ),
     );
     store(

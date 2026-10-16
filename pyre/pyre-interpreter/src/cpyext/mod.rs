@@ -732,7 +732,7 @@ pub(super) fn call_cfunction(
     flags: methodobject::MethFlags,
     w_self: PyObjectRef,
     positional: &[PyObjectRef],
-    keywords: &[(String, PyObjectRef)],
+    keywords: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
     call_cfunction_in_class(function, flags, w_self, None, positional, keywords)
 }
@@ -746,7 +746,7 @@ pub(super) fn call_cfunction_in_class(
     w_self: PyObjectRef,
     defining_class: Option<PyObjectRef>,
     positional: &[PyObjectRef],
-    keywords: &[(String, PyObjectRef)],
+    keywords: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
     use methodobject::MethFlags;
 
@@ -757,7 +757,8 @@ pub(super) fn call_cfunction_in_class(
         ));
     }
     // Everything the call needs is pinned before the first allocation below:
-    // the argument tuple, the keyword dict and the key strings all collect.
+    // the argument tuple, the keyword dict and the original key objects
+    // (`argument.py` `_collect_keyword_args` / `w_kwargs_from_args`).
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_self);
@@ -767,7 +768,12 @@ pub(super) fn call_cfunction_in_class(
     for (_, value) in keywords {
         let _ = roots.pin_root(*value);
     }
+    let keys_base = pyre_object::gc_roots::shadow_stack_len();
+    for (key, _) in keywords {
+        let _ = roots.pin_root(*key);
+    }
     let value_slot = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + 1 + index);
+    let key_slot = |index: usize| pyre_object::gc_roots::shadow_stack_get(keys_base + index);
 
     let fastcall = flags.contains(MethFlags::METH_FASTCALL);
     let mut arguments = std::ptr::null_mut();
@@ -778,16 +784,7 @@ pub(super) fn call_cfunction_in_class(
             fastcall_slots.push(pyobject::make_ref(value_slot(index)));
         }
         if flags.contains(MethFlags::METH_KEYWORDS) && !keywords.is_empty() {
-            let mut name_slots = Vec::with_capacity(keywords.len());
-            for (name, _) in keywords.iter() {
-                let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = roots.pin_root(pyre_object::w_str_new_managed(name));
-                name_slots.push(name_slot);
-            }
-            let names: Vec<PyObjectRef> = name_slots
-                .iter()
-                .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
-                .collect();
+            let names: Vec<PyObjectRef> = (0..keywords.len()).map(key_slot).collect();
             keywords_arg = pyobject::make_ref(pyre_object::tupleobject::w_tuple_new(names));
         }
     } else if !flags.intersects(MethFlags::METH_NOARGS | MethFlags::METH_O) {
@@ -799,14 +796,14 @@ pub(super) fn call_cfunction_in_class(
             let dict = pyre_object::dictmultiobject::w_dict_new();
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(dict);
-            for (index, (name, _)) in keywords.iter().enumerate() {
+            for index in 0..keywords.len() {
                 unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str(
+                    pyre_object::dictmultiobject::w_dict_store(
                         pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                        name,
+                        key_slot(index),
                         value_slot(positional.len() + index),
-                    )
-                };
+                    );
+                }
             }
             keywords_arg = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(dict_slot));
         }

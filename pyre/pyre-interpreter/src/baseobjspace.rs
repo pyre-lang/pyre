@@ -7298,7 +7298,10 @@ pub fn getattr_str_impl(
             // (unittest._WritelnDecorator, pathlib, etc.).
             // `_PyObject_LookupAttr` (`suppress`): the hook still runs; the
             // absent result is `Ok(null)` so the AttributeError is not built.
+            // `try_instance_getattr_hook` can collect; reload `w_type` from
+            // its slot (`shadowstack.py` `expand_pop_roots`).
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_slot);
             if let Some(result) = unsafe { try_instance_getattr_hook(w_type, obj, name) } {
                 return result;
             }
@@ -7308,7 +7311,7 @@ pub fn getattr_str_impl(
             return Err(PyError::attribute_error_with_context(
                 format!(
                     "'{}' object has no attribute '{name}'",
-                    w_type_get_name(w_type)
+                    w_type_get_name(pyre_object::gc_roots::shadow_stack_get(w_type_slot))
                 ),
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 name,
@@ -16429,33 +16432,7 @@ pub fn call_args(
     callable: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, PyError> {
-    if let (Some(keyword_names_w), Some(keywords_w)) =
-        (args.keyword_names_w.as_ref(), args.keywords_w.as_ref())
-        && !keyword_names_w.is_empty()
-    {
-        debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
-        let mut kwargs = Vec::with_capacity(keyword_names_w.len());
-        for (&name, &value) in keyword_names_w.iter().zip(keywords_w.iter()) {
-            // `do_combine_starstarargs_wrapped` already rejects a non-string
-            // key while `**` is expanded, so this only guards the WTF-8 read
-            // below for `Arguments` values built natively instead.
-            if unsafe { !is_str(name) } {
-                return Err(PyError::type_error("keywords must be strings"));
-            }
-            kwargs.push((unsafe { w_str_get_wtf8(name) }.to_owned(), value));
-        }
-        return crate::call::call_with_kwargs_in_ctx(
-            crate::call::getexecutioncontext(),
-            callable,
-            &args.arguments_w,
-            &kwargs,
-        );
-    }
-    crate::call::call_callable_in_ctx(
-        crate::call::getexecutioncontext(),
-        callable,
-        &args.arguments_w,
-    )
+    crate::call::call_args(callable, args)
 }
 
 /// PyPy: baseobjspace.py `call_obj_args` — add a leading object before args.

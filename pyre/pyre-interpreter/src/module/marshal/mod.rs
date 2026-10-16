@@ -1482,6 +1482,27 @@ crate::py_module! {
             Ok(result)
         }
     },
+    extra_init: |ns| {
+        // `loads(bytes, /, *, allow_code=True)` and the dump/dumps/load
+        // siblings. `_match_signature` requires `Function.w_kw_defs` for
+        // that declared default (`interp2app._getdefaults`).
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(ns);
+        for name in ["dumps", "loads", "dump", "load"] {
+            if let Some(mut function) = unsafe {
+                pyre_object::w_dict_getitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                    name,
+                )
+            } {
+                function = crate::gateway::function_set_kwonly_default_pairs(
+                    function,
+                    &[("allow_code", pyre_object::w_bool_from(true))],
+                );
+                crate::__pyre_put_new!(ns_slot, name, function);
+            }
+        }
+    },
 }
 
 #[cfg(test)]

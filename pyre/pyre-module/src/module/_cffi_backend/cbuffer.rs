@@ -286,15 +286,19 @@ fn init_buffer_type(ns: PyObjectRef) {
     store("__doc__", pyre_object::w_str_new(DOC));
     store(
         "__new__",
-        pyre_interpreter::typedef::make_new_descr_with_signature(
-            mini_buffer_new,
-            pyre_interpreter::gateway::Signature::new(
-                vec!["cls", "cdata", "size"],
-                None,
-                None,
-                0,
-                1,
+        // `MiniBuffer___new__(space, w_subtype, w_cdata, size=-1)`
+        pyre_interpreter::gateway::function_set_null_positional_defaults(
+            pyre_interpreter::typedef::make_new_descr_with_signature(
+                mini_buffer_new,
+                pyre_interpreter::gateway::Signature::new(
+                    vec!["cls", "cdata", "size"],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
             ),
+            1,
         ),
     );
     for (name, f, arity) in [

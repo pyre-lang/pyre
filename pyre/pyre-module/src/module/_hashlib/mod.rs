@@ -1073,7 +1073,7 @@ fn new_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     })?;
     let data = bound_slot(args, 1);
     let usedforsecurity = bound_slot(args, 2);
-    let string = bound_slot(args, 3);
+    let string = bound_slot(args, 3).filter(|value| unsafe { !is_none(*value) });
     let mut data_root = data.unwrap_or(pyre_object::PY_NULL);
     let mut used_root = usedforsecurity.unwrap_or(pyre_object::PY_NULL);
     let mut string_root = string.unwrap_or(pyre_object::PY_NULL);
@@ -1106,7 +1106,7 @@ fn make_openssl_hash(
     // Bound scope: `data`, kw-only `usedforsecurity`, `string`.
     let data = bound_slot(args, 0);
     let usedforsecurity = bound_slot(args, 1);
-    let string = bound_slot(args, 2);
+    let string = bound_slot(args, 2).filter(|value| unsafe { !is_none(*value) });
     make_hash(w_str_new(digest), data, string, usedforsecurity)
 }
 
@@ -1151,6 +1151,59 @@ pyre_interpreter::py_module! {
         "get_fips_mode" / 0 = |_| Ok(w_int_new(0)),
     },
     extra_init: |ns| {
+        // Trailing / keyword defaults (`interp2app._getdefaults`).
+        // `new`/`openssl_*`: optional `data`, `usedforsecurity=True`,
+        // `string=None`. `hmac_new`: optional `msg` then required
+        // `digestmod` (null sentinel). `pbkdf2_hmac`: optional `dklen`.
+        // `scrypt`: optional `maxmem=0`, `dklen=64`.
+        let wrap_hash_factory = |function: pyre_object::PyObjectRef, ndef: usize| {
+            pyre_interpreter::function_set_kwonly_default_pairs(
+                pyre_interpreter::gateway::function_set_null_positional_defaults(function, ndef),
+                &[
+                    ("usedforsecurity", pyre_object::w_bool_from(true)),
+                    ("string", pyre_object::w_none()),
+                ],
+            )
+        };
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "new") } {
+            function = wrap_hash_factory(function, 1);
+            pyre_interpreter::__pyre_store!(ns, "new", function);
+        }
+        for name in [
+            "openssl_md5",
+            "openssl_sha1",
+            "openssl_sha224",
+            "openssl_sha256",
+            "openssl_sha384",
+            "openssl_sha512",
+            "openssl_sha3_224",
+            "openssl_sha3_256",
+            "openssl_sha3_384",
+            "openssl_sha3_512",
+            "openssl_shake_128",
+            "openssl_shake_256",
+        ] {
+            if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, name) } {
+                function = wrap_hash_factory(function, 1);
+                pyre_interpreter::__pyre_store!(ns, name, function);
+            }
+        }
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "hmac_new") } {
+            function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 2);
+            pyre_interpreter::__pyre_store!(ns, "hmac_new", function);
+        }
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "pbkdf2_hmac") } {
+            function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+            pyre_interpreter::__pyre_store!(ns, "pbkdf2_hmac", function);
+        }
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "scrypt") } {
+            function = pyre_interpreter::function_set_kwonly_defaults!(
+                function,
+                "maxmem" => pyre_object::w_int_new(0),
+                "dklen" => pyre_object::w_int_new(64),
+            );
+            pyre_interpreter::__pyre_store!(ns, "scrypt", function);
+        }
         // [3.14-spec] PyPy owns `HMAC` as the ordinary app-level
         // `lib_pypy._hashlib.HMAC` class.  CPython 3.14's `_hashlib.HMAC`
         // rejects use as a base; retain the PyPy class relationship and

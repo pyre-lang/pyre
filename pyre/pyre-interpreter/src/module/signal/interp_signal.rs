@@ -886,6 +886,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "set_wakeup_fd",
+        crate::gateway::function_set_kwonly_default_pairs(
         crate::make_builtin_function_with_signature(
             "set_wakeup_fd",
             |args| {
@@ -1013,6 +1014,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(pyre_object::w_int_new(prev as i64))
             },
             crate::gateway::Signature::new(vec!["fd", "warn_on_full_buffer"], None, None, 1, 1),
+        ),
+            &[("warn_on_full_buffer", pyre_object::w_bool_from(true))],
         )
     );
     // `__pyre_put_new!` forwards `ns_slot` only. Reload before the store path

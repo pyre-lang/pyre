@@ -4589,10 +4589,13 @@ fn init_module_type(mut ns: PyObjectRef) {
             Some("Initialize self.  See help(type(self)) for accurate signature."),
             crate::gateway::Signature::new(vec!["self", "name", "doc"], None, None, 0, 1),
         );
-        crate::function_new_with_fixed_code(
-            code as *const (),
-            "__init__".to_string(),
-            pyre_object::PY_NULL,
+        crate::gateway::function_set_null_positional_defaults(
+            crate::function_new_with_fixed_code(
+                code as *const (),
+                "__init__".to_string(),
+                pyre_object::PY_NULL,
+            ),
+            1,
         )
     });
     for (name, function, arity, doc) in [
@@ -6470,9 +6473,12 @@ fn init_enumerate_type(mut ns: PyObjectRef) {
     crate::__pyre_store!(
         ns,
         "__new__",
-        make_functional_new_descr_with_signature(
-            enumerate_descr_new,
-            crate::gateway::Signature::new(vec!["cls", "iterable", "start"], None, None, 0, 1),
+        crate::gateway::function_set_null_positional_defaults(
+            make_functional_new_descr_with_signature(
+                enumerate_descr_new,
+                crate::gateway::Signature::new(vec!["cls", "iterable", "start"], None, None, 0, 1),
+            ),
+            1,
         )
     );
     crate::__pyre_store!(
@@ -6559,15 +6565,18 @@ fn init_map_type(mut ns: PyObjectRef) {
     crate::__pyre_store!(
         ns,
         "__new__",
-        make_functional_new_descr_with_signature(
-            map_descr_new,
-            crate::gateway::Signature::new(
-                vec!["cls", "func", "strict"],
-                Some("iterables"),
-                None,
-                1,
-                2,
+        crate::gateway::function_set_kwonly_default_pairs(
+            make_functional_new_descr_with_signature(
+                map_descr_new,
+                crate::gateway::Signature::new(
+                    vec!["cls", "func", "strict"],
+                    Some("iterables"),
+                    None,
+                    1,
+                    2,
+                ),
             ),
+            &[("strict", pyre_object::w_bool_from(false))],
         )
     );
     for (name, function, arity) in [
@@ -6626,9 +6635,18 @@ fn init_zip_type(mut ns: PyObjectRef) {
     crate::__pyre_store!(
         ns,
         "__new__",
-        make_functional_new_descr_with_signature(
-            zip_descr_new,
-            crate::gateway::Signature::new(vec!["cls", "strict"], Some("iterables"), None, 1, 1),
+        crate::gateway::function_set_kwonly_default_pairs(
+            make_functional_new_descr_with_signature(
+                zip_descr_new,
+                crate::gateway::Signature::new(
+                    vec!["cls", "strict"],
+                    Some("iterables"),
+                    None,
+                    1,
+                    1
+                ),
+            ),
+            &[("strict", pyre_object::w_bool_from(false))],
         )
     );
     for (name, function, arity) in [
@@ -7538,17 +7556,23 @@ fn init_list_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "sort",
-            crate::gateway::make_builtin_function_with_text_signature_and_sig(
-                "sort",
-                __majit_wrap_list_descr_sort,
-                "($self, /, *, key=None, reverse=False)",
-                Some(crate::gateway::Signature::new(
-                    vec!["self", "key", "reverse"],
-                    None,
-                    None,
-                    2,
-                    1,
-                )),
+            crate::gateway::function_set_kwonly_default_pairs(
+                crate::gateway::make_builtin_function_with_text_signature_and_sig(
+                    "sort",
+                    __majit_wrap_list_descr_sort,
+                    "($self, /, *, key=None, reverse=False)",
+                    Some(crate::gateway::Signature::new(
+                        vec!["self", "key", "reverse"],
+                        None,
+                        None,
+                        2,
+                        1,
+                    )),
+                ),
+                &[
+                    ("key", pyre_object::w_none()),
+                    ("reverse", pyre_object::w_bool_from(false)),
+                ],
             )
         )
     };
@@ -8090,10 +8114,19 @@ fn init_str_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "split",
-            crate::make_builtin_function_with_signature(
-                "split",
-                crate::type_methods::str_method_split,
-                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "split",
+                    crate::type_methods::str_method_split,
+                    crate::gateway::Signature::new(
+                        vec!["self", "sep", "maxsplit"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
+                ),
+                2,
             )
         )
     };
@@ -8101,10 +8134,19 @@ fn init_str_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "rsplit",
-            crate::make_builtin_function_with_signature(
-                "rsplit",
-                crate::type_methods::str_method_rsplit,
-                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "rsplit",
+                    crate::type_methods::str_method_rsplit,
+                    crate::gateway::Signature::new(
+                        vec!["self", "sep", "maxsplit"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
+                ),
+                2,
             )
         )
     };
@@ -8112,10 +8154,13 @@ fn init_str_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "splitlines",
-            crate::make_builtin_function_with_signature(
-                "splitlines",
-                crate::type_methods::str_method_splitlines,
-                crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "splitlines",
+                    crate::type_methods::str_method_splitlines,
+                    crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+                ),
+                1,
             )
         )
     };
@@ -8158,10 +8203,13 @@ fn init_str_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "expandtabs",
-            crate::make_builtin_function_with_signature(
-                "expandtabs",
-                crate::type_methods::descr_expandtabs,
-                crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "expandtabs",
+                    crate::type_methods::descr_expandtabs,
+                    crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+                ),
+                1,
             )
         )
     };
@@ -8217,16 +8265,19 @@ fn init_str_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "replace",
-            crate::make_builtin_function_with_signature(
-                "replace",
-                crate::type_methods::str_method_replace,
-                crate::gateway::Signature::new(
-                    vec!["self", "old", "new", "count"],
-                    None,
-                    None,
-                    0,
-                    3,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "replace",
+                    crate::type_methods::str_method_replace,
+                    crate::gateway::Signature::new(
+                        vec!["self", "old", "new", "count"],
+                        None,
+                        None,
+                        0,
+                        3,
+                    ),
                 ),
+                1,
             )
         )
     };
@@ -8288,16 +8339,19 @@ fn init_str_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "encode",
-            crate::make_builtin_function_with_signature(
-                "encode",
-                crate::type_methods::str_method_encode,
-                crate::gateway::Signature::new(
-                    vec!["self", "encoding", "errors"],
-                    None,
-                    None,
-                    0,
-                    1,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "encode",
+                    crate::type_methods::str_method_encode,
+                    crate::gateway::Signature::new(
+                        vec!["self", "encoding", "errors"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                2,
             )
         )
     };
@@ -8490,10 +8544,13 @@ fn init_str_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "splitlines",
-            crate::make_builtin_function_with_signature(
-                "splitlines",
-                crate::type_methods::str_method_splitlines,
-                crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "splitlines",
+                    crate::type_methods::str_method_splitlines,
+                    crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+                ),
+                1,
             )
         )
     };
@@ -8523,10 +8580,13 @@ fn init_str_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "expandtabs",
-            crate::make_builtin_function_with_signature(
-                "expandtabs",
-                crate::type_methods::descr_expandtabs,
-                crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "expandtabs",
+                    crate::type_methods::descr_expandtabs,
+                    crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+                ),
+                1,
             )
         )
     };
@@ -17653,23 +17713,26 @@ fn init_function_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_with_signature(
-                crate::function::descr_function_new,
-                crate::gateway::Signature::new(
-                    vec![
-                        "cls",
-                        "code",
-                        "globals",
-                        "name",
-                        "argdefs",
-                        "closure",
-                        "kwdefaults",
-                    ],
-                    None,
-                    None,
-                    0,
-                    1,
+            crate::gateway::function_set_null_positional_defaults(
+                make_new_descr_with_signature(
+                    crate::function::descr_function_new,
+                    crate::gateway::Signature::new(
+                        vec![
+                            "cls",
+                            "code",
+                            "globals",
+                            "name",
+                            "argdefs",
+                            "closure",
+                            "kwdefaults",
+                        ],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                4,
             )
         )
     };
@@ -20147,10 +20210,13 @@ fn init_cell_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_posonly_with_doc(
-                cell_descr_new,
-                vec!["cls", "contents"],
-                "Create and return a new object.  See help(type) for accurate signature.",
+            crate::gateway::function_set_null_positional_defaults(
+                make_new_descr_posonly_with_doc(
+                    cell_descr_new,
+                    vec!["cls", "contents"],
+                    "Create and return a new object.  See help(type) for accurate signature.",
+                ),
+                1,
             )
         );
         crate::__pyre_put_new!(
@@ -21639,16 +21705,19 @@ fn init_property_type(ns: PyObjectRef) {
     );
     unsafe {
         crate::__pyre_put_new!(ns_slot, "__init__", {
-            let descr = crate::make_builtin_function_with_signature(
-                "__init__",
-                property_descr_init,
-                crate::gateway::Signature::new(
-                    vec!["self", "fget", "fset", "fdel", "doc"],
-                    None,
-                    None,
-                    0,
-                    1,
+            let descr = crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "__init__",
+                    property_descr_init,
+                    crate::gateway::Signature::new(
+                        vec!["self", "fget", "fset", "fdel", "doc"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                4,
             );
             unsafe {
                 // wrapper_descriptor `tp_init` text; the type object's
@@ -22709,10 +22778,13 @@ fn init_int_type(ns: PyObjectRef) {
             // fast_natural_arity=2 so `int(x)` stays on fastcall_2
             // (`function.py` nargs == fast_natural_arity); `int()` and
             // `int(x, base)` still bind through `_match_signature`.
-            make_new_descr_with_fast_arity_and_signature(
-                int_descr_new,
+            crate::gateway::function_set_null_positional_defaults(
+                make_new_descr_with_fast_arity_and_signature(
+                    int_descr_new,
+                    2,
+                    crate::gateway::Signature::new(vec!["cls", "x", "base"], None, None, 0, 2),
+                ),
                 2,
-                crate::gateway::Signature::new(vec!["cls", "x", "base"], None, None, 0, 2),
             )
         )
     };
@@ -22833,132 +22905,159 @@ fn init_int_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "to_bytes",
-            crate::make_builtin_function_with_signature(
-                "to_bytes",
-                |args| {
-                    // Bound scope: pos-only `self`, `length`/`byteorder`, kw-only
-                    // `signed` (`PY_NULL` omitted).
-                    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
-                    let w_self = bound(0);
-                    let owned_val;
-                    let val = if let Some(o) =
-                        w_self.filter(|&o| unsafe { pyre_object::is_bool(o) })
-                    {
-                        owned_val =
-                            BigInt::from(unsafe { pyre_object::w_bool_get_value(o) as i64 });
-                        &owned_val
-                    } else if let Some(o) = w_self.filter(|&o| unsafe { pyre_object::is_int(o) }) {
-                        owned_val = BigInt::from(unsafe { pyre_object::w_int_get_value(o) });
-                        &owned_val
-                    } else if let Some(o) = w_self.filter(|&o| unsafe { pyre_object::is_long(o) }) {
-                        unsafe { pyre_object::w_long_get_value(o) }
-                    } else {
-                        owned_val = BigInt::from(0);
-                        &owned_val
-                    };
-                    // `space_index_w` and `is_true` run Python code, which collects.
-                    let val = live_rbigint(val);
-                    let _arg_roots = pyre_object::gc_roots::push_roots();
-                    let byteorder_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ =
-                        pyre_object::gc_roots::pin_root(bound(2).unwrap_or(pyre_object::PY_NULL));
-                    let signed_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ =
-                        pyre_object::gc_roots::pin_root(bound(3).unwrap_or(pyre_object::PY_NULL));
-                    let length_i = match bound(1) {
-                        Some(o) => crate::builtins::space_index_w(o)?,
-                        None => 1,
-                    };
-                    if length_i < 0 {
-                        return Err(crate::PyError::value_error(
-                            "length argument must be non-negative",
-                        ));
-                    }
-                    let w_byteorder = pyre_object::gc_roots::shadow_stack_get(byteorder_slot);
-                    let byteorder = match (!w_byteorder.is_null()).then_some(w_byteorder) {
-                        None => "big",
-                        Some(o) if unsafe { pyre_object::is_str(o) } => {
-                            match unsafe { pyre_object::w_str_get_value_opt(o) } {
-                                Some("little") => "little",
-                                Some("big") => "big",
-                                _ => {
-                                    return Err(crate::PyError::value_error(
-                                        "byteorder must be either 'little' or 'big'",
-                                    ));
-                                }
+            crate::gateway::function_set_kwonly_default_pairs(
+                crate::gateway::function_set_null_positional_defaults(
+                    crate::make_builtin_function_with_signature(
+                        "to_bytes",
+                        |args| {
+                            // Bound scope: pos-only `self`, `length`/`byteorder`, kw-only
+                            // `signed` (`PY_NULL` omitted).
+                            let bound =
+                                |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+                            let w_self = bound(0);
+                            let owned_val;
+                            let val = if let Some(o) =
+                                w_self.filter(|&o| unsafe { pyre_object::is_bool(o) })
+                            {
+                                owned_val = BigInt::from(unsafe {
+                                    pyre_object::w_bool_get_value(o) as i64
+                                });
+                                &owned_val
+                            } else if let Some(o) =
+                                w_self.filter(|&o| unsafe { pyre_object::is_int(o) })
+                            {
+                                owned_val =
+                                    BigInt::from(unsafe { pyre_object::w_int_get_value(o) });
+                                &owned_val
+                            } else if let Some(o) =
+                                w_self.filter(|&o| unsafe { pyre_object::is_long(o) })
+                            {
+                                unsafe { pyre_object::w_long_get_value(o) }
+                            } else {
+                                owned_val = BigInt::from(0);
+                                &owned_val
+                            };
+                            // `space_index_w` and `is_true` run Python code, which collects.
+                            let val = live_rbigint(val);
+                            let _arg_roots = pyre_object::gc_roots::push_roots();
+                            let byteorder_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(
+                                bound(2).unwrap_or(pyre_object::PY_NULL),
+                            );
+                            let signed_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(
+                                bound(3).unwrap_or(pyre_object::PY_NULL),
+                            );
+                            let length_i = match bound(1) {
+                                Some(o) => crate::builtins::space_index_w(o)?,
+                                None => 1,
+                            };
+                            if length_i < 0 {
+                                return Err(crate::PyError::value_error(
+                                    "length argument must be non-negative",
+                                ));
                             }
-                        }
-                        Some(o) => {
-                            return Err(crate::PyError::type_error(format!(
-                                "expected str, got {} object",
-                                crate::error::type_name_of(o)
-                            )));
-                        }
-                    };
-                    let w_signed = pyre_object::gc_roots::shadow_stack_get(signed_slot);
-                    let signed = (!w_signed.is_null())
-                        .then_some(w_signed)
-                        .map(crate::baseobjspace::is_true)
-                        .transpose()?
-                        .unwrap_or(false);
-                    // `rbigint.tobytes` skips its final sign-fit check when
-                    // `nbytes == 0` (rbigint.py), and `-1` is the one value
-                    // whose two's complement emits no bytes at all, so it falls
-                    // through as `b''`.  `_PyLong_AsByteArray` rejects every
-                    // nonzero value that does not fit the requested width.
-                    if length_i == 0 && signed && val.get_sign() == -1 {
-                        return Err(crate::PyError::overflow_error("int too big to convert"));
-                    }
-                    // intobject.py `descr_to_bytes`: route directly through
-                    // rbigint.tobytes.  Besides preserving its exact exception
-                    // contract, this is linear in the output length; shifting the
-                    // whole bigint once per output byte is quadratic.
-                    let bytes =
-                        val.tobytes(length_i, byteorder, signed)
-                            .map_err(|error| match error {
-                                majit_rlib::rbigint::RBigIntError::InvalidEndianness => {
-                                    crate::PyError::value_error(
-                                        "byteorder must be either 'little' or 'big'",
-                                    )
+                            let w_byteorder =
+                                pyre_object::gc_roots::shadow_stack_get(byteorder_slot);
+                            let byteorder = match (!w_byteorder.is_null()).then_some(w_byteorder) {
+                                None => "big",
+                                Some(o) if unsafe { pyre_object::is_str(o) } => {
+                                    match unsafe { pyre_object::w_str_get_value_opt(o) } {
+                                        Some("little") => "little",
+                                        Some("big") => "big",
+                                        _ => {
+                                            return Err(crate::PyError::value_error(
+                                                "byteorder must be either 'little' or 'big'",
+                                            ));
+                                        }
+                                    }
                                 }
-                                majit_rlib::rbigint::RBigIntError::InvalidSignedness
-                                | majit_rlib::rbigint::RBigIntError::NegativeToUnsigned => {
-                                    crate::PyError::overflow_error(
-                                        "can't convert negative int to unsigned",
-                                    )
+                                Some(o) => {
+                                    return Err(crate::PyError::type_error(format!(
+                                        "expected str, got {} object",
+                                        crate::error::type_name_of(o)
+                                    )));
                                 }
-                                majit_rlib::rbigint::RBigIntError::Overflow => {
-                                    crate::PyError::overflow_error("int too big to convert")
-                                }
-                                majit_rlib::rbigint::RBigIntError::Memory => {
-                                    crate::PyError::memory_error("")
-                                }
-                                _ => unreachable!("rbigint.tobytes returned an unrelated error"),
-                            })?;
-                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
-                },
-                crate::gateway::Signature::new(
-                    vec!["self", "length", "byteorder", "signed"],
-                    None,
-                    None,
-                    1,
-                    1,
+                            };
+                            let w_signed = pyre_object::gc_roots::shadow_stack_get(signed_slot);
+                            let signed = (!w_signed.is_null())
+                                .then_some(w_signed)
+                                .map(crate::baseobjspace::is_true)
+                                .transpose()?
+                                .unwrap_or(false);
+                            // `rbigint.tobytes` skips its final sign-fit check when
+                            // `nbytes == 0` (rbigint.py), and `-1` is the one value
+                            // whose two's complement emits no bytes at all, so it falls
+                            // through as `b''`.  `_PyLong_AsByteArray` rejects every
+                            // nonzero value that does not fit the requested width.
+                            if length_i == 0 && signed && val.get_sign() == -1 {
+                                return Err(crate::PyError::overflow_error(
+                                    "int too big to convert",
+                                ));
+                            }
+                            // intobject.py `descr_to_bytes`: route directly through
+                            // rbigint.tobytes.  Besides preserving its exact exception
+                            // contract, this is linear in the output length; shifting the
+                            // whole bigint once per output byte is quadratic.
+                            let bytes =
+                                val.tobytes(length_i, byteorder, signed).map_err(|error| {
+                                    match error {
+                                        majit_rlib::rbigint::RBigIntError::InvalidEndianness => {
+                                            crate::PyError::value_error(
+                                                "byteorder must be either 'little' or 'big'",
+                                            )
+                                        }
+                                        majit_rlib::rbigint::RBigIntError::InvalidSignedness
+                                        | majit_rlib::rbigint::RBigIntError::NegativeToUnsigned => {
+                                            crate::PyError::overflow_error(
+                                                "can't convert negative int to unsigned",
+                                            )
+                                        }
+                                        majit_rlib::rbigint::RBigIntError::Overflow => {
+                                            crate::PyError::overflow_error("int too big to convert")
+                                        }
+                                        majit_rlib::rbigint::RBigIntError::Memory => {
+                                            crate::PyError::memory_error("")
+                                        }
+                                        _ => unreachable!(
+                                            "rbigint.tobytes returned an unrelated error"
+                                        ),
+                                    }
+                                })?;
+                            Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+                        },
+                        crate::gateway::Signature::new(
+                            vec!["self", "length", "byteorder", "signed"],
+                            None,
+                            None,
+                            1,
+                            1,
+                        ),
+                    ),
+                    2,
                 ),
+                &[("signed", pyre_object::w_bool_from(false))],
             )
         )
     };
     // int.from_bytes(bytes, byteorder='big', *, signed=False) — classmethod.
-    let from_bytes_fn = crate::gateway::make_builtin_function_with_text_signature_and_sig(
-        "from_bytes",
-        int_from_bytes,
-        "($type, /, bytes, byteorder='big', *, signed=False)",
-        Some(crate::gateway::Signature::new(
-            vec!["cls", "bytes", "byteorder", "signed"],
-            None,
-            None,
+    let from_bytes_fn = crate::gateway::function_set_kwonly_default_pairs(
+        crate::gateway::function_set_null_positional_defaults(
+            crate::gateway::make_builtin_function_with_text_signature_and_sig(
+                "from_bytes",
+                int_from_bytes,
+                "($type, /, bytes, byteorder='big', *, signed=False)",
+                Some(crate::gateway::Signature::new(
+                    vec!["cls", "bytes", "byteorder", "signed"],
+                    None,
+                    None,
+                    1,
+                    1,
+                )),
+            ),
             1,
-            1,
-        )),
+        ),
+        &[("signed", pyre_object::w_bool_from(false))],
     );
     let from_bytes_fn_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(from_bytes_fn);
@@ -24539,7 +24638,10 @@ fn init_bool_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_posonly(__majit_wrap_bool_descr_new, vec!["cls", "x"])
+            crate::gateway::function_set_null_positional_defaults(
+                make_new_descr_posonly(__majit_wrap_bool_descr_new, vec!["cls", "x"]),
+                1,
+            )
         )
     };
     set_type_callable_text_signature(
@@ -24690,83 +24792,15 @@ pub fn object_descr_new_args(
     object_descr_new_from(&flat, crate::builtins::arguments_has_keywords(args))
 }
 
-#[majit_macros::dont_look_inside]
-fn object_new_not_enough_args() -> crate::PyError {
-    crate::PyError::type_error("object.__new__(): not enough arguments".to_string())
-}
-
-#[majit_macros::dont_look_inside]
-fn object_new_x_is_not_a_type(cls: PyObjectRef) -> crate::PyError {
-    let name = crate::typedef::r#type(cls)
-        .map(|t| unsafe { pyre_object::w_type_get_name(t.as_ptr()) })
-        .unwrap_or("object");
-    crate::PyError::type_error(format!(
-        "object.__new__(X): X is not a type object ({name})"
-    ))
-}
-
-#[majit_macros::dont_look_inside]
-fn object_new_takes_exactly_one_arg() -> crate::PyError {
-    crate::PyError::type_error(
-        "object.__new__() takes exactly one argument (the type to instantiate)".to_string(),
-    )
-}
-
-#[majit_macros::dont_look_inside]
-fn object_new_type_takes_no_arguments(cls: PyObjectRef) -> crate::PyError {
-    let name = unsafe { pyre_object::w_type_get_name(cls) };
-    crate::PyError::type_error(format!("{name}() takes no arguments"))
-}
-
-/// objectobject.py descr__new__ checks before `allocate_instance`.
-/// Error arms format `TypeError` strings (`oefmt` / `_abstract_method_error`
-/// interphook); residual so the allocator graph does not merge String with
-/// the instance pointer.
-#[majit_macros::dont_look_inside]
-fn object_new_validate(
-    cls: PyObjectRef,
-    w_object: PyObjectRef,
-    has_surplus: bool,
-) -> Result<(), crate::PyError> {
-    // `_precheck_for_new` (typeobject.py): a non-type first argument is a
-    // `TypeError`, not a silent bare instance.  `%T` names the Python type of
-    // `cls` (tag-safe via `r#type`), not its raw C layout.
-    if !unsafe { is_type(cls) } {
-        return Err(object_new_x_is_not_a_type(cls));
-    }
-    crate::call::check_type_instantiable(cls)?;
-    // objectobject.py descr__new__ — surplus arguments are accepted only
-    // when __new__ or __init__ is overridden; the bare object() takes none.
-    if has_surplus {
-        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
-        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
-        if !same_inherited_slot(tp_new, obj_new) {
-            return Err(object_new_takes_exactly_one_arg());
-        }
-        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
-        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
-        if same_inherited_slot(tp_init, obj_init) {
-            return Err(object_new_type_takes_no_arguments(cls));
-        }
-    }
-    // objectobject.py descr__new__ — abstract classes refuse instantiation,
-    // checked after the excess-args gate and before allocating.
-    if unsafe { pyre_object::w_type_is_abstract(cls) } {
-        return Err(abstract_instantiation_error(cls));
-    }
-    // `descr__new__` allocates through `allocate_instance(W_ObjectObject, ...)`,
-    // whose `check_user_subclass` refuses a type laid out by something other
-    // than `object`.
-    check_user_subclass(w_object, cls)
-}
-
 fn object_descr_new_from(
     positional: &[PyObjectRef],
     has_keywords: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     let w_object = w_object();
     let Some(&w_type_arg) = positional.first() else {
-        return Err(object_new_not_enough_args());
+        return Err(crate::PyError::type_error(
+            "object.__new__(): not enough arguments".to_string(),
+        ));
     };
     let mut cls = w_type_arg;
     // Bootstrap: before `object` is installed the slot lookups below cannot
@@ -24778,10 +24812,41 @@ fn object_descr_new_from(
             w_instance_new(PY_NULL)
         });
     }
-    // `object_new_validate` residualises TypeError formatting
-    // (`objectobject.py descr__new__`).  Reload `cls` for `allocate_instance`.
+    // objectobject.py descr__new__ — `_precheck_for_new`, surplus-args
+    // gate, abstractness, then `allocate_instance`. Error formatting is
+    // `oefmt`; only `_abstract_method_error` stays residual.
     pyre_object::with_roots!(cls => {
-        object_new_validate(cls, w_object, positional.len() > 1 || has_keywords)
+        if !unsafe { is_type(cls) } {
+            let name = crate::typedef::r#type(cls)
+                .map(|t| unsafe { pyre_object::w_type_get_name(t.as_ptr()) })
+                .unwrap_or("object");
+            return Err(crate::PyError::type_error(format!(
+                "object.__new__(X): X is not a type object ({name})"
+            )));
+        }
+        crate::call::check_type_instantiable(cls)?;
+        if positional.len() > 1 || has_keywords {
+            let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
+            let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+            if !same_inherited_slot(tp_new, obj_new) {
+                return Err(crate::PyError::type_error(
+                    "object.__new__() takes exactly one argument (the type to instantiate)"
+                        .to_string(),
+                ));
+            }
+            let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
+            let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+            if same_inherited_slot(tp_init, obj_init) {
+                let name = unsafe { pyre_object::w_type_get_name(cls) };
+                return Err(crate::PyError::type_error(format!(
+                    "{name}() takes no arguments"
+                )));
+            }
+        }
+        if unsafe { pyre_object::w_type_is_abstract(cls) } {
+            return Err(abstract_instantiation_error(cls));
+        }
+        check_user_subclass(w_object, cls)
     })?;
     Ok(w_instance_new(cls))
 }
@@ -25787,16 +25852,19 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "decode",
-            crate::make_builtin_function_with_signature(
-                "decode",
-                descr_decode,
-                crate::gateway::Signature::new(
-                    vec!["self", "encoding", "errors"],
-                    None,
-                    None,
-                    0,
-                    1,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "decode",
+                    descr_decode,
+                    crate::gateway::Signature::new(
+                        vec!["self", "encoding", "errors"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                2,
             )
         )
     };
@@ -25818,16 +25886,19 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "hex",
-            crate::make_builtin_function_with_signature(
-                "hex",
-                descr_hex,
-                crate::gateway::Signature::new(
-                    vec!["self", "sep", "bytes_per_sep"],
-                    None,
-                    None,
-                    0,
-                    1,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "hex",
+                    descr_hex,
+                    crate::gateway::Signature::new(
+                        vec!["self", "sep", "bytes_per_sep"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                2,
             )
         )
     };
@@ -25919,16 +25990,19 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "replace",
-            crate::make_builtin_function_with_signature(
-                "replace",
-                bytes_method_replace,
-                crate::gateway::Signature::new(
-                    vec!["self", "old", "new", "count"],
-                    None,
-                    None,
-                    0,
-                    4,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "replace",
+                    bytes_method_replace,
+                    crate::gateway::Signature::new(
+                        vec!["self", "old", "new", "count"],
+                        None,
+                        None,
+                        0,
+                        4,
+                    ),
                 ),
+                1,
             )
         )
     };
@@ -25936,10 +26010,19 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "split",
-            crate::make_builtin_function_with_signature(
-                "split",
-                bytes_method_split,
-                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "split",
+                    bytes_method_split,
+                    crate::gateway::Signature::new(
+                        vec!["self", "sep", "maxsplit"],
+                        None,
+                        None,
+                        0,
+                        1
+                    ),
+                ),
+                2,
             )
         )
     };
@@ -25947,10 +26030,19 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "rsplit",
-            crate::make_builtin_function_with_signature(
-                "rsplit",
-                bytes_method_rsplit,
-                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "rsplit",
+                    bytes_method_rsplit,
+                    crate::gateway::Signature::new(
+                        vec!["self", "sep", "maxsplit"],
+                        None,
+                        None,
+                        0,
+                        1
+                    ),
+                ),
+                2,
             )
         )
     };
@@ -25979,10 +26071,19 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "translate",
-            crate::make_builtin_function_with_signature(
-                "translate",
-                bytes_method_translate,
-                crate::gateway::Signature::new(vec!["self", "table", "delete"], None, None, 0, 2),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "translate",
+                    bytes_method_translate,
+                    crate::gateway::Signature::new(
+                        vec!["self", "table", "delete"],
+                        None,
+                        None,
+                        0,
+                        2
+                    ),
+                ),
+                1,
             )
         )
     };
@@ -26109,10 +26210,13 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "splitlines",
-            crate::make_builtin_function_with_signature(
-                "splitlines",
-                bytes_method_splitlines,
-                crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "splitlines",
+                    bytes_method_splitlines,
+                    crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+                ),
+                1,
             )
         )
     };
@@ -26120,10 +26224,13 @@ fn init_bytes_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "expandtabs",
-            crate::make_builtin_function_with_signature(
-                "expandtabs",
-                bytes_method_expandtabs,
-                crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "expandtabs",
+                    bytes_method_expandtabs,
+                    crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+                ),
+                1,
             )
         )
     };
@@ -29910,6 +30017,8 @@ fn init_bytearray_type(ns: PyObjectRef) {
     };
     unsafe {
         crate::__pyre_put_new!(ns_slot, "__init__", {
+            // bytearrayobject.py descr_init — `w_source`/`w_encoding`/`w_errors`
+            // default to `None`. Bound slots use PY_NULL for omitted.
             let code = crate::gateway::builtin_code_new_with_signature(
                 "__init__",
                 bytearray_descr_init,
@@ -29922,10 +30031,13 @@ fn init_bytearray_type(ns: PyObjectRef) {
                     1,
                 ),
             );
-            crate::function_new_with_fixed_code(
-                code as *const (),
-                "__init__".to_string(),
-                pyre_object::PY_NULL,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::function_new_with_fixed_code(
+                    code as *const (),
+                    "__init__".to_string(),
+                    pyre_object::PY_NULL,
+                ),
+                3,
             )
         })
     };
@@ -30036,16 +30148,19 @@ fn init_bytearray_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "decode",
-            crate::make_builtin_function_with_signature(
-                "decode",
-                descr_decode,
-                crate::gateway::Signature::new(
-                    vec!["self", "encoding", "errors"],
-                    None,
-                    None,
-                    0,
-                    1,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "decode",
+                    descr_decode,
+                    crate::gateway::Signature::new(
+                        vec!["self", "encoding", "errors"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                2,
             )
         )
     };
@@ -30239,10 +30354,19 @@ fn init_bytearray_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "translate",
-            crate::make_builtin_function_with_signature(
-                "translate",
-                bytes_method_translate,
-                crate::gateway::Signature::new(vec!["self", "table", "delete"], None, None, 0, 2),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "translate",
+                    bytes_method_translate,
+                    crate::gateway::Signature::new(
+                        vec!["self", "table", "delete"],
+                        None,
+                        None,
+                        0,
+                        2
+                    ),
+                ),
+                1,
             )
         )
     };
@@ -30285,16 +30409,19 @@ fn init_bytearray_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "replace",
-            crate::make_builtin_function_with_signature(
-                "replace",
-                bytes_method_replace,
-                crate::gateway::Signature::new(
-                    vec!["self", "old", "new", "count"],
-                    None,
-                    None,
-                    0,
-                    4,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "replace",
+                    bytes_method_replace,
+                    crate::gateway::Signature::new(
+                        vec!["self", "old", "new", "count"],
+                        None,
+                        None,
+                        0,
+                        4,
+                    ),
                 ),
+                1,
             )
         )
     };
@@ -30302,10 +30429,19 @@ fn init_bytearray_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "split",
-            crate::make_builtin_function_with_signature(
-                "split",
-                bytes_method_split,
-                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "split",
+                    bytes_method_split,
+                    crate::gateway::Signature::new(
+                        vec!["self", "sep", "maxsplit"],
+                        None,
+                        None,
+                        0,
+                        1
+                    ),
+                ),
+                2,
             )
         )
     };
@@ -30313,10 +30449,19 @@ fn init_bytearray_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "rsplit",
-            crate::make_builtin_function_with_signature(
-                "rsplit",
-                bytes_method_rsplit,
-                crate::gateway::Signature::new(vec!["self", "sep", "maxsplit"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "rsplit",
+                    bytes_method_rsplit,
+                    crate::gateway::Signature::new(
+                        vec!["self", "sep", "maxsplit"],
+                        None,
+                        None,
+                        0,
+                        1
+                    ),
+                ),
+                2,
             )
         )
     };
@@ -30324,10 +30469,13 @@ fn init_bytearray_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "splitlines",
-            crate::make_builtin_function_with_signature(
-                "splitlines",
-                bytes_method_splitlines,
-                crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "splitlines",
+                    bytes_method_splitlines,
+                    crate::gateway::Signature::new(vec!["self", "keepends"], None, None, 0, 1),
+                ),
+                1,
             )
         )
     };
@@ -30419,10 +30567,13 @@ fn init_bytearray_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "expandtabs",
-            crate::make_builtin_function_with_signature(
-                "expandtabs",
-                bytes_method_expandtabs,
-                crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "expandtabs",
+                    bytes_method_expandtabs,
+                    crate::gateway::Signature::new(vec!["self", "tabsize"], None, None, 0, 1),
+                ),
+                1,
             )
         )
     };
@@ -30430,16 +30581,19 @@ fn init_bytearray_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "hex",
-            crate::make_builtin_function_with_signature(
-                "hex",
-                descr_hex,
-                crate::gateway::Signature::new(
-                    vec!["self", "sep", "bytes_per_sep"],
-                    None,
-                    None,
-                    0,
-                    1,
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "hex",
+                    descr_hex,
+                    crate::gateway::Signature::new(
+                        vec!["self", "sep", "bytes_per_sep"],
+                        None,
+                        None,
+                        0,
+                        1,
+                    ),
                 ),
+                2,
             )
         )
     };
@@ -36163,15 +36317,18 @@ fn init_batched_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_with_signature(
-                batched_descr_new,
-                crate::gateway::Signature::new(
-                    vec!["cls", "iterable", "n", "strict"],
-                    None,
-                    None,
-                    1,
-                    1,
+            crate::gateway::function_set_kwonly_default_pairs(
+                make_new_descr_with_signature(
+                    batched_descr_new,
+                    crate::gateway::Signature::new(
+                        vec!["cls", "iterable", "n", "strict"],
+                        None,
+                        None,
+                        1,
+                        1,
+                    ),
                 ),
+                &[("strict", pyre_object::w_bool_from(false))],
             )
         )
     };
@@ -36309,15 +36466,18 @@ fn init_product_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_with_signature(
-                product_descr_new,
-                crate::gateway::Signature::new(
-                    vec!["cls", "repeat"],
-                    Some("iterables"),
-                    None,
-                    1,
-                    1,
+            crate::function_set_kwonly_defaults!(
+                make_new_descr_with_signature(
+                    product_descr_new,
+                    crate::gateway::Signature::new(
+                        vec!["cls", "repeat"],
+                        Some("iterables"),
+                        None,
+                        1,
+                        1,
+                    ),
                 ),
+                "repeat" => pyre_object::w_int_new(1),
             )
         )
     };
@@ -37248,15 +37408,21 @@ fn init_accumulate_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_with_signature(
-                accumulate_descr_new,
-                crate::gateway::Signature::new(
-                    vec!["cls", "iterable", "func", "initial"],
-                    None,
-                    None,
-                    1,
+            crate::gateway::function_set_kwonly_default_pairs(
+                crate::gateway::function_set_null_positional_defaults(
+                    make_new_descr_with_signature(
+                        accumulate_descr_new,
+                        crate::gateway::Signature::new(
+                            vec!["cls", "iterable", "func", "initial"],
+                            None,
+                            None,
+                            1,
+                            1,
+                        ),
+                    ),
                     1,
                 ),
+                &[("initial", pyre_object::w_none())],
             )
         )
     };
@@ -37291,15 +37457,18 @@ fn init_zip_longest_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            make_new_descr_with_signature(
-                zip_longest_descr_new,
-                crate::gateway::Signature::new(
-                    vec!["cls", "fillvalue"],
-                    Some("iterables"),
-                    None,
-                    1,
-                    1,
+            crate::gateway::function_set_kwonly_default_pairs(
+                make_new_descr_with_signature(
+                    zip_longest_descr_new,
+                    crate::gateway::Signature::new(
+                        vec!["cls", "fillvalue"],
+                        Some("iterables"),
+                        None,
+                        1,
+                        1,
+                    ),
                 ),
+                &[("fillvalue", pyre_object::w_none())],
             )
         )
     };

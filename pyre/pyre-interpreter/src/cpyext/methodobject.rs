@@ -951,8 +951,8 @@ pub(super) fn call_method_def_in_class(
     let name = text_or_empty(unsafe { (*method).ml_name });
     let flags = unsafe { (*method).ml_flags }
         & !(MethFlags::METH_CLASS | MethFlags::METH_STATIC | MethFlags::METH_COEXIST);
-    let keywords: Vec<(String, PyObjectRef)> = match kwargs {
-        Some(dict) => unsafe { pyre_object::w_dict_str_entries(dict) },
+    let keywords: Vec<(PyObjectRef, PyObjectRef)> = match kwargs {
+        Some(dict) => unsafe { pyre_object::w_dict_items(dict) },
         None => Vec::new(),
     };
     if !keywords.is_empty() && !flags.contains(MethFlags::METH_KEYWORDS) {

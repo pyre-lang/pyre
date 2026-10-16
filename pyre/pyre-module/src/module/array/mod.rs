@@ -487,11 +487,19 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// Keyword path: positional typecode/initializer stay on the slice. Extra
-/// keywords belong to an overridden subtype `__init__`.
+/// keywords belong to an overridden subtype `__init__`. The exact array
+/// type rejects keywords (`interp_array.py` `w_array`).
 fn array_descr_new_args(
     w_type: PyObjectRef,
     args: &pyre_interpreter::argument::Arguments,
 ) -> PyResult {
+    let canonical = pyre_interpreter::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
+        .map_or(PY_NULL, |ty| ty.as_ptr());
+    if std::ptr::eq(w_type, canonical) && pyre_interpreter::builtins::arguments_has_keywords(args) {
+        return Err(PyError::type_error(
+            "array.array() takes no keyword arguments",
+        ));
+    }
     array_descr_new(&pyre_interpreter::builtins::passthrough1_positional_slice(
         w_type, args,
     ))

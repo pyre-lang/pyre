@@ -1908,12 +1908,12 @@ const REPLACE_KWARGS: [&str; 18] = [
     "co_exceptiontable",
 ];
 
-/// `code.replace(self, /, **co_* )` — pos-only receiver, keyword-only fields.
+/// `pycode.py` `descr_replace` packs `__args__` into `(w_args, w_kwds)`;
+/// applevel `replace(self, kwds)` walks the dict (`if attr not in kwds`).
+/// Named kw-only slots cannot carry a PY_NULL default (`w_dict_store`
+/// rejects null values), so the bound scope is `self, **kwds`.
 pub fn code_replace_signature() -> crate::gateway::Signature {
-    let mut names = Vec::with_capacity(REPLACE_KWARGS.len() + 1);
-    names.push("self");
-    names.extend_from_slice(&REPLACE_KWARGS);
-    crate::gateway::Signature::new(names, None, None, REPLACE_KWARGS.len(), 1)
+    crate::gateway::Signature::new(vec!["self"], None, Some("kwds"), 0, 1)
 }
 
 #[inline]
@@ -2871,7 +2871,7 @@ pub unsafe fn code_branches(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyEr
 /// # Safety
 /// `args[0]` must be the receiver `code` object (verified).
 pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Bound scope: self, then the 18 keyword-only co_* fields (`PY_NULL` omitted).
+    // Bound scope: `self, **kwds` (`pycode.py` descr_replace / applevel replace).
     let w_self = args
         .first()
         .copied()
@@ -2883,22 +2883,28 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         ));
     }
     // `read_code_consts` and `box_code_object` allocate. Pin the bound scope
-    // and reload each field from its slot.
+    // and reload the kwargs dict from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::pin_roots(args);
     let n_bound = args.len();
     let w_self = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    if n_bound >= 2 {
+        let kwds = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        if !kwds.is_null() {
+            crate::builtins::kwarg_reject_unknown(Some(kwds), &REPLACE_KWARGS, "replace")?;
+        }
+    }
     let get = |name: &str| -> Option<PyObjectRef> {
-        let index = 1 + REPLACE_KWARGS.iter().position(|&field| field == name)?;
-        if index >= n_bound {
+        if n_bound < 2 {
             return None;
         }
-        let value = pyre_object::gc_roots::shadow_stack_get(root_base + index);
-        if value.is_null() || unsafe { pyre_object::is_none(value) } {
-            None
-        } else {
-            Some(value)
+        let kwds = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        if kwds.is_null() {
+            return None;
         }
+        // `pycode.py` applevel `replace`: `if attr not in kwds` inherits;
+        // a supplied value, including `None`, is passed to the constructor.
+        unsafe { pyre_object::w_dict_getitem_str(kwds, name) }
     };
 
     let code_ptr = unsafe { w_code_get_ptr(w_self()) } as *const crate::CodeObject;

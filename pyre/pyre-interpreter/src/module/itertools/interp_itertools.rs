@@ -75,10 +75,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "tee",
-        crate::gateway::make_builtin_function_with_signature(
-            "tee",
-            crate::typedef::itertools_tee,
-            crate::gateway::Signature::new(vec!["iterable", "n"], None, None, 0, 2),
+        crate::gateway::function_set_null_positional_defaults(
+            crate::gateway::make_builtin_function_with_signature(
+                "tee",
+                crate::typedef::itertools_tee,
+                crate::gateway::Signature::new(vec!["iterable", "n"], None, None, 0, 2),
+            ),
+            1,
         )
     );
     crate::__pyre_put_new!(

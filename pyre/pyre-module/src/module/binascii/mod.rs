@@ -297,11 +297,14 @@ pyre_interpreter::py_module! {
         // binder rather than the fixed-arity fast entry.
         pyre_interpreter::__pyre_store!(ns, "crc32", pyre_interpreter::gateway::with_module(
                 "binascii",
-                pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
-                    "crc32",
-                    crc32,
-                    pyre_interpreter::HOPELESS,
-                    Some(sig_all_posonly("crc32", &["data", "crc"])),
+                pyre_interpreter::gateway::function_set_null_positional_defaults(
+                    pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
+                        "crc32",
+                        crc32,
+                        pyre_interpreter::HOPELESS,
+                        Some(sig_all_posonly("crc32", &["data", "crc"])),
+                    ),
+                    1,
                 ),
             ));
         // `HOPELESS` as well: a fixed arity would take the positional fast

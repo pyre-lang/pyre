@@ -246,10 +246,8 @@ fn sys_namespace_init_args(
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
-    namespace_apply_kwargs(
-        pyre_object::gc_roots::shadow_stack_get(self_slot),
-        crate::builtins::arguments_as_kwargs_dict(args)?,
-    )
+    let kwargs = crate::builtins::arguments_as_kwargs_dict(args)?;
+    namespace_apply_kwargs(pyre_object::gc_roots::shadow_stack_get(self_slot), kwargs)
 }
 
 /// Copy the keyword arguments into a namespace instance's dict. Shared by
@@ -272,10 +270,7 @@ fn namespace_apply_kwargs(self_obj: PyObjectRef, kwargs: Option<PyObjectRef>) ->
 /// before the first store, matching `PyArg_ValidateKeywordArguments`: a bad
 /// mapping cannot partially update the namespace.  The destination is the
 /// real instance dict, so subclass `__setattr__` is deliberately bypassed.
-fn namespace_update_dict(
-    self_obj: PyObjectRef,
-    source: PyObjectRef,
-) -> Result<(), crate::PyError> {
+fn namespace_update_dict(self_obj: PyObjectRef, source: PyObjectRef) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
@@ -441,10 +436,7 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
         )?;
     }
     // Keywords stay on `Arguments` for `simple_namespace_init_args`.
-    namespace_apply_kwargs(
-        pyre_object::gc_roots::shadow_stack_get(operands_sp),
-        None,
-    )
+    namespace_apply_kwargs(pyre_object::gc_roots::shadow_stack_get(operands_sp), None)
 }
 
 fn simple_namespace_init_args(
@@ -896,10 +888,8 @@ fn simple_namespace_replace_args(
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
-    simple_namespace_replace_from(
-        pyre_object::gc_roots::shadow_stack_get(self_slot),
-        crate::builtins::arguments_as_kwargs_dict(args)?,
-    )
+    let kwargs = crate::builtins::arguments_as_kwargs_dict(args)?;
+    simple_namespace_replace_from(pyre_object::gc_roots::shadow_stack_get(self_slot), kwargs)
 }
 
 fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
@@ -2062,50 +2052,56 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "_getframemodulename",
-        crate::make_builtin_function_with_signature(
-            "_getframemodulename",
-            |args| {
-                // Bound scope: optional `depth` (`PY_NULL` omitted).
-                let depth = match args.get(0).copied().filter(|value| !value.is_null()) {
-                    Some(v) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?,
-                    None => 0,
-                };
-                let ec = current_execution_context();
-                if ec.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                let mut current = unsafe { (*ec).gettopframe_nohidden() };
-                // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
-                // post-decrement test fails immediately for a negative depth, so a
-                // negative walks zero frames and reports the current module rather
-                // than `None`.
-                let mut remaining = depth.max(0);
-                while !current.is_null() && remaining > 0 {
-                    current =
-                        crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
-                    remaining -= 1;
-                }
-                if current.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                // `get_w_globals` reads `pycode`, which `interp_jit.py`
-                // declares virtualizable, so the frame it is read off has to be
-                // materialized first.  The force belongs HERE, at the consumer, and
-                // not at the walk that reached the frame — see [`force_frame`]:
-                // forcing a walk escapes the traced virtualizable and
-                // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
-                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
-                crate::executioncontext::jit_force_virtualizable(anchor.live());
-                let w_globals = unsafe { (*anchor.live()).get_w_globals() };
-                if w_globals.is_null() {
-                    return Ok(pyre_object::w_none());
-                }
-                match crate::baseobjspace::finditem_str(w_globals, "__name__")? {
-                    Some(name) if !name.is_null() => Ok(name),
-                    _ => Ok(pyre_object::w_none()),
-                }
-            },
-            crate::Signature::new(vec!["depth"], None, None, 0, 0),
+        crate::gateway::function_set_null_positional_defaults(
+            crate::make_builtin_function_with_signature(
+                "_getframemodulename",
+                |args| {
+                    // Bound scope: optional `depth` (`PY_NULL` omitted).
+                    let depth = match args.get(0).copied().filter(|value| !value.is_null()) {
+                        Some(v) => {
+                            crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?
+                        }
+                        None => 0,
+                    };
+                    let ec = current_execution_context();
+                    if ec.is_null() {
+                        return Ok(pyre_object::w_none());
+                    }
+                    let mut current = unsafe { (*ec).gettopframe_nohidden() };
+                    // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
+                    // post-decrement test fails immediately for a negative depth, so a
+                    // negative walks zero frames and reports the current module rather
+                    // than `None`.
+                    let mut remaining = depth.max(0);
+                    while !current.is_null() && remaining > 0 {
+                        current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(
+                            current,
+                        );
+                        remaining -= 1;
+                    }
+                    if current.is_null() {
+                        return Ok(pyre_object::w_none());
+                    }
+                    // `get_w_globals` reads `pycode`, which `interp_jit.py`
+                    // declares virtualizable, so the frame it is read off has to be
+                    // materialized first.  The force belongs HERE, at the consumer, and
+                    // not at the walk that reached the frame — see [`force_frame`]:
+                    // forcing a walk escapes the traced virtualizable and
+                    // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
+                    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
+                    crate::executioncontext::jit_force_virtualizable(anchor.live());
+                    let w_globals = unsafe { (*anchor.live()).get_w_globals() };
+                    if w_globals.is_null() {
+                        return Ok(pyre_object::w_none());
+                    }
+                    match crate::baseobjspace::finditem_str(w_globals, "__name__")? {
+                        Some(name) if !name.is_null() => Ok(name),
+                        _ => Ok(pyre_object::w_none()),
+                    }
+                },
+                crate::Signature::new(vec!["depth"], None, None, 0, 0),
+            ),
+            1,
         ),
     );
     // sys.exc_info() → (type, value, traceback)
@@ -2920,27 +2916,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "exit",
-        crate::make_module_builtin_function_with_arity_and_sig(
-            "exit",
-            |args| {
-                // Bound scope: optional `exitcode` (`PY_NULL` omitted).
-                let exitcode = args
-                    .get(0)
-                    .copied()
-                    .filter(|value| !value.is_null())
-                    .unwrap_or_else(w_none);
-                let cls = crate::builtins::lookup_exc_class("SystemExit")
-                    .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
-                let ctor_args = if unsafe { is_tuple(exitcode) } {
-                    unsafe { w_tuple_items_copy_as_vec(exitcode) }
-                } else {
-                    vec![exitcode]
-                };
-                let exc = crate::call::call_function_impl_result(cls, &ctor_args)?;
-                Err(unsafe { crate::PyError::from_exc_object(exc) })
-            },
-            crate::HOPELESS,
-            crate::Signature::new(vec!["exitcode"], None, None, 0, 0),
+        crate::gateway::function_set_positional_defaults(
+            crate::make_module_builtin_function_with_arity_and_sig(
+                "exit",
+                |args| {
+                    // Bound scope: optional `exitcode` (`app.py` `exit(exitcode=None)`).
+                    let exitcode = args
+                        .get(0)
+                        .copied()
+                        .filter(|value| !value.is_null())
+                        .unwrap_or_else(w_none);
+                    let cls = crate::builtins::lookup_exc_class("SystemExit")
+                        .ok_or_else(|| crate::PyError::runtime_error("SystemExit class missing"))?;
+                    let ctor_args = if unsafe { is_tuple(exitcode) } {
+                        unsafe { w_tuple_items_copy_as_vec(exitcode) }
+                    } else {
+                        vec![exitcode]
+                    };
+                    let exc = crate::call::call_function_impl_result(cls, &ctor_args)?;
+                    Err(unsafe { crate::PyError::from_exc_object(exc) })
+                },
+                crate::HOPELESS,
+                crate::Signature::new(vec!["exitcode"], None, None, 0, 1),
+            ),
+            &[w_none()],
         ),
     );
     // `init_sys_streams`: Windows has no `sys.abiflags`; its ABI tag
@@ -3378,22 +3377,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "getunicodeinternedsize",
-        crate::make_builtin_function_with_signature(
-            "getunicodeinternedsize",
-            |args| {
-                // Bound scope: kw-only `_only_immortal` (`PY_NULL` omitted).
-                let only_immortal = match args.get(0).copied().filter(|value| !value.is_null()) {
-                    Some(value) => crate::baseobjspace::is_true(value)?,
-                    None => false,
-                };
-                let size = if only_immortal {
-                    pyre_object::unicodeobject::interned_size_immortal()
-                } else {
-                    pyre_object::unicodeobject::interned_size()
-                };
-                Ok(w_int_new(size as i64))
-            },
-            crate::Signature::new(vec!["_only_immortal"], None, None, 1, 0),
+        crate::gateway::function_set_kwonly_default_pairs(
+            crate::make_builtin_function_with_signature(
+                "getunicodeinternedsize",
+                |args| {
+                    // Bound scope: kw-only `_only_immortal` (`PY_NULL` omitted).
+                    let only_immortal = match args.get(0).copied().filter(|value| !value.is_null())
+                    {
+                        Some(value) => crate::baseobjspace::is_true(value)?,
+                        None => false,
+                    };
+                    let size = if only_immortal {
+                        pyre_object::unicodeobject::interned_size_immortal()
+                    } else {
+                        pyre_object::unicodeobject::interned_size()
+                    };
+                    Ok(w_int_new(size as i64))
+                },
+                crate::Signature::new(vec!["_only_immortal"], None, None, 1, 0),
+            ),
+            &[("_only_immortal", pyre_object::w_bool_from(false))],
         ),
     );
     module_ns_store(
@@ -3516,11 +3519,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         "copyright",
         w_str_new("Copyright (c) 2001-2024 Python Software Foundation.\nAll Rights Reserved."),
     );
-    module_ns_store(
-        roots.get(ns_slot),
-        "getsizeof",
-        {
-            let function = make_builtin_function_with_signature(
+    module_ns_store(roots.get(ns_slot), "getsizeof", {
+        let function = crate::gateway::function_set_null_positional_defaults(
+            make_builtin_function_with_signature(
                 "getsizeof",
                 |args| {
                     let scope = crate::builtins::bind_builtin_kwargs(
@@ -3548,13 +3549,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                 },
                 Signature::new(vec!["object", "default"], None, None, 0, 0),
-            );
-            let _ = unsafe {
-                crate::function::function_set_doc(function, w_str_new(GETSIZEOF_DOC))
-            };
-            function
-        },
-    );
+            ),
+            1,
+        );
+        let _ = unsafe { crate::function::function_set_doc(function, w_str_new(GETSIZEOF_DOC)) };
+        function
+    });
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes
     // tests only require the strong-reference delta created by a c_char_p
     // `_objects` keepalive; bytes records that real ownership transition in
@@ -3636,10 +3636,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "set_asyncgen_hooks",
-        make_builtin_function_with_signature(
-            "set_asyncgen_hooks",
-            sys_set_asyncgen_hooks_impl,
-            Signature::new(vec!["firstiter", "finalizer"], None, None, 0, 0),
+        crate::gateway::function_set_null_positional_defaults(
+            make_builtin_function_with_signature(
+                "set_asyncgen_hooks",
+                sys_set_asyncgen_hooks_impl,
+                Signature::new(vec!["firstiter", "finalizer"], None, None, 0, 0),
+            ),
+            2,
         ),
     );
     // sys.getfilesystemencoding

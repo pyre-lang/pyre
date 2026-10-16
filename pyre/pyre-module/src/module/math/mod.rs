@@ -110,33 +110,34 @@ pyre_interpreter::py_module! {
         pyre_interpreter::__pyre_store!(
             ns,
             "log",
-            pyre_interpreter::make_module_builtin_function_with_fast_arity_and_sig(
-                "log",
-                m::__majit_wrap_math_log,
-                pyre_interpreter::HOPELESS,
-                pyre_interpreter::Signature::new(vec!["x", "base"], None, None, 0, 2),
+            pyre_interpreter::gateway::function_set_null_positional_defaults(
+                pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+                    "log",
+                    m::__majit_wrap_math_log,
+                    pyre_interpreter::HOPELESS,
+                    pyre_interpreter::Signature::new(vec!["x", "base"], None, None, 0, 2),
+                ),
+                1,
             )
         );
         pyre_interpreter::__pyre_store!(
             ns,
             "isclose",
-            pyre_interpreter::function_set_kwonly_default_pairs(
-                pyre_interpreter::make_module_builtin_function_with_fast_arity_and_sig(
+            pyre_interpreter::function_set_kwonly_defaults!(
+                pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
                     "isclose",
                     m::__majit_wrap_math_isclose,
-                    2,
+                    pyre_interpreter::HOPELESS,
                     pyre_interpreter::Signature::new(
                         vec!["a", "b", "rel_tol", "abs_tol"],
                         None,
                         None,
                         2,
-                        2,
+                        0,
                     ),
                 ),
-                &[
-                    ("rel_tol", pyre_object::floatobject::w_float_new(1e-9)),
-                    ("abs_tol", pyre_object::floatobject::w_float_new(0.0)),
-                ],
+                "rel_tol" => pyre_object::floatobject::w_float_new(1e-9),
+                "abs_tol" => pyre_object::floatobject::w_float_new(0.0),
             )
         );
         let install2 = |mut ns: pyre_object::PyObjectRef,
@@ -154,6 +155,27 @@ pyre_interpreter::py_module! {
         ns = install2(ns, "copysign", m::__majit_wrap_math_copysign);
         ns = install2(ns, "remainder", m::__majit_wrap_math_remainder);
         ns = install2(ns, "atan2", m::__majit_wrap_math_atan2);
-        install2(ns, "ldexp", m::__majit_wrap_math_ldexp);
+        ns = install2(ns, "ldexp", m::__majit_wrap_math_ldexp);
+        // Trailing defaults live on `Function.defs_w` / `w_kw_defs`
+        // (`interp2app._getdefaults`). `perm` `k`, `prod` `start=1`,
+        // `nextafter` `steps=None`.
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "perm") } {
+            function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+            pyre_interpreter::__pyre_store!(ns, "perm", function);
+        }
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "prod") } {
+            function = pyre_interpreter::function_set_kwonly_defaults!(
+                function,
+                "start" => pyre_object::w_int_new(1),
+            );
+            pyre_interpreter::__pyre_store!(ns, "prod", function);
+        }
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "nextafter") } {
+            function = pyre_interpreter::function_set_kwonly_default_pairs(
+                function,
+                &[("steps", pyre_object::w_none())],
+            );
+            pyre_interpreter::__pyre_store!(ns, "nextafter", function);
+        }
     },
 }

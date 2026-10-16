@@ -4935,6 +4935,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "__init__",
+            pyre_interpreter::function_set_null_positional_defaults(
             pyre_interpreter::make_builtin_function_with_signature(
                 "__init__",
                 |args| {
@@ -5101,6 +5102,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     0,
                     1,
                 ),
+            ),
+            4,
             )
         )
     };

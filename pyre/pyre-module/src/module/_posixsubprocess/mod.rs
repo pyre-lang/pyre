@@ -734,12 +734,11 @@ mod imp {
     }
 
     pub fn fork_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        let given = args.iter().filter(|value| !value.is_null()).count();
-        if given != 22 {
-            return Err(PyError::type_error(format!(
-                "fork_exec() takes exactly 22 arguments ({given} given)"
-            )));
-        }
+        // Bound scope from `interp_subprocess.fork_exec`: 22 required
+        // slots plus trailing `allow_vfork` (`unwrap_spec(allow_vfork=int)`).
+        // PyPy treats `allow_vfork` as a NOOP; the default is filled by
+        // `Function.defs_w` so a 22-arg call (3.14 `subprocess._execute_child`)
+        // still matches.
         let pos = args;
 
         // [3.14-spec] PyPy `interp_subprocess.fork_exec` permits preexec_fn
@@ -840,39 +839,47 @@ pyre_interpreter::py_module! {
         pyre_interpreter::__pyre_store!(
             ns,
             "fork_exec",
-            pyre_interpreter::make_builtin_function_with_signature(
-                "fork_exec",
-                imp::fork_exec,
-                pyre_interpreter::Signature::new(
-                    vec![
-                        "args",
-                        "executable_list",
-                        "close_fds",
-                        "fds_to_keep",
-                        "cwd",
-                        "env_list",
-                        "p2cread",
-                        "p2cwrite",
-                        "c2pread",
-                        "c2pwrite",
-                        "errread",
-                        "errwrite",
-                        "errpipe_read",
-                        "errpipe_write",
-                        "restore_signals",
-                        "call_setsid",
-                        "pgid_to_set",
-                        "gid",
-                        "groups_list",
-                        "uid",
-                        "child_umask",
-                        "preexec_fn",
-                    ],
-                    None,
-                    None,
-                    0,
-                    22,
+            pyre_interpreter::gateway::function_set_positional_defaults(
+                pyre_interpreter::make_builtin_function_with_signature(
+                    "fork_exec",
+                    imp::fork_exec,
+                    pyre_interpreter::Signature::new(
+                        vec![
+                            "args",
+                            "executable_list",
+                            "close_fds",
+                            "fds_to_keep",
+                            "cwd",
+                            "env_list",
+                            "p2cread",
+                            "p2cwrite",
+                            "c2pread",
+                            "c2pwrite",
+                            "errread",
+                            "errwrite",
+                            "errpipe_read",
+                            "errpipe_write",
+                            "restore_signals",
+                            "call_setsid",
+                            "pgid_to_set",
+                            "gid",
+                            "groups_list",
+                            "uid",
+                            "child_umask",
+                            "preexec_fn",
+                            "allow_vfork",
+                        ],
+                        None,
+                        None,
+                        0,
+                        23,
+                    ),
                 ),
+                // `interp_subprocess.fork_exec` `allow_vfork`: NOOP on PyPy.
+                // 3.14 clinic dropped the slot; `test_fork_exec` still passes
+                // the extra positional, and `subprocess._execute_child` omits
+                // it. `Function.defs_w` holds True (`allow_vfork: bool = True`).
+                &[pyre_object::w_bool_from(true)],
             )
         );
         #[cfg(not(all(unix, feature = "host_env")))]

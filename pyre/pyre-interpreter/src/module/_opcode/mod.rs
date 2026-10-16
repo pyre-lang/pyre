@@ -165,10 +165,9 @@ pyre_interpreter::py_module! {
         }
     },
     functions: {
-        // `stack_effect(opcode, oparg=None, *, jump=None)` — the optional
-        // tail and the keyword-only `jump` leave no single natural arity, so
-        // the body enforces the count itself.
-        "stack_effect"             / * = stack_effect; crate::Signature::new(vec!["opcode", "oparg", "jump"], None, None, 1, 0),
+        // `stack_effect(opcode, oparg=None, /, *, jump=None)` — opcode and
+        // oparg are positional-only; jump is keyword-only.
+        "stack_effect"             / * = stack_effect; crate::Signature::new(vec!["opcode", "oparg", "jump"], None, None, 1, 2),
         "get_executor"             / 2 = |_| Ok(w_none()),
         "get_specialization_stats" / 0 = |_| Ok(w_none()),
         "get_intrinsic1_descs"     / 0 = get_intrinsic1_descs,
@@ -178,6 +177,14 @@ pyre_interpreter::py_module! {
         "get_hot_code"             / 0 = |_| Ok(w_list_new(vec![])),
     },
     extra_init: |ns| {
+        if let Some(function) = unsafe { pyre_object::w_dict_getitem_str(ns, "stack_effect") } {
+            let mut function = crate::gateway::function_set_null_positional_defaults(function, 1);
+            function = crate::function_set_kwonly_default_pairs(
+                function,
+                &[("jump", pyre_object::w_none())],
+            );
+            crate::__pyre_store!(ns, "stack_effect", function);
+        }
         // `Python/bytecodes.c` exposes `ENABLE_SPECIALIZATION`; pyre has no
         // CPython-style adaptive specialization, so it reads False — tests
         // gated on `@requires_specialization` then skip.

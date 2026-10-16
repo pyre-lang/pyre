@@ -47,24 +47,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "compile",
-        make_module_builtin_function_with_arity_and_sig(
-            "compile",
-            sre_compile,
-            crate::HOPELESS,
-            Signature::new(
-                vec![
-                    "pattern",
-                    "flags",
-                    "code",
-                    "groups",
-                    "groupindex",
-                    "indexgroup",
-                ],
-                None,
-                None,
-                0,
-                0,
+        crate::gateway::function_set_null_positional_defaults(
+            make_module_builtin_function_with_arity_and_sig(
+                "compile",
+                sre_compile,
+                crate::HOPELESS,
+                Signature::new(
+                    vec![
+                        "pattern",
+                        "flags",
+                        "code",
+                        "groups",
+                        "groupindex",
+                        "indexgroup",
+                    ],
+                    None,
+                    None,
+                    0,
+                    0,
+                ),
             ),
+            3,
         )
     );
     // `_sre.template` (`sre.c` `_sre_template_impl`). `re._compile_template`
@@ -212,14 +215,30 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
             ))
         );
     }
+    fn sre_pattern_sig(
+        name: &'static str,
+        func: crate::gateway::BuiltinCodeFn,
+        names: Vec<&'static str>,
+        ndef: usize,
+    ) -> PyObjectRef {
+        crate::gateway::function_set_null_positional_defaults(
+            make_builtin_function_with_signature(
+                name,
+                func,
+                Signature::new(names, None, None, 0, 1),
+            ),
+            ndef,
+        )
+    }
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "match",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "match",
                 sre_pattern_match,
-                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+                vec!["self", "string", "pos", "endpos"],
+                2,
             )
         )
     };
@@ -227,10 +246,11 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "fullmatch",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "fullmatch",
                 sre_pattern_fullmatch,
-                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+                vec!["self", "string", "pos", "endpos"],
+                2,
             )
         )
     };
@@ -238,10 +258,11 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "search",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "search",
                 sre_pattern_search,
-                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+                vec!["self", "string", "pos", "endpos"],
+                2,
             )
         )
     };
@@ -249,10 +270,11 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "findall",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "findall",
                 sre_pattern_findall,
-                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+                vec!["self", "string", "pos", "endpos"],
+                2,
             )
         )
     };
@@ -260,10 +282,11 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "finditer",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "finditer",
                 sre_pattern_finditer,
-                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+                vec!["self", "string", "pos", "endpos"],
+                2,
             )
         )
     };
@@ -273,10 +296,11 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "scanner",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "scanner",
                 sre_pattern_finditer,
-                Signature::new(vec!["self", "string", "pos", "endpos"], None, None, 0, 1),
+                vec!["self", "string", "pos", "endpos"],
+                2,
             )
         )
     };
@@ -284,10 +308,11 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "sub",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "sub",
                 sre_pattern_sub,
-                Signature::new(vec!["self", "repl", "string", "count"], None, None, 0, 1),
+                vec!["self", "repl", "string", "count"],
+                1,
             )
         )
     };
@@ -295,10 +320,11 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "subn",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "subn",
                 sre_pattern_subn,
-                Signature::new(vec!["self", "repl", "string", "count"], None, None, 0, 1),
+                vec!["self", "repl", "string", "count"],
+                1,
             )
         )
     };
@@ -306,10 +332,11 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "split",
-            make_builtin_function_with_signature(
+            sre_pattern_sig(
                 "split",
                 sre_pattern_split,
-                Signature::new(vec!["self", "string", "maxsplit"], None, None, 0, 1),
+                vec!["self", "string", "maxsplit"],
+                1,
             )
         )
     };
@@ -775,10 +802,15 @@ pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)
 /// — `SRE_Pattern__new__` (interp_sre.py).
 fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() < 3 {
-        return Err(crate::PyError::type_error(
-            "_sre.compile() requires at least 3 arguments",
-        ));
+    // `_sre_compile` requires `pattern`, `flags`, and `code`. A PY_NULL
+    // pad must not be read as `flags` (`w_int_get_value`).
+    for (index, name) in ["pattern", "flags", "code"].iter().enumerate() {
+        if args.get(index).copied().filter(|o| !o.is_null()).is_none() {
+            return Err(crate::PyError::type_error(format!(
+                "compile() missing required argument '{name}' (pos {})",
+                index + 1
+            )));
+        }
     }
     let flags = unsafe { w_int_get_value(args[1]) };
     let groups_arg = args.get(3).copied().filter(|o| !o.is_null());

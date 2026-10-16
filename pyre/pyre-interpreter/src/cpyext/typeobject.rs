@@ -2473,7 +2473,7 @@ pub(super) fn interpreter_type(tp: *mut CPyTypeObject) -> PyObjectRef {
 pub fn type_vectorcall(
     w_type: PyObjectRef,
     positional: &[PyObjectRef],
-    keywords: &[(String, PyObjectRef)],
+    keywords: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
     let tp = pyobject::as_pyobj(w_type) as *mut CPyTypeObject;
     if tp.is_null() {
@@ -3547,11 +3547,15 @@ impl Drop for TernaryArgs {
     }
 }
 
-fn ternary_args(positional: &[PyObjectRef], keywords: &[(String, PyObjectRef)]) -> TernaryArgs {
+fn ternary_args(
+    positional: &[PyObjectRef],
+    keywords: &[(PyObjectRef, PyObjectRef)],
+) -> TernaryArgs {
     let roots = pyre_object::gc_roots::push_roots();
-    let mut live = Vec::with_capacity(positional.len() + keywords.len());
+    let mut live = Vec::with_capacity(positional.len() + 2 * keywords.len());
     live.extend_from_slice(positional);
-    for (_, value) in keywords {
+    for (key, value) in keywords {
+        live.push(*key);
         live.push(*value);
     }
     let base = roots.pin_roots(&live);
@@ -3565,14 +3569,16 @@ fn ternary_args(positional: &[PyObjectRef], keywords: &[(String, PyObjectRef)]) 
         let dict = pyre_object::dictmultiobject::w_dict_new();
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(dict);
-        for (index, (name, _)) in keywords.iter().enumerate() {
+        for index in 0..keywords.len() {
+            let key = value_slot(positional.len() + 2 * index);
+            let value = value_slot(positional.len() + 2 * index + 1);
             unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str(
+                pyre_object::dictmultiobject::w_dict_store(
                     pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                    name,
-                    value_slot(positional.len() + index),
-                )
-            };
+                    key,
+                    value,
+                );
+            }
         }
         keywords_arg = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(dict_slot));
     }
@@ -3582,14 +3588,15 @@ fn ternary_args(positional: &[PyObjectRef], keywords: &[(String, PyObjectRef)]) 
     }
 }
 
-fn split_call(args: &[PyObjectRef]) -> (Vec<PyObjectRef>, Vec<(String, PyObjectRef)>) {
+fn split_call(args: &[PyObjectRef]) -> (Vec<PyObjectRef>, Vec<(PyObjectRef, PyObjectRef)>) {
     (args.to_vec(), Vec::new())
 }
 
-/// Keywords stay on `Arguments`; names are interned strings for the C slot.
+/// Keywords stay on `Arguments` as the original wrapped names
+/// (`argument.py` `_collect_keyword_args` / `w_kwargs_from_args`).
 fn keyword_pairs_from_arguments(
     args: &crate::argument::Arguments,
-) -> Result<Vec<(String, PyObjectRef)>, crate::PyError> {
+) -> Result<Vec<(PyObjectRef, PyObjectRef)>, crate::PyError> {
     let Some(names) = args.keyword_names_w.as_ref() else {
         return Ok(Vec::new());
     };
@@ -3604,13 +3611,12 @@ fn keyword_pairs_from_arguments(
     let mut keywords = Vec::with_capacity(names.len());
     for i in 0..names.len() {
         let name = pyre_object::gc_roots::shadow_stack_get(names_base + i);
-        let key = crate::baseobjspace::text_w(name)?.to_string();
         let value = if values.is_empty() {
             pyre_object::PY_NULL
         } else {
             pyre_object::gc_roots::shadow_stack_get(values_base + i)
         };
-        keywords.push((key, value));
+        keywords.push((name, value));
     }
     Ok(keywords)
 }
@@ -3652,7 +3658,7 @@ fn slot_new_kw(
     slot: *const c_void,
     cls: PyObjectRef,
     positional: &[PyObjectRef],
-    keywords: &[(String, PyObjectRef)],
+    keywords: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
     if slot.is_null() {
         return Err(crate::PyError::type_error(
@@ -3697,7 +3703,7 @@ fn slot_init_kw(
     slot: *const c_void,
     w_self: PyObjectRef,
     positional: &[PyObjectRef],
-    keywords: &[(String, PyObjectRef)],
+    keywords: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
     if slot.is_null() {
         return Ok(pyre_object::w_none());
@@ -3748,7 +3754,7 @@ fn slot_call_kw(
     slot: *const c_void,
     w_self: PyObjectRef,
     positional: &[PyObjectRef],
-    keywords: &[(String, PyObjectRef)],
+    keywords: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
     if slot.is_null() {
         return Err(crate::PyError::type_error("cpyext object is not callable"));

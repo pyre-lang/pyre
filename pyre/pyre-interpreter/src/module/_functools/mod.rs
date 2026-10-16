@@ -488,6 +488,12 @@ cmp_to_key = staticmethod(cmp_to_key)
     functions: {
         "reduce" / * = reduce; pyre_interpreter::Signature::new(vec!["function", "iterable", "initial"], None, None, 0, 2),
     },
+    extra_init: |ns| {
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "reduce") } {
+            function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
+            pyre_interpreter::__pyre_store!(ns, "reduce", function);
+        }
+    },
 }
 
 /// The GC types this module owns, in `build_gc` registration order.

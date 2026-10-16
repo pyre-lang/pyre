@@ -196,7 +196,26 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _ = pyre_object::gc_roots::pin_root(ns);
     let bisect_sig =
         || pyre_interpreter::Signature::new(vec!["a", "x", "lo", "hi", "key"], None, None, 1, 0);
-    let left = pyre_interpreter::gateway::with_module(
+    let wrap_bisect = |function: pyre_object::PyObjectRef| {
+        let roots = pyre_object::gc_roots::push_roots();
+        let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(function);
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        items.push(pyre_object::w_int_new(0));
+        items.push(pyre_object::w_none());
+        let _ = pyre_interpreter::gateway::function_set_positional_defaults(
+            pyre_object::gc_roots::shadow_stack_get(fn_slot),
+            &[items.get(0), items.get(1)],
+        );
+        drop(items);
+        pyre_interpreter::gateway::function_set_kwonly_default_pair(
+            fn_slot,
+            "key",
+            pyre_object::w_none(),
+        );
+        roots.get(fn_slot)
+    };
+    let left = wrap_bisect(pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
             "bisect_left",
@@ -204,13 +223,13 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             0,
             bisect_sig(),
         ),
-    );
+    ));
     // Each function is pinned before the next allocation. The stores below
     // reload those original slots: a second `pin_root` of the Rust local
     // would publish the pre-forward word (`RootScope::pin_roots`).
     let left_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(left);
-    let right = pyre_interpreter::gateway::with_module(
+    let right = wrap_bisect(pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
             "bisect_right",
@@ -218,10 +237,10 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             0,
             bisect_sig(),
         ),
-    );
+    ));
     let right_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(right);
-    let insert_left = pyre_interpreter::gateway::with_module(
+    let insert_left = wrap_bisect(pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
             "insort_left",
@@ -229,10 +248,10 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             0,
             bisect_sig(),
         ),
-    );
+    ));
     let insert_left_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(insert_left);
-    let insert_right = pyre_interpreter::gateway::with_module(
+    let insert_right = wrap_bisect(pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
             "insort_right",
@@ -240,7 +259,7 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             0,
             bisect_sig(),
         ),
-    );
+    ));
     let insert_right_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(insert_right);
     unsafe {

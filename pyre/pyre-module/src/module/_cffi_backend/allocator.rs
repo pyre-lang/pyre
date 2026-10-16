@@ -159,10 +159,14 @@ fn init_allocator_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "__call__",
-        pyre_interpreter::make_builtin_function_with_signature(
-            "__call__",
-            allocator_call,
-            pyre_interpreter::Signature::new(vec!["self", "arg", "init"], None, None, 0, 1),
+        // `W_Allocator.descr_call` `w_init=WrappedDefault(None)`
+        pyre_interpreter::gateway::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature(
+                "__call__",
+                allocator_call,
+                pyre_interpreter::Signature::new(vec!["self", "arg", "init"], None, None, 0, 1),
+            ),
+            1,
         )
     )
 }

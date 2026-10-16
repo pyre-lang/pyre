@@ -300,13 +300,6 @@ fn bind_method(
     Ok(bound)
 }
 
-fn no_keyword_varargs<'a>(
-    args: &'a [PyObjectRef],
-    _method: &str,
-) -> Result<&'a [PyObjectRef], PyError> {
-    Ok(args)
-}
-
 fn dict_string_type(ffi: &W_FFIObject, string: &str) -> Option<PyObjectRef> {
     unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(ffi.types_dict, string) }
 }
@@ -514,7 +507,6 @@ pub fn fetch_int_constant(w_ffi: PyObjectRef, name: &str) -> Result<Option<PyObj
 }
 
 fn ffi_addressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let args = no_keyword_varargs(args, "addressof")?;
     if args.len() < 2 {
         return Err(PyError::type_error("addressof() missing cdata argument"));
     }
@@ -858,7 +850,6 @@ fn ffi_new_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_offsetof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let args = no_keyword_varargs(args, "offsetof")?;
     if args.len() < 3 {
         return Err(PyError::type_error(
             "offsetof() needs a cdecl and field or array index",
@@ -1308,30 +1299,34 @@ fn init_ffi_type(ns: PyObjectRef) {
     );
     store(
         "__init__",
-        pyre_interpreter::make_builtin_function_with_signature(
-            "__init__",
-            ffi_init,
-            pyre_interpreter::Signature::new(
-                vec![
-                    "self",
-                    "module_name",
-                    "_version",
-                    "_types",
-                    "_globals",
-                    "_struct_unions",
-                    "_enums",
-                    "_typenames",
-                    "_includes",
-                ],
-                None,
-                None,
-                0,
-                1,
+        pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature(
+                "__init__",
+                ffi_init,
+                pyre_interpreter::Signature::new(
+                    vec![
+                        "self",
+                        "module_name",
+                        "_version",
+                        "_types",
+                        "_globals",
+                        "_struct_unions",
+                        "_enums",
+                        "_typenames",
+                        "_includes",
+                    ],
+                    None,
+                    None,
+                    0,
+                    1,
+                ),
             ),
+            8,
         ),
     );
-    // `addressof` / `offsetof` take a variable field-name tail and reject
-    // keywords themselves (`no_keyword_varargs`).
+    // `addressof` / `offsetof` take a variable field-name tail. Keywords
+    // are refused by the HOPELESS CALL_KW gate in front of
+    // `make_builtin_function_with_doc`.
     for (name, function) in [
         (
             "addressof",
@@ -1389,14 +1384,24 @@ fn init_ffi_type(ns: PyObjectRef) {
             Some(ffi_method_doc(name)),
             pyre_interpreter::Signature::new(argnames.to_vec(), None, None, 0, 1),
         );
-        store(
-            name,
-            pyre_interpreter::function_new_with_fixed_code(
-                code as *const (),
-                name.to_string(),
-                pyre_object::PY_NULL,
-            ),
+        // Trailing optional slots (`ffi_obj.py` descr_dlopen flags=0,
+        // descr_new w_init, descr_string maxlen=-1, …). PY_NULL is the
+        // WrappedDefault those bodies already test with is_null.
+        let ndef = match name {
+            "callback" | "new_allocator" => 3,
+            "from_buffer" => 2,
+            "dlopen" | "gc" | "getctype" | "new" | "string" => 1,
+            _ => 0,
+        };
+        let mut function = pyre_interpreter::function_new_with_fixed_code(
+            code as *const (),
+            name.to_string(),
+            pyre_object::PY_NULL,
         );
+        if ndef > 0 {
+            function = pyre_interpreter::function_set_null_positional_defaults(function, ndef);
+        }
+        store(name, function);
     }
     // `ffi_obj.py` registers this one through `_extras` because it exists on
     // win32 alone; its docstring is the same table entry every other method
@@ -1411,10 +1416,14 @@ fn init_ffi_type(ns: PyObjectRef) {
         );
         store(
             "getwinerror",
-            pyre_interpreter::function_new_with_fixed_code(
-                code as *const (),
-                "getwinerror".to_string(),
-                pyre_object::PY_NULL,
+            // `W_FFIObject.descr_getwinerror(self, code=-1)`
+            pyre_interpreter::function_set_null_positional_defaults(
+                pyre_interpreter::function_new_with_fixed_code(
+                    code as *const (),
+                    "getwinerror".to_string(),
+                    pyre_object::PY_NULL,
+                ),
+                1,
             ),
         );
     }
