@@ -406,6 +406,13 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("unpack_ex", "pyopcode.py UNPACK_EX"),
     ("build_string", "pyopcode.py BUILD_STRING"),
     ("call_kw", "pyopcode.py CALL_FUNCTION_KW"),
+    // `pyopcode.py CALL_FUNCTION_KW` packs the names tuple and value tail
+    // into `Arguments` (`argument_factory` keyword half). The copy loops
+    // are bounded by the names-tuple length, a LOAD_CONST at the call site.
+    (
+        "arguments_from_call_kw",
+        "pyopcode.py CALL_FUNCTION_KW argument_factory",
+    ),
     ("build_map_from_refs", "pyopcode.py BUILD_MAP pair store"),
     ("match_keys_value", "pyopcode.py MATCH_KEYS"),
     ("match_class_value", "pyopcode.py _match_class"),
@@ -451,6 +458,26 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // is harvested ⊆ reviewed.
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
     ("match_signature", "argument.py _match_signature"),
+    // `starargs_w = args_w[args_left:]` + `space.newtuple(starargs_w)`
+    // step of `_match_signature`, split out of the `match_signature` graph.
+    (
+        "starargs_newtuple",
+        "argument.py _match_signature starargs / space.newtuple",
+    ),
+    // `pycode.py PyCode.funcrun` stores `parse_into_scope` into
+    // `fresh_frame.locals_cells_stack_w`. `_match_signature` takes a list;
+    // passing the virtualizable array type-unions that list with a vable
+    // slice and stamps every `_match_signature` caller with
+    // `ForcesVirtualOrVirtualizable` extraeffect. Parse into a plain list,
+    // then copy under `access_directly` / `fresh_virtualizable`. The copy
+    // is bounded by `signature.scope_length()`, the same constant
+    // `_match_signature` already unrolls; without the hint
+    // `look_inside_graph` residualizes the helper (`funcrun` is not
+    // `unroll_safe` and must stay loop-free).
+    (
+        "parse_into_fresh_frame",
+        "argument.py _match_signature + pycode.py funcrun locals_cells_stack_w store",
+    ),
     // `argument.py unpack` is `@jit.look_inside_iff(lambda self:
     // self._jit_few_keywords)`. `look_inside_iff.inner` does
     // `func = unroll_safe(func)`, so the harvested name is `_orig_unpack`.
@@ -463,6 +490,30 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `dont_look_inside`, so the walk still residualizes at allocation
     // rather than expanding a new fold row.
     ("_orig_unpack", "argument.py unpack"),
+    // `argument.py` `_match_keywords` / `_collect_keyword_args` are
+    // `@jit.look_inside_iff(lambda ... jiton: jiton)`. `look_inside_iff.inner`
+    // does `func = unroll_safe(func)`, so the harvested names are the
+    // originals.
+    (
+        "_orig_match_keywords",
+        "argument.py look_inside_iff unroll_safe(_match_keywords)",
+    ),
+    (
+        "_orig_collect_keyword_args",
+        "argument.py look_inside_iff unroll_safe(_collect_keyword_args)",
+    ),
+    (
+        "_orig_check_not_duplicate_kwargs",
+        "argument.py look_inside_iff unroll_safe(_check_not_duplicate_kwargs)",
+    ),
+    (
+        "_orig_setitem_correct_indirection",
+        "kwargsdict.py look_inside_iff unroll_safe(_setitem_correct_indirection)",
+    ),
+    (
+        "_orig_getitem_correct_indirection",
+        "kwargsdict.py look_inside_iff unroll_safe(_getitem_correct_indirection)",
+    ),
     (
         "_orig__dict_merge_loop",
         "pyopcode.py look_inside_iff unroll_safe(_dict_merge_loop)",

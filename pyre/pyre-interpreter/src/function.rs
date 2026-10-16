@@ -2541,7 +2541,7 @@ pub unsafe fn fset_func_kwdefaults(
             function_set_kwdefaults(obj, pyre_object::PY_NULL);
             return Ok(());
         }
-        if !pyre_object::is_dict(value) {
+        if !crate::baseobjspace::isinstance_dict_w(value) {
             return Err(crate::PyError::type_error("__kwdefaults__ must be a dict"));
         }
         function_set_kwdefaults(obj, value);
@@ -4490,19 +4490,24 @@ pub fn funccall_valuestack(
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1
     {
-        let w_obj = frame.peekvalue(nargs - 1);
-        let rest = frame.make_arguments(nargs - 1, false, func);
+        let w_obj = unsafe { &*caller.live() }.peekvalue(nargs - 1);
+        // Pin the receiver before `make_arguments`: `peekvalues` then
+        // `freeze_gc_arrays` allocate.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = _roots.base();
+        let _ = _roots.pin_root(code as PyObjectRef);
+        let _ = _roots.pin_root(w_obj);
+        let rest =
+            unsafe { &*caller.live() }.make_arguments(nargs - 1, false, _roots.get(root_base));
         // Same live-variable set as the fixed-arity arm above, for the same
         // two reasons: `dropvalues()` retires the frame slots that root these
         // values, and `args_w` is a native Vec no root walker updates.
         // `builtin_code_call` roots nothing of its own, so the whole
         // `[code, w_obj, ...rest]` set has to be published here and read back
-        // for the call.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(code as PyObjectRef);
-        let _ = _roots.pin_root(w_obj);
-        let _ = _roots.pin_roots(&rest);
+        // for the call. PyPy `funccall_valuestack` PASSTHROUGHARGS1 keeps
+        // the rest on `Arguments` (`frame.make_arguments`); the gateway
+        // still takes a flat slice.
+        let _ = _roots.pin_roots(&rest.arguments_w);
         unsafe { &mut *caller.live() }.dropvalues(dropvalues);
         let mut args_w = vec![pyre_object::PY_NULL; nargs];
         pyre_object::gc_roots::shadow_stack_copy_range_into_vec(root_base + 1, &mut args_w);
@@ -4535,13 +4540,44 @@ pub fn funccall_valuestack(
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
     let _ = _roots.pin_root(func);
-    let mut args =
-        unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
-    let _ = _roots.pin_roots(&args);
+    let args = unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
+    let npos = args.arguments_w.len();
+    let names_is_some = args.keyword_names_w.is_some();
+    let nkw = crate::argument::arguments_keyword_count(&args);
+    let jit_few_keywords = args.jit_few_keywords;
+    let methodcall_flag = args.methodcall;
+    let args_base = _roots.pin_roots(&args.arguments_w);
+    let names_base = _roots.pin_roots(args.keyword_names_w.as_deref().unwrap_or(&[]));
+    let values_base = _roots.pin_roots(args.keywords_w.as_deref().unwrap_or(&[]));
     unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-    let func_now = _roots.get(root_base);
-    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(root_base + 1, &mut args);
-    funccall(func_now, &args)
+    let mut arguments_w = vec![pyre_object::PY_NULL; npos];
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(args_base, &mut arguments_w);
+    let mut keyword_names_w = vec![pyre_object::PY_NULL; nkw];
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(names_base, &mut keyword_names_w);
+    let mut keywords_w = vec![pyre_object::PY_NULL; nkw];
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(values_base, &mut keywords_w);
+    let args = crate::argument::Arguments::from_owned_vecs(
+        arguments_w,
+        if names_is_some {
+            Some(keyword_names_w)
+        } else {
+            None
+        },
+        if names_is_some {
+            Some(keywords_w)
+        } else {
+            None
+        },
+        jit_few_keywords,
+        methodcall_flag,
+    );
+    match crate::baseobjspace::call_args(_roots.get(root_base), &args) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            pyre_object::PY_NULL
+        }
+    }
 }
 
 /// function.py `_flat_pycall` — create frame directly from stack.

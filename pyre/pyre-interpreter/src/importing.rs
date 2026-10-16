@@ -8949,6 +8949,7 @@ mod tests {
             let bound = unsafe { pyre_object::w_dict_getitem_str(w_globals, "y") }.expect("y");
             assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(bound) }, 2);
         }
+        #[cfg(feature = "host_env")]
         {
             // frozen_alias_keeps_an_installed_frozen_spec
             let loader = pyre_object::w_module_new("FrozenImporter");

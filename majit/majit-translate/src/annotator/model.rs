@@ -281,13 +281,24 @@ fn unresolved_option_none_name(name: &str) -> bool {
     name.contains("Option<") && name.contains("??") && name.ends_with("::None")
 }
 
-fn same_struct_identity(a: &str, b: &str) -> bool {
+pub(crate) fn same_struct_identity(a: &str, b: &str) -> bool {
     fn identity(name: &str) -> String {
         majit_ir::descr::canonical_struct_name(
             &crate::annotator::bookkeeper::normalize_class_qualname(name),
         )
     }
-    identity(a) == identity(b)
+    let ia = identity(a);
+    let ib = identity(b);
+    if ia == ib {
+        return true;
+    }
+    // Bare leaf vs `module::Leaf` of one unique struct. `canonical_struct_name`
+    // only qualifies the leaf when `STRUCT_ORIGIN_REGISTRY` has it; an
+    // ambiguous or unregistered leaf (`Arguments`) stays bare and otherwise
+    // fails `commonbase` against the qualified spelling.
+    let leaf_a = ia.rsplit("::").next().unwrap_or(ia.as_str());
+    let leaf_b = ib.rsplit("::").next().unwrap_or(ib.as_str());
+    leaf_a == leaf_b && (ia == leaf_a || ib == leaf_b)
 }
 
 // SomeObject base — RPython `model.py`.
@@ -5838,5 +5849,12 @@ mod tests {
             ))),
             SomeValue::None_(_)
         ));
+    }
+
+    #[test]
+    fn same_struct_identity_bare_leaf_matches_module_qualified() {
+        assert!(same_struct_identity("argument::Arguments", "Arguments"));
+        assert!(same_struct_identity("Arguments", "argument::Arguments"));
+        assert!(!same_struct_identity("foo::Bar", "baz::Bar"));
     }
 }

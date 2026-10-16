@@ -1606,14 +1606,18 @@ mod local_class {
             // lookup, which can itself run Python: nothing between the copy and
             // the callee rooting them allocates, so a collection cannot leave
             // the copies naming pre-move addresses.
-            let result = crate::typedef::r#type(obj)
-                .ok_or_else(|| crate::PyError::type_error("_local instance has no type"))
-                .and_then(|w_type| crate::baseobjspace::getattr_str(w_type.as_ptr(), "__init__"))
-                .and_then(|w_init| {
-                    let mut call_args = vec![obj];
-                    call_args.extend(unsafe { w_tuple_items_copy_as_vec(self.initargs) });
-                    self.call_init(w_init, &call_args)
-                });
+            let result = match crate::typedef::r#type(obj) {
+                None => Err(crate::PyError::type_error("_local instance has no type")),
+                Some(w_type) => match crate::baseobjspace::getattr_str(w_type.as_ptr(), "__init__")
+                {
+                    Err(err) => Err(err),
+                    Ok(w_init) => {
+                        let mut call_args = vec![obj];
+                        call_args.extend(unsafe { w_tuple_items_copy_as_vec(self.initargs) });
+                        self.call_init(w_init, &call_args)
+                    }
+                },
+            };
             if let Err(err) = result {
                 // failed, forget w_dict and propagate the exception
                 let key = w_int_new(ident);
@@ -1916,6 +1920,11 @@ fn local_type() -> PyObjectRef {
 /// W_Root.getdict dispatch for `os_local.Local.getdict`.  `None` means the
 /// receiver is not a `_local`; `Some(Err(..))` is the app-level `__init__` the
 /// first access from a thread runs (`os_local.py create_new_dict`) raising.
+///
+/// The typed downcast is a raw pointer cast the annotator residualizes
+/// (`cast_int_to_ptr`); `os_local.py Local.getdict` is not on the CALL_KW
+/// hot path, so the dispatch stays a residual.
+#[majit_macros::dont_look_inside]
 pub(crate) fn local_getdict(obj: PyObjectRef) -> Option<Result<PyObjectRef, crate::PyError>> {
     let local = W_Local::from_obj(obj)?;
     Some(local.current_dict())

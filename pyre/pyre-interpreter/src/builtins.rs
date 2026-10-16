@@ -6288,7 +6288,8 @@ pub fn arguments_pos_and_kwargs(
 pub fn arguments_has_keywords(args: &crate::argument::Arguments) -> bool {
     args.keyword_names_w
         .as_ref()
-        .is_some_and(|names| !names.is_empty())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// `[w_obj, ...arguments_w]` for a `PassThroughArguments1` constructor that
@@ -6693,7 +6694,14 @@ fn parse_single_required(
     let signature = crate::gateway::Signature::new(vec![name], None, None, 0, 0);
     let arguments = crate::argument::Arguments::positional_only(&refreshed_pos);
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
-    arguments.parse_into_scope(PY_NULL, &mut scope_w, fn_name, &signature, None, PY_NULL)?;
+    arguments.parse_into_scope(
+        PY_NULL,
+        &mut scope_w,
+        Wtf8::new(fn_name),
+        &signature,
+        &[],
+        PY_NULL,
+    )?;
     Ok(scope_w[0])
 }
 

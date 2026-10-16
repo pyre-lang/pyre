@@ -629,8 +629,13 @@ pub unsafe fn bytes_like_getitem(obj: PyObjectRef, index: usize) -> u8 {
 pub unsafe fn bytes_like_data(obj: PyObjectRef) -> &'static [u8] {
     unsafe {
         if is_bytes(obj) {
-            w_bytes_data(obj)
+            // `W_BytesObject._value` is the rstr; `chars` are the bytes.
+            bytes_block_chars(w_bytes_block(obj))
         } else {
+            // `W_BytearrayObject.getdata` returns the char list.
+            // `__repr__` builds `''.join(self._data[self._offset:-1])` from
+            // that list at the use site. The list's bytes are that join;
+            // the bytearray does not cache an rstr.
             crate::bytearrayobject::w_bytearray_data(obj)
         }
     }

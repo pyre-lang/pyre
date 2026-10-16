@@ -77,7 +77,12 @@
 //!     `Call(SyntheticTransparentCtor)` for later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
-//!     / __len / __nullary_*)`.
+//!     / __len / __nullary_*)`. `new_array_clear` is produced later by
+//!     `do_fixed_newlist_clear`, after the rtyper, so a `[i64; N]`
+//!     repeat stays the `__array_repeat(fill, count)` call here. The
+//!     result type is the dest's `Array<T;N>` so
+//!     `fixed_repeat_identity` can redirect without a later
+//!     `ArrayRead` / `ArrayWrite` of the same SSA.
 //!
 //! ### Terminators
 //!   - `Return` → `returnblock`.
@@ -5213,6 +5218,7 @@ fn splice_recorded_fat_dyn_returns(
 #[path = "shadow_stack_erase.rs"]
 mod shadow_stack_erase;
 pub use shadow_stack_erase::census as shadow_stack_erase_census;
+pub use shadow_stack_erase::erase_named as shadow_stack_erase_named;
 pub use shadow_stack_erase::{
     discover_depth_neutral_fns, discover_stack_fn_effects, discover_stack_leaves_above_fns,
     discover_stack_param_slots_fns, discover_stack_returns_index_fns, discover_stack_sensitive_fns,
@@ -5599,22 +5605,33 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         if !lo.result_exc_call_results.is_empty() {
             let carrier = static_addrs.error_carrier;
-            let foreign_sites =
-                crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
-            let mut conversions = Vec::with_capacity(foreign_sites.len());
-            for site in &foreign_sites {
-                conversions.push(
-                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty).map_err(
-                        |err| LowerError::Unsupported(format!("{}: {err}", lo.graph.name)),
-                    )?,
-                );
+            // `FromResidual::from_residual` of a foreign error becomes
+            // `Err(From::from(e))` raised as the carrier only when this
+            // graph *is* `Result<T, PyError>` (`result_exc_callee`).
+            // `argument.py _match_signature` raises `ArgErr` or
+            // `OperationError`; pyre returns `MatchOutcome` (not `Result`)
+            // and `parse_into_scope` catches `ArgErr`. A `from_residual` of
+            // `MatchSignatureError` is that function's own error arm, not a
+            // conversion into `PyError`.
+            if result_exc_callee {
+                let foreign_sites =
+                    crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
+                let mut conversions = Vec::with_capacity(foreign_sites.len());
+                for site in &foreign_sites {
+                    conversions.push(
+                        from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty)
+                            .map_err(|err| {
+                                LowerError::Unsupported(format!("{}: {err}", lo.graph.name))
+                            })?,
+                    );
+                }
+                crate::front::result_exc::apply_foreign_from_residuals(
+                    &mut lo.graph,
+                    &foreign_sites,
+                    &conversions,
+                )
+                .map_err(LowerError::Unsupported)?;
             }
-            crate::front::result_exc::apply_foreign_from_residuals(
-                &mut lo.graph,
-                &foreign_sites,
-                &conversions,
-            )
-            .map_err(LowerError::Unsupported)?;
             let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
                 &lo.result_exc_call_results,
@@ -11623,18 +11640,24 @@ impl<'a> Lowering<'a> {
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let mut field = FieldDescriptor::new(field_name, Some(owner_root.to_string()))
+            .with_owner_id(*owner_id)
+            .with_base_is_deref(true)
+            .with_inline_vec(
+                field_ty_is_inline_vec(field_ty, self.llbc)
+                    || field_ty_is_inline_vec(place_ty, self.llbc),
+            );
+        if tyref_rust_vec_item_kind(field_ty, self.llbc).is_some()
+            || tyref_rust_vec_item_kind(place_ty, self.llbc).is_some()
+        {
+            field = field.with_taken_by_address(true);
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::InteriorFieldRead {
                 base,
                 index,
-                field: FieldDescriptor::new(field_name, Some(owner_root.to_string()))
-                    .with_owner_id(*owner_id)
-                    .with_base_is_deref(true)
-                    .with_inline_vec(
-                        field_ty_is_inline_vec(field_ty, self.llbc)
-                            || field_ty_is_inline_vec(place_ty, self.llbc),
-                    ),
+                field,
                 item_ty,
                 array_type_id: Some(alias.array_type_id),
             },
@@ -15177,20 +15200,25 @@ impl<'a> Lowering<'a> {
                 self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
             }
-            // `Repeat(elem, ty, count)` — `[v; N]` literal. The decodable
-            // shape follows upstream `transform.py:36-50` and
-            // `rlist.py`: `newlist(fill)` followed by
-            // `mul(list, count)`, which the transform pass collapses to
-            // `alloc_and_set(count, fill)`.
+            // `Repeat(elem, elem_ty, count)` — `[v; N]` literal. The
+            // decodable shape follows upstream `transform.py` and
+            // `rlist.py`: `newlist(fill)` followed by `mul(list, count)`,
+            // which the transform pass collapses to `alloc_and_set`.
+            // `do_fixed_newlist_clear`'s `new_array_clear` is that later
+            // pass, so the repeat reaches the rtyper as
+            // `__array_repeat(fill, count)`. The transparent `Array` ctor
+            // is not equivalent: `Repeat` carries one fill value and a
+            // count, not per-slot `__pos_N` writes.
             //
-            // `__array_repeat` remains deliberately unregistered for the
-            // fallback shape when Charon supplies a const-generic reference
-            // that cannot be decoded. In that case the old 1-arg call is
-            // preserved verbatim and the graph follows its existing legacy
-            // walker path. The transparent `Array` ctor is not equivalent:
-            // `Repeat` carries one fill value and a count, not per-slot
-            // `__pos_N` writes.
-            Rvalue::Repeat(elem, _ty, count, _) => {
+            // The result is the list object (`newlist` / `OpKind::NewList`
+            // is `ValueType::Ref`). `rtype_alloc_and_set` concretetypes
+            // that pointer `GcRef`. Declaring `Int` makes the legacy
+            // walker `Signed` on the same variable. The dest's
+            // `Array<T;N>` is the ARRAY identity `fixed_repeat_identity`
+            // reads; `Ref(None)` leaves the rewrite to `LinkClasses`
+            // matching a later index of the same SSA, which address-of
+            // (`&mut mapping`) splits.
+            Rvalue::Repeat(elem, _elem_ty, count, _) => {
                 let arg = self.resolve_operand(mir_bb, elem)?;
                 let res = self
                     .graph
@@ -15206,7 +15234,7 @@ impl<'a> Lowering<'a> {
                             fun_decl_id: None,
                         },
                         args: crate::model::call_args(args),
-                        result_ty: ValueType::Ref(None),
+                        result_ty: repeat_array_result_ty(dest_ty, self.llbc),
                     }),
                     res,
                 ))
@@ -20903,6 +20931,14 @@ impl<'a> Lowering<'a> {
                             field_ty_is_inline_vec(&field_ty, self.llbc)
                                 || field_ty_is_inline_vec(&place_ty, self.llbc),
                         );
+                    // `RustVecRepr`: a one-word-item `Vec` is the header
+                    // address (`rewrite_op_getsubstruct`). `with_vec_part`
+                    // later clears this for Buf/Len so `.len()` stays a load.
+                    if tyref_rust_vec_item_kind(&field_ty, self.llbc).is_some()
+                        || tyref_rust_vec_item_kind(&place_ty, self.llbc).is_some()
+                    {
+                        field = field.with_taken_by_address(true);
+                    }
                     if dyn_vtable {
                         field = field.with_vec_part(crate::model::VecFieldPart::FatVtable);
                     }
@@ -28281,7 +28317,7 @@ impl<'a> Lowering<'a> {
                             }
                         } else {
                             OpKind::ArrayLen {
-                                base: args[0].clone(),
+                                base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
                                 array_type_id: self.slice_object_array_type_id(&reg),
                                 nolength: false,
                             }
@@ -28356,7 +28392,7 @@ impl<'a> Lowering<'a> {
                             }
                         } else {
                             OpKind::ArrayLen {
-                                base: args[0].clone(),
+                                base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
                                 array_type_id: self.slice_object_array_type_id(&reg),
                                 nolength: false,
                             }
@@ -28511,6 +28547,11 @@ impl<'a> Lowering<'a> {
                 // list annotation.  Same routing
                 // [`is_concrete_iter_constructor`] gives the container
                 // `iter`.
+                // `IntArray::len` / `FloatArray::len` are the same call:
+                // the receiver is the `{ block, len }` struct, so `__len`
+                // becomes `getattr("__len__")`. [`Self::is_container_len`]
+                // emits the `FieldRead` of `len` (`typed_array_len_owner`)
+                // instead of entering that body.
                 if args.len() == 1 && self.is_container_len(&reg) {
                     let res = self
                         .graph
@@ -37150,14 +37191,17 @@ impl<'a> Lowering<'a> {
     /// The length-prefixed containers `IntArray` / `FloatArray`
     /// (`pyre-object/src/int_array.rs` / `float_array.rs`) expose the same
     /// inherent `len()` whose body reads the nested LIST `length` word
-    /// (`rlist.py` `("length", Signed)`).  Entering the body dead-ends at
-    /// `AtomicUsize::load`; recognising the call emits a `FieldRead` of
-    /// `len` (`jtransform.py` `_handle_list_call` `list.int_len`).
+    /// (`rlist.py` `("length", Signed)`).  The receiver is the
+    /// `{ block, len }` struct, not a `SomeList`, so the read is that
+    /// field ([`Self::typed_array_len_owner`]), not `ListRepr.rtype_len`.
+    /// Entering the body dead-ends at `AtomicUsize::load`; recognising
+    /// the call emits a `FieldRead` of `len`
+    /// (`jtransform.py` `_handle_list_call` `list.int_len`).
     ///
     /// `FixedObjectArray::len` is *not* here: it goes to [`OpKind::ArrayLen`]
     /// via [`Self::is_object_array_len`], because its receiver is the
     /// virtualizable array and a `__len` call would pass that array as a
-    /// call argument. `Vec::len` is included: `rlist.ll_length` reads
+    /// call argument. `Vec::len` stays here: `rlist.ll_length` reads
     /// `l.length`, and a field named `"len"` is not that attribute.
     ///
     /// The FunDecl path is the container (`alloc::vec::<Impl>::len` /
@@ -37370,6 +37414,24 @@ impl<'a> Lowering<'a> {
     /// ARRAY identity of a `<[T]>::len` / `is_empty` receiver whose `T` is
     /// an object pointer. Every other slice keeps the identity-less length
     /// read. The identity string itself comes from [`slice_array_type_id`].
+    /// `<[PyObject]>::len` / `is_empty` sees the list, so `len` is
+    /// `AbstractListRepr.rtype_len`. A classdef-less receiver takes
+    /// `len_SomeInstance`, which looks up `__len__`.
+    fn object_slice_arraylen_base(
+        &mut self,
+        bb_id: BlockId,
+        reg: &RegularCall,
+        base: Variable,
+    ) -> Variable {
+        if self.slice_object_array_type_id(reg).is_none() {
+            return base;
+        }
+        self.narrow_value_to_instance_root(bb_id, crate::model::LinkArg::Value(base), "[PyObject]")
+            .as_variable()
+            .expect("an object-pointer slice base stays a Variable")
+            .clone()
+    }
+
     fn slice_object_array_type_id(&self, reg: &RegularCall) -> Option<String> {
         self.slice_swap_elem_tyref(reg)
             .is_some_and(|ty| output_type_is_objectptr(&ty, self.llbc))
@@ -41731,9 +41793,12 @@ impl<'a> Lowering<'a> {
         // projection manufactures an attribute no RPython object has.
         // A `Vec` of one-word items is instead the address of its raw
         // `{ptr, len, cap}` header, which is never null, so its `Option`
-        // keeps the tagged aggregate.
+        // keeps the tagged aggregate. `String` is that header too, but
+        // RPython has one nullable `SomeString`; the rust-heap spelling
+        // stays `Ref` for concat and is still a null-niche Option.
         match payload_path.as_deref() {
             Some("core::ptr::non_null::NonNull") => true,
+            Some("alloc::string::String") => true,
             Some("alloc::vec::Vec") => {
                 tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_none()
             }
@@ -64100,6 +64165,12 @@ fn dont_look_inside_return_token(
     if is_unit_type(kind_src, llbc) {
         return None;
     }
+    // A stored `fn` pointer (`get_eval_fn` → `EvalFn`) is `Ptr(FuncType)`.
+    // `history.getkind` banks it as int; the stub shell must stay `SomePtr`
+    // so a caller `simple_call` of the result is callable.
+    if let Some(spelling) = tyref_fn_ptr_spelling(kind_src, llbc) {
+        return Some(format!("fn:{spelling}"));
+    }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
     // A byte pointer stays on the `ref` arm below.
@@ -68434,15 +68505,23 @@ pub fn slice_array_type_id(spelling: &str) -> Option<String> {
 
 /// `local[i]` versus `(*p)[i]`. A deref's type is the pointee, so the
 /// borrow spelling is the parent's (`&[T; N]`, `*const [T; N]`).
+///
+/// `tyref_to_ast_string` strips `&T` / `&mut T` for nominal lookup.
+/// `fixed_array_index_identity` keys the length-prefixed ctor reader
+/// on that prefix (`borrowed_fixed_list_is_gcarray`); without it
+/// `(*mapping)[i]` of `&mut [i64; N]` is spelled `[i64; N]` and shares
+/// the headerless inline-field descr, so a later `mapping[j]` of the
+/// owned ctor value still sees the `-1` init.
 fn index_identity_inputs(place: &Place, llbc: &Llbc) -> (bool, String) {
-    let (value_local, ty) = match &place.kind {
-        PlaceKind::Local(_) => (true, &place.ty),
+    match &place.kind {
+        PlaceKind::Local(_) => (true, tyref_to_ast_string(&place.ty, llbc)),
         PlaceKind::Projection(parent, ProjectionElem::Atom(name)) if name == "Deref" => {
-            (false, &parent.ty)
+            let spelling = tyref_reference_layout_string(&parent.ty, llbc)
+                .unwrap_or_else(|| tyref_to_ast_string(&parent.ty, llbc));
+            (false, spelling)
         }
-        _ => (false, &place.ty),
-    };
-    (value_local, tyref_to_ast_string(ty, llbc))
+        _ => (false, tyref_to_ast_string(&place.ty, llbc)),
+    }
 }
 
 /// Pointee spelling and whether a borrow or pointer prefix was peeled.
@@ -69334,6 +69413,30 @@ fn tyref_positional_aggregate_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     node.as_object()
         .is_some_and(|body| body.contains_key("Array"))
         .then(|| format!("Array{suffix}"))
+}
+
+/// ARRAY identity of a `[T; N]` Repeat destination.
+///
+/// `fixed_repeat_identity` recovers ARRAY from a shaped `Array<T;N>`
+/// result. A `Ref(None)` marker depends on `LinkClasses` matching a
+/// later `ArrayRead` / `ArrayWrite` of the same SSA; taking the address
+/// of the local (`&mut mapping`) splits that class and the marker stays
+/// residual. Stamp the dest shape here so the rewrite does not need
+/// that alias.
+fn repeat_array_result_ty(dest_ty: &TyRef, llbc: &Llbc) -> ValueType {
+    if let Some(owner) = tyref_positional_aggregate_root(dest_ty, llbc)
+        && majit_ir::descr::is_shaped_array_name(&owner)
+    {
+        return ValueType::Ref(Some(owner));
+    }
+    let spelling = tyref_to_ast_string(dest_ty, llbc);
+    if let Some((item, n)) = shaped_array_parts(&spelling) {
+        let owner = format!("Array<{item};{n}>");
+        if majit_ir::descr::is_shaped_array_name(&owner) {
+            return ValueType::Ref(Some(owner));
+        }
+    }
+    ValueType::Ref(None)
 }
 
 /// The `TypeDeclRef` (`{"id", "generics", …}`) of a TyRef's ADT, after
@@ -80899,12 +81002,13 @@ mod tests {
         int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
         json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
         primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
-        scalar_replace_named_struct_aggregates, scalar_to_const_value, shaped_array_parts,
-        simplify_lowered_graph, static_key_segments, type_decl_is_closure_env, tyref_array_suffix,
-        tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-        tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type,
-        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
+        repeat_array_result_ty, scalar_replace_named_struct_aggregates, scalar_to_const_value,
+        shaped_array_parts, simplify_lowered_graph, static_key_segments, type_decl_is_closure_env,
+        tyref_array_suffix, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
+        tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
+        tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
+        tyref_to_attr_value_type, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+        tyref_tuple_suffix,
     };
     use crate::flowspace::model::{ConstValue, Variable};
     use crate::model::{
@@ -90134,6 +90238,17 @@ mod tests {
         assert_eq!(tyref_array_suffix(&array(i64_ty, "2"), &llbc), "<i64;2>");
         assert_eq!(tyref_array_suffix(&array(bool_ty, "1"), &llbc), "<bool;1>");
         assert_eq!(shaped_array_parts("Array<[i64;2];3>"), Some(("[i64;2]", 3)));
+        let i64_n = array(
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+            "64",
+        );
+        assert_eq!(
+            repeat_array_result_ty(&i64_n, &llbc),
+            ValueType::Ref(Some("Array<i64;64>".to_string()))
+        );
+        let scalar =
+            TyRef::Other(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}));
+        assert_eq!(repeat_array_result_ty(&scalar, &llbc), ValueType::Ref(None));
     }
 
     #[test]

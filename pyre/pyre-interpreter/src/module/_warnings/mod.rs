@@ -233,12 +233,19 @@ fn setup_context(
             pyre_object::gc_roots::shadow_stack_get(globals_slot),
         )
     } else {
-        let frame = unsafe { &*frame };
-        (
-            unsafe { crate::pycode::w_code_filename_obj(frame.fget_f_code()) },
-            frame.get_last_lineno() as i64,
-            frame.get_w_globals(),
-        )
+        // `get_last_lineno` reads `last_instr`. `hook_access_field` emits
+        // `jit_force_virtualizable` at that GETFIELD later; an explicit
+        // `jit_force_virtualizable` Call here is already in the rtyped
+        // graph `getcalldescr` extraeffect walks, and poisons elidable
+        // callers (`_get_attr_elidable` → `key_error_with_key` → repr).
+        // Reload through the anchor after `w_code_filename_obj`, which
+        // can collect.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        let lineno = unsafe { (*anchor.live()).get_last_lineno() } as i64;
+        let filename =
+            unsafe { crate::pycode::w_code_filename_obj((*anchor.live()).fget_f_code()) };
+        let globals = unsafe { (*anchor.live()).get_w_globals() };
+        (filename, lineno, globals)
     };
     let pair = pyre_object::gc_roots::pin_roots(&[filename, globals]);
     let filename_slot = pair;

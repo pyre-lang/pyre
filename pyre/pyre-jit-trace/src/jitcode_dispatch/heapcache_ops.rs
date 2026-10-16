@@ -21,9 +21,11 @@ use super::*;
 /// there; that shadow holds the same MIFrame box value, so it answers after
 /// the ordinary OpRef carrier rather than instead of it.
 ///
-/// A null and an all-ones word are both rejected: null is no object, and
-/// all-ones is the `vable_setfield` storage placeholder, which says "no
-/// concrete known" rather than naming one.
+/// A null, an all-ones word, and `GcRef::NO_CONCRETE` are all rejected:
+/// null is no object, all-ones is the `vable_setfield` storage placeholder,
+/// and `NO_CONCRETE` is the stamp for a box with no materialized
+/// recording-time pointer (a virtual `NEW`). None of those name a live
+/// object the blackhole can load from.
 fn concrete_ref_operand_ptr<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -34,7 +36,9 @@ fn concrete_ref_operand_ptr<Sym: WalkSym>(
     ctx.trace_ctx
         .box_value(obj)
         .and_then(|value| match value {
-            majit_ir::Value::Ref(reference) => Some(reference.0 as i64),
+            majit_ir::Value::Ref(reference) if reference != majit_ir::GcRef::NO_CONCRETE => {
+                Some(reference.0 as i64)
+            }
             _ => None,
         })
         .or_else(
@@ -43,7 +47,57 @@ fn concrete_ref_operand_ptr<Sym: WalkSym>(
                 _ => None,
             },
         )
-        .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64)
+        .filter(|&ptr| {
+            ptr != 0 && ptr != usize::MAX as i64 && ptr != majit_ir::GcRef::NO_CONCRETE.0 as i64
+        })
+}
+
+/// A pointer the blackhole can load a GC field from.
+///
+/// Dynasm `raw_mem_ptr` only refuses `addr == 0`, so `bh_getfield_gc_i` of
+/// a first-page word (struct_ptr=4, offset 0) SIGSEGVs. Those bit patterns
+/// are not objects; the walk declines and the helper residualizes.
+fn is_plausible_gc_object_ptr(ptr: i64) -> bool {
+    ptr > 4095
+}
+
+/// A GETFIELD / GETARRAYITEM miss that would call `execute_and_record`
+/// (`pyjitpl.py` `_opimpl_getfield_gc_any_pureornot` /
+/// `_do_getarrayitem_gc_any`) needs a live object the blackhole can load.
+///
+/// `GcRef::NO_CONCRETE` is "no recording-time value", not a pointer: the
+/// heapcache must already have been consulted, and a miss with no other
+/// concrete cannot execute.
+fn unexecutable_gc_load_receiver(
+    concrete_ptr: Option<i64>,
+    box_value: Option<majit_ir::Value>,
+) -> bool {
+    if concrete_ptr.is_some_and(|ptr| !is_plausible_gc_object_ptr(ptr)) {
+        return true;
+    }
+    match box_value {
+        Some(majit_ir::Value::Ref(reference)) if reference == majit_ir::GcRef::NO_CONCRETE => {
+            concrete_ptr.is_none()
+        }
+        Some(majit_ir::Value::Ref(reference))
+            if !is_plausible_gc_object_ptr(reference.0 as i64) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn decline_unexecutable_gc_load(
+    concrete_ptr: Option<i64>,
+    box_value: Option<majit_ir::Value>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if unexecutable_gc_load_receiver(concrete_ptr, box_value) {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
+    } else {
+        Ok(())
+    }
 }
 
 /// The live value of a store's value operand, or `None` where the walk holds
@@ -253,6 +307,11 @@ fn headerless_const_index(index: OpRef, index_value: i64, descr: &majit_ir::Desc
 ///   heapcache.getarrayitem_now_known(arraybox, indexbox, resop, arraydescr)
 ///   return resop
 ///
+/// A receiver the blackhole cannot load — including `GcRef::NO_CONCRETE`
+/// with no shadow pointer — declines only after a cache miss. The
+/// ConstPtr+ConstInt pure bypass (`opimpl_getarrayitem_gc_*_pure`) still
+/// runs first and only dereferences a plausible pointer.
+///
 /// `opcode` is one of `GetarrayitemGc{I,R,F}`; `dst_bank` selects the
 /// result bank (`'i'`/`'r'`/`'f'`) the walker writes back into.  The
 /// index operand is always int-classified, so it is decoded from the
@@ -268,11 +327,13 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
     let index = read_int_reg(code, op, 1, ctx)?;
     let descr = read_descr(code, op, 2, ctx)?;
     let descr_index = descr.index();
+    let array_ptr_now = concrete_ref_operand_ptr(code, op, 0, array, ctx);
 
     // `_opimpl_getarrayitem_gc_pure_any`: directly-constant array and
     // index operands bypass the heapcache completely — execute the load
     // now and substitute a `Const`, with no profiler counts (the bypass
     // calls `executor.execute`, not `execute_and_record`).
+    // Plausibility is checked on this load, not before the heapcache.
     let is_pure = matches!(
         opcode,
         OpCode::GetarrayitemGcPureI | OpCode::GetarrayitemGcPureR | OpCode::GetarrayitemGcPureF
@@ -288,7 +349,7 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             ctx.trace_ctx.box_value(index),
         ) {
             let array_ptr = array_ref.0 as i64;
-            if array_ptr != 0
+            if is_plausible_gc_object_ptr(array_ptr)
                 && array_ptr != usize::MAX as i64
                 && (index_in_array_bounds(ctx, array_ptr, index_value, &descr)
                     || headerless_const_index(index, index_value, &descr))
@@ -348,6 +409,11 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
         );
         cached
     } else {
+        // `_do_getarrayitem_gc_any` (`pyjitpl.py`) looks up the heapcache
+        // first; only a miss reaches `execute_with_descr`. Decline a
+        // receiver the blackhole cannot load — including `NO_CONCRETE`
+        // with no shadow pointer — so the helper residualizes.
+        decline_unexecutable_gc_load(array_ptr_now, ctx.trace_ctx.box_value(array), op.pc)?;
         ctx.trace_ctx
             .profiler()
             .count_ops(opcode, majit_metainterp::counters::OPS);
@@ -374,7 +440,6 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
         // and `indexbox.getint()`. A bridge or inlined helper can hold those
         // on the MIFrame register shadow when the OpRef itself was not
         // stamped in this recorder (`concrete_ref_operand_ptr`).
-        let array_ptr = concrete_ref_operand_ptr(code, op, 0, array, ctx);
         let index_value = match ctx.trace_ctx.box_value(index) {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => match read_int_reg_concrete(code, op, 1, ctx) {
@@ -383,7 +448,7 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             },
         };
         let live_value = if let (Some(ty), Some(array_ptr), Some(index_value)) =
-            (load_type, array_ptr, index_value)
+            (load_type, array_ptr_now, index_value)
         {
             // A helper walk can put a Ref bit-pattern in an Int index
             // register.  `bh_getarrayitem_gc_r` then SIGBUS
@@ -634,10 +699,12 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
 /// materialized for a `new_array` / `new_array_clear` recorded in this
 /// trace, write the concrete element into it so a later BUILD_LIST /
 /// BUILD_TUPLE residual reads a complete block during the walk. If the
-/// element value (not a ref) or the index has no known concrete, the
-/// block cannot be completed, so revert the array to the no-concrete
-/// sentinel (`Ref(usize::MAX)`): the residual then declines and the void
-/// store aborts, exactly as without materialization.
+/// element value has no known concrete, or the value's bank disagrees
+/// with the block, the block cannot be completed, so revert the array
+/// to the no-concrete sentinel (`Ref(usize::MAX)`): the residual then
+/// declines and the void store aborts, exactly as without materialization.
+/// A `GcArray(Signed)` block stores the `i64` (`setarrayitem_gc_i`).
+/// Scalar items are not GC pointers, so that store is not a write barrier.
 ///
 /// A real heap array store — whose `array` operand is a `GetfieldGcR`
 /// load of a pre-existing container's items block — is left untouched,
@@ -731,6 +798,28 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     if idx >= cap {
         ctx.trace_ctx
             .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+        return;
+    }
+    // `GcArray(Signed)` (`try_alloc_typed_items_block`) shares the
+    // capacity word with `ItemsBlock` but its slots are `i64`, not
+    // pointers. Writing a ref into it would publish an integer as a
+    // traced pointer; writing an int into an `ItemsBlock` would do the
+    // reverse. The header tid is the one `gc_int_array_gc_type_id`
+    // published at GC init.
+    let int_tid = pyre_object::gc_int_array_gc_type_id();
+    let payload_tid = unsafe { (*majit_gc::header::header_of(block as usize)).type_id() };
+    if int_tid != 0 && payload_tid == int_tid {
+        let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(value) else {
+            ctx.trace_ctx
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+            return;
+        };
+        unsafe {
+            let base = pyre_object::typed_items_block_items_base(
+                block as *mut pyre_object::TypedItemsBlock,
+            );
+            *(base as *mut i64).add(idx) = n;
+        }
         return;
     }
     let elem = match ctx.trace_ctx.box_value(value) {
@@ -1281,7 +1370,10 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
                 && let Some(value) = ctx.trace_ctx.box_value(valuebox)
             {
                 let struct_ptr = struct_ref.0 as i64;
-                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
+                if struct_ref != majit_ir::GcRef::NO_CONCRETE
+                    && struct_ptr != usize::MAX as i64
+                    && is_plausible_gc_object_ptr(struct_ptr)
+                {
                     // `box_value` already resolved a ConstPtr to the table
                     // slot's live pointer. Pin across `field_store`: the
                     // barrier is an allocation.
@@ -1310,7 +1402,9 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
             let (offset, size, ty) = (fd.offset(), fd.field_size(), fd.field_type());
             let obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
             let value = concrete_store_value_operand(code, op, 1, value_bank, valuebox, ctx);
-            let before = obj_ptr.and_then(|p| ctx.trace_ctx.field_sanity_load(p, &descr, ty));
+            let before = obj_ptr
+                .filter(|&p| is_plausible_gc_object_ptr(p))
+                .and_then(|p| ctx.trace_ctx.field_sanity_load(p, &descr, ty));
             walker_execute_gc_store(
                 ctx,
                 obj_ptr,
@@ -1356,12 +1450,15 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 /// value as a Const literal with no recorded op.
 ///
 /// Walker behaviour mirrors `_opimpl_getfield_gc_any_pureornot`
-/// uniformly: heapcache hit returns the cached box (no IR op);
-/// heapcache miss records the opcode the dispatch selected +
-/// writes through. RPython aliases the `_pure` jitcode spelling to
+/// uniformly: ConstPtr+always-pure folds first (`opimpl_getfield_gc_*`),
+/// then a heapcache hit returns the cached box (no IR op), then a miss
+/// records the opcode the dispatch selected and writes through. A
+/// receiver the blackhole cannot load — including `GcRef::NO_CONCRETE`
+/// with no shadow pointer — declines only on that miss path.
+/// RPython aliases the `_pure` jitcode spelling to
 /// the plain opimpl (`pyjitpl.py`), so both spellings record the
 /// plain opnum here; the optimizer re-derives purity from
-/// `descr.is_always_pure()` (`heap.py:641` const fold +
+/// `descr.is_always_pure()` (`heap.py` const fold +
 /// invalidation-exempt field cache). There is no post-trace rewrite
 /// to the Pure opcodes.
 ///
@@ -1380,8 +1477,11 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let descr_index = descr.index();
     let concrete_obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
     // The cache-miss record below appends to `opencoder.py Trace._ops` and can
-    // minor-collect before the sanity load reads the receiver.
-    let obj_pin = concrete_obj_ptr.and_then(|p| residual_call::owner_root_if_gc(p as usize));
+    // minor-collect before the sanity load reads the receiver. Pin only a
+    // pointer the blackhole could load; `NO_CONCRETE` is not one.
+    let obj_pin = concrete_obj_ptr
+        .filter(|&ptr| is_plausible_gc_object_ptr(ptr))
+        .and_then(|ptr| residual_call::owner_root_if_gc(ptr as usize));
 
     // ConstPtr + always-pure fast path (pyjitpl.py): a constant
     // source through an immutable descr loads the field now and
@@ -1395,16 +1495,15 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         };
         let struct_ptr = concrete_obj_ptr;
         match (load_type, struct_ptr) {
-            (Some(ty), Some(p)) => {
-                ctx.trace_ctx
-                    .field_sanity_load(p, &descr, ty)
-                    .map(|v| match v {
-                        majit_ir::Value::Int(n) => ctx.trace_ctx.const_int(n),
-                        majit_ir::Value::Ref(r) => ctx.trace_ctx.const_ref(r.0 as i64),
-                        majit_ir::Value::Float(f) => ctx.trace_ctx.const_float(f.to_bits() as i64),
-                        _ => unreachable!("field_sanity_load returns Int/Ref/Float only"),
-                    })
-            }
+            (Some(ty), Some(p)) if is_plausible_gc_object_ptr(p) => ctx
+                .trace_ctx
+                .field_sanity_load(p, &descr, ty)
+                .map(|v| match v {
+                    majit_ir::Value::Int(n) => ctx.trace_ctx.const_int(n),
+                    majit_ir::Value::Ref(r) => ctx.trace_ctx.const_ref(r.0 as i64),
+                    majit_ir::Value::Float(f) => ctx.trace_ctx.const_float(f.to_bits() as i64),
+                    _ => unreachable!("field_sanity_load returns Int/Ref/Float only"),
+                }),
             _ => None,
         }
     } else {
@@ -1428,12 +1527,12 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         && ctx.trace_ctx.heap_cache().is_class_known(obj)
     {
         match (concrete_obj_ptr, opcode) {
-            (Some(p), OpCode::GetfieldGcI) => {
+            (Some(p), OpCode::GetfieldGcI) if is_plausible_gc_object_ptr(p) => {
                 let cls =
                     unsafe { (*(p as *const pyre_object::pyobject::PyObject)).ob_type as i64 };
                 Some(ctx.trace_ctx.const_int(cls))
             }
-            (Some(p), OpCode::GetfieldGcR) => {
+            (Some(p), OpCode::GetfieldGcR) if is_plausible_gc_object_ptr(p) => {
                 let cls =
                     unsafe { (*(p as *const pyre_object::pyobject::PyObject)).ob_type as i64 };
                 Some(ctx.trace_ctx.const_ref(cls))
@@ -1462,6 +1561,11 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         );
         cached
     } else {
+        // `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py`) consults the
+        // heapcache first; only a miss reaches `execute_with_descr`. A
+        // first-page word SIGSEGVs in `bh_getfield_gc_i`; `NO_CONCRETE`
+        // with no shadow pointer cannot execute either.
+        decline_unexecutable_gc_load(concrete_obj_ptr, ctx.trace_ctx.box_value(obj), op.pc)?;
         // Recording a `getfield_gc_*` whose FieldDescr lacks a parent_descr
         // backreference would later crash the optimizer's
         // `ensure_ptr_info_arg0` (`optimizer.py`).  Inside a sub-walk
@@ -1540,6 +1644,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         let concrete_obj_ptr =
             concrete_obj_ptr.map(|p| obj_pin.as_ref().map_or(p, |pin| pin.get().0 as i64));
         if let (Some(ty), Some(struct_ptr)) = (load_type, concrete_obj_ptr)
+            && is_plausible_gc_object_ptr(struct_ptr)
             && let Some(live_value) = ctx.trace_ctx.field_sanity_load(struct_ptr, &descr, ty)
         {
             if let majit_ir::Value::Ref(reference) = live_value {
@@ -1952,5 +2057,27 @@ mod tests {
             super::materialize_cleared_struct_gcarray(8, published, item_size, items_base)
                 .is_some()
         );
+    }
+
+    /// `_opimpl_getfield_gc_any_pureornot` / `_do_getarrayitem_gc_any`
+    /// (`pyjitpl.py`) consult the heapcache first. `NO_CONCRETE` is "no
+    /// value", so a miss without a shadow pointer cannot execute; a
+    /// first-page word is an invalid pointer the blackhole must not load.
+    #[test]
+    fn unexecutable_gc_load_receiver_treats_no_concrete_as_missing_not_invalid() {
+        let no_concrete = majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE);
+        assert!(super::unexecutable_gc_load_receiver(
+            None,
+            Some(no_concrete)
+        ));
+        assert!(!super::unexecutable_gc_load_receiver(
+            Some(0x1000),
+            Some(no_concrete)
+        ));
+        assert!(super::unexecutable_gc_load_receiver(
+            Some(4),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(4)))
+        ));
+        assert!(!super::unexecutable_gc_load_receiver(None, None));
     }
 }

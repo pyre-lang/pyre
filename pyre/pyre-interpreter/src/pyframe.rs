@@ -1634,6 +1634,7 @@ pub unsafe fn alloc_fixed_array_with_header(
 
 /// Allocate a frame locals array in the lifetime regime selected by its owner.
 /// The old-gen form is the type-9 GcArray layout `[GcHeader | len | items]`.
+#[majit_macros::dont_look_inside]
 unsafe fn alloc_frame_locals_array(
     len: usize,
     fill: pyre_object::PyObjectRef,
@@ -2208,6 +2209,11 @@ impl FrameBox {
 /// Creation therefore walks the live ExecutionContext from its current top
 /// frame, using the PyPy no-hidden-frame traversal, and records summaries in
 /// most-recent-first order.
+///
+/// Residual: `Vec::into_iter().map` is not a registered graph
+/// (`vec::into_iter::IntoIter::map`). Origin tracking is off the CALL_KW
+/// hot path (`sys.set_coroutine_origin_tracking_depth`).
+#[majit_macros::dont_look_inside]
 fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
     if ec.is_null() {
         return w_none();
@@ -2247,12 +2253,12 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
         summary_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
         frame = crate::executioncontext::ExecutionContext::getnextframe_nohidden(anchor.live());
     }
-    w_tuple_new(
-        summary_slots
-            .into_iter()
-            .map(pyre_object::gc_roots::shadow_stack_get)
-            .collect(),
-    )
+    let n = summary_slots.len();
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n {
+        items.push(pyre_object::gc_roots::shadow_stack_get(summary_slots[i]));
+    }
+    w_tuple_new(items)
 }
 
 impl std::ops::Deref for FrameBox {
@@ -6355,19 +6361,25 @@ impl PyFrame {
     }
 
     /// pyframe.py `make_arguments` — build Arguments from the value
-    /// stack. `methodcall` and `w_function` are stored on the resulting
-    /// Arguments for diagnostic use (better error messages on argument
-    /// mismatch); pyre's call path currently passes only the positional
-    /// vector, so the parameters are recorded as part of the parity contract
-    /// without downstream consumers yet.
+    /// stack. `methodcall` is stored on the resulting Arguments for
+    /// diagnostic use (better error messages on argument mismatch).
+    /// `w_function` is the `__init__` diagnostic operand; pyre's
+    /// `Arguments` carries it only into `_combine_wrapped`, which this
+    /// path does not invoke.
     #[inline]
     pub fn make_arguments(
         &self,
         nargs: usize,
-        _methodcall: bool,
+        methodcall: bool,
         _w_function: PyObjectRef,
-    ) -> Vec<PyObjectRef> {
-        self.peekvalues(nargs)
+    ) -> crate::argument::Arguments {
+        crate::argument::Arguments::from_owned_vecs(
+            self.peekvalues(nargs),
+            None,
+            None,
+            true,
+            methodcall,
+        )
     }
 
     /// PyPy-compatible argument list builder.
@@ -7143,7 +7155,11 @@ pub fn createframe_obj(
         let _root = FrameLocalsRoot::new(frame.as_mut_ptr());
         frame.initialize_frame_scopes(outer_ref, _roots.get(root_base) as *const ())?;
     }
-    remember_frame_locals_array(frame.locals_cells_stack_w);
+    // Same pointer stored on the frame. `PyFrame::new` remembers that
+    // local; a getfield of `locals_cells_stack_w` on the boxed frame
+    // would enter `vable_array_vars` and `_check_no_vable_array` would
+    // reject the call argument (`jtransform.py`).
+    remember_frame_locals_array(locals_cells_stack_w);
 
     Ok(frame)
 }

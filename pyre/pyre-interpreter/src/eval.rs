@@ -6412,13 +6412,12 @@ impl OpcodeStepExecutor for PyFrame {
     // Stack: [callable, self_or_null, arg1, ..., argN, kwarg_names_tuple]
     /// CALL_KW — call with keyword arguments.
     ///
-    /// PyPy: argument.py _match_signature
     /// Stack: [callable, null_or_self, arg0..argN-1, kwarg_names_tuple]
     /// The last `len(kwarg_names)` args are keyword args.
     ///
-    /// Keyword resolution happens HERE (before frame creation) so the
-    /// JIT eval loop sees correctly-positioned locals. PyPy does this
-    /// in Arguments.parse_into_scope before the frame executes.
+    /// Packs the names tuple + value tail into `Arguments` (`CALL_FUNCTION_KW`
+    /// `argument_factory`) then `space.call_args`. Binding is
+    /// `Arguments.parse_into_scope` / `_match_signature`.
     /// `pyopcode.py CALL_FUNCTION_KW` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
     fn call_kw(&mut self, nargs: usize) -> Result<(), PyError> {

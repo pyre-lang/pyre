@@ -46,6 +46,8 @@
 //! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (kind-flow territory). |
 //! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py _do_getarrayitem_gc_any`. All three `_i` / `_r` / `_f` result shapes are wired to this same heapcache body (kind-keyed dst bank, dispatch arms below) and registered in `wellknown_bh_insns()` (`insns.rs`) for blackhole execution + codewriter emission. |
 //! | `setarrayitem_gc_r/rird`, `setarrayitem_gc_r/rcrd` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. The `rcrd` `c`-argcode form (USE_C_FORM `assembler.py/312`) decodes the index as one inline signed byte → ConstInt; same recording body otherwise. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (kind-flow). |
+//! | `getarrayitem_raw_i/iid>i` | PARITY | `pyjitpl.py opimpl_getarrayitem_raw_i` / `blackhole.py bhimpl_getarrayitem_raw_i` (`iid>i`). Int-bank array pointer + index + descr; records `GetarrayitemRawI`. When both operands are concrete the walk performs the load (`bh_getarrayitem_raw_i`) and stamps the word, same as `raw_load_i`. No heapcache. |
+//! | `getarrayitem_raw_f/iid>f` | PARITY | Float twin of `getarrayitem_raw_i`. Records `GetarrayitemRawF`. The Float bank carries no concrete shadow, matching `raw_load_f`. |
 //! | `strlen/r>i`, `strgetitem/ri>i`, `strgetitem/rc>i` | PARITY | `pyjitpl.py opimpl_strlen` / `opimpl_strgetitem` — `self.execute(rop.STRLEN/STRGETITEM, ...)`. Live result stamped via `cpu.bh_strlen` / `bh_strgetitem` so a later `goto_if_not` can take the observed branch. |
 //! | `newstr/{i,c}>r`, `strsetitem/r{i,c}{i,c}`, `copystrcontent/rr{i,c}{i,c}{i,c}` | PARITY | `pyjitpl.py opimpl_newstr` / `opimpl_strsetitem` / `opimpl_copystrcontent` — `self.execute(rop.NEWSTR/STRSETITEM/COPYSTRCONTENT, ...)`. `cpu.bh_newstr` allocates the live STR; a store or copy runs when every operand is live and in bounds. |
 //! | `residual_call_r_r/iRd>r` | TODO (`direct_assembler_call` + `capture_resumedata` not yet wired) | classifies the call by `EffectInfo`. Wired sub-cases: (1) libffi via [`direct_libffi_call`] — checked first, on `OopSpecIndex::LibffiCall`; parses the `CIF_DESCRIPTION_P` through [`libffi_call_plan`] and records one `GETARRAYITEM_RAW` per argument slot before the `CALL_RELEASE_GIL_*`, declining to the `resbox is None` fallthrough on an unsupported kind; (2) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (3) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py + 2109`; (4) vable IR bookkeeping (`pyjitpl.py`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap halves of the token protocol (`vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` and the after-call `vinfo.tracing_after_residual_call`, `pyjitpl.py`) are bracketed around the concrete callee execution by [`try_execute_residual_call_via_executor`], which arms TOKEN_TRACING_RESCALL before the call and probe-and-clears it after, surfacing [`DispatchError::VableEscapedDuringResidualCall`] on a detected force (`pyjitpl.py` ABORT_ESCAPE parity). The vref halves of the bracket ARE called by the walker, under the same `is_may_force` gate, and their loops are NOT empty: [`walker_ec_enter`] takes a vref of every seeded callee frame through `TraceCtx::opimpl_virtual_ref` (`ExecutionContext.enter`'s vref), so `virtualref_boxes` carries real pairs. Measured over 431 synth + 93 parity fixtures: 5487 bracket entries, of which 686 (12.5%) saw at least one pair and 66 of 316 emitting fixtures reached a nonzero count, up to 7 pairs. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (pyre-jit's `flatten.rs`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_assembler_call` specialization (`pyjitpl.py` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py → 2586`). |
@@ -6192,6 +6194,15 @@ unsafe fn raw_load_int(addr: *const u8, itemsize: usize, signed: bool) -> i64 {
     }
 }
 
+/// Address of item `index` in a raw array whose header is `base_size`
+/// bytes and whose items are `itemsize` bytes. `index` is non-negative;
+/// the caller checks that before this wraps.
+fn raw_array_item_ptr(array: i64, index: i64, base_size: usize, itemsize: usize) -> *mut u8 {
+    (array as usize)
+        .wrapping_add(base_size)
+        .wrapping_add((index as usize).wrapping_mul(itemsize)) as *mut u8
+}
+
 /// Store counterpart of [`raw_load_int`] — `bhimpl_raw_store_i`.
 ///
 /// # Safety
@@ -8049,7 +8060,17 @@ struct InlineParentFrame {
     jitcode_index: u32,
     /// The caller CALL opcode's JitCode pc. A nested inline-capture abort
     /// carries this native coordinate to the interpreter-flush boundary.
+    /// `Some` arms `WalkEndResume::Rewind` and re-executes that call. A
+    /// bridge root leaves this unset; the call position is `call_pc`.
     call_jitcode_pc: Option<usize>,
+    /// Jitcode pc of the CALL this frame is paused in. The handler records
+    /// that position, then sets `MIFrame.pc` to the first byte after the
+    /// opcode before the callee runs. Not the Rewind coordinate above.
+    call_pc: Option<usize>,
+    /// Post-call resume pc. `MIFrame.pc` while the callee runs, and the pc
+    /// half of `AbstractResumeDataReader.read_jitcode_pos_pc` restored by
+    /// `MIFrame.setup_resume_at_op`. Includes a trailing `-live-`.
+    resume_pc: Option<usize>,
     /// Concrete operand-stack slots at the caller CALL, keyed by absolute
     /// `locals_cells_stack_w` index. Used only by the abort-point flush.
     call_stack_overrides: Vec<(usize, pyre_object::PyObjectRef)>,
@@ -8062,8 +8083,8 @@ struct InlineParentFrame {
     /// Python-native consumers resolve this at their boundary.
     resume_coord: ParentResumeCoord,
     /// Codewrite-time jitcode-keyed marker for the CALL fallthrough resume
-    /// point, queried at the CALL site.  Bridge-root frames have no CALL
-    /// offset in hand and carry `None`.
+    /// point, queried at the CALL site. Same word as `resume_pc` when the
+    /// paused frame has a valid jitcode offset.
     resume_marker_jit_pc: Option<usize>,
     /// The caller's `in_a_call` active boxes at its resolved resume pc — the liveness
     /// at the return point with the not-yet-produced call-result slot nulled
@@ -8072,8 +8093,9 @@ struct InlineParentFrame {
     /// Live `MIFrame.registers_{r,i,f}` of the paused caller, plus the
     /// walker extras on `WalkFrameState`. `MetaInterp.replace_box` writes
     /// these in place (`pyjitpl.py replace_box` → `replace_active_box_in_frame`).
-    /// `None` on a reconstructed resume image that has no live walk
-    /// (bridge reconstruct, ctor continuation).
+    /// `consume_boxes` (`resume.py`) fills these on a bridge root, null refs
+    /// included. `None` when that bank was not captured (ctor continuation,
+    /// empty list).
     registers_r: Option<RegisterBank>,
     registers_i: Option<RegisterBank>,
     registers_f: Option<RegisterBank>,
@@ -8224,6 +8246,19 @@ struct InlineParentBlackhole {
     float_values: Vec<(usize, OpRef)>,
 }
 
+/// The instruction whose next byte is `resume_pc`.
+///
+/// The handler sets `MIFrame.pc` to the first byte after the opcode before
+/// the callee runs. `AbstractResumeDataReader.read_jitcode_pos_pc` restores
+/// that word through `MIFrame.setup_resume_at_op`. The CALL's jitcode pc is
+/// the opcode that ends at that word; the opcode name is not consulted.
+pub(crate) fn jitcode_op_ending_at(
+    code: &[u8],
+    resume_pc: usize,
+) -> Option<crate::jitcode_runtime::DecodedOp> {
+    crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
+}
+
 /// The derivation flavor of a paused caller frame's Python resume pc.
 #[derive(Clone, Copy)]
 enum ParentResumeCoord {
@@ -8254,6 +8289,8 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
         // The tail has no Python code object and so no Python pc. `Backxlat`
@@ -8296,6 +8333,8 @@ pub(crate) fn operator_continuation_parent_frame(
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
         // The tail has no Python code object and so no Python pc. `Backxlat`
@@ -8344,6 +8383,27 @@ impl<'a> WalkSessionRoots<'a> {
             _area: area,
             _session: session,
         }
+    }
+}
+
+fn walk_paused_register_bank(
+    bank: &Option<RegisterBank>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let Some(bank) = bank else {
+        return;
+    };
+    if bank.is_empty() {
+        return;
+    }
+    // `ConstPtr` stores its `GcRef` by value. Walk a copy, then write the
+    // forwarded word back into the shared bank (`OpRef::walk_const_ptr_refs_mut`).
+    let mut values = bank.to_vec();
+    for value in &mut values {
+        value.walk_const_ptr_refs_mut(visitor);
+    }
+    for (index, value) in values.into_iter().enumerate() {
+        bank.set(index, value);
     }
 }
 
@@ -8396,6 +8456,11 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
             for (_, value) in &mut parent.call_stack_overrides {
                 walk_ptr(value, visitor);
             }
+            // `MIFrame.registers_*` on a bridge root hold ConstPtr boxes,
+            // including nulls. Forward those slots in place.
+            walk_paused_register_bank(&parent.registers_r, visitor);
+            walk_paused_register_bank(&parent.registers_i, visitor);
+            walk_paused_register_bank(&parent.registers_f, visitor);
             if let Some(blackhole) = parent.blackhole.as_mut() {
                 for (_, value) in &mut blackhole.ref_values {
                     walk_ptr(value, visitor);
@@ -9918,6 +9983,12 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     {
         return create_segmented_trace(ctx, jit_pc, py_pc as usize, true);
     }
+    // `opimpl_loop_header` (`pyjitpl.py`) only stamps
+    // `seen_loop_header_for_jdindex`. The close is `opimpl_jit_merge_point`
+    // on the `jit_merge_point` emitted at the loop-header block
+    // (`handle_jit_marker__jit_merge_point`, `jtransform.py`). This
+    // synthesized boundary records `DEBUG_MERGE_POINT` and the segmenting
+    // check above.
     Ok(None)
 }
 
@@ -14735,6 +14806,7 @@ fn handle<Sym: WalkSym>(
             } else {
                 OpCode::GetarrayitemRawI
             };
+
             let array = read_int_reg(code, op, 0, ctx)?;
             let index = read_int_reg(code, op, 1, ctx)?;
             let descr = read_descr(code, op, 2, ctx)?;
