@@ -7473,9 +7473,10 @@ impl<M: Clone> MetaInterp<M> {
         portal_pc: usize,
     ) -> crate::TraceAction {
         // rlib/jit.py we_are_jitted: true during tracing and blackholing
-        // so the jitted arm is the one recorded. The residual hook
-        // otherwise reads JIT_MODE_FLAG, which is only set in compiled
-        // code, and would keep interpreter-only reload/ticker in the trace.
+        // so the jitted arm is the one recorded. Residual helpers from
+        // compiled assembler see `_we_are_jitted == 0`
+        // (`CDefinedIntSymbolic`); without this guard the residual hook
+        // would keep interpreter-only reload/ticker in the trace.
         // `_compile_and_run_once` catches `SwitchToBlackhole` with this
         // stack still on the metainterp. Later `abort_trace` calls stage
         // it; the bytecode walker does not.

@@ -43,7 +43,6 @@ pub mod module;
 /// The interpreter does not depend on this crate. The final binary calls
 /// [`register`] before `install_builtin_modules`.
 pub fn install_optional_modules() {
-    pyre_interpreter::importing::register_builtin_module("_bisect", module::_bisect::init);
     pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
     #[cfg(all(
         feature = "host_env",
@@ -71,7 +70,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_codecs_kr", module::_codecs_kr::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_tw", module::_codecs_tw::init);
     pyre_interpreter::importing::register_builtin_module("_hashlib", module::_hashlib::init);
-    pyre_interpreter::importing::register_builtin_module("_heapq", module::_heapq::init);
     pyre_interpreter::importing::register_builtin_module("_json", module::_json::init);
     pyre_interpreter::importing::register_builtin_module("_lsprof", module::_lsprof::init);
     pyre_interpreter::importing::register_builtin_module("_lzma", module::_lzma::init);

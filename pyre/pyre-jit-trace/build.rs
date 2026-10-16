@@ -135,6 +135,11 @@ fn emit_llbc_extraction_placeholders() {
     )
     .unwrap();
     std::fs::write(
+        format!("{out_dir}/ei_descr_lookups.bin"),
+        bincode::serialize(&Vec::<u8>::new()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
         format!("{out_dir}/field_mint_census.bin"),
         bincode::serialize(&majit_ir::descr::FieldMintCensus::default()).unwrap(),
     )

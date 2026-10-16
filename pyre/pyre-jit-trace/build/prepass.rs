@@ -34,7 +34,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v23";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v24";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -78,6 +78,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "ei_descr_mints_index.bin",
     "ei_descr_stamps.bin",
     "ei_descr_stamps_index.bin",
+    "ei_descr_lookups.bin",
     "field_mint_census.bin",
     "liveness.bin",
     "fnaddr_bindings.bin",
@@ -116,7 +117,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
 /// `descrs_index.bin`, `descr_layouts_index.bin`, `effect_infos_index.bin`,
 /// `ei_descr_mints.bin`, `ei_descr_mints_index.bin`, `ei_descr_stamps.bin`,
-/// `ei_descr_stamps_index.bin`,
+/// `ei_descr_stamps_index.bin`, `ei_descr_lookups.bin`,
 /// `liveness.bin`.
 /// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
@@ -1710,6 +1711,65 @@ fn real_main() {
             false
         });
 
+        // `effectinfo.compute_bitstrings` already assigned every raw-set
+        // member an `ei_index`; `GcCache.setup_descrs` already numbered the
+        // opcode-published subset. Collapse those two tables into one dense
+        // slot space (stamps, then mints) and rewrite each EffectInfo's
+        // structural spellings as indices into it, so the runtime pass is
+        // an index lookup rather than a `descr_from_set_member` walk of
+        // every membership. Drop the duplicated `DescrSetMember` strings
+        // from the serialized EffectInfo; they are not part of the
+        // translated object (`effectinfo.py`).
+        let mut member_index = std::collections::BTreeMap::new();
+        for (i, (member, _)) in frozen_stamps.iter().enumerate() {
+            member_index.insert(member.clone(), i as u32);
+        }
+        let stamp_count = frozen_stamps.len();
+        for (i, entry) in frozen_mints.iter().enumerate() {
+            member_index.insert(
+                entry.member.clone(),
+                u32::try_from(stamp_count + i).expect("too many frozen descriptor slots"),
+            );
+        }
+        // Opcode layouts can publish a field `GcCache.setup_descrs` already
+        // numbered without a mint-log row. Those members still live in some
+        // EffectInfo raw set; give them slots after the mint table and resolve
+        // them with `descr_from_set_member` once gccache is populated.
+        let mut leftover_set = std::collections::BTreeSet::new();
+        for effect_info in frozen_effect_infos.values() {
+            let Some(keys) = effect_info.descr_set_keys.as_ref() else {
+                continue;
+            };
+            for member in keys.iter_members() {
+                if !member_index.contains_key(member) {
+                    leftover_set.insert(member.clone());
+                }
+            }
+        }
+        let frozen_lookups: Vec<_> = leftover_set.into_iter().collect();
+        let mint_count = frozen_mints.len();
+        for (i, member) in frozen_lookups.iter().enumerate() {
+            member_index.insert(
+                member.clone(),
+                u32::try_from(stamp_count + mint_count + i)
+                    .expect("too many frozen descriptor slots"),
+            );
+        }
+        let mut frozen_slots: std::collections::BTreeMap<
+            u32,
+            Option<majit_ir::effectinfo::DescrSetSlots>,
+        > = std::collections::BTreeMap::new();
+        for (translated_id, effect_info) in &mut frozen_effect_infos {
+            let slots = effect_info
+                .descr_set_keys
+                .as_ref()
+                .map(|keys| keys.to_slots(&member_index));
+            if effect_info.descr_set_keys.is_some() {
+                effect_info.descr_set_keys = Some(majit_ir::effectinfo::DescrSetKeysImage::Empty);
+            }
+            frozen_slots.insert(*translated_id, slots);
+        }
+
         // Persist `pipeline.jitcodes` (RPython `all_jitcodes` returned by
         // codewriter.py `make_jitcodes`) as individually encoded entries plus a name/offset
         // index. Runtime materializes entries lazily into the shared
@@ -1960,7 +2020,11 @@ fn real_main() {
         let mut effect_info_offsets = Vec::with_capacity(frozen_effect_infos.len() + 1);
         effect_info_offsets.push(0_u32);
         for (translated_id, effect_info) in &frozen_effect_infos {
-            effect_infos_bin.extend(bincode::serialize(&(*translated_id, effect_info)).unwrap());
+            let slots = frozen_slots
+                .get(translated_id)
+                .expect("every frozen EffectInfo has a slot image");
+            effect_infos_bin
+                .extend(bincode::serialize(&(*translated_id, effect_info, slots)).unwrap());
             effect_info_offsets.push(
                 u32::try_from(effect_infos_bin.len())
                     .expect("serialized effect_infos.bin exceeds the u32 offset range"),
@@ -2043,6 +2107,13 @@ fn real_main() {
         std::fs::write(
             format!("{out_dir}/ei_descr_stamps_index.bin"),
             &ei_descr_stamps_index_bin,
+        )
+        .unwrap();
+
+        let ei_descr_lookups_bin = bincode::serialize(&frozen_lookups).unwrap();
+        std::fs::write(
+            format!("{out_dir}/ei_descr_lookups.bin"),
+            &ei_descr_lookups_bin,
         )
         .unwrap();
 

@@ -318,9 +318,6 @@ cargo test -p pyre-jit --no-default-features --features dynasm,prepass
   pyre/check.py --build no --backend dynasm target/jit-core/pyre-dynasm`
   measures it, with the same `requires-modules` skips as the cranelift leg.
   JIT counters (`.jitstats`) are comparable; wall-clock ratios are not.
-  `synth/foriter_setadd_call_consuming_body` reports a jit-stats change
-  there: without `_heapq` it runs the pure-Python `heapq`, which only its
-  cranelift baseline records.
 - The core loop does not replace the full gate below. When the full gate is
   due (see "How much to verify"), it is the product `cargo test` and a bare
   `python3 pyre/check.py`, not their core variants.

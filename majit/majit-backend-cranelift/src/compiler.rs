@@ -10971,7 +10971,16 @@ fn run_compiled_code_inner(
     let func: unsafe extern "C" fn(*mut i64, i32) -> *mut i64 =
         unsafe { std::mem::transmute(code_ptr) };
 
-    let _jitted_guard = majit_backend::JittedGuard::enter();
+    // Residual helpers from this call see `we_are_jitted() == false`.
+    // `rlib/jit.py` `_we_are_jitted` is `CDefinedIntSymbolic('0 /* we are not
+    // jitted here */')`; `jtransform.py Transformer.rewrite_op_int_is_true`
+    // folds the symbolic to True only inside traces. Tracing and blackholing
+    // set the flag via `JittedGuard` (`pyjitpl.py MetaInterp._interpret`,
+    // `blackhole.py`). Holding it across `func()` made cranelift residual
+    // `send_ex` (`generator.py send_ex`) take `generatorentry_driver` and
+    // compile a FINISH-only entry-bridge with no `ResumeGuardDescr.handle_fail`
+    // bridge. Dynasm `run_compiled_frame` and this file's `run_done_raw_entry`
+    // already leave the flag unset.
 
     // assembler.py:1074 _call_header_shadowstack and assembler.py:1101
     // _call_footer_shadowstack are emitted as inline MOVs in compiled
@@ -11042,7 +11051,6 @@ fn run_compiled_code_inner(
     // Values stay in jf_frame — no copying.
     let jf_gcref = GcRef(result_jf as usize);
 
-    drop(_jitted_guard);
     JitExecResult {
         jf_gcref,
         heap_owner,

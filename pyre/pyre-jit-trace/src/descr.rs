@@ -13401,7 +13401,8 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
 /// asserts.
 ///
 /// Outcome of looking one serialized raw-set member back up.
-enum SetMemberLookup {
+#[derive(Clone)]
+pub(crate) enum SetMemberLookup {
     /// The gccache holds the slot the analyzer minted through.
     Resolved(majit_ir::DescrRef),
     /// The *container* (`STRUCT` / `ARRAY`) is absent from this process's
@@ -13419,7 +13420,7 @@ enum SetMemberLookup {
     /// Two exact-key publishes hold it at zero inside the `Once` in
     /// `jitcode_runtime::rehydrate_build_descr_raw_sets`: `make_descr_from_bh`
     /// forces the matching module-scope group before each opcode layout, and
-    /// `publish_effect_info_descr_mints` does the same for slots only a raw set
+    /// `publish_effect_info_descr_mint` does the same for slots only a raw set
     /// names. `descrs.bin` — upstream's `opcode_descrs`, not its `all_descrs`
     /// — does not carry the latter.
     ///
@@ -13506,65 +13507,60 @@ enum SetMemberLookup {
 /// or not any operation names the field, and `descr.py setup_descrs`
 /// then snapshots that gccache into `all_descrs`.  So a raw-set-only descr
 /// referenced by no trace op is normal, not a sign of a mis-keyed publish.
-pub(crate) fn publish_effect_info_descr_mints(entries: &[majit_ir::effectinfo::DescrMintEntry]) {
+/// Publish one EffectInfo-only gccache slot and return the descriptor
+/// `get_field_descr` / `get_array_descr` / `get_interiorfield_descr` stored.
+///
+/// The returned `Arc` is the stamp/mint table entry the frozen EffectInfo
+/// raw sets index into; callers must not look the same member up again.
+pub(crate) fn publish_effect_info_descr_mint(
+    entry: &majit_ir::effectinfo::DescrMintEntry,
+) -> Option<majit_ir::DescrRef> {
     use majit_ir::descr::LLType;
     use majit_ir::effectinfo::{DescrMintSpec, DescrSetMember};
 
-    for entry in entries {
-        let descr = match (&entry.member, &entry.spec) {
-            (
-                DescrSetMember::Field {
-                    struct_id,
-                    field_name,
-                },
-                spec,
-            ) => mint_field(LLType::Struct(*struct_id), field_name, spec)
-                .map(|descr| descr as majit_ir::DescrRef),
-            (DescrSetMember::Array { array_id }, spec) => {
-                mint_array(LLType::Array(*array_id), spec)
-            }
-            (
-                DescrSetMember::InteriorField { array_id, name },
-                DescrMintSpec::InteriorField {
-                    array,
-                    field_struct_id,
-                    field_name,
-                    field,
-                },
-            ) => {
-                let array_key = LLType::Array(*array_id);
-                let Some(array_descr) = mint_array(array_key.clone(), array)
-                    .and_then(majit_ir::descr::descr_arc_as_array_descr)
-                else {
-                    continue;
-                };
-                // `descr.py fielddescr = get_field_descr(gc_ll_descr,
-                // REALARRAY.OF, name)` — the element struct's own slot, then
-                // `:436 InteriorFieldDescr(arraydescr, fielddescr)`.
-                let Some(field_descr) =
-                    mint_field(LLType::Struct(*field_struct_id), field_name, field)
-                else {
-                    continue;
-                };
-                Some(majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
-                    array_key,
-                    name.clone(),
-                    String::new(),
-                    array_descr,
-                    field_descr,
-                ))
-            }
-            // A member paired with a spec of another shape cannot describe its
-            // own slot; leaving it unpublished keeps it counted as absent
-            // rather than filling the slot with the wrong layout.
-            _ => None,
-        };
-        if let Some(descr) = descr
-            && entry.ei_index != u32::MAX
-        {
-            descr.set_ei_index(entry.ei_index);
+    let descr = match (&entry.member, &entry.spec) {
+        (
+            DescrSetMember::Field {
+                struct_id,
+                field_name,
+            },
+            spec,
+        ) => mint_field(LLType::Struct(*struct_id), field_name, spec)
+            .map(|descr| descr as majit_ir::DescrRef),
+        (DescrSetMember::Array { array_id }, spec) => mint_array(LLType::Array(*array_id), spec),
+        (
+            DescrSetMember::InteriorField { array_id, name },
+            DescrMintSpec::InteriorField {
+                array,
+                field_struct_id,
+                field_name,
+                field,
+            },
+        ) => {
+            let array_key = LLType::Array(*array_id);
+            let array_descr = mint_array(array_key.clone(), array)
+                .and_then(majit_ir::descr::descr_arc_as_array_descr)?;
+            // `descr.py fielddescr = get_field_descr(gc_ll_descr,
+            // REALARRAY.OF, name)` — the element struct's own slot, then
+            // InteriorFieldDescr(arraydescr, fielddescr).
+            let field_descr = mint_field(LLType::Struct(*field_struct_id), field_name, field)?;
+            Some(majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
+                array_key,
+                name.clone(),
+                String::new(),
+                array_descr,
+                field_descr,
+            ))
         }
+        // A member paired with a spec of another shape cannot describe its
+        // own slot; leaving it unpublished keeps it counted as absent
+        // rather than filling the slot with the wrong layout.
+        _ => None,
+    }?;
+    if entry.ei_index != u32::MAX {
+        descr.set_ei_index(entry.ei_index);
     }
+    Some(descr)
 }
 
 /// `descr.py:234-238` — bind the parent size descr, then mint the field.
@@ -13706,7 +13702,10 @@ fn set_member_label(m: &majit_ir::effectinfo::DescrSetMember) -> String {
     }
 }
 
-fn record_set_member_lookup(m: &majit_ir::effectinfo::DescrSetMember, out: &SetMemberLookup) {
+pub(crate) fn record_set_member_lookup(
+    m: &majit_ir::effectinfo::DescrSetMember,
+    out: &SetMemberLookup,
+) {
     let mut ledger = SET_MEMBER_LEDGER.lock();
     match out {
         SetMemberLookup::Resolved(_) => ledger.resolved += 1,
@@ -13887,7 +13886,7 @@ fn is_gil_ready_struct(struct_id: u64) -> bool {
     .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
 }
 
-fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
+pub(crate) fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
     use majit_ir::descr::{LLType, gc_cache};
 
     match m {
@@ -13962,33 +13961,8 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
     }
 }
 
-/// Replay `EffectInfo.compute_bitstrings`'s `descr.ei_index = ...` mutation
-/// for a member whose descriptor was already published through
-/// `Assembler.descrs`. The caller deliberately carries no mint spec: reaching
-/// a cache miss here means the build-time opcode/member join was wrong, and
-/// minting a replacement would hide an identity split PyPy cannot represent.
-/// A size is published, but this field is not on it. The caller can
-/// still install the opcode `BhDescr::Field` that names the same struct
-/// (`GcEntries.items` sits past the fixed `length` word).
-pub(crate) fn ambiguous_field_struct(
-    member: &majit_ir::effectinfo::DescrSetMember,
-) -> Option<(u64, &str)> {
-    match descr_from_set_member(member) {
-        SetMemberLookup::Ambiguous => match member {
-            majit_ir::effectinfo::DescrSetMember::Field {
-                struct_id,
-                field_name,
-            } => Some((*struct_id, field_name.as_str())),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-pub(crate) fn stamp_effect_info_descr(
-    member: &majit_ir::effectinfo::DescrSetMember,
-    ei_index: u32,
-) {
+#[cfg(test)]
+fn stamp_effect_info_descr(member: &majit_ir::effectinfo::DescrSetMember, ei_index: u32) {
     match descr_from_set_member(member) {
         SetMemberLookup::Resolved(descr) => descr.set_ei_index(ei_index),
         SetMemberLookup::AbsentContainer => {
@@ -14146,66 +14120,52 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
     ei._write_descrs_interiorfields = Some(write_interiorfields);
 }
 
-/// Validate a translated EffectInfo's structural raw-set image without
-/// retaining the rehydrated `Vec<DescrRef>` graph.
+/// Restore `single_write_descr_array` from build-time slot indices into
+/// the stamp-then-mint-then-lookup table filled by
+/// `rehydrate_build_descr_raw_sets`.
 ///
-/// RPython discards the six raw frozensets after translation has run
-/// `compute_bitstrings`; the translated object retains the compact bitstrings,
-/// and each descriptor retains `ei_index`. Pyre's earlier runtime rehydration
-/// rebuilt those translation-only frozensets solely because partitioning had
-/// been delayed across the process boundary. Once the build artifact carries
-/// both outputs, resolving every member here is an invariant check, not
-/// runtime state construction. `single_write_descr_array` is the one raw
-/// descriptor reference EffectInfo deliberately keeps after compaction
-/// (`effectinfo.py`), so that singleton alone remains live.
-pub fn prepare_frozen_effect_info(ei: &mut majit_ir::EffectInfo) {
-    // Shared with `rehydrate_effect_info` rather than spelled out again: the
-    // two had drifted, and this one was clearing only the compacted sets while
-    // the six `_*_descrs_*` kept the `Some(vec![])` that `EffectInfo::default()`
-    // seeds and serde skips.
+/// `effectinfo.compute_bitstrings` already compacted the six frozensets
+/// into bitstrings, and `GcCache.setup_descrs` already numbered the
+/// descriptors. The structural spellings are not part of the translated
+/// object (`effectinfo.py`); walking them again at run time was a
+/// process-boundary artifact. The indices are that numbering.
+pub fn prepare_frozen_effect_info_from_slots(
+    ei: &mut majit_ir::EffectInfo,
+    slots: Option<majit_ir::effectinfo::DescrSetSlots>,
+    resolved: &[Option<majit_ir::DescrRef>],
+) {
     use degrade_to_random_effects as degrade;
 
-    let Some(keys) = ei.descr_set_keys.take() else {
+    ei.descr_set_keys.take();
+    let Some(slots) = slots else {
         if ei.extraeffect != majit_ir::ExtraEffect::RandomEffects {
             degrade(ei);
         }
         return;
     };
-    let resolve = |members: &[majit_ir::effectinfo::DescrSetMember]| {
-        let mut out = Vec::with_capacity(members.len());
-        let mut complete = true;
-        for member in members {
-            let looked_up = descr_from_set_member(member);
-            record_set_member_lookup(member, &looked_up);
-            match looked_up {
-                SetMemberLookup::Resolved(descr) => out.push(descr),
-                SetMemberLookup::AbsentContainer | SetMemberLookup::Ambiguous => complete = false,
-            }
+    let slot_ok = |index: u32| {
+        resolved
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .is_some()
+    };
+    if !resolved.iter().all(Option::is_some) {
+        let complete = slots
+            .readonly_fields
+            .iter()
+            .chain(&slots.write_fields)
+            .chain(&slots.readonly_arrays)
+            .chain(&slots.write_arrays)
+            .chain(&slots.readonly_interiorfields)
+            .chain(&slots.write_interiorfields)
+            .all(|&index| slot_ok(index));
+        if !complete {
+            degrade(ei);
+            return;
         }
-        complete.then_some(out)
-    };
-    let resolved = (
-        resolve(&keys.readonly_fields),
-        resolve(&keys.write_fields),
-        resolve(&keys.readonly_arrays),
-        resolve(&keys.write_arrays),
-        resolve(&keys.readonly_interiorfields),
-        resolve(&keys.write_interiorfields),
-    );
-    let (
-        Some(_readonly_fields),
-        Some(_write_fields),
-        Some(_readonly_arrays),
-        Some(write_arrays),
-        Some(_readonly_interiorfields),
-        Some(_write_interiorfields),
-    ) = resolved
-    else {
-        degrade(ei);
-        return;
-    };
-    ei.single_write_descr_array = match write_arrays.as_slice() {
-        [only] => Some(only.clone()),
+    }
+    ei.single_write_descr_array = match slots.write_arrays.as_slice() {
+        [only] => resolved.get(*only as usize).and_then(Clone::clone),
         _ => None,
     };
 }
@@ -14334,45 +14294,43 @@ mod degrade_shape_tests {
     /// `writes_field_descr_by_identity`, the unsound direction.
     #[test]
     fn both_degrade_paths_clear_the_raw_sets_too() {
-        for (label, prepare) in [
-            (
-                "prepare_frozen_effect_info",
-                prepare_frozen_effect_info as fn(&mut majit_ir::EffectInfo),
-            ),
-            (
-                "rehydrate_effect_info",
-                rehydrate_effect_info as fn(&mut majit_ir::EffectInfo),
-            ),
-        ] {
-            // A concrete classification with no key channel — the shape whose
-            // sets cannot be rebuilt, so it must fall back to the wildcard.
-            let mut ei = majit_ir::EffectInfo {
-                extraeffect: majit_ir::ExtraEffect::CanRaise,
-                descr_set_keys: None,
-                ..majit_ir::EffectInfo::default()
-            };
-            // The premise: `default()` really does seed the raw sets, so
-            // clearing them is not vacuous.
-            assert!(ei._write_descrs_fields.is_some(), "{label}: premise");
+        // A concrete classification with no key channel — the shape whose
+        // sets cannot be rebuilt, so it must fall back to the wildcard.
+        let mut ei = majit_ir::EffectInfo {
+            extraeffect: majit_ir::ExtraEffect::CanRaise,
+            descr_set_keys: None,
+            ..majit_ir::EffectInfo::default()
+        };
+        // The premise: `default()` really does seed the raw sets, so
+        // clearing them is not vacuous.
+        assert!(
+            ei._write_descrs_fields.is_some(),
+            "rehydrate_effect_info: premise"
+        );
 
-            prepare(&mut ei);
+        rehydrate_effect_info(&mut ei);
 
-            assert_eq!(
-                ei.extraeffect,
-                majit_ir::ExtraEffect::RandomEffects,
-                "{label}"
-            );
-            assert!(ei._readonly_descrs_fields.is_none(), "{label}");
-            assert!(ei._write_descrs_fields.is_none(), "{label}");
-            assert!(ei._readonly_descrs_arrays.is_none(), "{label}");
-            assert!(ei._write_descrs_arrays.is_none(), "{label}");
-            assert!(ei._readonly_descrs_interiorfields.is_none(), "{label}");
-            assert!(ei._write_descrs_interiorfields.is_none(), "{label}");
-            assert!(ei.write_descrs_fields.is_none(), "{label}");
-            assert!(ei.single_write_descr_array.is_none(), "{label}");
-            assert!(ei.can_collect, "{label}");
-            assert!(ei.can_invalidate, "{label}");
-        }
+        assert_eq!(ei.extraeffect, majit_ir::ExtraEffect::RandomEffects);
+        assert!(ei._readonly_descrs_fields.is_none());
+        assert!(ei._write_descrs_fields.is_none());
+        assert!(ei._readonly_descrs_arrays.is_none());
+        assert!(ei._write_descrs_arrays.is_none());
+        assert!(ei._readonly_descrs_interiorfields.is_none());
+        assert!(ei._write_descrs_interiorfields.is_none());
+        assert!(ei.write_descrs_fields.is_none());
+        assert!(ei.single_write_descr_array.is_none());
+        assert!(ei.can_collect);
+        assert!(ei.can_invalidate);
+
+        let mut ei = majit_ir::EffectInfo {
+            extraeffect: majit_ir::ExtraEffect::CanRaise,
+            descr_set_keys: None,
+            ..majit_ir::EffectInfo::default()
+        };
+        prepare_frozen_effect_info_from_slots(&mut ei, None, &[]);
+        assert_eq!(ei.extraeffect, majit_ir::ExtraEffect::RandomEffects);
+        assert!(ei._write_descrs_fields.is_none());
+        assert!(ei.can_invalidate);
     }
 }
 
@@ -14574,7 +14532,7 @@ mod set_member_lookup_tests {
             "nothing has named this container yet"
         );
 
-        publish_effect_info_descr_mints(&[DescrMintEntry {
+        let _ = publish_effect_info_descr_mint(&DescrMintEntry {
             member: member.clone(),
             spec: DescrMintSpec::Field {
                 struct_size: 24,
@@ -14587,7 +14545,7 @@ mod set_member_lookup_tests {
                 index_in_parent: 1,
             },
             ei_index: u32::MAX,
-        }]);
+        });
 
         let SetMemberLookup::Resolved(descr) = descr_from_set_member(&member) else {
             panic!("the published slot must resolve");

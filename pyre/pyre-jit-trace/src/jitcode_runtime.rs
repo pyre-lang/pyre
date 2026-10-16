@@ -1433,7 +1433,13 @@ fn effect_info_count() -> usize {
     effect_info_offsets().len() - 1
 }
 
-fn load_effect_info(index: usize) -> (u32, majit_ir::EffectInfo) {
+fn load_effect_info(
+    index: usize,
+) -> (
+    u32,
+    majit_ir::EffectInfo,
+    Option<majit_ir::effectinfo::DescrSetSlots>,
+) {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/effect_infos.bin"));
     let offsets = effect_info_offsets();
     let start = offsets[index] as usize;
@@ -1450,7 +1456,7 @@ fn load_effect_info(index: usize) -> (u32, majit_ir::EffectInfo) {
 /// Indexed `pipeline.ei_descr_mints` — gccache slots named only by an
 /// EffectInfo raw set, paired with the arguments their mint took.
 ///
-/// See `descr::publish_effect_info_descr_mints` for why the opcode table alone
+/// See `descr::publish_effect_info_descr_mint` for why the opcode table alone
 /// leaves these slots empty on this side of the build/runtime split.  Entries
 /// are decoded independently so setup never retains all 2,000+ string-heavy
 /// mint specs at once.
@@ -1530,6 +1536,75 @@ fn load_ei_descr_stamp(index: usize) -> (majit_ir::effectinfo::DescrSetMember, u
             BYTES.len(),
         )
     })
+}
+
+/// Opcode-published raw-set members that have no mint-log row. The stamp/mint
+/// tables already number `compute_bitstrings` / `GcCache.setup_descrs`; these
+/// leftover spellings occupy the slots after that pair and are resolved once
+/// gccache is populated.
+fn load_ei_descr_lookups() -> Vec<majit_ir::effectinfo::DescrSetMember> {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_lookups.bin"));
+    if BYTES.is_empty() {
+        return Vec::new();
+    }
+    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize ei_descr_lookups.bin \
+             ({} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+}
+
+fn resolve_frozen_stamp(index: usize) -> Option<majit_ir::DescrRef> {
+    let (member, ei_index) = load_ei_descr_stamp(index);
+    let mut lookup = crate::descr::descr_from_set_member(&member);
+    if matches!(lookup, crate::descr::SetMemberLookup::Ambiguous)
+        && let majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id,
+            field_name,
+        } = &member
+    {
+        publish_kind0_field(*struct_id, field_name);
+        lookup = crate::descr::descr_from_set_member(&member);
+    }
+    crate::descr::record_set_member_lookup(&member, &lookup);
+    match lookup {
+        crate::descr::SetMemberLookup::Resolved(descr) => {
+            descr.set_ei_index(ei_index);
+            Some(descr)
+        }
+        crate::descr::SetMemberLookup::AbsentContainer => {
+            panic!("opcode-published EffectInfo member has no runtime container: {member:?}")
+        }
+        crate::descr::SetMemberLookup::Ambiguous => {
+            panic!("opcode-published EffectInfo member is ambiguous at runtime: {member:?}")
+        }
+    }
+}
+
+fn resolve_frozen_mint(index: usize) -> Option<majit_ir::DescrRef> {
+    let entry = load_ei_descr_mint(index);
+    let lookup = match crate::descr::publish_effect_info_descr_mint(&entry) {
+        Some(descr) => crate::descr::SetMemberLookup::Resolved(descr),
+        None => crate::descr::SetMemberLookup::AbsentContainer,
+    };
+    crate::descr::record_set_member_lookup(&entry.member, &lookup);
+    match lookup {
+        crate::descr::SetMemberLookup::Resolved(descr) => Some(descr),
+        _ => None,
+    }
+}
+
+fn resolve_frozen_lookup(
+    member: &majit_ir::effectinfo::DescrSetMember,
+) -> Option<majit_ir::DescrRef> {
+    let lookup = crate::descr::descr_from_set_member(member);
+    crate::descr::record_set_member_lookup(member, &lookup);
+    match lookup {
+        crate::descr::SetMemberLookup::Resolved(descr) => Some(descr),
+        _ => None,
+    }
 }
 
 /// Analyzer-side release census captured at the end of the build-script
@@ -1863,12 +1938,12 @@ fn register_array_layout(
 ///
 /// What is left eager here is eager because it must be.
 /// `descr::descr_from_set_member` is lookup-only by construction, and
-/// `descr::prepare_frozen_effect_info` resolves each EffectInfo's six raw sets
-/// exactly once and degrades the whole EffectInfo to `RandomEffects` when any
-/// member is unresolvable — a container published afterwards cannot repair it.
-/// Deferring pass 2 or pass 3 therefore buys an unmeasured amount of memory
-/// against a silent optimizer downgrade that surfaces only as
-/// `descr_set_absent` rising off zero.
+/// `descr::prepare_frozen_effect_info_from_slots` indexes the stamp/mint
+/// table those lookups fill. A member unresolvable at that moment degrades
+/// the whole EffectInfo to `RandomEffects` — a container published afterwards
+/// cannot repair it. Deferring pass 2 or pass 3 therefore buys an unmeasured
+/// amount of memory against a silent optimizer downgrade that surfaces only
+/// as `descr_set_absent` rising off zero.
 /// Type id of the packed parent at `index` in `descr_layouts.bin`.
 fn descr_layout_type_id(index: usize) -> u64 {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
@@ -1921,12 +1996,16 @@ pub fn rehydrate_build_descr_raw_sets() {
         // `compute_bitstrings` partition stamp. PyPy mutates that one cached
         // descriptor object in place; replaying the complete mint spec would
         // re-run a cache-miss recipe against a slot that is already full.
+        //
+        // The stamp-then-mint-then-lookup order is the dense slot space the
+        // frozen EffectInfo raw sets index into (`DescrSetKeys::to_slots`).
+        // Resolve each distinct member once and keep the `DescrRef`; every
+        // EffectInfo membership is then an index lookup.
+        let leftover = load_ei_descr_lookups();
+        let mut resolved: Vec<Option<majit_ir::DescrRef>> =
+            Vec::with_capacity(ei_descr_stamp_count() + ei_descr_mint_count() + leftover.len());
         for i in 0..ei_descr_stamp_count() {
-            let (member, ei_index) = load_ei_descr_stamp(i);
-            if let Some((struct_id, field_name)) = crate::descr::ambiguous_field_struct(&member) {
-                publish_kind0_field(struct_id, field_name);
-            }
-            crate::descr::stamp_effect_info_descr(&member, ei_index);
+            resolved.push(resolve_frozen_stamp(i));
         }
         // Last, and only into what is still empty: the slots no opcode names,
         // which `descrs.bin` — RPython's `opcode_descrs`, not its `all_descrs`
@@ -1944,17 +2023,20 @@ pub fn rehydrate_build_descr_raw_sets() {
         // passed to get_*_descr do not.  Drop the decoded strings/specs as
         // soon as their canonical runtime descriptors have been published.
         for i in 0..ei_descr_mint_count() {
-            let entry = load_ei_descr_mint(i);
-            crate::descr::publish_effect_info_descr_mints(std::slice::from_ref(&entry));
+            resolved.push(resolve_frozen_mint(i));
+        }
+        for member in &leftover {
+            resolved.push(resolve_frozen_lookup(member));
         }
         // `effectinfo.compute_bitstrings` has already run in the translator.
-        // Resolve the structural spellings once per canonical EffectInfo,
-        // retain only its compact bitstrings/single-write descriptor, and
-        // publish the object table before any CallDescr asks for an id.
+        // Each EffectInfo carries slot indices into `resolved` rather than
+        // structural spellings; retain only its compact bitstrings and
+        // single-write descriptor, and publish the object table before any
+        // CallDescr asks for an id.
         for i in 0..effect_info_count() {
-            let (translated_id, mut effect_info) = load_effect_info(i);
+            let (translated_id, mut effect_info, slots) = load_effect_info(i);
             crate::runtime_fnaddr_patch::rewrite_call_release_gil_target(&mut effect_info);
-            crate::descr::prepare_frozen_effect_info(&mut effect_info);
+            crate::descr::prepare_frozen_effect_info_from_slots(&mut effect_info, slots, &resolved);
             majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
         }
         // Call/JitCode slots stay lazy across the Rust build/runtime-image
@@ -3900,27 +3982,28 @@ mod tests {
             )
         };
 
+        let leftover = load_ei_descr_lookups();
+        let mut resolved: Vec<Option<majit_ir::DescrRef>> =
+            Vec::with_capacity(ei_descr_stamp_count() + ei_descr_mint_count() + leftover.len());
         for i in 0..ei_descr_stamp_count() {
-            let (member, ei_index) = load_ei_descr_stamp(i);
-            if let Some((struct_id, field_name)) = crate::descr::ambiguous_field_struct(&member) {
-                publish_kind0_field(struct_id, field_name);
-            }
-            crate::descr::stamp_effect_info_descr(&member, ei_index);
+            resolved.push(resolve_frozen_stamp(i));
         }
         let after_stamps = rss_kb();
         let heap_after_stamps = crate::allocation_counter::live_bytes();
 
         for i in 0..ei_descr_mint_count() {
-            let entry = load_ei_descr_mint(i);
-            crate::descr::publish_effect_info_descr_mints(std::slice::from_ref(&entry));
+            resolved.push(resolve_frozen_mint(i));
+        }
+        for member in &leftover {
+            resolved.push(resolve_frozen_lookup(member));
         }
         let after_mints = rss_kb();
         let heap_after_mints = crate::allocation_counter::live_bytes();
 
         for i in 0..effect_info_count() {
-            let (translated_id, mut effect_info) = load_effect_info(i);
+            let (translated_id, mut effect_info, slots) = load_effect_info(i);
             crate::runtime_fnaddr_patch::rewrite_call_release_gil_target(&mut effect_info);
-            crate::descr::prepare_frozen_effect_info(&mut effect_info);
+            crate::descr::prepare_frozen_effect_info_from_slots(&mut effect_info, slots, &resolved);
             majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
         }
         let after_effect_infos = rss_kb();

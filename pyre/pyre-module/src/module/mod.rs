@@ -1,8 +1,6 @@
 //! Builtin modules that are not part of interpreter bootstrap.
 
 #[allow(non_snake_case)]
-pub mod _bisect;
-#[allow(non_snake_case)]
 pub mod _blake2;
 #[allow(non_snake_case)]
 #[cfg(all(
@@ -30,8 +28,6 @@ pub mod _csv;
 pub mod _ctypes;
 #[allow(non_snake_case)]
 pub mod _hashlib;
-#[allow(non_snake_case)]
-pub mod _heapq;
 #[allow(non_snake_case)]
 pub mod _json;
 #[allow(non_snake_case)]

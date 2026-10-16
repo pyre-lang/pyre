@@ -5033,10 +5033,14 @@ thread_local! {
     static JIT_MODE_FLAG: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Returns `true` when executing inside JIT-compiled code.
+/// `rlib/jit.py we_are_jitted`.
 ///
-/// Interpreters can use this to choose optimized code paths that
-/// the JIT can trace more efficiently.
+/// True during tracing and blackholing (`JittedGuard` in
+/// `pyjitpl.py MetaInterp._interpret` and `blackhole.py`) so traces record
+/// the jitted arm. Residual helpers called from compiled assembler see
+/// False: `_we_are_jitted` is `CDefinedIntSymbolic('0 /* we are not jitted
+/// here */')`. Traces fold the call to True (`jtransform.py
+/// Transformer.rewrite_op_int_is_true`).
 #[inline]
 pub fn we_are_jitted() -> bool {
     JIT_MODE_FLAG.with(|f| f.get())
@@ -5112,7 +5116,8 @@ pub fn memory_error_singleton_ref() -> i64 {
     }
 }
 
-/// Set the JIT mode flag. Called by the backend when entering compiled code.
+/// Set the JIT mode flag. Tracing and blackholing use [`JittedGuard`]; residual
+/// assembler helpers leave it false (`rlib/jit.py` `_we_are_jitted`).
 pub fn set_jitted(jitted: bool) {
     JIT_MODE_FLAG.with(|f| f.set(jitted));
 }
@@ -5120,7 +5125,9 @@ pub fn set_jitted(jitted: bool) {
 /// RAII guard for the JIT mode flag.
 ///
 /// Sets `we_are_jitted()` to `true` on creation, restores the previous
-/// value on drop.
+/// value on drop. Held for tracing (`pyjitpl.py MetaInterp._interpret`) and
+/// blackholing (`blackhole.py`), not for `execute_token`: residual CallMayForce
+/// helpers must see `_we_are_jitted == 0`.
 ///
 /// Holds the flag's address rather than resolving the thread-local twice:
 /// `JIT_MODE_FLAG` is a `const`-initialised cell with no destructor, so it
@@ -5135,7 +5142,7 @@ pub struct JittedGuard {
 impl JittedGuard {
     /// Create a new guard, setting `we_are_jitted()` to `true`.
     ///
-    /// One thread-local resolution per entry into compiled code, shared with
+    /// One thread-local resolution per tracing/blackhole entry, shared with
     /// the drop; measured 2.4 ns for the pair on cel's entry probe when each
     /// side resolved its own.
     pub fn enter() -> Self {

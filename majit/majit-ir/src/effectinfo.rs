@@ -190,6 +190,69 @@ impl DescrSetKeys {
         sort_dedup(&mut self.readonly_interiorfields);
         sort_dedup(&mut self.write_interiorfields);
     }
+
+    /// Every member of the six raw sets, in category order.
+    pub fn iter_members(&self) -> impl Iterator<Item = &DescrSetMember> {
+        self.readonly_fields
+            .iter()
+            .chain(&self.write_fields)
+            .chain(&self.readonly_arrays)
+            .chain(&self.write_arrays)
+            .chain(&self.readonly_interiorfields)
+            .chain(&self.write_interiorfields)
+    }
+
+    /// Map each raw-set member onto the dense translated descriptor table.
+    ///
+    /// RPython's `compute_bitstrings` mutates live `Descr` objects that
+    /// `GcCache.setup_descrs` already numbered in the same process. Pyre's
+    /// analyzer records those objects as stamp (opcode-published) then mint
+    /// (`get_field_descr` / `get_array_descr` / `get_interiorfield_descr`
+    /// cache-miss) slots; this rewrite is that numbering, so the runtime
+    /// pass is an index lookup rather than a structural `DescrSetMember`
+    /// walk.
+    pub fn to_slots(
+        &self,
+        member_index: &std::collections::BTreeMap<DescrSetMember, u32>,
+    ) -> DescrSetSlots {
+        fn map_members(
+            members: &[DescrSetMember],
+            member_index: &std::collections::BTreeMap<DescrSetMember, u32>,
+        ) -> Vec<u32> {
+            members
+                .iter()
+                .map(|member| {
+                    *member_index.get(member).unwrap_or_else(|| {
+                        panic!(
+                            "frozen EffectInfo raw-set member has no stamp/mint/lookup slot: {member:?}"
+                        )
+                    })
+                })
+                .collect()
+        }
+        DescrSetSlots {
+            readonly_fields: map_members(&self.readonly_fields, member_index),
+            write_fields: map_members(&self.write_fields, member_index),
+            readonly_arrays: map_members(&self.readonly_arrays, member_index),
+            write_arrays: map_members(&self.write_arrays, member_index),
+            readonly_interiorfields: map_members(&self.readonly_interiorfields, member_index),
+            write_interiorfields: map_members(&self.write_interiorfields, member_index),
+        }
+    }
+}
+
+/// Compact translated-image form of [`DescrSetKeys`]: each member is an
+/// index into the stamp-then-mint-then-lookup descriptor table
+/// (`compute_bitstrings` / `GcCache.setup_descrs` numbering across the
+/// analyzer/runtime split).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescrSetSlots {
+    pub readonly_fields: Vec<u32>,
+    pub write_fields: Vec<u32>,
+    pub readonly_arrays: Vec<u32>,
+    pub write_arrays: Vec<u32>,
+    pub readonly_interiorfields: Vec<u32>,
+    pub write_interiorfields: Vec<u32>,
 }
 
 /// Compact owner for the translation-only raw-set projection.
@@ -198,8 +261,9 @@ impl DescrSetKeys {
 /// but its own comment states that they are not part of the translated runtime
 /// object. Pyre must carry their structural image across the build/runtime
 /// boundary, so a populated image is boxed and dropped by
-/// `prepare_frozen_effect_info`; the overwhelmingly common six-empty-sets case
-/// is a zero-allocation enum value usable by `EffectInfo::const_new`.
+/// `prepare_frozen_effect_info_from_slots`; the overwhelmingly common
+/// six-empty-sets case is a zero-allocation enum value usable by
+/// `EffectInfo::const_new`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DescrSetKeysImage {
     Empty,
@@ -2794,5 +2858,25 @@ mod compute_bitstrings_tests {
         assert!(random.write_descrs_arrays.is_none());
         assert!(random.readonly_descrs_interiorfields.is_none());
         assert!(random.write_descrs_interiorfields.is_none());
+    }
+
+    #[test]
+    fn to_slots_indexes_the_stamp_then_mint_table() {
+        let ka = field_member(1, "a");
+        let kb = field_member(1, "b");
+        let arr = DescrSetMember::Array { array_id: 7 };
+        let mut member_index = std::collections::BTreeMap::new();
+        member_index.insert(ka.clone(), 0);
+        member_index.insert(kb.clone(), 1);
+        member_index.insert(arr.clone(), 2);
+        let keys = DescrSetKeys {
+            readonly_fields: vec![kb.clone(), ka.clone()],
+            write_arrays: vec![arr],
+            ..DescrSetKeys::default()
+        };
+        let slots = keys.to_slots(&member_index);
+        assert_eq!(slots.readonly_fields, vec![1, 0]);
+        assert_eq!(slots.write_arrays, vec![2]);
+        assert!(slots.write_fields.is_empty());
     }
 }

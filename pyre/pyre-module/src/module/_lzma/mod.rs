@@ -2,7 +2,7 @@
 //!
 //! PyPy has no interpreter-level `_lzma`: `lib_pypy/_lzma.py` drives liblzma
 //! through cffi and the applevel `lzma.py` stands on that, so the C module is
-//! the structure this follows, the same footing `_heapq` sits on.
+//! the structure this follows.
 //!
 //! The codec lives in `rustpython_common::compression::lzma`, using xz-core,
 //! outside the LLBC extraction, exactly as `zlib` and `_bz2` keep theirs.
