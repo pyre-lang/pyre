@@ -280,7 +280,9 @@ impl Signature {
         }
         scopelen
     }
+}
 
+impl Signature {
     /// pypy/interpreter/signature.py `getallvarnames`:
     /// ```python
     /// def getallvarnames(self):

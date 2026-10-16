@@ -302,6 +302,10 @@ enum Special {
     SliceIndex { slice_local: usize, k: usize },
     /// Checked-add pair whose `.0` is a [`Special::SliceIndex`].
     SliceIndexPair { slice_local: usize, k: usize },
+    /// `base + i` of a [`Special::SliceBase`] with a runtime index local.
+    SliceRuntimeIndex { slice_local: usize, index: usize },
+    /// Checked-add pair whose `.0` is [`Special::SliceRuntimeIndex`].
+    SliceRuntimeIndexPair { slice_local: usize, index: usize },
 }
 
 /// `drop(roots)` is `core::mem::drop` of the guard. rustc emits a Call that
@@ -535,6 +539,22 @@ fn operand_local(op: &Operand) -> Option<usize> {
     }
 }
 
+/// Locals an operand names, including a field/deref of one. `Assert`
+/// `check_kind` is panic-message metadata and is not walked here.
+fn operand_mentions_watched(op: &Operand, watched: &bit_set::BitSet) -> bool {
+    fn place_watched(place: &Place, watched: &bit_set::BitSet) -> bool {
+        match &place.kind {
+            PlaceKind::Local(l) => watched.contains(*l as usize),
+            PlaceKind::Projection(inner, _) => place_watched(inner, watched),
+            PlaceKind::Global { .. } | PlaceKind::Unknown => false,
+        }
+    }
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => place_watched(p, watched),
+        Operand::Const(_) => false,
+    }
+}
+
 /// The base local of `*local`.
 fn deref_of_local(place: &Place) -> Option<usize> {
     let PlaceKind::Projection(inner, ProjectionElem::Atom(elem)) = &place.kind else {
@@ -737,7 +757,9 @@ fn assert_is_erased_index_overflow(
     matches!(
         pair.and_then(|(pair, field)| (field == 1).then_some(specials.get(&pair))),
         Some(Some(
-            Special::IndexPair { .. } | Special::SliceIndexPair { .. }
+            Special::IndexPair { .. }
+                | Special::SliceIndexPair { .. }
+                | Special::SliceRuntimeIndexPair { .. }
         ))
     )
 }
@@ -1903,6 +1925,12 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 Some(Special::SliceIndexPair { slice_local, k }) => {
                                     Some(Special::SliceIndexPair { slice_local, k })
                                 }
+                                Some(Special::SliceRuntimeIndex { slice_local, index }) => {
+                                    Some(Special::SliceRuntimeIndex { slice_local, index })
+                                }
+                                Some(Special::SliceRuntimeIndexPair { slice_local, index }) => {
+                                    Some(Special::SliceRuntimeIndexPair { slice_local, index })
+                                }
                                 _ => None,
                             }
                         } else if let Some((base, field)) = tuple_field_of_local(src) {
@@ -1913,6 +1941,10 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                 (0, Some(Special::SliceIndexPair { slice_local, k })) => {
                                     Some(Special::SliceIndex { slice_local, k })
                                 }
+                                (
+                                    0,
+                                    Some(Special::SliceRuntimeIndexPair { slice_local, index }),
+                                ) => Some(Special::SliceRuntimeIndex { slice_local, index }),
                                 (0, Some(Special::Guard { depth, .. })) => Some(Special::Index {
                                     k: depth,
                                     relative: false,
@@ -1968,6 +2000,54 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             IndexArith::Add { checked } => slice_add(spec_of(lhs), rhs, checked)
                                 .or_else(|| slice_add(spec_of(rhs), lhs, checked)),
                             IndexArith::Sub { .. } => None,
+                        } {
+                            Some(special)
+                        } else if let Some(special) = match (arith, spec_of(lhs)) {
+                            // Field / local Vec `base + i` (CALL_KW binder
+                            // `pin_roots(&self.arguments_w)`): the addend is
+                            // the element index. Leftover-slice `base + i`
+                            // with dest Const 0 uses the same local.
+                            (
+                                IndexArith::Add { checked: false },
+                                Some(Special::SliceBase { slice_local }),
+                            ) => operand_local(rhs)
+                                .map(|index| Special::SliceRuntimeIndex { slice_local, index }),
+                            (
+                                IndexArith::Add { checked: true },
+                                Some(Special::SliceBase { slice_local }),
+                            ) => operand_local(rhs)
+                                .map(|index| Special::SliceRuntimeIndexPair { slice_local, index }),
+                            (
+                                IndexArith::Sub { checked: false },
+                                Some(Special::SliceBase { slice_local }),
+                            ) => const_usize(rhs, llbc).and_then(|c| {
+                                0usize
+                                    .checked_sub(c)
+                                    .map(|k| Special::SliceIndex { slice_local, k })
+                            }),
+                            (
+                                IndexArith::Sub { checked: true },
+                                Some(Special::SliceBase { slice_local }),
+                            ) => const_usize(rhs, llbc).and_then(|c| {
+                                0usize
+                                    .checked_sub(c)
+                                    .map(|k| Special::SliceIndexPair { slice_local, k })
+                            }),
+                            (
+                                IndexArith::Sub { checked: false },
+                                Some(Special::SliceIndex { slice_local, k }),
+                            ) => const_usize(rhs, llbc).and_then(|c| {
+                                k.checked_sub(c)
+                                    .map(|n| Special::SliceIndex { slice_local, k: n })
+                            }),
+                            (
+                                IndexArith::Sub { checked: true },
+                                Some(Special::SliceIndex { slice_local, k }),
+                            ) => const_usize(rhs, llbc).and_then(|c| {
+                                k.checked_sub(c)
+                                    .map(|n| Special::SliceIndexPair { slice_local, k: n })
+                            }),
+                            _ => None,
                         } {
                             Some(special)
                         } else if matches!(arith, IndexArith::Add { .. })
@@ -2361,6 +2441,21 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                     json!({ "Use": [{ "Const": [{ "Integer": { "Unsigned": ["Usize", "0"] } }, dest_json["ty"].clone()] }, "Yes"] }),
                                 ));
                             }
+                        } else if let Some(slice_local) =
+                            resolve_published_slice_local(block, slice)
+                        {
+                            // Field / local Vec slice in this block (CALL_KW
+                            // binder `pin_roots(&self.arguments_w)`). Incoming
+                            // params are the `pin_roots_incoming_slice` arm.
+                            if let Some(dest) = dest {
+                                cx.bind(dest, Special::SliceBase { slice_local })?;
+                            }
+                            if cx.emit() {
+                                stmts.push(assign_json(
+                                    dest_json.clone(),
+                                    json!({ "Use": [{ "Const": [{ "Integer": { "Unsigned": ["Usize", "0"] } }, dest_json["ty"].clone()] }, "Yes"] }),
+                                ));
+                            }
                         } else {
                             return Err("publish-array-unresolved");
                         }
@@ -2449,6 +2544,40 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                     stmts.push(assign_json(dest_json.clone(), rvalue));
                                 }
                             }
+                            Some(
+                                Special::SliceRuntimeIndex { slice_local, index }
+                                | Special::SliceRuntimeIndexPair { slice_local, index },
+                            ) => {
+                                // A runtime slice index is `slice[i]`. The
+                                // index local has to be a value the body
+                                // defined (param, Assign, call dest, or a
+                                // folded const). An unassigned local — the
+                                // return place used as an addend — is not
+                                // an index (`index-not-static`).
+                                if !runtime_slice_index_defined(
+                                    body,
+                                    index,
+                                    cx.stmt_assigned,
+                                    cx.call_dests,
+                                    cx.const_locals,
+                                ) {
+                                    return Err("index-not-static");
+                                }
+                                if cx.emit() && open == 0 {
+                                    return Err("get-above-depth");
+                                }
+                                if cx.emit() {
+                                    stmts.push(assign_json(
+                                        dest_json.clone(),
+                                        slice_elem_use_runtime(
+                                            body,
+                                            slice_local,
+                                            dest_json,
+                                            index,
+                                        )?,
+                                    ));
+                                }
+                            }
                             _ if const_k.is_some() => {
                                 let k = const_k.unwrap();
                                 cx.check_slot_read(k, false, depth, lo, false)?;
@@ -2514,14 +2643,30 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         }
                     }
                     Leaf::Set => {
-                        let (k, relative) = cx.slot_index_of(call, arg0, llbc)?;
-                        cx.check_slot_read(k, relative, depth, lo, true)?;
-                        if cx.emit() {
-                            let ty = cx.slot_ty_at(k).ok_or("set-before-any-pin")?;
-                            stmts.push(assign_json(
-                                local_place_json(cx.slot_local(k), &ty),
-                                json!({ "Use": [copy_operand_json(&args_json[arg0 + 1]), "Yes"] }),
-                            ));
+                        if let Some(src) = slice_src(&cx.specials, call.args.get(arg0)) {
+                            if cx.emit() {
+                                let slice_ty = slice_ty_of(body, src.slice)?;
+                                let value = &args_json[arg0 + 1];
+                                let elem_ty = operand_json_ty(value)
+                                    .or_else(|| cx.plan.as_ref().and_then(|p| p.slot_ty.clone()))
+                                    .ok_or("set-slice-untyped")?;
+                                cx.ensure_slot_ty(elem_ty.clone());
+                                let offset = slice_offset_operand_json(&src, &slice_ty);
+                                stmts.push(assign_json(
+                                    index_place_json(src.slice, &slice_ty, offset, &elem_ty),
+                                    json!({ "Use": [copy_operand_json(value), "Yes"] }),
+                                ));
+                            }
+                        } else {
+                            let (k, relative) = cx.slot_index_of(call, arg0, llbc)?;
+                            cx.check_slot_read(k, relative, depth, lo, true)?;
+                            if cx.emit() {
+                                let ty = cx.slot_ty_at(k).ok_or("set-before-any-pin")?;
+                                stmts.push(assign_json(
+                                    local_place_json(cx.slot_local(k), &ty),
+                                    json!({ "Use": [copy_operand_json(&args_json[arg0 + 1]), "Yes"] }),
+                                ));
+                            }
                         }
                     }
                     Leaf::ReloadTop => {
@@ -2910,7 +3055,12 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             // panic edge; the offsets are compile-time so the check
             // is statically true. Guard/Alias mentions stay: rewriting
             // those Goto'd past Drop of a surviving RootScope.
-            let target = match block.term_ref(llbc) {
+            //
+            // Overflow `check_kind` lists the original addends as
+            // panic-message metadata. A chained `base + i` can name an
+            // erased `SliceIndexPair` there while `cond` is the overflow
+            // bit of a later, still-real add. That metadata is not a use.
+            match block.term_ref(llbc) {
                 Ok(TermKind::Assert { assert, target, .. })
                     if assert_is_slot_index_bounds_check(
                         assert,
@@ -2919,17 +3069,18 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         llbc,
                     ) =>
                 {
-                    *target
+                    plan.terms.insert(
+                        bb,
+                        TermRewrite {
+                            target: *target,
+                            stmts: Vec::new(),
+                        },
+                    );
                 }
+                Ok(TermKind::Assert { assert, .. })
+                    if !operand_mentions_watched(&assert.cond, &watched) => {}
                 _ => return Err("unmodeled-use-in-terminator"),
-            };
-            plan.terms.insert(
-                bb,
-                TermRewrite {
-                    target,
-                    stmts: Vec::new(),
-                },
-            );
+            }
         }
     }
     plan.unreachable = (0..n_blocks).filter(|bb| !visited[*bb]).collect();
@@ -3164,6 +3315,38 @@ fn slice_index_use(
     Ok(json!({ "Use": [{ "Read": index_place }, "Yes"] }))
 }
 
+fn runtime_slice_index_defined(
+    body: &Unstructured,
+    index: usize,
+    stmt_assigned: &HashMap<usize, usize>,
+    call_dests: &bit_set::BitSet,
+    const_locals: &HashMap<usize, usize>,
+) -> bool {
+    let args = body.locals.arg_count as usize;
+    (index >= 1 && index <= args)
+        || stmt_assigned.get(&index).copied().unwrap_or(0) > 0
+        || call_dests.contains(index)
+        || const_locals.contains_key(&index)
+}
+
+/// `(*slice)[i]` for a runtime index local. Same Read-of-Index shape as
+/// [`slice_elem_use`]; the offset is the index local instead of a const.
+fn slice_elem_use_runtime(
+    body: &Unstructured,
+    slice_local: usize,
+    dest_place: &Value,
+    index: usize,
+) -> Result<Value, Refusal> {
+    let index_ty = body
+        .locals
+        .locals
+        .get(index)
+        .map(|loc| ty_ref_json(&loc.ty))
+        .ok_or("index-untyped")?;
+    let offset = json!({ "Read": local_place_json(index, &index_ty) });
+    slice_index_use(body, slice_local, dest_place, offset)
+}
+
 /// Unique forward `Assign` of `local`, with its block and statement index.
 fn unique_assign_stmt<'a>(
     body: &'a Unstructured,
@@ -3311,6 +3494,94 @@ fn slot_seed_rvalue(u: &Value, ty: &Value) -> Option<Value> {
     (1..=arg_count).find_map(|i| {
         (locals.get(i)?.get("ty") == Some(ty))
             .then(|| json!({ "Use": [{ "Read": local_place_json(i, ty) }, "Yes"] }))
+    })
+}
+
+/// Follow a published slice through copies, reborrows and unsizing in this
+/// block. Unlike [`resolve_published_array`], a non-literal slice (incoming
+/// `&[T]`, a field, a local `Vec`) is the answer: erase aliases that local.
+fn resolve_published_slice_local(
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    slice: Option<usize>,
+) -> Option<usize> {
+    let mut want = slice?;
+    for stmt in block.statements.iter().rev() {
+        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+            continue;
+        };
+        if place_local(place) != Some(want) {
+            continue;
+        }
+        match rvalue {
+            Rvalue::UnaryOp(_, op) | Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                want = operand_local(op)?;
+            }
+            Rvalue::Ref { place: src, .. } => {
+                want = place_local(src).or_else(|| deref_of_local(src))?;
+            }
+            Rvalue::Aggregate(kind, _) if kind.get("Array").is_some() => return None,
+            _ => return Some(want),
+        }
+    }
+    Some(want)
+}
+
+struct SliceSrc {
+    slice: usize,
+    offset: SliceOff,
+}
+
+enum SliceOff {
+    Const(usize),
+    Local(usize),
+}
+
+fn slice_src(specials: &HashMap<usize, Special>, op: Option<&Operand>) -> Option<SliceSrc> {
+    op.and_then(operand_local)
+        .and_then(|l| match specials.get(&l) {
+            Some(Special::SliceBase { slice_local }) => Some(SliceSrc {
+                slice: *slice_local,
+                offset: SliceOff::Const(0),
+            }),
+            Some(Special::SliceIndex { slice_local, k }) => Some(SliceSrc {
+                slice: *slice_local,
+                offset: SliceOff::Const(*k),
+            }),
+            Some(Special::SliceRuntimeIndex { slice_local, index }) => Some(SliceSrc {
+                slice: *slice_local,
+                offset: SliceOff::Local(*index),
+            }),
+            _ => None,
+        })
+}
+
+fn slice_ty_of(body: &Unstructured, slice: usize) -> Result<Value, Refusal> {
+    body.locals
+        .locals
+        .get(slice)
+        .map(|loc| ty_ref_json(&loc.ty))
+        .ok_or("slice-local-missing")
+}
+
+fn slice_offset_operand_json(src: &SliceSrc, ty: &Value) -> Value {
+    match src.offset {
+        SliceOff::Const(k) => json!({
+            "Const": [{ "Integer": { "Unsigned": ["Usize", k.to_string()] } }, ty]
+        }),
+        SliceOff::Local(index) => json!({ "Read": local_place_json(index, ty) }),
+    }
+}
+
+fn index_place_json(slice: usize, slice_ty: &Value, offset: Value, elem_ty: &Value) -> Value {
+    let deref = json!({
+        "kind": { "Projection": [{ "kind": { "Local": slice }, "ty": slice_ty }, "Deref"] },
+        "ty": slice_ty
+    });
+    json!({
+        "kind": {
+            "Projection": [deref, { "Index": { "offset": offset, "from_end": false } }]
+        },
+        "ty": elem_ty
     })
 }
 
@@ -3583,6 +3854,39 @@ fn debug_check_registered_effects_match_rewalk(llbc: &Llbc) {
             mismatches,
             overlay_hides
         );
+    }
+}
+
+/// Scalar-replace one named body and report the outcome. Skips the
+/// registered-effect invariant so a single CALL_KW binder can be diagnosed
+/// when a different function's rewalk disagrees.
+pub fn erase_named(llbc: &Llbc, suffix: &str) -> String {
+    ensure_stack_sensitive_fns(llbc);
+    let Some(fd) = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path().ends_with(suffix))
+    else {
+        return "missing".into();
+    };
+    let Some(body) = fd.unstructured() else {
+        return "no-body".into();
+    };
+    match erase_shadow_stack(fd, &body, llbc) {
+        Ok(Some(_)) => "erased".into(),
+        Ok(None) => "no-bracket".into(),
+        Err(reason) => {
+            let walk = stack_walk(&body, llbc, &|identity| callee_effect_of(llbc, identity));
+            let callee = first_non_none_callee(&body, llbc);
+            format!(
+                "{reason} why={} callee={} effect={}",
+                walk.why.as_deref().unwrap_or("-"),
+                callee.as_ref().map(|(p, _)| p.as_str()).unwrap_or("-"),
+                callee
+                    .as_ref()
+                    .map(|(_, effect)| effect.as_str())
+                    .unwrap_or("-"),
+            )
+        }
     }
 }
 
@@ -4147,6 +4451,7 @@ fn stack_walk(
     let mut param_pairs: HashMap<usize, u8> = HashMap::new();
     let mut field_indices: HashMap<(usize, u64), Depth> = HashMap::new();
     let mut field_params: HashMap<(usize, u64), u8> = HashMap::new();
+    let mut slice_bases: HashSet<usize> = HashSet::new();
     let arg_count = body.locals.arg_count as usize;
     for i in 1..=arg_count {
         if let Ok(p) = u8::try_from(i - 1) {
@@ -4188,6 +4493,7 @@ fn stack_walk(
             let Some(dest) = place_local(place) else {
                 continue;
             };
+            slice_bases.remove(&dest);
             match rvalue {
                 Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
                     clear_tracked(
@@ -4225,6 +4531,9 @@ fn stack_walk(
                     let mut fields_from = None;
                     if let Some(l) = place_local(src) {
                         index_from = indices.get(&l).copied();
+                        if slice_bases.contains(&l) {
+                            slice_bases.insert(dest);
+                        }
                         if let Some(g) = aliases.get(&l).copied() {
                             aliases.insert(dest, g);
                         }
@@ -4244,6 +4553,9 @@ fn stack_walk(
                         if field == 0 {
                             index_from = pairs.get(&base).copied();
                             param_from = param_pairs.get(&base).copied();
+                            if slice_bases.contains(&base) {
+                                slice_bases.insert(dest);
+                            }
                         }
                         if index_from.is_none() {
                             index_from = field_indices
@@ -4322,6 +4634,14 @@ fn stack_walk(
                         &mut field_params,
                     );
                     if let Some(arith) = binop_is_index_arith(op) {
+                        let slice_of = |o: &Operand| {
+                            operand_local(o).is_some_and(|l| slice_bases.contains(&l))
+                        };
+                        if matches!(arith, IndexArith::Add { .. })
+                            && (slice_of(lhs) || slice_of(rhs))
+                        {
+                            slice_bases.insert(dest);
+                        }
                         let base =
                             |o: &Operand| operand_local(o).and_then(|l| indices.get(&l).copied());
                         // Unsigned add cannot produce a smaller index:
@@ -4391,6 +4711,7 @@ fn stack_walk(
                         &mut field_indices,
                         &mut field_params,
                     );
+                    slice_bases.remove(&dest);
                 }
                 let path = callee_path(call, llbc);
                 match classify_call(call, llbc) {
@@ -4462,12 +4783,19 @@ fn stack_walk(
                             Leaf::Pin | Leaf::ItemsPush => depth = depth.add(1),
                             Leaf::Publish => {
                                 let slice = call.args.get(arg0).and_then(operand_local);
-                                if let Some(dest) = place_local(&call.dest) {
-                                    indices.insert(dest, depth);
-                                }
-                                match resolve_published_array_len(block, slice) {
-                                    Some(n) => depth = depth.add(n),
-                                    None => depth = depth.after_unknown_push(),
+                                if let Some(n) = resolve_published_array_len(block, slice) {
+                                    if let Some(dest) = place_local(&call.dest) {
+                                        indices.insert(dest, depth);
+                                    }
+                                    depth = depth.add(n);
+                                } else if resolve_published_slice_local(block, slice).is_some() {
+                                    // Incoming / field slice: dest aliases that
+                                    // slice. Depth does not grow.
+                                    if let Some(dest) = place_local(&call.dest) {
+                                        slice_bases.insert(dest);
+                                    }
+                                } else {
+                                    depth = depth.after_unknown_push();
                                 }
                             }
                             Leaf::Normalize
@@ -4481,7 +4809,8 @@ fn stack_walk(
                                     .get(arg0)
                                     .and_then(operand_local)
                                     .is_some_and(|l| {
-                                        accept_index(l, &indices, &params, &mut param_slots)
+                                        slice_bases.contains(&l)
+                                            || accept_index(l, &indices, &params, &mut param_slots)
                                     })
                                 {
                                     reads_below = true;
@@ -5363,6 +5692,70 @@ mod tests {
             Ok(Some(_)) => {}
             Ok(None) => panic!("expected accepted erase, got no bracket"),
             Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    /// `pin_roots` of an incoming slice (parameter / field), not a same-block
+    /// array literal. Erase aliases that local as [`Special::SliceBase`].
+    #[test]
+    fn erase_accepts_pin_roots_of_incoming_slice() {
+        let ty = json!({"Deduplicated": 0});
+        let place = |i: u64| json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64| json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let bb = |kind: Value| {
+            json!({
+                "statements": [],
+                "terminator": {"span": span(), "kind": kind},
+                "kind": "Regular"
+            })
+        };
+        let call = |fun: u64, args: Vec<Value>, dest: u64, target: u64, on_unwind: u64| {
+            json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
+                    "args": args}, "dest": place(dest),
+                "target": target,
+                "on_unwind": on_unwind
+            }})
+        };
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": (0..5).map(local).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(call(1, vec![], 2, 1, 3)),
+                bb(call(2, vec![json!({"Read": place(1)})], 3, 2, 3)),
+                bb(json!("UndefinedBehavior")),
+                bb(json!("UnwindResume"))
+            ]
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(
+                        3,
+                        &["pyre_object", "celldict", "write_cell"],
+                        json!({ "Unstructured": unstructured })
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let fd = llbc.fn_by_id(3).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase of incoming-slice pin, got {reason}"),
         }
     }
 
@@ -6854,6 +7247,57 @@ mod tests {
                 "keeping the bracket is the sound answer when the length local disagrees across paths"
             ),
             Ok(None) => panic!("body has a root bracket"),
+        }
+    }
+
+    /// Chained `base + i` then a later real add: rustc's Overflow
+    /// `check_kind` may still name the erased `SliceIndexPair` as
+    /// panic-message metadata. That is not a use of the slot.
+    #[test]
+    fn overflow_check_kind_naming_erased_slice_index_is_not_a_use() {
+        let llbc = stack_ops_llbc_with_callee();
+        let pair_field1 =
+            json!({"kind": {"Projection": [place(8), {"Field": [null, 1]}]}, "ty": ty()});
+        let body = body_of_args(
+            1,
+            9,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(6, vec![copy_local(1)], 3, 2)),
+                bb_stmts(
+                    vec![assign_local(
+                        5,
+                        json!({"BinaryOp": ["AddChecked", copy_local(3), copy_local(4)]}),
+                    )],
+                    json!({"Goto": {"target": 3}}),
+                ),
+                bb_stmts(
+                    vec![assign_local(
+                        8,
+                        json!({"BinaryOp": ["AddChecked", copy_local(6), copy_local(7)]}),
+                    )],
+                    json!({"Assert": {
+                        "assert": {
+                            "cond": {"Move": pair_field1},
+                            "expected": false,
+                            "check_kind": {"Overflow": [
+                                {"Add": "Wrap"},
+                                {"Read": place(4)},
+                                {"Read": place(5)}
+                            ]}
+                        },
+                        "target": 4,
+                        "on_unwind": 99
+                    }}),
+                ),
+                bb(drop_local(2, 5)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
         }
     }
 
