@@ -4058,15 +4058,9 @@ impl<M: Clone> MetaInterp<M> {
         // `metainterp.framestack`; the carrier's recipes are the frames still
         // to be pushed, so their register boxes are roots like `registers_r`.
         if let Some(carrier) = trace_ctx.active_bridge_inline_carrier() {
-            for recipe in &carrier.recipes {
-                for op in &recipe.registers_r {
-                    Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
-                }
-                Self::push_frontend_live_box(recipe.frame, &mut live_boxes, &mut visited);
-                for op in recipe.return_substitute.iter().chain(&recipe.rebuilt_frame) {
-                    Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
-                }
-            }
+            carrier.for_each_box(|op| {
+                Self::push_frontend_live_box(op, &mut live_boxes, &mut visited);
+            });
         }
         // heapcache.py `CacheEntry` — keys (`from_ref_box`) and values
         // (`to_field_box`) plus `quasiimmut_seen` / `last_const_box` /
@@ -4122,6 +4116,15 @@ impl<M: Clone> MetaInterp<M> {
         // to sync `virtualizable_heap_ptr`; that concrete must already be
         // the forwarded address.
         trace_ctx.walk_virtualizable_value_refs(&mut visitor);
+        // The carrier, parked or taken, holds its recipes' `ConstPtr` boxes.
+        for carrier in trace_ctx
+            .bridge_inline_carrier
+            .as_ref()
+            .into_iter()
+            .chain(trace_ctx.active_bridge_inline_carrier())
+        {
+            carrier.trace_const_ptr_boxes(&mut visitor);
+        }
         // util.py args_dict / history.py ConstPtr.value: CALL_PURE's keys and
         // results own collector-updated Const slots. Compile/optimizer handles
         // share that same dictionary; its roots survive even after this trace

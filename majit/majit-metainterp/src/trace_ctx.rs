@@ -963,6 +963,35 @@ pub struct BridgeInlineCarrier {
     pub recipes: Vec<ReconstructRecipe>,
 }
 
+impl ReconstructRecipe {
+    /// Every box this level holds.
+    pub fn for_each_box(&self, mut f: impl FnMut(OpRef)) {
+        self.registers_r
+            .iter()
+            .chain(std::iter::once(&self.frame))
+            .chain(self.return_substitute.iter())
+            .chain(self.rebuilt_frame.iter())
+            .chain(self.rebuilt_ec.iter())
+            .for_each(|op| f(*op));
+    }
+}
+
+impl BridgeInlineCarrier {
+    /// Every box the recipes hold, for the live-box census of
+    /// `MetaInterp::walk_active_trace_refs`.
+    pub fn for_each_box(&self, mut f: impl FnMut(OpRef)) {
+        for recipe in self.recipes.iter() {
+            recipe.for_each_box(&mut f);
+        }
+    }
+
+    /// history.py `ConstPtr.value` of the recipes' constant boxes: the
+    /// carrier is their holder, so it traces their `const_ptr_table` slots.
+    pub fn trace_const_ptr_boxes(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        self.for_each_box(|op| op.trace_const_ptr(visitor));
+    }
+}
+
 /// The virtualizable shadow slot a `vable_set*` standard leg overwrote, and
 /// the Box it held before.
 ///
