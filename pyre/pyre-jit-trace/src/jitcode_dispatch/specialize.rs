@@ -5479,8 +5479,8 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 
 /// FBW virtualization of the array-backed BUILD_TUPLE — the arities
 /// `makespecialisedtuple2` does not claim.  Sibling of
-/// [`try_walker_specialize_newtuple`] (arity-2 plain-int `spec_ii`) and
-/// [`try_walker_specialize_newlist`], reached only after the `spec_ii` fold
+/// [`try_walker_specialize_newtuple`] (arity-2 `makespecialisedtuple2`) and
+/// [`try_walker_specialize_newlist`], reached only after the arity-2 descent
 /// declines, so that path stays byte-identical.
 ///
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear` +
@@ -5495,9 +5495,9 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 /// Arity 2 is `makespecialisedtuple2` territory (`Cls_ii` / `Cls_ff` /
 /// `Cls_oo`, `specialisedtupleobject.py`): the runtime never builds an
 /// array-backed tuple there, so emitting one would diverge from what the
-/// blackhole rebuilds on deopt.  Declined here — the `spec_ii` fold owns the
-/// int-int case and the residual owns the rest.  The empty tuple is declined
-/// too (no element to recover a length from).
+/// blackhole rebuilds on deopt.  Declined here — [`try_walker_specialize_newtuple`]
+/// owns arity 2.  The empty tuple is declined too (no element to recover a
+/// length from).
 ///
 /// Lifting that decline is not a trace-local question: the trace stays
 /// self-consistent, but a side exit hands a real pair — inline `value0` /
@@ -5586,29 +5586,29 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-const SPECIALISED_TUPLE_II_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new",
-    commit_label: "specialised_tuple_ii_commit",
-    call_site_label: "specialised_tuple_ii_call_site",
-    decline_tag: "TUPLE-II-SUBWALK",
+const SPECIALISED_TUPLE2_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::tupleobject::makespecialisedtuple2",
+    commit_label: "specialised_tuple2_commit",
+    call_site_label: "specialised_tuple2_call_site",
+    decline_tag: "TUPLE2-SUBWALK",
 };
 
-/// #195 / #73: FBW virtualization of an arity-2 plain-int BUILD_TUPLE.
+/// #195 / #73: FBW virtualization of an arity-2 BUILD_TUPLE.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
-/// (oopspec [`majit_ir::RuntimeHelperKind::NewtupleFromArray`]).  When both
-/// backing-array elements are concrete plain ints, descend
-/// [`SPECIALISED_TUPLE_II_DESCENT`].  `fuse_boxing_alloc` records that
-/// constructor as `new_with_vtable` plus the `value0` / `value1` stores.
-/// The elements come straight out of the array heap-cache, so the array
-/// build keeps no consumer and DCEs.  The partner
-/// [`try_walker_specialize_unpack`] then folds those stores, collapsing
-/// build→unpack to a pure-int loop.
+/// (oopspec [`majit_ir::RuntimeHelperKind::NewtupleFromArray`]).  Descend
+/// [`SPECIALISED_TUPLE2_DESCENT`] (`specialisedtupleobject.py
+/// makespecialisedtuple2`) with the two element boxes; the walk records
+/// the `is_plain_int1` / float guards and the chosen arm's `new_with_vtable`
+/// (`Cls_ii` / `Cls_ff` / `Cls_oo`) via `fuse_boxing_alloc`.  The elements
+/// come straight out of the array heap-cache, so the array build keeps no
+/// consumer and DCEs.  The partner [`try_walker_specialize_unpack`] then
+/// folds those stores, collapsing build→unpack.
 ///
 /// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
-/// for any other shape (object tuple, arity ≠ 2, out-of-range long, tagged
-/// immediate, cache miss) — so a non-foldable build is not declined.
+/// for any other shape (arity ≠ 2, cache miss) — so a non-foldable build
+/// is not declined.
 pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -5635,10 +5635,10 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    // Arity must be exactly 2 (the only specialised int tuple).  A BUILD_TUPLE
+    // Arity must be exactly 2 (`makespecialisedtuple2`).  A BUILD_TUPLE
     // array sets every index before `newtuple_from_array`, so a cached element
     // at index 2 means arity ≥ 3 → fall through to the residual (a wrongly
-    // built arity-2 spec_ii would length-mismatch the arity-N unpack).
+    // built arity-2 specialised pair would length-mismatch the arity-N unpack).
     if ctx
         .trace_ctx
         .heapcache_getarrayitem(arr, OpRef::ConstInt(2), descr_idx)
@@ -5652,96 +5652,20 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    // The arity-2 int specialised tuple `Cls_ii` (`makespecialisedtuple2`,
-    // specialisedtupleobject.py) is built when both elements pass
-    // `is_plain_int1` — an exact `W_IntObject` or a fits-in-word
-    // `W_LongObject`; the stored payload is `plain_int_w` of each.  A tagged
-    // immediate has no real header for the unbox guard, so decline it to the
-    // residual (correct for any shape).
-    if pyre_object::tagged_int::CAN_BE_TAGGED
-        && (pyre_object::tagged_int::is_tagged_int(c0)
-            || pyre_object::tagged_int::is_tagged_int(c1))
-    {
-        return Ok(None);
-    }
-    let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
-    let both_plain_int =
-        unsafe { pyre_object::is_plain_int1(c0) && pyre_object::is_plain_int1(c1) };
-    if !both_plain_int {
-        return Ok(None);
-    }
-    let c0_long = unsafe { pyre_object::pyobject::is_long(c0) };
-    let c1_long = unsafe { pyre_object::pyobject::is_long(c1) };
-    // Concrete element int payloads (`plain_int_w`: `W_IntObject`'s `intval`
-    // or a fits-int `W_LongObject`'s `toint()`).
-    let v0 = if c0_long {
-        pyre_object::longobject::jit_w_long_toint(c0)
-    } else {
-        unsafe { pyre_object::w_int_get_value(c0) }
-    };
-    let v1 = if c1_long {
-        pyre_object::longobject::jit_w_long_toint(c1)
-    } else {
-        unsafe { pyre_object::w_int_get_value(c1) }
-    };
 
-    let Some(jc) = crate::jitcode_runtime::pathed_jitcode_cached(SPECIALISED_TUPLE_II_DESCENT.path)
-    else {
-        return Ok(None);
-    };
-    if jc.calldescr.arg_classes != "ii" || jc.calldescr.result_type != 'r' {
-        return Ok(None);
-    }
-
-    // Paired `w_class` guard per element so a runtime int subclass sharing
-    // the public `int` `w_class` side-exits, then the plain-int payload unbox.
-    // A fits-int `W_LongObject` also carries the public `int` `w_class`
-    // (`is_plain_int1`), so the same guard covers it; the payload extraction
-    // switches to `walker_unbox_long` (`&LONG_TYPE` + `_fits_int`).
     let pre_body = ctx.trace_ctx.get_trace_position();
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    walker_guard_exact_w_class(ctx, op_pc, e0, int_typeobj)?;
-    walker_guard_exact_w_class(ctx, op_pc, e1, int_typeobj)?;
-    let int_type_addr = int_ty as i64;
-    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-    let raw0 = if c0_long {
-        walker_unbox_long(ctx, op_pc, e0, long_type_addr)?
-    } else {
-        walker_unbox_int_typed(
-            ctx,
-            op_pc,
-            e0,
-            int_type_addr,
-            crate::descr::int_intval_descr(),
-        )?
-    };
-    let raw1 = if c1_long {
-        walker_unbox_long(ctx, op_pc, e1, long_type_addr)?
-    } else {
-        walker_unbox_int_typed(
-            ctx,
-            op_pc,
-            e1,
-            int_type_addr,
-            crate::descr::int_intval_descr(),
-        )?
-    };
-    ctx.trace_ctx
-        .set_opref_concrete(raw0, majit_ir::Value::Int(v0));
-    ctx.trace_ctx
-        .set_opref_concrete(raw1, majit_ir::Value::Int(v1));
     let mut produced = None;
     let outcome = try_walker_orthodox_descent_ex(
         ctx,
         op_pc,
-        &[(raw0, v0), (raw1, v1)],
         &[],
+        &[(e0, c0), (e1, c1)],
         &[],
         dst,
         dst_bank,
-        &SPECIALISED_TUPLE_II_DESCENT,
+        &SPECIALISED_TUPLE2_DESCENT,
         Some(&mut produced),
-        false, // payloads, not a BinaryOperator tag
+        false, // not a BinaryOperator tag
     )?;
     if !matches!(outcome, Some(DispatchOutcome::Continue)) {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_body);
@@ -5757,7 +5681,7 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         walker_concrete_ref_object(ctx, tuple),
         Some(obj) if !obj.is_null()
     ) {
-        let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
+        let tuple_ptr = pyre_object::makespecialisedtuple2(c0, c1);
         if tuple_ptr.is_null() {
             return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
         }
