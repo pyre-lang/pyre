@@ -527,32 +527,23 @@ impl VirtualizableInfo {
             .enumerate()
             .map(|(j, a)| struct_descr_at(&a.name, a.field_offset, &self._array_field_descrs[j]))
             .collect();
-        // virtualizable.py `cpu.fielddescrof(VTYPE, 'vable_token')` is
-        // `descr.py get_field_descr`'s cached object, the same row
-        // `heaptracker.all_fielddescrs` lists. The sequential mint above
-        // is `[token, statics, arrays]` numbering with an empty name; a
-        // SETFIELD through that spelling lands in `field_slot_index`'s
-        // unslotted band once the parent lists the token, and `force_box`
-        // then sees a leftover that is not a position in
-        // `all_fielddescrs`. Prefer the listed geometry and stamp the
-        // vinfo backref onto a clone so `get_vinfo()` still resolves.
-        // Name and offset must both match: an LLBC row named `vable_token`
-        // at a different byte is not the host `offset_of!` slot, and a
+        // virtualizable.py `self.vable_token_descr = cpu.fielddescrof(VTYPE,
+        // 'vable_token')` is `descr.py get_field_descr`'s cached object,
+        // the same row `heaptracker.all_fielddescrs` lists.
+        // `virtualizable.py` then stamps `descr.vinfo = self` on that
+        // object. Name and offset must both match: an LLBC row named
+        // `vable_token` at a different byte is not the host slot, and a
         // different name at `token_offset` is not `fielddescrof(...,
         // 'vable_token')`. Either mismatch keeps the minted descr.
         if let Some(listed) = listed_struct_field(descr, "vable_token", self.token_offset) {
-            if let Some(simple) = listed
-                .as_any()
-                .and_then(|any| any.downcast_ref::<majit_ir::SimpleFieldDescr>())
+            if let Some(w) = vinfo.clone()
+                && let Some(simple) = listed
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<majit_ir::SimpleFieldDescr>())
             {
-                let mut token = simple.clone();
-                if let Some(w) = vinfo.clone() {
-                    token = token.with_vinfo(w);
-                }
-                self.vable_token_descr = Some(std::sync::Arc::new(token));
-            } else {
-                self.vable_token_descr = Some(listed);
+                simple.set_vinfo(w);
             }
+            self.vable_token_descr = Some(listed);
         }
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
         // Identity-keyed on the FieldDescr this vinfo owns, the same

@@ -553,7 +553,6 @@ impl PtrInfoExt for PtrInfo {
             // build time, so the value reads as no known class while the flag stays valid.
             PtrInfo::Instance(v) => v.known_class.filter(|&c| c != 0),
             PtrInfo::Virtual(v) => v.known_class.filter(|&c| c != 0),
-            PtrInfo::VirtualStruct(v) => v.known_class.filter(|&c| c != 0),
             PtrInfo::Constant(gcref) => {
                 // info.py:764: `if not self._const.nonnull(): return None`
                 if gcref.is_null() {
@@ -1074,19 +1073,6 @@ impl PtrInfoExt for PtrInfo {
     /// Check if this virtual is immutable and all fields are constants.
     /// Used by force_box to determine if the virtual can be constant-folded.
     fn is_immutable_and_filled_with_constants(&self, ctx: &crate::optimizeopt::OptContext) -> bool {
-        // typeptr is excluded from `_fields` (`heaptracker.py
-        // all_fielddescrs`). A residual `new` may still hold a runtime
-        // header value there; treating the vstruct as const-foldable
-        // would allocate without writing it.
-        if let PtrInfo::VirtualStruct(v) = self
-            && let Some(tp) = &v.typeptr_value
-            && ctx
-                .resolve_operand_operand_opt(tp)
-                .and_then(|cb| cb.const_value())
-                .is_none()
-        {
-            return false;
-        }
         let (fields, descr) = match self {
             PtrInfo::Virtual(v) => (&v.fields, &v.descr),
             PtrInfo::VirtualStruct(v) => (&v.fields, &v.descr),
@@ -1337,16 +1323,6 @@ fn force_box_impl(
                     "[jit][force-box] virtual-struct {:?} in_final_emission={} pass_idx={}",
                     opref, ctx.in_final_emission, ctx.current_pass_idx
                 );
-            }
-            if let Some(value_ref) = vinfo.typeptr_value.take() {
-                let value_ref = force_child(&value_ref, ctx);
-                if let Some(descr) = vinfo.ob_type_descr.clone() {
-                    let arg_alloc = Operand::from_bound_op(&alloc_rc);
-                    let arg_value = ctx.resolve_operand_operand(&value_ref);
-                    let mut set_op = Op::new(OpCode::SetfieldGc, &[arg_alloc, arg_value]);
-                    set_op.setdescr(descr);
-                    emit_op(ctx, set_op);
-                }
             }
             // info.py _force_elements:
             //   for i, fielddescr in enumerate(descr.get_all_fielddescrs()):

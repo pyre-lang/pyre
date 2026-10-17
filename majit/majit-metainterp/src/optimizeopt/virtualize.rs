@@ -665,27 +665,12 @@ impl OptVirtualize {
                         ))
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
-                        // Residual `new` (`virtualize.py optimize_NEW` /
-                        // `make_vstruct`) does not stamp the class word.
-                        // `rewrite_op_setfield` keeps that store when the
-                        // base is not `new_with_vtable`. Absorbing it into
-                        // `_fields` is refused (`heaptracker.py
-                        // all_fielddescrs` skips typeptr). Emitting it
-                        // (`PassOn`) forces this vstruct before sibling
-                        // fields are written — a 16-byte `New PyObject`
-                        // stack header then lives as a GC object, and a
-                        // later `guard_class` on it loads the header into
-                        // a traced Ref. Record the store as metadata and
-                        // write it from `force_box`, the way `known_class`
-                        // / vtable write works on `PtrInfo::Virtual`.
+                        // `heaptracker.py all_fielddescrs` skips typeptr
+                        // (`dealt otherwise`): `_fields` never contains it.
+                        // `jtransform.py rewrite_op_setfield` drops the
+                        // store; residual allocation stamps the class word
+                        // at `new_with_vtable`.
                         if is_typeptr && field_descr.offset() == 0 {
-                            if let Some(class_val) = value_as_constant {
-                                if vinfo.known_class.is_none() {
-                                    vinfo.known_class = Some(class_val as i64);
-                                }
-                            }
-                            vinfo.typeptr_value = Some(value_op.clone());
-                            vinfo.ob_type_descr = Some(setfield_descr_arc.clone());
                             return Some(OptimizationResult::Remove);
                         }
                         Some(store_virtual_field_or_emit(
@@ -807,38 +792,6 @@ impl OptVirtualize {
                 };
                 ctx.make_constant_box(&b, class_const);
                 return OptimizationResult::Remove;
-            }
-            // Residual `new`: the typeptr SETFIELD is metadata, not a
-            // `_fields` slot. Fold the read to that stored value so the
-            // getfield does not force a 16-byte header object.
-            if is_typeptr && field_descr.offset() == 0 {
-                let stored_tp = match &*info {
-                    PtrInfo::VirtualStruct(vinfo) => vinfo.typeptr_value.clone(),
-                    _ => None,
-                };
-                if let Some(stored) = stored_tp {
-                    let stored = ctx.resolve_operand_operand(&stored);
-                    let b = Operand::from_bound_op(op_rc);
-                    if b.type_() == stored.type_() {
-                        drop(info);
-                        ctx.make_equal_to(&b, &stored);
-                        return OptimizationResult::Remove;
-                    }
-                    if let Some(class_val) = ctx.get_constant_int_box(&stored) {
-                        drop(info);
-                        let class_const = match op.result_type() {
-                            majit_ir::Type::Ref => {
-                                majit_ir::Value::Ref(majit_ir::GcRef(class_val as usize))
-                            }
-                            majit_ir::Type::Int => majit_ir::Value::Int(class_val),
-                            other => unreachable!(
-                                "typeptr getfield must return Int or Ref, got {other:?}"
-                            ),
-                        };
-                        ctx.make_constant_box(&b, class_const);
-                        return OptimizationResult::Remove;
-                    }
-                }
             }
             // Pyre object-model: `w_class` (PyObject offset 8) is a header
             // field carrying Python-level class identity, not a value field.
@@ -2496,34 +2449,6 @@ pub(crate) fn slot_in_field_list(
         .map(|i| i as u32)
 }
 
-/// Position of the unique `all_fielddescrs` row at `field.offset()`
-/// with the same setfield kind. `None` when that word is missing or
-/// shared by overlay siblings (`descr.py` `cache[STRUCT][fieldname]`).
-///
-/// A sequential mint (`virtualizable.py` `cpu.fielddescrof`) or a
-/// leftover extra-gc spelling can disagree on `field_key` with the
-/// listed row (`"vable_token"` vs `"PyFrame.vable_token"` / empty).
-/// `force_box` still walks by position, so a unique word at that
-/// offset is the listed slot.
-pub(crate) fn unique_offset_slot(
-    fields: &[Arc<dyn FieldDescr>],
-    field: &dyn FieldDescr,
-) -> Option<u32> {
-    let mut found = None;
-    for (i, slot) in fields.iter().enumerate() {
-        if slot.offset() == field.offset()
-            && setfield_kind_matches(slot.as_ref(), field)
-            && slot.field_type() == field.field_type()
-        {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(i as u32);
-        }
-    }
-    found
-}
-
 /// Slot in `owner`'s `all_fielddescrs` when that is a SizeDescr that
 /// holds `field`, otherwise the field's own parent list.
 ///
@@ -2537,9 +2462,6 @@ pub(crate) fn parent_list_slot_in(owner: Option<&DescrRef>, field: &dyn FieldDes
     if let Some(size) = owner.and_then(|d| d.as_size_descr()) {
         let fields = size.all_fielddescrs();
         if let Some(i) = slot_in_field_list(fields, field) {
-            return i;
-        }
-        if let Some(i) = unique_offset_slot(fields, field) {
             return i;
         }
         // Owner `_fields` is the allocation list. A nested STRUCT slot
@@ -5127,18 +5049,8 @@ mod tests {
         );
     }
 
-    fn plain_new_typeptr_then_guard_class(typeptr_value: Operand, expected: i64) -> Vec<Op> {
-        let sd = size_descr(1);
-        let typeptr_descr: DescrRef = Arc::new(majit_ir::SimpleFieldDescr::new_with_name(
-            0,
-            0,
-            8,
-            Type::Ref,
-            false,
-            majit_ir::ArrayFlag::Pointer,
-            "PyObject.ob_type".to_string(),
-            "ob_type".to_string(),
-        ));
+    fn new_with_vtable_then_guard_class(vtable: i64, expected: i64) -> Vec<Op> {
+        let sd: DescrRef = majit_ir::make_size_descr_with_vtable(1, 8, 0, vtable as usize);
         let mut guard = Op::new(
             OpCode::GuardClass,
             &[
@@ -5146,11 +5058,6 @@ mod tests {
                 Operand::const_from_value(Value::Int(expected)),
             ],
         );
-        // Production capture_resumedata lists the object when it is live.
-        // That is resume virtual encoding; the replacement GUARD_VALUE
-        // must keep those fail args without force_box of the vstruct
-        // (optimizer.py emit_guard_operation force_box is on finish()'s
-        // TAGBOX liveboxes, not TAGVIRTUAL).
         guard.setfailargs(
             vec![crate::history::test_support::rooted_resop_operand(
                 Type::Ref,
@@ -5158,87 +5065,28 @@ mod tests {
             )]
             .into(),
         );
-        let mut ops = vec![
-            Op::with_descr(OpCode::New, &[], sd),
-            Op::with_descr(
-                OpCode::SetfieldGc,
-                &[
-                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    typeptr_value,
-                ],
-                typeptr_descr,
-            ),
-            guard,
-        ];
+        let mut ops = vec![Op::with_descr(OpCode::NewWithVtable, &[], sd), guard];
         assign_positions(&mut ops);
         ops
     }
 
     #[test]
-    fn runtime_typeptr_then_guard_class_on_plain_new_does_not_force() {
-        // `handle_getfield_typeptr` rewrites the typeptr read to GuardClass.
-        // A runtime typeptr is not a proof: replace GUARD_CLASS with
-        // GUARD_VALUE on the typeptr box. Emitting GUARD_CLASS would
-        // force the vstruct; dropping it would leave the class unguarded.
-        let typeptr = crate::history::test_support::rooted_resop_operand(Type::Ref, 50);
-        let ops = plain_new_typeptr_then_guard_class(typeptr, 0xCAFE);
-        let result = run_default_pipeline(&ops);
-        let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
-        assert!(
-            !opcodes.contains(&OpCode::New),
-            "guard_value on the typeptr box must not force the vstruct: {opcodes:?}"
-        );
-        assert!(
-            !opcodes.contains(&OpCode::GuardClass),
-            "GUARD_CLASS must be rewritten, not emitted: {opcodes:?}"
-        );
-        let gv = result
-            .iter()
-            .find(|op| op.opcode == OpCode::GuardValue)
-            .expect("runtime typeptr must emit GUARD_VALUE");
-        assert!(
-            !opcodes.contains(&OpCode::CastPtrToInt) && !opcodes.contains(&OpCode::CastIntToPtr),
-            "runtime Ref typeptr is stored unchanged; no cast before GUARD_VALUE: {opcodes:?}"
-        );
-        assert!(
-            !gv.arg(0).is_constant(),
-            "GUARD_VALUE must check the runtime typeptr box, got {:?}",
-            gv.arg(0)
-        );
-        assert_eq!(
-            gv.arg(0).type_(),
-            Type::Ref,
-            "GUARD_VALUE arg0 is the stored typeptr box, got {:?}",
-            gv.arg(0)
-        );
-        match gv.arg(1).const_value() {
-            Some(Value::Ref(g)) => assert_eq!(g.0, 0xCAFE),
-            other => panic!("GUARD_VALUE expected ConstPtr class word, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn constant_typeptr_matching_guard_class_on_plain_new_is_removed() {
+    fn matching_guard_class_on_new_with_vtable_is_removed() {
         // rewrite.py optimize_GUARD_CLASS: known class matches → drop.
-        let ops = plain_new_typeptr_then_guard_class(
-            Operand::const_from_value(Value::Ref(majit_ir::GcRef(0xCAFE))),
-            0xCAFE,
-        );
+        // `new_with_vtable` stamps known_class; the typeptr store is dropped.
+        let ops = new_with_vtable_then_guard_class(0xCAFE, 0xCAFE);
         let result = run_default_pipeline(&ops);
         assert!(
             result.is_empty(),
-            "matching constant typeptr must drop GUARD_CLASS without forcing: {:?}",
+            "matching new_with_vtable class must drop GUARD_CLASS: {:?}",
             result.iter().map(|op| op.opcode).collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn constant_typeptr_mismatch_guard_class_on_plain_new_is_invalid_loop() {
+    fn mismatch_guard_class_on_new_with_vtable_is_invalid_loop() {
         // rewrite.py optimize_GUARD_CLASS: known class mismatch → InvalidLoop.
-        let ops = plain_new_typeptr_then_guard_class(
-            Operand::const_from_value(Value::Ref(majit_ir::GcRef(0xBEEF))),
-            0xCAFE,
-        );
+        let ops = new_with_vtable_then_guard_class(0xBEEF, 0xCAFE);
         let err =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_default_pipeline(&ops)));
         let payload = match err {

@@ -394,16 +394,13 @@ impl CachedField {
         // info.py opinfo.setfield(descr, struct, op, optheap, cf=self)
         // PyPy: `setfield(..., cf=cf)` calls `cf.register_info(struct, self)`
         // (info.py). The Rust port performs both halves here.
-        let arg = ctx.resolve_operand_operand(&op.arg(1));
-        let struct_box = ctx.resolve_operand_operand(&op.arg(0));
-        let owner = ctx
-            .peek_ptr_info(&struct_box)
-            .and_then(|info| info.get_descr().cloned());
         let descr_idx = op
             .getdescr()
             .as_ref()
-            .map(|d| OptHeap::field_slot_index_in(d, owner.as_ref()))
+            .map(OptHeap::field_slot_index)
             .unwrap_or(0);
+        let arg = ctx.resolve_operand_operand(&op.arg(1));
+        let struct_box = ctx.resolve_operand_operand(&op.arg(0));
         self.register_info(&struct_box);
         ctx.structinfo_setfield(op, descr_idx, &arg);
     }
@@ -1084,60 +1081,30 @@ impl OptHeap {
     /// header word from an unplaced field naming the same word, so the two
     /// bands stay apart.
     pub(crate) fn field_slot_index(descr: &DescrRef) -> u32 {
-        Self::field_slot_index_in(descr, None)
-    }
-
-    /// Slot for `descr` in `owner`'s `all_fielddescrs()` when that list
-    /// holds the field (`virtualize.rs slot_in_field_list` /
-    /// `heaptracker.get_fielddescr_index_in`). Falls back to the field's
-    /// own parent list, then the unslotted offset band.
-    ///
-    /// A SETFIELD of `vable_token` must land on the listed row
-    /// (`descr.py get_field_descr` / `cpu.fielddescrof(VTYPE, 'vable_token')`)
-    /// so `force_box` can walk it by position. An empty-name sequential mint
-    /// with a live parent still names that row by offset+kind.
-    pub(crate) fn field_slot_index_in(descr: &DescrRef, owner: Option<&DescrRef>) -> u32 {
         let Some(field_descr) = descr.as_field_descr() else {
             return descr.index();
         };
-        // Header words resolve through no field list (`OptVirtualize`
-        // folds `is_typeptr` from `known_class` and `is_w_class` from the
-        // virtual's class identity). `heaptracker.all_fielddescrs` skips
-        // `typeptr` and prepends the inherited `w_class` leaf, but the
-        // heap `_fields` slot for that word stays the header band so a
-        // GETFIELD fold goes through `record_quasiimmut_field` /
-        // `notify_w_class_mutated` rather than `_fields[0]`.
         if field_descr.is_typeptr() || field_descr.is_w_class() {
             return Self::header_field_slot(field_descr);
         }
-        if let Some(size) = owner.and_then(|d| d.as_size_descr()) {
-            let fields = size.all_fielddescrs();
-            if let Some(i) = crate::optimizeopt::virtualize::slot_in_field_list(fields, field_descr)
-            {
-                return i;
-            }
-            if let Some(i) = crate::optimizeopt::virtualize::unique_offset_slot(fields, field_descr)
-            {
-                return i;
-            }
-        }
+        // One walk of the parent list. `parent_list_slot` already searched it;
+        // re-fetching the row and cloning the `DescrRef` just to confirm the
+        // same `slot_holds_field` answer is the same work twice.
         if let Some(parent) = field_descr.get_parent_descr()
             && let Some(size) = parent.as_size_descr()
         {
             let fields = size.all_fielddescrs();
-            if let Some(i) = crate::optimizeopt::virtualize::slot_in_field_list(fields, field_descr)
-            {
-                return i;
+            let minted = field_descr.index_in_parent();
+            if fields.get(minted).is_some_and(|slot| {
+                crate::optimizeopt::virtualize::slot_holds_field(slot.as_ref(), field_descr)
+            }) {
+                return minted as u32;
             }
-            // Do not unique_offset on the field's parent when that list is
-            // not the PtrInfo owner. A T-path payload list `[map, storage]`
-            // puts `storage` at 1; the listed group prepends `w_class`
-            // (`heaptracker.all_fielddescrs` into the inlined parent), so
-            // listed `_fields[1]` is `map`. Unique-offset onto the parent
-            // would fold GetfieldGcR `W_ObjectObject.storage` to map's Int.
-            // `unique_offset_slot` stays on the owner path above, where the
-            // allocation SizeDescr is the `_fields` index space
-            // (`virtualizable.py` `cpu.fielddescrof` leftover token).
+            if let Some(i) = fields.iter().position(|slot| {
+                crate::optimizeopt::virtualize::slot_holds_field(slot.as_ref(), field_descr)
+            }) {
+                return i as u32;
+            }
         }
         // The parent places this field nowhere, so there is no slot number
         // for it — and `descr.index()` is not one either.  Slot numbers are
@@ -2312,6 +2279,7 @@ impl OptHeap {
             return OptimizationResult::Remove;
         }
 
+        let field_idx = Self::field_slot_index(&descr);
         let descr_id = descr_ptr(&descr);
         let raw_obj = op.arg(0).to_opref();
         // heap.py:645
@@ -2327,12 +2295,6 @@ impl OptHeap {
         // canonical OpRef.
         let obj_box = ctx.resolve_operand_operand(&op.arg(0));
         let _ = ctx.ensure_ptr_info_arg0(op);
-        let field_idx = Self::field_slot_index_in(
-            &descr,
-            ctx.peek_ptr_info(&obj_box)
-                .and_then(|info| info.get_descr().cloned())
-                .as_ref(),
-        );
         // heap.py `cf = self.field_cache(descr)` — get-or-CREATE
         // (heap.py:392-397), so the aliasing check and the cache consult below
         // run even for a descr this pass has not touched yet.
@@ -2392,10 +2354,8 @@ impl OptHeap {
         if let Some(cached) = must_alias_cached {
             let b_old = Operand::from_bound_op(op_rc);
             let b_cached = ctx.resolve_operand_operand(&cached);
-            if b_old.type_() == b_cached.type_() {
-                ctx.make_equal_to(&b_old, &b_cached);
-                return OptimizationResult::Remove;
-            }
+            ctx.make_equal_to(&b_old, &b_cached);
+            return OptimizationResult::Remove;
         }
         if let Some(entry) = cached_entry {
             // heap.py:182-186: isinstance(res, PreambleOp)
@@ -2407,18 +2367,14 @@ impl OptHeap {
                     // Force first (use_box / potential_extra_ops side
                     // effects) and store the returned `preamble_op.op`,
                     // then walk forwarding for the body replace.
+                    let cached = ctx.force_op_from_preamble_op(pop);
+                    ctx.structinfo_setfield(op, field_idx, &cached);
+                    let obj_box = ctx.resolve_operand_operand(&obj_box);
+                    self.cached_fields[pos].2.register_info(&obj_box);
                     let b_old = Operand::from_bound_op(op_rc);
-                    if b_old.type_() == pop.op.type_() {
-                        let cached = ctx.force_op_from_preamble_op(pop);
-                        ctx.structinfo_setfield(op, field_idx, &cached);
-                        let obj_box = ctx.resolve_operand_operand(&obj_box);
-                        self.cached_fields[pos].2.register_info(&obj_box);
-                        let b_cached = ctx.resolve_operand_operand(&cached);
-                        if b_old.type_() == b_cached.type_() {
-                            ctx.make_equal_to(&b_old, &b_cached);
-                            return OptimizationResult::Remove;
-                        }
-                    }
+                    let b_cached = ctx.resolve_operand_operand(&cached);
+                    ctx.make_equal_to(&b_old, &b_cached);
+                    return OptimizationResult::Remove;
                 }
                 crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                     if !cached.is_none() {
@@ -2433,10 +2389,8 @@ impl OptHeap {
                         self.cached_fields[pos].2.register_info(&obj_box);
                         let b_old = Operand::from_bound_op(op_rc);
                         let b_cached = ctx.resolve_operand_operand(&cached);
-                        if b_old.type_() == b_cached.type_() {
-                            ctx.make_equal_to(&b_old, &b_cached);
-                            return OptimizationResult::Remove;
-                        }
+                        ctx.make_equal_to(&b_old, &b_cached);
+                        return OptimizationResult::Remove;
                     }
                 }
             }
@@ -2493,18 +2447,14 @@ impl OptHeap {
                 crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
                     // heap.py:185-186: force the preamble op, then write the
                     // forced value back into the struct info.
+                    let cached = ctx.force_op_from_preamble_op(pop);
+                    ctx.structinfo_setfield(op, field_idx, &cached);
+                    let obj_box = ctx.resolve_operand_operand(&obj_box);
+                    self.cached_fields[pos].2.register_info(&obj_box);
                     let b_old = Operand::from_bound_op(op_rc);
-                    if b_old.type_() == pop.op.type_() {
-                        let cached = ctx.force_op_from_preamble_op(pop);
-                        ctx.structinfo_setfield(op, field_idx, &cached);
-                        let obj_box = ctx.resolve_operand_operand(&obj_box);
-                        self.cached_fields[pos].2.register_info(&obj_box);
-                        let b_cached = ctx.resolve_operand_operand(&cached);
-                        if b_old.type_() == b_cached.type_() {
-                            ctx.make_equal_to(&b_old, &b_cached);
-                            return OptimizationResult::Remove;
-                        }
-                    }
+                    let b_cached = ctx.resolve_operand_operand(&cached);
+                    ctx.make_equal_to(&b_old, &b_cached);
+                    return OptimizationResult::Remove;
                 }
                 crate::optimizeopt::info::FieldEntryKind::Value(cached) => {
                     if !cached.is_none() {
@@ -2512,10 +2462,8 @@ impl OptHeap {
                         self.cached_fields[pos].2.register_info(&obj_box);
                         let b_old = Operand::from_bound_op(op_rc);
                         let b_cached = ctx.resolve_operand_operand(&cached);
-                        if b_old.type_() == b_cached.type_() {
-                            ctx.make_equal_to(&b_old, &b_cached);
-                            return OptimizationResult::Remove;
-                        }
+                        ctx.make_equal_to(&b_old, &b_cached);
+                        return OptimizationResult::Remove;
                     }
                 }
             }
@@ -2532,10 +2480,8 @@ impl OptHeap {
                     // Subsequent read: reuse the cached value.
                     let b_old = Operand::from_bound_op(op_rc);
                     let b_qi = ctx.get_box_replacement_operand(qi_cached);
-                    if b_old.type_() == b_qi.type_() {
-                        ctx.make_equal_to(&b_old, &b_qi);
-                        return OptimizationResult::Remove;
-                    }
+                    ctx.make_equal_to(&b_old, &b_qi);
+                    return OptimizationResult::Remove;
                 }
                 // First read after QUASIIMMUT_FIELD: emit the load, then cache
                 // the result so it survives calls (unlike normal mutable fields).
@@ -2660,12 +2606,7 @@ impl OptHeap {
     ) -> OptimizationResult {
         // heap.py arg1 = get_box_replacement(self._get_rhs_from_set_op(op))
         let arg1 = ctx.resolve_operand_operand(&op.arg(1));
-        let field_idx = Self::field_slot_index_in(
-            descr,
-            ctx.peek_ptr_info(obj_box)
-                .and_then(|info| info.get_descr().cloned())
-                .as_ref(),
-        );
+        let field_idx = Self::field_slot_index(descr);
         let pos = self.ensure_cached_field(descr, Some(field_idx));
         // heap.py if self.possible_aliasing(structinfo):
         //                  self.force_lazy_set(optheap, op.getdescr())
@@ -3731,41 +3672,6 @@ impl OptHeap {
             _ => self.handle_side_effects(op, op_rc, ctx),
         }
     }
-
-    /// Stores, allocations, and debug markers that can sit between an
-    /// `INT_*_OVF` and its `GUARD_[NO_]OVERFLOW` once a listed GCREF
-    /// row (`vable_token`) has forced a virtual frame. Holding the
-    /// postponed ovf across them restores the assembler adjacency.
-    fn holds_ovf_across(op: &Op) -> bool {
-        matches!(
-            op.opcode,
-            OpCode::SetfieldGc
-                | OpCode::SetfieldRaw
-                | OpCode::SetarrayitemGc
-                | OpCode::SetarrayitemRaw
-                | OpCode::SetinteriorfieldGc
-                | OpCode::SetinteriorfieldRaw
-                | OpCode::New
-                | OpCode::NewWithVtable
-                | OpCode::NewArray
-                | OpCode::NewArrayClear
-                | OpCode::CondCallGcWb
-                | OpCode::CondCallGcWbArray
-                | OpCode::DebugMergePoint
-                | OpCode::LeavePortalFrame
-                | OpCode::EnterPortalFrame
-                | OpCode::Keepalive
-                | OpCode::JitDebug
-        )
-    }
-
-    fn op_uses_postponed_result(op: &Op, postponed: &Op) -> bool {
-        let pos = postponed.pos().get();
-        if pos.is_none() {
-            return false;
-        }
-        (0..op.num_args()).any(|i| op.arg(i).to_opref() == pos)
-    }
 }
 
 impl Default for OptHeap {
@@ -3824,31 +3730,18 @@ impl Optimization for OptHeap {
             if op.opcode.is_guard() {
                 self.force_lazy_sets_for_guard_early(ctx);
             }
-            // heap.py `emit_postponed_op()`. Hold an INT_*_OVF across a
-            // store/alloc that does not consume it: listing `vable_token`
-            // (`descr.py get_field_descr` / `heaptracker.all_fielddescrs`)
-            // forces a virtual PyFrame and leaves `SETFIELD_GC`
-            // (`ExecutionContext.topframeref`) in the stream between the
-            // ovf and GUARD_[NO_]OVERFLOW. Releasing on that store splits
-            // the pair the assembler asserts (`aarch64/assembler.py`).
-            let hold_ovf = self.postponed_op.as_ref().is_some_and(|p| {
-                p.opcode.is_ovf()
-                    && (matches!(op.opcode, OpCode::GuardOverflow | OpCode::GuardNoOverflow)
-                        || (Self::holds_ovf_across(op) && !Self::op_uses_postponed_result(op, p)))
-            });
-            if !hold_ovf {
-                if let Some(postponed) = self.postponed_op.take() {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
-                            postponed.opcode,
-                            postponed.pos().get(),
-                            op.opcode,
-                            op.pos().get()
-                        );
-                    }
-                    ctx.emit_extra(ctx.current_pass_idx, postponed);
+            // heap.py `emit_postponed_op()`.
+            if let Some(postponed) = self.postponed_op.take() {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
+                        postponed.opcode,
+                        postponed.pos().get(),
+                        op.opcode,
+                        op.pos().get()
+                    );
                 }
+                ctx.emit_extra(ctx.current_pass_idx, postponed);
             }
         }
         // heap.py:419-423 — postpone comparison / ovf ops. CALL_MAY_FORCE is
@@ -3904,13 +3797,6 @@ impl Optimization for OptHeap {
         self.cached_dict_reads.clear();
         self.corresponding_array_descrs.clear();
         self.quasi_immut_cache.clear();
-    }
-
-    fn take_postponed_ovf(&mut self) -> Option<Op> {
-        match self.postponed_op.as_ref() {
-            Some(p) if p.opcode.is_ovf() => self.postponed_op.take(),
-            _ => None,
-        }
     }
 
     fn flush(&mut self, ctx: &mut OptContext) {
@@ -4064,25 +3950,6 @@ impl Optimization for OptHeap {
             if descr.get_descr_index() == -1 {
                 continue;
             }
-            // Header words are not `serialize_optheap` fields.
-            // `heaptracker.all_fielddescrs` skips `typeptr`; the inherited
-            // `w_class` leaf is listed (`heaptracker` recursion into the
-            // inlined parent) but the tracer GETFIELD used to be a parentless
-            // `PyreFieldDescr` whose `get_descr_index` stayed -1, so this
-            // loop never emitted it. Unifying onto that listed
-            // `SimpleFieldDescr` (`descr.py get_field_descr` cache) assigns a
-            // real `descr_index` and `get_field_descr` stamps the child
-            // SizeDescr as `parent_descr` (`descr.py fielddescr.parent_descr
-            // = get_size_descr`). Exporting `instance.w_class == ClassA`
-            // into a class-change bridge then proves `GUARD_VALUE(ClassB)`
-            // always-fail. The class word travels as `known_class` /
-            // `GUARD_VALUE`, same as `typeptr`.
-            if descr
-                .as_field_descr()
-                .is_some_and(|field| field.is_header_field())
-            {
-                continue;
-            }
             // heap.py:833-834:
             //     parent_descr = descr.get_parent_descr()
             //     if not parent_descr.is_object(): continue
@@ -4153,11 +4020,7 @@ impl Optimization for OptHeap {
             if box1.is_none() || box2.is_none() {
                 continue;
             }
-            let owner_box = ctx.get_box_replacement_operand(*box1);
-            let owner = ctx
-                .peek_ptr_info(&owner_box)
-                .and_then(|info| info.get_descr().cloned());
-            let field_idx = Self::field_slot_index_in(descr, owner.as_ref());
+            let field_idx = Self::field_slot_index(descr);
             let resolved = ctx.get_replacement_opref(*box1);
             // heap.py:872-873: parent_descr = descr.get_parent_descr()
             //                  assert parent_descr.is_object()
@@ -4769,23 +4632,26 @@ mod tests {
         );
     }
 
-    /// A SETFIELD spelling at the listed token offset must land on the
-    /// listed row even when `field_key` disagrees (`descr.py`
-    /// `get_field_descr` vs a sequential `cpu.fielddescrof` mint).
+    /// The listed token descr (`descr.py get_field_descr`) maps onto its
+    /// parent-list row. A parentless mint at the same offset is a
+    /// different identity and stays in the unslotted band.
     #[test]
-    fn field_slot_index_maps_token_offset_onto_listed_row() {
+    fn field_slot_index_maps_listed_token_via_parent_list() {
         use majit_ir::descr::{ArrayFlag, SimpleFieldDescr, SimpleSizeDescr};
 
-        let listed: Arc<SimpleFieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
-            12,
-            48,
-            8,
-            Type::Ref,
-            false,
-            ArrayFlag::Pointer,
-            "PyFrame.vable_token".to_string(),
-            "vable_token",
-        ));
+        let listed: Arc<SimpleFieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                12,
+                48,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "PyFrame.vable_token".to_string(),
+                "vable_token",
+            )
+            .with_index_in_parent(1),
+        );
         let header: Arc<SimpleFieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
             0,
             0,
@@ -4808,37 +4674,17 @@ mod tests {
         let parentless: DescrRef = Arc::new(
             SimpleFieldDescr::new(0, 48, 8, Type::Ref, false).with_flag(ArrayFlag::Pointer),
         );
-        let qualified: DescrRef = Arc::new(SimpleFieldDescr::new_with_name(
-            99,
-            48,
-            8,
-            Type::Ref,
-            false,
-            ArrayFlag::Pointer,
-            "PyFrame.vable_token".to_string(),
-            "PyFrame.vable_token",
-        ));
         let listed_ref: DescrRef = listed.clone() as DescrRef;
 
         assert_eq!(
-            OptHeap::field_slot_index_in(&listed_ref, Some(&size)),
+            OptHeap::field_slot_index(&listed_ref),
             1,
             "listed token is all_fielddescrs[1]"
         );
-        assert_eq!(
-            OptHeap::field_slot_index_in(&parentless, Some(&size)),
+        assert_ne!(
+            OptHeap::field_slot_index(&parentless),
             1,
-            "empty-name sequential mint at offset 48 is the listed token"
-        );
-        assert_eq!(
-            OptHeap::field_slot_index_in(&qualified, Some(&size)),
-            1,
-            "qualified field_key at offset 48 is the listed token"
-        );
-        assert_eq!(
-            OptHeap::field_slot_index_in(&listed_ref, None),
-            1,
-            "listed token's parent list is the SizeDescr row"
+            "a parentless mint is not the listed token descr"
         );
     }
 
@@ -4897,29 +4743,23 @@ mod tests {
         let header = OptHeap::header_field_slot(w_class.as_ref());
 
         assert_eq!(
-            OptHeap::field_slot_index_in(&w_class_ref, Some(&size)),
+            OptHeap::field_slot_index(&w_class_ref),
             header,
             "listed w_class still uses the header band"
         );
         assert_eq!(
-            OptHeap::field_slot_index_in(&shared, Some(&size)),
+            OptHeap::field_slot_index(&shared),
             header,
             "shared header leaf at the same offset uses the header band"
-        );
-        assert_eq!(
-            OptHeap::field_slot_index_in(&w_class_ref, None),
-            header,
-            "parent-less class word uses the header band"
         );
         assert_ne!(header, 0, "header band is disjoint from all_fielddescrs[0]");
     }
 
-    /// The listed inherited `w_class` leaf has a `descr_index` and a child
-    /// object SizeDescr as `parent_descr`, which would pass every
-    /// `serialize_optheap` gate that a payload field passes. It still must
-    /// not be exported: a class-change bridge would inherit the old class.
+    /// `serialize_optheap` has no header exclusion. A listed `w_class`
+    /// that passes the existing reachability and lazy-store gates is
+    /// exported like any other field.
     #[test]
-    fn export_cached_fields_skips_listed_w_class() {
+    fn export_cached_fields_includes_listed_w_class() {
         use majit_ir::GcRef;
         use majit_ir::descr::{ArrayFlag, SimpleFieldDescr, SimpleSizeDescr};
 
@@ -4971,11 +4811,11 @@ mod tests {
         let map_word = OpRef::const_int(0xbbb);
         ctx.with_ptr_info_mut(&obj, |info| {
             info.setfield(
-                OptHeap::field_slot_index_in(&w_class_ref, Some(&size)),
+                OptHeap::field_slot_index(&w_class_ref),
                 Operand::from_opref(class_a),
             );
             info.setfield(
-                OptHeap::field_slot_index_in(&map_ref, Some(&size)),
+                OptHeap::field_slot_index(&map_ref),
                 Operand::from_opref(map_word),
             );
         })
@@ -4987,15 +4827,14 @@ mod tests {
         assert!(
             exported
                 .iter()
-                .all(|(_, descr, _)| !descr.as_field_descr().is_some_and(|f| f.is_w_class())),
-            "listed w_class must not serialize into a bridge, got {exported:?}"
+                .any(|(_, descr, _)| descr.as_field_descr().is_some_and(|f| f.is_w_class())),
+            "listed w_class serializes when it passes serialize_optheap gates, got {exported:?}"
         );
         assert_eq!(
             exported.len(),
-            1,
-            "payload map still serializes, got {exported:?}"
+            2,
+            "w_class and payload map both serialize, got {exported:?}"
         );
-        assert_eq!(exported[0].2, map_word);
     }
 
     #[test]

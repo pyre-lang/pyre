@@ -347,6 +347,10 @@ mod tests {
         let listed = crate::descr::pyframe_vable_token_descr();
         let token_fd = token.as_field_descr().expect("token FieldDescr");
         let listed_fd = listed.as_field_descr().expect("listed FieldDescr");
+        assert!(
+            std::sync::Arc::ptr_eq(&token, &listed),
+            "vinfo token descr is the listed SizeDescr row"
+        );
         assert_eq!(token_fd.offset(), listed_fd.offset());
         assert_eq!(token_fd.field_key(), listed_fd.field_key());
         assert_eq!(token_fd.index_in_parent(), listed_fd.index_in_parent());

@@ -6977,8 +6977,35 @@ impl<'a> Transformer<'a> {
         // class word is stamped by the allocation, so a write to it emits no
         // op at all.  Dropping it is sound only after `rewrite_op_malloc`
         // turned the allocation into `new_with_vtable`
-        // (`heaptracker.get_vtable_for_gcstruct`).  A residual nursery bump
-        // never became that op, so the store stays.
+        // (`heaptracker.get_vtable_for_gcstruct`).
+        //
+        // `alloc_instance_object` does not become that op. Three stacked
+        // gaps, each required:
+        // 1. `fuse_boxing_alloc` `gc_malloc_flavor` matches only
+        //    `lltype::{malloc,malloc_typed,malloc_typed_managed,malloc_typed_stable}`.
+        //    The body calls `try_gc_alloc_nursery_raw(tid, size)`;
+        //    `lower_struct_ptr_writes` then turns `ptr::write` into
+        //    FieldWrites, so the residual is nursery Call + `ob_type` store.
+        // 2. `instance_typeptr_for` chooses `INSTANCE_TYPE` vs
+        //    `INSTANCE_USER_TYPE` at runtime. `resolve_header_plan` refuses a
+        //    non-constant `ob_type` (`ob_type-not-a-constant-address`) rather
+        //    than emitting plain `new`.
+        // 3. One Rust STRUCT (`W_ObjectObject`) carries two vtables: tid 53 /
+        //    `INSTANCE_TYPE` for exact `object()`, tid 217 /
+        //    `INSTANCE_USER_TYPE` for `_getusercls`. Upstream
+        //    `get_vtable_for_gcstruct` answers one vtable per STRUCT.
+        //    `NewWithVtable { owner: "W_ObjectObject", vtable: 0 }` would
+        //    stamp the published exact-object group, the wrong tid/typeptr
+        //    for user carriers. The user size descr already lives under
+        //    `objectobject::W_ObjectObjectUser`
+        //    (`W_OBJECT_OBJECT_USER_SIZE_DESCR`); there is no Rust STRUCT of
+        //    that name for `rclass.new_instance` to malloc.
+        // Convergence is `typedef.py _getusercls` as its own interp class
+        // (`W_ObjectObjectUserDictWeakrefable`), two specialized
+        // `new_instance` graphs with constant vtables, then this drop is
+        // unconditional. Teaching fuse the nursery spelling, or splitting
+        // only the typeptr without that STRUCT, still stamps the wrong GC
+        // tid on user instances. The store stays until that landing.
         if matches!(&op.kind, OpKind::FieldWrite { .. })
             && crate::codewriter::heaptracker::is_typeptr_field(field)
             && Self::field_write_base_stamps_typeptr(graph, op)
@@ -27651,8 +27678,9 @@ mod tests {
 
     /// `jtransform.py rewrite_op_setfield` drops typeptr only because
     /// `rewrite_op_malloc` already emitted `new_with_vtable`. A residual
-    /// `try_gc_alloc_nursery_raw` never became that op, so the store stays
-    /// even after `__cast_instance_intrinsic`.
+    /// `try_gc_alloc_nursery_raw` is not that op (`gc_malloc_flavor` does
+    /// not match it; see `rewrite_op_setfield`), so the store stays even
+    /// after `__cast_instance_intrinsic`.
     #[test]
     fn rewrite_op_setfield_keeps_typeptr_on_residual_nursery_alloc() {
         let mut graph = FunctionGraph::new("alloc_instance_object");

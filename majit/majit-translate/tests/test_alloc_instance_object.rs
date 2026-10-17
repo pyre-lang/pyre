@@ -2,9 +2,12 @@
 //!
 //! `try_gc_alloc_nursery_raw` + `ptr::write` is `lltype.malloc(STRUCT)`.
 //! `jtransform.py rewrite_op_malloc` turns that into `new_with_vtable` when
-//! the STRUCT has a vtable; otherwise the residual bump must keep the
-//! typeptr store (`rewrite_op_setfield` drops it only because `'new'` stamps
-//! it).
+//! the STRUCT has one vtable. This graph does not: `W_ObjectObject` is one
+//! STRUCT with two vtables (`INSTANCE_TYPE` tid 53 vs `INSTANCE_USER_TYPE`
+//! tid 217), `fuse_boxing_alloc` does not match `try_gc_alloc_nursery_raw`,
+//! and `instance_typeptr_for` is not a constant. Until `_getusercls` is its
+//! own interp class (`W_ObjectObjectUserDictWeakrefable`), the residual bump
+//! must keep the typeptr store.
 
 mod common;
 
