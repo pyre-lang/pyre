@@ -331,17 +331,6 @@ pub struct ArrayPtrInfo {
 pub struct VirtualStructInfo {
     /// The size descriptor.
     pub descr: DescrRef,
-    /// Residual `new` does not stamp the class word. A typeptr SETFIELD on
-    /// this vstruct is the header write `new_with_vtable` would have done;
-    /// it is metadata here, never a `_fields` slot (`heaptracker.py
-    /// all_fielddescrs` skips typeptr). `PassOn` of that store would force
-    /// the vstruct before sibling fields are written.
-    pub known_class: Option<i64>,
-    /// Runtime typeptr value to write at `force_box`, when the store is not
-    /// a compile-time constant. Immortal vtables stay in `known_class`.
-    pub typeptr_value: Option<Operand>,
-    /// Descr for the header store `force_box` emits from `typeptr_value`.
-    pub ob_type_descr: Option<DescrRef>,
     /// Field values: (field_index, value, optional original field descriptor).
     pub fields: VirtualFieldList,
     /// info.py:91-92
@@ -354,9 +343,6 @@ impl VirtualStructInfo {
     pub fn new(descr: DescrRef) -> Self {
         Self {
             descr,
-            known_class: None,
-            typeptr_value: None,
-            ob_type_descr: None,
             fields: VirtualFieldList::new(),
             last_guard_pos: -1,
             avpi: AbstractVirtualPtrInfo::new(),
@@ -639,9 +625,6 @@ impl PtrInfo {
                 }
             }
             PtrInfo::VirtualStruct(info) => {
-                if let Some(b) = &info.typeptr_value {
-                    b.walk_const_ptr_refs(visitor);
-                }
                 for (_, b) in &info.fields {
                     b.walk_const_ptr_refs(visitor);
                 }
@@ -952,13 +935,7 @@ impl PtrInfo {
             PtrInfo::Array(v) => v.items.iter().filter_map(|e| e.as_opref()).collect(),
             PtrInfo::Virtual(v) => v.fields.iter().map(|(_, r)| r.to_opref()).collect(),
             PtrInfo::VirtualArray(v) => v.items.iter().map(|b| b.to_opref()).collect(),
-            PtrInfo::VirtualStruct(v) => {
-                let mut refs: Vec<OpRef> = v.fields.iter().map(|(_, r)| r.to_opref()).collect();
-                if let Some(b) = &v.typeptr_value {
-                    refs.push(b.to_opref());
-                }
-                refs
-            }
+            PtrInfo::VirtualStruct(v) => v.fields.iter().map(|(_, r)| r.to_opref()).collect(),
             PtrInfo::VirtualArrayStruct(v) => v
                 .element_fields
                 .iter()
@@ -1000,11 +977,6 @@ impl PtrInfo {
                 }
             }
             PtrInfo::VirtualStruct(v) => {
-                if let Some(field) = v.typeptr_value.as_mut()
-                    && !field.is_none()
-                {
-                    *field = recurse(field.clone());
-                }
                 for (_, field) in &mut v.fields {
                     if !field.is_none() {
                         *field = recurse(field.clone());

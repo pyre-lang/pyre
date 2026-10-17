@@ -2020,6 +2020,22 @@ impl BhFieldSpec {
     }
 }
 
+/// Recover descr.py's FIELDNAME half of `cache[STRUCT][fieldname]` from a
+/// serialized `BhDescr::Field`.
+///
+/// Flatten stores the printable display (`STRUCT._name + '.' + fieldname`)
+/// in `name` and the owner separately. The cache keys only the STRUCT-local
+/// fieldname. An empty owner means `name` is already that fieldname
+/// (`BhDescr::from_field_descr`).
+pub fn bh_field_cache_key<'a>(owner: &str, name: &'a str) -> &'a str {
+    if owner.is_empty() {
+        return name;
+    }
+    name.strip_prefix(owner)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or(name)
+}
+
 /// Mirror `SizeDescr.all_fielddescrs` (`descr.py`) onto a
 /// fresh `Vec<BhFieldSpec>`.
 pub fn bh_field_specs_from_size_descr(sd: &dyn majit_ir::descr::SizeDescr) -> Vec<BhFieldSpec> {

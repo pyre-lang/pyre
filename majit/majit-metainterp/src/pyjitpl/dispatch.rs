@@ -265,10 +265,18 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
             index_in_parent,
             parent,
             name,
+            owner,
             is_immutable,
             is_quasi_immutable,
             ..
         } => {
+            // descr.py get_field_descr keys cache[STRUCT][fieldname] by the
+            // STRUCT-local fieldname. Flatten serializes the printable
+            // display (`STRUCT._name + '.' + fieldname`) in `name` and the
+            // owner separately; asking with the display string mints a
+            // parallel descr (exact fieldname, S1-2) whose leftover lands in
+            // the unslotted offset band (S1-8).
+            let field_key = majit_jitcode::jitcode::bh_field_cache_key(owner, name);
             if let Some(p) = parent {
                 if !p.all_fielddescrs.is_empty() {
                     // The descr's own two halves, before any of the branches
@@ -296,7 +304,9 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     let expected = p
                         .all_fielddescrs
                         .iter()
-                        .position(|f| !name.is_empty() && f.name == *name)
+                        .position(|f| {
+                            (!name.is_empty() && f.name == *name) || f.field_key() == field_key
+                        })
                         .or_else(|| {
                             let mut at = p
                                 .all_fielddescrs
@@ -352,7 +362,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         // `protect_speculative_field` still has a parent.
                         let selected = specs
                             .iter()
-                            .position(|spec| spec.field_key == *name || spec.name == *name)
+                            .position(|spec| spec.field_key == field_key || spec.name == *name)
                             .unwrap_or_else(|| {
                                 // This row is appended, so its slot is the new
                                 // end of the list. The incoming claim numbered
@@ -361,7 +371,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                 let slot = specs.len();
                                 specs.push(majit_ir::descr::SimpleFieldDescrSpec {
                                     index: u32::MAX,
-                                    field_key: name.clone(),
+                                    field_key: field_key.to_string(),
                                     // The container name is all this arm
                                     // has; nothing declared, so the descr
                                     // infers from it.
@@ -414,7 +424,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         .lock()
                         ._cache_field
                         .get(&struct_key)
-                        .and_then(|m| m.get(name.as_str()))
+                        .and_then(|m| m.get(field_key))
                         .cloned();
                     if let Some(fd) = cached {
                         let fd: majit_ir::DescrRef = fd;
@@ -438,8 +448,8 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     if gc._cache_size.contains_key(&struct_key) {
                         let fd = gc.get_field_descr(
                             struct_key,
-                            name,
-                            None,
+                            field_key,
+                            Some(name.as_str()),
                             *offset,
                             *field_size,
                             *field_type,
@@ -499,7 +509,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         }
                         let spec = majit_ir::descr::SimpleFieldDescrSpec {
                             index: u32::MAX,
-                            field_key: name.clone(),
+                            field_key: field_key.to_string(),
                             // A parentless field with no layout carrier:
                             // nothing declared, so the descr infers from the
                             // name.
@@ -544,8 +554,8 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     gc.get_size_descr(struct_key.clone(), p.size, p.vtable as usize, false);
                     let fd = gc.get_field_descr(
                         struct_key,
-                        name,
-                        None,
+                        field_key,
+                        Some(name.as_str()),
                         *offset,
                         *field_size,
                         *field_type,
@@ -6463,6 +6473,115 @@ mod tests {
         );
         assert!(!std::sync::Arc::ptr_eq(&a, &other));
         assert_eq!(parent_size_of(&other), 48);
+    }
+
+    /// Flatten stores `BhDescr::Field.name` as the printable display
+    /// (`descr.py` `'%s.%s' % (STRUCT._name, fieldname)`) and `owner` as
+    /// the STRUCT leaf. `get_field_descr` keys `_cache_field[STRUCT]` by
+    /// the STRUCT-local fieldname only, so reconstitution must ask with
+    /// that recovered key (`bh_field_cache_key`) rather than the display
+    /// string. A display lookup mints a parallel descr whose `field_key`
+    /// is `"PyFrame.flags"`; `slot_holds_field` then refuses the listed
+    /// `"flags"` row and `field_slot_index` puts the store in the unslotted
+    /// offset band (`0x40000030` at flags offset 48).
+    #[test]
+    fn display_spelling_field_reconstitutes_to_the_listed_struct_local_row() {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+
+        const CACHE_KEY: u64 = 0x5046_4C41_4753_0001;
+        const FLAGS_OFFSET: usize = 48;
+        const FLAGS_INDEX: usize = 10;
+        const PARENT_SIZE: usize = 104;
+
+        let mut specs = Vec::with_capacity(FLAGS_INDEX + 1);
+        for i in 0..FLAGS_INDEX {
+            specs.push(SimpleFieldDescrSpec {
+                index: i as u32,
+                field_key: format!("f{i}"),
+                is_class_word: None,
+                name: format!("T.f{i}"),
+                offset: 100 + i,
+                field_size: 1,
+                field_type: Type::Int,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Unsigned,
+                virtualizable: false,
+                index_in_parent: i,
+            });
+        }
+        specs.push(SimpleFieldDescrSpec {
+            index: FLAGS_INDEX as u32,
+            field_key: "flags".to_string(),
+            is_class_word: None,
+            name: "PyFrame.flags".to_string(),
+            offset: FLAGS_OFFSET,
+            field_size: 1,
+            field_type: Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Unsigned,
+            virtualizable: false,
+            index_in_parent: FLAGS_INDEX,
+        });
+        let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            PARENT_SIZE,
+            CACHE_KEY as u32,
+            CACHE_KEY,
+            0,
+            true,
+            false,
+            &specs,
+            &[],
+        );
+        let listed: majit_ir::DescrRef = group.field_descrs[FLAGS_INDEX].clone();
+        let listed_field = listed.as_field_descr().expect("listed flags");
+        assert_eq!(listed_field.field_key(), "flags");
+        assert_eq!(listed_field.offset(), FLAGS_OFFSET);
+        assert_eq!(listed_field.index_in_parent(), FLAGS_INDEX);
+
+        let parent_specs: Vec<_> = group
+            .field_descrs
+            .iter()
+            .map(|fd| {
+                majit_jitcode::jitcode::BhFieldSpec::from_field_descr(
+                    fd.as_ref() as &dyn majit_ir::descr::FieldDescr
+                )
+            })
+            .collect();
+        let bh = crate::blackhole::BhDescr::Field {
+            offset: FLAGS_OFFSET,
+            field_size: 1,
+            field_type: Type::Int,
+            field_flag: ArrayFlag::Unsigned,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(FLAGS_INDEX),
+            parent: Some(std::sync::Arc::new(majit_jitcode::jitcode::BhSizeSpec {
+                size: PARENT_SIZE,
+                type_id: CACHE_KEY,
+                vtable: 0,
+                owner: String::new(),
+                is_gc_managed: true,
+                headerless: false,
+                all_fielddescrs: parent_specs,
+            })),
+            name: "PyFrame.flags".to_string(),
+            owner: "PyFrame".to_string(),
+        };
+
+        let reconstituted = field_descr_ref_from_bh(&bh).1;
+        assert!(
+            std::sync::Arc::ptr_eq(&listed, &reconstituted),
+            "display spelling must resolve to cache[STRUCT][\"flags\"], not a parallel row"
+        );
+        assert_eq!(
+            crate::optimizeopt::heap::OptHeap::field_slot_index(&reconstituted),
+            FLAGS_INDEX as u32,
+            "listed flags is all_fielddescrs[{FLAGS_INDEX}]"
+        );
     }
 
     /// A missing cache key says nothing about the STRUCT's shape.

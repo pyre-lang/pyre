@@ -3915,15 +3915,20 @@ fn shared_pyobject_w_class_descr() -> Arc<majit_ir::descr::SimpleFieldDescr> {
     DESCR.clone()
 }
 
-fn register_shared_pyobject_w_class(fd: &Arc<majit_ir::descr::SimpleFieldDescr>) {
-    use majit_ir::descr::{LLType, gc_cache, path_hash};
+/// `descr.py get_field_descr` first-wins insert of the shared header leaf.
+/// Takes the already-held `GcCache` because `gc_cache` is a non-reentrant
+/// mutex: `descr_from_set_member` and a group factory may already own it.
+fn register_shared_pyobject_w_class_in(
+    gc: &mut majit_ir::descr::GcCache,
+    fd: &Arc<majit_ir::descr::SimpleFieldDescr>,
+) {
+    use majit_ir::descr::{LLType, path_hash};
     let names = [
         "PyObject",
         "pyobject::PyObject",
         "pyre_object::pyobject::PyObject",
     ];
     let size = std::mem::size_of::<pyre_object::pyobject::PyObject>();
-    let mut gc = gc_cache().lock();
     for name in names {
         let key = LLType::Struct(path_hash(name));
         let parent = gc.get_size_descr(key.clone(), size, 0, false);
@@ -3933,8 +3938,15 @@ fn register_shared_pyobject_w_class(fd: &Arc<majit_ir::descr::SimpleFieldDescr>)
         gc._cache_field
             .entry(key)
             .or_default()
-            .insert("w_class".to_string(), fd.clone());
+            .entry("w_class".to_string())
+            .or_insert_with(|| fd.clone());
     }
+}
+
+fn register_shared_pyobject_w_class(fd: &Arc<majit_ir::descr::SimpleFieldDescr>) {
+    use majit_ir::descr::gc_cache;
+    let mut gc = gc_cache().lock();
+    register_shared_pyobject_w_class_in(&mut gc, fd);
 }
 
 fn inherited_w_class_gc_edge() -> Arc<dyn FieldDescr> {
@@ -3956,7 +3968,9 @@ static W_CLASS_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> =
     LazyLock::new(|| shared_pyobject_w_class_descr() as Arc<dyn FieldDescr>);
 
 pub fn w_class_descr() -> DescrRef {
-    shared_pyobject_w_class_descr() as DescrRef
+    let leaf = shared_pyobject_w_class_descr();
+    register_shared_pyobject_w_class(&leaf);
+    leaf as DescrRef
 }
 
 /// The canonical `w_class` (Python class object) for instances of the type
@@ -11134,6 +11148,29 @@ mod tests {
         assert_eq!(descr.index(), OBJECT_W_CLASS_INDEX);
     }
 
+    /// `descr.py get_field_descr` first-wins: publication `or_insert`s the
+    /// shared leaf and does not replace a cache occupant.
+    #[test]
+    fn w_class_descr_registers_without_replacing_a_cached_row() {
+        use majit_ir::descr::{LLType, gc_cache, path_hash};
+        let _ = w_class_descr();
+        let gc = gc_cache().lock();
+        for name in [
+            "PyObject",
+            "pyobject::PyObject",
+            "pyre_object::pyobject::PyObject",
+        ] {
+            let key = LLType::Struct(path_hash(name));
+            assert!(
+                gc._cache_field
+                    .get(&key)
+                    .and_then(|inner| inner.get("w_class"))
+                    .is_some(),
+                "{name} must have a w_class cache row"
+            );
+        }
+    }
+
     #[test]
     fn make_descr_from_bh_size_and_kind0_parent_layout() {
         use majit_ir::descr::ArrayFlag;
@@ -12640,12 +12677,7 @@ pub(crate) fn bh_field_cache_key<'a>(owner: &str, name: &'a str) -> &'a str {
     // STRUCT already stores. The owner prefix is only a printable
     // qualification on the wire, so strip it in place instead of
     // allocating `format!("{owner}.")` on every kind-0 field.
-    if owner.is_empty() {
-        return name;
-    }
-    name.strip_prefix(owner)
-        .and_then(|rest| rest.strip_prefix('.'))
-        .unwrap_or(name)
+    majit_jitcode::jitcode::bh_field_cache_key(owner, name)
 }
 
 /// Field half of an interior descr whose owner list has no row for it.
@@ -14300,7 +14332,7 @@ pub(crate) fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) ->
                 return SetMemberLookup::Resolved(gil_ready_descr());
             }
             let struct_key = LLType::Struct(*struct_id);
-            let gc = gc_cache().lock();
+            let mut gc = gc_cache().lock();
             if let Some(inner) = gc._cache_field.get(&struct_key)
                 && let Some(fd) = lookup_field_by_either_spelling(inner, field_name)
             {
@@ -14319,8 +14351,12 @@ pub(crate) fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) ->
             // `pyobject::PyObject`, which the name bridge does not list, so
             // the size can be present while neither field list carries the
             // name. The stamp has to use the same descr the walker reads.
+            // Register through the lock this function already holds:
+            // `w_class_descr()` would take `gc_cache` again.
             if field_name == "w_class" && is_shared_pyobject_header(*struct_id) {
-                return SetMemberLookup::Resolved(w_class_descr());
+                let leaf = shared_pyobject_w_class_descr();
+                register_shared_pyobject_w_class_in(&mut gc, &leaf);
+                return SetMemberLookup::Resolved(leaf as majit_ir::DescrRef);
             }
             if gc
                 ._cache_field

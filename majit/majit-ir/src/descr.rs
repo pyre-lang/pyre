@@ -2653,232 +2653,156 @@ impl GcCache {
     ) -> Arc<SimpleFieldDescr> {
         // descr.py: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
-        // descr.py get_field_descr: cache[STRUCT][fieldname]. `fieldname` is the
-        // STRUCT-local name. A caller that passed the display spelling
-        // (`"PyFrame.flags"`) still names that row when the cached descr
-        // occupies the same offset/size/type; nested paths that only share
-        // a leaf (`"a.block"` vs `"b.block"`) stay distinct keys.
+        // descr.py get_field_descr: cache[STRUCT][fieldname]. First insert
+        // owns the descriptor; a later caller with different geometry still
+        // receives that object.
         let cached = self
             ._cache_field
             .get(&struct_key)
             .and_then(|inner| inner.get(field_name))
             .cloned();
-        let cached = cached.or_else(|| {
-            self._cache_field.get(&struct_key).and_then(|inner| {
-                cached_field_same_physical_row(inner, field_name, offset, field_size, field_type)
-            })
-        });
         if let Some(descr) = cached {
-            // descr.py never sees two layouts for one (STRUCT, fieldname):
-            // `symbolic.get_field_token` is unique. Kind-0 LLBC and a later
-            // rust `offset_of!` mint can disagree (Windows PyFrame
-            // `vable_token` at 16 vs host 64). Returning the stale geometry
-            // makes SETFIELD_GC write the token into `pycode`. Remint.
-            let geometry_agrees = descr.offset == offset
-                && descr.field_size == field_size
-                && descr.field_type == field_type;
-            if !geometry_agrees {
+            // field-cache identity: does this slot answer for the field the caller asked
+            // about?  Passing the *cached* values for the three components
+            // whose expected value is derived differently per build profile
+            // (immutability pair below, `index_in_parent` further down) leaves
+            // offset / size / type / virtualizable as the discriminator — the
+            // physical payload, compared identically in every profile.
+            FIELD_DESCR_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !descr.describes_same_field(
+                offset,
+                field_size,
+                field_type,
+                descr.is_immutable,
+                descr.is_quasi_immutable(),
+                virtualizable,
+                descr.index_in_parent,
+            ) {
+                FIELD_DESCR_CACHE_COLLISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // `front/mir.rs` leaves `SemanticProgram::immutable_fields`
+            // empty for the whole LLBC pipeline — Charon serializes doc
+            // comments but not the `#[jit_immutable_fields]` hint — so
+            // every spec built from that side reports the pair
+            // `(false, false)` for a field no matter what
+            // `_immutable_fields_` says about it. That pair is the absence
+            // of the declaration channel, not a claim the field is mutable,
+            // and the hit path resolves it by keeping the cached descr's
+            // flags. Compare what is kept. The opposite direction — a
+            // caller claiming purity a cached descr denies — is a real
+            // disagreement and still trips.
+            let (expected_immutable, expected_quasi_immutable) =
+                if !is_immutable && !is_quasi_immutable {
+                    (descr.is_immutable, descr.is_quasi_immutable())
+                } else {
+                    (is_immutable, is_quasi_immutable)
+                };
+            // descr.py get_field_descr returns the cached descr with no
+            // caller re-check.
+            // The authoritative slot number is the cached descr's own — it was
+            // normalised (rederived against the parent's positional list) when
+            // minted, so a field that was rederived once stays rederived. When
+            // the parent carries a positional list, `find_index_in_parent`
+            // arbitrates and the canary stays strict; when it does not (the mint
+            // path binds a fieldless size-descr shell), defer to the cached
+            // value rather than the caller's un-arbitrable raw number, which
+            // still carries whichever producer's header convention minted it.
+            // The arbitration walks the parent's whole positional list, and the
+            // canary below is its only reader — `debug_assert!` keeps the code
+            // but guards it on the same `cfg!(debug_assertions)`, so a release
+            // build would scan and discard. Repeat lookups are the common case
+            // (`make_simple_descr_group_keyed_with_headerless` calls this once
+            // per field spec under the `gc_cache` lock), so spell the gate out
+            // and let the release build keep the cached number.
+            let expected_index_in_parent = if cfg!(debug_assertions) {
+                Self::find_index_in_parent(parent.as_ref(), field_name)
+                    .unwrap_or(descr.index_in_parent)
+            } else {
+                descr.index_in_parent
+            };
+            let offset_disagrees = descr.offset != offset;
+            let size_disagrees = descr.field_size != field_size;
+            let type_disagrees = descr.field_type != field_type;
+            let immutability_disagrees = descr.is_immutable != expected_immutable
+                || descr.is_quasi_immutable() != expected_quasi_immutable;
+            let virtualizable_disagrees = descr.virtualizable != virtualizable;
+            let index_disagrees = descr.index_in_parent != expected_index_in_parent;
+            let disagrees = offset_disagrees
+                || size_disagrees
+                || type_disagrees
+                || immutability_disagrees
+                || virtualizable_disagrees
+                || index_disagrees;
+            if disagrees {
                 use std::sync::atomic::Ordering::Relaxed;
-                FIELD_DESCR_CACHE_COLLISIONS.fetch_add(1, Relaxed);
                 FIELD_MINT.cache_hit_disagree.fetch_add(1, Relaxed);
-                if descr.offset != offset {
+                if offset_disagrees {
                     FIELD_MINT.cache_hit_offset.fetch_add(1, Relaxed);
                 }
-                if descr.field_size != field_size {
+                if size_disagrees {
                     FIELD_MINT.cache_hit_size.fetch_add(1, Relaxed);
                 }
-                if descr.field_type != field_type {
+                if type_disagrees {
                     FIELD_MINT.cache_hit_type.fetch_add(1, Relaxed);
                 }
+                if immutability_disagrees {
+                    FIELD_MINT.cache_hit_immutability.fetch_add(1, Relaxed);
+                }
+                if virtualizable_disagrees {
+                    FIELD_MINT.cache_hit_virtualizable.fetch_add(1, Relaxed);
+                }
+                if index_disagrees {
+                    FIELD_MINT.cache_hit_index_in_parent.fetch_add(1, Relaxed);
+                }
                 if field_mint_trace_enabled() {
+                    let cached_parent_has_positional_list = descr
+                        .get_parent_descr()
+                        .and_then(|p| p.as_size_descr().map(|sd| !sd.all_fielddescrs().is_empty()))
+                        .unwrap_or(false);
                     eprintln!(
-                        "MAJIT_FIELD_MINT_TRACE remint_geometry field_key={field_name:?} \
-                         cached_offset={} requested_offset={offset} \
-                         cached_size={} requested_size={field_size} \
-                         cached_type={:?} requested_type={field_type:?}",
-                        descr.offset, descr.field_size, descr.field_type,
-                    );
-                }
-            } else if descr.field_key() != field_name {
-                self._cache_field
-                    .entry(struct_key.clone())
-                    .or_default()
-                    .entry(field_name.to_string())
-                    .or_insert_with(|| descr.clone());
-            }
-            if geometry_agrees {
-                // field-cache identity: does this slot answer for the field the caller asked
-                // about?  Passing the *cached* values for the three components
-                // whose expected value is derived differently per build profile
-                // (immutability pair below, `index_in_parent` further down) leaves
-                // offset / size / type / virtualizable as the discriminator — the
-                // physical payload, compared identically in every profile.
-                FIELD_DESCR_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if !descr.describes_same_field(
-                    offset,
-                    field_size,
-                    field_type,
-                    descr.is_immutable,
-                    descr.is_quasi_immutable(),
-                    virtualizable,
-                    descr.index_in_parent,
-                ) {
-                    FIELD_DESCR_CACHE_COLLISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                // `front/mir.rs` leaves `SemanticProgram::immutable_fields`
-                // empty for the whole LLBC pipeline — Charon serializes doc
-                // comments but not the `#[jit_immutable_fields]` hint — so
-                // every spec built from that side reports the pair
-                // `(false, false)` for a field no matter what
-                // `_immutable_fields_` says about it. That pair is the absence
-                // of the declaration channel, not a claim the field is mutable,
-                // and the hit path resolves it by keeping the cached descr's
-                // flags. Compare what is kept. The opposite direction — a
-                // caller claiming purity a cached descr denies — is a real
-                // disagreement and still trips.
-                let (expected_immutable, expected_quasi_immutable) =
-                    if !is_immutable && !is_quasi_immutable {
-                        (descr.is_immutable, descr.is_quasi_immutable())
-                    } else {
-                        (is_immutable, is_quasi_immutable)
-                    };
-                // descr.py get_field_descr returns the cached descr with no
-                // caller re-check.
-                // The authoritative slot number is the cached descr's own — it was
-                // normalised (rederived against the parent's positional list) when
-                // minted, so a field that was rederived once stays rederived. When
-                // the parent carries a positional list, `find_index_in_parent`
-                // arbitrates and the canary stays strict; when it does not (the mint
-                // path binds a fieldless size-descr shell), defer to the cached
-                // value rather than the caller's un-arbitrable raw number, which
-                // still carries whichever producer's header convention minted it.
-                // The arbitration walks the parent's whole positional list, and the
-                // canary below is its only reader — `debug_assert!` keeps the code
-                // but guards it on the same `cfg!(debug_assertions)`, so a release
-                // build would scan and discard. Repeat lookups are the common case
-                // (`make_simple_descr_group_keyed_with_headerless` calls this once
-                // per field spec under the `gc_cache` lock), so spell the gate out
-                // and let the release build keep the cached number.
-                let expected_index_in_parent = if cfg!(debug_assertions) {
-                    Self::find_index_in_parent(parent.as_ref(), field_name)
-                        .unwrap_or(descr.index_in_parent)
-                } else {
-                    descr.index_in_parent
-                };
-                let offset_disagrees = descr.offset != offset;
-                let size_disagrees = descr.field_size != field_size;
-                let type_disagrees = descr.field_type != field_type;
-                let immutability_disagrees = descr.is_immutable != expected_immutable
-                    || descr.is_quasi_immutable() != expected_quasi_immutable;
-                let virtualizable_disagrees = descr.virtualizable != virtualizable;
-                let index_disagrees = descr.index_in_parent != expected_index_in_parent;
-                let disagrees = offset_disagrees
-                    || size_disagrees
-                    || type_disagrees
-                    || immutability_disagrees
-                    || virtualizable_disagrees
-                    || index_disagrees;
-                if disagrees {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    FIELD_MINT.cache_hit_disagree.fetch_add(1, Relaxed);
-                    if offset_disagrees {
-                        FIELD_MINT.cache_hit_offset.fetch_add(1, Relaxed);
-                    }
-                    if size_disagrees {
-                        FIELD_MINT.cache_hit_size.fetch_add(1, Relaxed);
-                    }
-                    if type_disagrees {
-                        FIELD_MINT.cache_hit_type.fetch_add(1, Relaxed);
-                    }
-                    if immutability_disagrees {
-                        FIELD_MINT.cache_hit_immutability.fetch_add(1, Relaxed);
-                    }
-                    if virtualizable_disagrees {
-                        FIELD_MINT.cache_hit_virtualizable.fetch_add(1, Relaxed);
-                    }
-                    if index_disagrees {
-                        FIELD_MINT.cache_hit_index_in_parent.fetch_add(1, Relaxed);
-                    }
-                    if field_mint_trace_enabled() {
-                        let cached_parent_has_positional_list = descr
-                            .get_parent_descr()
-                            .and_then(|p| {
-                                p.as_size_descr().map(|sd| !sd.all_fielddescrs().is_empty())
-                            })
-                            .unwrap_or(false);
-                        eprintln!(
-                            "MAJIT_FIELD_MINT_TRACE cache_hit_disagree field_key={field_name:?} \
-                         display_name={display_name:?} cached_display_name={:?} \
-                         struct_key={struct_key:?} cached_offset={} requested_offset={offset} \
-                         cached_size={} requested_size={field_size} cached_type={:?} \
-                         requested_type={field_type:?} cached_flag={:?} requested_flag={flag:?} \
-                         cached_immutable={} requested_immutable={is_immutable} \
-                         effective_requested_immutable={expected_immutable} \
-                         cached_quasi_immutable={} \
-                         requested_quasi_immutable={is_quasi_immutable} \
-                         effective_requested_quasi_immutable={expected_quasi_immutable} \
-                         cached_virtualizable={} requested_virtualizable={virtualizable} \
-                         cached_index_in_parent={} caller_index_in_parent={index_in_parent:?} \
-                         expected_index_in_parent={expected_index_in_parent} \
-                         cached_parent_has_positional_list={cached_parent_has_positional_list}",
-                            descr.name,
-                            descr.offset,
-                            descr.field_size,
-                            descr.field_type,
-                            descr.flag,
-                            descr.is_immutable,
-                            descr.is_quasi_immutable(),
-                            descr.virtualizable,
-                            descr.index_in_parent,
-                        );
-                        if field_mint_backtrace_enabled() {
-                            eprintln!("{}", std::backtrace::Backtrace::force_capture());
-                        }
-                    }
-                }
-                debug_assert!(
-                    descr.describes_same_field(
-                        offset,
-                        field_size,
-                        field_type,
-                        expected_immutable,
-                        expected_quasi_immutable,
-                        virtualizable,
-                        // The completed parent list can shift the positional
-                        // slot after the first mint (`args_w` 1 → 2).  Offset
-                        // still names the same field; `get_field_descr` returns
-                        // the cached descr.  Virtualize looks the slot up on
-                        // the parent list, not this mint number.
+                        "MAJIT_FIELD_MINT_TRACE cache_hit_disagree field_key={field_name:?} \
+                     display_name={display_name:?} cached_display_name={:?} \
+                     struct_key={struct_key:?} cached_offset={} requested_offset={offset} \
+                     cached_size={} requested_size={field_size} cached_type={:?} \
+                     requested_type={field_type:?} cached_flag={:?} requested_flag={flag:?} \
+                     cached_immutable={} requested_immutable={is_immutable} \
+                     effective_requested_immutable={expected_immutable} \
+                     cached_quasi_immutable={} \
+                     requested_quasi_immutable={is_quasi_immutable} \
+                     effective_requested_quasi_immutable={expected_quasi_immutable} \
+                     cached_virtualizable={} requested_virtualizable={virtualizable} \
+                     cached_index_in_parent={} caller_index_in_parent={index_in_parent:?} \
+                     expected_index_in_parent={expected_index_in_parent} \
+                     cached_parent_has_positional_list={cached_parent_has_positional_list}",
+                        descr.name,
+                        descr.offset,
+                        descr.field_size,
+                        descr.field_type,
+                        descr.flag,
+                        descr.is_immutable,
+                        descr.is_quasi_immutable(),
+                        descr.virtualizable,
                         descr.index_in_parent,
-                    ),
-                    "get_field_descr cache hit for {field_name} disagrees with the caller: \
-                     cached {:?} (offset {}, size {}, type {:?}, immutable {}, quasi {}, vable {}, \
-                     index_in_parent {}) vs requested {display_name:?} (offset {offset}, \
-                     size {field_size}, type {field_type:?}, immutable \
-                     {expected_immutable}, quasi {expected_quasi_immutable}, \
-                     vable {virtualizable}, index_in_parent \
-                     {expected_index_in_parent} [caller said {index_in_parent:?}])",
-                    descr.name,
-                    descr.offset,
-                    descr.field_size,
-                    descr.field_type,
-                    descr.is_immutable,
-                    descr.is_quasi_immutable(),
-                    descr.virtualizable,
-                    descr.index_in_parent,
-                );
-                // The class word is not one of the components checked above: it is
-                // settled, not compared. `describes_same_field` asks whether this
-                // slot answers for the field the caller means, and both answers
-                // describe the same field either way — what differs is how much
-                // the two producers knew. `declare_class_word` resolves that,
-                // replacing a name guess and refusing to silently pick between two
-                // declarations.
-                if let Some(is_class_word) = declared_class_word {
-                    descr.declare_class_word(is_class_word);
+                    );
+                    if field_mint_backtrace_enabled() {
+                        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+                    }
                 }
-                return descr;
             }
+            // descr.py get_field_descr returns cache[STRUCT][fieldname] with
+            // no caller re-check. Geometry disagreement is counted above;
+            // the first cached object still owns the row.
+            // The class word is not one of the components checked above: it is
+            // settled, not compared. `describes_same_field` asks whether this
+            // slot answers for the field the caller means, and both answers
+            // describe the same field either way — what differs is how much
+            // the two producers knew. `declare_class_word` resolves that,
+            // replacing a name guess and refusing to silently pick between two
+            // declarations.
+            if let Some(is_class_word) = declared_class_word {
+                descr.declare_class_word(is_class_word);
+            }
+            return descr;
         }
         // descr.py:227: name = '%s.%s' % (STRUCT._name, fieldname)
         let name = match display_name {
@@ -2900,9 +2824,9 @@ impl GcCache {
             let found = SizeDescr::all_fielddescrs(size.as_ref())
                 .iter()
                 .find(|field| {
-                    field.offset() == offset
+                    field.field_key() == field_name
+                        && field.offset() == offset
                         && field.field_size() == field_size
-                        && field_keys_name_same_row(field.field_key(), field_name)
                 })?
                 .clone();
             let simple = try_downcast_arc::<SimpleFieldDescr>(found as DescrRef).ok()?;
@@ -2919,21 +2843,17 @@ impl GcCache {
             if let Some(is_class_word) = declared_class_word {
                 simple.declare_class_word(is_class_word);
             }
-            // Same geometry keeps the cached object (`descr.py` first-wins).
-            // A kind-0 LLBC row at a different offset must not stay in
-            // `cache[STRUCT][fieldname]` after the host `offset_of!` publish
-            // adopts the listed rust row (Windows `vable_token` 16 vs 64).
+            // descr.py get_field_descr: first cache[STRUCT][fieldname]
+            // occupant owns the row. Adopt the listed object only when
+            // that slot is vacant.
             let inner = self._cache_field.entry(struct_key.clone()).or_default();
-            if let Some(existing) = inner.get(field_name) {
-                if existing.offset == offset
-                    && existing.field_size == field_size
-                    && existing.field_type == field_type
-                {
-                    return existing.clone();
+            return match inner.entry(field_name.to_string()) {
+                indexmap::map::Entry::Vacant(slot) => {
+                    slot.insert(simple.clone());
+                    simple
                 }
-            }
-            inner.insert(field_name.to_string(), simple.clone());
-            return simple;
+                indexmap::map::Entry::Occupied(slot) => slot.get().clone(),
+            };
         }
         self.mint_field_descr(
             struct_key,
@@ -3035,22 +2955,16 @@ impl GcCache {
         }
         let descr = Arc::new(fd);
         // descr.py `get_field_descr`: cache[STRUCT][fieldname] is the first
-        // FieldDescr stored for that name. A later mint of the same
-        // geometry returns it. A later mint of a *different* offset/size/type
-        // is not that hit: kind-0 LLBC and rust `offset_of!` can disagree,
-        // and the host layout must win so a SETFIELD of `vable_token` does
-        // not land in `pycode`.
+        // FieldDescr stored for that name. A later caller with different
+        // geometry still receives that object.
         let inner = self._cache_field.entry(struct_key).or_default();
-        if let Some(existing) = inner.get(&field_key) {
-            if existing.offset == offset
-                && existing.field_size == field_size
-                && existing.field_type == field_type
-            {
-                return existing.clone();
+        match inner.entry(field_key) {
+            indexmap::map::Entry::Vacant(slot) => {
+                slot.insert(descr.clone());
+                descr
             }
+            indexmap::map::Entry::Occupied(slot) => slot.get().clone(),
         }
-        inner.insert(field_key, descr.clone());
-        descr
     }
 
     /// [`Self::get_field_descr_declaring`] for a caller that already owns the
@@ -6406,16 +6320,10 @@ pub use crate::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
 
 // ── Concrete descriptor implementations (descr.py) ──
 
-/// `descr.py cache[STRUCT][fieldname]` — `fieldname` is the STRUCT-local
-/// name. A caller that passed the display spelling `"PyFrame.flags"` still
-/// names the same row as `"flags"`. Nested paths that only share a leaf
-/// (`"a.block"` vs `"b.block"`) stay distinct keys.
+/// Leaf of a fieldname, used by `heaptracker.py` `c__pad` skip.
+/// Cache identity is the full `fieldname` (`descr.py cache[STRUCT][fieldname]`).
 pub fn cache_fieldname(field_name: &str) -> &str {
     field_name.rsplit('.').next().unwrap_or(field_name)
-}
-
-fn field_keys_name_same_row(listed: &str, asked: &str) -> bool {
-    listed == asked || cache_fieldname(listed) == cache_fieldname(asked)
 }
 
 /// `heaptracker.py all_fielddescrs`: `if name == 'typeptr': continue`
@@ -6448,22 +6356,6 @@ fn size_list_has_typeptr(descr: &DescrRef) -> bool {
     descr
         .as_size_descr()
         .is_some_and(|sd| sd.all_fielddescrs().iter().any(|fd| fd.is_typeptr()))
-}
-
-fn cached_field_same_physical_row(
-    inner: &IndexMap<String, Arc<SimpleFieldDescr>>,
-    field_name: &str,
-    offset: usize,
-    field_size: usize,
-    field_type: Type,
-) -> Option<Arc<SimpleFieldDescr>> {
-    let leaf = cache_fieldname(field_name);
-    inner.values().cloned().find(|descr| {
-        descr.offset == offset
-            && descr.field_size == field_size
-            && descr.field_type == field_type
-            && cache_fieldname(descr.field_key()) == leaf
-    })
 }
 
 /// `descr.py name = '%s.%s' % (STRUCT._name, fieldname)` — locate the
@@ -6558,7 +6450,10 @@ pub struct SimpleFieldDescr {
     /// `_static_field_descrs` / `_array_field_descrs` / `vable_token_descr`
     /// slots); a strong back-ref would form a reference cycle. Populated
     /// by `VirtualizableInfo::finalize_arc` via `Arc::new_cyclic`.
-    pub vinfo: Option<Weak<dyn VinfoMarker>>,
+    /// Interior-mutable because `virtualizable.py` stamps `descr.vinfo`
+    /// on the cached `cpu.fielddescrof` object after that descr is
+    /// already shared as `Arc<SimpleFieldDescr>`.
+    pub vinfo: RwLock<Option<Weak<dyn VinfoMarker>>>,
 }
 
 /// Where a [`SimpleFieldDescr`]'s class-word answer came from.
@@ -6662,7 +6557,7 @@ impl Clone for SimpleFieldDescr {
             class_word: AtomicU8::new(self.class_word.load(Ordering::Relaxed)),
             index_in_parent: self.index_in_parent,
             parent_descr: RwLock::new(self.parent_descr.read().clone()),
-            vinfo: self.vinfo.clone(),
+            vinfo: RwLock::new(self.vinfo.read().clone()),
         }
     }
 }
@@ -6738,7 +6633,7 @@ impl SimpleFieldDescr {
             class_word: AtomicU8::new(ClassWordDeclaration::InferredNot as u8),
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
-            vinfo: None,
+            vinfo: RwLock::new(None),
         }
     }
 
@@ -6782,7 +6677,7 @@ impl SimpleFieldDescr {
             class_word: AtomicU8::new(class_word as u8),
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
-            vinfo: None,
+            vinfo: RwLock::new(None),
         }
     }
 
@@ -6919,8 +6814,14 @@ impl SimpleFieldDescr {
     /// reference; upgrades succeed for as long as the owning vinfo Arc
     /// is alive. Upstream: pyjitpl.py emit_force_virtualizable `fielddescr.get_vinfo()`.
     pub fn with_vinfo(mut self, vinfo: Weak<dyn VinfoMarker>) -> Self {
-        self.vinfo = Some(vinfo);
+        *self.vinfo.get_mut() = Some(vinfo);
         self
+    }
+
+    /// `virtualizable.py` `descr.vinfo = self` on the cached
+    /// `cpu.fielddescrof` object.
+    pub fn set_vinfo(&self, vinfo: Weak<dyn VinfoMarker>) {
+        *self.vinfo.write() = Some(vinfo);
     }
 }
 
@@ -7037,7 +6938,7 @@ impl FieldDescr for SimpleFieldDescr {
         self.parent_descr.read().as_ref().and_then(|p| p.upgrade())
     }
     fn get_vinfo(&self) -> Option<Arc<dyn VinfoMarker>> {
-        self.vinfo.as_ref().and_then(|w| w.upgrade())
+        self.vinfo.read().as_ref().and_then(|w| w.upgrade())
     }
 }
 
@@ -7964,7 +7865,7 @@ fn make_simple_descr_group_inner(
                     } as u8),
                     index_in_parent: spec.index_in_parent,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
-                    vinfo: None,
+                    vinfo: RwLock::new(None),
                 })
             })
             .collect();
@@ -8811,7 +8712,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     class_word: AtomicU8::new(ClassWordDeclaration::DeclaredNot as u8),
                     index_in_parent: 0,
                     parent_descr: RwLock::new(Some(parent_descr)),
-                    vinfo: None,
+                    vinfo: RwLock::new(None),
                 });
                 *field_descr_cell.borrow_mut() = Some(field_descr.clone());
                 let all_fielddescrs = vec![field_descr as Arc<dyn FieldDescr>];
@@ -9908,8 +9809,9 @@ mod register_keyed_size_authority_tests {
         assert_eq!(second.index_in_parent, 1);
     }
 
-    /// `descr.py cache[STRUCT][fieldname]` keys on the STRUCT-local name.
-    /// A caller that passed the display spelling still names that row.
+    /// `descr.py cache[STRUCT][fieldname]` keys on the `fieldname` argument.
+    /// Display spelling `"PyFrame.flags"` as `fieldname` occupies a different
+    /// row from `"flags"`; callers pass the STRUCT-local name.
     #[test]
     fn a_qualified_fieldname_is_the_struct_local_cache_key() {
         let mut gc = GcCache::new();
@@ -9943,11 +9845,12 @@ mod register_keyed_size_authority_tests {
             false,
             Some(10),
         );
-        assert!(
-            std::sync::Arc::ptr_eq(&short, &qualified),
-            "qualified display spelling must hit cache[STRUCT][flags]"
-        );
         assert_eq!(short.field_key(), "flags");
+        assert_eq!(qualified.field_key(), "PyFrame.flags");
+        assert!(
+            !std::sync::Arc::ptr_eq(&short, &qualified),
+            "display spelling as fieldname is a distinct cache[STRUCT][fieldname] key"
+        );
         let reverse = gc.get_field_descr(
             key,
             "flags",
@@ -10058,12 +9961,10 @@ mod register_keyed_size_authority_tests {
         assert_eq!(second.index_in_parent, 0, "the cached descr wins");
     }
 
-    /// Kind-0 LLBC and rust `offset_of!` can mint the same fieldname at
-    /// two offsets. `descr.py cache[STRUCT][fieldname]` would keep the
-    /// first; pyre remints so a later host layout is not stuck behind
-    /// the LLBC row. Windows CI: `vable_token` at 16 (pycode) vs 64.
+    /// `descr.py get_field_descr` returns `cache[STRUCT][fieldname]` on
+    /// every later lookup, even when the caller supplies a different offset.
     #[test]
-    fn get_field_descr_remints_when_same_fieldname_has_a_different_offset() {
+    fn get_field_descr_keeps_the_first_cached_geometry() {
         let mut gc = GcCache::new();
         let key = LLType::Struct(0x0A81_E_70_4E);
         gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
@@ -10096,14 +9997,10 @@ mod register_keyed_size_authority_tests {
             false,
             Some(0),
         );
-        assert_eq!(
-            second.offset(),
-            64,
-            "a later host offset_of! must replace the LLBC geometry"
-        );
+        assert_eq!(second.offset(), 16);
         assert!(
-            !std::sync::Arc::ptr_eq(&first, &second),
-            "the reminted descr is a new object, not the stale cache hit"
+            std::sync::Arc::ptr_eq(&first, &second),
+            "cache[STRUCT][fieldname] is first-wins"
         );
         let third = gc.get_field_descr(
             key,
@@ -10119,17 +10016,13 @@ mod register_keyed_size_authority_tests {
             false,
             Some(0),
         );
-        assert!(
-            std::sync::Arc::ptr_eq(&second, &third),
-            "the reminted geometry is then cache[STRUCT][fieldname]"
-        );
+        assert!(std::sync::Arc::ptr_eq(&first, &third));
     }
 
-    /// Parent SizeDescr already lists the host offset. Adopting that row
-    /// must still replace `cache[STRUCT][fieldname]` when the cached
-    /// geometry is the LLBC one; Vacant-only insert would keep offset 16.
+    /// A listed parent row is adopted only when `cache[STRUCT][fieldname]`
+    /// is vacant. A later listed geometry does not replace the occupant.
     #[test]
-    fn get_field_descr_adopts_listed_row_and_replaces_stale_cache() {
+    fn get_field_descr_adopts_listed_row_only_when_cache_is_vacant() {
         let mut gc = GcCache::new();
         let key = LLType::Struct(0x0A81_E_70_5E);
         let listed = SimpleFieldDescr::new_with_name(
@@ -10177,8 +10070,8 @@ mod register_keyed_size_authority_tests {
             false,
             Some(0),
         );
-        assert_eq!(second.offset(), 64);
-        assert_eq!(second.field_key(), "vable_token");
+        assert_eq!(second.offset(), 16);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
         let third = gc.get_field_descr(
             key,
             "vable_token",
@@ -10193,11 +10086,89 @@ mod register_keyed_size_authority_tests {
             false,
             Some(0),
         );
-        assert!(
-            std::sync::Arc::ptr_eq(&second, &third),
-            "adopting the listed host row must replace cache[STRUCT][fieldname]"
+        assert!(std::sync::Arc::ptr_eq(&first, &third));
+        assert_eq!(third.offset(), 16);
+    }
+
+    /// Nested paths that only share a leaf (`a.block` vs `b.block`) stay
+    /// distinct `cache[STRUCT][fieldname]` rows even at the same offset.
+    #[test]
+    fn nested_same_geometry_keeps_two_cache_rows() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0x0A81_E_70_6E);
+        gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
+        let a = gc.get_field_descr(
+            key.clone(),
+            "a.block",
+            Some("S.a.block"),
+            16,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
         );
-        assert_eq!(third.offset(), 64);
+        let b = gc.get_field_descr(
+            key,
+            "b.block",
+            Some("S.b.block"),
+            16,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        assert_eq!(a.field_key(), "a.block");
+        assert_eq!(b.field_key(), "b.block");
+    }
+
+    /// `heaptracker.py all_fielddescrs` skips typeptr while numbering.
+    /// Post-filter is a safety net: it drops the typeptr row and does not
+    /// clone or reindex the remaining shared descriptors.
+    #[test]
+    fn listed_fielddescrs_drops_typeptr_without_reindexing() {
+        let typeptr = SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            true,
+            ArrayFlag::Signed,
+            "object.typeptr".to_string(),
+            "typeptr",
+        )
+        .with_index_in_parent(0);
+        let payload = SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Int,
+            false,
+            ArrayFlag::Signed,
+            "S.payload".to_string(),
+            "payload",
+        )
+        .with_index_in_parent(1);
+        let sd = SimpleSizeDescr::new(0, 16, 0).with_all_fielddescrs(vec![
+            std::sync::Arc::new(typeptr) as std::sync::Arc<dyn FieldDescr>,
+            std::sync::Arc::new(payload) as std::sync::Arc<dyn FieldDescr>,
+        ]);
+        let listed = SizeDescr::all_fielddescrs(&sd);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].field_key(), "payload");
+        assert_eq!(
+            listed[0].index_in_parent(),
+            1,
+            "post-filter does not reindex a shared descr"
+        );
     }
 
     /// Kind-0 bake supplies one complete layout (`descr.py` `get_size_descr`
