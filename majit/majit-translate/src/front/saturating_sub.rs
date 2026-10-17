@@ -1,4 +1,5 @@
-//! `{uN}::saturating_sub(a, b)` → unsigned clamp diamond.
+//! `{uN}::saturating_sub(a, b)` → unsigned clamp diamond;
+//! `{i64,isize}::saturating_sub(a, b)` → `sub_ovf` + MIN/MAX select.
 //!
 //! ## Positioning
 //!
@@ -9,14 +10,17 @@
 //! `FunctionPath` segments `["core","num","<Impl>","saturating_sub"]`, the
 //! receiver `a` in `args[0]` and the subtrahend `b` in `args[1]`.
 //!
-//! Every observed call site is unsigned (`usize`/`u16`/`u32`), where saturating
-//! subtraction floors at zero:
+//! Unsigned sites (`usize`/`u16`/`u32`) floor at zero:
 //!
 //! ```text
 //!     r = saturating_sub(a, b)            // residual `saturating_sub` call
 //! becomes
 //!     if a < b { r = 0 } else { r = a - b }
 //! ```
+//!
+//! Signed `i64`/`isize` saturating sub is `checked_sub` with a clamp:
+//! `sub_ovf` raises `OverflowError`, and the overflow arm selects
+//! `i64::MIN` when the receiver is negative and `i64::MAX` otherwise.
 //!
 //! The branch is mandatory — an unconditional `a - b` underflows for `a < b`
 //! (unsigned subtraction wraps to a huge positive), so a single-block
@@ -37,7 +41,8 @@
 //! Unsigned` value (`ConstInt(0)` and `BinOp("sub")`), which the consumer reads
 //! from the `r` slot.  `Unsigned` carries no width (all operands share the u64
 //! register bank), and saturating never wraps, so lowering a narrow `u16`/`u32`
-//! difference in that bank is width-correct.
+//! difference in that bank is width-correct.  `U128` stays residual: the
+//! rewrite types the difference as `ValueType::Unsigned`.
 //!
 //! ## The rewrite (`rewire_one_saturating_sub_site`)
 //!
@@ -60,13 +65,16 @@ use crate::flowspace::model::Variable;
 use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
-/// A recognized `{uN}::saturating_sub(a, b)` call site captured during body
-/// lowering (`front::mir` `recognize_saturating_sub_site`).
+/// A recognized `{uN}` / `{i64,isize}::saturating_sub(a, b)` call site
+/// captured during body lowering (`front::mir` `recognize_saturating_sub_site`).
 #[derive(Clone)]
 pub(crate) struct SaturatingSubSite {
-    /// The `saturating_sub` call result (the `uN` value) — locates block A.
+    /// The `saturating_sub` call result — locates block A.
     /// The `a`/`b` operands are read from that located call's `args[0]`/`args[1]`.
     pub result_var: Variable,
+    /// `true` for signed `i64`/`isize` (`sub_ovf` + MIN/MAX); `false` for
+    /// unsigned (floor at zero).
+    pub signed: bool,
 }
 
 /// Rewrite every recorded `saturating_sub` call site into the unsigned clamp
@@ -94,6 +102,14 @@ fn rewire_one_saturating_sub_site(
     graph: &mut FunctionGraph,
     site: &SaturatingSubSite,
 ) -> Result<(), String> {
+    if site.signed {
+        return crate::front::saturating_add::rewire_signed_saturating_ovf(
+            graph,
+            &site.result_var,
+            "sub_ovf",
+            "saturating_sub",
+        );
+    }
     let name = graph.name.clone();
     // Block A: the `saturating_sub` residual call producing `result_var`.
     let a = graph
@@ -240,7 +256,10 @@ mod tests {
     use crate::model::CallTarget;
 
     fn saturating_sub_site(result_var: Variable) -> SaturatingSubSite {
-        SaturatingSubSite { result_var }
+        SaturatingSubSite {
+            result_var,
+            signed: false,
+        }
     }
 
     fn emit_call(g: &mut FunctionGraph, a: crate::model::BlockId, args: Vec<Variable>) -> Variable {
@@ -347,5 +366,51 @@ mod tests {
             )),
             "residual saturating_sub call is left untouched"
         );
+    }
+
+    #[test]
+    fn rewrite_lifts_signed_saturating_sub_to_sub_ovf_clamp() {
+        let mut g = FunctionGraph::new("test_saturating_sub_signed");
+        let a = g.startblock;
+        let av = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let bv = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let r = emit_call(&mut g, a, vec![av, bv]);
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![r.clone()]);
+
+        let rewritten = rewire_saturating_sub_call_sites(
+            &mut g,
+            &[SaturatingSubSite {
+                result_var: r.clone(),
+                signed: true,
+            }],
+        );
+        assert_eq!(rewritten, 1);
+        assert!(
+            g.blocks[a.0].operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "sub_ovf"
+            )),
+            "A signed-subs with overflow"
+        );
+        assert!(matches!(
+            g.blocks[a.0].exitswitch,
+            Some(crate::model::ExitSwitch::LastException)
+        ));
+        let mins = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| matches!(&op.kind, OpKind::ConstInt(n) if *n == i64::MIN))
+            .count();
+        let maxes = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| matches!(&op.kind, OpKind::ConstInt(n) if *n == i64::MAX))
+            .count();
+        assert!(mins >= 1);
+        assert!(maxes >= 1);
     }
 }

@@ -70,9 +70,12 @@
 
 pub(crate) mod bigint_binop;
 pub(crate) mod bool_then;
+pub(crate) mod char_from_u32;
+pub(crate) mod char_len_utf8;
 pub(crate) mod checked_arith;
 pub(crate) mod checked_arith_uint;
 pub(crate) mod clause_spec;
+pub(crate) mod div_ceil;
 pub(crate) mod dyn_fat;
 pub(crate) mod exc_from_raise;
 pub(crate) mod from_raw_parts;
@@ -80,6 +83,7 @@ pub(crate) mod from_size_align;
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) mod graph_body;
 pub mod host_layout;
+pub(crate) mod is_ascii_whitespace;
 pub(crate) mod iter_adapter;
 pub(crate) mod iter_next;
 pub mod llbc_hints;

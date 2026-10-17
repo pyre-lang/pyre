@@ -180,6 +180,14 @@ pub(crate) fn is_word_sized_uint_atom(atom: &str) -> bool {
     is_word_sized_uint_atom_for(atom, crate::layout::target_word_size())
 }
 
+/// Unsigned atoms that fit in [`crate::model::ValueType::Unsigned`].
+/// Narrow `u8`/`u16`/`u32` and word-sized `u64`/`usize` are accepted;
+/// `U128` declines because the saturating_sub / div_ceil rewrites type
+/// results as that word-sized bank.
+pub(crate) fn is_non_u128_uint_atom(atom: &str) -> bool {
+    atom != "U128"
+}
+
 /// Destination `Option<Self>` payload first (covers both-const
 /// `1usize.checked_add(2)`), then either operand Place.  A readable
 /// narrow payload declines even if an operand atom looks word-sized.
