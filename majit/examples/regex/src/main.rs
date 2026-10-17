@@ -126,9 +126,10 @@ const N: usize = 20;
 /// that reimplements `nonmatching` — scans exactly the same bytes.
 const SEED: u64 = 42;
 
-/// Back-edge count before a portal records. The tests in `jit_interp` grade
-/// the loop compiled at this threshold, so the benchmark times that same loop.
-const THRESHOLD: u32 = 3;
+/// `rlib/jit.py` PARAMETERS `threshold`. `warmspot.py jittify_and_run`
+/// forces 3 for tests; the translated `target.py` binary keeps this default.
+/// Tests pass 3 explicitly (`shortcircuit.rs` / `jit_interp.rs`).
+const THRESHOLD: u32 = majit_metainterp::jit::PARAMETERS.threshold;
 
 /// A row whose fastest and slowest length differ by more than this is not
 /// reporting a per-character rate, and the difference is a finding rather than

@@ -646,6 +646,114 @@ pub fn verify_result_type(result_type: char, accepted: &str) {
     );
 }
 
+/// `descr.py process(c)`: one bank load at this declaration position.
+/// `I` is `args_i[k]`, `R` is `args_r[k]`, `F` is `args_f[k]` (bits).
+macro_rules! bank_ty {
+    (I) => {
+        i64
+    };
+    (R) => {
+        i64
+    };
+    (F) => {
+        f64
+    };
+}
+
+macro_rules! bank_load {
+    (I, $i:ident, $r:ident, $f:ident, $ii:ident, $ri:ident, $fi:ident) => {{
+        let v = $i[$ii];
+        $ii += 1;
+        v
+    }};
+    (R, $i:ident, $r:ident, $f:ident, $ii:ident, $ri:ident, $fi:ident) => {{
+        let v = $r[$ri];
+        $ri += 1;
+        v
+    }};
+    (F, $i:ident, $r:ident, $f:ident, $ii:ident, $ri:ident, $fi:ident) => {{
+        let v = f64::from_bits($f[$fi] as u64);
+        $fi += 1;
+        v
+    }};
+}
+
+macro_rules! bank_invoke_i {
+    ($func:ident, $i:ident, $r:ident, $f:ident $(, $bank:ident)*) => {{
+        #[allow(unused_variables, unused_assignments, unused_mut)]
+        {
+            let mut ii = 0usize;
+            let mut ri = 0usize;
+            let mut fi = 0usize;
+            let fp: unsafe extern "C" fn($(bank_ty!($bank)),*) -> i64 =
+                std::mem::transmute($func);
+            fp($(bank_load!($bank, $i, $r, $f, ii, ri, fi)),*)
+        }
+    }};
+}
+
+/// Monomorphic `call_stub(func, args_i, args_r, args_f)` for integer
+/// `arg_classes` of length 0..=4. `descr.py create_call_stub` source-generates
+/// one such function per CallDescr; this table is that product keyed by
+/// `arg_classes`, not a call-site special case.
+macro_rules! define_lookup_bank_stub_i {
+    ($(($classes:literal $(, $bank:ident)*)),* $(,)?) => {
+        fn lookup_bank_stub_i(
+            arg_classes: &str,
+        ) -> Option<unsafe fn(usize, &[i64], &[i64], &[i64]) -> i64> {
+            match arg_classes {
+                $($classes => Some({
+                    #[allow(unused_variables)]
+                    unsafe fn stub(
+                        func: usize,
+                        args_i: &[i64],
+                        args_r: &[i64],
+                        args_f: &[i64],
+                    ) -> i64 {
+                        unsafe { bank_invoke_i!(func, args_i, args_r, args_f $(, $bank)*) }
+                    }
+                    stub
+                }),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+define_lookup_bank_stub_i! {
+    (""),
+    ("i", I),
+    ("r", R),
+    ("ii", I, I),
+    ("ir", I, R),
+    ("ri", R, I),
+    ("rr", R, R),
+    ("iii", I, I, I),
+    ("iir", I, I, R),
+    ("iri", I, R, I),
+    ("irr", I, R, R),
+    ("rii", R, I, I),
+    ("rir", R, I, R),
+    ("rri", R, R, I),
+    ("rrr", R, R, R),
+    ("iiii", I, I, I, I),
+    ("iiir", I, I, I, R),
+    ("iiri", I, I, R, I),
+    ("iirr", I, I, R, R),
+    ("irii", I, R, I, I),
+    ("irir", I, R, I, R),
+    ("irri", I, R, R, I),
+    ("irrr", I, R, R, R),
+    ("riii", R, I, I, I),
+    ("riir", R, I, I, R),
+    ("riri", R, I, R, I),
+    ("rirr", R, I, R, R),
+    ("rrii", R, R, I, I),
+    ("rrir", R, R, I, R),
+    ("rrri", R, R, R, I),
+    ("rrrr", R, R, R, R),
+}
+
 /// `descr.py CallDescr.create_call_stub`: walk `arg_classes` once, pick the
 /// monomorphic ABI stub, and record the bank mapping. `verify_result_type`
 /// and the `verify_types` count of each class run here, not per call.
@@ -722,12 +830,25 @@ pub fn create_call_stub(arg_classes: &str, result_type: char) -> BhCallStub {
     } else {
         lookup_stub_i(classes)
     };
+    // `'i'`/`'r'`/`'L'` are integer C ABI (`descr.py TYPE`). `'f'`/`'S'`
+    // need the class-sequence arm; integer ABI indexes banks like the
+    // generated `call_stub`.
+    let int_abi = result_type != 'S' && classes.iter().all(|class| matches!(class, ArgClass::Int));
+    // Integer-result stubs take banks like the generated `call_stub`.
+    // `'S'` returns a C float then `singlefloat2int`; keep the flat arm.
+    let call_i_banks = if result_type == 'i' || result_type == 'r' || result_type == 'v' {
+        lookup_bank_stub_i(arg_classes)
+    } else {
+        None
+    };
     BhCallStub::new(
         slots,
         arity,
         expect_i,
         expect_r,
         expect_f,
+        int_abi,
+        call_i_banks,
         call_i,
         lookup_stub_f(classes),
         lookup_stub_v(classes),
@@ -756,6 +877,7 @@ fn call_stub_for(calldescr: &BhCallDescr) -> &BhCallStub {
 ///
 /// # Safety
 /// `func` must match the ABI [`create_call_stub`] derives from `arg_classes`.
+#[inline(always)]
 pub unsafe fn bh_call_i_with_descr(
     func: usize,
     args_i: Option<&[i64]>,
@@ -1446,8 +1568,9 @@ mod tests {
         assert_eq!(result, 4.5);
     }
 
-    /// `shift` (`arg_classes = "rii"`) is the regex residual that the stub
-    /// must serve without walking the class string on the second call.
+    /// `descr.py CallDescr.create_call_stub` for `arg_classes = "rii"` is
+    /// `f(args_r[0], args_i[0], args_i[1])`. The stub is cached on the
+    /// descr, so the second call does not walk the class string.
     #[test]
     fn create_call_stub_i_rii_places_ref_then_two_ints() {
         let _hook_test = hold_hook_test_lock();
@@ -1480,5 +1603,6 @@ mod tests {
         };
         assert_eq!(again, 321);
         assert!(descr.call_stub.get().is_some());
+        assert!(descr.call_stub.get().and_then(|s| s.call_i_banks).is_some());
     }
 }

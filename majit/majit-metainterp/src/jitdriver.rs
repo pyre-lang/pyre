@@ -7459,21 +7459,33 @@ impl<S: JitState> JitDriver<S> {
         // exception guard unwinds into its handler instead of resuming
         // the no-exception continuation.
         let guard_exc = result.exception.exc_value;
-        let savedata = result.savedata;
-        // Keep `result` (and its deadframe) until this arm returns so
-        // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
-        // `compile.py handle_fail(self, deadframe, ...)`.
-        // Also park the copied GCREF: `AllVirtuals.show` reads this
-        // word after the reconstruction has already allocated.
-        let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
-        let _savedata_root = unsafe {
-            crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
+        // `ResumeGuardDescr.handle_fail` does not read `jf_savedata`.
+        // `ResumeGuardForcedDescr.handle_fail` does: `get_savedata_ref`
+        // then `AllVirtuals.show`, passed as `all_virtuals` to
+        // `resume_in_blackhole`. Keep the deadframe (and the GCREF) until
+        // that show, matching `handle_fail(self, deadframe, ...)`.
+        let mut savedata_slot = [0i64; 1];
+        let _savedata_root = if fd.is_guard_forced() {
+            result.savedata.map(|sd| {
+                savedata_slot[0] = sd.as_usize() as i64;
+                unsafe { crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true) }
+            })
+        } else {
+            None
         };
-        let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
-        // The reconstruction below allocates through the blackhole allocator,
-        // so hold the exception where the frontend's root walker can reach
-        // it until `prepare_resume_from_failure` hands it to the blackhole.
-        let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
+        let all_virtuals = if fd.is_guard_forced() {
+            let savedata = _savedata_root
+                .as_ref()
+                .map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
+            savedata.and_then(crate::compile::AllVirtuals::show)
+        } else {
+            None
+        };
+        // `_prepare_resume_from_failure(deadframe)` seeds a pending
+        // exception only when the deadframe holds one. A zero cell is
+        // not parked: `GuardExcRoot::park` would still touch the TLS.
+        let _guard_exc_root =
+            (guard_exc != 0).then(|| crate::blackhole::GuardExcRoot::park(guard_exc));
 
         // must_compile tick for bridge threshold counting.
         if crate::majit_log_enabled() {
@@ -7611,14 +7623,45 @@ impl<S: JitState> JitDriver<S> {
         // the failing descr itself (`get_resumestorage(): return self`),
         // so blackhole resume observes the guard-owned pool the GC
         // walker updates, and nothing is built per failure to hold them.
-        if let Some(rd_numb) = fd.rd_numb_ref() {
-            let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
-
+        //
+        // `handle_fail` is a method on the descr (`assert isinstance(self,
+        // ResumeGuardDescr)`); those `_attrs_` are fields. One
+        // downcast (including the Forced wrapper), then payload / types /
+        // rd_locs reads. `ResumeGuardCopiedDescr` has no inner descr
+        // (`get_resumestorage(): return prev`); its FailDescr vtable
+        // chases `prev`.
+        let rgd = crate::compile::resume_guard_from_fail(fd);
+        let (rd_numb, rd_consts_slice, rd_virtuals_opt, fail_arg_types, rd_pendingfields, rd_locs) =
+            if let Some(d) = rgd {
+                (
+                    d.payload.rd_numb_ref(),
+                    d.payload.rd_consts().unwrap_or(&[]),
+                    d.payload.rd_virtuals(),
+                    majit_ir::FailDescr::fail_arg_types(d),
+                    d.payload.rd_pendingfields().unwrap_or(&[]),
+                    majit_ir::FailDescr::rd_locs(d),
+                )
+            } else {
+                (
+                    fd.rd_numb_ref(),
+                    fd.rd_consts().unwrap_or(&[]),
+                    fd.rd_virtuals(),
+                    fd.fail_arg_types(),
+                    fd.rd_pendingfields().unwrap_or(&[]),
+                    fd.rd_locs(),
+                )
+            };
+        if let Some(rd_numb) = rd_numb {
             // `resume.py ResumeDataVirtualAdder._number_virtuals` stores
             // `storage.rd_virtuals` once. Resume assigns that list
             // (`AbstractResumeDataReader._prepare_virtuals`). An empty
-            // list skips the two `VirtualCache` vecs.
-            let guard_virtuals = crate::resume::guard_virtual_infos(fd);
+            // list skips the two `VirtualCache` vecs — and skips
+            // `guard_virtual_infos` (`shaped_virtuals_any` downcast) which
+            // has no counterpart on the empty `rd_virtuals is None` path.
+            let guard_virtuals = match rd_virtuals_opt {
+                Some(rds) if !rds.is_empty() => crate::resume::guard_virtual_infos(fd),
+                _ => None,
+            };
             let rd_virtuals_slice = guard_virtuals.as_ref().map(|infos| infos.as_slice());
 
             // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
@@ -7642,20 +7685,7 @@ impl<S: JitState> JitDriver<S> {
             // `to_vec` that stood here cloned every `Arc` in the registry
             // — two atomic RMWs per jitcode — on a path this fixture takes
             // once per input character.
-            let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] = self.meta.jitcodes();
-            let resolve_jitcode =
-                |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
-                    // `jitcodes[jitcode_pos]` and `setposition(jitcode, pc)`.
-                    // `as usize` wraps a negative index or pc into a huge
-                    // slot and resumes mid-instruction in unrelated code.
-                    let index = usize::try_from(jitcode_index).ok()?;
-                    let resolved_pc = usize::try_from(pc).ok()?;
-                    let resolved_jitcode = jitcode_registry.get(index)?.clone();
-                    Some(crate::resume::ResolvedJitCode::new(
-                        resolved_jitcode,
-                        resolved_pc,
-                    ))
-                };
+            let jitcodes: &[std::sync::Arc<crate::jitcode::JitCode>] = self.meta.jitcodes();
 
             let fallback_alloc = crate::resume::NullAllocator;
             let allocator: &dyn crate::resume::BlackholeAllocator = self
@@ -7694,33 +7724,32 @@ impl<S: JitState> JitDriver<S> {
             let all_liveness = self.meta_interp().staticdata.liveness_info.snapshot_arc();
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. A GC
-            // jitframe is re-read through `OwnerRootGuard`; an off-heap
+            // jitframe is re-read through `ShadowRoot`; an off-heap
             // frame is read in place (`llmodel.py get_int_value`).
             // Keep `result` alive so `jf_savedata` stays rooted.
-            let n_fail_args = fd.fail_arg_types().len();
+            let n_fail_args = fail_arg_types.len();
             let mut fallback_raw = Vec::new();
-            let fail_args =
-                match result.deadframe.as_ref().and_then(|frame| {
-                    majit_backend::fail_arg_source_from_frame(frame, fd, n_fail_args)
-                }) {
-                    Some(src) => src,
-                    None => {
-                        if let Some(frame) = result.deadframe.as_ref() {
-                            fallback_raw = self.meta.raw_exit_slots_from_deadframe(frame, fd);
-                        }
-                        majit_backend::FailArgSource::Slice(&fallback_raw)
+            let fail_args = match result.deadframe.as_ref().and_then(|frame| {
+                majit_backend::fail_arg_source_from_frame_with_locs(frame, fd, rd_locs, n_fail_args)
+            }) {
+                Some(src) => src,
+                None => {
+                    if let Some(frame) = result.deadframe.as_ref() {
+                        fallback_raw = self.meta.raw_exit_slots_from_deadframe(frame, fd);
                     }
-                };
+                    majit_backend::FailArgSource::Slice(&fallback_raw)
+                }
+            };
             let bh = crate::resume::blackhole_from_resumedata(
                 &mut bh_builder,
-                &resolve_jitcode,
+                jitcodes,
                 rd_numb.as_slice(),
                 rd_consts_slice,
                 &all_liveness,
                 fail_args,
-                Some(fd.fail_arg_types()),
+                Some(fail_arg_types),
                 rd_virtuals_slice,
-                Some(fd.rd_pendingfields().unwrap_or(&[])), // rd_guard_pendingfields
+                Some(rd_pendingfields), // rd_guard_pendingfields
                 Some(
                     &self.meta_interp().staticdata.virtualref_info as &dyn crate::resume::VRefInfo,
                 ),
@@ -7731,19 +7760,17 @@ impl<S: JitState> JitDriver<S> {
                     .virtualizable_info()
                     .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo
-                savedata.and_then(crate::compile::AllVirtuals::show),
+                all_virtuals,
                 allocator,
                 Some(rd_numb),
             );
             let (mut bh, vable_ptr) = bh;
             {
-                // Thread the state-field register layout onto every frame
-                // so the `state_field` handlers map a logical scalar/array
-                // index to the flat register slot the resume reader seeded.
-                // Inlined sub-frames carry no state-field ops, but the root
-                // dispatch frame (the chain tail, which owns the merge point
-                // and the loop's state load/store) does, so it must hold the
-                // layout before it runs.
+                // Thread the state-field register layout onto the dispatch
+                // frame (chain tail) so the `state_field` handlers map a
+                // logical scalar/array index to the flat register slot the
+                // resume reader seeded. Inlined sub-frames carry no
+                // state-field ops.
                 let sf_layout = state.state_field_layout();
                 // Seed the reconstructed blackhole chain with the registered
                 // virtualizable info + identity pointer so a mid-body
@@ -7764,14 +7791,21 @@ impl<S: JitState> JitDriver<S> {
                 // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
                 // whenever `virtualizable_info` is non-null.
                 let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
-                {
+                if sf_layout.total_live_values() != 0 {
+                    // `blackhole_from_resumedata` builds the chain from the
+                    // numbering alone. State-field ops live on the dispatch
+                    // frame (chain tail), not on inlined callees.
+                    let mut tail = &mut *bh;
+                    while let Some(next) = tail.nextblackholeinterp.as_deref_mut() {
+                        tail = next;
+                    }
+                    tail.state_field_layout = sf_layout.clone();
+                }
+                if !seed_vinfo_ptr.is_null() {
                     let mut current = Some(&mut *bh);
                     while let Some(frame) = current {
-                        frame.state_field_layout = sf_layout.clone();
-                        if !seed_vinfo_ptr.is_null() {
-                            frame.virtualizable_info = seed_vinfo_ptr;
-                            frame.virtualizable_ptr = vable_ptr;
-                        }
+                        frame.virtualizable_info = seed_vinfo_ptr;
+                        frame.virtualizable_ptr = vable_ptr;
                         current = frame.nextblackholeinterp.as_deref_mut();
                     }
                 }
@@ -7817,10 +7851,16 @@ impl<S: JitState> JitDriver<S> {
                 if crate::majit_log_enabled() {
                     eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                 }
-                let portal_jc = self.dispatch_jitcode().cloned();
+                // `warmspot.py handle_jitexception` reads
+                // `ContinueRunningNormally` in place and does not
+                // consult `jd.mainjitcode`. A DoneWithThisFrame /
+                // bail / exception Halt still needs the portal's
+                // merge-point green regs (`bhimpl_jit_merge_point`
+                // mapping), so the lookup stays in that arm.
                 let banks_from_bh =
                     |this: &mut Self, bh: &crate::blackhole::BlackholeInterpreter| {
-                        let jc = portal_jc.as_deref().unwrap_or(bh.jitcode.as_ref());
+                        let portal = this.dispatch_jitcode().cloned();
+                        let jc = portal.as_deref().unwrap_or(bh.jitcode.as_ref());
                         let mut args = this.meta.take_portal_resume_scratch();
                         match jc.merge_point_green_regs() {
                             Some((gi, gr, gf)) => {
@@ -7849,8 +7889,7 @@ impl<S: JitState> JitDriver<S> {
                     // Next merge point reached (loop back-edge): flush the
                     // register file into the live state and resume the
                     // interpreter at the merge point's green pc.
-                    crate::jitexc::JitException::ContinueRunningNormally(args) => {
-                        let green_int = &args.green_int;
+                    crate::jitexc::JitException::ContinueRunningNormally(mut args) => {
                         // PyPy re-enters the portal with the CRN greens
                         // (warmspot.py:970-983), so the interpreter
                         // resumes at the pc the re-executed
@@ -7866,7 +7905,8 @@ impl<S: JitState> JitDriver<S> {
                         // position; end the dispatch loop instead of falling
                         // back to the loop-header `target_pc`, which would
                         // re-execute the opcodes the blackhole already ran.
-                        let green_pc = green_int
+                        let green_pc = args
+                            .green_int
                             .first()
                             .copied()
                             .map(|pc| usize::try_from(pc).unwrap_or(usize::MAX));
@@ -7874,7 +7914,7 @@ impl<S: JitState> JitDriver<S> {
                             eprintln!(
                                 "[portal-rca][crn] target_pc={} green_int={:?} \
                                  selected_green_pc={:?}",
-                                target_pc, green_int, green_pc,
+                                target_pc, args.green_int, green_pc,
                             );
                         }
                         if let Some(pc) = green_pc {
@@ -7958,12 +7998,19 @@ impl<S: JitState> JitDriver<S> {
                         // with no green pc has no position to resume at, so
                         // end the dispatch loop the same way a negative
                         // green does.
-                        // Copy into the recycled driver buffer before
-                        // `recycle_merge_point_args` clears the blackhole
-                        // lists. `warmspot.py ll_portal_runner` rebuilds
-                        // every green, not only `green_int[0]`.
+                        // `warmspot.py handle_jitexception` reads
+                        // `ContinueRunningNormally` in place
+                        // (`getattr(e, attrname)[count]`).
+                        // `_handle_jitexception` `release_interp` then
+                        // `raise exc`: the six lists live on the
+                        // exception, not a second buffer.
+                        // Swap the recycled driver buffer with those
+                        // lists so the values are not cloned
+                        // (`copy_from_args`) and the blackhole frame
+                        // keeps the Vec capacities
+                        // (`recycle_merge_point_args`).
                         let mut dest = self.meta.take_portal_resume_scratch();
-                        dest.copy_from_args(&args);
+                        std::mem::swap(&mut dest, args.as_mut());
                         bh.recycle_merge_point_args(args);
                         Some(continue_with_args(dest))
                     }

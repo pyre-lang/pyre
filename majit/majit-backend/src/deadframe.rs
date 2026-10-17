@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use majit_gc::shadow_stack::OwnerRootGuard;
+use majit_gc::shadow_stack::ShadowRoot;
 use majit_ir::{DescrRef, GcRef};
 
 use crate::ExitRecoveryLayout;
@@ -465,21 +465,12 @@ pub fn frame_build_passes() -> u64 {
 /// the holder's own address irrelevant, so this frame can be returned by value
 /// instead of being pinned behind a per-exit heap allocation.
 enum JitFrameRoot {
-    /// The frame's position among this thread's root slots. Every read goes
-    /// back through the position, so a collection that moved the frame between
-    /// two reads is already accounted for by the second one.
-    ///
-    /// Slots are taken from the fixed-slot vector rather than the strictly
-    /// LIFO stack next to it: a deadframe's lifetime is the caller's, and two
-    /// live deadframes are released in whatever order their owners drop, which
-    /// a stack discipline cannot express.
-    ///
-    /// The vector is per-thread, so the position names a slot on the thread
-    /// that acquired it and the guard must be dropped there: releasing it
-    /// elsewhere would free a foreign thread's slot, or find none active. The
-    /// guard is `!Send` for that reason, which makes the whole deadframe
-    /// thread-confined.
-    Slot(OwnerRootGuard),
+    /// The frame as a GCREF local: `llmodel.py` `return ll_frame` roots the
+    /// deadframe on the function's shadow stack (`push_stack` / `pop_stack`).
+    /// [`ShadowRoot`] is that slot. A non-LIFO drop nulls the hole
+    /// (`walk_stack_root` `if content:`) instead of shrinking past a nested
+    /// push.
+    Slot(ShadowRoot),
     /// The frame is not a GC object — it was allocated out of the Rust heap
     /// because no type registry was available to allocate it under — so it
     /// cannot move and taking a slot would hand the collector an address
@@ -645,7 +636,7 @@ impl JitFrameDeadFrame {
         let jf_root = if heap_owner.is_some() {
             JitFrameRoot::Unrooted(jf_gcref)
         } else {
-            JitFrameRoot::Slot(OwnerRootGuard::new(jf_gcref))
+            JitFrameRoot::Slot(ShadowRoot::new(jf_gcref))
         };
         JitFrameDeadFrame {
             jf_root,
@@ -667,7 +658,7 @@ impl JitFrameDeadFrame {
         latest_descr: Option<DescrRef>,
     ) -> Self {
         JitFrameDeadFrame {
-            jf_root: JitFrameRoot::Slot(OwnerRootGuard::new(jf_gcref)),
+            jf_root: JitFrameRoot::Slot(ShadowRoot::new(jf_gcref)),
             fail_descr,
             latest_descr,
             call_assembler_caller_layout: None,
@@ -682,6 +673,21 @@ impl JitFrameDeadFrame {
     #[inline]
     pub fn jf_gcref(&self) -> GcRef {
         self.jf_root.get()
+    }
+
+    /// The shadow-stack slot this deadframe already holds.
+    ///
+    /// `llmodel.py` `return ll_frame`: the deadframe IS the jitframe, and
+    /// `ResumeGuardDescr.handle_fail` keeps that object alive for
+    /// `blackhole_from_resumedata`. TAGBOX loads re-read this slot
+    /// (`cpu.get_int_value(self.deadframe, num)`); they do not acquire a
+    /// second one.
+    #[inline]
+    pub fn shadow_root(&self) -> Option<&ShadowRoot> {
+        match &self.jf_root {
+            JitFrameRoot::Slot(root) => Some(root),
+            JitFrameRoot::Unrooted(_) => None,
+        }
     }
 
     /// `llmodel.py _decode_pos` — translate a logical fail-argument index

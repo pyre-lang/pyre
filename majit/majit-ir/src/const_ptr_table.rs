@@ -144,6 +144,13 @@ struct ChunkDir {
 
 static DIR: AtomicPtr<ChunkDir> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Chunk 0 pointer. `decode_ref` TAGCONST intern indices on this fixture
+/// live in the first chunk; the reader is the mutator between STW
+/// collections. `history.py` `ConstPtr.getref_base` is a field load on
+/// the descr-owned list. Directory Acquire is the grow-publish of later
+/// chunks (`DIR` still covers `index >= SLOT_CHUNK`).
+static FIRST_CHUNK: AtomicPtr<SlotChunk> = AtomicPtr::new(std::ptr::null_mut());
+
 /// `history.py` drops a `ConstPtr` with the last holder. A major that
 /// traces every live holder then frees a slot no holder stamped.
 /// Process-global: one generation for the whole table. Sound when the
@@ -226,6 +233,9 @@ fn publish_slot(index: usize, addr: GcRef) {
     }
     unsafe {
         (*chunk).slots[index % SLOT_CHUNK].store(addr.0, Ordering::Release);
+    }
+    if ci == 0 {
+        FIRST_CHUNK.store(chunk, Ordering::Release);
     }
 }
 
@@ -473,6 +483,12 @@ pub fn resolve(index: u32) -> GcRef {
         return GcRef::NULL;
     }
     let i = index as usize;
+    if i < SLOT_CHUNK {
+        let chunk = FIRST_CHUNK.load(Ordering::Acquire);
+        if !chunk.is_null() {
+            return unsafe { GcRef((*chunk).slots[i].load(Ordering::Relaxed)) };
+        }
+    }
     let ci = i / SLOT_CHUNK;
     let dir = DIR.load(Ordering::Acquire);
     if dir.is_null() {

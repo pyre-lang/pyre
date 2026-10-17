@@ -12178,6 +12178,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             novable,
             all_virtuals,
             Some(deadframe_roots),
+            None,
         );
         if majit_metainterp::majit_log_enabled() {
             eprintln!(

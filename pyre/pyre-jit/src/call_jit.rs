@@ -2184,13 +2184,21 @@ fn jit_blackhole_resume_from_guard(
     let n_fail_args = descr_fd.fail_arg_types().len();
     // `resume_in_blackhole` reads fail args off the deadframe
     // (`cpu.grab_exc_value` / `get_latest_descr` path in `llmodel.py`).
-    let fail_args = majit_backend::FailArgSource::from_jitframe(deadframe, descr_fd, n_fail_args);
-    let fail0 = if ca_resume_frame != 0 {
-        ca_resume_frame as i64
-    } else if fail_args.len() > 0 {
-        fail_args.get(0)
-    } else {
-        0
+    // This path has no `DeadFrame` holder; push the jitframe as a GCREF
+    // local (`shadowstack.py` `push_stack`) the way `JitFrameDeadFrame`
+    // does on the compiled guard-exit arm.
+    let fail_arg_root =
+        majit_gc::shadow_stack::ShadowRoot::new(majit_ir::GcRef(deadframe as usize));
+    let fail0 = {
+        let fail_args =
+            majit_backend::FailArgSource::from_held_root(&fail_arg_root, descr_fd, n_fail_args);
+        if ca_resume_frame != 0 {
+            ca_resume_frame as i64
+        } else if fail_args.len() > 0 {
+            fail_args.get(0)
+        } else {
+            0
+        }
     };
 
     if let Some(result) =
@@ -2228,7 +2236,7 @@ fn jit_blackhole_resume_from_guard(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
                 storage.rd_numb().expect("rd_numb").len(),
                 storage.rd_consts().unwrap_or(&[]).len(),
-                fail_args.len(),
+                n_fail_args,
             );
         }
         // resume.py:922 storage.rd_consts: the decoder borrows the shared
@@ -2260,7 +2268,7 @@ fn jit_blackhole_resume_from_guard(
         let result = blackhole_resume_via_rd_numb(
             storage.rd_numb_ref().expect("rd_numb"),
             storage.rd_consts().unwrap_or(&[]),
-            fail_args,
+            majit_backend::FailArgSource::from(&[] as &[i64]),
             storage.rd_pendingfields(),
             storage.rd_virtuals(),
             Some(deadframe_types.as_slice()),
@@ -2268,6 +2276,7 @@ fn jit_blackhole_resume_from_guard(
             novable,
             all_virtuals,
             None, // `raw_deadframe` is rooted only by the copy made inside
+            Some((fail_arg_root, descr_fd, n_fail_args)),
         );
         return handle_blackhole_result(result);
     }
@@ -2744,7 +2753,21 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // across this call: a caller-side scope would stay registered for the whole
     // forward run.
     caller_deadframe_roots: Option<majit_metainterp::resume::DeadFrameRefRoots>,
+    // `llmodel.py` GCREF local for a jitframe deadframe, plus the descr
+    // used to rebuild `FailArgSource` after the root is moved in. Dropped
+    // with `caller_deadframe_roots` after the last TAGBOX read, before
+    // `bh.run()` (`blackhole.py` `resume_in_blackhole`).
+    held_deadframe_root: Option<(
+        majit_gc::shadow_stack::ShadowRoot,
+        &'df dyn majit_ir::FailDescr,
+        usize,
+    )>,
 ) -> BlackholeResult {
+    let deadframe = if let Some((ref root, descr, n)) = held_deadframe_root {
+        majit_backend::FailArgSource::from_held_root(root, descr, n)
+    } else {
+        deadframe
+    };
     // Same window as `handle_fail`, for every blackhole resume including the
     // CALL_ASSEMBLER caller: the decode below rebuilds virtuals through the
     // blackhole allocator while the grabbed exception is still only a bare
@@ -2873,9 +2896,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         let builder = &mut *cell.get();
         builder.set_cpu(driver.meta_interp().blackhole_cpu());
         sync_bh_builder_control_opcodes(builder);
-        resume::blackhole_from_resumedata(
+        resume::blackhole_from_resumedata_with(
             builder,
-            &resolve_jitcode,
+            resolve_jitcode,
             rd_numb.as_slice(),
             rd_consts,
             &all_liveness,
@@ -2919,7 +2942,12 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // `finally` never runs.  `blackhole.py resume_in_blackhole` ends
     // `deadframe`'s live range at `_prepare_resume_from_failure`, before
     // `_run_forever`, for the same reason.
+    // Snapshot `{deadframe:x?}` for the exception-propagation dump: that
+    // format runs after `bh.run()`, past this drop.
+    let deadframe_debug = format!("{deadframe:x?}");
+    drop(deadframe);
     drop(caller_deadframe_roots);
+    drop(held_deadframe_root);
     // resume.py builds the caller chain (`nextblackholeinterp`)
     // but does not set the virtualizable-info handle on each frame.  pyre
     // stores the vinfo per-`BlackholeInterpreter` (RPython reads it from
@@ -3382,7 +3410,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                              code[-10..]={bh_code_window:?} \
                              keeps_existing_traceback={keeps_existing_traceback} \
                              guard_exc={guard_exc:x} py_pc={:?} entry_py_pc={:?} \
-                             deadframe_types={deadframe_types:?} deadframe={deadframe:x?} \
+                             deadframe_types={deadframe_types:?} deadframe={deadframe_debug} \
                              registers_r={bh_regs_r:x?}",
                             bh_opcode_at,
                             // Which ref registers hold a real
@@ -8047,6 +8075,7 @@ pub fn cranelift_resumedata_deopt(
         None,
         &allocator,
     );
+    reader.bind_deadframe_root();
     // `resumecode.py` `Reader.next_item` reloads `numb.code` after a
     // collection. `prepare_resume_heap_with_roots` materializes virtuals
     // and can minor-collect. Same bind as `blackhole_from_resumedata`.

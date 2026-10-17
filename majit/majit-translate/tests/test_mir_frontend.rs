@@ -3400,14 +3400,15 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
 }
 
 /// Graphs that pass a guard-containing pointer to a residual callee are
-/// declined. The interpreter corpus has none. `pyre-jit` resumes a native
-/// `FailArgSource` (it holds the guard) through `llmodel` methods that stay
-/// residual, so those graphs are the decline set.
+/// declined. The interpreter corpus has none. `pyre-jit` used to resume a
+/// native `FailArgSource` (it holds the guard) through residual `llmodel`
+/// methods; `blackhole.py` `resume_in_blackhole` / `compile.py` `handle_fail`
+/// drop the deadframe root after the last TAGBOX read, before `bh.run()`,
+/// so those graphs no longer escape either.
 #[test]
 fn owner_root_guard_pointer_does_not_reach_a_residual_callee() {
     use majit_translate::front::mir::residual_owner_root_guard_escapes;
 
-    let mut escapes_by_artefact = Vec::new();
     for artefact in [
         "pyre-interpreter.ullbc",
         "pyre-object.ullbc",
@@ -3419,46 +3420,11 @@ fn owner_root_guard_pointer_does_not_reach_a_residual_callee() {
         let mut escapes = residual_owner_root_guard_escapes(&llbc);
         escapes.sort();
         escapes.dedup();
-        escapes_by_artefact.push((artefact, escapes));
-    }
-    for (artefact, escapes) in &escapes_by_artefact[..3] {
         assert!(
             escapes.is_empty(),
             "{artefact} residual OwnerRootGuard pointer escapes: {escapes:?}"
         );
     }
-    let jit = &escapes_by_artefact[3].1;
-    let expected = [
-        (
-            "pyre_jit::call_jit::blackhole_resume_via_rd_numb",
-            "majit_backend::llmodel::<Impl>::get",
-        ),
-        (
-            "pyre_jit::call_jit::blackhole_resume_via_rd_numb",
-            "majit_backend::llmodel::<Impl>::len",
-        ),
-        (
-            "pyre_jit::call_jit::blackhole_resume_via_rd_numb::<Impl>::call_once",
-            "core::fmt::rt::<Impl>::new_debug",
-        ),
-        (
-            "pyre_jit::call_jit::blackhole_resume_via_rd_numb::<Impl>::call_once",
-            "majit_backend::llmodel::<Impl>::clone",
-        ),
-        (
-            "pyre_jit::call_jit::jit_blackhole_resume_from_guard",
-            "majit_backend::llmodel::<Impl>::get",
-        ),
-        (
-            "pyre_jit::call_jit::jit_blackhole_resume_from_guard",
-            "majit_backend::llmodel::<Impl>::len",
-        ),
-    ];
-    let got: Vec<(&str, &str)> = jit
-        .iter()
-        .map(|(graph, callee)| (graph.as_str(), callee.as_str()))
-        .collect();
-    assert_eq!(got, expected);
 }
 
 fn call_target_text(target: &majit_translate::model::CallTarget) -> String {

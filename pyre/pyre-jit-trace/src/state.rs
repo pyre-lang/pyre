@@ -1211,69 +1211,19 @@ pub fn finish_blackhole_level_frame(frame_ptr: i64) {
 /// `walk_bh_regs` calls this before visiting a blackhole register bank.
 ///
 /// `bhimpl_live` only records the marker pc. Precise liveness is a
-/// collection-time `gcmap` (`jitframe` + `gcmap` in
-/// `rpython/jit/backend/llsupport`), not a per-instruction clear.
-/// `cleanup_registers` (`blackhole.py`) still runs at `release_interp`.
-/// Between those points a loop-only colour is never redefined — this
-/// codewriter colours one function per jitcode, not one
-/// `dispatch_bytecode` graph — so `walk_bh_regs` would keep that object
-/// alive until frame exit. The marker's Ref set (`liveness.py`) is the
-/// bound: a register missing from it is rewritten before any read.
-///
-/// No marker, a marker that does not decode, or an empty Ref set roots
-/// the whole bank. The clear stops at `num_regs_r()`; the slots above it
-/// are the constants window.
+/// collection-time `gcmap` (`jitframe` + `gcmap`), not a per-instruction
+/// clear. `cleanup_registers` (`blackhole.py`) still runs at
+/// `release_interp`. Applying the last `-live-` Ref set here would zero a
+/// register written since that marker: `getarrayitem_vable_r` into `r2`
+/// then `raise/r` of `r2` has a `-live-` only after the load, and a minor
+/// in that window (`clear_vable_token` / `force_now`) left `r2` as 0 so
+/// `bhimpl_raise` aborted. Root the whole bank; a missing `gcmap` is not
+/// a last-marker clear.
 ///
 /// # Safety
 /// `ctx` is a live `BlackholeInterpreter` registered with the bank.
 /// `regs` is that interpreter's `registers_r` for `len` slots.
-pub unsafe fn retain_live_ref_registers(ctx: *const (), regs: *mut i64, len: usize) {
-    let bh = unsafe { &*(ctx as *const majit_metainterp::blackhole::BlackholeInterpreter) };
-    let Some(marker_pc) = bh.last_live_marker_pc() else {
-        return;
-    };
-    let regs = unsafe { std::slice::from_raw_parts_mut(regs, len) };
-    let num_regs_r = bh.jitcode.num_regs_r().min(regs.len());
-    if num_regs_r == 0 {
-        return;
-    }
-    if !bh.jitcode.can_decode_live_vars(marker_pc, bh.op_live) {
-        return;
-    }
-    let info = bh.jitcode.get_live_vars_info(marker_pc, bh.op_live);
-    METAINTERP_SD.with(|r| {
-        let Ok(sd) = r.try_borrow() else {
-            return;
-        };
-        let liveness_bytes = sd.liveness_info.snapshot_arc();
-        let all_liveness: &[u8] = liveness_bytes.as_ref();
-        if info + 3 > all_liveness.len() {
-            return;
-        }
-        let length_r = all_liveness[info + 1] as usize;
-        if length_r > num_regs_r || length_r == 0 {
-            return;
-        }
-        let mut live_r: [u64; 4] = [0; 4];
-        majit_jitcode::codewriter::jitcode::enumerate_vars(
-            info,
-            all_liveness,
-            |_| {},
-            |index| {
-                let index = index as usize;
-                if index < 256 {
-                    live_r[index / 64] |= 1u64 << (index % 64);
-                }
-            },
-            |_| {},
-        );
-        for index in 0..num_regs_r.min(256) {
-            if live_r[index / 64] & (1u64 << (index % 64)) == 0 {
-                regs[index] = 0;
-            }
-        }
-    });
-}
+pub unsafe fn retain_live_ref_registers(_ctx: *const (), _regs: *mut i64, _len: usize) {}
 
 /// Whether an exception exit emitted for the Python instruction at `py_pc`
 /// re-raises a value that already carries this frame's traceback node, so

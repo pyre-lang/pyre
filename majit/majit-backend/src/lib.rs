@@ -162,7 +162,10 @@ pub use finish_descrs::{
     propagate_exception_handle_fail,
 };
 pub use jitframe::JitFrameInfo;
-pub use llmodel::{FailArgSource, fail_arg_source_from_frame, get_int_value, get_int_value_direct};
+pub use llmodel::{
+    FailArgSource, fail_arg_source_from_frame, fail_arg_source_from_frame_with_locs, get_int_value,
+    get_int_value_at, get_int_value_direct,
+};
 pub use model::{
     cpu_subclassrange_min_offset, read_vtable_subclass_range, set_cpu_subclassrange_min_offset,
 };
@@ -2300,10 +2303,10 @@ impl DeadFrame {
         }
     }
 
-    /// Pointer for `FailArgSource::from_jitframe`.
+    /// Pointer for an off-holder jitframe load.
     ///
-    /// Only the GC-owned variant: `from_jitframe` takes an
-    /// `OwnerRootGuard` on the address, matching
+    /// Only the GC-owned variant: `FailArgSource::from_held_root` reuses
+    /// the deadframe's shadow-stack slot, matching
     /// `compile.py ResumeGuardDescr.handle_fail` handing the deadframe to
     /// `resume.py blackhole_from_resumedata` so
     /// `resume.py ResumeDataDirectReader.decode_int` can call

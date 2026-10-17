@@ -921,6 +921,7 @@ impl JitCode {
     /// blackhole interpreter at `setup_insns` time, RPython
     /// `blackhole.py`). The result is the offset into the metainterp's
     /// `all_liveness` table.
+    #[inline(always)]
     pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
         // `jitcode.py` `JitCode.get_live_vars_info`: `if not
         // we_are_translated(): assert pc in self._startpoints`. A release
@@ -928,9 +929,16 @@ impl JitCode {
         // `debug_assert!`. PyPy does not gate on `_startpoints is not
         // None` — `pc in None` would raise TypeError; a jitcode whose
         // liveness is consulted was assembled (`_startpoints = Some(set)`).
+        //
+        // `self.code` is a field of the body. One `body()` load: `Deref`
+        // would walk the `OnceLock` again on every index.
         self.assert_startpoint(pc);
+        let code = &self.body().code;
         let mut pc = pc;
-        if self.code[pc] != op_live {
+        if pc >= code.len() {
+            self.missing_liveness(pc);
+        }
+        if unsafe { *code.get_unchecked(pc) } != op_live {
             // `pc -= OFFSET_SIZE + 1`. A short pc cannot name a previous
             // `-live-`; that is `_missing_liveness`, not a wrapped index.
             let Some(back) = pc.checked_sub(super::liveness::OFFSET_SIZE + 1) else {
@@ -938,15 +946,24 @@ impl JitCode {
             };
             pc = back;
             self.assert_startpoint(pc);
-            if self.code[pc] != op_live {
+            if pc >= code.len() {
+                self.missing_liveness(pc);
+            }
+            if unsafe { *code.get_unchecked(pc) } != op_live {
                 self.missing_liveness(pc);
             }
         }
-        super::liveness::decode_offset(&self.code, pc + 1)
+        if pc + super::liveness::OFFSET_SIZE >= code.len() {
+            self.missing_liveness(pc);
+        }
+        // SAFETY: `pc` names a `-live-` opcode and `pc+1 .. pc+OFFSET_SIZE`
+        // are in `code` (`JitCode.get_live_vars_info` after the opcode test).
+        unsafe { super::liveness::decode_offset_unchecked(code, pc + 1) }
     }
 
     /// `jitcode.py` `JitCode.get_live_vars_info`: `if not
     /// we_are_translated(): assert pc in self._startpoints`.
+    #[inline]
     fn assert_startpoint(&self, pc: usize) {
         // `jitcode.py get_live_vars_info`: `if not we_are_translated():
         // assert pc in self._startpoints`. A body whose `_startpoints`
@@ -1377,9 +1394,10 @@ impl CallResultErasedKey {
 /// `args_r` / `args_f` into the callee's declaration order.
 ///
 /// Resolved once per descr (lazily, on the first blackhole call) and
-/// stored on [`BhCallDescr::call_stub`]. The per-call path is: read this
-/// stub, place the three banks into a stack buffer, invoke the fn pointer.
-/// The fn pointers are the arms of `majit-backend` `dispatch_classes_body!`.
+/// stored on [`BhCallDescr::call_stub`]. `descr.py CallDescr.create_call_stub`
+/// emits `fnptr(args_r[0], args_i[0], …)` directly from `arg_classes`.
+/// Integer-ABI stubs do the same here; float/`S` still place into a buffer
+/// and use the `dispatch_classes_body!` arm.
 #[derive(Clone, Copy, Debug)]
 pub struct BhCallStub {
     /// Per-position: high 2 bits = bank (0 = `args_i`, 1 = `args_r`,
@@ -1389,6 +1407,15 @@ pub struct BhCallStub {
     expect_i: u8,
     expect_r: u8,
     expect_f: u8,
+    /// True when every `arg_classes` char is `'i'` / `'r'` / `'L'`
+    /// (`descr.py TYPE` → integer C ABI). Then `call_i` indexes the
+    /// banks like the generated stub instead of flattening first.
+    int_abi: bool,
+    /// `descr.py create_call_stub` product: `call_stub(func, args_i, args_r, args_f)`
+    /// with bank indices compiled into the function. `None` when the
+    /// `arg_classes` string has no monomorphic arm (float/`S`/wide); those
+    /// still `place` into the flat `call_stub_i`.
+    pub call_i_banks: Option<unsafe fn(usize, &[i64], &[i64], &[i64]) -> i64>,
     /// `llmodel.py AbstractLLCPU.bh_call_i` / `bh_call_r` — i64 result word.
     pub call_stub_i: unsafe fn(usize, &[i64]) -> i64,
     /// `llmodel.py AbstractLLCPU.bh_call_f` — f64 result.
@@ -1408,6 +1435,8 @@ impl BhCallStub {
         expect_i: u8,
         expect_r: u8,
         expect_f: u8,
+        int_abi: bool,
+        call_i_banks: Option<unsafe fn(usize, &[i64], &[i64], &[i64]) -> i64>,
         call_stub_i: unsafe fn(usize, &[i64]) -> i64,
         call_stub_f: unsafe fn(usize, &[i64]) -> f64,
         call_stub_v: unsafe fn(usize, &[i64]),
@@ -1418,12 +1447,15 @@ impl BhCallStub {
             expect_i,
             expect_r,
             expect_f,
+            int_abi,
+            call_i_banks,
             call_stub_i,
             call_stub_f,
             call_stub_v,
         }
     }
 
+    #[inline(always)]
     fn place<'a>(
         &self,
         args_i: Option<&[i64]>,
@@ -1453,23 +1485,100 @@ impl BhCallStub {
             args_f.map_or(0, <[i64]>::len),
         );
         let n = self.arity as usize;
+        // descr.py `create_call_stub` indexes `args_i[k]` / `args_r[k]` /
+        // `args_f[k]` directly. Unwrap the banks once; a per-slot `expect`
+        // is not in the generated stub.
+        let args_i = args_i.unwrap_or(&[]);
+        let args_r = args_r.unwrap_or(&[]);
+        let args_f = args_f.unwrap_or(&[]);
         for i in 0..n {
             let slot = self.slots[i];
-            let bank = slot >> 6;
             let idx = (slot & 0x3f) as usize;
-            buf[i] = match bank {
-                Self::BANK_I => args_i.expect("BhCallDescr.collect_call_args: args_i missing")[idx],
-                Self::BANK_R => args_r.expect("BhCallDescr.collect_call_args: args_r missing")[idx],
-                _ => args_f.expect("BhCallDescr.collect_call_args: args_f missing")[idx],
+            buf[i] = match slot >> 6 {
+                Self::BANK_I => args_i[idx],
+                Self::BANK_R => args_r[idx],
+                _ => args_f[idx],
             };
         }
         &buf[..n]
+    }
+
+    /// `descr.py create_call_stub` `process(c)`: one bank load at this
+    /// declaration position.
+    #[inline(always)]
+    fn load_bank(slot: u8, args_i: &[i64], args_r: &[i64], args_f: &[i64]) -> i64 {
+        let idx = (slot & 0x3f) as usize;
+        match slot >> 6 {
+            Self::BANK_I => args_i[idx],
+            Self::BANK_R => args_r[idx],
+            _ => args_f[idx],
+        }
+    }
+
+    /// Integer-ABI `call_stub(func, args_i, args_r, args_f)`: index the
+    /// banks in `arg_classes` order and invoke, matching the source
+    /// `create_call_stub` emits.
+    #[inline(always)]
+    unsafe fn call_i_int_abi(
+        &self,
+        func: usize,
+        args_i: &[i64],
+        args_r: &[i64],
+        args_f: &[i64],
+    ) -> i64 {
+        let slots = &self.slots;
+        unsafe {
+            match self.arity {
+                0 => {
+                    let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(func);
+                    f()
+                }
+                1 => {
+                    let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(func);
+                    f(Self::load_bank(slots[0], args_i, args_r, args_f))
+                }
+                2 => {
+                    let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func);
+                    f(
+                        Self::load_bank(slots[0], args_i, args_r, args_f),
+                        Self::load_bank(slots[1], args_i, args_r, args_f),
+                    )
+                }
+                3 => {
+                    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(func);
+                    f(
+                        Self::load_bank(slots[0], args_i, args_r, args_f),
+                        Self::load_bank(slots[1], args_i, args_r, args_f),
+                        Self::load_bank(slots[2], args_i, args_r, args_f),
+                    )
+                }
+                4 => {
+                    let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
+                        std::mem::transmute(func);
+                    f(
+                        Self::load_bank(slots[0], args_i, args_r, args_f),
+                        Self::load_bank(slots[1], args_i, args_r, args_f),
+                        Self::load_bank(slots[2], args_i, args_r, args_f),
+                        Self::load_bank(slots[3], args_i, args_r, args_f),
+                    )
+                }
+                _ => {
+                    let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
+                    let n = self.arity as usize;
+                    for i in 0..n {
+                        buf[i] = Self::load_bank(slots[i], args_i, args_r, args_f);
+                    }
+                    (self.call_stub_i)(func, &buf[..n])
+                }
+            }
+        }
     }
 
     /// Place banks and invoke `call_stub_i`.
     ///
     /// # Safety
     /// `func` must match the ABI this stub was selected for.
+    #[inline(always)]
     pub unsafe fn call_i(
         &self,
         func: usize,
@@ -1477,9 +1586,27 @@ impl BhCallStub {
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
     ) -> i64 {
+        let args_i = args_i.unwrap_or(&[]);
+        let args_r = args_r.unwrap_or(&[]);
+        let args_f = args_f.unwrap_or(&[]);
+        debug_assert_eq!(args_i.len(), self.expect_i as usize);
+        debug_assert_eq!(args_r.len(), self.expect_r as usize);
+        debug_assert_eq!(args_f.len(), self.expect_f as usize);
+        // `descr.py create_call_stub` stores one `call_stub(func, args_i,
+        // args_r, args_f)` on the descr; `llmodel.py bh_call_i` reads that
+        // field. The monomorphic arm already names the bank slots.
+        if let Some(stub) = self.call_i_banks {
+            return unsafe { stub(func, args_i, args_r, args_f) };
+        }
+        if self.int_abi {
+            return unsafe { self.call_i_int_abi(func, args_i, args_r, args_f) };
+        }
         let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
-        let args = self.place(args_i, args_r, args_f, &mut buf);
-        unsafe { (self.call_stub_i)(func, args) }
+        let n = self.arity as usize;
+        for i in 0..n {
+            buf[i] = Self::load_bank(self.slots[i], args_i, args_r, args_f);
+        }
+        unsafe { (self.call_stub_i)(func, &buf[..n]) }
     }
 
     /// Place banks and invoke `call_stub_f`.

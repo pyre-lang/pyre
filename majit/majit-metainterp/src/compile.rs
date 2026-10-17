@@ -3573,7 +3573,7 @@ pub fn make_resume_guard_descr_instance_next_foriter(
         }
         _ => make_resume_guard_descr_typed(Vec::new()),
     };
-    resume_guard_inner(&descr)
+    resume_guard_descr(&descr)
         .expect("every arm above constructs a ResumeGuardDescr or a newtype over one")
         .instance_next_foriter_key
         .store(green_key, Ordering::Relaxed);
@@ -3589,13 +3589,19 @@ pub fn make_resume_guard_descr_instance_next_foriter(
 /// (`rd_numb`, `rd_loop_token_clt`) go through this unwrap — including
 /// Cranelift `cranelift_resumedata_deopt`.
 pub fn resume_guard_descr(descr: &DescrRef) -> Option<&ResumeGuardDescr> {
-    resume_guard_inner(descr)
+    resume_guard_from_any(descr.as_any()?)
+}
+
+/// `compile.py` `assert isinstance(self, ResumeGuardDescr)` then field
+/// reads. `ResumeGuardForcedDescr::as_any` returns the wrapper; the
+/// other tag-only newtypes hand out the inner descr.
+pub fn resume_guard_from_fail(fd: &dyn FailDescr) -> Option<&ResumeGuardDescr> {
+    resume_guard_from_any(fd.as_any()?)
 }
 
 /// The `ResumeGuardDescr` inside a descr that either is one or is one of its
 /// tag-only newtypes.
-fn resume_guard_inner(descr: &DescrRef) -> Option<&ResumeGuardDescr> {
-    let any = descr.as_any()?;
+fn resume_guard_from_any(any: &dyn std::any::Any) -> Option<&ResumeGuardDescr> {
     if let Some(plain) = any.downcast_ref::<ResumeGuardDescr>() {
         return Some(plain);
     }

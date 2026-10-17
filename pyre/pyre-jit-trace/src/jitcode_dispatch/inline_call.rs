@@ -5221,6 +5221,26 @@ impl Drop for OpenInlineActivation<'_> {
     }
 }
 
+// Root a frame-chain pointer (`topframeref` / `f_backref`) across a collecting
+// `record_op`. `history.py` keeps that word on a `RefFrontendOp` the collector
+// updates; a Rust local is not that box. Re-reading `ExecutionContext.topframeref`
+// after the append is a different slot and can pick up a forwarded interior.
+fn pin_frame_chain_ptr(
+    ptr: *mut pyre_interpreter::PyFrame,
+) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
+    let addr = majit_gc::gc_current_object_address(ptr as usize);
+    (addr != 0 && majit_gc::gc_owns_object(addr))
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)))
+}
+
+fn live_frame_chain_ptr(
+    pin: Option<&majit_gc::shadow_stack::OwnerRootGuard>,
+    fallback: *mut pyre_interpreter::PyFrame,
+) -> *mut pyre_interpreter::PyFrame {
+    pin.map(|p| p.get().0 as *mut pyre_interpreter::PyFrame)
+        .unwrap_or(fallback)
+}
+
 /// `executioncontext.py ExecutionContext.enter`, at an inlined call.
 ///
 /// ```python
@@ -5255,12 +5275,11 @@ fn walker_ec_enter(
     // callee, unforced.  `emit_new_pyframe_inline_with_params` leaves the slot
     // at its constructor default, so this is the store that links the chain.
     //
-    // Record first. `record_op` / `virtual_ref_during_tracing` allocate in
-    // the Trace pools and can minor-collect. `topframeref` is a traced field
-    // of the execution context (`executioncontext.py enter` /
-    // `collect_roots_in_nursery`), so the collector forwards it in place.
-    // A Rust local taken before that allocation is the pre-move address;
-    // storing it writes the stale nursery pointer the barrier then remembers.
+    // `record_op` / `virtual_ref_during_tracing` allocate in the Trace pools
+    // and can minor-collect. Pin the caller's pointer first so the collector
+    // updates this local, then record.
+    let caller_topframeref_raw = unsafe { (*concrete_ec).topframeref };
+    let pinned_caller_topframeref = pin_frame_chain_ptr(caller_topframeref_raw);
     let caller_topframeref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[callee_ec],
@@ -5295,9 +5314,8 @@ fn walker_ec_enter(
         crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
         4,
     );
-    // Re-read after every collecting append. `history.py` `RefFrontendOp`
-    // would be the box the collector updates; the stamp is that box.
-    let concrete_caller_topframeref = unsafe { (*concrete_ec).topframeref };
+    let concrete_caller_topframeref =
+        live_frame_chain_ptr(pinned_caller_topframeref.as_ref(), caller_topframeref_raw);
     ctx.set_opref_concrete(
         caller_topframeref,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_caller_topframeref as usize)),
@@ -5421,9 +5439,10 @@ pub(crate) fn walker_ec_leave(
     }
     // `self.topframeref = frame.f_backref` — no parens: the caller's vref
     // moves back unforced, so a caller frame that stayed virtual stays virtual.
-    // Same window as `walker_ec_enter`: `f_backref` is a traced field
-    // (`pyframe.py` / `collect_roots_in_nursery`). Read it after `record_op`,
-    // which can minor-collect and forward the young pointer in place.
+    // Same window as `walker_ec_enter`: pin the callee's `f_backref` before
+    // `record_op`, which can minor-collect.
+    let f_backref_raw = unsafe { (*concrete_frame).f_backref };
+    let pinned_f_backref = pin_frame_chain_ptr(f_backref_raw);
     let f_backref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[callee_frame],
@@ -5434,7 +5453,7 @@ pub(crate) fn walker_ec_leave(
         &[callee_ec, f_backref],
         crate::descr::ec_topframeref_descr(),
     );
-    let concrete_f_backref = unsafe { (*concrete_frame).f_backref };
+    let concrete_f_backref = live_frame_chain_ptr(pinned_f_backref.as_ref(), f_backref_raw);
     ctx.set_opref_concrete(
         f_backref,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_f_backref as usize)),

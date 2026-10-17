@@ -232,10 +232,156 @@ impl CharList {
         self
     }
 
+    fn len_cap(h: *mut ListHdr) -> (usize, usize) {
+        unsafe {
+            let len = (*h).length;
+            let items = (*h).items;
+            let cap = if items == 0 {
+                0
+            } else {
+                *(items as *const usize)
+            };
+            (len, cap)
+        }
+    }
+
+    /// Grow so `extra` more bytes fit. One `header()`; `_ll_list_resize_ge`
+    /// only when the current items array is too short.
+    fn header_with_extra(&mut self, extra: usize) -> *mut ListHdr {
+        let h = self.header();
+        let (len, cap) = Self::len_cap(h);
+        if len + extra > cap {
+            self.realloc_items(list_overallocate(len + extra));
+            self.header()
+        } else {
+            h
+        }
+    }
+
+    /// `encode_varint_signed` into `chars[len..]`. Returns the new length.
+    unsafe fn write_varint_at(chars: *mut u8, len: usize, value: i64) -> usize {
+        let mut v = value;
+        let flag: u8 = if !(-(1 << 14)..(1 << 14)).contains(&v) {
+            0x80
+        } else {
+            0
+        };
+        unsafe {
+            *chars.add(len) = ((v & 0b0111_1111) as u8) | flag;
+            v >>= 7;
+            *chars.add(len + 1) = (v & 0xff) as u8;
+            if flag == 0 {
+                len + 2
+            } else {
+                v >>= 8;
+                *chars.add(len + 2) = (v & 0xff) as u8;
+                v >>= 8;
+                *chars.add(len + 3) = (v & 0xff) as u8;
+                len + 4
+            }
+        }
+    }
+
     /// `encode_varint_signed` into this list (`_ll_list_resize_ge` on growth).
+    ///
+    /// `opencoder.py` `encode_varint_signed` appends each `chr`; `Trace.append_int`
+    /// writes the same layout into a pre-grown `_ops` buffer after one length
+    /// check. One `header()` here, then in-place bytes — not a stack array
+    /// plus a per-byte copy, and not a shadow-stack root per byte.
     pub fn append_varint(&mut self, value: i64) {
-        let (bytes, n) = super::encode_varint_signed_array(value);
-        self.append_bytes(&bytes[..n]);
+        let h = self.header_with_extra(4);
+        unsafe {
+            let chars = ((*h).items as *mut u8).add(WORD);
+            (*h).length = Self::write_varint_at(chars, (*h).length, value);
+        }
+    }
+
+    /// Several `encode_varint_signed` writes with one `header()` and at most
+    /// one resize. `Trace.append_int` / `_encode` root `_ops` once per
+    /// recorded op; snapshot lists do the same for a run of varints that
+    /// does not allocate between them (`_encode_snapshot`, `_list_of_boxes`).
+    pub fn append_varints(&mut self, values: &[i64]) {
+        if values.is_empty() {
+            return;
+        }
+        let h = self.header_with_extra(values.len() * 4);
+        unsafe {
+            let mut len = (*h).length;
+            let chars = ((*h).items as *mut u8).add(WORD);
+            for &value in values {
+                len = Self::write_varint_at(chars, len, value);
+            }
+            (*h).length = len;
+        }
+    }
+
+    /// `append_varints` with `Trace.append_snapshot_array_data_int`'s range
+    /// check: a value outside `[min, max]` sets `overflow` and encodes 0.
+    pub fn append_varints_checked(
+        &mut self,
+        values: &[i64],
+        min: i64,
+        max: i64,
+        overflow: &mut bool,
+    ) {
+        if values.is_empty() {
+            return;
+        }
+        let h = self.header_with_extra(values.len() * 4);
+        unsafe {
+            let mut len = (*h).length;
+            let chars = ((*h).items as *mut u8).add(WORD);
+            for &value in values {
+                len = Self::write_varint_at(chars, len, Self::clamp_int(value, min, max, overflow));
+            }
+            (*h).length = len;
+        }
+    }
+
+    /// Length prefix then `values`, one `header()`.
+    pub fn append_prefixed_varints(&mut self, prefix: i64, values: &[i64]) {
+        let h = self.header_with_extra((1 + values.len()) * 4);
+        unsafe {
+            let mut len = (*h).length;
+            let chars = ((*h).items as *mut u8).add(WORD);
+            len = Self::write_varint_at(chars, len, prefix);
+            for &value in values {
+                len = Self::write_varint_at(chars, len, value);
+            }
+            (*h).length = len;
+        }
+    }
+
+    /// `append_prefixed_varints` with `Trace.append_snapshot_array_data_int`'s
+    /// range check on the prefix and every value.
+    pub fn append_prefixed_varints_checked(
+        &mut self,
+        prefix: i64,
+        values: &[i64],
+        min: i64,
+        max: i64,
+        overflow: &mut bool,
+    ) {
+        let h = self.header_with_extra((1 + values.len()) * 4);
+        unsafe {
+            let mut len = (*h).length;
+            let chars = ((*h).items as *mut u8).add(WORD);
+            len = Self::write_varint_at(chars, len, Self::clamp_int(prefix, min, max, overflow));
+            for &value in values {
+                len = Self::write_varint_at(chars, len, Self::clamp_int(value, min, max, overflow));
+            }
+            (*h).length = len;
+        }
+    }
+
+    #[inline]
+    fn clamp_int(value: i64, min: i64, max: i64, overflow: &mut bool) -> i64 {
+        if value >= min && value <= max {
+            value
+        } else {
+            *overflow = true;
+            0
+        }
     }
 
     pub fn append_bytes(&mut self, bytes: &[u8]) {
@@ -715,5 +861,40 @@ mod tests {
         assert_eq!(items_offset::<u64>(), items_offset::<i64>());
         assert!(items_offset::<i64>() >= std::mem::size_of::<usize>());
         assert_eq!(items_offset::<usize>() % std::mem::align_of::<usize>(), 0);
+    }
+
+    #[test]
+    fn append_varint_matches_encode_varint_signed_array() {
+        let samples = [
+            0i64,
+            1,
+            -1,
+            127,
+            -128,
+            1 << 13,
+            -(1 << 13),
+            (1 << 20) - 1,
+            -(1 << 20),
+        ];
+        let mut expected = Vec::new();
+        for &v in &samples {
+            let (bytes, n) = crate::opencoder::encode_varint_signed_array(v);
+            expected.extend_from_slice(&bytes[..n]);
+        }
+        let mut one_at_a_time = super::CharList::with_capacity(0);
+        for &v in &samples {
+            one_at_a_time.append_varint(v);
+        }
+        assert_eq!(&one_at_a_time[..], expected.as_slice());
+        let mut batched = super::CharList::with_capacity(0);
+        batched.append_varints(&samples);
+        assert_eq!(&batched[..], expected.as_slice());
+        let mut prefixed = super::CharList::with_capacity(0);
+        prefixed.append_prefixed_varints(samples.len() as i64, &samples);
+        let mut expected_prefixed = Vec::new();
+        let (bytes, n) = crate::opencoder::encode_varint_signed_array(samples.len() as i64);
+        expected_prefixed.extend_from_slice(&bytes[..n]);
+        expected_prefixed.extend_from_slice(&expected);
+        assert_eq!(&prefixed[..], expected_prefixed.as_slice());
     }
 }

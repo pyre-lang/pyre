@@ -21,9 +21,24 @@ pub fn encode_offset(pos: usize, code: &mut Vec<u8>) {
 }
 
 /// RPython liveness.py `decode_offset(jitcode, pc)`.
+#[inline(always)]
 pub fn decode_offset(jitcode: &[u8], pc: usize) -> usize {
-    assert_eq!(OFFSET_SIZE, 2);
+    debug_assert_eq!(OFFSET_SIZE, 2);
     (jitcode[pc] as usize) | ((jitcode[pc + 1] as usize) << 8)
+}
+
+/// Translated `decode_offset`: `ord(code[pc]) | (ord(code[pc+1]) << 8)`.
+///
+/// # Safety
+/// `pc + 1 < jitcode.len()`. The caller has a valid `-live-` pc in an
+/// assembled jitcode body (`JitCode.get_live_vars_info`).
+#[inline(always)]
+pub unsafe fn decode_offset_unchecked(jitcode: &[u8], pc: usize) -> usize {
+    debug_assert_eq!(OFFSET_SIZE, 2);
+    debug_assert!(pc + 1 < jitcode.len());
+    unsafe {
+        *jitcode.get_unchecked(pc) as usize | ((*jitcode.get_unchecked(pc + 1) as usize) << 8)
+    }
 }
 
 // within the string of all_liveness, we encode the bitsets of which of the 256
@@ -148,29 +163,34 @@ impl<'a> LivenessIterator<'a> {
             count: 0,
         }
     }
-}
 
-impl<'a> Iterator for LivenessIterator<'a> {
-    type Item = u32;
-
-    /// RPython liveness.py `next(self)`.
+    /// liveness.py `next` after `if not self.length: raise StopIteration`.
     ///
-    /// Same scan as the bit-at-a-time loop: skip a zero tail with
-    /// `trailing_zeros` and return the next set index. The produced
-    /// sequence is identical.
-    #[inline]
-    fn next(&mut self) -> Option<u32> {
-        if self.length == 0 {
-            return None;
-        }
+    /// `enumerate_vars` drives `for index in it:` with that check as the
+    /// loop end. The `Option` wrapper on `Iterator::next` is the StopIteration
+    /// translation; this returns the index the way the inlined `next`
+    /// does (`@objectmodel.always_inline`).
+    ///
+    /// `self.length != 0` is the caller's proof: `enumerate_vars` only
+    /// constructs the iterator when `length_*` is nonzero, and this is
+    /// called once per remaining live register.
+    ///
+    /// # Safety
+    /// `all_liveness` holds a complete encoded record from `offset` for
+    /// `length` set bits (`ord(all_liveness[self.offset])` in
+    /// `liveness.py` `LivenessIterator.next`). A truncated buffer is a
+    /// producer bug.
+    #[inline(always)]
+    pub unsafe fn next_index(&mut self) -> u32 {
+        debug_assert!(self.length != 0);
         self.length -= 1;
         let mut count = self.count;
         let all_liveness = self.all_liveness;
         let mut curr_byte = self.curr_byte;
-        // find next bit set
         loop {
             if (count & 7) == 0 {
-                curr_byte = all_liveness[self.offset] as u32;
+                debug_assert!(self.offset < all_liveness.len());
+                curr_byte = unsafe { *all_liveness.get_unchecked(self.offset) } as u32;
                 self.curr_byte = curr_byte;
                 self.offset += 1;
             }
@@ -178,10 +198,32 @@ impl<'a> Iterator for LivenessIterator<'a> {
             if remaining != 0 {
                 count += remaining.trailing_zeros();
                 self.count = count + 1;
-                return Some(count);
+                return count;
             }
             count = (count & !7) + 8;
         }
+    }
+}
+
+impl<'a> Iterator for LivenessIterator<'a> {
+    type Item = u32;
+
+    /// RPython liveness.py `next(self)`.
+    ///
+    /// `@objectmodel.always_inline`. Same scan as the bit-at-a-time
+    /// loop: skip a zero tail with `trailing_zeros` and return the next
+    /// set index. The produced sequence is identical. The byte load is
+    /// `ord(all_liveness[self.offset])` (`rffi`); a truncated buffer is
+    /// a producer bug.
+    #[inline(always)]
+    fn next(&mut self) -> Option<u32> {
+        if self.length == 0 {
+            return None;
+        }
+        // SAFETY: `new` is only built for a nonzero bank in a complete
+        // `all_liveness` record, and `length` counts remaining set bits
+        // in that record (`LivenessIterator.next`).
+        Some(unsafe { self.next_index() })
     }
 }
 

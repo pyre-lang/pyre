@@ -501,9 +501,27 @@ pub fn closedbg_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_CLOSEDBG").is_some())
 }
 
+/// `MAJIT_BH_DEBUG`. `setposition` reads this on every resume.
+///
+/// A `OnceLock` is an acquire load of the cell on every call.
+/// `have_debug_prints` is one relaxed load (`pypy_have_debug_prints & 1`).
+static BH_DEBUG_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline(always)]
 pub fn bh_debug_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_BH_DEBUG").is_some())
+    match BH_DEBUG_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => bh_debug_enabled_init(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn bh_debug_enabled_init() -> bool {
+    let on = std::env::var_os("MAJIT_BH_DEBUG").is_some();
+    BH_DEBUG_FLAG.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    on
 }
 
 #[inline]

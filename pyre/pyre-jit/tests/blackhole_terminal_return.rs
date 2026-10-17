@@ -94,6 +94,7 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
                     false,
                     None,
                     None,
+                    None,
                 );
                 let BlackholeResult::DoneWithThisFrameRef(returned) = result else {
                     panic!("one ref_return must complete, not resume at a merge point");

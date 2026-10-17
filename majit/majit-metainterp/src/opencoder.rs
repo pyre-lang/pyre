@@ -338,8 +338,25 @@ pub(crate) fn p92_dump_enc_log() {
 
 /// opencoder.py encode_varint_signed.
 pub fn encode_varint_signed(buf: &mut Vec<u8>, value: i64) {
-    let (bytes, n) = encode_varint_signed_array(value);
-    buf.extend_from_slice(&bytes[..n]);
+    debug_assert!(
+        (MIN_VALUE..=MAX_VALUE).contains(&value),
+        "encode_varint_signed out of range: {value}"
+    );
+    let mut v = value;
+    let flag: u8 = if !(-(1 << 14)..(1 << 14)).contains(&v) {
+        0x80
+    } else {
+        0
+    };
+    buf.push(((v & 0b0111_1111) as u8) | flag);
+    v >>= 7;
+    buf.push((v & 0xff) as u8);
+    if flag != 0 {
+        v >>= 8;
+        buf.push((v & 0xff) as u8);
+        v >>= 8;
+        buf.push((v & 0xff) as u8);
+    }
 }
 
 /// opencoder.py decode_varint_signed. Returns (value, bytes_consumed).
@@ -2354,16 +2371,13 @@ impl Trace {
     ///
     /// `history.py` `ConstPtr.value` is a GCREF local. A Rust `u64` is
     /// not; `_refs.push` can minor-collect (`WordArray` list-header growth).
-    /// Pin the referent, store the forwarded address, and re-hash from
-    /// that address so the dict key matches the slot.
+    /// `opencoder.py` `_cached_const_ptr` is a dict lookup then maybe
+    /// append; pin only on the append that may collect.
     pub fn _encode_ptr(&mut self, addr: u64) -> i64 {
         self._consts_ptr += 1;
         if addr == 0 {
             return tag(TAGCONSTPTR, 0) as i64;
         }
-        let pin = pin_gc_addr(addr as usize);
-        let addr = pin.as_ref().map(|p| p.get().0 as u64).unwrap_or(addr);
-        let addr = majit_gc::gc_current_object_address(addr as usize) as u64;
         let key = majit_ir::gc_id_or_identityhash(addr as usize) as u64;
         let cached = self
             ._refs_dict
@@ -2371,19 +2385,22 @@ impl Trace {
             .copied()
             .or_else(|| self._refs_dict.get(&(addr as u64)).copied())
             .filter(|&idx| self._refs.as_slice().get(idx as usize).copied() == Some(addr as usize));
-        let v = if let Some(idx) = cached {
-            idx
-        } else {
-            let stored = self._refs.push(addr as usize);
-            let idx = (self._refs.len() - 1) as u32;
-            let key = majit_ir::gc_id_or_identityhash(stored) as u64;
-            self._refs_dict.insert(key, idx);
-            if key != stored as u64 {
-                self._refs_dict.insert(stored as u64, idx);
-            }
-            idx
-        };
-        tag(TAGCONSTPTR, v) as i64
+        if let Some(idx) = cached {
+            return tag(TAGCONSTPTR, idx) as i64;
+        }
+        let pin = (self._refs.len() == self._refs.capacity())
+            .then(|| pin_gc_addr(addr as usize))
+            .flatten();
+        let addr = pin.as_ref().map(|p| p.get().0 as u64).unwrap_or(addr);
+        let addr = majit_gc::gc_current_object_address(addr as usize) as u64;
+        let stored = self._refs.push(addr as usize);
+        let idx = (self._refs.len() - 1) as u32;
+        let key = majit_ir::gc_id_or_identityhash(stored) as u64;
+        self._refs_dict.insert(key, idx);
+        if key != stored as u64 {
+            self._refs_dict.insert(stored as u64, idx);
+        }
+        tag(TAGCONSTPTR, idx) as i64
     }
 
     /// opencoder.py _encode for AbstractResOp — boxes that live
@@ -2423,6 +2440,15 @@ impl Trace {
     }
 
     // ── Snapshot writers (opencoder.py _list_of_boxes) ──
+
+    fn clamp_snapshot_int(&mut self, i: i64) -> i64 {
+        if !(MIN_VALUE..=MAX_VALUE).contains(&i) {
+            self.tag_overflow = true;
+            0
+        } else {
+            i
+        }
+    }
 
     /// opencoder.py new_array(lgt).
     ///
@@ -2474,10 +2500,18 @@ impl Trace {
     /// opencoder.py _list_of_boxes(boxes). Writes an array
     /// header then each box, returns the array index (0 for empty).
     pub fn _list_of_boxes(&mut self, boxes: &[i64]) -> i64 {
-        let res = self.new_array(boxes.len());
-        for &b in boxes {
-            self._add_box_to_storage(b);
+        if boxes.is_empty() {
+            return 0;
         }
+        let res = self._snapshot_array_data.len() as i64;
+        let n = self.clamp_snapshot_int(boxes.len() as i64);
+        self._snapshot_array_data.append_prefixed_varints_checked(
+            n,
+            boxes,
+            MIN_VALUE,
+            MAX_VALUE,
+            &mut self.tag_overflow,
+        );
         res
     }
 
@@ -2489,14 +2523,29 @@ impl Trace {
     /// frame slots. This reorders `[a, b, c, vable]` to `[vable, a, b, c]`.
     pub fn _list_of_boxes_virtualizable(&mut self, boxes: &[i64]) -> i64 {
         if boxes.is_empty() {
-            return self.new_array(0);
+            return 0;
         }
-        let res = self.new_array(boxes.len());
-        // boxes[-1] first (the virtualizable), then boxes[:-1].
-        self._add_box_to_storage(*boxes.last().unwrap());
-        for &b in &boxes[..boxes.len() - 1] {
-            self._add_box_to_storage(b);
-        }
+        let res = self._snapshot_array_data.len() as i64;
+        let n = self.clamp_snapshot_int(boxes.len() as i64);
+        let last = *boxes.last().unwrap();
+        let rest = &boxes[..boxes.len() - 1];
+        // boxes[-1] first (the virtualizable), then boxes[:-1]. Two
+        // header() loads: length+last, then the remainder. No GC alloc
+        // between them. Each value still goes through the
+        // `append_snapshot_array_data_int` range check (`tag_overflow`).
+        self._snapshot_array_data.append_prefixed_varints_checked(
+            n,
+            std::slice::from_ref(&last),
+            MIN_VALUE,
+            MAX_VALUE,
+            &mut self.tag_overflow,
+        );
+        self._snapshot_array_data.append_varints_checked(
+            rest,
+            MIN_VALUE,
+            MAX_VALUE,
+            &mut self.tag_overflow,
+        );
         res
     }
 
@@ -2534,15 +2583,18 @@ impl Trace {
             );
         }
         let res = self._snapshot_data.len() as i64;
-        self.append_snapshot_data_int(index);
-        self.append_snapshot_data_int(pc);
-        self.append_snapshot_data_int(array);
         let prev = if is_last {
             SNAPSHOT_PREV_NONE as i64
         } else {
             SNAPSHOT_PREV_NEEDS_PATCHING as i64
         };
-        self.append_snapshot_data_int(prev);
+        let vals = [
+            self.clamp_snapshot_int(index),
+            self.clamp_snapshot_int(pc),
+            self.clamp_snapshot_int(array),
+            self.clamp_snapshot_int(prev),
+        ];
+        self._snapshot_data.append_varints(&vals);
         res
     }
 
@@ -3421,23 +3473,15 @@ impl Trace {
     /// [MIN_VALUE, MAX_VALUE] trip `tag_overflow` (and encode 0 to keep
     /// the stream parseable).
     pub(crate) fn append_snapshot_array_data_int(&mut self, i: i64) {
-        if !(MIN_VALUE..=MAX_VALUE).contains(&i) {
-            self.tag_overflow = true;
-            self._snapshot_array_data.append_varint(0);
-        } else {
-            self._snapshot_array_data.append_varint(i);
-        }
+        let i = self.clamp_snapshot_int(i);
+        self._snapshot_array_data.append_varint(i);
     }
 
     /// opencoder.py append_snapshot_data_int(i).
     #[allow(dead_code)]
     pub(crate) fn append_snapshot_data_int(&mut self, i: i64) {
-        if !(MIN_VALUE..=MAX_VALUE).contains(&i) {
-            self.tag_overflow = true;
-            self._snapshot_data.append_varint(0);
-        } else {
-            self._snapshot_data.append_varint(i);
-        }
+        let i = self.clamp_snapshot_int(i);
+        self._snapshot_data.append_varint(i);
     }
 
     /// opencoder.py Trace.get_live_ranges().
@@ -4793,6 +4837,44 @@ mod tests {
         assert!(
             buf.tag_overflow,
             "append_int out of range must trip tag_overflow"
+        );
+        assert_eq!(
+            buf.tracing_done(),
+            Err(crate::pyjitpl::AbortReason::TooLong)
+        );
+    }
+
+    /// `Trace.append_snapshot_array_data_int` / `_list_of_boxes` /
+    /// `_list_of_boxes_virtualizable`: a box value outside
+    /// `[MIN_VALUE, MAX_VALUE]` sets `tag_overflow` and encodes 0.
+    #[test]
+    fn test_snapshot_array_box_overflow_sets_tag_overflow() {
+        let mut buf = TraceRecordBuffer::new(0, empty_sd());
+        buf._list_of_boxes(&[MAX_VALUE + 1]);
+        assert!(
+            buf.tag_overflow,
+            "_list_of_boxes(MAX_VALUE+1) must trip tag_overflow"
+        );
+
+        let mut buf = TraceRecordBuffer::new(0, empty_sd());
+        buf._list_of_boxes_virtualizable(&[1, MAX_VALUE + 1]);
+        assert!(
+            buf.tag_overflow,
+            "_list_of_boxes_virtualizable rest value must trip tag_overflow"
+        );
+
+        let mut buf = TraceRecordBuffer::new(0, empty_sd());
+        buf._list_of_boxes_virtualizable(&[MAX_VALUE + 1]);
+        assert!(
+            buf.tag_overflow,
+            "_list_of_boxes_virtualizable first (vable) value must trip tag_overflow"
+        );
+
+        let mut buf = TraceRecordBuffer::new(0, empty_sd());
+        buf.append_snapshot_array_data_int(MAX_VALUE + 1);
+        assert!(
+            buf.tag_overflow,
+            "append_snapshot_array_data_int(MAX_VALUE+1) must trip tag_overflow"
         );
         assert_eq!(
             buf.tracing_done(),

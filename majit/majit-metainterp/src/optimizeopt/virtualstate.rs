@@ -22,7 +22,6 @@
 use std::cell::Cell;
 use std::ops::Deref;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use indexmap::IndexSet;
 
@@ -429,71 +428,6 @@ impl VirtualStateInfo {
     }
 }
 
-/// Heap list of `ConstPtr` indexes kept alive with a loop token, plus the
-/// virtual-state nodes that store copies of those addresses.
-///
-/// The extra-area pointer is `Box::into_raw` provenance, so moving the
-/// `Arc` does not stale it. The node pointers are `Rc` payloads: they stay
-/// put while any clone of the virtual state holds them.
-struct RetainedConstPtrIndexes {
-    indexes: Vec<u32>,
-    nodes: Vec<*const VirtualStateInfoNode>,
-}
-
-/// One extra-area registration shared by every clone of a loop token's
-/// virtual state. Mutator-lifetime: `TargetToken.virtual_state` outlives
-/// `thread_die`. The last `Arc` drop unregisters if the mutator is still
-/// live, then frees the list.
-struct RetainedConstPtrRoot {
-    area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
-    indexes: *mut RetainedConstPtrIndexes,
-}
-
-impl std::fmt::Debug for RetainedConstPtrRoot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = if self.indexes.is_null() {
-            0
-        } else {
-            unsafe { (*self.indexes).indexes.len() }
-        };
-        f.debug_struct("RetainedConstPtrRoot")
-            .field("len", &len)
-            .finish()
-    }
-}
-
-impl Drop for RetainedConstPtrRoot {
-    fn drop(&mut self) {
-        // Unregister before freeing. A walk in between would use the list.
-        self.area.take();
-        if !self.indexes.is_null() {
-            unsafe { drop(Box::from_raw(self.indexes)) };
-            self.indexes = std::ptr::null_mut();
-        }
-    }
-}
-
-/// # Safety
-/// `data` is the `Box<RetainedConstPtrIndexes>` from
-/// [`VirtualState::retain_const_ptr_indexes`]. Drop unregisters this walk
-/// before freeing that box. `nodes` stay allocated until
-/// [`VirtualState`]'s drop clears the `Arc`, which runs before `state`.
-unsafe fn walk_retained_const_ptr_indexes(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
-    let roots = unsafe { &*(data as *const RetainedConstPtrIndexes) };
-    // The table slot and the `Constant(Value::Ref)` copy are different
-    // holders. `trace_index` forwards only the slot. A minor before the
-    // token is published on `CompiledEntry::front_target_tokens` has no
-    // other walker for the in-flight virtual state, so forward the copies
-    // here too. `trace_index` is idempotent inside one wave.
-    for &index in &roots.indexes {
-        majit_ir::const_ptr_table::trace_index(index, visitor);
-    }
-    let mut seen: Vec<*const VirtualStateInfoNode> = Vec::new();
-    for &node in &roots.nodes {
-        visit_info_node(node, visitor, &mut seen);
-    }
-}
-
 fn visit_const_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
     if let Value::Ref(gcref) = value {
         visitor(gcref);
@@ -510,9 +444,9 @@ fn visit_info_node(
     }
     seen.push(ptr);
     // SAFETY: `ptr` is an `Rc<VirtualStateInfoNode>` payload held by a
-    // `VirtualState` that still owns the extra-area registration. The walk
-    // is stop-the-world. RPython mutates `TargetToken.virtual_state` in
-    // place; this writes the shared node so every clone sees the new address.
+    // live `VirtualState`. The walk is stop-the-world. `TargetToken.virtual_state`
+    // is mutated in place; this writes the shared node so every clone sees
+    // the new address.
     let node_mut = unsafe { &mut *(ptr as *mut VirtualStateInfoNode) };
     visit_state_info(&mut node_mut.info, visitor, seen);
 }
@@ -580,12 +514,15 @@ pub struct VirtualState {
     /// virtualstate.py `VirtualState.info_counter`. Increments through
     /// `enum_into` to assign per-instance positions.
     info_counter: i32,
-    /// `ExportedState::publish_const_ptr_root`'s extra area dies with the
-    /// optimizer. A later bridge snapshot still re-interns `ConstPtr` slots
-    /// the token's virtual state and short preamble still hold, so those
-    /// indexes stay registered here until the token is dropped. Partial-trace
-    /// ops are not part of that graph and must not be.
-    const_ptr_root: Option<Arc<RetainedConstPtrRoot>>,
+    /// ConstPtr table indexes interned from this state's `Constant` refs.
+    ///
+    /// `TargetToken.virtual_state` is a field of a GC object; MiniMark traces
+    /// `NotVirtualStateInfo.constbox` through that graph. The compiled-loop
+    /// holder walk (`MetaInterp::walk_rd_consts_refs`) is that graph here:
+    /// it stamps these indexes via `trace_index` and forwards the inline
+    /// copies. The list lives as long as this state, independent of which
+    /// mutator created the token.
+    const_ptr_indexes: Vec<u32>,
 }
 
 impl VirtualState {
@@ -620,52 +557,35 @@ impl VirtualState {
             state,
             numnotvirtuals: 0,
             info_counter: -1,
-            const_ptr_root: None,
+            const_ptr_indexes: Vec::new(),
         };
         vs.enum_top_level();
         vs
     }
 
-    /// Register `indexes` until the last clone of this virtual state drops.
+    /// Record interned ConstPtr indexes this state still names.
     ///
-    /// A thread with no registered mutator skips the registration, matching
-    /// `ExportedState::publish_const_ptr_root`. An empty index list still
-    /// registers when this state has info nodes, so those `Constant` refs
-    /// are forwarded. Replaces any previous root on this state.
-    /// `trace_index` is idempotent inside one wave, so a second registration
-    /// beside the optimizer's short-lived root is safe.
+    /// `finalize_short_preamble` assigns `TargetToken.virtual_state` and
+    /// then records the indexes that graph (and the short preamble) hold.
+    /// `walk_rd_consts_refs` stamps them for the token's life. Replaces any
+    /// previous list. Partial-trace ops are not part of that graph.
     pub(crate) fn retain_const_ptr_indexes(&mut self, indexes: &[u32]) {
-        self.const_ptr_root = None;
-        if !majit_gc::shadow_stack::mutator_is_registered() {
-            return;
-        }
-        // Top-level nodes. The walk follows children from these payloads.
-        // An empty index list still has to walk them: a `Constant` ref is
-        // not always an interned table slot, and skipping the registration
-        // leaves that copy unforwarded.
-        let nodes: Vec<*const VirtualStateInfoNode> = self.state.iter().map(Rc::as_ptr).collect();
-        if indexes.is_empty() && nodes.is_empty() {
-            return;
-        }
         let mut indexes = indexes.to_vec();
         indexes.sort_unstable();
         indexes.dedup();
-        let indexes = Box::into_raw(Box::new(RetainedConstPtrIndexes { indexes, nodes }));
-        // SAFETY: `indexes` stays allocated until `RetainedConstPtrRoot`'s
-        // drop, which unregisters `area` first. The `Arc` shares one
-        // registration across clones. The walk reads the index list and
-        // writes forwarded addresses into the shared info nodes.
-        let area = unsafe {
-            majit_gc::shadow_stack::MutatorExtraAreaGuard::permanent(
-                walk_retained_const_ptr_indexes,
-                indexes.cast(),
-                "loop_virtual_state",
-            )
-        };
-        self.const_ptr_root = Some(Arc::new(RetainedConstPtrRoot {
-            area: Some(area),
-            indexes,
-        }));
+        indexes.retain(|&i| i != 0);
+        self.const_ptr_indexes = indexes;
+    }
+
+    /// Stamp interned `ConstPtr.value` slots this state still names.
+    ///
+    /// The inline `Constant(Value::Ref)` copies are a different holder;
+    /// [`Self::walk_const_ptr_refs_mut`] forwards those. `trace_index` is
+    /// idempotent inside one wave.
+    pub(crate) fn trace_const_ptr_indexes(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        for &index in &self.const_ptr_indexes {
+            majit_ir::const_ptr_table::trace_index(index, visitor);
+        }
     }
 
     /// virtualstate.py `VirtualState.__init__` per-state walk:
@@ -2475,14 +2395,6 @@ impl VirtualState {
     }
 }
 
-impl Drop for VirtualState {
-    fn drop(&mut self) {
-        // Field order drops `state` before `const_ptr_root`. Clear the
-        // registration first so a walk cannot read nodes this drop frees.
-        self.const_ptr_root = None;
-    }
-}
-
 impl Clone for VirtualState {
     /// Share the `AbstractVirtualStateInfo` graph. RPython `VirtualState`
     /// is one object; assignment (`TargetToken.virtual_state = vs`,
@@ -2496,7 +2408,7 @@ impl Clone for VirtualState {
             state: self.state.clone(),
             numnotvirtuals: self.numnotvirtuals,
             info_counter: self.info_counter,
-            const_ptr_root: self.const_ptr_root.clone(),
+            const_ptr_indexes: self.const_ptr_indexes.clone(),
         }
     }
 }
@@ -3898,12 +3810,12 @@ mod tests {
         assert_eq!(vs.state[0].position.get(), cloned.state[0].position.get());
     }
 
-    /// The extra-area walk forwards `Constant` refs stored in the state,
-    /// including a nested field, and leaves a vtable integer alone.
+    /// The compiled-loop holder walk forwards `Constant` refs stored in the
+    /// state, including a nested field, and leaves a vtable integer alone.
     #[test]
     fn retained_walk_forwards_constant_refs_in_the_state() {
         let descr = test_descr(3);
-        let state = VirtualState::new(vec![
+        let mut state = VirtualState::new(vec![
             VirtualStateInfo::Constant(Value::Ref(GcRef(0x1000))),
             VirtualStateInfo::VStruct {
                 descr,
@@ -3917,18 +3829,9 @@ mod tests {
             },
             VirtualStateInfo::KnownClass { class_ptr: 7 },
         ]);
-        let nodes: Vec<*const VirtualStateInfoNode> =
-            state.state.iter().map(std::rc::Rc::as_ptr).collect();
-        let held = Box::into_raw(Box::new(RetainedConstPtrIndexes {
-            indexes: Vec::new(),
-            nodes,
-        }));
-        unsafe {
-            walk_retained_const_ptr_indexes(held.cast(), &mut |gcref| {
-                gcref.0 += 0x10;
-            });
-            drop(Box::from_raw(held));
-        }
+        state.walk_const_ptr_refs_mut(&mut |gcref| {
+            gcref.0 += 0x10;
+        });
         match &state.state[0].info {
             VirtualStateInfo::Constant(Value::Ref(gcref)) => assert_eq!(gcref.0, 0x1010),
             other => panic!("top-level constant became {other:?}"),

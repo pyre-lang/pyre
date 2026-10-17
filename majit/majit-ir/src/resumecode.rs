@@ -9,22 +9,17 @@
 
 /// resumecode.py: append_numbering(lst, item)
 pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
-    let (bytes, n) = encode_varint_bytes(value);
-    buf.extend_from_slice(&bytes[..n]);
-}
-
-fn encode_varint_bytes(value: i32) -> ([u8; 3], usize) {
     let mut item = (value as i64) * 2;
     if item < 0 {
         item = -1 - item;
     }
     assert!(item >= 0);
     let item = item as u32;
-
     if item < (1 << 7) {
-        ([item as u8, 0, 0], 1)
+        buf.push(item as u8);
     } else if item < (1 << 14) {
-        ([(item | 0x80) as u8, (item >> 7) as u8, 0], 2)
+        buf.push((item | 0x80) as u8);
+        buf.push((item >> 7) as u8);
     } else {
         // `resumecode.py` `append_numbering` asserts `item < 2**16` because
         // `append_int` feeds it a SHORT. A jitcode pc is a `fix_labels`
@@ -32,14 +27,9 @@ fn encode_varint_bytes(value: i32) -> ([u8; 3], usize) {
         // still fits this 3-byte form (`item >> 14` in one byte, so
         // `item < 2**22`).
         assert!(item < (1 << 22), "resumecode item too large: {item}");
-        (
-            [
-                (item | 0x80) as u8,
-                ((item >> 7) | 0x80) as u8,
-                (item >> 14) as u8,
-            ],
-            3,
-        )
+        buf.push((item | 0x80) as u8);
+        buf.push(((item >> 7) | 0x80) as u8);
+        buf.push((item >> 14) as u8);
     }
 }
 
@@ -50,38 +40,80 @@ pub fn append_numbering(buf: &mut Vec<u8>, item: i32) {
 
 /// resumecode.py: numb_next_item(numb, index)
 ///
-/// line-by-line port. Does not bounds-check: upstream contract requires
-/// the buffer to contain a complete varint at `index`. A truncated
-/// buffer is a bug in resume data generation and should panic loudly
-/// via the standard slice indexing rather than silently returning 0.
+/// One load of `numb.code[index]` on the one-byte path. A truncated
+/// buffer is a bug in resume data generation and panics through slice
+/// indexing rather than returning 0.
 #[inline]
 pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
-    let b0 = buf[index] as i64;
-    // resumecode.py `numb_next_item`: one-byte items are `item < 2**7`
-    // after zigzag. Same decode as the multi-byte path, without the
-    // continuation loads.
+    decode_varint_at(buf.as_ptr(), buf.len(), index)
+}
+
+/// `resumecode.py` `numb_next_item`. `_always_inline_ = True`: the
+/// one-, two-, and three-byte forms are one function. A truncated
+/// buffer is a producer bug; the translated `rffi` load has no length
+/// test. Debug still panics through `varint_oob`.
+#[inline(always)]
+fn decode_varint_at(
+    ptr: *const u8,
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))] len: usize,
+    index: usize,
+) -> (i32, usize) {
+    // `numb_next_item` is `numb.code[index]`.
+    #[cfg(debug_assertions)]
+    if index >= len {
+        varint_oob(ptr, len, index);
+    }
+    let b0 = unsafe { *ptr.add(index) } as i64;
     if b0 & (1 << 7) == 0 {
         let value = if b0 & 1 != 0 { -1 - b0 } else { b0 };
         return ((value >> 1) as i32, index + 1);
     }
+    decode_varint_rest(ptr, len, index, b0)
+}
 
+#[inline(always)]
+fn decode_varint_rest(
+    ptr: *const u8,
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))] len: usize,
+    mut index: usize,
+    b0: i64,
+) -> (i32, usize) {
     let mut value = b0;
-    let mut index = index + 1;
+    index += 1;
+    #[cfg(debug_assertions)]
+    if index >= len {
+        varint_oob(ptr, len, index);
+    }
     value &= (1 << 7) - 1;
-    value |= (buf[index] as i64) << 7;
+    value |= (unsafe { *ptr.add(index) } as i64) << 7;
     index += 1;
     if value & (1 << 14) != 0 {
+        #[cfg(debug_assertions)]
+        if index >= len {
+            varint_oob(ptr, len, index);
+        }
         value &= (1 << 14) - 1;
-        value |= (buf[index] as i64) << 14;
+        value |= (unsafe { *ptr.add(index) } as i64) << 14;
         index += 1;
     }
-
     if value & 1 != 0 {
         value = -1 - value;
     }
     value >>= 1;
-
     (value as i32, index)
+}
+
+#[cfg(debug_assertions)]
+#[cold]
+#[inline(never)]
+fn varint_oob(ptr: *const u8, len: usize, index: usize) -> ! {
+    let buf: &[u8] = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    };
+    let _ = buf[index];
+    unreachable!("slice index already panicked");
 }
 
 /// resumecode.py: numb_next_item(numb, index)
@@ -196,81 +228,169 @@ impl Writer {
 
 /// resumecode.py: Reader
 ///
-/// Holds `numb` and an index. Each item re-reads `numb.code[index]`
-/// (`numb_next_item`): one plain load of the payload cell. The byte
-/// pointer is not cached across an item. The consumer of an item can
-/// allocate, and a minor forwards `compile.py` `ResumeGuardDescr.rd_numb`.
+/// Holds the numbering slot and an index. Each item re-reads
+/// `numb.code[index]` (`numb_next_item`): one plain load of the payload
+/// cell. The byte pointer is not cached across an item. The consumer of
+/// an item can allocate, and a minor forwards `compile.py`
+/// `ResumeGuardDescr.rd_numb`.
 pub struct Reader<'a> {
     code: &'a [u8],
-    /// When set, reads come from this numbering's payload.
-    numb: Option<&'a NumberingRef>,
+    /// `NumberingRef`'s slot address, copied at bind time. Zero means
+    /// reads use `code`.
+    slot: usize,
+    _tie: std::marker::PhantomData<&'a NumberingRef>,
     pub cur_pos: usize,
     pub items_read: usize,
+    /// `resumecode.py` `Reader.code`: the numbering payload `numb_next_item`
+    /// indexes. A moving collection rewrites `NumSlot.addr`; `stable` is
+    /// set only when the rest of this reader's walk does not allocate, so
+    /// the pointer cannot go stale (`resume.py` `blackhole_from_resumedata`
+    /// with empty virtuals and pending fields).
+    payload_ptr: *const u8,
+    payload_len: usize,
+    stable: bool,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(code: &'a [u8]) -> Self {
+        let (payload_ptr, payload_len) = Self::unbound_payload(code);
         Reader {
             code,
-            numb: None,
+            slot: 0,
+            _tie: std::marker::PhantomData,
             cur_pos: 0,
             items_read: 0,
+            payload_ptr,
+            payload_len,
+            // The unbound slice is not a GC numbering; it does not move.
+            stable: true,
         }
     }
 
     /// Subsequent reads follow `numb` across a minor.
     ///
     /// `resumecode.py` `Reader.next_item` calls `numb_next_item`, which
-    /// loads `numb.code[index]` from the GC pointer on every item.
+    /// loads `numb.code[index]` from the GC pointer. That pointer is
+    /// `Reader.code`; it is not re-fetched from a side cell unless a
+    /// collection can rewrite it. `mark_payload_stable` pins it when
+    /// the remaining walk does not allocate.
     pub fn bind_numbering(&mut self, numb: &'a NumberingRef) {
-        self.numb = Some(numb);
+        self.slot = numb.slot.as_ptr() as usize;
+        self.refresh_from_slot();
+        self.stable = false;
     }
 
     pub fn from_numbering(numb: &'a NumberingRef) -> Self {
-        Reader {
+        let mut reader = Reader {
             code: &[],
-            numb: Some(numb),
+            slot: numb.slot.as_ptr() as usize,
+            _tie: std::marker::PhantomData,
             cur_pos: 0,
             items_read: 0,
-        }
-    }
-
-    /// One `numb_next_item` view. The slice dies with the call that
-    /// decodes it; the next item loads the cell again.
-    #[inline(always)]
-    fn bytes(&self) -> &[u8] {
-        if let Some(numb) = self.numb {
-            numb.as_slice()
-        } else {
-            self.code
-        }
-    }
-
-    /// resumecode.py: next_item / `numb_next_item` (always inline).
-    #[inline(always)]
-    pub fn next_item(&mut self) -> i32 {
-        let pos = self.cur_pos;
-        let (result, new_pos) = {
-            let buf = self.bytes();
-            decode_varint(buf, pos)
+            payload_ptr: std::ptr::null(),
+            payload_len: 0,
+            stable: false,
         };
+        reader.refresh_from_slot();
+        reader
+    }
+
+    /// Pin `Reader.code` for a walk that does not allocate.
+    ///
+    /// `numb_next_item` then indexes this pointer the way translated
+    /// `Reader.next_item` indexes `self.code` after the GC map has
+    /// already forwarded it.
+    #[inline]
+    pub fn mark_payload_stable(&mut self) {
+        if self.slot != 0 {
+            self.refresh_from_slot();
+        }
+        self.stable = true;
+    }
+
+    #[inline(always)]
+    fn refresh_from_slot(&mut self) {
+        let (ptr, len) = self.payload_from_slot();
+        self.payload_ptr = ptr;
+        self.payload_len = len;
+    }
+
+    /// Payload `(bytes, len)`. Reloads the slot's address word unless
+    /// `stable` holds `Reader.code`. A null payload is the empty numbering.
+    #[inline(always)]
+    fn payload(&self) -> (*const u8, usize) {
+        if self.stable {
+            return (self.payload_ptr, self.payload_len);
+        }
+        if self.slot != 0 {
+            return self.payload_from_slot();
+        }
+        Self::unbound_payload(self.code)
+    }
+
+    /// `resumecode.py` `numb_next_item`: `numb.code` is the GC numbering.
+    #[inline(always)]
+    fn payload_from_slot(&self) -> (*const u8, usize) {
+        let addr = unsafe {
+            (*(self.slot as *const NumSlot))
+                .addr
+                .load(Ordering::Relaxed)
+        };
+        payload_parts(addr)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unbound_payload(code: &[u8]) -> (*const u8, usize) {
+        (code.as_ptr(), code.len())
+    }
+
+    #[inline(always)]
+    fn take_item(&mut self, ptr: *const u8, len: usize) -> i32 {
+        let index = self.cur_pos;
+        let (result, new_pos) = decode_varint_at(ptr, len, index);
         self.cur_pos = new_pos;
         self.items_read += 1;
         result
     }
 
+    /// resumecode.py: next_item / `numb_next_item` (always inline).
+    #[inline(always)]
+    pub fn next_item(&mut self) -> i32 {
+        let (ptr, len) = self.payload();
+        self.take_item(ptr, len)
+    }
+
+    /// `numb_next_item` after `bind_numbering` / `from_numbering`.
+    /// The unbound slice arm stays on `next_item` for tests.
+    #[inline(always)]
+    pub fn next_item_bound(&mut self) -> i32 {
+        #[cfg(debug_assertions)]
+        if self.slot == 0 {
+            return self.next_item();
+        }
+        let (ptr, len) = if self.stable {
+            (self.payload_ptr, self.payload_len)
+        } else {
+            self.payload_from_slot()
+        };
+        self.take_item(ptr, len)
+    }
+
     /// resumecode.py: peek
     #[inline]
     pub fn peek(&self) -> i32 {
-        let (result, _) = decode_varint(self.bytes(), self.cur_pos);
+        let (ptr, len) = self.payload();
+        let (result, _) = decode_varint_at(ptr, len, self.cur_pos);
         result
     }
 
     /// resumecode.py: jump — skip n items forward
     pub fn jump(&mut self, size: usize) {
         for _ in 0..size {
-            let pos = self.cur_pos;
-            let (_, new_pos) = decode_varint(self.bytes(), pos);
+            let index = self.cur_pos;
+            let (ptr, len) = self.payload();
+            let (_, new_pos) = decode_varint_at(ptr, len, index);
             self.cur_pos = new_pos;
         }
         self.items_read += size;
@@ -278,7 +398,8 @@ impl<'a> Reader<'a> {
 
     #[inline]
     pub fn has_more(&self) -> bool {
-        self.cur_pos < self.bytes().len()
+        let (_, len) = self.payload();
+        self.cur_pos < len
     }
 }
 
@@ -361,6 +482,34 @@ unsafe impl Sync for NumberingRef {}
 
 fn numb_len_word() -> usize {
     std::mem::size_of::<usize>()
+}
+
+/// Length word, then bytes. `addr == 0` is an empty numbering.
+#[inline(always)]
+fn payload_parts(addr: usize) -> (*const u8, usize) {
+    if addr != 0 {
+        let len = unsafe { *(addr as *const usize) };
+        let ptr = unsafe { (addr as *const u8).add(numb_len_word()) };
+        return (ptr, len);
+    }
+    empty_payload()
+}
+
+#[cold]
+#[inline(never)]
+fn empty_payload() -> (*const u8, usize) {
+    (std::ptr::NonNull::<u8>::dangling().as_ptr(), 0)
+}
+
+#[inline(always)]
+fn slice_from_parts<'a>((ptr, len): (*const u8, usize)) -> &'a [u8] {
+    if len == 0 {
+        return &[];
+    }
+    // The caller names `'a` from the numbering or the `code` borrow that
+    // owns this payload. A zero length is the empty numbering, not a
+    // dangling pointer.
+    unsafe { std::slice::from_raw_parts(ptr, len) }
 }
 
 fn fresh_slot(addr: usize, host: bool) -> *mut NumSlot {
@@ -545,14 +694,10 @@ impl NumberingRef {
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         let addr = self.payload_addr();
-        if addr == 0 {
-            return &[];
-        }
         if diag_numb_on() {
             diag_numb_check(self.slot.as_ptr(), addr, "NumberingRef::as_slice");
         }
-        let len = unsafe { *(addr as *const usize) };
-        unsafe { std::slice::from_raw_parts((addr as *const u8).add(numb_len_word()), len) }
+        slice_from_parts(payload_parts(addr))
     }
 
     /// Hand the payload address to a holder walk. Host blocks are not `GcRef`s.
@@ -831,5 +976,20 @@ mod tests {
         reader.jump(1);
         assert!(!reader.has_more());
         assert_eq!(reader.items_read, 4);
+    }
+
+    #[test]
+    fn reader_stable_payload_matches_per_item_reload() {
+        // `Reader.code` pinned: `numb_next_item` indexes the same bytes
+        // `next_item` reloads from `NumSlot.addr`.
+        let numb = create_numbering(&[1, -2, 3, 64, -128, 255]);
+        let mut moving = Reader::from_numbering(&numb);
+        let mut stable = Reader::from_numbering(&numb);
+        stable.mark_payload_stable();
+        while moving.has_more() {
+            assert_eq!(stable.next_item_bound(), moving.next_item());
+        }
+        assert_eq!(stable.items_read, moving.items_read);
+        assert!(!stable.has_more());
     }
 }

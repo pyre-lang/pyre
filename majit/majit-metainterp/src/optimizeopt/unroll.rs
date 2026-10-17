@@ -1807,8 +1807,9 @@ impl UnrollOptimizer {
         self.target_tokens.push(target_token);
         // `publish_const_ptr_root` dies with `imported_loop_state`. That
         // list also names ConstPtrs in partial-trace ops, which die with
-        // the state. The token keeps its virtual state and short preamble,
-        // so register only the indexes those two still hold.
+        // the state. The token keeps its virtual state and short preamble;
+        // record only the indexes those two still hold so
+        // `walk_rd_consts_refs` can stamp them for the token's life.
         if let Some(token) = self.target_tokens.last_mut() {
             // Virtual-state walks do not take the table lock. Holder and
             // exported-state walks call `trace_index`, which holds it:
@@ -2652,7 +2653,10 @@ struct ExportedConstPtrIndexes {
 }
 
 /// Drops the extra area before freeing [`ExportedConstPtrIndexes`].
-/// Mutator-lifetime: a token-held `ExportedState` outlives `thread_die`.
+/// `ExportedState.final` is false: the state dies with the optimization
+/// (`export_state` / `import_state` / `MetaInterp.exported_state` retrace
+/// window). That window outlives a compile frame, so the extra area is
+/// permanent on the mutator (`MutatorExtraAreaGuard::permanent`).
 struct ExportedConstPtrRoot {
     area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
     indexes: *mut ExportedConstPtrIndexes,
@@ -3127,8 +3131,13 @@ impl ExportedState {
         self.publish_const_ptr_root(&const_ptr_addrs);
     }
 
-    /// Register `addrs` so a minor's extra-root `drag_out_root` writes
-    /// `ConstPtr.value` through `trace_index`.
+    /// Register `addrs` for the life of this `ExportedState` so a minor's
+    /// extra-root `drag_out_root` writes `ConstPtr.value` through
+    /// `trace_index`.
+    ///
+    /// Scoped: `ExportedState.final` is false and the object dies with the
+    /// optimization. Token-held `VirtualState` constants are walked from
+    /// `walk_rd_consts_refs`, not from this area.
     ///
     /// The shadow-stack copy is a different slot. `refresh_from_gc` copies
     /// it back later; cranelift snapshot re-interns the table before that.
@@ -3152,6 +3161,12 @@ impl ExportedState {
         // SAFETY: `indexes` stays allocated until `ExportedConstPtrRoot`'s
         // drop, which unregisters `area` first. Moving the owner copies the
         // pointer and does not move the allocation. The walk only reads it.
+        // `MetaInterp.exported_state` holds this across the retrace
+        // window (`pyjitpl.py retrace_needed`), which outlives a compile
+        // frame on the same mutator. A scoped area would assert in
+        // `unregister_mutator` / `gc_thread_die` if the thread dies
+        // before `begin_attempt` clears the state. Permanent: Drop after
+        // unregister is a no-op (`MutatorExtraAreaGuard::permanent`).
         let area = unsafe {
             majit_gc::shadow_stack::MutatorExtraAreaGuard::permanent(
                 walk_exported_const_ptr_indexes,

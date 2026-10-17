@@ -2856,9 +2856,31 @@ impl WarmEnterState {
         hash: u64,
         make_key: Option<&dyn Fn() -> GreenKey>,
     ) -> (u64, Option<Arc<JitCellToken>>) {
+        // `maybe_compile_and_run`: `cell = get_jitcell(*greenargs)`;
+        // `if cell.flags & (JC_TRACING | JC_TEMPORARY)`; `procedure_token =
+        // cell.get_procedure_token()`. The unchained bucket is that cell
+        // only when it is this driver's JitCell (`isinstance(cell, JitCell)`
+        // in `JitCell.get_jitcell`); every driver files into the one
+        // `jitcounter.celltable`.
+        if let Some(cell) = self.lookup_chain(hash)
+            && cell.next.borrow().is_none()
+            && cell.cell_bucket.get() == hash
+            && cell.jitdriver_sd == self.jitdriver_sd
+            && make_key.is_none_or(|mk| cell.comparekey_matches(&mk()))
+        {
+            let cell_key = cell.cell_key.get().unwrap_or(hash);
+            if cell.flags.get().contains(JcFlags::JC_TRACING)
+                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+            {
+                return (cell_key, None);
+            }
+            return (cell_key, cell.get_procedure_token());
+        }
         let (cell_key, cell) = self.resolved_cell(hash, make_key);
         let token = cell.and_then(|cell| {
-            if cell.flags.get().contains(JcFlags::JC_TEMPORARY) {
+            if cell.flags.get().contains(JcFlags::JC_TRACING)
+                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+            {
                 return None;
             }
             cell.get_procedure_token()
@@ -2917,7 +2939,16 @@ impl WarmEnterState {
             }
         };
         match (count, found) {
-            (1, Some((cell, cell_key))) => (cell_key, Some(cell)),
+            (1, Some((cell, cell_key))) => match make_key {
+                // `JitCell.get_jitcell`: `cell.comparekey(*greenargs)` even
+                // when the chain holds one occupant. A 64-bit `get_uhash`
+                // collision with a different green key must miss.
+                Some(make_key) if !cell.comparekey_matches(&make_key()) => {
+                    let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
+                    (cell_key, self.cell_by_key(cell_key))
+                }
+                _ => (cell_key, Some(cell)),
+            },
             (0, _) => (hash, cell_named_by_hash()),
             _ => match make_key {
                 Some(make_key) => {
@@ -5253,6 +5284,46 @@ mod tests {
         assert_eq!(
             hit_head.comparekey.borrow().as_ref(),
             Some(&key_head_after_chain)
+        );
+    }
+
+    /// `JitCell.get_jitcell`: a unique hash occupant is still accepted
+    /// only after `comparekey`. A different green key under the same
+    /// lookup hash must miss.
+    #[test]
+    fn unique_hash_candidate_still_compares_greens() {
+        let mut ws = WarmEnterState::new(100);
+        let key_hit = GreenKey::new(vec![1, 2]);
+        let key_miss = GreenKey::new(vec![3, 4]);
+        ws.ensure_cell_for_key(&key_hit);
+        let hash = key_hit.get_uhash();
+        assert!(
+            ws.lookup_chain(hash)
+                .expect("installed")
+                .next
+                .borrow()
+                .is_none(),
+            "test needs a unique occupant"
+        );
+
+        let (_cell_key, cell) = ws.resolved_cell(hash, Some(&|| key_miss.clone()));
+        assert!(
+            cell.as_ref()
+                .is_none_or(|c| !c.comparekey_matches(&key_miss)),
+            "unique hash occupant must not win without comparekey"
+        );
+
+        let (_cell_key, cell_hit) = ws.resolved_cell(hash, Some(&|| key_hit.clone()));
+        assert!(
+            cell_hit
+                .expect("matching greens must hit")
+                .comparekey_matches(&key_hit)
+        );
+
+        let (_cell_key, token) = ws.resolved_cell_procedure_token(hash, Some(&|| key_miss.clone()));
+        assert!(
+            token.is_none(),
+            "unchained shortcut must not accept a comparekey miss"
         );
     }
 

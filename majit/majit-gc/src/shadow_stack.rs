@@ -607,12 +607,12 @@ impl MutatorExtraAreaGuard {
     /// Mutator-lifetime extra area with RAII unregistration.
     ///
     /// [`Self::new`] is the frame-owned path and must drop before
-    /// [`unregister_mutator`]. `TargetToken.virtual_state` (and the short
-    /// preamble's exported state) stays reachable until the compiled-loop
-    /// token is discarded, which is after `thread_die` runs the mutator
-    /// destructor. Those walks are mutator roots: [`unregister_mutator`]
-    /// allows them to still be live, and `Drop` is a no-op once the mutator
-    /// entry is gone.
+    /// [`unregister_mutator`]. A long-lived driver walk (regex `Matcher`
+    /// `walk_match_roots`) can outlive a given compile frame on the same
+    /// mutator; [`unregister_mutator`] allows that area to still be live,
+    /// and `Drop` is a no-op once the mutator entry is gone.
+    /// `TargetToken.virtual_state` is not this path: it is walked from the
+    /// compiled-loop holder graph (`walk_rd_consts_refs`).
     ///
     /// # Safety
     /// Same as [`Self::new`], except `data` must remain valid until this
@@ -990,6 +990,16 @@ impl ShadowStack {
         unsafe { *self.base.get().add(index) }
     }
 
+    /// Overwrite a live slot. `walk_stack_root` skips a null, so a
+    /// non-LIFO drop stores 0 here rather than shrinking past a later
+    /// push.
+    #[inline(always)]
+    fn set(&self, index: usize, gcref: GcRef) {
+        assert!(index < self.len(), "shadow stack index out of range");
+        // SAFETY: `index` is below the live length.
+        unsafe { *self.base.get().add(index) = gcref };
+    }
+
     /// The live slots, for a root walk.
     ///
     /// # Safety
@@ -1212,6 +1222,34 @@ impl Drop for OwnerRootGuard {
     }
 }
 
+/// One root slot for a GC local's live range.
+///
+/// `shadowstack.py` `push_stack` / `pop_stack` are a LIFO pair
+/// (`incr_stack(1)` + store, `decr_stack(1)`). A Rust local that lives
+/// across several collecting calls keeps the slot for the whole range
+/// and is re-read with [`ShadowRoot::get`] after each one. Drop order
+/// is not always LIFO (`JitFrameDeadFrame` fields, `fail_arg_root`),
+/// so this reuses [`OwnerRootGuard`]: interior release marks the slot
+/// free and a tail release trims dead slots, leaving the walked depth
+/// where it started.
+pub struct ShadowRoot {
+    guard: OwnerRootGuard,
+}
+
+impl ShadowRoot {
+    #[inline]
+    pub fn new(root: GcRef) -> Self {
+        Self {
+            guard: OwnerRootGuard::new(root),
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self) -> GcRef {
+        self.guard.get()
+    }
+}
+
 /// An opaque handle to this thread's `SHADOW_STACK` cell.
 ///
 /// The pointer is stable for the life of the owning thread (the same
@@ -1251,6 +1289,13 @@ impl ShadowStackSlot {
     pub fn get(&self, index: usize) -> GcRef {
         // SAFETY: same cell lifetime as [`Self::push`].
         unsafe { &*self.0 }.get(index)
+    }
+
+    /// Store through this resolved handle.
+    #[inline]
+    pub fn set(&self, index: usize, gcref: GcRef) {
+        // SAFETY: same cell lifetime as [`Self::push`].
+        unsafe { &*self.0 }.set(index, gcref)
     }
 
     /// `depth` through this resolved handle.
@@ -1481,10 +1526,17 @@ pub fn increase_root_stack_depth(new_depth: usize) {
     });
 }
 
+/// Live [`OwnerRootGuard`] / [`ShadowRoot`] slots on this thread.
+#[cfg(test)]
+pub(crate) fn owner_root_live_count() -> usize {
+    OWNER_ROOTS.with(|roots| roots.borrow().iter().flatten().count())
+}
+
 /// Clear both shadow stacks.
 pub fn clear() {
     SHADOW_STACK.with(|ss| ss.truncate(0));
     OWNER_ROOTS.with(|roots| roots.borrow_mut().clear());
+    let _ = OWNER_ROOTS_FREE.try_with(|free| free.borrow_mut().clear());
     JF_ROOT_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.ensure_init();
@@ -2629,6 +2681,30 @@ mod tests {
 
         pop_to(depth);
         assert_eq!(super::depth(), 0);
+    }
+
+    #[test]
+    fn test_shadow_root_lifo_and_hole() {
+        let _lock = TEST_MUTEX.lock();
+        clear();
+        let outer = ShadowRoot::new(GcRef(0x1000));
+        let inner = ShadowRoot::new(GcRef(0x2000));
+        assert_eq!(outer.get(), GcRef(0x1000));
+        assert_eq!(inner.get(), GcRef(0x2000));
+        assert_eq!(super::owner_root_live_count(), 2);
+        drop(inner);
+        assert_eq!(super::owner_root_live_count(), 1);
+        assert_eq!(outer.get(), GcRef(0x1000));
+        let nested = ShadowRoot::new(GcRef(0x3000));
+        // Drop outer while nested is live: recycle the hole, do not
+        // disturb nested.
+        drop(outer);
+        assert_eq!(nested.get(), GcRef(0x3000));
+        assert_eq!(super::owner_root_live_count(), 1);
+        drop(nested);
+        assert_eq!(super::owner_root_live_count(), 0);
+        assert_eq!(super::depth(), 0);
+        clear();
     }
 
     #[test]

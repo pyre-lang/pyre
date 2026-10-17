@@ -34,6 +34,18 @@ fn register_to_box(opref: OpRef) -> OpBox {
     }
 }
 
+/// pyjitpl.py `copy_constants`: grow `registers` only when too small.
+///
+/// A too-small bank is replaced (`registers = [missing] * n`), not
+/// extended in place. Extending would keep the previous jitcode's
+/// constant slots as the new jitcode's register prefix.
+fn grow_reg_file<T>(regs: &mut Vec<Option<T>>, n: usize) {
+    if regs.len() < n {
+        regs.clear();
+        regs.resize_with(n, || None);
+    }
+}
+
 /// A single execution frame for jitcode bytecode.
 ///
 /// RPython pyjitpl.py: class MIFrame
@@ -319,13 +331,10 @@ impl MIFrame {
     /// `pyjitpl.py MIFrame.setup` on an object taken from
     /// `MetaInterp.free_frames_list`.
     ///
-    /// RPython reuses the `MIFrame` object and replaces its register lists.
-    /// Rust can preserve the lists' backing capacity while spelling the same
-    /// reset: every logical slot is cleared, the lists are resized for the new
-    /// JitCode, constants are recopied, and all per-call bookkeeping returns
-    /// to the values established by `setup`. This is allocator-equivalent to
-    /// RPython's nursery list replacement without changing frame identity or
-    /// retaining a live box across calls.
+    /// `copy_constants` grows a bank only when it is too small and, when
+    /// translated, leaves live slots alone. Tests still fill, matching
+    /// `elif not we_are_translated()`. Constants are recopied; per-call
+    /// bookkeeping returns to the values `setup` writes.
     pub fn setup_reused(
         &mut self,
         jitcode: Arc<JitCode>,
@@ -342,12 +351,18 @@ impl MIFrame {
         self.pc = pc;
         self.code_cursor = 0;
         self.last_opcode_position = pc;
-        self.int_regs.resize(regs_and_consts_i, None);
-        self.int_regs.fill(None);
-        self.ref_regs.resize(regs_and_consts_r, None);
-        self.ref_regs.fill(None);
-        self.float_regs.resize(regs_and_consts_f, None);
-        self.float_regs.fill(None);
+        // pyjitpl.py `copy_constants`: grow if too small; the translated
+        // path does not zero live slots (`elif not we_are_translated()`).
+        grow_reg_file(&mut self.int_regs, regs_and_consts_i);
+        grow_reg_file(&mut self.ref_regs, regs_and_consts_r);
+        grow_reg_file(&mut self.float_regs, regs_and_consts_f);
+        #[cfg(debug_assertions)]
+        {
+            // pyjitpl.py `copy_constants`: `elif not we_are_translated()`.
+            self.int_regs.fill(None);
+            self.ref_regs.fill(None);
+            self.float_regs.fill(None);
+        }
         self.inline_frame = false;
         self.portal_scalar_state = None;
         self.portal_entered = false;
