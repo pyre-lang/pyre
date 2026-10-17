@@ -8,6 +8,7 @@ use crate::regalloc::LifetimeManager;
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
 use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
 use indexmap::IndexMap;
+use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRef, Type};
 
 /// regalloc.py:26-28.
@@ -295,12 +296,9 @@ impl RegisterHints {
         };
         let gc_level = compute_gc_level(calldescr, guard_not_forced);
         let arglist = op.getarglist();
-        let args: Vec<OpRef> = arglist[first_arg_index..]
-            .iter()
-            .map(|a| a.to_opref())
-            .collect();
-        let argtypes = calldescr.arg_types();
-        self.hint(longevity, position, &args, argtypes, gc_level);
+        let args = &arglist[first_arg_index..];
+        let argtypes = calldescr.arg_classes();
+        self.hint(longevity, position, args, argtypes.as_bytes(), gc_level);
     }
 
     /// reghint.py `CallHints64.hint`.
@@ -308,8 +306,8 @@ impl RegisterHints {
         &self,
         longevity: &mut LifetimeManager,
         position: i32,
-        args: &[OpRef],
-        argtypes: &[Type],
+        args: &[Operand],
+        argtypes: &[u8],
         save_all_regs: u8,
     ) {
         let mut hinted_xmm: Vec<RegLoc> = Vec::new();
@@ -318,9 +316,9 @@ impl RegisterHints {
         let mut next_arg_gpr = 0usize;
         let mut next_arg_xmm = 0usize;
 
-        for (i, &arg) in args.iter().enumerate() {
-            let arg_type = argtypes.get(i).copied().unwrap_or(Type::Int);
-            if arg_type == Type::Float {
+        for (i, operand) in args.iter().enumerate() {
+            let arg = operand.to_opref();
+            if operand.type_() == Type::Float || argtypes.get(i) == Some(&b'S') {
                 if next_arg_xmm < ARGUMENTS_XMM.len() {
                     let tgt = ARGUMENTS_XMM[next_arg_xmm];
                     if !arg.is_constant() && !hinted_args.contains(&arg) {
@@ -387,4 +385,51 @@ fn compute_gc_level(calldescr: &dyn majit_ir::descr::CallDescr, guard_not_forced
 /// signed 32-bit immediates.
 fn fits_in_32bits(value: i64) -> bool {
     (i32::MIN as i64) <= value && value <= (i32::MAX as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::regalloc::compute_vars_longevity;
+    use majit_ir::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
+    use majit_ir::forwarding::bound_operand_from_opref as rb;
+    use majit_ir::{InputArg, OpRc};
+
+    /// `CallHints64.hint` sends an argument to XMM when `arg.type == 'f'`
+    /// or `argtypes[i] == 'S'`; the singlefloat argument does not take a
+    /// GPR slot, so the next integer argument still gets ARGUMENTS_GPR[0].
+    #[test]
+    fn call_hint_singlefloat_takes_xmm() {
+        let f = OpRef::input_arg_int(0);
+        let i = OpRef::input_arg_int(1);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let mut effect = EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None);
+        effect.can_collect = false;
+        let call = Op::new(OpCode::CallN, &[rb(OpRef::const_int(0x1000)), rb(f), rb(i)]);
+        call.pos().set(OpRef::void_op(0));
+        call.setdescr(majit_ir::descr::make_call_descr_full_with_classes(
+            0,
+            "Si".to_string(),
+            vec![Type::Int, Type::Int],
+            Type::Void,
+            'v',
+            false,
+            0,
+            effect,
+        ));
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(1));
+        let ops: Vec<OpRc> = vec![OpRc::new(call), OpRc::new(finish)];
+        let mut longevity = compute_vars_longevity(&inputargs, &ops);
+        RegisterHints::new(vec![], vec![], vec![], vec![], IndexMap::new()).add_hints(
+            &mut longevity,
+            &inputargs,
+            &ops,
+        );
+        let fixed = |v: OpRef| longevity.get(v).unwrap().find_fixed_register(0, &longevity);
+        assert_eq!(fixed(f), Some(ARGUMENTS_XMM[0]));
+        // The separate GPR/XMM counters are the SysV numbering.
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(fixed(i), Some(ARGUMENTS_GPR[0]));
+    }
 }
