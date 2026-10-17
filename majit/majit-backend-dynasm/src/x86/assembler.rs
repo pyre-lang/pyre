@@ -7596,13 +7596,7 @@ impl<'a> Assembler386<'a> {
         });
         // `x86/assembler.py redirect_call_assembler`:
         // `asm_adr = newlooptoken._ll_raw_start`.
-        let raw = new.ll_raw_start();
-        let asm_adr = if raw != 0 {
-            raw as u64
-        } else {
-            new.number() as u64
-        };
-        majit_backend::redirect_assembler(old, new, asm_adr);
+        majit_backend::redirect_assembler(old, new, new.ll_raw_start() as u64);
     }
 
     // genop_* — integer arithmetic
