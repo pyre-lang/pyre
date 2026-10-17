@@ -2358,29 +2358,25 @@ where
         // guard-origin bridge) takes the else-arm.
         let is_loop_trace = ctx.current_merge_points_first_greenkey().is_some()
             && ctx.resumekey_original_loop_token().is_none();
-        // pyjitpl.py:1637 `history.record1(rop.FINISH, exception_box, None,
-        // descr=token)`, recorded before the branch and seen by both arms.
-        // The loop arm keeps it here, where `record_finish` writes the op
-        // with its operand alone.  The bridge arm leaves it to
+        // pyjitpl.py `_create_segmented_trace_and_blackhole`:
+        // `token = sd.exit_frame_with_exception_descr_ref;
+        // history.record1(rop.FINISH, exception_box, None, descr=token)`,
+        // recorded before the branch and seen by both arms.  The loop arm
+        // keeps it here.  The bridge arm leaves it to
         // `compile_finish_from_active_session`, which is the port of
         // pyjitpl.py `compile_trace(metainterp, resumekey,
-        // [exception_box])` and records the same FINISH through
-        // `recorder.finish(finish_args, finish_descr)` — carrying
-        // `sd.exit_frame_with_exception_descr_ref`, the descr upstream's
-        // `target_token is not token` test compares against.  Recording it
-        // here as well would give that trace two terminators.
-        //
-        // The loop arm's FINISH therefore still carries no descr, which is
-        // the one place this stays short of pyjitpl.py.  The slot is
-        // there (`Op::setdescr`, and `Trace::record_op_with_descr` behind
-        // `recorder.finish`); what is missing is a `record_finish` that
-        // takes one.  Left alone here because the loop arm reaches the
-        // backend through `compile_simple_loop`, where a FINISH that starts
-        // reporting `is_exception_exit` changes exit dispatch for a segment
-        // that compiles today — a change to make with its own measurement,
-        // not alongside the bridge arm's first one.
+        // [exception_box])` and records the same FINISH with the same
+        // descr.  Recording it here as well would give that trace two
+        // terminators.
         if is_loop_trace {
-            ctx.record_finish(exception_box, majit_ir::Type::Int);
+            let token = ctx
+                .metainterp_sd()
+                .exit_frame_with_exception_descr_ref
+                .clone()
+                .unwrap_or_else(|| {
+                    crate::make_finish_fail_descr_typed(vec![majit_ir::Type::Int], true)
+                });
+            ctx.finish(&[exception_box], token);
         }
         // pyjitpl.py:1671-1673: "we now need to blackhole back to the
         // interpreter instead of jumping to some existing code, because we

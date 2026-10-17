@@ -3175,12 +3175,6 @@ impl TraceCtx {
         self.call_int_typed(func_ptr, args, &arg_types)
     }
 
-    /// Record a FINISH op with a single result value.
-    /// pyjitpl.py:1637 history.record1(rop.FINISH, ..., descr=token)
-    pub fn record_finish(&mut self, result: OpRef, _tp: Type) {
-        Self::do_record_op(&mut self.recorder, OpCode::Finish, &[result]);
-    }
-
     /// pyjitpl.py `blackhole_if_trace_too_long` check:
     /// `length > warmrunnerstate.trace_limit`.  `num_ops` is the non-inputarg
     /// op count (= `history.length()`); `trace_limit` is cached from warmstate

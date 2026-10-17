@@ -2614,16 +2614,21 @@ fn call_assembler_result_kind_name(kind: u64) -> &'static str {
     }
 }
 
-/// `None` when the target exposes no FINISH descr: a loop-greenkey target
-/// reached via do_recursive_call(assembler_call=True) at an inline-frame loop
-/// header (pyjitpl.py) exits via guard-deopt, not FINISH, so it has no
-/// fixed result kind to compare against a caller's expectation. The result is
-/// reconstructed on the deopt/helper path. Callers skip the (cranelift-only)
-/// expectation check in that case.
+/// `None` when the target exposes no `done_with_this_frame` FINISH.
+/// A loop-greenkey target reached via `do_recursive_call(assembler_call=True)`
+/// at an inline-frame loop header (pyjitpl.py) exits via guard-deopt, and a
+/// segmented loop (`_create_segmented_trace_and_blackhole`) ends on
+/// `ExitFrameWithExceptionDescrRef` after `GUARD_ALWAYS_FAILS`. Neither is
+/// the portal result kind `_call_assembler_check_descr` (x86/assembler.py)
+/// compares against (`jd.portal_finishtoken` / `make_and_attach_done_descrs`).
+/// Callers skip the (cranelift-only) expectation check in that case.
 fn actual_call_assembler_target_result_kind(
     fail_descrs: &[DescrRef],
 ) -> Result<Option<u64>, BackendError> {
-    let Some(finish_descr) = fail_descrs.iter().find(|descr| as_fd(descr).is_finish()) else {
+    let Some(finish_descr) = fail_descrs.iter().find(|descr| {
+        let fd = as_fd(descr);
+        fd.is_finish() && !fd.is_exit_frame_with_exception()
+    }) else {
         return Ok(None);
     };
     actual_call_assembler_result_kind(as_fd(finish_descr)).map(Some)
@@ -5864,7 +5869,10 @@ fn resolve_call_assembler_target(
     // returned jf_descr against the CPU-global done_with_this_frame descr, and
     // the helper path handles the deopt result. When the target DOES expose a
     // finish exit (function-entry traces), keep validating its result type.
-    if let Some(finish_descr) = target.fail_descrs.iter().find(|d| as_fd(d).is_finish()) {
+    if let Some(finish_descr) = target.fail_descrs.iter().find(|d| {
+        let fd = as_fd(d);
+        fd.is_finish() && !fd.is_exit_frame_with_exception()
+    }) {
         let finish_types = as_fd(finish_descr).fail_arg_types();
 
         // Validate that the finish result type matches the call descriptor.

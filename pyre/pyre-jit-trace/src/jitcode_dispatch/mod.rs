@@ -2852,14 +2852,24 @@ fn create_segmented_trace<Sym: WalkSym>(
         .current_merge_points_first_greenkey()
         .is_some()
         && ctx.trace_ctx.resumekey_original_loop_token().is_none();
-    // pyjitpl.py:1637 `history.record1(rop.FINISH, exception_box, None,
-    // descr=token)`. The loop arm keeps it here; the bridge arm leaves it to
-    // `compile_finish_from_active_session`, the port of pyjitpl.py:1666
+    // pyjitpl.py `_create_segmented_trace_and_blackhole`:
+    // `token = sd.exit_frame_with_exception_descr_ref;
+    // history.record1(rop.FINISH, exception_box, None, descr=token)`. The loop
+    // arm keeps it here; the bridge arm leaves it to
+    // `compile_finish_from_active_session`, the port of pyjitpl.py
     // `compile_trace(metainterp, resumekey, [exception_box])`, which records the
-    // same FINISH carrying `exit_frame_with_exception_descr_ref`. Recording it
-    // here as well would give that trace two terminators.
+    // same FINISH with the same descr. Recording it here as well would give
+    // that trace two terminators.
     if is_loop {
-        ctx.trace_ctx.record_finish(exception_box, Type::Int);
+        let token = ctx
+            .trace_ctx
+            .metainterp_sd()
+            .exit_frame_with_exception_descr_ref
+            .clone()
+            .unwrap_or_else(|| {
+                majit_metainterp::make_finish_fail_descr_typed(vec![Type::Int], true)
+            });
+        ctx.trace_ctx.finish(&[exception_box], token);
     }
     // pyjitpl.py:1671-1673: "we now need to blackhole back to the interpreter
     // instead of jumping to some existing code, because we are at a really
