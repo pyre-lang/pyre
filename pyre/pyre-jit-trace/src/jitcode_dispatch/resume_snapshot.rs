@@ -1373,7 +1373,6 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
 /// after temporarily nulling the result slot's register.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InlineCallerFrameDecline {
-    TryBlockCatchMarker,
     Unavailable,
 }
 
@@ -1385,45 +1384,6 @@ fn unavail(site: &'static str) -> InlineCallerFrameDecline {
         crate::jitcode_dispatch::census_record(site);
     }
     InlineCallerFrameDecline::Unavailable
-}
-
-/// Decline a closure inline only when the CALL's handler returns out of the
-/// frame. A handler that rejoins the loop, or that only clears an
-/// `except ... as` cell and reraises, still inlines: the cell read is the
-/// residual `w_cell_get` once `CellFamily.ever_mutated` is set
-/// (`nestedscope.py Cell.set` / `Cell.get`).
-///
-/// The returning case stays declined for the traceback: delivering the
-/// inlined callee's raise to such a handler drops the catching frame's
-/// traceback node, so `exception_traceback_frame_lineno` reports the raising
-/// frame twice. A handler whose exit the bounded scan cannot prove
-/// (`Unproven`: a `switch`, an exhausted budget, an undecodable path) may be
-/// that returning handler, so it takes the same decline.
-pub(crate) fn decline_inline_caller_frame_for_catch_marker(
-    after_residual_call_resume: Option<usize>,
-    caller_jitcode: &[u8],
-    callee_has_freevars: bool,
-) -> Result<(), InlineCallerFrameDecline> {
-    if !callee_has_freevars {
-        return Ok(());
-    }
-    let Some(resume_pos) = after_residual_call_resume else {
-        return Ok(());
-    };
-    let Some(catch_target) =
-        crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos)
-    else {
-        return Ok(());
-    };
-    match crate::jitcode_dispatch::exc_handler_shape(caller_jitcode, catch_target) {
-        crate::jitcode_dispatch::ExcHandlerShape::Returns
-        | crate::jitcode_dispatch::ExcHandlerShape::ExceptAsReturn
-        | crate::jitcode_dispatch::ExcHandlerShape::Unproven => {
-            Err(InlineCallerFrameDecline::TryBlockCatchMarker)
-        }
-        crate::jitcode_dispatch::ExcHandlerShape::Rejoins
-        | crate::jitcode_dispatch::ExcHandlerShape::Reraise => Ok(()),
-    }
 }
 
 pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
@@ -2509,7 +2469,6 @@ fn restore_in_a_call_result(banks: [&RegisterBank; 3], saved: Option<(usize, usi
 pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
-    callee_has_freevars: bool,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     // #68 nested multiframe: when an inlined callee is already active
     // (the framestack has a top level), the immediate caller of THIS
@@ -2522,12 +2481,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     // caller, falling through to the `fbw_mode.snapshot_sym` path below.
     let caller_code = ctx.session.borrow().last_inline().map(|frame| frame.w_code);
     if let Some(caller_code) = caller_code {
-        return compute_nested_inline_caller_frame(
-            ctx,
-            call_jit_pc,
-            caller_code,
-            callee_has_freevars,
-        );
+        return compute_nested_inline_caller_frame(ctx, call_jit_pc, caller_code);
     }
     let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
     if caller_sym_ptr.is_null() {
@@ -2547,12 +2501,6 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         let call_is_void =
             crate::jitcode_runtime::decode_op_at(jc.payload.jitcode.code.as_slice(), call_jit_pc)
                 .is_some_and(|op| op.result_argcode() == 'v');
-        decline_inline_caller_frame_for_catch_marker(
-            jc.payload
-                .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
-            jc.payload.jitcode.code.as_slice(),
-            callee_has_freevars,
-        )?;
         // #73 phase-3 (twin-first): the forward `after_residual_fallthrough`
         // twin carries the containing-then-fallthrough coordinate; the
         // containing lookup survives for the empty-twin class and as the audit
@@ -2716,7 +2664,6 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
     caller_code: usize,
-    callee_has_freevars: bool,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
         .ok_or_else(|| unavail("Unavail::Nested/NoJitcodeIndex"))? as u32;
@@ -2729,11 +2676,6 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     let call_is_void =
         crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
             .is_some_and(|op| op.result_argcode() == 'v');
-    decline_inline_caller_frame_for_catch_marker(
-        pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc),
-        pjc.jitcode.code.as_slice(),
-        callee_has_freevars,
-    )?;
     let legacy_fallthrough_py_pc = || unsafe {
         let call_py =
             crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
@@ -2743,8 +2685,13 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // The call result is the top operand-stack slot only when it remains live
     // at the return point; a call whose value is immediately discarded can
     // resume with depth zero.
-    let depth = match resume_marker_jit_pc {
-        Some(marker) => pjc.depth_trivia_for_jitcode_pc(marker).unwrap_or(0) as usize,
+    //
+    // `None` is "this source has no entry for the coordinate", which is not
+    // the same statement as a source answering zero — see the decline below.
+    let depth_read: Option<usize> = match resume_marker_jit_pc {
+        Some(marker) => pjc
+            .depth_trivia_for_jitcode_pc(marker)
+            .map(|depth| depth as usize),
         None => {
             let raw = || {
                 let fallthrough_py_pc = legacy_fallthrough_py_pc();
@@ -2752,18 +2699,17 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                     crate::liveness::liveness_for(pjc.code_ptr)
                         .depth_at_py_pc()
                         .get(fallthrough_py_pc as usize)
-                        .copied()
-                        .unwrap_or(0) as usize
+                        .map(|&depth| depth as usize)
                 }
             };
             if pjc.depth_after_residual_populated() {
                 let depth = pjc
                     .depth_after_residual_for_jitcode_pc(call_jit_pc)
-                    .unwrap_or(0) as usize;
+                    .map(|depth| depth as usize);
                 if pcmap_afterresidual_audit_enabled() {
                     assert_eq!(
-                        depth,
-                        raw(),
+                        depth.unwrap_or(0),
+                        raw().unwrap_or(0),
                         "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: nested inline-caller after-residual depth twin diverged at jit_pc {call_jit_pc}"
                     );
                 }
@@ -2773,9 +2719,10 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
             }
         }
     };
-    // Zero depth is only known to be an empty operand stack for a result-less
-    // CALL — see the top-level sibling.
-    if depth == 0 && !call_is_void {
+    let depth = depth_read.unwrap_or(0);
+    // Only the defaulted zero is untrusted; a source answering zero states an
+    // empty operand stack — see the top-level sibling.
+    if depth == 0 && !call_is_void && depth_read.is_none() {
         return Err(unavail("Unavail::Nested/DepthZero"));
     }
     let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);
@@ -2821,23 +2768,33 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // here (before the nested callee's body walk) — not at capture — places the
     // stores ahead of every in-callee guard, so `_number_virtuals` reads the
     // populated array when it numbers those guards' resume data.
+    // A void call leaves no pending result, so every operand slot is a
+    // sibling (`get_list_of_active_boxes` clears only the `_result_argcode`
+    // bank's register).
+    let result_slots = usize::from(!call_is_void);
     if resume_marker_jit_pc.is_some() {
-        if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > 1 {
+        if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > result_slots {
             let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index as i32);
-            let frame_red = (frame_reg != u16::MAX)
+            let Some(frame_red) = (frame_reg != u16::MAX)
                 .then(|| ctx.registers_r.get(frame_reg as usize))
                 .flatten()
-                .filter(|&r| r != OpRef::NONE);
-            let locals_idx = crate::descr::pyframe_locals_cells_stack_descr().index();
-            if let Some(locals_array) =
-                frame_red.and_then(|fr| ctx.trace_ctx.heapcache_getfield_cached(fr, locals_idx))
+                .filter(|&r| r != OpRef::NONE)
+            else {
+                return Err(unavail("Unavail::Nested/NoFrameRed"));
+            };
+            // `gen_store_back_in_vable` reads the array with
+            // `GETFIELD_GC_R`; the heapcache answers it when it can.
             {
-                // nlocals from the paused caller's own code (varnames count), the
-                // same base the decoder uses (`code_ref.varnames.len()`).
-                let nlocals = unsafe { &*pjc.code_ptr }.varnames.len();
-                // `depth` is the operand-stack depth at the CALL return point,
-                // top slot = the pending nested-call result.
-                let pending_top_slot = nlocals + depth - 1;
+                let locals_array =
+                    crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame_red);
+                // The operand stack starts behind the cell and free variable
+                // slots (`PyFrame._stack_start`), the same base
+                // `reconstruct_inline_recipe` decodes the array with.
+                let code = unsafe { &*pjc.code_ptr };
+                let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+                // `depth` is the operand-stack depth at the CALL return point;
+                // a call with a result leaves it pending in the top slot.
+                let pending_top_slot = (!call_is_void).then(|| nlocals + depth - 1);
                 // No Python coordinate here. This slot used to carry
                 // `resume_marker_jit_pc`, which `inline_call_return_marker`
                 // mints as `decode_op_at(..).next_pc` — a JitCode byte offset,
@@ -2862,46 +2819,47 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                     caller_liveness_word,
                 );
                 for &color in &banks.ref_ {
-                    let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
-                        nlocals,
-                        depth,
-                        &maps.pcdep_entries,
-                        color as usize,
-                    ) else {
-                        continue;
-                    };
-                    // Locals are already seeded; the pending result slot is
-                    // delivered on resume — only sibling operands need the flush.
-                    if slot < nlocals || slot == pending_top_slot {
-                        continue;
-                    }
                     let Some(operand) = ctx.registers_r.get(color as usize) else {
                         continue;
                     };
                     if operand == OpRef::NONE {
                         continue;
                     }
-                    let idx = ctx.trace_ctx.const_int(slot as i64);
-                    // pyjitpl.py `gen_store_back_in_vable`
-                    // escape flush uses the standard recorded store path.
-                    ctx.trace_ctx
-                        .profiler()
-                        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
-                    ctx.trace_ctx.profiler().count_ops(
-                        OpCode::SetarrayitemGc,
-                        majit_metainterp::counters::RECORDED_OPS,
-                    );
-                    ctx.trace_ctx.record_op_with_descr(
-                        OpCode::SetarrayitemGc,
-                        &[locals_array, idx, operand],
-                        array_descr.clone(),
-                    );
-                    ctx.trace_ctx.heapcache_setarrayitem(
-                        locals_array,
-                        idx,
-                        item_descr_index,
-                        operand,
-                    );
+                    // `gen_store_back_in_vable` stores every array position;
+                    // a COPY shape maps one register to several of them.
+                    for slot in crate::state::semantic_ref_slots_for_reg_color(
+                        nlocals,
+                        depth,
+                        &maps.pcdep_entries,
+                        color as usize,
+                    ) {
+                        // Locals are already seeded; the pending result slot is
+                        // delivered on resume — only sibling operands need the flush.
+                        if slot < nlocals || Some(slot) == pending_top_slot {
+                            continue;
+                        }
+                        let idx = ctx.trace_ctx.const_int(slot as i64);
+                        // pyjitpl.py `gen_store_back_in_vable`
+                        // escape flush uses the standard recorded store path.
+                        ctx.trace_ctx
+                            .profiler()
+                            .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+                        ctx.trace_ctx.profiler().count_ops(
+                            OpCode::SetarrayitemGc,
+                            majit_metainterp::counters::RECORDED_OPS,
+                        );
+                        ctx.trace_ctx.record_op_with_descr(
+                            OpCode::SetarrayitemGc,
+                            &[locals_array, idx, operand],
+                            array_descr.clone(),
+                        );
+                        ctx.trace_ctx.heapcache_setarrayitem(
+                            locals_array,
+                            idx,
+                            item_descr_index,
+                            operand,
+                        );
+                    }
                 }
             }
         }

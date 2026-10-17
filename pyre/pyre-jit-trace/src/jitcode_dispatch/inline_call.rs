@@ -8538,11 +8538,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // through `convert_and_run_from_pyjitpl` (`blackhole.py`).
     let seeded_inline = try_multiframe || strict_seed;
     // Preflight the caller frame BEFORE the seed below records a virtual
-    // PyFrame.  A CALL covered by a try/catch marker must remain residual so
-    // its post-call catch resume routes an exception; returning after frame
-    // emission would strand dead seed IR and force an abort/replay after the
-    // callee already consumed external state.  RPython decides whether to
-    // inline the graph before `perform_call` pushes its MIFrame.
+    // PyFrame.  Returning after frame emission would strand dead seed IR and
+    // force an abort/replay after the callee already consumed external state.
+    // RPython decides whether to inline the graph before `perform_call`
+    // pushes its MIFrame.
     if !seeded_inline {
         // The remaining strict cases are deeper than the resume chain
         // currently supports. Keep the CALL residual instead of entering an
@@ -8588,14 +8587,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         } else {
             op.pc
         };
-    let precomputed_parent_frame =
-        match compute_inline_caller_frame(ctx, caller_frame_pc, !callee_code.freevars.is_empty()) {
-            Ok(parent) => parent,
-            Err(InlineCallerFrameDecline::TryBlockCatchMarker)
-            | Err(InlineCallerFrameDecline::Unavailable) => {
-                return resolved_inline_decline(op.pc, line!());
-            }
-        };
+    let precomputed_parent_frame = match compute_inline_caller_frame(ctx, caller_frame_pc) {
+        Ok(parent) => parent,
+        Err(InlineCallerFrameDecline::Unavailable) => {
+            return resolved_inline_decline(op.pc, line!());
+        }
+    };
     // Every reason `latch_operator_tail_return` can refuse (mirror, paused
     // parents, this caller, the tail parent, blackhole preflight) is known
     // here. Decline to the residual CALL before the dunder body runs.

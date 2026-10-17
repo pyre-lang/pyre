@@ -1944,28 +1944,6 @@ fn done_descr_ref_for_tests() -> DescrRef {
     make_fail_descr(1)
 }
 
-#[test]
-fn inline_caller_frame_declines_only_a_returning_handler() {
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let catch_exception = insns["catch_exception/L"];
-    let void_return = insns["void_return/"];
-    let reraise = insns["reraise/"];
-    let handler_returns = [catch_exception, 3, 0, void_return];
-    assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_returns, true),
-        Err(InlineCallerFrameDecline::TryBlockCatchMarker),
-    );
-    let handler_reraises = [catch_exception, 3, 0, reraise];
-    assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_reraises, true),
-        Ok(()),
-    );
-    assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_returns, false),
-        Ok(()),
-    );
-}
-
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
 /// for all three residual-call shapes (iRd / iIRd / iIRFd); they all
 /// funnel through this helper, so one direct test covers the guard
@@ -16672,6 +16650,7 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
         pending_inline_frame: None,
         residual_call_pc: None,
         loop_close_marker_jit_pc: None,
+        loop_close_registers_r: Vec::new(),
         close_merge_point_vsd: None,
         orgpc: 0,
         concrete_frame_addr: 0,
@@ -16756,6 +16735,7 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
         pending_inline_frame: None,
         residual_call_pc: None,
         loop_close_marker_jit_pc: None,
+        loop_close_registers_r: Vec::new(),
         close_merge_point_vsd: None,
         orgpc: 0,
         concrete_frame_addr: 0,
@@ -16844,6 +16824,7 @@ fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_rais
         pending_inline_frame: None,
         residual_call_pc: None,
         loop_close_marker_jit_pc: None,
+        loop_close_registers_r: Vec::new(),
         close_merge_point_vsd: None,
         orgpc: 0,
         concrete_frame_addr: 0,

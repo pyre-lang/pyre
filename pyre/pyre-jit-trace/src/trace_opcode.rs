@@ -881,6 +881,7 @@ impl MIFrame {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
         }
     }
@@ -921,7 +922,9 @@ impl MIFrame {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
-        self.with_ctx(|this, ctx| this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc))
+        self.with_ctx(|this, ctx| {
+            this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc, &[])
+        })
     }
 
     #[doc(hidden)]
@@ -1610,25 +1613,33 @@ impl MIFrame {
                         reg_idx as usize,
                     )
                     .is_some();
+                    // `registers_r_bank` is indexed by frame slot, so a live
+                    // color no slot backs is a jitcode temporary the bank
+                    // does not hold: `registers_r_bank[color]` is whatever
+                    // local sits in slot `color`. `get_list_of_active_boxes`
+                    // records `registers_r[index]`, the register itself. At
+                    // the merge point that is the walked frame's register,
+                    // e.g. the `pycode` green `getfield_vable_r` loads before
+                    // `jit_merge_point`, which is a `virtualizable_boxes`
+                    // entry and so one of `reached_loop_header`'s
+                    // `live_arg_boxes`.
+                    let walked = if mapped {
+                        None
+                    } else {
+                        self.loop_close_registers_r
+                            .get(reg_idx as usize)
+                            .copied()
+                            .filter(|r| !r.is_none())
+                    };
                     let shadow_holds = raw.is_input_arg()
                         && (0..ctx.virtualizable_boxes_len().unwrap_or(0))
                             .any(|i| ctx.virtualizable_box_at(i) == Some(raw));
                     // An unmapped bridge inputarg the shadow no longer
                     // holds is not a merge-point loop inputarg. One the
                     // shadow still names is.
-                    //
-                    // A drained jitcode's `-live-` marker is the union of
-                    // a PC range (`liveness.py`). An unmapped color at this
-                    // PC is dead here. The semantic `registers_r` mirror is
-                    // slot-indexed, so `registers_r[color]` is a leftover
-                    // local — a pre-cut `NEW_WITH_VTABLE` that
-                    // `virtualizable_boxes` already replaced. Naming it
-                    // past `reached_loop_header` fails `TraceIterator._get`
-                    // (`opencoder.py`). Empty pcdep (skeleton fixtures)
-                    // has no color map, so keep the raw box.
-                    if !mapped && raw.is_input_arg() && !shadow_holds {
-                        ctx.const_ref(0)
-                    } else if !mapped && !pcdep_entries.is_empty() && !raw.is_input_arg() {
+                    if let Some(walked) = walked {
+                        walked
+                    } else if !mapped && raw.is_input_arg() && !shadow_holds {
                         ctx.const_ref(0)
                     } else {
                         raw
@@ -2062,6 +2073,7 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        merge_point_registers_r: &[OpRef],
     ) -> Vec<OpRef> {
         // The `--TICK--` poll now lives in JUMP_BACKWARD's jitcode
         // (`emit_jump_absolute_tick`: `raw_load_i` / `uint_ge` / `goto_if_not`
@@ -2076,6 +2088,7 @@ impl MIFrame {
         // preamble's guarded-zero value into the loop body and
         // `optimize_guard_false` deletes the body's poll.
         self.loop_close_marker_jit_pc = header_marker_jit_pc;
+        self.loop_close_registers_r = merge_point_registers_r.to_vec();
         // pyjitpl.py reached_loop_header: virtualizable_boxes
         // (read from locals_cells_stack_w[*] by virtualizable.py read_boxes
         // read_boxes) are carried into the JUMP unchanged, including
@@ -2711,6 +2724,7 @@ impl MIFrame {
             }
         }
         self.loop_close_marker_jit_pc = None;
+        self.loop_close_registers_r = Vec::new();
         self.close_merge_point_vsd = None;
         args
     }
@@ -3536,6 +3550,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -3745,6 +3760,7 @@ mod tests {
             // marker so `get_list_of_active_boxes` reads liveness at offset 0
             // instead of declining on an unset marker.
             loop_close_marker_jit_pc: Some(0),
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -3761,7 +3777,7 @@ mod tests {
     }
 
     #[test]
-    fn get_list_of_active_boxes_nulls_unmapped_leftover_when_pcdep_is_present() {
+    fn get_list_of_active_boxes_reads_an_unmapped_merge_point_color_from_the_walked_register() {
         use indexmap::IndexMap;
         use majit_jitcode::liveness::encode_liveness;
         use std::sync::Arc;
@@ -3777,7 +3793,7 @@ mod tests {
 
         let runtime_jc = {
             let inner = majit_metainterp::jitcode::JitCode::new(
-                "get_list_of_active_boxes_unmapped_leftover_test",
+                "get_list_of_active_boxes_unmapped_merge_point_color_test",
             );
             inner.set_body(majit_jitcode::jitcode::JitCodeBody {
                 code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
@@ -3794,8 +3810,9 @@ mod tests {
         pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0)];
         pyjit.metadata.is_drained = true;
         pyjit.metadata.has_color_map = true;
-        // Color 1 owns local slot 1; color 2 is union-liveness-only and
-        // has no slot at this PC (`semantic_ref_slot_for_reg_color`).
+        // Color 1 owns local slot 1. Color 2 is live with no slot at this PC:
+        // a temporary such as the `pycode` green read before
+        // `jit_merge_point`.
         pyjit.metadata.pcdep_by_jit_pc.push((0, vec![(1, 1, 1)]));
         pyjit.metadata.depth_pred_by_jit_pc.push((0, 0));
         let inner_jc = crate::state::JitCode {
@@ -3805,19 +3822,18 @@ mod tests {
         let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
 
         let mapped = OpRef::ref_op(20);
-        let leftover = OpRef::ref_op(99);
+        let stale_slot = OpRef::ref_op(99);
+        let walked_green = OpRef::ref_op(50);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.jitcode = inner_jc_ptr;
         sym.nlocals = 2;
         sym.valuestackdepth = 2;
         sym.execution_context = OpRef::input_arg_ref(0);
-        // Slot-indexed semantic mirror: index 2 coincides with live
-        // color 2, the leftover a pre-cut `NEW_WITH_VTABLE` would occupy
-        // after `put_back_list_of_boxes3` wrote only the mapped reds.
-        sym.registers_r.replace(vec![OpRef::NONE, mapped, leftover]);
+        // The slot-indexed mirror holds an unrelated box at index 2.
+        sym.registers_r
+            .replace(vec![OpRef::NONE, mapped, stale_slot]);
 
         let mut ctx = crate::trace_ctx_for_test(1);
-        let null_ref = ctx.const_ref(0);
         let mut frame = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
@@ -3827,6 +3843,9 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: Some(0),
+            // The walked registers: color 2 is the green the merge point
+            // reads; a mapped color keeps its frame slot's box.
+            loop_close_registers_r: vec![OpRef::NONE, OpRef::ref_op(21), walked_green],
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -3835,7 +3854,7 @@ mod tests {
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false, None);
-        assert_eq!(active, vec![mapped, null_ref]);
+        assert_eq!(active, vec![mapped, walked_green]);
 
         unsafe {
             let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
@@ -3920,6 +3939,7 @@ mod tests {
             // [(0, 0)]`); seed the jitcode resume marker so the snapshot reads
             // liveness at offset 0 rather than declining on an unset marker.
             loop_close_marker_jit_pc: Some(0),
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,

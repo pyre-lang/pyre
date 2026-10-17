@@ -3154,6 +3154,7 @@ pub trait WalkSym {
         orgpc: usize,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        merge_point_registers_r: &[OpRef],
     ) -> Vec<OpRef>;
 }
 
@@ -3364,9 +3365,15 @@ impl WalkSym for PyreSym {
         orgpc: usize,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        merge_point_registers_r: &[OpRef],
     ) -> Vec<OpRef> {
         let mut frame = MIFrame::from_sym(ctx, self, concrete_frame, orgpc, orgpc);
-        frame.close_loop_args_at(ctx, target_pc, header_marker_jit_pc)
+        frame.close_loop_args_at(
+            ctx,
+            target_pc,
+            header_marker_jit_pc,
+            merge_point_registers_r,
+        )
     }
 }
 
@@ -3437,6 +3444,11 @@ pub struct MIFrame {
     /// eval-breaker poll and `GuardFutureCondition` emits; it is `None`
     /// outside that window.
     pub(crate) loop_close_marker_jit_pc: Option<usize>,
+    /// The walked frame's Ref registers at the merge point
+    /// (`MIFrame.registers_r`), set and cleared with
+    /// `loop_close_marker_jit_pc`. Empty outside that window and on paths
+    /// that do not walk the merge point.
+    pub(crate) loop_close_registers_r: Vec<OpRef>,
     /// Operand-stack depth of the merge point the closing JUMP targets,
     /// when it exceeds the depth the concrete `PyFrame` still advertises.
     /// `close_loop_args_at` sets and clears it around the JUMP-arg
@@ -8559,18 +8571,15 @@ fn reconstruct_inline_recipe(
         decline!("NullRawCode");
     }
     let code_ref = unsafe { &*raw_code };
-    // Forward inlining already accepts freevars by threading the existing
-    // closure cell objects into the callee's own frame, and a cellvar that
-    // also names a parameter lives in that varname's slot
-    // (`pyframe::npure_cellvars` excludes it). `MAKE_CELL` wraps the slot in
-    // the callee prologue, so by any body pc the forward inline reaches the
-    // cell object is already the local `try_walker_inline_resolved_user_call`
-    // stored, and both reconstructions below copy that slot. A pure cellvar
-    // lives in its own band, which this resume does not allocate, and stays
-    // on the conservative path.
-    if pyre_interpreter::pyframe::npure_cellvars(code_ref) > 0 {
-        decline!("FreshCellvars");
-    }
+    // Cell and free variable slots are ordinary `locals_cells_stack_w`
+    // entries (`PyFrame._stack_start` puts the operand stack behind them), so
+    // they are rebuilt with the frame like every other slot, as
+    // `consume_boxes` rebuilds every MIFrame register.  The forward inline
+    // (`try_walker_inline_resolved_user_call`) threads the closure's cells
+    // into that band and stores a fresh `w_cell_new` for each pure cellvar,
+    // as `PyFrame::finish_for_call_with_globals_obj` does; a cellvar that
+    // also names a parameter keeps that varname's slot, which `MAKE_CELL`
+    // wraps in the callee prologue.
     // pyframe.py get_w_globals get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
     // resolves them the same way via `recover_inline_callee_globals`). If the
@@ -14704,6 +14713,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -14745,6 +14755,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -14801,6 +14812,7 @@ mod tests {
                 pending_inline_frame: None,
                 residual_call_pc: None,
                 loop_close_marker_jit_pc: None,
+                loop_close_registers_r: Vec::new(),
                 close_merge_point_vsd: None,
                 orgpc: 0,
                 concrete_frame_addr: 0,
@@ -16088,6 +16100,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -16095,7 +16108,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[]));
 
         assert_eq!(jump_args.len(), 9);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
@@ -16199,6 +16212,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: frame_ptr,
@@ -16206,7 +16220,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[]));
 
         assert_eq!(
             jump_args.len(),
@@ -17178,17 +17192,22 @@ pub(crate) fn setup_reconstructed_callee_frame(
             };
             let _ = pyre_object::gc_roots::pin_root(value);
         }
-        let closure = if stack_base == nlocals {
+        // `initialize_frame_scopes` reads the closure as the freevar cells
+        // alone and allocates each pure cellvar itself; the rebuilt cells of
+        // both bands are stored over the array by
+        // `store_reconstructed_callee_array_image` below.
+        let freevar_base = nlocals + pyre_interpreter::pyframe::npure_cellvars(code_ref);
+        let closure = if stack_base == freevar_base {
             pyre_object::PY_NULL
         } else {
-            let cells = (nlocals..stack_base)
+            let cells = (freevar_base..stack_base)
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
                 .collect();
             let closure = pyre_object::w_tuple_new(cells);
             let closure = pyre_object::gc_roots::pin_root(closure);
             closure
         };
-        let closure_root = (stack_base != nlocals).then_some(slot_root + stack_base);
+        let closure_root = (stack_base != freevar_base).then_some(slot_root + stack_base);
         let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
             .collect();

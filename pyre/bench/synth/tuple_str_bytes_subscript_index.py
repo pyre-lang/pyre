@@ -39,7 +39,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(1350000))
+    print("warm", warm(5400000))
     t = (10, 20, 30)
     m("t_idx", lambda: t[Idx(1)])
     m("t_neg", lambda: t[Idx(-1)])

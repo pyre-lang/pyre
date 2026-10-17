@@ -1301,19 +1301,56 @@ const LIVE_ADD_COUNT: u32 = 16;
 const EXTRA_ADD_NS: [u32; 3] = [14, 15, 16];
 const COND_CALL_EXTRA_HELPER_RESULT: i64 = 0x5A5A_5A5A_5A5A_5A5A_u64 as i64;
 
+// One set of cells per helper, so the two tests running in parallel never
+// read or reset each other's.
 static COND_CALL_EXTRA0: AtomicI64 = AtomicI64::new(0);
 static COND_CALL_EXTRA1: AtomicI64 = AtomicI64::new(0);
 static COND_CALL_EXTRA2: AtomicI64 = AtomicI64::new(0);
 static COND_CALL_EXTRA_HITS: AtomicUsize = AtomicUsize::new(0);
+static COND_CALL_VALUE_EXTRA0: AtomicI64 = AtomicI64::new(0);
+static COND_CALL_VALUE_EXTRA1: AtomicI64 = AtomicI64::new(0);
+static COND_CALL_VALUE_EXTRA2: AtomicI64 = AtomicI64::new(0);
 static COND_CALL_VALUE_EXTRA_HITS: AtomicUsize = AtomicUsize::new(0);
 static EAX_LIVE_HITS: AtomicUsize = AtomicUsize::new(0);
 
-fn reset_cond_call_extras() {
-    COND_CALL_EXTRA0.store(0, Ordering::SeqCst);
-    COND_CALL_EXTRA1.store(0, Ordering::SeqCst);
-    COND_CALL_EXTRA2.store(0, Ordering::SeqCst);
-    COND_CALL_EXTRA_HITS.store(0, Ordering::SeqCst);
-    COND_CALL_VALUE_EXTRA_HITS.store(0, Ordering::SeqCst);
+/// The cells one clobber helper writes: its three recorded extras and its
+/// hit count.
+struct ExtraCells {
+    extras: [&'static AtomicI64; 3],
+    hits: &'static AtomicUsize,
+}
+
+const COND_CALL_EXTRAS: ExtraCells = ExtraCells {
+    extras: [&COND_CALL_EXTRA0, &COND_CALL_EXTRA1, &COND_CALL_EXTRA2],
+    hits: &COND_CALL_EXTRA_HITS,
+};
+
+const COND_CALL_VALUE_EXTRAS: ExtraCells = ExtraCells {
+    extras: [
+        &COND_CALL_VALUE_EXTRA0,
+        &COND_CALL_VALUE_EXTRA1,
+        &COND_CALL_VALUE_EXTRA2,
+    ],
+    hits: &COND_CALL_VALUE_EXTRA_HITS,
+};
+
+impl ExtraCells {
+    fn reset(&self) {
+        for cell in self.extras {
+            cell.store(0, Ordering::SeqCst);
+        }
+        self.hits.store(0, Ordering::SeqCst);
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    fn assert_recorded(&self, expected: [i64; 3]) {
+        for (cell, expected) in self.extras.iter().zip(expected) {
+            assert_eq!(cell.load(Ordering::SeqCst), expected);
+        }
+    }
 }
 
 fn live_add_ops(base: OpRef) -> (Vec<Op>, Vec<Operand>) {
@@ -1371,12 +1408,6 @@ fn assert_live_adds(
             "live add {n}"
         );
     }
-}
-
-fn assert_recorded_extras(expected: [i64; 3]) {
-    assert_eq!(COND_CALL_EXTRA0.load(Ordering::SeqCst), expected[0]);
-    assert_eq!(COND_CALL_EXTRA1.load(Ordering::SeqCst), expected[1]);
-    assert_eq!(COND_CALL_EXTRA2.load(Ordering::SeqCst), expected[2]);
 }
 
 /// Record the three extra arguments, then clobber every managed register.
@@ -1463,9 +1494,9 @@ extern "C" fn cond_call_value_extra_clobber() {
         "mov rax, 0x5A5A5A5A5A5A5A5A",
         "ret",
         hits = sym COND_CALL_VALUE_EXTRA_HITS,
-        e0 = sym COND_CALL_EXTRA0,
-        e1 = sym COND_CALL_EXTRA1,
-        e2 = sym COND_CALL_EXTRA2,
+        e0 = sym COND_CALL_VALUE_EXTRA0,
+        e1 = sym COND_CALL_VALUE_EXTRA1,
+        e2 = sym COND_CALL_VALUE_EXTRA2,
     );
 }
 
@@ -1492,9 +1523,9 @@ extern "C" fn cond_call_value_extra_clobber() {
         "mov rax, 0x5A5A5A5A5A5A5A5A",
         "ret",
         hits = sym COND_CALL_VALUE_EXTRA_HITS,
-        e0 = sym COND_CALL_EXTRA0,
-        e1 = sym COND_CALL_EXTRA1,
-        e2 = sym COND_CALL_EXTRA2,
+        e0 = sym COND_CALL_VALUE_EXTRA0,
+        e1 = sym COND_CALL_VALUE_EXTRA1,
+        e2 = sym COND_CALL_VALUE_EXTRA2,
     );
 }
 
@@ -1582,19 +1613,19 @@ fn cond_call_three_extras_remap_on_taken_path() {
     let base = 10i64;
     let expected = extra_expected(base);
 
-    reset_cond_call_extras();
+    COND_CALL_EXTRAS.reset();
     let (backend, token) = compile_cond_call_three_extras(0, func);
     let frame = backend.execute_token(&token, &[Value::Int(base)]);
     assert!(!backend.get_latest_descr(&frame).is_finish());
-    assert_eq!(COND_CALL_EXTRA_HITS.load(Ordering::SeqCst), 0);
+    assert_eq!(COND_CALL_EXTRAS.hits(), 0);
     assert_live_adds(&backend, &frame, base, 0);
 
-    reset_cond_call_extras();
+    COND_CALL_EXTRAS.reset();
     let (backend, token) = compile_cond_call_three_extras(1, func);
     let frame = backend.execute_token(&token, &[Value::Int(base)]);
     assert!(!backend.get_latest_descr(&frame).is_finish());
-    assert_eq!(COND_CALL_EXTRA_HITS.load(Ordering::SeqCst), 1);
-    assert_recorded_extras(expected);
+    assert_eq!(COND_CALL_EXTRAS.hits(), 1);
+    COND_CALL_EXTRAS.assert_recorded(expected);
     assert_live_adds(&backend, &frame, base, 0);
 }
 
@@ -1607,20 +1638,20 @@ fn cond_call_value_i_three_extras_taken_and_not_taken() {
     let expected = extra_expected(base);
     let live_value = 0x1111_2222_3333_4444i64;
 
-    reset_cond_call_extras();
+    COND_CALL_VALUE_EXTRAS.reset();
     let (backend, token) = compile_cond_call_value_three_extras(func);
     let frame = backend.execute_token(&token, &[Value::Int(live_value), Value::Int(base)]);
     assert!(!backend.get_latest_descr(&frame).is_finish());
-    assert_eq!(COND_CALL_VALUE_EXTRA_HITS.load(Ordering::SeqCst), 0);
+    assert_eq!(COND_CALL_VALUE_EXTRAS.hits(), 0);
     assert_eq!(backend.get_int_value(&frame, 0), live_value);
     assert_live_adds(&backend, &frame, base, 1);
 
-    reset_cond_call_extras();
+    COND_CALL_VALUE_EXTRAS.reset();
     let (backend, token) = compile_cond_call_value_three_extras(func);
     let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(base)]);
     assert!(!backend.get_latest_descr(&frame).is_finish());
-    assert_eq!(COND_CALL_VALUE_EXTRA_HITS.load(Ordering::SeqCst), 1);
-    assert_recorded_extras(expected);
+    assert_eq!(COND_CALL_VALUE_EXTRAS.hits(), 1);
+    COND_CALL_VALUE_EXTRAS.assert_recorded(expected);
     assert_eq!(
         backend.get_int_value(&frame, 0),
         COND_CALL_EXTRA_HELPER_RESULT

@@ -1,5 +1,14 @@
 # pyre-check: spec-folds=builtin_len_descent
 # pyre-check: trace-shape=hot:absent=CallMayForceR
+# pyre-check: max-wasm-ratio=5.2
+# The inner loop retraces once per layout: the oracle compiles 1 loop and 14
+# bridges, pyre 1 loop and 13 bridges, and wasm materializes each as its own
+# module, so wasm/dynasm is mostly that per-module compilation. On the ubuntu
+# runner it read 3.41x-4.12x over 18 runs of 2026-10-15 and 3.89x-4.48x over 11
+# runs of 2026-10-16 (check.py dynasm (ubuntu-24.04) jobs, the latter runs
+# 38921897893 through 38983736997), as dynasm went from 0.25-0.41s to
+# 0.21-0.35s and wasm from 0.89-1.65s to 0.82-1.54s. The allowance is 4.48x
+# plus 15%.
 # PyPy installs the builtin implementations reached by
 # descroperation.py `_len` through typedef.py
 # `use_special_method_shortcut('__len__')`.  Keep every layout formerly emitted

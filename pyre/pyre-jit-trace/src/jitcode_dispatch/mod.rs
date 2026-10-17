@@ -2703,6 +2703,12 @@ pub enum DispatchOutcome {
         back_edge_pc: Option<usize>,
         /// Resume-marker twin for [`Self::CloseLoop::back_edge_pc`].
         back_edge_marker_jit_pc: Option<usize>,
+        /// The walked frame's Ref registers at the merge point
+        /// (`MIFrame.registers_r`). `GUARD_FUTURE_CONDITION`'s snapshot reads
+        /// a live color from here when no frame slot backs it, such as the
+        /// `pycode` green that `getfield_vable_r` loads right before
+        /// `jit_merge_point`.
+        merge_point_registers_r: Vec<OpRef>,
     },
     /// `jit_merge_point/cIRFIRF` reached a loop header that already has
     /// compiled targets, and the in-walk `compile_trace` attempt
@@ -2929,6 +2935,7 @@ impl PartialEq for DispatchOutcome {
                     loop_header_marker_jit_pc: a_marker,
                     back_edge_pc: a_back_edge_pc,
                     back_edge_marker_jit_pc: a_back_edge_marker,
+                    merge_point_registers_r: a_regs,
                 },
                 Self::CloseLoop {
                     jump_args: b_args,
@@ -2936,11 +2943,13 @@ impl PartialEq for DispatchOutcome {
                     loop_header_marker_jit_pc: b_marker,
                     back_edge_pc: b_back_edge_pc,
                     back_edge_marker_jit_pc: b_back_edge_marker,
+                    merge_point_registers_r: b_regs,
                 },
             ) => {
                 a_args == b_args
                     && a_pc == b_pc
                     && a_marker == b_marker
+                    && a_regs == b_regs
                     && a_back_edge_pc == b_back_edge_pc
                     && a_back_edge_marker == b_back_edge_marker
             }
@@ -5685,124 +5694,6 @@ fn label_operand_offset(key: &str) -> Option<usize> {
     None
 }
 
-/// How the `except` handler at a `catch_exception` target leaves the frame.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExcHandlerShape {
-    /// Reaches `jit_merge_point`.
-    Rejoins,
-    /// Every scanned path returns (`*_return`); none reraise.
-    Returns,
-    /// Clears state and `reraise`s, and no path returns.
-    Reraise,
-    /// `except E as e: return` — the match path returns, the CHECK_EXC_MATCH
-    /// miss reraises. `perform_call` (`pyjitpl.py`) traces the taken return;
-    /// the miss is a guard side-exit, not a reason to residualize the callee.
-    ExceptAsReturn,
-    /// Switch, budget, or a scan that proved neither.
-    Unproven,
-}
-
-/// Bounded forward reachability from `catch_target`.
-pub(crate) fn exc_handler_shape(code: &[u8], catch_target: usize) -> ExcHandlerShape {
-    let mut visited = std::collections::HashSet::new();
-    let mut work = vec![catch_target];
-    let mut budget = 4096usize;
-    let mut saw_return = false;
-    let mut saw_reraise = false;
-    while let Some(pc) = work.pop() {
-        if budget == 0 {
-            return ExcHandlerShape::Unproven;
-        }
-        budget -= 1;
-        if !visited.insert(pc) {
-            continue;
-        }
-        let Some(op) = decode_op_at(code, pc) else {
-            continue;
-        };
-        if op.key.starts_with("jit_merge_point") {
-            return ExcHandlerShape::Rejoins;
-        }
-        if matches!(
-            op.key,
-            "ref_return/r" | "int_return/i" | "float_return/f" | "void_return/"
-        ) {
-            saw_return = true;
-            continue;
-        }
-        // `raise/r` is how a bare `RERAISE` leaves the frame. It does not
-        // fall through: the bytes after it are the next block, and walking
-        // into them reports a `ref_return` the handler never reaches.
-        if op.key.starts_with("reraise") || op.key.starts_with("raise") {
-            saw_reraise = true;
-            continue;
-        }
-        // Follow every jitcode branch that carries a target, the same
-        // edges [`control_successors`] already enumerates from the
-        // opcode table: `goto/L`, the `goto_if_not*` family,
-        // `goto_if_exception_mismatch/iL` (`pyjitpl.py`
-        // `opimpl_goto_if_exception_mismatch` jumps to `next_exc_target`),
-        // and `*_jump_if_ovf`. A mismatch arm that reraises must be
-        // seen, or a matching `ref_return` classifies the handler
-        // `Returns`. Mixed return+reraise is `ExceptAsReturn`.
-        // `switch` and an unmodelled label are Unproven.
-        match control_successors(code, &op) {
-            None => return ExcHandlerShape::Unproven,
-            Some(succs) => work.extend(succs),
-        }
-    }
-    if saw_return && !saw_reraise {
-        ExcHandlerShape::Returns
-    } else if saw_reraise && !saw_return {
-        ExcHandlerShape::Reraise
-    } else if saw_return && saw_reraise {
-        ExcHandlerShape::ExceptAsReturn
-    } else {
-        ExcHandlerShape::Unproven
-    }
-}
-
-fn control_successors(code: &[u8], op: &DecodedOp) -> Option<Vec<usize>> {
-    let key = op.key;
-    if key.starts_with("raise")
-        || key.starts_with("reraise")
-        || key == "unreachable/"
-        || key == "void_return/"
-        || key.starts_with("ref_return/")
-        || key.starts_with("int_return/")
-        || key.starts_with("float_return/")
-    {
-        return Some(Vec::new());
-    }
-    if key == "goto/L" {
-        return Some(succ_in_code(code, read_label(code, op, 0)));
-    }
-    if key == "catch_exception/L" {
-        return Some(succ_in_code(code, op.next_pc));
-    }
-    if key.starts_with("switch") {
-        return None;
-    }
-    let labeled = label_operand_offset(key).is_some()
-        || key.starts_with("goto_if")
-        || key.contains("jump_if_ovf");
-    if labeled {
-        let offset = label_operand_offset(key)?;
-        let mut succs = succ_in_code(code, read_label(code, op, offset));
-        succs.extend(succ_in_code(code, op.next_pc));
-        return Some(succs);
-    }
-    Some(succ_in_code(code, op.next_pc))
-}
-
-fn succ_in_code(code: &[u8], pc: usize) -> Vec<usize> {
-    if pc < code.len() {
-        vec![pc]
-    } else {
-        Vec::new()
-    }
-}
-
 /// True when a path reachable from `position` reads the walker's active
 /// exception (`last_exception/>i` / `last_exc_value/>r`) before reaching the
 /// `catch_exception/L` that would replace it.
@@ -8142,8 +8033,7 @@ struct InlineParentFrame {
     /// best-effort decline that leaves the existing guard snapshot usable.
     blackhole: Option<InlineParentBlackhole>,
     /// Authoritative derivation of the caller's Python resume pc.  The
-    /// Python-native consumers resolve this at their boundary; a CALL inside
-    /// a try-block (catch marker) still declines multi-frame.
+    /// Python-native consumers resolve this at their boundary.
     resume_coord: ParentResumeCoord,
     /// Codewrite-time jitcode-keyed marker for the CALL fallthrough resume
     /// point, queried at the CALL site.  Bridge-root frames have no CALL
@@ -16795,6 +16685,7 @@ fn handle<Sym: WalkSym>(
                         loop_header_marker_jit_pc,
                         back_edge_pc,
                         back_edge_marker_jit_pc,
+                        merge_point_registers_r: ctx.registers_r.to_vec(),
                     },
                     op.next_pc,
                 ))

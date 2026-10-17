@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=4
-# The measured reading stays under 4, so the ceiling is 4.
+# pyre-check: max-pypy-ratio=3
+# Native CI readings span 0.8x (macos cranelift) to 1.9x (windows dynasm), so
+# the ceiling is 3 and its derived floor 0.75 sits under the fastest of them.
 # pyre-check: skip-cpython
 # cpython 2.92s vs pyre 0.28s (10.4x on the ubuntu runner), and it is not
 # gated on — only pypy is.
