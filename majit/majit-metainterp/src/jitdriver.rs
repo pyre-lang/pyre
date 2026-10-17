@@ -9426,17 +9426,8 @@ impl<S: JitState> JitDriver<S> {
         if !filled_without_meta {
             live_values = state.extract_live_values(&meta);
         }
-        if crate::debug::have_debug_prints() {
-            let vals: Vec<String> = live_values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| format!("[{}]={:?}", i, v))
-                .collect();
-            crate::debug::log_one(
-                "jit-running",
-                &format!("run_bridge live_values: {}", vals.join(", ")),
-            );
-        }
+        // `llmodel.py execute_token` does not log live values on the compiled
+        // run; `logger.py log_loop` is the dump check.py binds to a census.
         if !Self::live_values_match_descriptor(
             descriptor.as_deref(),
             &live_values,
@@ -9620,17 +9611,8 @@ impl<S: JitState> JitDriver<S> {
         if !filled_without_meta {
             live_values = state.extract_live_values(&meta);
         }
-        if crate::debug::have_debug_prints() {
-            let vals: Vec<String> = live_values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| format!("[{}]={:?}", i, v))
-                .collect();
-            crate::debug::log_one(
-                "jit-running",
-                &format!("BRIDGE live_values: {}", vals.join(", ")),
-            );
-        }
+        // `llmodel.py execute_token` does not log live values on the compiled
+        // run; `logger.py log_loop` is the dump check.py binds to a census.
         if !Self::live_values_match_descriptor(
             descriptor,
             &live_values,
