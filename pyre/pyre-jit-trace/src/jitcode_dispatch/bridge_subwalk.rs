@@ -1510,6 +1510,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 constants_i: jc.constants_i.as_slice(),
                 constants_r: jc.constants_r.as_slice(),
                 constants_f: jc.constants_f.as_slice(),
+                jitcode_index: jc.try_index(),
             })
     };
 

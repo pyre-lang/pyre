@@ -6918,6 +6918,12 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                     symbolic,
                 });
             }
+            if let DispatchError::TraceTooLong { ops, .. } = &error {
+                return Err(DispatchError::TraceTooLong {
+                    pc: op.pc,
+                    ops: *ops,
+                });
+            }
             return Err(error);
         }
     };
@@ -10133,6 +10139,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // snapshot / last_instr / abort-coordinate identity.
                 transparent_helper_subwalk: false,
                 transparent_helper_jitcode_index: None,
+                transparent_helper_effects_at_entry: None,
+                transparent_helper_journal_at_entry: None,
                 ..ctx.fbw_mode
             },
             session: ctx.session,
@@ -18705,6 +18713,60 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
         self.frames.pop().expect("completed sub-walk frame missing")
     }
 
+    /// Copy ancestor helper MIFrames into the latched abort image, outermost
+    /// first, immediately below the innermost helper the walk already latched.
+    /// `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`
+    /// (`blackhole.py`) copies every framestack level, helper frames included.
+    ///
+    /// Python inline ancestors already sit on `session.framestack`
+    /// (`build_multi_frame_miframe`). They have no helper jitcode index;
+    /// skipping them is what keeps a successful helper-frame latch.
+    /// A paused helper sits at the CALL that entered its child: that
+    /// opcode lives in this helper's body at the child's `caller_pc`.
+    fn splice_ancestor_helpers(&self, trace_ctx: &TraceCtx) -> bool {
+        if self.frames.len() <= 1 {
+            return true;
+        }
+        let mut helpers = Vec::new();
+        for i in 0..self.frames.len() - 1 {
+            let frame = &self.frames[i];
+            if !frame.fbw_mode.transparent_helper_subwalk {
+                continue;
+            }
+            let Some(index) = frame.fbw_mode.transparent_helper_jitcode_index else {
+                return false;
+            };
+            let Some(jitcode) = helper_jitcode_arc(index) else {
+                return false;
+            };
+            let child = &self.frames[i + 1];
+            let Some((dst_bank, dst, resume_pc)) =
+                call_opcode_result_dst(frame.body.code, child.caller_pc)
+            else {
+                return false;
+            };
+            let skip = (dst_bank != 'v').then_some((dst_bank, dst));
+            let Some(miframe) = build_helper_parent_miframe(
+                trace_ctx,
+                jitcode,
+                resume_pc,
+                &frame.registers_i,
+                &frame.registers_r,
+                &frame.registers_f,
+                &frame.concrete_registers_i,
+                &frame.frame_state,
+                skip,
+            ) else {
+                return false;
+            };
+            helpers.push(miframe);
+        }
+        if !splice_helper_frames_before_innermost(helpers) {
+            return false;
+        }
+        true
+    }
+
     fn drive(
         &mut self,
         trace_ctx: &mut TraceCtx,
@@ -18727,8 +18789,20 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     // `drop` on a reference does not.
                     let _ = frame;
                     self.exchange.completed.clear();
+                    let session = self.frames[0].session;
+                    let latched = abort_blackhole_latched();
+                    let splice_ok = latched && self.splice_ancestor_helpers(trace_ctx);
+                    if latched && !splice_ok {
+                        discard_staged_abort(session);
+                    }
+                    let rollback = !abort_blackhole_latched();
                     while !self.frames.is_empty() {
-                        let _ = self.pop_frame();
+                        let popped = self.pop_frame();
+                        if rollback
+                            && let Some(mark) = popped.fbw_mode.transparent_helper_journal_at_entry
+                        {
+                            fbw_effect_journal_rollback_since(mark);
+                        }
                     }
                     return Err(error);
                 }
@@ -18947,6 +19021,38 @@ mod subwalk_checkpoint_tests {
     use super::*;
 
     #[test]
+    fn helper_parent_resume_pc_is_the_child_call_in_the_parent_body() {
+        let inline_byte = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("inline_call_ir_v/dIR")
+            .expect("`inline_call_ir_v/dIR` must be in insns table");
+        let void_ret = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table");
+        // dIR: 2B descr + I-list(len=2, i0, i1) + R-list(len=1, r0)
+        let parent = [
+            inline_byte,
+            0x08,
+            0x00,
+            0x02,
+            0x00,
+            0x01,
+            0x01,
+            0x00,
+            void_ret,
+        ];
+        let (bank, _dst, resume_pc) =
+            call_opcode_result_dst(&parent, 0).expect("CALL at pc 0 must decode");
+        assert_eq!(bank, 'v');
+        assert_eq!(resume_pc, parent.len() - 1);
+        // The splice bug decoded the ancestor's own `caller_pc` (a Python
+        // CALL offset) against this helper body. That is not this CALL.
+        assert!(
+            call_opcode_result_dst(&parent, 955).is_none(),
+            "a foreign caller_pc must not decode as this helper's CALL"
+        );
+    }
+
+    #[test]
     fn only_calls_keep_a_heap_cache_replay_checkpoint() {
         let mut exchange = SubWalkExchange::<crate::state::PyreSym> {
             pending: None,
@@ -19161,6 +19267,21 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         }
     }
 
+    // `_interpret` / `blackhole_if_trace_too_long` (`pyjitpl.py`) has
+    // already raised on the live helper MIFrame. The keep-recording
+    // leftover (latch declined, unjournaled write in the helper stack)
+    // would otherwise stack another frame after the cut — recursive
+    // `isinstance` of nested tuples. Residualize through
+    // `jitcode.fnaddr` (`bhimpl_inline_call_*`) so the parent records
+    // the CALL and does not execute a new helper body. A 0-delta
+    // helper still walks so its post-step can return `TraceTooLong`.
+    if ctx.fbw_mode.transparent_helper_subwalk
+        && ctx.trace_ctx.is_too_long()
+        && helper_has_unjournaled_executed_write(ctx)
+    {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
+    }
+
     let (
         callee_regs_r,
         mut callee_regs_i,
@@ -19308,6 +19429,24 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         fbw_mode: FbwWalkMode {
             inline_subwalk: true,
             transparent_helper_subwalk: true,
+            // Sampled at the outermost helper. Nested helpers inherit so a
+            // too-long abort sees every unjournaled write in the helper
+            // stack (`helper_has_unjournaled_executed_write`) and rolls
+            // the whole stack's journals (`helper_too_long_result`) when
+            // the helper-frame latch declined.
+            transparent_helper_effects_at_entry: if ctx.fbw_mode.transparent_helper_subwalk {
+                ctx.fbw_mode.transparent_helper_effects_at_entry
+            } else {
+                Some(fbw_executed_effect_count())
+            },
+            transparent_helper_journal_at_entry: if ctx.fbw_mode.transparent_helper_subwalk {
+                ctx.fbw_mode.transparent_helper_journal_at_entry
+            } else {
+                Some(fbw_effect_journal_mark())
+            },
+            // Overwrite the parent's index: a nested helper is a different
+            // `MIFrame.jitcode`.
+            transparent_helper_jitcode_index: helper_index_for_sub_body(ctx, sub_body),
             // A helper has no Python PC. Residual last_instr publication
             // reads this field when `current_inline_concrete_frame()==0`.
             inline_caller_py_pc: ctx
@@ -19381,11 +19520,11 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             // `aborted_tracing` captured; a single-frame adopt of the
             // caller is not that resume.
             //
-            // `TraceTooLong` is the enclosing Python walk's length check
-            // (`_interpret` `blackhole_if_trace_too_long`) firing inside
-            // this helper MIFrame. The CALL's register image is the
-            // resume coordinate, so do not mark the abort as a callee-pc
-            // capability gap: that flag declines single-frame adopt.
+            // `TraceTooLong` is `_interpret` `blackhole_if_trace_too_long`
+            // firing inside this helper MIFrame. The helper (or the CALL)
+            // register image is the resume coordinate, so do not mark the
+            // abort as a callee-pc capability gap: that flag declines
+            // single-frame adopt.
             if !matches!(error, DispatchError::TraceTooLong { .. }) {
                 ctx.session.borrow_mut().crossed_inline_subwalk = true;
             }

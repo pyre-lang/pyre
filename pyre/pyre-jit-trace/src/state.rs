@@ -1533,6 +1533,7 @@ fn sub_jitcode_body_from_payload(
             constants_r: &*(jc.constants_r.as_slice()
                 as *const [majit_jitcode::codewriter::jitcode::ConstSlotR]),
             constants_f: &*(jc.constants_f.as_slice() as *const [i64]),
+            jitcode_index: jc.try_index(),
         }
     })
 }
@@ -1632,6 +1633,7 @@ fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
                     constants_i: jc.constants_i.as_slice(),
                     constants_r: jc.constants_r.as_slice(),
                     constants_f: jc.constants_f.as_slice(),
+                    jitcode_index: jc.try_index(),
                 })
         });
         let lookup: &'static crate::jitcode_dispatch::SubJitCodeLookup = Box::leak(lookup);

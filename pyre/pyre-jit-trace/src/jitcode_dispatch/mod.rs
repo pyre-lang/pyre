@@ -309,6 +309,10 @@ pub struct SubJitCodeBody {
     pub constants_r: &'static [majit_jitcode::codewriter::jitcode::ConstSlotR],
     /// Callee's Float-bank constant pool (`JitCode.constants_f`).
     pub constants_f: &'static [i64],
+    /// `JitCode.index` when this view came from the build-time table or an
+    /// installed runtime helper (`MIFrame.jitcode`). Synthetic test bodies
+    /// leave this `None`.
+    pub jitcode_index: Option<usize>,
 }
 
 /// Caller-provided sub-jitcode lookup. RPython equivalent: descr
@@ -341,6 +345,7 @@ pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
         constants_i: jc.constants_i.as_slice(),
         constants_r: jc.constants_r.as_slice(),
         constants_f: jc.constants_f.as_slice(),
+        jitcode_index: Some(idx),
     })
 }
 
@@ -2089,12 +2094,23 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     pub immediate_inline_caller_py_pc: Option<u32>,
     /// The current sub-walk is a translated builtin gateway helper.  The
     /// helper is not a Python frame, but it is an RPython `MIFrame` and must be
-    /// retained as the innermost blackhole frame so a post-residual guard can
-    /// continue after the residual instead of re-running the Python CALL.
+    /// retained as the innermost blackhole frame so a too-long abort resumes
+    /// the helper at its own pc (`blackhole.py` `convert_and_run_from_pyjitpl`).
     pub transparent_helper_subwalk: bool,
     /// Absolute build-time `MetaInterpStaticData.jitcodes` index of that
     /// helper. `None` outside a translated helper sub-walk.
     pub transparent_helper_jitcode_index: Option<usize>,
+    /// [`fbw_executed_effect_count`] sampled when the outermost helper in
+    /// this stack was entered. Nested helpers inherit it so a too-long
+    /// abort sees every unjournaled write in the popped helper stack
+    /// (`helper_has_unjournaled_executed_write`).
+    pub(crate) transparent_helper_effects_at_entry: Option<usize>,
+    /// Journal lengths at that same outermost-helper entry.  A helper that
+    /// returns [`DispatchError::TraceTooLong`] without a latched helper
+    /// image rolls this delta so the enclosing Python CALL's
+    /// `latch_abort_blackhole` re-run is the sole remaining execution of
+    /// those writes.  A successful helper-frame latch leaves the journals.
+    pub(crate) transparent_helper_journal_at_entry: Option<FbwEffectJournalMark>,
     /// Set only while walking the generated `write_cell` helper.  Inner
     /// ops are `helper=None` Void writes the StoreName loop-var exemption
     /// cannot see; the caller journals them (`FBW_CELL_STORE_JOURNAL`).
@@ -2201,6 +2217,8 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             immediate_inline_caller_py_pc: None,
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
+            transparent_helper_effects_at_entry: None,
+            transparent_helper_journal_at_entry: None,
             cell_store_helper_subwalk: false,
             carrier_resume: false,
             current_exception_seed_from_walk_store: false,
@@ -4860,12 +4878,22 @@ pub fn walk<Sym: WalkSym>(
             // loop over `metainterp.framestack`.
             Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
             Err(error @ DispatchError::TraceTooLong { .. }) => {
-                // Nested helper already ran `note_root_trace_too_long`. This
-                // frame owns the Python resume coordinate; latch it the same
-                // way the post-step too-long arm does. The CALL did not
-                // finish, so the coordinate is `opcode_position`.
-                if !ctx.fbw_mode.transparent_helper_subwalk && !abort_blackhole_latched() {
-                    let _ = latch_abort_blackhole(ctx, opcode_position, "mod2730-too-long");
+                // Nested helper returns `TraceTooLong` after
+                // `blackhole_if_trace_too_long` (`pyjitpl.py`). If the helper
+                // already latched its own MIFrame, keep that image. Otherwise
+                // this Python frame owns the resume coordinate (the CALL that
+                // did not finish).
+                if !ctx.fbw_mode.transparent_helper_subwalk {
+                    if !ctx.session.borrow().trace_too_long {
+                        crate::state::note_root_trace_too_long(
+                            ctx.trace_ctx.current_merge_points_first_green_key_pair(),
+                            ctx.trace_ctx.resumekey_original_loop_token().cloned(),
+                        );
+                        ctx.session.borrow_mut().trace_too_long = true;
+                    }
+                    if !abort_blackhole_latched() {
+                        let _ = latch_abort_blackhole(ctx, opcode_position, "mod2730-too-long");
+                    }
                 }
                 return Err(error);
             }
@@ -5004,10 +5032,12 @@ pub fn walk<Sym: WalkSym>(
         //
         // A complete image makes the abort safe regardless of effects.  If the
         // image cannot be built, a zero-effect walk may still take the legacy
-        // replay; an effectful walk must retain the former keep-recording
-        // fallback because replay would apply an irreversible effect twice.
-        // The remaining overshoot is tallied so an unsupported multi-frame
-        // shape cannot silently become unbounded.
+        // replay; an effectful walk keeps recording rather than replaying an
+        // irreversible write.  Residuals in a crossed helper are recorded-only
+        // (`declined_symbolic`) and a nested helper walk is refused
+        // (`OrthodoxSubWalkTraceUnsupported`), so this leftover cannot stack
+        // new executed writes or helper frames.  The overshoot is tallied
+        // (`mc_diag_bump(26)`).
         // pyjitpl.py raises out of `debug_merge_point`, i.e. from
         // INSIDE the step, so `blackhole_if_trace_too_long` (pyjitpl.py)
         // never sees a segmented trace. When a walk crosses a merge point
@@ -5045,26 +5075,50 @@ pub fn walk<Sym: WalkSym>(
             if snapshot_safe {
                 reconcile_vstack_to_resume_pc(ctx, pc);
             }
-            // A translated helper is not a Python resume coordinate; latching
-            // here would pair helper pc with the enclosing JitCode. Unwind
-            // `TraceTooLong` to the enclosing Python walk, which latches its
-            // own banks at the CALL (the Err arm above). `abort_safe` still
-            // fires on a zero-effect helper Continue, which is what stops
-            // nested-tuple `isinstance` from descending forever.
-            let mut blackhole_latched = snapshot_safe
-                && !ctx.fbw_mode.transparent_helper_subwalk
-                && latch_abort_blackhole(ctx, pc, "mod2786");
+            // A translated helper is an ordinary `MIFrame` on
+            // `metainterp.framestack`. `_interpret` /
+            // `blackhole_if_trace_too_long` (`pyjitpl.py`) latches it at
+            // this post-step pc; `convert_and_run_from_pyjitpl` copies
+            // the helper with its own jitcode, pc, and registers. Latch
+            // that image here. A declined latch with no unjournaled
+            // helper write still returns `TraceTooLong` so the enclosing
+            // Python CALL can latch; an unjournaled write without a latch
+            // keeps recording.
+            let mut blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
             // Root-walk too-long publishes the walker mirror (`_copy_data_from_miframe`
             // equivalent).  Ask the height check here, while a refusal can still
             // unstage: a preflighted adopt treats a later decline as an assert.
+            // A helper latches multi-frame (portal + helper); do not judge it
+            // with the single-frame publishable gate.
             if blackhole_latched
                 && !ctx.fbw_mode.inline_subwalk
+                && !ctx.fbw_mode.transparent_helper_subwalk
                 && !latched_single_frame_mirror_publishable()
             {
                 discard_staged_abort(ctx.session);
                 blackhole_latched = false;
             }
-            if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
+            // `SwitchToBlackhole(ABORT_TOO_LONG)` always has a blackhole
+            // resume upstream.  Abort only once `trace_too_long_abort_safe`
+            // holds: a complete image, or a zero-effect walk that may still
+            // take entry replay.
+            let abort_safe =
+                trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count());
+            if ctx.fbw_mode.transparent_helper_subwalk {
+                if blackhole_latched {
+                    let ops = ctx.trace_ctx.num_recorded_ops();
+                    return Err(DispatchError::TraceTooLong {
+                        pc: opcode_position,
+                        ops,
+                    });
+                } else if helper_has_unjournaled_executed_write(ctx) {
+                    majit_metainterp::mc_diag_bump(26);
+                } else if ctx.is_authoritative_executor || abort_safe {
+                    return Err(helper_too_long_result(ctx, opcode_position));
+                } else {
+                    majit_metainterp::mc_diag_bump(26);
+                }
+            } else if abort_safe {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
                     ctx.trace_ctx.current_merge_points_first_green_key_pair(),
