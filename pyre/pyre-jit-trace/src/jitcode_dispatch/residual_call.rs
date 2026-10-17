@@ -5835,7 +5835,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         }
         let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
             .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-        fbw_foriter_inflight_mark_attempt(body);
+        fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body);
     }
     // gh#467: sample the user-frame odometer UNCONDITIONALLY (not only under an
     // in-flight FOR_ITER) so the concrete-heap-write gate can detect a callee
@@ -6672,6 +6672,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     result_i64 = scope.get(index) as i64;
                 }
                 fbw_foriter_inflight_capture(
+                    InflightForiterOwner::current(ctx.session),
                     result_i64 as usize as pyre_object::PyObjectRef,
                     body,
                     for_iter_journaled,

@@ -10130,9 +10130,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Those recordings can minor-collect. Re-read the rooted holders
     // before the copy is published on the session.
     super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut parent_frame);
-    // The in-flight FOR_ITER entries the callee's own loops push sit above
-    // this height.
-    let inflight_depth_before_subwalk = fbw_foriter_inflight_depth();
+    // The callee frame that owns the FOR_ITER items its own loops consume.
+    let caller_inflight_owner = InflightForiterOwner::current(ctx.session);
+    let callee_inflight_owner;
     let (mut callee_outcome, callee_class_of_last_exc_is_const, mut operator_tail_caller) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -10236,6 +10236,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             true,
             parents,
         );
+        // A level without a live `W_Code` shares its caller's id and is no
+        // `MIFrame` of its own, so it has nothing to pop.
+        callee_inflight_owner = Some(InflightForiterOwner::current(ctx.session))
+            .filter(|owner| *owner != caller_inflight_owner);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
@@ -10842,13 +10846,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     };
 
     let outcome = promote_published_null_return_since(ctx, outcome, op.pc, exc_before_subwalk)?;
-    if matches!(
-        outcome,
-        DispatchOutcome::SubReturn { .. }
-            | DispatchOutcome::SubRaise { .. }
-            | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
-    ) {
-        fbw_foriter_inflight_truncate(inflight_depth_before_subwalk);
+    if let Some(owner) = callee_inflight_owner
+        && matches!(
+            outcome,
+            DispatchOutcome::SubReturn { .. }
+                | DispatchOutcome::SubRaise { .. }
+                | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
+        )
+    {
+        fbw_foriter_inflight_popframe(owner);
     }
     match outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -14883,7 +14889,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     }
     let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body_coord);
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body_coord);
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
 
     let _roots = pyre_object::gc_roots::push_roots();
@@ -14993,7 +14999,12 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    fbw_foriter_inflight_capture(concrete_item, body_coord, false);
+    fbw_foriter_inflight_capture(
+        InflightForiterOwner::current(ctx.session),
+        concrete_item,
+        body_coord,
+        false,
+    );
     ctx.frame_state.borrow_mut().vstack_last_ref = item_op;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -16063,7 +16074,7 @@ fn walk_generator_resume<Sym: WalkSym>(
 
     let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body_coord);
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body_coord);
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
     let executed_effects_before = fbw_executed_effect_count();
 
@@ -16264,7 +16275,12 @@ fn walk_generator_resume<Sym: WalkSym>(
         return Ok(None);
     };
     write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
-    fbw_foriter_inflight_capture(concrete_item, body_coord, false);
+    fbw_foriter_inflight_capture(
+        InflightForiterOwner::current(ctx.session),
+        concrete_item,
+        body_coord,
+        false,
+    );
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
     let _ = code_root;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
