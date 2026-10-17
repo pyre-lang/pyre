@@ -6440,6 +6440,38 @@ fn dict_lookup_checked(
     }
 }
 
+/// `descroperation.py dict_getitem` — the `dict.__getitem__` descriptor
+/// `_do_combine_starstarargs_wrapped` call. Reads the backing
+/// mapping so a subclass `__getitem__` is skipped. A miss is
+/// `raise_key_error` (`KeyError(w_key)`).
+///
+/// The lookup hashes `w_key` and can collect; both operands are rooted
+/// across it.
+pub(crate) fn dict_getitem(
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_dict, w_key]);
+    let backing = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(base));
+    let found = if backing.is_null() {
+        None
+    } else {
+        let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(backing);
+        dict_lookup_checked(
+            pyre_object::gc_roots::shadow_stack_get(backing_slot),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        )?
+    };
+    match found {
+        Some(v) => Ok(v),
+        None => Err(crate::PyError::key_error_with_key(
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        )),
+    }
+}
+
 pub(crate) fn dict_store_checked(
     dict: PyObjectRef,
     mut key: PyObjectRef,
@@ -6908,13 +6940,8 @@ pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     unsafe { Ok(pyre_object::dictmultiobject::w_dict_copy(src)) }
 }
 
-/// PyPy: dictmultiobject.py descr_update — dict.update([other], **kwargs).
-///
-/// CPython 3.x signature accepts a single optional positional that is
-/// either a mapping (uses keys()) or an iterable of (key, value) pairs,
-/// followed by arbitrary kwargs that are merged on top.  The trailing
-/// `dictmultiobject.py update1` — merge `w_data` into
-/// `w_dict`.  Shared by `dict.__init__` and `dict.update`.
+/// `dictmultiobject.py update1` — merge `w_data` into `w_dict`.
+/// Shared by `dict.__init__` and `dict.update`.
 pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(), crate::PyError> {
     // RPython's shadowstack transform keeps both operands live across
     // `keys`, iteration, `__getitem__`, hashing, and equality calls.  Those
@@ -6932,131 +6959,193 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
     let _ = pyre_object::gc_roots::pin_root(dict);
     let dict = || pyre_object::gc_roots::shadow_stack_get(backing_slot);
     let data = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    if unsafe { crate::baseobjspace::isinstance_dict_w(data()) }
+        && dict_subclass_uses_default_iter(data())
+    {
+        return dict_update1_dict_dict(dict(), data());
+    }
+    // `dictmultiobject.py update1`
+    // `space.findattr(w_data, "keys")`: the lookup runs suppressed, so
+    // a sequence of pairs reaches the absent arm without an
+    // AttributeError being built. Only a missing attribute reads as
+    // absent (`PyObject_GetOptionalAttr`).
+    let w_keys_method = match crate::baseobjspace::getattr_str_impl(data(), "keys", true, true) {
+        Ok(value) if value.is_null() => None,
+        Ok(value) => Some(value),
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
+        Err(e) => return Err(e),
+    };
+    let Some(w_method) = w_keys_method else {
+        return dict_update1_pairs(dict(), data());
+    };
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_method);
+    let w_keys = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(method_slot),
+        &[],
+    )?;
+    dict_update1_keys(dict(), data(), w_keys)
+}
+
+/// `dictmultiobject.py update1_dict_dict` / `rev_update1_dict_dict`.
+fn dict_update1_dict_dict(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_dict, w_data]);
+    let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let data = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     unsafe {
-        let fast_path_eligible = !resolve_dict_backing(data()).is_null()
-            && pyre_object::is_dict(resolve_dict_backing(data()))
-            && dict_subclass_uses_default_iter(data());
-        if fast_path_eligible {
-            // `dictmultiobject.py update1_dict_dict`
-            let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty(dict());
-            if dst_is_empty {
-                let w_copy =
-                    pyre_object::dictmultiobject::w_dict_copy(resolve_dict_backing(data()));
-                pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
-                    dict(),
-                    w_copy,
-                );
-            } else {
-                // PyPy `create_iterator_classes.rev_update1_dict_dict`
-                // (`dictmultiobject.py`) supplies the live
-                // `getiteritems_with_hash` walk.  Python 3.14 adds
-                // `dict_dict_merge`'s `orig_size` check after every
-                // destination insertion (`Objects/dictobject.c:3947-3985`):
-                // destination key equality can re-enter Python and mutate
-                // the source, which must raise instead of silently ending
-                // the next `nth_item` lookup.
-                let source = resolve_dict_backing(data());
-                let orig_size = pyre_object::dictmultiobject::w_dict_len(source);
-                let mut i = 0;
-                loop {
-                    // `getiteritems_with_hash` (`dictmultiobject.py`) — an
-                    // object- or unicode-shaped source already stores each key's
-                    // hash, so reusing it keeps `__hash__` at the single call
-                    // that filled the source.  Re-deriving it here is observable
-                    // for a key whose `__hash__` has side effects, and it puts
-                    // an extra Python call inside this walk.  Typed strategies
-                    // store no hash and `w_dict_nth_hashed_key` returns `None`
-                    // for them, which selects the plain walk below.
-                    let source_now = resolve_dict_backing(data());
-                    // `i` names an entry slot, and a delete leaves a tombstone
-                    // between the live ones, so step to the next live slot
-                    // rather than assuming the numbering is dense.
-                    let Some(live) = pyre_object::dictmultiobject::w_dict_next_slot(source_now, i)
-                    else {
-                        break;
-                    };
-                    i = live;
-                    let hashed = pyre_object::is_exact_type(source_now, &pyre_object::DICT_TYPE)
-                        .then(|| pyre_object::dictmultiobject::w_dict_nth_hashed_key(source_now, i))
-                        .flatten();
-                    let Some((k, v)) = (match hashed {
-                        Some(key) => pyre_object::dictmultiobject::w_dict_nth_value(source_now, i)
-                            .map(|v| (key.obj, v)),
-                        None => pyre_object::dictmultiobject::w_dict_nth_item(source_now, i),
-                    }) else {
-                        break;
-                    };
-                    let _iteration_roots = pyre_object::gc_roots::push_roots();
-                    let iteration_roots = pyre_object::gc_roots::pin_roots(&[k, v]);
-                    let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
-                    let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
-                    match hashed {
-                        Some(key) => pyre_object::dictmultiobject::w_dict_store_hashed_checked(
-                            dict(),
-                            k,
-                            v,
-                            key.hash,
-                        )
-                        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))?,
-                        None => dict_store_checked(dict(), k, v)?,
-                    }
-                    if orig_size
-                        != pyre_object::dictmultiobject::w_dict_len(resolve_dict_backing(data()))
-                    {
-                        return Err(crate::PyError::runtime_error("dict mutated during update"));
-                    }
-                    i += 1;
-                }
-            }
+        // `dictmultiobject.py update1_dict_dict`
+        let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty(dict());
+        if dst_is_empty {
+            let w_copy = pyre_object::dictmultiobject::w_dict_copy(resolve_dict_backing(data()));
+            pyre_object::dictmultiobject::w_dict_adopt_regular_copy_for_empty_update(
+                dict(),
+                w_copy,
+            );
         } else {
-            // `dictmultiobject.py update1`
-            // `space.findattr(w_data, "keys")`: the lookup runs suppressed, so
-            // a sequence of pairs reaches the absent arm without an
-            // AttributeError being built. Only a missing attribute reads as
-            // absent (`PyObject_GetOptionalAttr`).
-            let w_keys_method =
-                match crate::baseobjspace::getattr_str_impl(data(), "keys", true, true) {
-                    Ok(value) if value.is_null() => None,
-                    Ok(value) => Some(value),
-                    Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
-                    Err(e) => return Err(e),
+            // PyPy `create_iterator_classes.rev_update1_dict_dict`
+            // (`dictmultiobject.py`) supplies the live
+            // `getiteritems_with_hash` walk.  Python 3.14 adds
+            // `dict_dict_merge`'s `orig_size` check after every
+            // destination insertion (`Objects/dictobject.c:3947-3985`):
+            // destination key equality can re-enter Python and mutate
+            // the source, which must raise instead of silently ending
+            // the next `nth_item` lookup.
+            let source = resolve_dict_backing(data());
+            let orig_size = pyre_object::dictmultiobject::w_dict_len(source);
+            let mut i = 0;
+            loop {
+                // `getiteritems_with_hash` (`dictmultiobject.py`) — an
+                // object- or unicode-shaped source already stores each key's
+                // hash, so reusing it keeps `__hash__` at the single call
+                // that filled the source.  Re-deriving it here is observable
+                // for a key whose `__hash__` has side effects, and it puts
+                // an extra Python call inside this walk.  Typed strategies
+                // store no hash and `w_dict_nth_hashed_key` returns `None`
+                // for them, which selects the plain walk below.
+                let source_now = resolve_dict_backing(data());
+                // `i` names an entry slot, and a delete leaves a tombstone
+                // between the live ones, so step to the next live slot
+                // rather than assuming the numbering is dense.
+                let Some(live) = pyre_object::dictmultiobject::w_dict_next_slot(source_now, i)
+                else {
+                    break;
                 };
-            if let Some(w_method) = w_keys_method {
-                // `dictmultiobject.py update1_keys`
-                let w_keys_view = crate::call::call_function_impl_result(w_method, &[])?;
-                let keys = crate::builtins::collect_iterable(w_keys_view)?;
-                let keys_base = pyre_object::gc_roots::pin_roots(&keys);
-                for i in 0..keys.len() {
-                    let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
-                    let v = crate::baseobjspace::getitem(data(), k)?;
-                    let value_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(v);
-                    let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
-                    let v = pyre_object::gc_roots::shadow_stack_get(value_slot);
-                    dict_store_checked(dict(), k, v)?;
+                i = live;
+                let hashed = pyre_object::is_exact_type(source_now, &pyre_object::DICT_TYPE)
+                    .then(|| pyre_object::dictmultiobject::w_dict_nth_hashed_key(source_now, i))
+                    .flatten();
+                let Some((k, v)) = (match hashed {
+                    Some(key) => pyre_object::dictmultiobject::w_dict_nth_value(source_now, i)
+                        .map(|v| (key.obj, v)),
+                    None => pyre_object::dictmultiobject::w_dict_nth_item(source_now, i),
+                }) else {
+                    break;
+                };
+                let _iteration_roots = pyre_object::gc_roots::push_roots();
+                let iteration_roots = pyre_object::gc_roots::pin_roots(&[k, v]);
+                let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
+                let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
+                dict_update1_dict_dict_store(dict(), k, v, hashed)?;
+                if orig_size
+                    != pyre_object::dictmultiobject::w_dict_len(resolve_dict_backing(data()))
+                {
+                    return Err(crate::PyError::runtime_error("dict mutated during update"));
                 }
-            } else {
-                // PyPy `dictmultiobject.py:update1_pairs`, with Python 3.14
-                // `merge_from_seq2_lock_held`'s PySequence_Fast error/note
-                // semantics where the versions differ.
-                let pairs = crate::builtins::collect_iterable(data())?;
-                let pairs_base = pyre_object::gc_roots::pin_roots(&pairs);
-                for idx in 0..pairs.len() {
-                    let pair = pyre_object::gc_roots::shadow_stack_get(pairs_base + idx);
-                    let entries = dict_update_pair_entries(pair, idx)?;
-                    if entries.len() != 2 {
-                        return Err(crate::PyError::value_error(format!(
-                            "dictionary update sequence element #{idx} has length {}; 2 is required",
-                            entries.len()
-                        )));
-                    }
-                    let entry_base = pyre_object::gc_roots::pin_roots(&[entries[0], entries[1]]);
-                    let k = pyre_object::gc_roots::shadow_stack_get(entry_base);
-                    let v = pyre_object::gc_roots::shadow_stack_get(entry_base + 1);
-                    dict_store_checked(dict(), k, v)?;
-                }
+                i += 1;
             }
         }
+    }
+    Ok(())
+}
+
+/// Store half of `dict_update1_dict_dict`'s live walk.  Kept out of the
+/// slot loop so rustc does not merge the hashed and plain `?` continue
+/// blocks (`merged continue branch block N is shared`).
+fn dict_update1_dict_dict_store(
+    dict: PyObjectRef,
+    k: PyObjectRef,
+    v: PyObjectRef,
+    hashed: Option<pyre_object::dictmultiobject::ObjectKey>,
+) -> Result<(), crate::PyError> {
+    unsafe {
+        match hashed {
+            Some(key) => {
+                pyre_object::dictmultiobject::w_dict_store_hashed_checked(dict, k, v, key.hash)
+                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))
+            }
+            None => dict_store_checked(dict, k, v),
+        }
+    }
+}
+
+/// `dictmultiobject.py update1_keys` —
+/// `for k in o.keys(): dict.__setitem__(d, k, o[k])`.
+fn dict_update1_keys(
+    w_dict: PyObjectRef,
+    w_data: PyObjectRef,
+    w_keys: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_dict, w_data, w_keys]);
+    let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let data = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    // [3.14-spec] dictmultiobject.py update1_keys iterates w_keys lazily; CPython v3.14.6 dict_merge
+    // takes PyMapping_Keys (a list) first (measured: keys() generator side effects all precede the
+    // first __getitem__). Engineered as space.listview(w_keys) + the update1_keys loop.
+    let keys =
+        crate::baseobjspace::listview(pyre_object::gc_roots::shadow_stack_get(root_base + 2), -1)?;
+    let keys_base = pyre_object::gc_roots::pin_roots(&keys);
+    let key_len = keys.len();
+    for i in 0..key_len {
+        let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+        let v = crate::baseobjspace::getitem(data(), k)?;
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(v);
+        let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+        let v = pyre_object::gc_roots::shadow_stack_get(value_slot);
+        dict_store_checked(dict(), k, v)?;
+    }
+    Ok(())
+}
+
+/// `dictmultiobject.py update1_pairs` — iterable of `(key, value)` pairs.
+fn dict_update1_pairs(w_dict: PyObjectRef, w_iterable: PyObjectRef) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_dict, w_iterable]);
+    let w_iterator =
+        crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_iterator);
+    let mut i = 0usize;
+    loop {
+        let pair =
+            match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+                Ok(p) => p,
+                Err(e) => {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
+                        break;
+                    }
+                    return Err(e);
+                }
+            };
+        let _iteration_roots = pyre_object::gc_roots::push_roots();
+        let pair_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pair);
+        let entries =
+            dict_update_pair_entries(pyre_object::gc_roots::shadow_stack_get(pair_slot), i)?;
+        if entries.len() != 2 {
+            return Err(crate::PyError::value_error(format!(
+                "dictionary update sequence element #{i} has length {}; 2 is required",
+                entries.len()
+            )));
+        }
+        let entry_base = pyre_object::gc_roots::pin_roots(&[entries[0], entries[1]]);
+        let k = pyre_object::gc_roots::shadow_stack_get(entry_base);
+        let v = pyre_object::gc_roots::shadow_stack_get(entry_base + 1);
+        dict_store_checked(pyre_object::gc_roots::shadow_stack_get(root_base), k, v)?;
+        i += 1;
     }
     Ok(())
 }
@@ -7261,7 +7350,7 @@ pub fn dict_descr_init_args(
 /// `is_dict` already established the W_DictMultiObject side; this
 /// helper performs the `findattr` identity check to keep
 /// `__iter__`-overriding subclasses on the slow `keys()` path.
-fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
+pub(crate) fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
     let Some(other_type) = crate::typedef::r#type(other) else {
         return false;
     };
@@ -7277,6 +7366,10 @@ fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
     if std::ptr::eq(other_type.as_ptr() as *const _, dict_type as *const _) {
         return true;
     }
+    // [3.14-spec] dictmultiobject.py update1 compares space.findattr(space.type(w_data), "__iter__");
+    // CPython v3.14.6 dict_merge compares the tp_iter slot (C source at tag v3.14.6), i.e. the
+    // type's MRO entry, so a metaclass attribute named __iter__ does not count. space.lookup is
+    // that MRO lookup.
     let other_iter =
         unsafe { crate::baseobjspace::lookup_in_type(other_type.as_ptr(), "__iter__") };
     let dict_iter = unsafe { crate::baseobjspace::lookup_in_type(dict_type, "__iter__") };

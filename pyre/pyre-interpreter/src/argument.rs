@@ -304,32 +304,11 @@ pub fn do_combine_starstarargs_wrapped(
         let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py — `keyword_names_w[i] = w_key`.
         pyre_object::gc_roots::shadow_stack_set(keyword_names_w + i, w_key);
-        // argument.py:449-457 — value lookup.
+        // argument.py — `dict_getitem` / `space.getitem`. A str subclass is
+        // probed as `w_key`; the WTF-8 `seen` key is the wrong probe.
         let w_value = if is_dict {
-            // `_do_combine_starstarargs_wrapped` calls `dict_getitem` with
-            // the original `w_key`. A str subclass is probed as that object:
-            // its `__hash__` / `__eq__` may differ from `str`, so the WTF-8
-            // text recorded for `key in seen` is the wrong probe. A dict
-            // subclass keeps its entries in a backing dict; exact `dict` is
-            // that backing already. A miss is KeyError, the same answer
-            // `dict.__getitem__` gives when the key disappeared mid-iteration.
-            let backing = crate::type_methods::resolve_dict_backing(w_starstararg());
-            let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
-            let direct = if backing.is_null() {
-                Ok(None)
-            } else {
-                unsafe { pyre_object::dictmultiobject::w_dict_lookup_checked(backing, w_key) }
-            };
-            // The lookup hashes `w_key` and can collect. Read the key back
-            // before a hash error is wrapped around it.
-            let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
-            match direct {
-                Ok(Some(v)) => v,
-                Ok(None) => return Err(crate::PyError::key_error(format!("'{key}'"))),
-                Err(_) => return Err(crate::baseobjspace::take_pending_dict_key_error(w_key)),
-            }
+            crate::type_methods::dict_getitem(w_starstararg(), w_key)?
         } else {
-            // argument.py:457 — `w_value = space.getitem(...)`.
             crate::baseobjspace::getitem(w_starstararg(), w_key)?
         };
         // argument.py — `keywords_w[i] = w_value`.

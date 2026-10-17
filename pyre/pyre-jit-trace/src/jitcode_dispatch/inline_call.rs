@@ -4234,6 +4234,7 @@ struct StarArgsInline {
 /// leave no keyword for `_match_keywords` to reject.
 struct StarKwargsInline {
     dict_op: OpRef,
+    strategy: &'static pyre_object::dictmultiobject::DictStrategyRef,
     /// `(parameter index, interned parameter name, value at resolve time)`.
     bound: Vec<(usize, pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
 }
@@ -4495,11 +4496,12 @@ fn rehome_extracted_star(
 /// `w_code` past the `npos` the star tuple filled, the way `_match_keywords`
 /// (`argument.py`) binds the `view_as_kwargs` keys.
 ///
-/// Only an exact dict under the unicode strategy is taken, and only by a
-/// callee whose locals are its positional parameters alone.  Every key has to
-/// name a parameter it may bind — past the positional fill and past the
-/// positional-only range — or the call is a TypeError the interpreter
-/// reports, so the inline declines.
+/// Only an exact dict under the unicode or kwargs strategy
+/// (`view_as_kwargs` answers for both: `dictmultiobject.py` / `kwargsdict.py`)
+/// is taken, and only by a callee whose locals are its positional parameters
+/// alone.  Every key has to name a parameter it may bind — past the positional
+/// fill and past the positional-only range — or the call is a TypeError the
+/// interpreter reports, so the inline declines.
 ///
 /// # Safety
 /// `kwargs` must be a live object.
@@ -4514,12 +4516,17 @@ unsafe fn fbw_bind_star_kwargs(
         (*kwargs).ob_type == &pyre_object::pyobject::DICT_TYPE as *const _
             && (*kwargs).w_class == pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE)
     };
-    if !exact_dict
-        || !std::ptr::eq(
-            unsafe { (*(kwargs as *const pyre_object::W_DictObject)).dstrategy },
-            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
-        )
-    {
+    if !exact_dict {
+        return None;
+    }
+    let dstrategy = unsafe { (*(kwargs as *const pyre_object::W_DictObject)).dstrategy };
+    if !std::ptr::eq(
+        dstrategy,
+        &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
+    ) && !std::ptr::eq(
+        dstrategy,
+        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+    ) {
         return None;
     }
     if !fbw_callee_scope_is_positional_only(w_code) {
@@ -4548,6 +4555,14 @@ unsafe fn fbw_bind_star_kwargs(
     let roots = pyre_object::gc_roots::push_roots();
     let kwargs_slot = roots.base();
     let _ = roots.pin_root(kwargs);
+    let lookup = if std::ptr::eq(
+        dstrategy,
+        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+    ) {
+        pyre_object::kwargsdict::w_dict_lookup_or_null_kwargs_strategy
+    } else {
+        pyre_object::dictmultiobject::w_dict_lookup_or_null_unicode_strategy
+    };
     let mut bound = Vec::new();
     let mut value_slots = Vec::new();
     for (index, name) in names {
@@ -4560,9 +4575,7 @@ unsafe fn fbw_bind_star_kwargs(
             return None;
         }
         let kwargs = roots.get(kwargs_slot);
-        if let Some(value) = unsafe {
-            pyre_object::dictmultiobject::w_dict_lookup_or_null_unicode_strategy(kwargs, name_obj)
-        } {
+        if let Some(value) = unsafe { lookup(kwargs, name_obj) } {
             value_slots.push(pyre_object::gc_roots::shadow_stack_len());
             let _ = roots.pin_root(value);
             bound.push((index, name_obj, value));
@@ -4577,7 +4590,11 @@ unsafe fn fbw_bind_star_kwargs(
     if bound.len() != unsafe { pyre_object::dictmultiobject::w_dict_len(kwargs) } {
         return None;
     }
-    Some(StarKwargsInline { dict_op, bound })
+    Some(StarKwargsInline {
+        dict_op,
+        strategy: dstrategy,
+        bound,
+    })
 }
 
 /// Body-shape verdicts for a callee's per-fn JitCode, decided once and kept on
@@ -8748,8 +8765,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
 
     if let Some(kw) = star_kwargs {
         // `view_as_kwargs` reads the keys and values of an exact dict under
-        // the unicode strategy; the class and strategy guards re-prove the
-        // layout the resolve bound the names against.
+        // the unicode or kwargs strategy; the class and strategy guards re-prove
+        // the layout the resolve bound the names against.
         walker_guard_class(
             ctx,
             op.pc,
@@ -8767,9 +8784,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             kw.dict_op,
             crate::descr::dict_strategy_word_descr(),
         );
-        let strategy_const = ctx
-            .trace_ctx
-            .const_int(&pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64);
+        let strategy_const = ctx.trace_ctx.const_int(kw.strategy as *const _ as i64);
         walker_emit_guard_with_snapshot(
             ctx,
             op.pc,
@@ -8797,6 +8812,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             .set_opref_concrete(len_op, majit_ir::Value::Int(kw.bound.len() as i64));
         let expected = ctx.trace_ctx.const_int(kw.bound.len() as i64);
         walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[len_op, expected])?;
+        let lookup = if std::ptr::eq(
+            kw.strategy,
+            &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+        ) {
+            crate::helpers::jit_dict_exact_kwargs_lookup_or_null as *const ()
+        } else {
+            crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const ()
+        };
         for &(index, name, _) in &kw.bound {
             let value = match arg_root_slots.get(index).copied().flatten() {
                 Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
@@ -8807,7 +8830,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             };
             let name_op = ctx.trace_ctx.const_ref(name as i64);
             let value_op = ctx.trace_ctx.call_ref_typed_with_effect(
-                crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const (),
+                lookup,
                 &[kw.dict_op, name_op],
                 &[Type::Ref, Type::Ref],
                 effect.clone(),

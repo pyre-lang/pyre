@@ -284,6 +284,19 @@ unsafe fn kwargs_getitem_correct_indirection(
     None
 }
 
+/// `kwargsdict.py KwargsDictStrategy.getitem_str` for a dict already known to
+/// be on this strategy: `_getitem_correct_indirection` on an exact unicode key.
+///
+/// # Safety
+/// `w_dict` must be a live dict whose strategy is `KWARGS_DICT_STRATEGY_REF`,
+/// and `w_key` a live exact str.
+pub unsafe fn w_dict_lookup_or_null_kwargs_strategy(
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    kwargs_getitem_correct_indirection(w_dict, w_key)
+}
+
 crate::register_dyn_impl_vtable!(
     DYN_IMPL_KwargsDictStrategy,
     KwargsDictStrategy,
