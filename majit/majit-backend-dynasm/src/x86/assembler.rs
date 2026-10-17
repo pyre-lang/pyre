@@ -1095,44 +1095,18 @@ pub(crate) fn build_frame_realloc_slowpath(
     (buffer, ptr)
 }
 
-/// Overflow epilogue for `_build_stack_check_slowpath`. Same stores as
-/// the prologue's old inline overflow (`pos_exc_value` into `jf_guard_exc`,
-/// both cells cleared, `propagate_exception_descr` into `jf_descr`), then
-/// the callee-save restore and `ret` from `_call_footer` without
-/// `emit_footer_shadowstack_raw`. Entry `rsp` is the trace body's `rsp`:
-/// the helper's `add rsp, WORD` already dropped its own return address.
-fn emit_stack_overflow_footer(asm: &mut Assembler, propagate_descr: i64) {
-    let scratch = rx86::R11;
-    let exc_value_addr = crate::jit_exc_value_addr() as i64;
-    let exc_type_addr = crate::jit_exc_type_addr() as i64;
-    rx86::mov_ri(asm, scratch, exc_value_addr);
-    rx86::mov_rm(asm, rx86::EAX, (scratch, 0));
-    rx86::mov_mi(asm, (scratch, 0), 0);
-    rx86::mov_br(asm, JF_GUARD_EXC_OFS, rx86::EAX);
-    rx86::mov_ri(asm, scratch, exc_type_addr);
-    rx86::mov_mi(asm, (scratch, 0), 0);
-    rx86::mov_ri(asm, scratch, propagate_descr);
-    rx86::mov_br(asm, JF_DESCR_OFS, scratch);
-    dynasm!(asm ; .arch x64 ; mov rax, rbp);
-    // Same restore as `_call_footer`, without `emit_footer_shadowstack_raw`:
-    // the probe runs before the shadow push.
-    emit_restore_callee_saves(asm);
-    dynasm!(asm ; .arch x64 ; ret);
-}
-
-/// `_build_stack_check_slowpath`, plus the no-pop overflow footer instead
-/// of `JMP propagate_exception_path`. The registered function is
+/// `_build_stack_check_slowpath`. The registered function is
 /// `extern "C" fn(current: usize) -> u8`; this helper passes the entry
 /// `rsp` and then tests `pos_exception`, not `al`.
 pub(crate) fn build_stack_check_slowpath(
     slowpath_addr: usize,
-    propagate_descr: usize,
+    propagate_exception_path: usize,
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
     assert!(slowpath_addr != 0, "stack_check_slowpath address is 0");
     assert!(
-        propagate_descr != 0,
-        "build_stack_check_slowpath: propagate_exception_descr is 0"
+        propagate_exception_path != 0,
+        "build_stack_check_slowpath: propagate_exception_path is 0"
     );
     let mut asm = Assembler::new(0);
     #[cfg(target_os = "windows")]
@@ -1155,10 +1129,12 @@ pub(crate) fn build_stack_check_slowpath(
         ; ret
         ; =>overflow
     );
-    // Drop this helper's return address. The footer `ret` returns to the
-    // original caller. `rsp` is then the trace body's `rsp`.
+    // From now on this function is basically "merged" with its caller:
+    // drop my own return address, then `JMP(imm(propagate_exception_path))`
+    // through r11, since the two helpers are separate arena blocks.
     rx86::add_ri(&mut asm, rx86::ESP, WORD as i32);
-    emit_stack_overflow_footer(&mut asm, propagate_descr as i64);
+    rx86::mov_ri(&mut asm, rx86::R11, propagate_exception_path as i64);
+    dynasm!(asm ; .arch x64 ; jmp r11);
     let buffer = codebuf::finalize_executable(asm, arena).expect("stack_check_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
@@ -2986,8 +2962,8 @@ impl<'a> Assembler386<'a> {
     /// x64: System V AMD64 ABI — first arg (jf_ptr) in RDI.
     /// aarch64: AAPCS64 — first arg (jf_ptr) in X0.
     ///
-    /// `_call_header_with_stack_check`: SP probe after the prologue
-    /// and before `gen_shadowstack_header`. Deep compiled-to-compiled
+    /// `_call_header_with_stack_check`: SP probe after `_call_header`,
+    /// which ends with `_call_header_shadowstack`. Deep compiled-to-compiled
     /// recursion returns the caller-provided jf_ptr in RAX so the glue
     /// drains the overflow on the way back to the interpreter.
     ///
@@ -2999,9 +2975,10 @@ impl<'a> Assembler386<'a> {
     ///   JA   slow                 ; not taken when eax <= [length]
     /// continue:
     /// ```
-    /// The slow body is one `call` of `stack_check_slowpath`. Overflow
-    /// returns through that helper's footer and does not pop the shadow
-    /// stack: this probe runs before the push.
+    /// The slow body is one `call` of `stack_check_slowpath`. On overflow
+    /// that helper drops its return address and jumps to
+    /// `propagate_exception_path`, whose `_call_footer` pops the shadow
+    /// stack entry pushed above.
     fn _call_header(&mut self, inputargs: &[InputArgRc]) {
         // x86/assembler.py `_call_header`. One
         // `SUB rsp, FRAME_FIXED_SIZE * WORD` reserves the
@@ -3027,6 +3004,8 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; mov rbp, rdi);
         }
         emit_save_callee_saves(&mut self.mc);
+        // `_call_header_shadowstack`, the tail of `_call_header`.
+        self.gen_shadowstack_header();
         // `_call_header_with_stack_check`: emit nothing while
         // `stack_check_slowpath` is 0 (descr missing, or
         // `insert_stack_check` not registered). The helper is built
@@ -3046,7 +3025,6 @@ impl<'a> Assembler386<'a> {
             self.set_continue_here(&mut sp);
             self.pending_slowpaths.push(sp);
         }
-        self.gen_shadowstack_header();
         self.setup_input_state(inputargs);
     }
 

@@ -3441,14 +3441,6 @@ fn assert_stack_probe(code: &[u8]) {
     assert_eq!(jcc, Some(&[0x0F, 0x87][..]), "not-taken ja, not jbe");
 }
 
-fn shadow_words() -> (usize, usize, usize) {
-    let top = shadow_top();
-    if top == 0 {
-        return (0, 0, 0);
-    }
-    unsafe { (top, *(top as *const usize), *((top + 8) as *const usize)) }
-}
-
 /// `_call_header_with_stack_check`. `STACK_CHECK_ADDRS` is a process-wide
 /// `OnceLock`, so the unregistered probe and the three slow-path behaviours
 /// share this one test.
@@ -3483,6 +3475,12 @@ fn stack_check_slowpath_once_per_process() {
     // compile must retry `ensure_stack_check_slowpath`.
     let token = compile_input_finish(&mut backend);
     assert_stack_probe(compiled_bytes(&token));
+    // `_call_header_shadowstack` (`mov [rax+8], rbp`) precedes the probe.
+    assert!(
+        unique_bytes(compiled_bytes(&token), &[0x48, 0x89, 0x68, 0x08])
+            < unique_bytes(compiled_bytes(&token), &[0x48, 0x29, 0xE0]),
+        "the stack check follows the shadow-stack push"
+    );
 
     let _lock = lock_exception_cells();
     let _clear = ClearExc;
@@ -3490,17 +3488,17 @@ fn stack_check_slowpath_once_per_process() {
     STACK_LENGTH.store(0, Ordering::Release);
     STACK_MODE.with(|mode| mode.set(2));
     STACK_CALLS.with(|calls| calls.set(0));
-    let before = shadow_words();
+    let before = shadow_top();
     let frame = backend.execute_token(&token, &[Value::Int(7)]);
     assert_propagate(&backend, &frame);
     assert!(
         !majit_backend_dynasm::jit_exc_is_pending(),
-        "the overflow footer clears both exception cells"
+        "propagate_exception_path clears both exception cells"
     );
     assert_eq!(
-        shadow_words(),
+        shadow_top(),
         before,
-        "overflow runs before gen_shadowstack_header and must not pop"
+        "the probe runs after the shadow-stack push, and          propagate_exception_path's _call_footer pops it"
     );
     assert!(
         STACK_CALLS.with(|calls| calls.get()) >= 1,
