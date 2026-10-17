@@ -4075,6 +4075,94 @@ fn zero_array_displacement_crosses_i32() {
     run_zero_array_at(ZERO_ARRAY_UNROLL_LIMIT + 16, 0, false, false, bias);
 }
 
+/// `consider_zero_array`'s memset() path with a variable length:
+/// `LEA` of the destination, `LEA` of the byte length when the length
+/// scale is 8, and `simple_call_no_collect`. A value computed before the
+/// call and the length itself must survive it.
+fn run_zero_array_variable_length(
+    items: i64,
+    start: i64,
+    len_itemsize: i64,
+    use_length_after: bool,
+) {
+    const BASEOFS: usize = 16;
+    let total = BASEOFS + ((start + items) as usize + 2) * 8;
+    let mut buf = vec![0xAAu8; total];
+    let ptr = buf.as_mut_ptr() as usize;
+    let descr: DescrRef = Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        BASEOFS,
+        8,
+        1,
+        Type::Int,
+    ));
+    let length = if len_itemsize == 1 { items * 8 } else { items };
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+    ];
+    let x = OpRef::int_op(3);
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[rb(OpRef::input_arg_int(1)), rb(OpRef::const_int(1000))],
+    );
+    add.pos().set(x);
+    let zero = Op::new(
+        OpCode::ZeroArray,
+        &[
+            rb(OpRef::input_arg_ref(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_int(2)),
+            rb(OpRef::const_int(8)),
+            rb(OpRef::const_int(len_itemsize)),
+        ],
+    );
+    zero.pos().set(OpRef::void_op(4));
+    zero.setdescr(descr);
+    let mut ops = vec![OpRc::new(add), OpRc::new(zero)];
+    let result = if use_length_after {
+        let y = OpRef::int_op(5);
+        let sum = Op::new(OpCode::IntAdd, &[rb(x), rb(OpRef::input_arg_int(2))]);
+        sum.pos().set(y);
+        ops.push(OpRc::new(sum));
+        y
+    } else {
+        x
+    };
+    ops.push(OpRc::new(finish_of(result, Type::Int, 6)));
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile variable ZERO_ARRAY: {err:?}"));
+    let frame = backend.execute_token(
+        &token,
+        &[
+            Value::Ref(GcRef(ptr)),
+            Value::Int(start),
+            Value::Int(length),
+        ],
+    );
+    let expected = start + 1000 + if use_length_after { length } else { 0 };
+    assert_eq!(backend.get_int_value(&frame, 0), expected);
+    let lo = BASEOFS + start as usize * 8;
+    let hi = lo + items as usize * 8;
+    assert!(buf[..lo].iter().all(|&b| b == 0xAA), "{:02x?}", &buf[..lo]);
+    assert!(buf[lo..hi].iter().all(|&b| b == 0), "{:02x?}", &buf[lo..hi]);
+    assert!(buf[hi..].iter().all(|&b| b == 0xAA), "{:02x?}", &buf[hi..]);
+}
+
+#[test]
+fn zero_array_memset_variable_length() {
+    for len_itemsize in [1, 8] {
+        for use_length_after in [false, true] {
+            run_zero_array_variable_length(40, 3, len_itemsize, use_length_after);
+            run_zero_array_variable_length(0, 2, len_itemsize, use_length_after);
+        }
+    }
+}
+
 static CALL_ENTRY_RSP: AtomicUsize = AtomicUsize::new(0);
 
 fn assert_call_entry_aligned() {

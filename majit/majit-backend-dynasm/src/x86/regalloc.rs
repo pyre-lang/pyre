@@ -9,13 +9,13 @@
 //! `x86` module is `#[cfg(target_arch = "x86_64")]` gated in
 //! `lib.rs`, so these methods only compile on x86_64.
 
-use crate::regalloc::{RegAlloc, RegAllocOp, fits_in_32bits};
-use crate::regloc::Loc;
+use crate::regalloc::{Lifetime, RegAlloc, RegAllocOp, fits_in_32bits};
 use crate::regloc::{
     EAX, EBP, EBX, ECX, EDI, EDX, ESI, R8, R9, R10, R12, R13, R14, R15, RegLoc, XMM0, XMM1, XMM2,
     XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14,
 };
-use majit_ir::{OpRc, OpRef, Type};
+use crate::regloc::{Loc, X86_64_XMM_SCRATCH_REG};
+use majit_ir::{Op, OpRc, OpRef, Type};
 
 /// x86/regalloc.py X86_64_RegisterManager.all_regs — the GPR allocation
 /// pool.  Order chosen to prefer caller-save first (popped from end).
@@ -339,6 +339,127 @@ impl<'a> RegAlloc<'a> {
             &mut self.pending_moves,
         );
         self.perform(i, [loc], Some(loc), output);
+    }
+
+    /// x86/regalloc.py `consider_zero_array`. A constant length up to
+    /// `16 * 8` bytes is unrolled by `genop_discard_zero_array`
+    /// (`[base_loc, startindex_loc, imm(constbytes), imm(start_itemsize),
+    /// imm(baseofs), null_loc]`). Otherwise memset() is called; upstream
+    /// emits the `LEA`s and `simple_call_no_collect` from here, and the
+    /// assembler emits them from `[base_loc, startindex_loc,
+    /// imm(start_itemsize), imm(baseofs), dstaddr_loc, length_loc,
+    /// imm(len_itemsize), bytes_loc]`.
+    pub(crate) fn consider_zero_array_j2(
+        &mut self,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let baseofs = op
+            .with_array_descr(|ad| ad.base_size() as i64)
+            .expect("ZERO_ARRAY needs an ArrayDescr");
+        let mut length_box = args[2];
+
+        assert!(args[3].is_constant());
+        let start_itemsize = self.const_value(args[3]);
+
+        assert!(args[4].is_constant());
+        let len_itemsize = self.const_value(args[4]);
+        // rewrite handles the mul of a constant length box
+        let constbytes = if length_box.is_constant() {
+            self.const_value(length_box)
+        } else {
+            -1
+        };
+        let base_loc = self.make_sure_var_in_reg(args[0], self.tp(args[0]), args, None, false);
+        let startindex_loc =
+            self.make_sure_var_in_reg(args[1], self.tp(args[1]), args, None, false);
+        if (0..=16 * 8).contains(&constbytes) {
+            let null_loc = Loc::Reg(X86_64_XMM_SCRATCH_REG);
+            self.perform_discard(
+                i,
+                vec![
+                    base_loc,
+                    startindex_loc,
+                    Loc::immed(constbytes),
+                    Loc::immed(start_itemsize),
+                    Loc::immed(baseofs),
+                    null_loc,
+                ],
+                output,
+            );
+        } else {
+            // base_loc and startindex_loc are in two regs here (or they are
+            // immediates).  Compute the dstaddr_loc, which is the raw
+            // address that we will pass as first argument to memset().
+            // It can be in the same register as either one, but not in
+            // args[2], because we're still needing the latter.
+            let dstaddr_box = self.fresh_temp_var();
+            self.longevity.set(
+                dstaddr_box,
+                Lifetime::new(self.rm.position, self.rm.position),
+            );
+            let dstaddr_loc = Loc::Reg(self.rm.force_allocate_reg(
+                dstaddr_box,
+                &[args[2]],
+                None,
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            ));
+            let mut len_itemsize_loc = Loc::immed(1);
+            let length_loc;
+            let mut bytes_loc;
+            if constbytes >= 0 {
+                length_loc = Loc::immed(constbytes);
+                bytes_loc = length_loc;
+            } else {
+                // load length_loc in a register different than dstaddr_loc
+                length_loc =
+                    self.make_sure_var_in_reg(length_box, Type::Int, &[dstaddr_box], None, false);
+                bytes_loc = length_loc;
+                if len_itemsize > 1 {
+                    // we need a register that is different from dstaddr_loc,
+                    // but which can be identical to length_loc (as usual,
+                    // only if the length_box is not used by future operations)
+                    let bytes_box = self.fresh_temp_var();
+                    self.longevity
+                        .set(bytes_box, Lifetime::new(self.rm.position, self.rm.position));
+                    bytes_loc = Loc::Reg(self.rm.force_allocate_reg(
+                        bytes_box,
+                        &[dstaddr_box],
+                        None,
+                        false,
+                        &mut self.longevity,
+                        &mut self.fm,
+                    ));
+                    len_itemsize_loc = Loc::immed(len_itemsize);
+                    length_box = bytes_box;
+                }
+            }
+            //
+            // call memset()
+            self.preserve_for_zero_array_memset();
+            self.perform_discard(
+                i,
+                vec![
+                    base_loc,
+                    startindex_loc,
+                    Loc::immed(start_itemsize),
+                    Loc::immed(baseofs),
+                    dstaddr_loc,
+                    length_loc,
+                    len_itemsize_loc,
+                    bytes_loc,
+                ],
+                output,
+            );
+            self.rm
+                .possibly_free_var(length_box, &mut self.longevity, &mut self.fm, Type::Int);
+            self.rm
+                .possibly_free_var(dstaddr_box, &mut self.longevity, &mut self.fm, Type::Int);
+        }
     }
 
     /// x86/regalloc.py `consider_int_is_true` / `consider_int_is_zero`.

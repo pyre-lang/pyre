@@ -2552,7 +2552,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py perform_discard
-    fn perform_discard(
+    pub(crate) fn perform_discard(
         &mut self,
         op_index: usize,
         arglocs: Vec<Loc>,
@@ -6790,7 +6790,7 @@ impl<'a> RegAlloc<'a> {
         }
     }
 
-    fn preserve_for_zero_array_memset(&mut self) {
+    pub(crate) fn preserve_for_zero_array_memset(&mut self) {
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,
@@ -6828,6 +6828,7 @@ impl<'a> RegAlloc<'a> {
         self.perform_discard(i, locs, output);
     }
 
+    #[cfg(not(target_arch = "x86_64"))]
     fn consider_zero_array_j2(
         &mut self,
         args: &[OpRef],
