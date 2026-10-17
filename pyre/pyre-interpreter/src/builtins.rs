@@ -3701,7 +3701,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             crate::gateway::function_set_null_positional_defaults(
                 crate::gateway::make_module_builtin_function_with_arity_and_sig(
                     "next",
-                    builtin_next,
+                    __majit_wrap_builtin_next,
                     2,
                     crate::gateway::Signature::new(vec!["iterator", "default"], None, None, 0, 2),
                 ),
@@ -15525,6 +15525,14 @@ fn builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
     }
 }
+
+/// `next(iterator[, default])`'s gateway entry, as `__majit_wrap_builtin_iter`
+/// is `iter`'s: the traced call descends through it into `space.next`.
+pub fn __majit_wrap_builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_next(args)
+}
+
+crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_next_target, __majit_wrap_builtin_next);
 
 /// `next(iterator[, default])` — PyPy: baseobjspace.py next
 fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
