@@ -542,6 +542,95 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
     );
 }
 
+/// Loop over `(f0, f1, i2)` guarded by `GUARD_VALUE(f0, rhs)`, then a counter
+/// that exits through `GUARD_TRUE(i < 5)`. Returns `(exited_at_counter, i)`:
+/// a counter exit means every `GUARD_VALUE` passed, `i == 0` from the first
+/// `GUARD_VALUE` means it failed on entry.
+#[cfg(target_arch = "x86_64")]
+fn run_float_guard_value_loop(rhs: OpRef, f0: f64, f1: f64) -> (bool, i64) {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(3);
+
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Float, 0),
+        InputArg::from_type_rc(Type::Float, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+    ];
+    let a = OpRef::input_arg_float(0);
+    let b = OpRef::input_arg_float(1);
+    let i = OpRef::input_arg_int(2);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
+
+    let label_op = Op::new(OpCode::Label, &[rb(a), rb(b), rb(i)]);
+    label_op.pos().set(OpRef::void_op(100));
+    label_op.setdescr(loop_descr.clone());
+
+    let value_descr = make_resume_guard_descr_typed(vec![Type::Float, Type::Int]);
+    let value_guard = Op::new(OpCode::GuardValue, &[rb(a), rb(rhs)]);
+    value_guard.pos().set(OpRef::void_op(1));
+    value_guard.set_fail_arg_types(vec![Type::Float, Type::Int]);
+    value_guard.setfailargs(vec![rb(a), rb(i)].into());
+    value_guard.setdescr(value_descr.clone());
+
+    let inc_op = Op::new(OpCode::IntAdd, &[rb(i), rb(OpRef::const_int(1))]);
+    inc_op.pos().set(OpRef::int_op(2));
+
+    let lt_op = Op::new(
+        OpCode::IntLt,
+        &[rb(OpRef::int_op(2)), rb(OpRef::const_int(5))],
+    );
+    lt_op.pos().set(OpRef::int_op(3));
+
+    let counter_descr = make_resume_guard_descr_typed(vec![Type::Float, Type::Int]);
+    let counter_guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(3))]);
+    counter_guard.pos().set(OpRef::void_op(4));
+    counter_guard.set_fail_arg_types(vec![Type::Float, Type::Int]);
+    counter_guard.setfailargs(vec![rb(a), rb(OpRef::int_op(2))].into());
+    counter_guard.setdescr(counter_descr.clone());
+
+    let jump_op = Op::new(OpCode::Jump, &[rb(a), rb(b), rb(OpRef::int_op(2))]);
+    jump_op.pos().set(OpRef::void_op(5));
+    jump_op.setdescr(loop_descr);
+
+    let ops_rc: Vec<OpRc> = vec![label_op, value_guard, inc_op, lt_op, counter_guard, jump_op]
+        .into_iter()
+        .map(OpRc::new)
+        .collect();
+    backend
+        .compile_loop(&inputargs, &ops_rc, &token)
+        .expect("compile loop with a float GUARD_VALUE");
+
+    let frame = backend.execute_token(&token, &[Value::Float(f0), Value::Float(f1), Value::Int(0)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert!(!descr.is_finish(), "the loop exits only through a guard");
+    let counter_fd = counter_descr
+        .as_fail_descr()
+        .expect("GUARD_TRUE descr is FailDescr");
+    let exited_at_counter = std::ptr::addr_eq(descr, counter_fd);
+    assert_eq!(backend.get_float_value(&frame, 0), f0);
+    (exited_at_counter, backend.get_int_value(&frame, 1))
+}
+
+/// `genop_guard_guard_value` compares a FLOAT operand with `UCOMISD`; here
+/// against a `ConstFloat`.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn guard_value_on_a_float_against_a_const_float() {
+    let k = OpRef::const_float(2.5);
+    assert_eq!(run_float_guard_value_loop(k, 2.5, 0.0), (true, 5));
+    assert_eq!(run_float_guard_value_loop(k, 1.0, 0.0), (false, 0));
+}
+
+/// `genop_guard_guard_value` with both FLOAT operands in xmm registers.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn guard_value_on_a_float_against_a_float_box() {
+    let b = OpRef::input_arg_float(1);
+    assert_eq!(run_float_guard_value_loop(b, -3.75, -3.75), (true, 5));
+    assert_eq!(run_float_guard_value_loop(b, -3.75, 3.75), (false, 0));
+}
+
 #[test]
 fn test_float_loop_carried_across_jump() {
     let mut backend = DynasmBackend::new();

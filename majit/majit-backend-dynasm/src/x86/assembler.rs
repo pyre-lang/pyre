@@ -5906,9 +5906,31 @@ impl<'a> Assembler386<'a> {
                     faillocs,
                 );
             }
+            // `genop_guard_guard_value`: `UCOMISD` when `getarg(0).type ==
+            // FLOAT`, `CMP` otherwise. `consider_guard_value` puts arg 0 in
+            // a register; arg 1 keeps its `self.loc()` location code.
             OpCode::GuardValue => {
                 if arglocs.len() >= 2 {
-                    self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
+                    if op.arg(0).to_opref().ty() == Some(majit_ir::Type::Float) {
+                        assert_eq!(op.arg(1).to_opref().ty(), Some(majit_ir::Type::Float));
+                        let Loc::Reg(x) = arglocs[0] else {
+                            panic!(
+                                "GUARD_VALUE float operand must be in a register \
+                                 (consider_guard_value), got {:?}",
+                                arglocs[0]
+                            );
+                        };
+                        self.emit_sd_src(
+                            x.value,
+                            &arglocs[1],
+                            rx86::ucomisd_xx,
+                            rx86::ucomisd_xb,
+                            rx86::ucomisd_xm,
+                            rx86::ucomisd_xj,
+                        );
+                    } else {
+                        self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
+                    }
                     self.guard_success_cc = Some(CC_E);
                 }
                 self.implement_guard_with_faillocs(
