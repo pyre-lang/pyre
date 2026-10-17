@@ -2320,11 +2320,10 @@ fn emit_jump_absolute_tick(
         // PC's first insn at the setfield, whose nearest `-live-` is
         // STORE_FAST's trailing marker (dead boxed temps still SSA-live).
         // The snapshot then treated those colors as kept operand-stack
-        // slots (`BranchGuardKeptSlotUnsourced`).  `get_list_of_active_boxes`
-        // (`pyjitpl.py`) reads the terminator's own `-live-`.  A fresh
-        // block's head `-live-` is the jump's frame-state variables — the
-        // same set the slow/hot arms already use — so the resume marker
-        // and the guard agree.
+        // slots.  `get_list_of_active_boxes` (`pyjitpl.py`) reads the
+        // terminator's own `-live-`.  A fresh block's head `-live-` is the
+        // jump's frame-state variables — the same set the slow/hot arms
+        // already use — so the resume marker and the guard agree.
         let mut tick_state = current_state.clone();
         tick_state.next_offset = py_pc;
         tick_state.blocklist = frame_blocks_for_offset(code, py_pc);
@@ -13374,8 +13373,7 @@ impl CodeWriter {
                             // not-taken arm resumes a slot this op
                             // already wrote. Pushing only on the bound
                             // arm leaves that slot live with no source
-                            // (`BranchGuardKeptSlotUnsourced`) and the
-                            // walk aborts after earlier stores.
+                            // and the walk aborts after earlier stores.
                             let value_value = emit_read_local_ref!(idx, py_pc);
                             let truth = emit_graph_op_with_result(
                                 &mut graph,

@@ -6653,14 +6653,11 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
             ctx.registers_r,
             ctx.registers_f,
             outer_jitcode_index,
-            false,
             call_site_word,
             op.pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
             active_tag,
             vstack,
-            &[],
-            None,
         )
     };
     Some(BuiltinWrapperCallSite {
@@ -7243,14 +7240,11 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             ctx.registers_r,
             ctx.registers_f,
             outer_jitcode_index,
-            false,
             call_site_word,
             op.pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
             "builtin_wrapper_call_site",
             vstack,
-            &[],
-            None,
         )
     };
 
@@ -10042,7 +10036,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     ctx.registers_r,
                     ctx.registers_f,
                     call_site_jc_index,
-                    false,
                     call_site_word,
                     // Keep the marker for the liveness-bank query, but key
                     // entry metadata to the raw CALL offset that produced the
@@ -10050,8 +10043,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     op.pc as i32,
                     OuterActiveBoxesEntryTwin::Plain,
                     "call_site_capture",
-                    None,
-                    &[],
                     None,
                 );
                 (

@@ -2108,9 +2108,10 @@ pub(crate) struct BridgeSemanticMaps {
 /// Which bucket a caller can produce is fixed by the argument it passes, so the
 /// two ends must not be welded together:
 /// * `setup_bridge_sym` is the one consumer that reads `stack_depth_at_pc`
-///   outside a `pcdep_entries` loop (`stack_only.max(..)` →
-///   `semantic_prefix_len`), and it passes `None` — so `no_py_pc` is the only
-///   bucket reachable from there and `in_range_*` is structurally unreachable.
+///   outside a `pcdep_entries` loop (`seed_deferred_to_overlay` compares
+///   pcdep depth to the resumed virtualizable stack), and it passes `None`
+///   — so `no_py_pc` is the only bucket reachable from there and
+///   `in_range_*` is structurally unreachable.
 /// * `in_range_nonzero` can only come from the one caller that supplies a
 ///   `Some` coordinate, `resume_snapshot.rs`
 ///   `walker_capture_snapshot_for_last_guard_impl`'s `liveness_py_pc`, whose
@@ -2263,20 +2264,18 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             };
         };
         let payload = &jc.payload;
-        // Expand a tagged branch `orgpc` word to the block-head marker
-        // BEFORE the `>= 0` / offset uses below — a tagged NEGATIVE word cast to
-        // usize would otherwise be a huge OOB index. No-op for offsets /
-        // NO_JITCODE_PC (flip-off), so byte-identical when off.
-        let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(payload, jitcode_pc);
+        // Branch guards carry the jump's `-live-` BEFORE as a non-negative
+        // offset (`generate_guard(resumepc=orgpc)`). `NO_JITCODE_PC` is the
+        // only negative sentinel.
         // A `Some` py_pc is already the published resume coordinate, so the
         // py_pc-keyed liveness/depth table fallback reads it directly.
         //
-        // When the carried `jitcode_pc` is set (kept-stack branch
-        // guard), resolve the guard's Python PC from the jitcode coordinate
-        // and use it for the pcdep/depth lookup, matching the encode side's
-        // `liveness_py_pc = guard_py_pc` keying. The guard PC is where the
-        // computed kept operand-stack temps are live; at the merge-target PC
-        // they've been consumed and carry no pcdep entry.
+        // When the carried `jitcode_pc` is set, resolve the guard's Python PC
+        // from the jitcode coordinate and use it for the pcdep/depth lookup,
+        // matching the encode side's `liveness_py_pc = guard_py_pc` keying.
+        // A branch guard carries the jump's own `-live-`
+        // (`generate_guard(resumepc=orgpc)`), so that coordinate is where
+        // `get_list_of_active_boxes` reads.
         //
         // A caller holding no Python coordinate reads the floor-only static
         // depth twin.  Frame width is a containing-operation property and does
@@ -2388,10 +2387,6 @@ pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> V
         let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
             return Vec::new();
         };
-        // Expand a tagged branch `orgpc` word to the block-head marker
-        // before the `>= 0` / offset uses below. No-op for offsets /
-        // NO_JITCODE_PC (flip-off), so byte-identical when off.
-        let jitcode_pc = crate::jitcode_dispatch::expand_branch_carried(&jc.payload, jitcode_pc);
         if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
             let jp = jitcode_pc as usize;
             if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
@@ -11476,34 +11471,7 @@ impl JitState for PyreJitState {
                 // live color to its slot via `semantic_ref_slot_for_reg_color` so the
                 // mirror is correct under freely-colored locals.
                 let maps = resume_maps;
-                // For a kept-stack branch guard, the vable's runtime
-                // `valuestackdepth` reflects the merge-target depth (post
-                // consumption) rather than the guard's deeper live depth. The
-                // guard-PC pcdep `stack_depth_at_pc` IS the guard-time depth
-                // (with kept temps live). Widen `semantic_prefix_len` to the
-                // pcdep depth so the color→slot inversion covers kept temps.
-                let stack_only = stack_only.max(maps.stack_depth_at_pc);
                 let semantic_prefix_len = nlocals + stack_only;
-                // Extend bridge_registers_r to cover the wider depth.
-                if bridge_registers_r.len() < semantic_prefix_len {
-                    bridge_registers_r.resize(semantic_prefix_len, OpRef::NONE);
-                }
-                if majit_metainterp::majit_log_enabled()
-                    && crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
-                {
-                    let old_so = bridge_valuestackdepth.saturating_sub(nlocals);
-                    eprintln!(
-                        "[jit][kept-stack-bridge] jitcode_pc={} pc={} pcdep={:?} \
-                     depth_at_guard={} vsd={} stack_only={}→{}",
-                        frame0.pc,
-                        frame0.pc,
-                        maps.pcdep_entries,
-                        maps.stack_depth_at_pc,
-                        bridge_valuestackdepth,
-                        old_so,
-                        stack_only,
-                    );
-                }
                 // virtualizable.py read_boxes + pyjitpl.py synchronize_virtualizable:
                 // the frame's `locals_cells_stack_w` array (the vable image) is the
                 // authoritative post-guard source for the frame's locals. At an

@@ -7057,12 +7057,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::AbortPermanentMarkerReached { .. } => TraceAction::AbortPermanent,
                 DE::GuardSnapshotVableUntyped { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
-                // Listed with its sibling kept-stack decline rather than left
-                // to the catch-all: the mirror shape and recovery set behind it
-                // are per-walk, not a static property of the coordinate, so
-                // retiring the location would be too strong.  The abort ceiling
-                // reaches the same terminal state if it does recur.
-                | DE::BranchGuardKeptSlotUnsourced { .. }
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
                 // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS

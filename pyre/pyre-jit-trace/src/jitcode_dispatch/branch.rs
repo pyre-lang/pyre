@@ -8,9 +8,8 @@
 //! divergence, not a tracer one.
 //!
 //! Helpers for the `goto_if_*` guard arms: follow register-renaming
-//! trampolines to the real py-boundary target, decode the side-exit
-//! other-target, and decide whether a branch arm resume can restore the
-//! kept operand stack.
+//! trampolines to the real py-boundary target, and decide whether a
+//! branch arm resume can restore the kept operand stack.
 
 use super::*;
 
@@ -70,100 +69,17 @@ pub(crate) fn resolve_branch_target_through_trampoline(code: &[u8], target: usiz
     resume
 }
 
-/// Re-derive a branch guard's resume `other_target` from
-/// the guard's OWN `-live-` BEFORE anchor `orgpc` (== ctx.live_before_jit_pc at
-/// the goto_if_not) + the recorded flavor (GuardTrue/GuardFalse), WITHOUT the
-/// runtime condbox — mirroring PyPy generate_guard(resumepc=orgpc) (pyjitpl.py),
-/// where orgpc is arm-independent and the arm is re-derived. A BOUNDED single
-/// leading `-live-` skip (NOT a permissive loop), mirroring pyjitpl.py's
-/// `assert code[pc]==op_live`: a mispositioned orgpc (e.g. `live; ref_copy;
-/// goto_if_not`, orgpc one op early) FAILS loudly rather than being walked forward.
-///
-/// The only conditional-branch opname in a stream this decoder reads is
-/// `goto_if_not` (`goto_if_not/iL`), so the goto opname set is the single
-/// `"goto_if_not"`. That is a fact about the STREAM, not about the walker: the
-/// walk dispatch does carry arms for the jtransform-fused `goto_if_not_<cmp>`
-/// forms, and `majit-translate`'s jtransform does mint them (`ExitSwitch::Fused`
-/// in `codewriter/jtransform.rs`), for the LLBC-lowered helper graphs. But the
-/// sole caller — [`expand_branch_carried`] — passes a `PyJitCode`, which is
-/// built per Python CodeObject by pyre's own codewriter, and that path has no
-/// producer of a fused exitswitch: pyre keeps COMPARE_OP and the branch as
-/// SEPARATE JitCode ops, so `flatten`'s tuple-exitswitch arm is reached only
-/// from its own unit test. Were one to appear anyway, the failure is a declined
-/// capture rather than a mis-decode — the `Err("notgoto")` below propagates as
-/// `NO_JITCODE_PC`, and the encode self-cert refuses to tag a word whose
-/// reconstruction fails.
-/// The `L` label operand is the LAST one in every member of the family
-/// (`iL`, `iiL`, `rL`, `rrL`, `ffL`), so its index is one less than the
-/// argcode count — the same index the matching handler reads `target` from —
-/// re-read here from the re-derived `goto` so the arm-select is genuinely
-/// reconstructed from `orgpc` alone rather than reusing the capture-site op.
-pub(crate) fn decode_side_other_target(
-    code: &[u8],
-    orgpc: usize,
-    flavor_guard_true: bool,
-) -> Result<usize, &'static str> {
-    let live = decode_op_at(code, orgpc).ok_or("notlive")?;
-    if live.opname != "live" {
-        return Err("notlive");
-    }
-    let goto = decode_op_at(code, live.next_pc).ok_or("notgoto")?;
-    if !goto.opname.starts_with("goto_if_not") || !goto.argcodes.ends_with('L') {
-        return Err("notgoto");
-    }
-    let target = read_label(code, &goto, goto.argcodes.len() - 1);
-    let raw = if flavor_guard_true {
-        target
-    } else {
-        goto.next_pc
-    };
-    Ok(resolve_branch_target_through_trampoline(code, raw))
-}
-
-/// Decode: if `carried` is a tagged branch `orgpc` (negative-space
-/// encoding, [`majit_ir::resumedata::encode_branch_orgpc`]), expand it to the
-/// genuine not-taken-arm jitcode offset (`derived` / other_target) DIRECTLY:
-/// `decode_side_other_target` picks the not-taken arm from `orgpc` + flavor and
-/// that jitcode offset IS the returned value. The former py_pc round-trip
-/// (`containing_py_pc_for_jitcode_pc` -> `skip_python_trivia_forward` ->
-/// historical Python-pc translation, with its `num_instrs` overshoot clamp) is
-/// deleted:
-/// it is byte-identical because the encode self-cert
-/// (`walker_capture_snapshot_for_last_guard_impl`) tags a word ONLY when this
-/// same `expand_branch_carried` yields `derived == marker`, so returning
-/// `derived` reproduces exactly the marker the round-trip would have. Non-tagged
-/// words (offsets `>= 0`, `NO_JITCODE_PC`) pass through unchanged, so this is a
-/// no-op whenever the flip is off (`decode_branch_orgpc` returns `None`).
-///
-/// Returns `NO_JITCODE_PC` only if the arm cannot be decoded, so the decoder
-/// declines the guard capture; the encode self-cert declines to carry any
-/// tagged word whose reconstruction fails, so a genuinely-carried tagged word
-/// never reaches that leg.
-pub(crate) fn expand_branch_carried(payload: &crate::PyJitCode, carried: i32) -> i32 {
-    match majit_ir::resumedata::decode_branch_orgpc(carried) {
-        None => carried,
-        Some((orgpc, flavor)) => {
-            let code = payload.jitcode.code.as_slice();
-            match decode_side_other_target(code, orgpc, flavor) {
-                Err(_) => majit_ir::resumedata::NO_JITCODE_PC,
-                Ok(derived) => derived as i32,
-            }
-        }
-    }
-}
-
 /// Decode a not-taken branch trampoline's `ref_copy` parallel-move
-/// sequence into `(dst, src)` Ref-color pairs (`#420`).  The trampoline
+/// sequence into `(dst, src)` Ref-color pairs.  The trampoline
 /// (`live; (ref_copy|int_copy|float_copy)*; [goto]; live; <op>`,
-/// `flatten.rs insert_renamings`) resolves the not-taken edge's Phi:
-/// each `ref_copy(dst <- src)` moves the kept value's guard-pc Ref color
-/// `src` into the merge block's inputarg color `dst`.  The walk does NOT
-/// execute these moves — they fire only when the branch is taken at
-/// runtime — so the merge color `dst` reads stale at the guard point; the
-/// live kept value sits at `src`, which the walk register file still
-/// holds.  Returning the `(dst, src)` list lets the snapshot / vable
-/// recovery read `registers_r[src]` for each kept slot, exact for any
-/// kept-stack depth (the positional depth-1 heuristic generalized).
+/// `flatten.rs insert_renamings`) resolves the not-taken edge's Phi.
+/// Branch-guard resume captures at the jump's own `-live-`
+/// (`generate_guard(resumepc=orgpc)`, pyjitpl.py `opimpl_goto_if_not`)
+/// and blackhole `bhimpl_goto_if_not` re-executes the jump, so this list
+/// is not a snapshot source.  `guarded_branch_core` still uses a non-empty
+/// move list as the `uses_edge_recovery` kept-stack hazard: an undermodeled
+/// walk (`!vstack_valid`) cannot prove the trampoline's kept Ref is
+/// restorable, so the walk declines.
 ///
 /// Returns `None` on a `*_push` / `*_pop` step — a cyclic parallel move
 /// whose value transits a blackhole stack the walk has no register for;

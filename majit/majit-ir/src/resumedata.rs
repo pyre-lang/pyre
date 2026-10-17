@@ -56,42 +56,14 @@ pub const TAGVIRTUAL: u8 = 3;
 /// resume coordinate. Such a frame is unrepresentable and must decline before
 /// resume data is published.
 ///
-/// Each per-frame header carries a `jitcode_pc` word after `pc`. A branch guard whose
-/// not-taken arm keeps operand-stack temps the JitCode virtualized cannot
-/// be described by the merge-target Python pc: its kept temps are only
-/// live at the *guard* JitCode position, not at the resume Python opcode
-/// boundary.  For such guards the capture stores the guard's JitCode byte
-/// offset here (a non-negative value), and both the box-count liveness
-/// query and the blackhole `setposition` resolve directly off it,
-/// bypassing `pc_map` — the direct `setposition(jitcode, pc)` shape
+/// Each per-frame header carries a `jitcode_pc` word after `pc`. A branch
+/// guard stores the jump's own `-live-` offset here (`generate_guard(resumepc=orgpc)`,
+/// pyjitpl.py `opimpl_goto_if_not`): a non-negative JitCode byte offset.
+/// Both the box-count liveness query and the blackhole `setposition` resolve
+/// directly off it — the direct `setposition(jitcode, pc)` shape
 /// (`pyjitpl.py`) without the pc round-trip.  The Python `pc`
 /// word stays populated for interpreter re-entry / `last_instr`.
 pub const NO_JITCODE_PC: i32 = -1;
-
-/// #73: a depth-0 branch guard's resume word may carry the walk's
-/// arm-independent `-live-` BEFORE anchor (`orgpc`) plus the GuardTrue/False
-/// flavor, tagged into the free negative space of the `jitcode_pc` word
-/// (offsets are >=0, NO_JITCODE_PC is -1). Decode expands it to the block-head
-/// resume marker. `orgpc` must be <= BRANCH_ORGPC_MAX to stay in i16 range.
-pub const BRANCH_ORGPC_MAX: usize = 16382;
-
-/// Tag `orgpc` (+ 1 flavor bit) into the free negative space `[-32767, -2]` of
-/// the `jitcode_pc` word. `orgpc` must be `<= BRANCH_ORGPC_MAX`.
-pub const fn encode_branch_orgpc(orgpc: usize, flavor_guard_true: bool) -> i32 {
-    // orgpc in [0, BRANCH_ORGPC_MAX], 1 flavor bit -> [-32767, -2]
-    -2 - (((orgpc as i32) << 1) | (flavor_guard_true as i32))
-}
-
-/// Inverse of [`encode_branch_orgpc`]. Returns `Some((orgpc, flavor))` for a
-/// tagged word (`<= -2`), `None` for offsets (`>= 0`) and NO_JITCODE_PC (`-1`).
-pub const fn decode_branch_orgpc(word: i32) -> Option<(usize, bool)> {
-    if word <= -2 {
-        let v = (-2 - word) as usize;
-        Some((v >> 1, (v & 1) == 1))
-    } else {
-        None
-    }
-}
 
 /// `resume.py` tag discriminator used by `ResumeValueSource` /
 /// `ResumeValueLayoutSummary` to record where a guard-time value
@@ -545,54 +517,4 @@ pub fn rebuild_from_numbering(
         });
     }
     (num_failargs, vable_values, vref_values, frames)
-}
-
-#[cfg(test)]
-mod branch_orgpc_tag_tests {
-    use super::{BRANCH_ORGPC_MAX, NO_JITCODE_PC, decode_branch_orgpc, encode_branch_orgpc};
-
-    #[test]
-    fn roundtrips_across_orgpc_and_flavor() {
-        // Every (orgpc, flavor) in range tags into the negative space
-        // and decodes back exactly, including the two endpoints.
-        for orgpc in [
-            0usize,
-            1,
-            2,
-            7,
-            100,
-            8191,
-            BRANCH_ORGPC_MAX - 1,
-            BRANCH_ORGPC_MAX,
-        ] {
-            for flavor in [false, true] {
-                let word = encode_branch_orgpc(orgpc, flavor);
-                assert!(word <= -2, "tagged word {word} must land in negative space");
-                assert_eq!(decode_branch_orgpc(word), Some((orgpc, flavor)));
-            }
-        }
-    }
-
-    #[test]
-    fn tagged_words_stay_in_i16_range() {
-        // The word is serialized by `append_int`, which asserts i16 range.
-        for orgpc in [0usize, BRANCH_ORGPC_MAX] {
-            for flavor in [false, true] {
-                let word = encode_branch_orgpc(orgpc, flavor);
-                assert!(
-                    word >= i16::MIN as i32 && word <= i16::MAX as i32,
-                    "tagged word {word} out of i16 range"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn non_tagged_words_decode_none() {
-        // Offsets (>=0) and NO_JITCODE_PC (-1) are NOT tagged: decode returns
-        // None so the expand at decode is a pure no-op for them.
-        for word in [0, 5, 32767, NO_JITCODE_PC] {
-            assert_eq!(decode_branch_orgpc(word), None);
-        }
-    }
 }

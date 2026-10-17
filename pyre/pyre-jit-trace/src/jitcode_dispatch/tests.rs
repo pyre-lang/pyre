@@ -4140,34 +4140,6 @@ fn raw_load_i_stamps_the_loaded_word_onto_the_result_box() {
     );
 }
 
-/// JUMP_BACKWARD's eval-breaker `goto_if_not` keeps both arms on that
-/// opcode, so `get_list_of_active_boxes` (`pyjitpl.py`) reads the
-/// terminator's own `-live-`.  A `FOR_ITER` not-taken arm is a different
-/// opcode.  A kept-stack `POP_JUMP_IF_*` / short-circuit trampoline can
-/// share the guard's own Python opcode and must NOT take this path.
-#[test]
-fn tick_goto_if_not_stays_in_the_jump_backward_opcode() {
-    // Measured on `simple.py` `def f`: poll `goto_if_not` at jit 564,
-    // not-taken arm at 568, both exact-py JUMP_BACKWARD.
-    assert!(
-        super::resume_snapshot::branch_not_taken_stays_in_guard_opcode(Some(32), Some(32), true),
-        "the poll's not-taken arm is still JUMP_BACKWARD",
-    );
-    // FOR_ITER `goto_if_not` at jit 302, not-taken arm at 592 (END_FOR).
-    assert!(
-        !super::resume_snapshot::branch_not_taken_stays_in_guard_opcode(Some(14), Some(36), true),
-        "FOR_ITER's exhausted arm is a different Python opcode",
-    );
-    assert!(
-        !super::resume_snapshot::branch_not_taken_stays_in_guard_opcode(Some(14), None, true),
-        "a missing other-arm py_pc is not the same-opcode poll",
-    );
-    assert!(
-        !super::resume_snapshot::branch_not_taken_stays_in_guard_opcode(Some(8), Some(8), false),
-        "a same-opcode POP_JUMP_IF_* / short-circuit branch is not the tick",
-    );
-}
-
 /// The walk executes a raw store as well as recording it, so the target has
 /// to be memory the test owns and every operand has to carry a concrete —
 /// `_opimpl_raw_store` goes through `execute_and_record`, and skipping the
