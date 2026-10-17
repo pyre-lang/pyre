@@ -6014,9 +6014,12 @@ impl<'a> Assembler386<'a> {
                             arglocs[0]
                         );
                     };
+                    // Patched below: `emit_forward_jump('B')` is a `J_il8`.
                     let jb_location = self.mc.new_dynamic_label();
-                    dynasm!(self.mc ; .arch x64 ; cmp Rq(obj.value), 1 ; jb =>jb_location);
+                    rx86::cmp_ri(&mut self.mc, obj.value, 1);
+                    dynasm!(self.mc ; .arch x64 ; jb BYTE =>jb_location);
                     self._cmp_guard_class(&arglocs[0], &arglocs[1]);
+                    // patch the JB above
                     self.forget_scratch_register();
                     dynasm!(self.mc ; .arch x64 ; =>jb_location);
                     self.guard_success_cc = Some(CC_E);
@@ -6503,15 +6506,18 @@ impl<'a> Assembler386<'a> {
     /// pointer — never null inside compiled code — clears ZF and CF, and is
     /// jumped over when PF is clear.
     fn emit_if_parity_clear_zero_and_carry(&mut self) {
+        // `emit_forward_jump('NP')`: a `J_il8` patched by
+        // `patch_forward_jump`.
         let ordered = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64
-        ; jnp =>ordered
+        ; jnp BYTE =>ordered
         );
+        // CMP EBP, 0: as EBP cannot be null here, that operation should
+        // always clear zero and carry
+        rx86::cmp_ri(&mut self.mc, rx86::EBP, 0);
+        // patch the JNP above
         self.forget_scratch_register();
-        dynasm!(self.mc ; .arch x64
-            ; cmp rbp, 0
-            ; =>ordered
-        );
+        dynasm!(self.mc ; .arch x64 ; =>ordered);
     }
 
     /// `flush_cc`.

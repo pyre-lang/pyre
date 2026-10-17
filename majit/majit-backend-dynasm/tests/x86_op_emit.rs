@@ -562,6 +562,65 @@ fn float_cmp_reads_const_operand_and_nan() {
     }
 }
 
+/// `_if_parity_clear_zero_and_carry`: `emit_forward_jump('NP')` is a
+/// two-byte `JNP rel8` over `CMP_ri(ebp, 0)`, whose immediate is imm8.
+#[test]
+fn float_cmp_parity_jump_is_rel8() {
+    let (_backend, token) = compile_float_cmp(OpCode::FloatEq, false, 1.0);
+    assert_has(
+        compiled_bytes(&token),
+        &[0x7B, 0x04, 0x48, 0x83, 0xFD, 0x00],
+        "jnp rel8; cmp rbp, 0",
+    );
+}
+
+/// `genop_guard_guard_nonnull_class`: `CMP obj, 1` then a `JB rel8`
+/// (`emit_forward_jump('B')`) over `_cmp_guard_class` to the guard's `JNE`.
+#[test]
+fn guard_nonnull_class_forward_jump_is_rel8() {
+    #[repr(C)]
+    struct Obj {
+        typeptr: usize,
+    }
+    let class_a = 0x5A5A_0000usize;
+    let class_b = 0x5B5B_0000usize;
+    let mut obj_a = Obj { typeptr: class_a };
+    let mut obj_b = Obj { typeptr: class_b };
+    let mut backend = fresh_backend();
+    backend.set_vtable_offset(Some(0));
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let p0 = inputargs[0].opref();
+    let guard = Op::new(
+        OpCode::GuardNonnullClass,
+        &[rb(p0), rb(OpRef::const_int(class_a as i64))],
+    );
+    guard.pos().set(OpRef::void_op(1));
+    guard.setdescr(make_resume_guard_descr_typed(vec![]));
+    guard.setfailargs(vec![].into());
+    let finish = Op::new(OpCode::Finish, &[]);
+    finish.pos().set(OpRef::void_op(2));
+    finish.set_fail_arg_types(vec![]);
+    finish.setfailargs(vec![].into());
+    let ops = vec![OpRc::new(guard), OpRc::new(finish)];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile GUARD_NONNULL_CLASS: {err:?}"));
+    let code = compiled_bytes(&token);
+    assert!(
+        code.windows(4)
+            .any(|w| w[0] == 0x83 && w[1] & 0xF8 == 0xF8 && w[2] == 0x01 && w[3] == 0x72),
+        "cmp obj, 1; jb rel8"
+    );
+    let run = |backend: &mut DynasmBackend, ptr: usize| {
+        let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        backend.get_latest_descr(&frame).is_finish()
+    };
+    assert!(run(&mut backend, &mut obj_a as *mut Obj as usize));
+    assert!(!run(&mut backend, &mut obj_b as *mut Obj as usize));
+    assert!(!run(&mut backend, 0));
+}
+
 // Test-only bridge into a `CALL_MAY_FORCE` helper. The helper is `extern "C"`
 // and has no Rust argument for the backend that owns the force token.
 thread_local! {
