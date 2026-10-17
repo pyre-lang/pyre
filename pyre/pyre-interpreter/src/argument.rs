@@ -233,13 +233,19 @@ fn find_duplicate_kwarg(
 /// the value is read through `dict_getitem` on the original `w_key`.
 /// The seen-set still records `text_w` (`key in seen`). The other arm is
 /// `space.getitem`, so a mapping's `__getitem__` override runs.
+///
+/// `keyword_names_w` / `keywords_w` are the caller's two output lists
+/// (`[None] * len(keys_w)` in `_combine_starstarargs_wrapped`), passed as
+/// shadow-stack base indices of GC-visible ranges the caller reserved.
 pub fn do_combine_starstarargs_wrapped(
     keys_w: &[PyObjectRef],
     w_starstararg: PyObjectRef,
+    keyword_names_w: usize,
+    keywords_w: usize,
     existingkeywords_w: Option<&[PyObjectRef]>,
     is_dict: bool,
     w_function: PyObjectRef,
-) -> Result<(Vec<PyObjectRef>, Vec<PyObjectRef>), crate::PyError> {
+) -> Result<(), crate::PyError> {
     // argument.py `seen = {}` — Python dict with None values.  Map
     // to `HashMap<String, ()>` rather than `HashSet` so the shape
     // matches PyPy's `dict` (key membership tested via `in`, value slot
@@ -251,10 +257,10 @@ pub fn do_combine_starstarargs_wrapped(
     // `gctransform/framework.py push_roots` stores every live GCREF before
     // that call; `pop_roots` / `expand_pop_roots` writes each one back.
     // `argument.py _do_combine_starstarargs_wrapped` writes
-    // `keyword_names_w[i] = w_key` / `keywords_w[i] = w_value` into GC lists;
-    // those lists are the pair slots here. The native out-slices are built
-    // from the slots once the loop is done, so they are not live across
-    // `contains_w_names` / `getitem`.
+    // `keyword_names_w[i] = w_key` / `keywords_w[i] = w_value` into GC lists
+    // the caller allocated and owns. Those lists are the two shadow-stack
+    // ranges whose bases are `keyword_names_w` / `keywords_w`; this helper
+    // fills slot `i` of each during the iteration and returns None.
     let _roots = pyre_object::gc_roots::push_roots();
     let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
     let n = keys_w.len();
@@ -262,11 +268,7 @@ pub fn do_combine_starstarargs_wrapped(
     let existing_base =
         pyre_object::gc_roots::publish_roots(existingkeywords_w.unwrap_or_default());
     let keys_base = pyre_object::gc_roots::publish_roots(keys_w);
-    let pairs_base = pyre_object::gc_roots::shadow_stack_len();
-    for _ in 0..2 * n {
-        pyre_object::gc_roots::publish_roots(&[pyre_object::PY_NULL]);
-    }
-    pyre_object::gc_roots::normalize_roots(root_base, 2 + existing_len + 3 * n);
+    pyre_object::gc_roots::normalize_roots(root_base, 2 + existing_len + n);
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let mut existing_now = vec![pyre_object::PY_NULL; existing_len];
@@ -301,7 +303,7 @@ pub fn do_combine_starstarargs_wrapped(
         // `contains_w_names` can collect; the key is read back from its slot.
         let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py — `keyword_names_w[i] = w_key`.
-        pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i, w_key);
+        pyre_object::gc_roots::shadow_stack_set(keyword_names_w + i, w_key);
         // argument.py:449-457 — value lookup.
         let w_value = if is_dict {
             // `_do_combine_starstarargs_wrapped` calls `dict_getitem` with
@@ -331,18 +333,12 @@ pub fn do_combine_starstarargs_wrapped(
             crate::baseobjspace::getitem(w_starstararg(), w_key)?
         };
         // argument.py — `keywords_w[i] = w_value`.
-        pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i + 1, w_value);
+        pyre_object::gc_roots::shadow_stack_set(keywords_w + i, w_value);
         // argument.py `seen[key] = None` — record key, value slot
         // is unread.
         seen.insert(key, ());
     }
-    let mut keyword_names_w = vec![pyre_object::PY_NULL; n];
-    let mut keywords_w = vec![pyre_object::PY_NULL; n];
-    for i in 0..n {
-        keyword_names_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
-        keywords_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
-    }
-    Ok((keyword_names_w, keywords_w))
+    Ok(())
 }
 
 /// pypy/interpreter/argument.py `_combine_starargs_wrapped`.
@@ -596,20 +592,41 @@ pub fn combine_starstarargs_wrapped(
         };
         crate::baseobjspace::unpackiterable(w_keys, -1)?
     };
-    // argument.py:142-144 — slow-path body fills name/value buffers,
-    // checking for duplicates against keyword_names_out (existing).
+    // argument.py:140-144 — the caller allocates both output lists
+    // (`keywords_w = [None] * len(keys_w)`, `keyword_names_w = [None] * len(keys_w)`)
+    // as GC-visible storage it owns, then `_do_combine_starstarargs_wrapped`
+    // fills them in place and returns None. Interpreter-level argument lists
+    // are `Vec<PyObjectRef>` plus shadow-stack slots, so the two buffers are
+    // contiguous ranges of nulls reserved inside this `push_roots` scope
+    // (`gctransform/framework.py push_roots` / `pop_roots`) and passed as
+    // base indices.
     refresh_out(keyword_names_out, keywords_out);
     let existing: Option<&[PyObjectRef]> = if keyword_names_out.is_empty() {
         None
     } else {
         Some(keyword_names_out.as_slice())
     };
-    let (keyword_names_w, keywords_w) =
-        do_combine_starstarargs_wrapped(&keys_w, w_starstararg(), existing, is_dict, w_function())?;
+    let n = keys_w.len();
+    let nulls = vec![pyre_object::PY_NULL; n];
+    let keywords_w = pyre_object::gc_roots::publish_roots(&nulls);
+    let keyword_names_w = pyre_object::gc_roots::publish_roots(&nulls);
+    do_combine_starstarargs_wrapped(
+        &keys_w,
+        w_starstararg(),
+        keyword_names_w,
+        keywords_w,
+        existing,
+        is_dict,
+        w_function(),
+    )?;
     // argument.py:145-150 — merge into the running output buffers.
     refresh_out(keyword_names_out, keywords_out);
-    keyword_names_out.extend(keyword_names_w);
-    keywords_out.extend(keywords_w);
+    let mut names_add = vec![pyre_object::PY_NULL; n];
+    let mut values_add = vec![pyre_object::PY_NULL; n];
+    pyre_object::gc_roots::shadow_stack_copy_range(keyword_names_w, &mut names_add);
+    pyre_object::gc_roots::shadow_stack_copy_range(keywords_w, &mut values_add);
+    keyword_names_out.extend(names_add);
+    keywords_out.extend(values_add);
     Ok(())
 }
 
