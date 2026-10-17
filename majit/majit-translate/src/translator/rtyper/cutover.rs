@@ -329,7 +329,7 @@ pub(crate) fn dual_gate_check_with_registry(
     let (graph, mut real_value_to_var, mut real_constants) = match result {
         Ok(Ok((graph, value_to_var, _, constants, _))) => (graph, value_to_var, constants),
         Ok(Err(e)) => {
-            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
+            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources, true);
             let msg = format!("{e}");
             if is_known_unported(&msg) {
                 return Ok(DualGateOutcome::Skip(msg));
@@ -337,7 +337,7 @@ pub(crate) fn dual_gate_check_with_registry(
             return Err(format!("real path failed: {msg}"));
         }
         Err(payload) => {
-            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
+            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources, true);
             let msg = crate::annotator::model::panic_payload_text(&*payload)
                 .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
             if is_known_unported(&msg) {
@@ -436,6 +436,17 @@ pub(crate) fn dual_gate_check_with_registry(
 ///   so `total_calltable_size` and `get_concrete_calltable`'s size
 ///   invariant hold; the family's cached concrete calltable is
 ///   dropped so it rebuilds against the fresh graph)
+///
+/// Two-phase Phase B is rtype-only: annotation has finished, so a
+/// later `pycall` will not `recursivecall` a replacement
+/// (`description.py FunctionDesc.pycall` → `annrpython.py
+/// recursivecall`). `FunctionRepr.convert_to_concrete_llfn`
+/// (`rpbc.py`) then `getcallable`s the calltable row
+/// (`lltype.getfunctionptr` walks `graph.getargs()`). Replacing
+/// `FunctionDesc.cache` with a never-flowed lift makes those getargs
+/// unbound. Phase B therefore keeps the original cache graph
+/// (`replace_cache = false`) — the one `FunctionDesc.cachedgraph` /
+/// `bookkeeper.getdesc` identity upstream keeps in `translator.graphs`.
 #[derive(Default)]
 struct SubjectSessionSnapshot {
     fixed_graphs: HashSet<crate::flowspace::model::GraphKey>,
@@ -459,6 +470,7 @@ fn unpoison_failed_subject_callees(
     call_registry: &CallRegistry,
     session_at_entry: &SubjectSessionSnapshot,
     lift_sources: &crate::codewriter::call::GraphStore,
+    replace_cache: bool,
 ) {
     let Some((annotator, rtyper)) = call_registry.session_if_started() else {
         return;
@@ -505,6 +517,11 @@ fn unpoison_failed_subject_callees(
             generation.retain(|bkey, _| !stale_block_keys.contains(bkey));
         }
         annotator.blocked_graphs.borrow_mut().shift_remove(&gkey);
+        if !replace_cache {
+            // Phase B: keep FunctionDesc.cache / calltable on this graph.
+            // getfunctionptr still reads its bound getargs.
+            continue;
+        }
         annotator
             .translator
             .graphs
@@ -567,148 +584,6 @@ fn unpoison_failed_subject_callees(
                     "callee graph poisoned by a failed subject scope; no re-lift source"
                         .to_string(),
                 );
-            }
-        }
-    }
-}
-
-/// Copy `getargs` annotations from `old` onto `stub`, aligned on the
-/// trailing slots when the lifted startblock dropped a Void ZST `self`.
-/// Unbound old slots become `SomeImpossibleValue` so `getrinputs` /
-/// `bindingrepr` have a hole, not a KeyError (`LLCallTable.lookup`).
-fn copy_stub_getargs_annotations(old: &Rc<PyGraph>, stub: &Rc<PyGraph>) {
-    use crate::annotator::model::SomeValue;
-    use crate::flowspace::model::Hlvalue;
-    let old_args = old.graph.borrow().getargs();
-    let stub_args = stub.graph.borrow().getargs();
-    let offset = stub_args.len().saturating_sub(old_args.len());
-    for (i, hl) in stub_args.iter().enumerate() {
-        let Hlvalue::Variable(v) = hl else {
-            continue;
-        };
-        let src = if i < offset {
-            SomeValue::Impossible
-        } else {
-            match old_args.get(i - offset) {
-                Some(Hlvalue::Variable(ov)) => ov
-                    .annotation
-                    .borrow()
-                    .as_ref()
-                    .map(|s| (**s).clone())
-                    .unwrap_or(SomeValue::Impossible),
-                _ => SomeValue::Impossible,
-            }
-        };
-        v.annotation.replace(Some(Rc::new(src)));
-    }
-}
-
-fn bind_unbound_stub_getargs_impossible(stub: &Rc<PyGraph>) {
-    use crate::annotator::model::SomeValue;
-    use crate::flowspace::model::Hlvalue;
-    for hl in stub.graph.borrow().getargs() {
-        let Hlvalue::Variable(v) = hl else {
-            continue;
-        };
-        if v.annotation.borrow().is_none() {
-            v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
-        }
-    }
-}
-
-/// Prefill a skipped subject's default `FunctionDesc` graph with the same
-/// signature-only stub `install_source_graph` uses for `@jit.dont_look_inside`.
-///
-/// `unpoison_failed_subject_callees` re-lifts the skipped body so a later
-/// caller that `cachedgraph`s it walks the full graph and fails on a nested
-/// wall (`rordereddict.py` `RDict.insert` → `pin_gcrefs`). Upstream never
-/// re-flows a graph that failed to annotate; the callsite residualizes
-/// (`policy.py look_inside_graph` / `ExtRegistryEntry.compute_result_annotation`).
-///
-/// Only `GraphCacheKey::None` and this funcdesc's family row are replaced.
-/// Other specializations stay; replacing every cache value with one stub
-/// made later callers of a working specialization fail as new skip ADDs.
-fn residualize_skipped_subject(
-    call_registry: &CallRegistry,
-    path: &crate::parse::CallPath,
-    lift_sources: &crate::codewriter::call::GraphStore,
-) {
-    let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
-    let Some(entry) = call_registry.lookup(&key) else {
-        return;
-    };
-    let Some(legacy) = lift_sources.get(path) else {
-        return;
-    };
-    let Some(signature) = lift_sources.signature(path) else {
-        return;
-    };
-    let semantic_key = legacy
-        .source_identity
-        .as_deref()
-        .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
-        .unwrap_or_else(|| key.clone());
-    let result_shell = raw_ptr_token_annotation(call_registry, legacy.return_type.as_deref())
-        .or_else(|| residual_stub_result_shell(&semantic_key, legacy.return_type.as_deref()))
-        .map(|shell| declared_return_annotation(call_registry, legacy.as_ref()).unwrap_or(shell))
-        .or_else(|| residual_return_shell(legacy.return_type.as_deref()));
-    let Some(result_shell) = result_shell else {
-        return;
-    };
-    let stub = build_stub_pygraph_with_result_shell(legacy.name.clone(), signature, result_shell);
-    let rowkey = crate::annotator::description::FunctionDesc::rowkey(&entry.function_desc);
-    let fd = entry.function_desc.borrow();
-    let old_none = fd
-        .cache
-        .borrow()
-        .get(&crate::annotator::description::GraphCacheKey::None)
-        .cloned();
-    if let Some(old) = old_none.as_ref() {
-        copy_stub_getargs_annotations(old, &stub);
-    } else {
-        bind_unbound_stub_getargs_impossible(&stub);
-    }
-    fd.release_source_graph();
-    fd.cache.borrow_mut().insert(
-        crate::annotator::description::GraphCacheKey::None,
-        stub.clone(),
-    );
-    *fd.lift_error.borrow_mut() = None;
-    let Ok(family) = fd.base.getcallfamily() else {
-        return;
-    };
-    replace_none_graph_in_calltables(&family, rowkey, old_none.as_ref(), &stub);
-    if let Some((_, rtyper)) = call_registry.session_if_started() {
-        rtyper
-            .concrete_calltables
-            .borrow_mut()
-            .remove(&(Rc::as_ptr(&family) as usize));
-    }
-}
-
-/// `CallFamily.calltable_lookup_row` compares rows by graph identity
-/// (`description.py` `existing_row == row`; `FunctionGraph` has no
-/// `__eq__`). `find_row` rebuilds the row with `desc.get_graph`, which
-/// returns the live `cachedgraph` (`FunctionDesc.specialize`). The None
-/// stub is only the default specialization; an AccessDirect copy stays
-/// in `FunctionDesc.cache` under `GraphCacheKey::AccessDirect`
-/// (`specialize.py` `cachedgraph`). Replacing every family-row graph
-/// with the stub made that hop's rebuilt row miss.
-fn replace_none_graph_in_calltables(
-    family: &Rc<RefCell<crate::annotator::description::CallFamily>>,
-    rowkey: crate::annotator::description::DescKey,
-    old_none: Option<&Rc<PyGraph>>,
-    stub: &Rc<PyGraph>,
-) {
-    let Some(old) = old_none else {
-        return;
-    };
-    for table in family.borrow_mut().calltables.values_mut() {
-        for row in table.iter_mut() {
-            if let Some(graph) = row.get(&rowkey)
-                && Rc::ptr_eq(graph, old)
-            {
-                row.insert(rowkey, stub.clone());
             }
         }
     }
@@ -4796,13 +4671,8 @@ fn run_two_phase_prepass_inner(
                         call_registry,
                         &session_at_entry,
                         function_graphs,
+                        true,
                     );
-                    // `dont_look_inside` analog: a skipped subject is opaque
-                    // to later callers (`install_source_graph` prefills the
-                    // same signature stub). unpoison re-lifts the body, so
-                    // a later subject that looks inside hits the next wall
-                    // (`pin_gcrefs` not in CallRegistry) and is skipped too.
-                    residualize_skipped_subject(call_registry, path, function_graphs);
                 }));
             }
         }
@@ -5183,6 +5053,7 @@ fn run_phase_b_rtype_isolated(
                             call_registry,
                             &session_at_entry,
                             lift_sources,
+                            false,
                         );
                     }));
                     break;
@@ -5740,80 +5611,9 @@ fn keep_legacy_kind_when_unfollowed_void(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotator::description::{CallFamily, CallTableRow, DescKey};
-    use crate::flowspace::argument::CallShape;
     use crate::flowspace::model::BlockKey;
     use crate::model::{Block, BlockId, LinkArg, ValueType};
     use crate::translator::rtyper::legacy_annotator::setbinding;
-
-    fn test_pygraph(name: &str) -> Rc<PyGraph> {
-        use crate::flowspace::model::{Block as FlowBlock, GraphFunc, Hlvalue, Link, Variable};
-        let arg = Hlvalue::Variable(Variable::named("x"));
-        let startblock = FlowBlock::shared(vec![arg.clone()]);
-        let graph = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
-        let link = Rc::new(RefCell::new(Link::new(
-            vec![arg],
-            Some(graph.returnblock.clone()),
-            None,
-        )));
-        startblock.closeblock(vec![link]);
-        Rc::new(PyGraph {
-            graph: Rc::new(RefCell::new(graph)),
-            func: GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default()))),
-            signature: RefCell::new(Signature::new(vec!["x".to_string()], None, None)),
-            defaults: RefCell::new(None),
-            access_directly: Cell::new(false),
-        })
-    }
-
-    #[test]
-    fn residualize_replaces_only_the_none_calltable_row() {
-        // `CallFamily.find_row` / `calltable_lookup_row` (`description.py`):
-        // the AccessDirect cachedgraph stays a distinct row. Residualizing
-        // the skipped None subject must not overwrite that row with the stub.
-        let rowkey = DescKey(7);
-        let none_graph = test_pygraph("call_module_helper");
-        let access_direct = test_pygraph("call_module_helper__AccessDirect_None");
-        let stub = test_pygraph("call_module_helper_stub");
-        let shape = CallShape {
-            shape_cnt: 4,
-            shape_keys: Vec::new(),
-            shape_star: false,
-        };
-        let mut none_row = CallTableRow::new();
-        none_row.insert(rowkey, none_graph.clone());
-        let mut ad_row = CallTableRow::new();
-        ad_row.insert(rowkey, access_direct.clone());
-        let family = Rc::new(RefCell::new(CallFamily::new(rowkey)));
-        family
-            .borrow_mut()
-            .calltable_add_row(shape.clone(), none_row);
-        family
-            .borrow_mut()
-            .calltable_add_row(shape.clone(), ad_row.clone());
-
-        replace_none_graph_in_calltables(&family, rowkey, Some(&none_graph), &stub);
-
-        let mut stub_row = CallTableRow::new();
-        stub_row.insert(rowkey, stub.clone());
-        let family = family.borrow();
-        assert_eq!(
-            family.calltable_lookup_row(&shape, &stub_row),
-            Some(0),
-            "None row becomes the residual stub"
-        );
-        assert_eq!(
-            family.calltable_lookup_row(&shape, &ad_row),
-            Some(1),
-            "AccessDirect row keeps its cachedgraph"
-        );
-        let mut old_none_row = CallTableRow::new();
-        old_none_row.insert(rowkey, none_graph);
-        assert!(
-            family.calltable_lookup_row(&shape, &old_none_row).is_none(),
-            "the skipped None graph is no longer a family row"
-        );
-    }
 
     #[test]
     fn std_alloc_raw_is_declined_and_unregistered() {
@@ -9912,6 +9712,91 @@ mod tests {
                 .borrow()
                 .contains_key(&GraphKey::of(&stale)),
             "discarded graph must not remain in blocked_graphs"
+        );
+    }
+
+    #[test]
+    fn phase_b_unpoison_keeps_annotated_functiondesc_cache_graph() {
+        let _lock = anchor_lock();
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::flowspace::model::GraphKey;
+        use crate::translator::rtyper::call_registry::{CallRegistry, FunctionPathKey};
+
+        let mut source = LegacyGraph::new("cached_callee");
+        let vars = mint_vars(&mut source, 2);
+        let value = vars[1].clone();
+        source.blocks = vec![
+            Block {
+                id: source.startblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(value.clone())],
+                    source.returnblock,
+                )],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: source.returnblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            },
+        ];
+        setbinding(&value, ValueType::Int);
+
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let signature =
+            crate::flowspace::argument::Signature::new(vec!["arg0".to_string()], None, None);
+        let lifted = lift_callee_to_pygraph(&source, signature.clone(), &registry)
+            .expect("callee must lift");
+        let stale = lifted.graph.clone();
+        registry.register_callee(
+            FunctionPathKey::from_segments(["cached_callee"]),
+            signature,
+            lifted,
+        );
+        let (annotator, _) = registry.ensure_session().expect("session must initialize");
+        for arg in stale.borrow().getargs() {
+            if let Hlvalue::Variable(var) = arg {
+                setbinding(&var, ValueType::Int);
+            }
+        }
+        let session_at_entry = SubjectSessionSnapshot::capture_fixed_only(&registry);
+        annotator
+            .fixed_graphs
+            .borrow_mut()
+            .insert(GraphKey::of(&stale), stale.clone());
+
+        unpoison_failed_subject_callees(
+            &registry,
+            &session_at_entry,
+            &crate::codewriter::call::GraphStore::default(),
+            false,
+        );
+
+        assert!(
+            registry.find_entry_with_cached_graph(&stale).is_some(),
+            "Phase B must keep FunctionDesc.cache on the annotated graph"
+        );
+        assert!(
+            stale.borrow().getargs().iter().all(|value| match value {
+                Hlvalue::Variable(var) => var.annotation.borrow().is_some(),
+                _ => true,
+            }),
+            "the cached graph's getargs must stay bound for getfunctionptr"
+        );
+        assert!(
+            !annotator
+                .fixed_graphs
+                .borrow()
+                .contains_key(&GraphKey::of(&stale)),
+            "the failed graph must leave fixed_graphs"
         );
     }
 

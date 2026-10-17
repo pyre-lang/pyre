@@ -29,7 +29,7 @@ use crate::annotator::argument::ArgumentsForTranslation;
 use crate::annotator::bookkeeper;
 use crate::annotator::model::{
     AnnotatorError, KnownType, SomeAddress, SomeBool, SomeBuiltinMethod, SomeChar, SomeFloat,
-    SomeInteger, SomeLongFloat, SomeObject, SomeObjectTrait, SomePtr, SomeSingleFloat,
+    SomeInteger, SomeLongFloat, SomeObject, SomeObjectTrait, SomePtr, SomeRustVec, SomeSingleFloat,
     SomeUnicodeCodePoint, SomeValue, SomeValueTag, s_bool, s_none,
 };
 use crate::flowspace::model::{ConstValue, Constant};
@@ -337,6 +337,99 @@ impl SomePtr {
             example
                 .setattr(attr, v_lltype._defl())
                 .map_err(AnnotatorError::new)?;
+        }
+        Ok(SomeValue::Impossible)
+    }
+}
+
+/// Named scalar fields of `rust_vec_lltype`'s `Struct(raw) "RustVec"`
+/// header (`ptr`, `len`, `cap`). Only `len` is a field getattr/setattr:
+/// it is the word `Vec::set_len` writes and the word `len()` reads.
+/// `ptr` is a container (`Ptr(Array(ITEM, hints={nolength}))`); `cap`
+/// is `Signed` but the front never lowers a store of it.
+fn rust_vec_header_field_type(attr: &str) -> Option<lltype::LowLevelType> {
+    match attr {
+        "len" => Some(lltype::LowLevelType::Signed),
+        _ => None,
+    }
+}
+
+/// Integer `Number` primitives (`lltype.py`). `Vec::set_len` takes
+/// `usize` (`Unsigned` / `r_uint`) while the header `len` word is
+/// `Signed` (`rlist.py` `l.length`). `RustVecRepr.rtype_setattr`
+/// already `ConvertedTo` `Signed`; the annotator accepts the same
+/// family so the store is not rejected before that conversion.
+fn integer_number_lltype(ty: &lltype::LowLevelType) -> bool {
+    matches!(
+        ty,
+        lltype::LowLevelType::Signed
+            | lltype::LowLevelType::Unsigned
+            | lltype::LowLevelType::SignedLongLong
+            | lltype::LowLevelType::SignedLongLongLong
+            | lltype::LowLevelType::UnsignedLongLong
+            | lltype::LowLevelType::UnsignedLongLongLong
+    )
+}
+
+impl SomeRustVec {
+    /// `SomePtr.getattr` (lltype.py) for a pointer to the raw
+    /// `{ptr, len, cap}` header. Methods (`append`, …) resolve through
+    /// `find_method` first, the way `SomeObject.getattr` (unaryop.py)
+    /// does, then the `len` field is `lltype_to_annotation(Signed)`.
+    pub fn getattr(&self, s_attr: &SomeValue) -> Result<SomeValue, AnnotatorError> {
+        if !s_attr.is_constant() {
+            return Err(AnnotatorError::new(
+                "getattr on RustVec with non-constant field-name",
+            ));
+        }
+        let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) else {
+            panic!(
+                "SomeRustVec.getattr expects a constant string field-name, got {:?}",
+                s_attr.const_()
+            );
+        };
+        if let Some(s_method) = SomeValue::RustVec(self.clone()).find_method(attr) {
+            return Ok(s_method);
+        }
+        let Some(field_t) = rust_vec_header_field_type(attr) else {
+            return Err(AnnotatorError::new(format!(
+                "struct RustVec has no field {attr:?}"
+            )));
+        };
+        Ok(lltype_to_annotation(field_t))
+    }
+
+    /// `SomePtr.setattr` (lltype.py): constant name, the field exists
+    /// on the pointed-to header, and `s_value` fits its lowleveltype.
+    /// Only `len` is settable (`Vec::set_len` → `FieldWrite` of `len`).
+    pub fn setattr(
+        &self,
+        s_attr: &SomeValue,
+        s_value: &SomeValue,
+    ) -> Result<SomeValue, AnnotatorError> {
+        if !s_attr.is_constant() {
+            return Err(AnnotatorError::new(
+                "setattr on RustVec with non-constant field-name",
+            ));
+        }
+        let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) else {
+            panic!(
+                "SomeRustVec.setattr expects a constant string field-name, got {:?}",
+                s_attr.const_()
+            );
+        };
+        let Some(field_t) = rust_vec_header_field_type(attr) else {
+            return Err(AnnotatorError::new(format!(
+                "struct RustVec has no field {attr:?}"
+            )));
+        };
+        let v_lltype = annotation_to_lltype(s_value, None)?;
+        if v_lltype != field_t
+            && !(integer_number_lltype(&v_lltype) && integer_number_lltype(&field_t))
+        {
+            return Err(AnnotatorError::new(format!(
+                "RustVec instance field {attr:?}:\nexpects {field_t:?}\n    got {v_lltype:?}"
+            )));
         }
         Ok(SomeValue::Impossible)
     }
@@ -1049,6 +1142,49 @@ mod tests {
                 "case {name}: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn some_rust_vec_getattr_setattr_len_mirrors_someptr() {
+        use crate::annotator::model::SomeInteger;
+        use majit_ir::rvec::VecItemKind;
+
+        let s_vec = SomeRustVec::for_kind(VecItemKind::Int);
+        let s_len = {
+            let mut s = crate::annotator::model::SomeString::new(false, false);
+            s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("len")));
+            SomeValue::String(s)
+        };
+        let s_cap = {
+            let mut s = crate::annotator::model::SomeString::new(false, false);
+            s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("cap")));
+            SomeValue::String(s)
+        };
+        let s_n = SomeValue::Integer(SomeInteger::new_with_knowntype(true, KnownType::Ruint));
+        assert!(matches!(
+            s_vec.getattr(&s_len).unwrap(),
+            SomeValue::Integer(_)
+        ));
+        assert!(s_vec.setattr(&s_len, &s_n).is_ok());
+        let err = s_vec.setattr(&s_cap, &s_n).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("no field \"cap\""),
+            "got {err:?}"
+        );
+        let SomeValue::BuiltinMethod(bound) = s_vec
+            .getattr(&{
+                let mut s = crate::annotator::model::SomeString::new(false, false);
+                s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("append")));
+                SomeValue::String(s)
+            })
+            .unwrap()
+        else {
+            panic!("append must resolve through find_method");
+        };
+        assert_eq!(bound.analyser_name, "rustvec_method_append");
     }
 
     #[test]

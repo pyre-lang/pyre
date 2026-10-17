@@ -357,11 +357,6 @@ fn dispatch_convert_from_to(
         (PtrRepr, InstanceRepr) => {
             super::rclass::pair_opaque_ptr_instance_convert_from_to(r_from, r_to, v, llops)
         }
-        // ZST method `self` (`VoidRepr`) is the empty RPython instance
-        // pointer (`rclass.py` `InstanceRepr.get_reusable_prebuilt_instance`).
-        (VoidRepr, InstanceRepr) => {
-            super::rclass::pair_void_instance_convert_from_to(r_from, r_to, v, llops)
-        }
         // rbool.py __extend__ — bool participates in IntegerRepr's MRO but
         // carries explicit primitive casts for the common Bool edges.
         (BoolRepr, FloatRepr) => {
@@ -2203,51 +2198,6 @@ mod tests {
             utf8_field.is_err(),
             "PyObject InstanceRepr has no `_utf8` field to convert from: {utf8_field:?}"
         );
-    }
-
-    #[test]
-    fn void_zst_self_converts_to_instance_repr_prebuilt() {
-        // ZST method `self` is Void; RPython empty instances still have
-        // a pointer (`rclass.py` `InstanceRepr.get_reusable_prebuilt_instance`).
-        use crate::annotator::annrpython::RPythonAnnotator;
-        use crate::flowspace::model::{ConstValue, Constant, HostObject};
-        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-        use crate::translator::rtyper::rclass::{Flavor, getclassrepr_arc, getinstancerepr};
-        use crate::translator::rtyper::rmodel::impossible_repr;
-        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
-        use std::rc::Rc;
-
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        rtyper
-            .initialize_exceptiondata()
-            .expect("initialize_exceptiondata in test setup");
-        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-        let host = HostObject::new_class("kwargsdict::KwargsDictStrategy", vec![]);
-        let entry = ann.bookkeeper.getdesc(&host).unwrap();
-        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
-            panic!("class desc");
-        };
-        let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
-        classdef.borrow_mut().minid = Some(11);
-        classdef.borrow_mut().maxid = Some(11);
-        let r_from = impossible_repr();
-        let r_to = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)
-            .expect("KwargsDictStrategy InstanceRepr");
-        Repr::setup(r_to.as_ref()).expect("setup InstanceRepr");
-        let rclass_arc = getclassrepr_arc(&rtyper, Some(&classdef)).unwrap();
-        Repr::setup(&*rclass_arc.as_repr()).unwrap();
-        let dummy_v = Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::None,
-            LowLevelType::Void,
-        ));
-        let converted = pair_convert_from_to(r_from.as_ref(), r_to.as_ref(), &dummy_v, &mut llops)
-            .expect("pair_convert_from_to");
-        let Some(Hlvalue::Constant(c)) = converted else {
-            panic!("ZST self must become the prebuilt instance pointer, got {converted:?}");
-        };
-        assert_eq!(c.concretetype.as_ref(), Some(r_to.lowleveltype()));
-        assert!(matches!(c.value, ConstValue::LLPtr(_)));
     }
 
     #[test]

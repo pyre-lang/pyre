@@ -2545,8 +2545,10 @@ fn block_reachable_from_start(graph: &FunctionGraph, block: usize) -> bool {
 ///
 /// `segments` is the path [`crate::parse::CallPath::for_trait_impl_method`]
 /// registers. `pass_payload` is false when that impl's parameter is a
-/// void zero-sized type: `FUNC.ARGS` then has no slot, so the call must
-/// not pass the field read (`history.getkind`).
+/// void zero-sized type (`()`, `PhantomData`, `Arg<T>`): `FUNC.ARGS`
+/// then has no slot, so the call must not pass the field read
+/// (`history.getkind`). A named empty class is still an instance and
+/// keeps the slot (`tyref_keeps_empty_class_instance`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FromResidualConversion {
     pub segments: Vec<String>,

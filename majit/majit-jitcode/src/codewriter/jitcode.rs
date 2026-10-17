@@ -187,6 +187,22 @@ pub struct EmptyArrayConstDescriptor {
     pub type_name: String,
 }
 
+/// A prebuilt empty-class instance whose runtime object is materialized
+/// at jitcode-load time. `rclass.py InstanceRepr.convert_const` mallocs
+/// immortal (`create_instance`) and `initialize_prebuilt_instance` writes
+/// the class vtable into `typeptr`; `assembler.py emit_const` stores that
+/// GCREF. The translator cannot allocate the runtime object, so the
+/// `constants_r` slot holds a non-canonical sentinel until the load pass
+/// writes one immortal instance per class.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct PrebuiltInstanceConstDescriptor {
+    /// Position in [`JitCodeBody::constants_r`] holding the sentinel.
+    pub constants_r_index: usize,
+    /// Interned class qualname, the runtime dedup key: one immortal
+    /// instance and one class vtable per class.
+    pub class_name: String,
+}
+
 /// Body of a `JitCode` — populated once by the assembler after
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
@@ -347,6 +363,11 @@ pub struct JitCodeBody {
     /// Default empty.
     #[serde(default)]
     pub empty_array_consts: Vec<EmptyArrayConstDescriptor>,
+    /// Prebuilt empty-class instances deferred to runtime materialization —
+    /// [`Self::str_consts`]' shape for `InstanceRepr.convert_const`.
+    /// Default empty.
+    #[serde(default)]
+    pub prebuilt_instance_consts: Vec<PrebuiltInstanceConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// The one-byte carrier is part of the JitCode format; both
     /// `JitCode.setup` and `Assembler.check_result` reject values that do not
@@ -421,6 +442,8 @@ impl std::fmt::Debug for JitCodeBody {
             .field("type_static_consts", &self.type_static_consts)
             .field("reloc_consts_i", &self.reloc_consts_i)
             .field("reloc_consts_r", &self.reloc_consts_r)
+            .field("empty_array_consts", &self.empty_array_consts)
+            .field("prebuilt_instance_consts", &self.prebuilt_instance_consts)
             .field("c_num_regs_i", &self.c_num_regs_i)
             .field("c_num_regs_r", &self.c_num_regs_r)
             .field("c_num_regs_f", &self.c_num_regs_f)
