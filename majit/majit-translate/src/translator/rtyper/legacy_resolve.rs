@@ -136,11 +136,13 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // with `ty: Unknown` (path references not yet bound by the annotator);
     // without this pass they end up defaulted to `GcRef` by the backfill
     // below and produce pyre-only `int_*/{ri,ir,rr,r}` keys. Upgrade
-    // Unknown/Void operands of pure integer ops to `Signed`, matching
+    // Unknown operands of pure integer ops to `Signed`, matching
     // RPython's mandatory kind assignment (`rint.py IntegerRepr`
-    // `hop.inputargs(self, self)`).  `ptr_eq` / `ptr_ne` remain
-    // Ref-Ref (rewritten in `jtransform` per `rpython/jit/codewriter/
-    // jtransform.py _rewrite_cmp_ptrs`) and are skipped.
+    // `hop.inputargs(self, self)`).  Void is Impossible/None
+    // (`IntegerRepr.convert_const` refuses None) and stays Void.
+    // `ptr_eq` / `ptr_ne` remain Ref-Ref (rewritten in `jtransform`
+    // per `rpython/jit/codewriter/jtransform.py _rewrite_cmp_ptrs`)
+    // and are skipped.
     fn is_int_unop(op: &str) -> bool {
         matches!(op, "neg" | "invert" | "not")
     }
@@ -164,7 +166,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                         rhs,
                         ..
                     } if canonical_int_binop(opname).is_some() => {
-                        // Only upgrade Unknown/Void operands.  Forcing
+                        // Only upgrade Unknown operands.  Forcing
                         // GcRef → Signed here is unsound: a value
                         // classified Ref may alias with pointer uses
                         // elsewhere in the graph, and demoting it to
@@ -174,9 +176,8 @@ pub fn resolve_types(graph: &FunctionGraph) {
                         // The remaining pyre-only `int_*/{ri,ir,rr}`
                         // keys need `cast_ptr_to_int` insertion in
                         // jtransform, not a type override in the
-                        // rtyper. Void is the None/Impossible leftover
-                        // `convert_link` writes; `IntegerRepr` still
-                        // occupies the integer bank.
+                        // rtyper. Void is Impossible/None; do not
+                        // repair it to Signed.
                         changed |= maybe_seed_int_operand(lhs);
                         changed |= maybe_seed_int_operand(rhs);
                         if let Some(result) = op.result.as_ref() {
@@ -416,8 +417,8 @@ fn convert_link(graph: &FunctionGraph, link: &Link) {
             && let Some(lltype) = value.concretetype.as_ref()
         {
             let incoming = crate::model::getkind(lltype);
-            // `_convert_link` `inputconst(r_to, value)` converts INTO
-            // the destination repr. `IntegerRepr.convert_const`
+            // `insert_link_conversions` converts the Constant INTO dest
+            // (`inputconst(r_a2, a1.value)`). `IntegerRepr.convert_const`
             // (`rint.py`) refuses None, so a Void Const must not smash
             // an already-Signed dest (`hop.inputarg(Signed)`).
             if incoming == ConcreteType::Void
@@ -578,12 +579,12 @@ pub(crate) fn canonical_int_binop(op: &str) -> Option<&'static str> {
 }
 
 /// `rint.py IntegerRepr` `hop.inputarg(self)` types the operand Signed.
-/// Void is the None/Impossible leftover `convert_link` writes on an
-/// AccessDirect copy; IntegerRepr still occupies the integer bank.
+/// Unknown is the only kind this pass fills in. Void is Impossible/None
+/// (`IntegerRepr.convert_const` refuses None) and stays Void.
 /// GcRef/Float stay put: demoting a Ref is unsound.
 fn maybe_seed_int_operand(dst: &Variable) -> bool {
     match FunctionGraph::concretetype_of(dst) {
-        ConcreteType::Unknown | ConcreteType::Void => {
+        ConcreteType::Unknown => {
             FunctionGraph::set_concretetype_of_inline(dst, ConcreteType::Signed);
             true
         }
@@ -853,7 +854,9 @@ mod tests {
     }
 
     #[test]
-    fn integer_repr_upgrades_a_void_int_sub_operand() {
+    fn integer_repr_leaves_a_void_int_sub_operand() {
+        // Void is Impossible/None. `IntegerRepr.convert_const` refuses
+        // None; this pass must not repair the operand to Signed.
         let mut graph = FunctionGraph::new("int_sub_void_rhs");
         let entry = graph.startblock;
         let lhs = graph
@@ -886,7 +889,7 @@ mod tests {
         annotate::annotate(&graph);
         resolve_types(&graph);
         assert_eq!(FunctionGraph::concretetype_of(&lhs), ConcreteType::Signed);
-        assert_eq!(FunctionGraph::concretetype_of(&rhs), ConcreteType::Signed);
+        assert_eq!(FunctionGraph::concretetype_of(&rhs), ConcreteType::Void);
         assert_eq!(
             FunctionGraph::concretetype_of(&result),
             ConcreteType::Signed

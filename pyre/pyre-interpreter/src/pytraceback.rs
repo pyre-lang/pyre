@@ -504,7 +504,7 @@ pub unsafe fn record_application_traceback(
             last_instruction
         } else {
             crate::pyopcode::owning_instruction(
-                &(*crate::pyframe::pyframe_get_pycode(&*frame)).instructions,
+                &(*frame).code().instructions,
                 last_instruction as usize,
             ) as i64
         };

@@ -2763,18 +2763,25 @@ pub fn translate_op(
                     // `gctransform` inserts `reload_top_root` after annotate.
                     // Pyre spells them in source; the annotator must see the
                     // identity (`rlib/jit.py` flag on the original value).
+                    // `try_gc_current_object_address` is the same identity
+                    // (`PyFrame::live_mut` forwarding lookup).
                     if crate::front::result_exc::is_gc_root_reload(&op.kind)
                         && matches!(
                             segments.last().map(String::as_str),
-                            Some("reload_top_root" | "reload_top_root_at")
+                            Some(
+                                "reload_top_root"
+                                    | "reload_top_root_at"
+                                    | "try_gc_current_object_address"
+                            )
                         )
                     {
-                        let analyser =
-                            if segments.last().map(String::as_str) == Some("reload_top_root_at") {
-                                "pyre_object.gc_roots.reload_top_root_at"
-                            } else {
-                                "pyre_object.gc_roots.reload_top_root"
-                            };
+                        let analyser = match segments.last().map(String::as_str) {
+                            Some("reload_top_root_at") => "pyre_object.gc_roots.reload_top_root_at",
+                            Some("try_gc_current_object_address") => {
+                                "pyre_object.gc_hook.try_gc_current_object_address"
+                            }
+                            _ => "pyre_object.gc_roots.reload_top_root",
+                        };
                         return Ok(builtin_simple_call(analyser, arg_hls, result));
                     }
                     if segments.as_slice() == ["type"] {
@@ -4044,6 +4051,7 @@ pub fn translate_op(
                 CallTarget::Indirect {
                     method_name,
                     trait_root,
+                    ..
                 } => {
                     dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
                 }
@@ -8496,6 +8504,46 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_try_gc_current_object_address_is_the_annotator_identity() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_try_gc_current_object_address_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".into(),
+                        "gc_hook".into(),
+                        "try_gc_current_object_address".into(),
+                    ],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![vars[1].clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("try_gc_current_object_address must not walk the residual body");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        let Hlvalue::Constant(callable) = &lowered.args[0] else {
+            panic!("try_gc callable must be constant");
+        };
+        let ConstValue::HostObject(host) = &callable.value else {
+            panic!("try_gc callable must be a HostObject");
+        };
+        assert_eq!(
+            host.qualname(),
+            "pyre_object.gc_hook.try_gc_current_object_address"
+        );
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+    }
+
+    #[test]
     fn translate_op_array_repeat_expands_to_newlist_then_mul() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_array_repeat_fixture");
@@ -10046,10 +10094,7 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::Indirect {
-                    trait_root: "MyTrait".into(),
-                    method_name: "do_it".into(),
-                },
+                target: crate::model::CallTarget::indirect("MyTrait", "do_it"),
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
             },

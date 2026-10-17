@@ -773,10 +773,10 @@ pub mod frame_locals_proxy {
             // below can collect, so each iteration re-reads `frame_slot`
             // (`shadowstack.py` restores the livevar after the call).
             let frame = || unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) };
-            // `pycode` is outside the GC heap. Take the pointer once so the
-            // `CodeObject` borrow does not keep the frame temporary alive.
-            let code_ptr = unsafe { crate::pyframe::pyframe_get_pycode(frame()) };
-            let code = unsafe { &*code_ptr };
+            // `pyframe.py PyFrame.getcode`: `hint(self.pycode, promote=True)`.
+            // Take the pointer once so the `CodeObject` borrow does not keep
+            // the frame temporary alive.
+            let code = unsafe { &*(frame().getcode() as *const CodeObject) };
             // The first slot this scan claims. Reading it from the bracket
             // rather than from `roots.base()` keeps the pair arithmetic below
             // correct for a caller that had already pinned something.
@@ -2491,23 +2491,20 @@ impl PyFrame {
     }
 }
 
-/// Extract raw CodeObject from frame's PyCode.
+/// Extract the compiler `CodeObject` from `frame.pycode`.
 ///
-/// PyPy: `frame.pycode` gives `PyCode` which IS the code object.
-/// pyre: PyCode wraps a raw CodeObject — this extracts it.
-///
-/// `@jit.elidable` (`rlib/jit.py`): deterministic, no allocation,
-/// no raise — pure pointer cast through `w_code_get_ptr`.
-/// Mapped to `EF_ELIDABLE_CANNOT_RAISE` (`call.py:299`) so the
-/// metainterp can execute it at trace time and the walker can read
-/// the concrete result back into the Ref bank.
-#[majit_macros::elidable_cannot_raise]
+/// Not elidable: `policy.py _reject_function` leaves elidable graphs
+/// out of `jit_graphs`, so an `access_directly` copy of a frame-taking
+/// elidable fails `warmspot.py WarmRunnerDesc.check_access_directly_sanity`.
+/// Traced readers use [`PyFrame::getcode`] (`hint(self.pycode, promote=True)`)
+/// or [`PyFrame::code`] (the field). Host-side and `dont_look_inside`
+/// callers keep this pointer extract.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
-    unsafe { crate::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef) as *const CodeObject }
+    frame.code() as *const CodeObject
 }
 
 /// Name the frame a stack underflow was detected on. A bare depth
@@ -4215,7 +4212,7 @@ impl PyFrame {
     /// The binding is the canonical `W_DictObject`, not the raw `DictStorage`
     /// proxy, so those opcodes route through the object.
     fn bind_unoptimized_locals_scope(&mut self) {
-        let flags = unsafe { (*pyframe_get_pycode(self)).flags };
+        let flags = self.code().flags;
         if flags.contains(CodeFlags::OPTIMIZED) {
             return;
         }
@@ -4251,7 +4248,11 @@ impl PyFrame {
     ) -> Result<(), crate::PyError> {
         self.bind_unoptimized_locals_scope();
 
-        let code = unsafe { &*pyframe_get_pycode(self) };
+        // `pyframe.py initialize_frame_scopes` reads the `code` argument,
+        // which is this frame's `self.pycode`. The compiler `CodeObject` is
+        // not a GC object; take a pointer so the borrow does not keep
+        // `self` frozen across `set_locals_w`.
+        let code = unsafe { &*(self.code() as *const CodeObject) };
         let npure = npure_cellvars(code);
         let nfreevars = code.freevars.len();
         if npure == 0 && nfreevars == 0 {
@@ -4730,25 +4731,32 @@ impl PyFrame {
         frame
     }
 
-    /// Number of local variable slots (from code object).
+    /// Number of local variable slots.
     ///
-    /// `@jit.elidable`: read-only access to `varnames.len()`, no
-    /// allocation, no raise.  `EF_ELIDABLE_CANNOT_RAISE` parity.
-    #[majit_macros::elidable_cannot_raise]
+    /// `pyframe.py` `self.getcode().co_nlocals` / `self.pycode.co_nlocals`.
+    /// `PyCode.co_nlocals` is `_immutable_fields_`. Look-inside through
+    /// [`Self::getcode`] (`hint(self.pycode, promote=True)`); there is no
+    /// elidable `nlocals(frame)` helper.
     #[inline]
     pub fn nlocals(&self) -> usize {
-        unsafe { (&*pyframe_get_pycode(self)).varnames.len() }
+        self.getcode().varnames.len()
     }
 
     /// Number of cell + free variable slots.
-    #[majit_macros::elidable_cannot_raise]
+    ///
+    /// The cell/free counts of `pyframe.py PyFrame._stack_start`
+    /// (`len(code.co_cellvars)` + `len(code.co_freevars)`), read off plain
+    /// `self.pycode` via [`Self::code`]. [`Self::getcode`] is the promote
+    /// path and is not used here. The cached `npure_cellvars` field
+    /// (unified-slot overlap) plus `co_freevars` length, with the sentinel
+    /// fallback.
     #[inline]
     pub fn ncells(&self) -> usize {
         // `npure_cellvars` (the O(cellvars × varnames) overlap count) is
         // code-invariant and cached on the `PyCode` wrapper; `freevars.len()`
         // is a direct read.  Falls back to the full walk for stub frames
         // whose `pycode` wrapper carries the `u32::MAX` sentinel.
-        let code = unsafe { &*pyframe_get_pycode(self) };
+        let code = self.code();
         match unsafe {
             crate::pycode::w_code_npure_cellvars(self.pycode as pyre_object::PyObjectRef)
         } {
@@ -4758,9 +4766,13 @@ impl PyFrame {
     }
 
     /// First index of the operand stack (after locals and cells).
+    ///
+    /// `pyframe.py PyFrame._stack_start`: `code = self.pycode`;
+    /// `code.co_nlocals + len(code.co_cellvars) + len(code.co_freevars)`.
+    /// Plain `self.pycode`, no promote. [`Self::code`] is that field read.
     #[inline]
     pub fn stack_base(&self) -> usize {
-        self.nlocals() + self.ncells()
+        self.code().varnames.len() + self.ncells()
     }
 
     // ── Stack operations ──────────────────────────────────────────────
@@ -6606,10 +6618,13 @@ impl PyFrame {
         frame
     }
 
-    /// Borrow the raw CodeObject.
+    /// Borrow the raw CodeObject (`pyframe.py` `self.pycode` field read).
+    /// [`Self::getcode`] is the `hint(self.pycode, promote=True)` path.
     #[inline]
     pub fn code(&self) -> &CodeObject {
-        unsafe { &*pyframe_get_pycode(self) }
+        unsafe {
+            &*(crate::w_code_get_ptr(self.pycode as pyre_object::PyObjectRef) as *const CodeObject)
+        }
     }
 
     #[inline]

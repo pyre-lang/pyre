@@ -2413,7 +2413,7 @@ pub(crate) unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // `w_str_concat` joins the surrogate-aware WTF-8 views, so concatenating a
     // surrogateescape/surrogatepass-decoded string does not go through
     // `w_str_get_value` (which rejects lone surrogates).
-    Ok(pyre_object::unicodeobject::w_str_concat(a, b))
+    crate::runtime_ops::obj_or_memory_error(pyre_object::unicodeobject::w_str_concat(a, b))
 }
 
 /// Extract a non-negative repeat count from an int or long.

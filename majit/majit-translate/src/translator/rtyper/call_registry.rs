@@ -315,6 +315,11 @@ pub struct TwoPhaseSubject {
     /// retaining the `GraphRef` lets post-rtype consumers inspect the exact
     /// low-level operations that succeeded.
     pub graph: crate::flowspace::model::GraphRef,
+    /// The annotator's `PyGraph` for an AccessDirect subject: the origin
+    /// FunctionDesc's `cachedgraph((AccessDirect, None))` entry. Publish
+    /// identity-checks this against the desc cache (`Rc::ptr_eq`). Regular
+    /// subjects leave it empty.
+    pub pygraph: Option<Rc<PyGraph>>,
     pub graph_key: crate::flowspace::model::GraphKey,
     pub value_to_var: crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
     pub value_to_var_candidates:
@@ -844,7 +849,7 @@ impl CallRegistry {
     }
 
     /// [`Self::lookup`] over the entries made so far.
-    fn lookup_registered(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
+    pub(crate) fn lookup_registered(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
         let entry = self.entries.borrow().get(key).cloned();
         if entry.is_some() {
             return entry;
@@ -900,6 +905,16 @@ impl CallRegistry {
         let mut keys = vec![canonical.clone()];
         keys.extend(aliases);
         keys
+    }
+
+    /// The canonical `entries` key that owns `entry`, if this registry
+    /// created it. Aliases resolve through [`Self::lookup_registered`];
+    /// [`Self::alias`] needs the canonical key.
+    pub(crate) fn canonical_key_of(&self, entry: &Rc<FunctionEntry>) -> Option<FunctionPathKey> {
+        self.entries
+            .borrow()
+            .iter()
+            .find_map(|(key, existing)| Rc::ptr_eq(existing, entry).then(|| key.clone()))
     }
 
     /// Same as [`Self::lookup`] with a narrowly-scoped cross-module

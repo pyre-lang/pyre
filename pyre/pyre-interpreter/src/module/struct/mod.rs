@@ -1560,15 +1560,15 @@ impl W_Struct {
         let right = pyre_object::intern_str_value("')");
         let right_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(right);
-        let inner = unsafe {
+        let inner = crate::runtime_ops::obj_or_memory_error(unsafe {
             w_str_concat(
                 pyre_object::gc_roots::shadow_stack_get(left_slot),
                 pyre_object::gc_roots::shadow_stack_get(format_slot),
             )
-        };
+        })?;
         let inner_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(inner);
-        Ok(unsafe {
+        crate::runtime_ops::obj_or_memory_error(unsafe {
             w_str_concat(
                 pyre_object::gc_roots::shadow_stack_get(inner_slot),
                 pyre_object::gc_roots::shadow_stack_get(right_slot),
