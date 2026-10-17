@@ -2,7 +2,7 @@
 
 use crate::warmstate::BaseJitCell;
 use majit_ir::IndexMapExt;
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -378,8 +378,12 @@ impl JitCounterInner {
     ///  def lookup_chain(self, hash):
     ///      return self.celltable[self._get_index(hash)]
     /// ```
-    fn lookup_chain(&self, hash: u64) -> Option<Rc<BaseJitCell>> {
-        self.celltable[self._get_index(hash)].clone()
+    ///
+    /// One load of the slot. Callers that need an owned `Rc` clone it;
+    /// `warmstate.py maybe_compile_and_run` keeps the pointer.
+    #[inline(always)]
+    fn lookup_chain(&self, hash: u64) -> &Option<Rc<BaseJitCell>> {
+        &self.celltable[self._get_index(hash)]
     }
 
     /// counter.py install_new_cell(hash, newcell)
@@ -468,7 +472,7 @@ impl JitCounterInner {
     /// drivers may file a cell under the same raw hash; a minted key is
     /// unique across drivers ([`Self::mint_cell_key`]).
     fn cell_by_key(&self, jitdriver_sd: usize, cell_key: u64) -> Option<Rc<BaseJitCell>> {
-        let mut cell = self.lookup_chain(self.bucket_of(cell_key));
+        let mut cell = self.lookup_chain(self.bucket_of(cell_key)).clone();
         while let Some(c) = cell {
             if c.jitdriver_sd == jitdriver_sd && c.cell_key.get() == Some(cell_key) {
                 return Some(c);
@@ -480,7 +484,7 @@ impl JitCounterInner {
 
     /// Whether any driver's cell holds `cell_key`.
     fn key_is_held(&self, cell_key: u64) -> bool {
-        let mut cell = self.lookup_chain(self.bucket_of(cell_key));
+        let mut cell = self.lookup_chain(self.bucket_of(cell_key)).clone();
         while let Some(c) = cell {
             if c.cell_key.get() == Some(cell_key) {
                 return true;
@@ -644,9 +648,17 @@ impl JitCounter {
 
     /// counter.py lookup_chain(hash) — the head of the chain at `hash`'s
     /// table slot; walk `.next` for the rest.
-    #[inline]
-    pub fn lookup_chain(&self, hash: u64) -> Option<Rc<BaseJitCell>> {
-        self.inner.borrow().lookup_chain(hash)
+    ///
+    /// A `Ref` of the table entry, matching the pointer load
+    /// `return self.celltable[self._get_index(hash)]`. The compiled portal
+    /// (`warmstate.py maybe_compile_and_run`) keeps that borrow; callers that
+    /// need an owned `Rc` clone it from the `Ref`.
+    #[inline(always)]
+    pub fn lookup_chain(&self, hash: u64) -> Option<Ref<'_, Rc<BaseJitCell>>> {
+        Ref::filter_map(self.inner.borrow(), |inner| {
+            inner.lookup_chain(hash).as_ref()
+        })
+        .ok()
     }
 
     /// counter.py install_new_cell(hash, newcell).
