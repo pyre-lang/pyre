@@ -632,6 +632,81 @@ fn guard_value_on_a_float_against_a_float_box() {
     assert_eq!(run_float_guard_value_loop(b, -3.75, 3.75), (false, 0));
 }
 
+/// More float loop arguments than xmm registers, rotated by one at every
+/// `JUMP`. Some of them live in frame slots, so `remap_frame_layout` breaks
+/// a cycle that runs through float frame slots with `regalloc_push` /
+/// `regalloc_pop`.
+#[test]
+fn float_frame_slots_rotated_across_jump() {
+    const N: u32 = 24;
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(7);
+
+    let mut inputargs: Vec<InputArgRc> = (0..N)
+        .map(|k| InputArg::from_type_rc(Type::Float, k))
+        .collect();
+    inputargs.push(InputArg::from_type_rc(Type::Int, N));
+    let floats: Vec<OpRef> = (0..N).map(OpRef::input_arg_float).collect();
+    let counter = OpRef::input_arg_int(N);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
+
+    let mut label_args: Vec<_> = floats.iter().map(|&f| rb(f)).collect();
+    label_args.push(rb(counter));
+    let label_op = Op::new(OpCode::Label, &label_args);
+    label_op.pos().set(OpRef::void_op(100));
+    label_op.setdescr(loop_descr.clone());
+
+    let inc_op = Op::new(OpCode::IntAdd, &[rb(counter), rb(OpRef::const_int(1))]);
+    inc_op.pos().set(OpRef::int_op(101));
+    let lt_op = Op::new(
+        OpCode::IntLt,
+        &[rb(OpRef::int_op(101)), rb(OpRef::const_int(3))],
+    );
+    lt_op.pos().set(OpRef::int_op(102));
+
+    let mut fail_types = vec![Type::Float; N as usize];
+    fail_types.push(Type::Int);
+    let mut fail_args: Vec<_> = floats.iter().map(|&f| rb(f)).collect();
+    fail_args.push(rb(OpRef::int_op(101)));
+    let guard_op = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(102))]);
+    guard_op.pos().set(OpRef::void_op(103));
+    guard_op.set_fail_arg_types(fail_types);
+    guard_op.setfailargs(fail_args.into());
+
+    let mut jump_args: Vec<_> = (1..N)
+        .chain(std::iter::once(0))
+        .map(|k| rb(floats[k as usize]))
+        .collect();
+    jump_args.push(rb(OpRef::int_op(101)));
+    let jump_op = Op::new(OpCode::Jump, &jump_args);
+    jump_op.pos().set(OpRef::void_op(104));
+    jump_op.setdescr(loop_descr);
+
+    let ops_rc: Vec<OpRc> = vec![label_op, inc_op, lt_op, guard_op, jump_op]
+        .into_iter()
+        .map(OpRc::new)
+        .collect();
+    backend
+        .compile_loop(&inputargs, &ops_rc, &token)
+        .expect("compile a loop rotating float arguments");
+
+    let mut args: Vec<Value> = (0..N).map(|k| Value::Float(k as f64 + 0.5)).collect();
+    args.push(Value::Int(0));
+    let frame = backend.execute_token(&token, &args);
+    assert!(!backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_int_value(&frame, N as usize), 3);
+    // Two JUMPs ran before the guard failed on the third pass.
+    for k in 0..N {
+        let expected = ((k + 2) % N) as f64 + 0.5;
+        assert_eq!(
+            backend.get_float_value(&frame, k as usize),
+            expected,
+            "float argument {k}"
+        );
+    }
+}
+
 #[test]
 fn test_float_loop_carried_across_jump() {
     let mut backend = DynasmBackend::new();

@@ -11394,6 +11394,9 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
         }
     }
 
+    /// `regalloc_push`: an xmm register goes through `SUB esp, 8` and
+    /// `MOVSD_sx`; everything else is `PUSH(loc)`. On x86-64 a float
+    /// `FrameLoc` is one word, so it is a plain `PUSH_b`.
     fn regalloc_push(&mut self, loc: &Loc) {
         match loc {
             Loc::Reg(r) if r.is_xmm => {
@@ -11401,11 +11404,6 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             }
             Loc::Reg(r) => {
                 dynasm!(self.mc ; .arch x64 ; push Rq(r.value));
-            }
-            ebp_loc_pat!(e) if e.is_float => {
-                dynasm!(self.mc ; .arch x64 ; sub rsp, 8);
-                rx86::movsd_xb(&mut self.mc, 15, e.value);
-                dynasm!(self.mc ; .arch x64 ; movsd [rsp], xmm15);
             }
             ebp_loc_pat!(e) => {
                 rx86::push_b(&mut self.mc, e.value);
@@ -11417,6 +11415,7 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
         }
     }
 
+    /// `regalloc_pop`, the mirror of `regalloc_push`.
     fn regalloc_pop(&mut self, loc: &Loc) {
         match loc {
             Loc::Reg(r) if r.is_xmm => {
@@ -11425,10 +11424,6 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             Loc::Reg(r) => {
                 self.forget_if_scratch_written(r.value);
                 dynasm!(self.mc ; .arch x64 ; pop Rq(r.value));
-            }
-            ebp_loc_pat!(e) if e.is_float => {
-                dynasm!(self.mc ; .arch x64 ; movsd xmm15, [rsp] ; add rsp, 8);
-                rx86::movsd_bx(&mut self.mc, e.value, 15);
             }
             ebp_loc_pat!(e) => {
                 rx86::pop_b(&mut self.mc, e.value);
