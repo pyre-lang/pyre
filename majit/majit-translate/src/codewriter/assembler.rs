@@ -329,6 +329,10 @@ fn host_object_ref_bits(
         if crate::translator::rtyper::unit_variant_fold::is_zero_length_shaped_aggregate(name) {
             return 0;
         }
+        panic!(
+            "Assembler.emit_const: empty-class instance {} must go through emit_prebuilt_instance_const_r",
+            class.qualname()
+        );
     }
     panic!(
         "Assembler.emit_const: HostObject {} has no runtime counterpart",
@@ -512,6 +516,12 @@ trait AssemblerEncode {
 
     fn emit_empty_array_const_r(&mut self, type_name: String, state: &mut AssemblyState) -> u8;
 
+    fn emit_prebuilt_instance_const_r(
+        &mut self,
+        class_name: String,
+        state: &mut AssemblyState,
+    ) -> u8;
+
     fn emit_const_f(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8;
 }
 
@@ -594,6 +604,7 @@ impl AssemblerExt for Assembler {
             reloc_consts_i: Vec::new(),
             reloc_consts_r: Vec::new(),
             empty_array_consts: Vec::new(),
+            prebuilt_instance_consts: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -720,6 +731,7 @@ impl AssemblerExt for Assembler {
             reloc_consts_i: state.reloc_consts_i,
             reloc_consts_r: state.reloc_consts_r,
             empty_array_consts: state.empty_array_consts,
+            prebuilt_instance_consts: state.prebuilt_instance_consts,
             c_num_regs_i: num_regs_i as u8,
             c_num_regs_r: num_regs_r as u8,
             c_num_regs_f: num_regs_f as u8,
@@ -3889,6 +3901,16 @@ impl AssemblerEncode for Assembler {
         {
             return self.emit_empty_array_const_r(name, state);
         }
+        // A named empty-class singleton (`DictKeyError`, `PyreEnv`, …)
+        // is `InstanceRepr.convert_const` / `get_reusable_prebuilt_instance`:
+        // malloc immortal, `initialize_prebuilt_instance` writes typeptr.
+        // The translator cannot allocate that object, so pool a sentinel
+        // plus a class-name descriptor for the load pass.
+        if let ConstValue::HostObject(obj) = value
+            && let Some(class_name) = empty_class_instance_host_object_name(obj)
+        {
+            return self.emit_prebuilt_instance_const_r(class_name, state);
+        }
         let bits = match value {
             // assembler.py::Assembler.emit_const casts ref constants to
             // GCREF and gives every typed nullptr the same None pool key.
@@ -4087,6 +4109,39 @@ impl AssemblerEncode for Assembler {
         reg
     }
 
+    /// Record a prebuilt empty-class instance for runtime materialization
+    /// and pool its sentinel — [`Self::emit_str_const_r`]'s shape for
+    /// `InstanceRepr.convert_const`. Identical class names share one
+    /// descriptor and one sentinel.
+    fn emit_prebuilt_instance_const_r(
+        &mut self,
+        class_name: String,
+        state: &mut AssemblyState,
+    ) -> u8 {
+        if let Some(ordinal) = state
+            .prebuilt_instance_consts
+            .iter()
+            .position(|d| d.class_name == class_name)
+        {
+            return self.emit_const_r_bits(prebuilt_instance_const_sentinel(ordinal), state);
+        }
+        let ordinal = state.prebuilt_instance_consts.len();
+        let constants_r_index = state.constants_r.len();
+        let reg = self.emit_const_r_bits(prebuilt_instance_const_sentinel(ordinal), state);
+        debug_assert_eq!(
+            state.constants_r.len(),
+            constants_r_index + 1,
+            "a fresh prebuilt-instance sentinel must push a new constants_r slot"
+        );
+        state
+            .prebuilt_instance_consts
+            .push(super::jitcode::PrebuiltInstanceConstDescriptor {
+                constants_r_index,
+                class_name,
+            });
+        reg
+    }
+
     fn emit_const_r_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
         for (i, &existing) in state.constants_r.iter().enumerate() {
             if existing == bits && !state.slot_r_is_reloc(i) {
@@ -4214,6 +4269,32 @@ fn empty_array_host_object_name(obj: &crate::flowspace::model::HostObject) -> Op
         .then(|| name.to_string())
 }
 
+/// Qualname of an interned empty-class singleton (`reusable_prebuilt_instance`).
+///
+/// Structural: an instance of a named class, empty constructor args, no
+/// unit-variant discriminant, not an exception instance, not `Array<T;0>`
+/// / `Tuple<>`. `rclass.py InstanceRepr.convert_const` keeps this as a
+/// prebuilt instance rather than Void.
+fn empty_class_instance_host_object_name(
+    obj: &crate::flowspace::model::HostObject,
+) -> Option<String> {
+    let class = obj.instance_class()?;
+    if crate::translator::rtyper::unit_variant_fold::unit_variant_const_from_host(obj).is_some() {
+        return None;
+    }
+    if exception_instance_spec(obj).is_some() {
+        return None;
+    }
+    let name = class.simple_name();
+    if crate::translator::rtyper::unit_variant_fold::is_zero_length_shaped_aggregate(name) {
+        return None;
+    }
+    if !obj.instance_args().unwrap_or(&[]).is_empty() {
+        return None;
+    }
+    Some(class.qualname().to_string())
+}
+
 /// Per-assembly state (RPython: Assembler.setup() fields).
 struct AssemblyState {
     code: Vec<u8>,
@@ -4241,6 +4322,9 @@ struct AssemblyState {
     /// Zero-length array constants recorded while assembling,
     /// committed to [`JitCodeBody::empty_array_consts`].
     empty_array_consts: Vec<super::jitcode::EmptyArrayConstDescriptor>,
+    /// Prebuilt empty-class instances recorded while assembling,
+    /// committed to [`JitCodeBody::prebuilt_instance_consts`].
+    prebuilt_instance_consts: Vec<super::jitcode::PrebuiltInstanceConstDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -7499,6 +7583,7 @@ mod tests {
             reloc_consts_i: Vec::new(),
             reloc_consts_r: Vec::new(),
             empty_array_consts: Vec::new(),
+            prebuilt_instance_consts: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -8383,6 +8468,86 @@ mod tests {
             body.constants_r[body.empty_array_consts[0].constants_r_index],
             empty_array_const_sentinel(0)
         );
+    }
+
+    #[test]
+    fn empty_class_instance_emits_prebuilt_instance_sentinel() {
+        let class = HostObject::new_class("dictmultiobject::DictKeyError", Vec::new());
+        let inst = class
+            .reusable_prebuilt_instance()
+            .expect("empty class instance");
+        let mut flat = SSARepr {
+            name: "empty_class".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(inst)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(body.prebuilt_instance_consts.len(), 1);
+        assert_eq!(
+            body.prebuilt_instance_consts[0].class_name,
+            "dictmultiobject::DictKeyError"
+        );
+        let idx = body.prebuilt_instance_consts[0].constants_r_index;
+        assert_eq!(body.constants_r[idx], prebuilt_instance_const_sentinel(0));
+        assert!(body.empty_array_consts.is_empty());
+        assert!(body.unit_variant_consts.is_empty());
+    }
+
+    #[test]
+    fn empty_class_instance_dedups_by_class() {
+        let class = HostObject::new_class("KwargsDictStrategy", Vec::new());
+        let a = class
+            .reusable_prebuilt_instance()
+            .expect("empty class instance");
+        let b = class
+            .reusable_prebuilt_instance()
+            .expect("same interned instance");
+        let mut flat = SSARepr {
+            name: "empty_class_dedup".into(),
+            insns: vec![
+                FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                    crate::flowspace::model::Constant::new(ConstValue::HostObject(a)),
+                )),
+                FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                    crate::flowspace::model::Constant::new(ConstValue::HostObject(b)),
+                )),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(body.prebuilt_instance_consts.len(), 1);
+        assert_eq!(
+            body.prebuilt_instance_consts[0].class_name,
+            "KwargsDictStrategy"
+        );
+        assert_eq!(body.constants_r.len(), 1);
+        assert_eq!(body.constants_r[0], prebuilt_instance_const_sentinel(0));
+    }
+
+    #[test]
+    fn empty_tuple_instance_emits_zero_not_prebuilt_instance() {
+        let class = HostObject::new_class("Tuple<>", Vec::new());
+        let inst = class
+            .reusable_prebuilt_instance()
+            .expect("empty tuple instance");
+        let mut flat = SSARepr {
+            name: "empty_tuple".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(inst)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(body.constants_r, vec![0]);
+        assert!(body.prebuilt_instance_consts.is_empty());
     }
 
     fn cc_with_exc_rows(pytypes: &[(&str, i64)]) -> crate::call::CallControl {

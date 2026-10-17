@@ -88,6 +88,33 @@ pub fn is_empty_array_const_sentinel(bits: u64) -> bool {
     bits & HIGH == (EMPTY_ARRAY_CONST_SENTINEL_BASE as u64) & HIGH
 }
 
+/// Non-canonical tag marking a deferred prebuilt empty-class instance
+/// slot in `constants_r`, disjoint from the empty-array base. The low
+/// 48 bits carry the [`super::jitcode::PrebuiltInstanceConstDescriptor`]
+/// ordinal.
+///
+/// `rclass.py InstanceRepr.convert_const` mallocs an immortal instance
+/// (`create_instance` / `initialize_prebuilt_instance`, typeptr = the
+/// class vtable) and `assembler.py emit_const` stores that GCREF. The
+/// translator cannot allocate the runtime object, so the slot holds
+/// this sentinel until the load pass writes the immortal instance.
+pub const PREBUILT_INSTANCE_CONST_SENTINEL_BASE: i64 = 0x7E5C_0000_0000_0000u64 as i64;
+
+/// `PREBUILT_INSTANCE_CONST_SENTINEL_BASE | ordinal`.
+pub fn prebuilt_instance_const_sentinel(ordinal: usize) -> i64 {
+    debug_assert!(
+        (ordinal as u64) < (1u64 << 48),
+        "too many prebuilt-instance constants"
+    );
+    PREBUILT_INSTANCE_CONST_SENTINEL_BASE | ordinal as i64
+}
+
+/// Whether `bits` is a [`prebuilt_instance_const_sentinel`] rather than an address.
+pub fn is_prebuilt_instance_const_sentinel(bits: u64) -> bool {
+    const HIGH: u64 = 0xFFFF_0000_0000_0000;
+    bits & HIGH == (PREBUILT_INSTANCE_CONST_SENTINEL_BASE as u64) & HIGH
+}
+
 /// RPython `class AssemblerError(Exception)` (assembler.py).
 ///
 /// Upstream raises this for unsupported constant kinds while assembling

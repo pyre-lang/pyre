@@ -6608,6 +6608,7 @@ impl JitCodeBuilder {
             reloc_consts_i: Vec::new(),
             reloc_consts_r: Vec::new(),
             empty_array_consts: Vec::new(),
+            prebuilt_instance_consts: Vec::new(),
             // `jitcode.py JitCode.setup`: the three register counts are
             // stored as one `chr` apiece.  The gate above proves these casts
             // lossless; keeping the builder counters wide is useful only
