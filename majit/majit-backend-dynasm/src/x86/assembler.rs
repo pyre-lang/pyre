@@ -3275,7 +3275,7 @@ impl<'a> Assembler386<'a> {
                 }
             }
             AbiArgPlacement::Stack(dst_offset) => {
-                let scratch = crate::regloc::XMM15.value;
+                let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
                 if arg_type == Type::Float {
                     rx86::movsd_xb(&mut self.mc, scratch, offset);
                     rx86::movsd_sx(&mut self.mc, dst_offset, scratch);
@@ -5589,7 +5589,7 @@ impl<'a> Assembler386<'a> {
                     dsts.push(dst_loc);
                 }
                 let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
-                let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
+                let tmpreg2 = Loc::Reg(crate::regloc::X86_64_XMM_SCRATCH_REG);
                 if majit_ir::debug::have_debug_prints() {
                     let _s = majit_ir::debug::scope("jit-backend");
                     majit_ir::debug::debug_print(&format!(
@@ -9127,7 +9127,7 @@ impl<'a> Assembler386<'a> {
             self.emit_singlefloat_movd(*src, *dst);
         }
         let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
-        let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
+        let tmpreg2 = Loc::Reg(crate::regloc::X86_64_XMM_SCRATCH_REG);
         crate::jump::remap_frame_layout_mixed(
             self, &int_src, &int_dst, tmpreg1, &xmm_src, &xmm_dst, tmpreg2,
         );
