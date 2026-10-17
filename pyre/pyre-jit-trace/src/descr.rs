@@ -13582,9 +13582,19 @@ fn mint_field(
     else {
         return None;
     };
-    if field_name == "gil_ready" {
-        return Some(GIL_READY_DESCR_GROUP.field_descrs[0].clone()
-            as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+    if field_name == "gil_ready"
+        && let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
+        && is_gil_ready_struct(*struct_id)
+    {
+        let canonical = gil_ready_descr();
+        if let Some(field) = canonical.as_field_descr()
+            && field.offset() == *offset
+            && field.field_size() == *field_size
+            && field.field_type() == *field_type
+        {
+            return Some(GIL_READY_DESCR_GROUP.field_descrs[0].clone()
+                as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+        }
     }
     // PyPy's single GcCache sees the runtime declaration at the same
     // `cpu.fielddescrof` request that creates this slot. At pyre's AOT
@@ -14556,6 +14566,46 @@ mod set_member_lookup_tests {
         assert_eq!(field.offset(), 16);
         assert_eq!(field.field_size(), 8);
         assert_eq!(field.index_in_parent(), 1);
+    }
+
+    /// A `gil_ready` field on some other STRUCT must not stamp the
+    /// process-global GIL descr's effect index.
+    #[test]
+    fn mint_gil_ready_on_another_struct_does_not_alias_the_quasi_descr() {
+        use majit_ir::effectinfo::{DescrMintEntry, DescrMintSpec};
+
+        let canonical = gil_ready_descr();
+        let before = canonical.get_ei_index();
+        let struct_id = 0x7e57_0000_0000_0004u64;
+        let _ = publish_effect_info_descr_mint(&DescrMintEntry {
+            member: DescrSetMember::Field {
+                struct_id,
+                field_name: "gil_ready".to_string(),
+            },
+            spec: DescrMintSpec::Field {
+                struct_size: 8,
+                offset: 0,
+                field_size: 8,
+                field_type: majit_ir::value::Type::Int,
+                flag: majit_ir::descr::ArrayFlag::Signed,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+            },
+            ei_index: 99,
+        });
+        assert_eq!(gil_ready_descr().get_ei_index(), before);
+        let lookup = descr_from_set_member(&DescrSetMember::Field {
+            struct_id,
+            field_name: "gil_ready".to_string(),
+        });
+        if let SetMemberLookup::Resolved(descr) = lookup {
+            assert!(
+                !std::sync::Arc::ptr_eq(&descr, &canonical),
+                "an unrelated gil_ready field must not be the GIL cell"
+            );
+            assert_eq!(descr.get_ei_index(), 99);
+        }
     }
 }
 

@@ -124,7 +124,16 @@ fn raw_pointer_pointee_is_fat(item: &str) -> bool {
         .and_then(|s| s.strip_suffix(')'))
         .unwrap_or(rest)
         .trim();
-    inner.starts_with("dyn ") || inner.starts_with('[') || inner == "str"
+    inner.starts_with("dyn ") || unsized_slice_spelling(inner) || inner == "str"
+}
+
+/// `*const [T]` / `*mut [T]` are two-word fat pointers. `*const [T; N]` is
+/// one word: the pointee is a sized array.
+fn unsized_slice_spelling(inner: &str) -> bool {
+    let Some(body) = inner.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    !body.contains(';')
 }
 
 /// The item spelling of a `Vec<item>` spelling (`Vec<T>`, `alloc::vec::Vec<T>`,
@@ -662,11 +671,24 @@ mod tests {
             "*const (dyn Foo + Send)",
             "*const [u8]",
             "*mut [usize]",
+            "*const ([u8])",
             "*const str",
             "*mut str",
         ] {
             assert_eq!(vec_item_kind_for_spelling(other, 8), None, "{other}");
         }
+        assert_eq!(
+            vec_item_kind_for_spelling("*const [u8; 4]", 8),
+            Some(VecItemKind::Ref)
+        );
+        assert_eq!(
+            vec_item_kind_for_spelling("*mut [usize; 2]", 8),
+            Some(VecItemKind::Ref)
+        );
+        assert_eq!(
+            vec_item_kind_for_spelling("*const ([u8; 4])", 8),
+            Some(VecItemKind::Ref)
+        );
         assert_eq!(vec_item_spelling("Vec<usize>"), Some("usize"));
         assert_eq!(vec_item_spelling("&mut alloc::vec::Vec<f64>"), Some("f64"));
         assert_eq!(vec_item_spelling("VecDeque<usize>"), None);
