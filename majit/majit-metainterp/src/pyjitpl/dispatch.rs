@@ -2408,9 +2408,7 @@ where
                 .metainterp_sd()
                 .exit_frame_with_exception_descr_ref
                 .clone()
-                .unwrap_or_else(|| {
-                    crate::make_finish_fail_descr_typed(vec![majit_ir::Type::Int], true)
-                });
+                .expect("compile.py make_and_attach_done_descrs attaches exit_frame_with_exception_descr_ref");
             ctx.finish(&[exception_box], token);
         }
         // pyjitpl.py:1671-1673: "we now need to blackhole back to the

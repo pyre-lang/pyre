@@ -2878,9 +2878,7 @@ fn create_segmented_trace<Sym: WalkSym>(
             .metainterp_sd()
             .exit_frame_with_exception_descr_ref
             .clone()
-            .unwrap_or_else(|| {
-                majit_metainterp::make_finish_fail_descr_typed(vec![Type::Int], true)
-            });
+            .expect("compile.py make_and_attach_done_descrs attaches exit_frame_with_exception_descr_ref");
         ctx.trace_ctx.finish(&[exception_box], token);
     }
     // pyjitpl.py:1671-1673: "we now need to blackhole back to the interpreter

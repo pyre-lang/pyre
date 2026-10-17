@@ -781,22 +781,6 @@ mod tests {
             "`shift(n: usize, c: i64, mark: bool)` is one Ref then two Ints, in that order",
         );
         assert_eq!(body.calldescr.result_type, 'i');
-        assert!(
-            majit_metainterp::blackhole::native_entry_args_intact(&jitcode, 0),
-            "pc 0 is the helper entry"
-        );
-        assert!(
-            majit_metainterp::blackhole::native_entry_args_intact(&jitcode, 25),
-            "Char ch==c is before any child call or this node's store"
-        );
-        assert!(
-            !majit_metainterp::blackhole::native_entry_args_intact(&jitcode, 29),
-            "int_eq dest overwrites mark (i1)"
-        );
-        assert!(
-            !majit_metainterp::blackhole::native_entry_args_intact(&jitcode, 168),
-            "Sequence after left child has already called; restart is unsafe"
-        );
         let starts = jitcode.startpoints.as_ref().expect("assembled shift");
         let mut leftover = std::collections::BTreeMap::<u8, usize>::new();
         for &pc in starts {

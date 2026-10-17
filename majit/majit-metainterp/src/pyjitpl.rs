@@ -8705,9 +8705,21 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         driver_descriptor: Option<&JitDriverStaticData>,
     ) -> Arc<JitCellToken> {
-        let token = make_jitcell_token(driver_descriptor.and_then(|d| d.index));
+        let token = make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor));
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor);
         token
+    }
+
+    /// `compile.py make_jitcell_token(jitdriver_sd)` always names the compiling
+    /// driver. Prefer the descriptor's registered slot; a descriptor-less
+    /// host entry uses `active_jitdriver_sd` set at trace start.
+    fn jitdriver_index_for_new_token(
+        &self,
+        driver_descriptor: Option<&JitDriverStaticData>,
+    ) -> Option<usize> {
+        driver_descriptor
+            .and_then(|d| d.index)
+            .or(self.active_jitdriver_sd)
     }
 
     /// Close the current trace, optimize, and compile.
@@ -9970,10 +9982,10 @@ impl<M: Clone> MetaInterp<M> {
             if pk == green_key {
                 token
             } else {
-                make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
+                make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
             }
         } else {
-            make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
         };
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
         // `compile.py:180-181` wref wiring — done inside
@@ -11658,7 +11670,8 @@ impl<M: Clone> MetaInterp<M> {
         // trace is installed under. The token `compile.py:355-356` resolves is
         // the optimization-time one — it carries the closing JUMP descr and
         // the retrace budget, not the installation identity.
-        let mut token = make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index));
+        let mut token =
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         self.configure_loop_token_for_driver(
             Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
             green_key,
@@ -12725,10 +12738,10 @@ impl<M: Clone> MetaInterp<M> {
             if pk == green_key {
                 token
             } else {
-                make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
+                make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
             }
         } else {
-            make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
         };
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
         // `compile.py:180-181` wref wiring — done inside
@@ -13225,7 +13238,8 @@ impl<M: Clone> MetaInterp<M> {
 
         // Allocate token and compile.
         // `compile.py jitcell_token = make_jitcell_token(jitdriver_sd)`.
-        let mut token = make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index));
+        let mut token =
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         self.configure_loop_token_for_driver(
             Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
             green_key,
@@ -15099,7 +15113,9 @@ impl<M: Clone> MetaInterp<M> {
             // evicted token's `outermost_jitdriver_index` rather than
             // leftover `active_jitdriver_sd`.
             let gk = token.green_key();
-            let jd_no = token.outermost_jitdriver_index.unwrap_or(0);
+            let jd_no = token
+                .outermost_jitdriver_index
+                .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd");
             let Some(entry) = self.compiled_loops.get_mut(&(jd_no, gk)) else {
                 continue;
             };
@@ -15196,22 +15212,30 @@ impl<M: Clone> MetaInterp<M> {
                 .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&attach_token)),
         };
         if let Some(old_token) = old_token {
-            // `warmstate.py:343-347` line-by-line: when an `old_token`
-            // is present, redirect + record_jump_to run unconditionally.
-            // Upstream guarantees both tokens own real compiled code at
-            // this point — the public attach paths (`compile_loop`,
-            // `compile_simple_loop_or_bridge`, bridge-finish) only call
-            // here after `backend.compile_loop` has stamped the new
-            // token, and the old token retained its compiled blob from
-            // the previous attach.
+            // `warmstate.py attach_procedure_to_interp`: when an
+            // `old_token` is present, redirect + record_jump_to run
+            // unconditionally. Upstream guarantees both tokens own real
+            // compiled code at this point — the public attach paths
+            // (`compile_loop`, `compile_simple_loop_or_bridge`,
+            // bridge-finish) only call here after `backend.compile_loop`
+            // has stamped the new token, and the old token retained its
+            // compiled blob from the previous attach.
             //
-            // `warmstate.py:344` `cpu.redirect_call_assembler(old, new)`.
-            // The assembler logs `jl.redirect_assembler` itself
-            // (`x86/assembler.py` / `aarch64/assembler.py`).
+            // `warmstate.py attach_procedure_to_interp`
+            // `cpu.redirect_call_assembler(old, new)`. A mismatch is an
+            // assert inside `redirect_call_assembler`
+            // (`assert old_nbargs == new_nbargs`).
             crate::rjitlog::install_backend_hooks();
-            let _ = self
+            if let Err(e) = self
                 .backend
-                .redirect_call_assembler(&old_token, &attach_token);
+                .redirect_call_assembler(&old_token, &attach_token)
+            {
+                panic!(
+                    "redirect_call_assembler old identity={} new identity={}: {e}",
+                    old_token.identity_key(),
+                    attach_token.identity_key(),
+                );
+            }
             // `warmstate.py` `old_token.record_jump_to(procedure_token)`.
             old_token.record_jump_to(attach_token);
         }
@@ -15366,18 +15390,6 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
             .filter(|(pk, _)| *pk == green_key)
             .map(|(_, token)| token)
-    }
-
-    /// Redirect existing call_assembler calls from one loop to another.
-    ///
-    /// `jl.redirect_assembler` is logged by the backend assembler.
-    pub fn redirect_call_assembler(&self, old_key: u64, new_key: u64) {
-        let old_token = self.get_procedure_token(old_key);
-        let new_token = self.get_procedure_token(new_key);
-        if let (Some(old), Some(new)) = (old_token, new_token) {
-            crate::rjitlog::install_backend_hooks();
-            let _ = self.backend.redirect_call_assembler(&old, &new);
-        }
     }
 
     /// Port of `rpython/jit/metainterp/compile.py record_loop_or_bridge
@@ -16683,7 +16695,8 @@ impl<M: Clone> MetaInterp<M> {
         self.backend
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
-        let token = make_jitcell_token(driver_descriptor.as_ref().and_then(|driver| driver.index));
+        let token =
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         // `green_key` is interior-mutable, so it is written through the
         // shared `Arc`.
         token.green_key.set(original_green_key);
@@ -28189,7 +28202,9 @@ mod metainterp_static_data_tests {
         assert_eq!(idx1, 1);
         meta.finish_setup_descrs_for_jitdrivers();
 
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(41));
+        let mut token = majit_backend::JitCellToken::new(41);
+        token.outermost_jitdriver_index = Some(idx1);
+        let token = std::sync::Arc::new(token);
         meta.active_jitdriver_sd = Some(idx1);
         meta.keep_compiled_token_alive(&token);
         meta.warm_state_for_driver(idx1)

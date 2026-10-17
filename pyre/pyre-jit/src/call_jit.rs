@@ -3761,11 +3761,12 @@ pub(crate) fn compiled_meta_for_bridge_source<M: Clone>(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     green_key: u64,
 ) -> Option<std::sync::Arc<M>> {
-    let jd_no = descr_arc
+    let token = descr_arc
         .as_fail_descr()
-        .and_then(majit_backend::descr_owning_jct)
-        .and_then(|token| token.outermost_jitdriver_index)
-        .unwrap_or(0);
+        .and_then(majit_backend::descr_owning_jct)?;
+    let jd_no = token
+        .outermost_jitdriver_index
+        .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd");
     meta_interp
         .get_compiled_meta_on_driver(jd_no, green_key)
         .cloned()
