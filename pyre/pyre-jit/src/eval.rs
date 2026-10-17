@@ -11794,52 +11794,6 @@ fn handle_fail(
         }
     }
 
-    // The range FOR_ITER `GuardClass(RANGE_ITER)` proves its own site
-    // polymorphic on the first failure.  The failing descr carries the
-    // FOR_ITER green key it protects (`range_foriter_green_key`), stamped
-    // when the guard was minted, so the demotion is keyed on descr identity
-    // rather than a per-trace fail index the optimizer can shift.  Demote
-    // before `should_bridge` can spend another retrace-limit cycle trying to
-    // close a bridge at the same failing loop header; blackhole resumes this
-    // invocation without the invalidated compiled loop.
-    //
-    // The demotion registry is keyed on the FOR_ITER SITE, which is what the
-    // marker carries and what `walker_foriter_green_key` reads back before
-    // specializing again — `make_green_key` at `(w_code, foriter_start_pc)` for the
-    // FOR_ITER the guard protects, not for the loop this trace was entered at.
-    // Those differ whenever the specialized FOR_ITER is not the entry header
-    // itself (an inner loop inside a trace entered at an outer one), and
-    // demoting under the entry key would leave the polymorphic site
-    // specialized — re-failing forever — while retiring an innocent one.  The
-    // token surgery below stays on `green_key`: the trace to discard is the
-    // one that just failed.
-    if let Some(site_key) = descr_arc.range_foriter_green_key()
-        && pyre_jit_trace::trace::range_foriter_demote_once(site_key)
-    {
-        let (driver, _) = driver_pair();
-        driver.invalidate_loop(green_key);
-        // This is an intentional replacement, unlike ordinary
-        // GUARD_NOT_INVALIDATED handling: discard the range trace's target
-        // tokens so the next walk compiles the generic FOR_ITER residual.
-        // The `ResumeInBlackhole` below decodes off the exit layout it was
-        // handed, so retiring the entry here cannot starve it of slot types.
-        driver.remove_compiled_loop(green_key);
-        return (
-            HandleFailOutcome::ResumeInBlackhole,
-            savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
-        );
-    }
-
-    // A keyed failure proves this FOR_ITER site's instance-`__next__`
-    // specialization unsuitable.  Deliberately discard the marker's bool:
-    // the first insertion retires the specialization, while later failures
-    // must leave it retired so the next walk compiles the generic residual.
-    // Do not override the ordinary bridge gate; `compile.py:702-703` makes
-    // `must_compile() && !stack_almost_full()` the complete decision.
-    if let Some(foriter_key) = descr_arc.instance_next_foriter_green_key() {
-        let _ = pyre_jit_trace::trace::instance_next_foriter_bridge_demote_once(foriter_key);
-    }
-
     // compile.py: must_compile() AND not stack_almost_full()
     if should_bridge && !stack_almost_full() {
         // compile.py try/finally: start_compiling() before
@@ -12154,8 +12108,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         // `compile.py handle_fail` and `resume.py blackhole_from_resumedata`
         // read every slot's kind out of the self-describing deadframe+descr
         // they were handed, so no metadata a pending resume is about to
-        // read can be retired under it (`remove_compiled_loop` on the
-        // range-FOR_ITER demotion runs before `ResumeInBlackhole` returns).
+        // read can be retired under it.
         // A missing slice would disarm both `ResumeDeadframeRoots::register`
         // and the Ref/Int discrimination in `decode_ref` — an unrooted,
         // mistyped raw word reaching the resume as a GCREF.

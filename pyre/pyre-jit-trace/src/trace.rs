@@ -516,21 +516,6 @@ thread_local! {
     /// return a plain abort and rely on the normal hotness/abort machinery.
     static FBW_DECLINED_KEYS: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
-    /// FOR_ITER green keys whose range-only specialization observed a class
-    /// mismatch.  This gates only the specialization; the full-body walk must
-    /// still retrace and compile its generic residual.
-    ///
-    /// This is deliberately per-thread, like `FBW_DECLINED_KEYS` and the JIT
-    /// driver itself.  A guard failure proves polymorphism only for the
-    /// executing thread's trace; no cross-thread mutable JIT state is needed.
-    static RANGE_FORITER_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-    /// FOR_ITER sites whose user-instance `__next__` inline has reached a
-    /// guard-failure bridge.  Only bridge walks consult this set: the primary
-    /// loop retains its inline, while the bridge records generic `jit_next` so
-    /// exhaustion is converted by the caller opcode.
-    static INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 pub(crate) fn fbw_declined(key: u64) -> bool {
@@ -557,38 +542,6 @@ fn abort_too_long_action() -> TraceAction {
         reason: majit_metainterp::counters::ABORT_TOO_LONG,
         raising_exception: false,
     })
-}
-
-pub(crate) fn range_foriter_demoted(key: u64) -> bool {
-    RANGE_FORITER_DEMOTED.with(|s| s.borrow().contains(&key))
-}
-
-/// Demote a range FOR_ITER site on the first failure of its class guard —
-/// a definitive polymorphism witness.
-///
-/// Returns `true` when this call performs the demotion (first class
-/// mismatch), `false` when the site was already demoted (idempotent
-/// re-failure).  `handle_fail` calls this only after confirming the failing
-/// descr carries the range marker (`Descr::range_foriter_green_key`), so an
-/// unrelated body guard at the same loop can never demote the site.
-///
-/// `site_key` is the key the marker carries — the FOR_ITER's own
-/// `make_green_key` at `(w_code, foriter_start_pc)`, which is what
-/// [`range_foriter_demoted`] is later asked about before the site specializes
-/// again.  It is not the key the failing trace was entered at.
-pub fn range_foriter_demote_once(site_key: u64) -> bool {
-    RANGE_FORITER_DEMOTED.with(|s| s.borrow_mut().insert(site_key))
-}
-
-pub(crate) fn instance_next_foriter_bridge_demoted(key: u64) -> bool {
-    INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED.with(|s| s.borrow().contains(&key))
-}
-
-/// Mark a user-instance `__next__` guard source so its bridge walk keeps the
-/// generic FOR_ITER residual.  The set is deliberately bridge-only; it does
-/// not retire the optimized loop or suppress the inline on a later root trace.
-pub fn instance_next_foriter_bridge_demote_once(green_key: u64) -> bool {
-    INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED.with(|s| s.borrow_mut().insert(green_key))
 }
 
 #[allow(dead_code)]

@@ -216,24 +216,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     after_residual_call: bool,
     scope: GuardCaptureScope<'_>,
 ) -> Result<(), DispatchError> {
-    let instance_next_foriter_keyed =
-        if let Some(green_key) = ctx.fbw_mode.instance_next_foriter_green_key {
-            // Mint the marker as the subtype this op's opcode requires: the
-            // whole inlined `__next__` body is tagged, so a may-force or
-            // can-raise residual inside it brings its `GuardNotForced` /
-            // `GuardNoException` through here, and the stamp is what
-            // `store_final_boxes_in_guard` finds instead of inventing.
-            let opcode = ctx.trace_ctx.last_op_opcode();
-            let descr =
-                majit_metainterp::make_resume_guard_descr_instance_next_foriter(opcode, green_key);
-            ctx.trace_ctx.set_last_op_descr(descr);
-            true
-        } else {
-            false
-        };
-    if ctx.fbw_mode.instance_next_foriter_census_active {
-        spec_census_record_instance_next_callee_guard(instance_next_foriter_keyed);
-    }
     // A guard whose resume snapshot cannot be built must abort the trace,
     // not panic.  `build_vable_snapshot_boxes` requires every virtualizable
     // box (including the identity at `[-1]`) to carry `OpRef::ty()`; a

@@ -2931,7 +2931,7 @@ thread_local! {
     /// mid-body resume.
     ///
     /// Per-thread for the same reason as [`crate::trace::fbw_declined`]'s
-    /// `FBW_DECLINED_KEYS` and `RANGE_FORITER_DEMOTED`: pyre's walk state is
+    /// `FBW_DECLINED_KEYS`: pyre's walk state is
     /// per-thread, and an inline hazard observed while tracing is a property of
     /// the tracing thread's framestack.  Sharing one memo while its siblings
     /// stay per-thread would be the inconsistency.

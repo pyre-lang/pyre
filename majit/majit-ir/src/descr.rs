@@ -4533,27 +4533,6 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     /// override.
     fn set_prev_descr(&self, _prev: DescrRef) {}
 
-    /// Pyre-only: the FOR_ITER green key whose walker-native range class
-    /// guard this descr backs, or `None`.  `handle_fail` reads it off the
-    /// failing descr to demote the range specialization on the first class
-    /// mismatch, independent of the guard's per-trace fail index (which
-    /// optimizer guard-folding / unroll can shift).  A shared-resume copied
-    /// guard carries no marker of its own, so the default chases `prev` to
-    /// the donor `ResumeGuardDescr` that holds the tag; `ResumeGuardDescr`
-    /// overrides to read its own slot.
-    fn range_foriter_green_key(&self) -> Option<u64> {
-        self.prev_descr()
-            .and_then(|prev| prev.range_foriter_green_key())
-    }
-
-    /// Pyre-only: the FOR_ITER green key whose user-instance `__next__`
-    /// inline emitted this guard, or `None`.  Copied guards chase their donor
-    /// descr exactly like [`Descr::range_foriter_green_key`].
-    fn instance_next_foriter_green_key(&self) -> Option<u64> {
-        self.prev_descr()
-            .and_then(|prev| prev.instance_next_foriter_green_key())
-    }
-
     /// intbounds.py: descr.is_integer_bounded() / get_integer_min/max.
     /// Returns (field_size_bytes, is_signed) if this is a field descriptor.
     /// Used by intbounds to narrow GETFIELD result bounds.

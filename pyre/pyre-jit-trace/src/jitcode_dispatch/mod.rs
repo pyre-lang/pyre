@@ -2126,15 +2126,6 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// bridge's own resume coordinate, restoring the RPython positional
     /// semantics.
     pub bridge_entry_merge_pc: Option<usize>,
-    /// FOR_ITER key inherited only by the user-instance `__next__` sub-walk.
-    /// Every guard it emits is tagged so failure resumes in the blackhole
-    /// instead of compiling a bridge from the middle of the callee.
-    pub instance_next_foriter_green_key: Option<u64>,
-    /// Census marker paired with `instance_next_foriter_green_key`.  Keeping
-    /// the route identity separate from the optional descr key lets the
-    /// specialization census prove that every captured callee guard was
-    /// actually stamped.
-    pub instance_next_foriter_census_active: bool,
     /// Set for the sub-walk that resumes a suspended generator body in place of
     /// the `jit_next` residual a `FOR_ITER` over it would otherwise leave.
     /// `None` for every other walk, which is what keeps the yield interception
@@ -2209,8 +2200,6 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
             bridge_entry_merge_pc: None,
-            instance_next_foriter_green_key: None,
-            instance_next_foriter_census_active: false,
             generator_resume: None,
         }
     }
@@ -12529,69 +12518,6 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
 /// `RawDescrPool::Global`), and its inline-call descrs through this lookup.
 static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
     sub_jitcode_body_by_index;
-
-/// Return the driver green key for this top-level FOR_ITER residual.
-///
-/// `op_pc` belongs to the current per-CodeObject JitCode, while the driver
-/// key is `(W_Code, python FOR_ITER pc)`.  The full-body snapshot root owns
-/// the outer JitCode metadata needed for that inversion.  Inlined sub-walks
-/// have a distinct callee JitCode but deliberately share the root snapshot;
-/// decline their range fold rather than associating a callee guard with the
-/// caller's key.
-fn walker_foriter_green_key<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-) -> Option<u64> {
-    // `op_pc` indexes the JitCode the walk is CURRENTLY executing, so the code
-    // object paired with it has to be that JitCode's.  Inside an inline
-    // sub-walk that is the callee's, resolved through
-    // `InlineCalleeConsts` exactly as `fbw_foriter_body_from_op_pc` resolves
-    // the matching body coordinate — `fbw_mode.snapshot_sym` still names the
-    // outer portal, and mapping a callee offset through the caller's pc tables
-    // answers with a Python pc that belongs to neither loop.
-    //
-    // Reading the caller's tables was why this returned `None` for every
-    // sub-walk, and the FOR_ITER specializations that key their demotion descr
-    // off this green key declined with it: a `for` loop inside an inlined
-    // callee kept the opaque `ForIterNext` residual, which runs the iterator's
-    // `__next__` as a real frame in the plain interpreter.
-    if let Some(consts) = ctx.inline_callee_consts {
-        let w_code = ctx.inline_w_code() as *const ();
-        if w_code.is_null() {
-            return None;
-        }
-        let jitcode = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
-        let foriter_start_pc =
-            crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.metadata, op_pc) as usize;
-        return Some(crate::driver::make_green_key(
-            w_code,
-            foriter_start_pc,
-            ctx.session.borrow().is_being_profiled,
-        ));
-    }
-    if ctx.fbw_mode.snapshot_sym.is_null() {
-        return None;
-    }
-    // SAFETY: snapshot-root mode keeps the outer `PyreSym` live throughout
-    // the full-body walk.  This reads immutable code metadata only.
-    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
-    if sym.jitcode().is_null() {
-        return None;
-    }
-    let jitcode = unsafe { &*sym.jitcode() };
-    let raw_code = unsafe { jitcode.raw_code() };
-    let w_code = pyre_interpreter::live_code_wrapper(raw_code as *const ()) as *const ();
-    if w_code.is_null() {
-        return None;
-    }
-    let foriter_start_pc =
-        crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc) as usize;
-    Some(crate::driver::make_green_key(
-        w_code,
-        foriter_start_pc,
-        ctx.session.borrow().is_being_profiled,
-    ))
-}
 
 fn mark_trace_reads_module_global(
     tc: &mut TraceCtx,
