@@ -53,25 +53,7 @@ impl W_BytesIO {
         // object, so its own exporter lock already counts the live views and
         // releases them, where `BytesIOView.releasebuffer` has to decrement a
         // counter of its own.
-        //
-        // `buffer` is one of this class's traced pointers, and
-        // `malloc_typed_stable` barriers the stream at birth, so a minor
-        // forwards the field in place. The collector's store is not a Rust
-        // assignment: this method is the `&mut self` write a caller has to
-        // see, and `try_gc_write_barrier` is the same barrier `reset_buffer`
-        // and `close` run after they store into the old stream. An unchanged
-        // address — the whole `exports == 0` path, which returns before it
-        // collects — skips both.
-        // Only the pre-call address is kept: it is compared, never read.
-        let current_addr = self.buffer as usize;
-        let live = unsafe { crate::builtins::bytearray_check_exports(self.buffer)? };
-        if live as usize != current_addr {
-            self.buffer = live;
-            pyre_object::gc_hook::try_gc_write_barrier(
-                self as *mut Self as pyre_object::gc_hook::GCREF,
-            );
-        }
-        Ok(())
+        unsafe { crate::builtins::bytearray_check_exports(self.buffer) }
     }
 
     fn getsize(&self) -> i64 {
@@ -318,7 +300,7 @@ impl W_BytesIO {
         #[default(pyre_object::w_none())] w_initial_bytes: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         // `W_BytesIO.descr_init`. The initial bytes stay live across
-        // `_check_exports`: a live view makes that check collect.
+        // `reset_buffer` (allocation) and `write`.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[self.self_obj(), w_initial_bytes]);
         Self::from_slot(base).check_exports()?;
@@ -382,9 +364,7 @@ impl W_BytesIO {
 
     fn write(&mut self, w_data: PyObjectRef) -> Result<i64, crate::PyError> {
         // `W_BytesIO.write_w`: check state before acquiring one contiguous
-        // read-only buffer, then copy its bytes once. `w_data` is reloaded
-        // after the export check because that check collects while a view
-        // is live.
+        // read-only buffer, then copy its bytes once.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[self.self_obj(), w_data]);
@@ -404,8 +384,8 @@ impl W_BytesIO {
         &mut self,
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<i64, crate::PyError> {
-        // `W_BytesIO.truncate_w`. The size argument is reloaded after the
-        // export check: a live view makes that check collect.
+        // `W_BytesIO.truncate_w`. Pin across `index_int_w_preserve_negative`
+        // (`__index__`).
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[self.self_obj(), w_size]);

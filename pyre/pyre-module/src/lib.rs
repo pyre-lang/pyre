@@ -427,7 +427,6 @@ pub fn register() {
             libffi_cif_shape: hook_libffi_cif_shape,
             math_builtin_name: module::math::interp_math::math_builtin_name,
             gc_initialize: hook_gc_initialize,
-            gc_run_finalizers_now: module::gc::interp_gc::run_finalizers_now,
             init_array_type: module::array::init_array_type,
             array_w_getitem: module::array::array_w_getitem,
             array_repr_wtf8: module::array::array_repr_wtf8,

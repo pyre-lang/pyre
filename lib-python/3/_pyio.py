@@ -1716,7 +1716,13 @@ class FileIO(RawIOBase):
         result = bytearray(bufsize)
         bytes_read = 0
         try:
-            while n := os.readinto(self._fd, memoryview(result)[bytes_read:]):
+            while True:
+                # PyPy: without refcounting, a dead view of `result` would keep
+                # it exported and `resize` would raise BufferError.
+                with memoryview(result) as view, view[bytes_read:] as chunk:
+                    n = os.readinto(self._fd, chunk)
+                if not n:
+                    break
                 bytes_read += n
                 if bytes_read >= len(result):
                     result.resize(_new_buffersize(bytes_read))
