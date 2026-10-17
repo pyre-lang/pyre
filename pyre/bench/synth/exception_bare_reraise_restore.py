@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=7.4
-# Widest reading 6.4x; the ceiling is 15% over that.
+# pyre-check: max-pypy-ratio=6
+# Readings 1.7x-3.9x (macOS cranelift 1.7x-2.1x, Linux 2.6x-3.3x, wasm 3.8x-3.9x,
+# Windows 2.7x-3.4x); the floor, a fourth of the ceiling, sits under the fastest.
 # Bare `raise` (RERAISE) inside a handler re-raises the exception currently
 # being handled, which an outer handler then catches. This exercises the
 # current-exception slot on the re-raise path: the bare raise must pick up the
