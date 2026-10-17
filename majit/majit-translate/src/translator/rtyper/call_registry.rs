@@ -100,6 +100,57 @@ impl FunctionPathKey {
     }
 }
 
+/// Binary `core::num::<Impl>::saturating_{add,sub,mul}` leaves.  The
+/// residual result is `Self`, so signedness follows the receiver.
+pub(crate) const CORE_NUM_SATURATING_ARITH_LEAVES: &[&str] =
+    &["saturating_add", "saturating_sub", "saturating_mul"];
+
+/// Charon renders every inherent integer impl as `<Impl>`
+/// (`ItemMeta::render_name_path`), so `i64::saturating_mul` and
+/// `usize::saturating_mul` share `["core", "num", "<Impl>", "saturating_mul"]`.
+/// `instance_leaf` keeps that template path for a bodyless foreign
+/// instance ("one external whatever it is instantiated at").
+pub(crate) fn is_core_num_saturating_arith(segments: &[String]) -> bool {
+    let n = segments.len();
+    n >= 3
+        && segments[n - 2] == "<Impl>"
+        && segments[n - 3] == "num"
+        && CORE_NUM_SATURATING_ARITH_LEAVES.contains(&segments[n - 1].as_str())
+}
+
+/// `specialize.py specialize_argtype` keys a graph on
+/// `args_s[i].knowntype`.  `SomeInteger(knowntype=int)` vs
+/// `rarithmetic.r_uint` must not share a residual FunctionDesc: the
+/// first-registered stub would annotate every caller with that
+/// signedness (`r_uint ∪ int` in `mergeinputargs`).
+///
+/// Insert `int` / `r_uint` before the leaf so the CallRegistry key
+/// carries the receiver knowntype while the MIR path (and unsigned
+/// clamp-diamond matchers) stay the untyped `<Impl>` spelling.
+pub(crate) fn saturating_arith_registry_key(
+    segments: &[String],
+    result_ty: &crate::model::ValueType,
+) -> Option<FunctionPathKey> {
+    if !is_core_num_saturating_arith(segments) {
+        return None;
+    }
+    let knowntype = saturating_arith_knowntype(result_ty)?;
+    let n = segments.len();
+    let mut keyed = Vec::with_capacity(n + 1);
+    keyed.extend_from_slice(&segments[..n - 1]);
+    keyed.push(knowntype.to_string());
+    keyed.push(segments[n - 1].clone());
+    Some(FunctionPathKey::from_segments(keyed))
+}
+
+fn saturating_arith_knowntype(result_ty: &crate::model::ValueType) -> Option<&'static str> {
+    match result_ty {
+        crate::model::ValueType::Int | crate::model::ValueType::Int128 => Some("int"),
+        crate::model::ValueType::Unsigned | crate::model::ValueType::UInt128 => Some("r_uint"),
+        _ => None,
+    }
+}
+
 /// Whether `key` identifies one of the residual ABI shims that materialises the
 /// Python exception object carried by an `OperationError`.
 ///
@@ -838,14 +889,16 @@ impl CallRegistry {
     /// Every key resolving to `canonical`'s entry: the canonical key
     /// itself plus all registered aliases pointing at it.
     pub fn keys_for_entry(&self, canonical: &FunctionPathKey) -> Vec<FunctionPathKey> {
+        let mut aliases: Vec<FunctionPathKey> = self
+            .aliases
+            .borrow()
+            .iter()
+            .filter(|(_, c)| *c == canonical)
+            .map(|(a, _)| a.clone())
+            .collect();
+        aliases.sort_by(|a, b| a.segments().cmp(b.segments()));
         let mut keys = vec![canonical.clone()];
-        keys.extend(
-            self.aliases
-                .borrow()
-                .iter()
-                .filter(|(_, c)| *c == canonical)
-                .map(|(a, _)| a.clone()),
-        );
+        keys.extend(aliases);
         keys
     }
 
@@ -1242,6 +1295,34 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn saturating_arith_registry_key_inserts_knowntype_before_leaf() {
+        use crate::model::ValueType;
+        let segs = ["core", "num", "<Impl>", "saturating_mul"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let signed = saturating_arith_registry_key(&segs, &ValueType::Int)
+            .expect("signed saturating_mul key");
+        let unsigned = saturating_arith_registry_key(&segs, &ValueType::Unsigned)
+            .expect("unsigned saturating_mul key");
+        assert_eq!(
+            signed.segments(),
+            &["core", "num", "<Impl>", "int", "saturating_mul"]
+        );
+        assert_eq!(
+            unsigned.segments(),
+            &["core", "num", "<Impl>", "r_uint", "saturating_mul"]
+        );
+        assert_ne!(signed, unsigned);
+        assert!(saturating_arith_registry_key(&segs, &ValueType::Bool).is_none());
+        let other = ["core", "num", "<Impl>", "wrapping_mul"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(saturating_arith_registry_key(&other, &ValueType::Int).is_none());
     }
 
     #[test]
@@ -1729,8 +1810,10 @@ mod tests {
         let alias = FunctionPathKey::from_segments(["crate", "m", "f"]);
         registry.alias(alias.clone(), &canonical);
         let keys = registry.keys_for_entry(&canonical);
-        assert!(keys.contains(&canonical));
-        assert!(keys.contains(&alias));
-        assert_eq!(keys.len(), 2);
+        assert_eq!(keys, vec![canonical.clone(), alias.clone()]);
+        let earlier = FunctionPathKey::from_segments(["a", "m", "f"]);
+        registry.alias(earlier.clone(), &canonical);
+        let keys = registry.keys_for_entry(&canonical);
+        assert_eq!(keys, vec![canonical, earlier, alias]);
     }
 }

@@ -1640,13 +1640,18 @@ impl HostEnv {
             ("IndexError", &exc),
             ("NameError", &exc),
             ("LookupError", &exc),
-            ("OSError", &exc),
             ("OverflowError", &exc),
         ];
         for (name, parent) in children {
             let cls = HostObject::new_class(name, vec![parent.clone()]);
             self.insert_builtin(name, cls);
         }
+        // Python 3 binds `EnvironmentError = OSError`. Upstream
+        // `EnvironmentError.__init__` (`builtin.py` / `rbuiltin.py`)
+        // is that class's initializer.
+        let os_error = HostObject::new_class("OSError", vec![exc.clone()]);
+        self.insert_builtin("OSError", os_error.clone());
+        self.insert_builtin("EnvironmentError", os_error);
         self.insert_builtin("BaseException", base);
         self.insert_builtin("Exception", exc);
         self.insert_builtin("RuntimeError", runtime);
@@ -1952,6 +1957,14 @@ impl HostEnv {
             "OrderedDict",
             HostObject::new_builtin_callable("collections.OrderedDict"),
         );
+        // `SomeOrderedDict.knowntype = OrderedDict` (`model.py`). The
+        // class object subclasses builtin `dict` so `our_issubclass`
+        // compares identities rather than the `dict` tag.
+        let dict_cls = self
+            .lookup_builtin("dict")
+            .expect("bootstrap_builtin_types registers dict");
+        let ordered_dict_cls = HostObject::new_class("OrderedDict", vec![dict_cls]);
+        self.insert_builtin("OrderedDict", ordered_dict_cls);
 
         // `rpython.rtyper.lltypesystem.lltype` — typing-time callables that
         // RPython routes through `@typer_for(lltype.<name>)` decorators
@@ -6108,6 +6121,34 @@ mod tests {
         let method = HostObject::new_bound_method("pkg.C.cm", cls.clone(), func, "cm", cls);
         let c = Constant::new(ConstValue::HostObject(method));
         assert!(c.foldable());
+    }
+
+    #[test]
+    fn environmenterror_is_the_oserror_class() {
+        // Python 3 binds `EnvironmentError = OSError`. `lookup_exception_class`
+        // needs a class object, not only the `EnvironmentError.__init__`
+        // callable (`builtin.py` / `rbuiltin.py`).
+        let env = HOST_ENV
+            .lookup_exception_class("EnvironmentError")
+            .expect("EnvironmentError class");
+        let os_error = HOST_ENV
+            .lookup_exception_class("OSError")
+            .expect("OSError class");
+        assert!(env.is_class());
+        assert!(os_error.is_class());
+        assert_eq!(env, os_error);
+    }
+
+    #[test]
+    fn ordereddict_builtin_class_subclasses_dict() {
+        // `SomeOrderedDict.knowntype = OrderedDict` (`model.py`). The
+        // class object subclasses builtin `dict`.
+        let ordered_dict = HOST_ENV
+            .lookup_builtin("OrderedDict")
+            .expect("OrderedDict class");
+        let dict = HOST_ENV.lookup_builtin("dict").expect("dict class");
+        assert!(ordered_dict.is_class());
+        assert!(ordered_dict.is_subclass_of(&dict));
     }
 
     #[test]

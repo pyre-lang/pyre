@@ -286,6 +286,9 @@ fn known_type_host(known: KnownType) -> Option<HostObject> {
         KnownType::List => "list",
         KnownType::Tuple => "tuple",
         KnownType::Dict => "dict",
+        KnownType::OrderedDict => "OrderedDict",
+        KnownType::FunctionType => "function",
+        KnownType::MethodType => "method",
         _ => return None,
     };
     HOST_ENV.lookup_builtin(name)
@@ -434,9 +437,6 @@ fn known_type_host_from_host(host: &HostObject) -> Option<KnownType> {
         "NoneType" => Some(KnownType::NoneType),
         "builtin_function_or_method" => Some(KnownType::BuiltinFunctionOrMethod),
         "property" => Some(KnownType::PropertyType),
-        "list" => Some(KnownType::List),
-        "tuple" => Some(KnownType::Tuple),
-        "dict" => Some(KnownType::Dict),
         _ => None,
     }
 }
@@ -1885,25 +1885,28 @@ fn dict_method_insert(
     s_self: &super::model::SomeDict,
     s_key: &SomeValue,
     s_value: &SomeValue,
-) -> SomeValue {
+) -> Result<SomeValue, AnnotatorError> {
     // Annotation of the old get(key) + setitem(key, value) pair:
     // get(key) defaults dfl to s_None (unaryop.py method_get), so the
     // result admits None (`ll_dict_insert` returns NULL on a miss);
     // setitem generalizes the stored value (binaryop.py setitem SomeDict).
+    // `SomeInteger.noneify` raises `UnionError` (`model.py`), so a
+    // non-nullable value type cannot represent the miss.
     let position = ann.bookkeeper.current_position_key();
     s_self
         .dictdef
         .generalize_key(s_key)
-        .expect("generalize_key");
-    s_self
-        .dictdef
-        .generalize_value(&s_none())
-        .expect("generalize_value");
+        .map_err(|e| AnnotatorError::new(e.to_string()))?;
+    s_self.dictdef.generalize_value(&s_none()).map_err(|e| {
+        AnnotatorError::new(format!(
+            "dict.insert: value type cannot represent None (miss returns NULL): {e}"
+        ))
+    })?;
     s_self
         .dictdef
         .generalize_value(s_value)
-        .expect("generalize_value");
-    s_self.dictdef.read_value(position)
+        .map_err(|e| AnnotatorError::new(e.to_string()))?;
+    Ok(s_self.dictdef.read_value(position))
 }
 
 #[allow(dead_code)]
@@ -3191,7 +3194,7 @@ pub(crate) fn call_builtin_method(
             let [s_key, s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            dict_method_insert(ann, s_self, s_key, s_value)
+            dict_method_insert(ann, s_self, s_key, s_value)?
         }
         "dict_method_copy" => {
             let SomeValue::Dict(s_self) = &*method.s_self else {
@@ -5336,6 +5339,47 @@ mod tests {
     }
 
     #[test]
+    fn consider_isinstance_user_class_named_list_is_not_builtin_list() {
+        // `our_issubclass` compares class identities (`unaryop.py`).
+        // Routing `"list"` through `KnownType::List` by qualname made a
+        // user class named `list` look like builtin `list`.
+        use super::super::classdesc::ClassDef;
+        use super::super::model::SomeInstance;
+
+        let ann = mk_ann();
+        let classdef = ClassDef::new_standalone("list", None);
+        let mut v_obj = Variable::named("obj");
+        let mut v_cls = Variable::named("cls");
+        ann.setbinding(
+            &mut v_obj,
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let s_cls = ann
+            .bookkeeper
+            .immutablevalue(&ConstValue::builtin("list"))
+            .expect("immutablevalue(list)");
+        ann.setbinding(&mut v_cls, s_cls);
+        let hl = HLOperation::new(
+            OpKind::IsInstance,
+            vec![Hlvalue::Variable(v_obj), Hlvalue::Variable(v_cls)],
+        );
+
+        let result = hl.consider(&ann).expect("isinstance").unwrap();
+        let SomeValue::Bool(b) = result else {
+            panic!("expected SomeBool");
+        };
+        assert_eq!(
+            b.base.const_box.unwrap().value,
+            ConstValue::Bool(false),
+            "user class named list is not builtin list"
+        );
+    }
+
+    #[test]
     fn consider_issubtype_sometypeof_routes_through_s_isinstance() {
         let ann = mk_ann();
         let mut v_obj = Variable::named("obj");
@@ -6939,6 +6983,42 @@ mod tests {
                 .as_ref()
                 .is_some_and(|cd| Rc::ptr_eq(cd, &classdef)),
             "dict value must stay generalized with the inserted instance class"
+        );
+    }
+
+    #[test]
+    fn dict_method_insert_rejects_integer_value_that_cannot_noneify() {
+        // `SomeInteger.noneify` raises `UnionError` (`model.py`). insert's
+        // miss path is NULL, so an integer-valued dict cannot be annotated.
+        let ann = mk_ann();
+        let pk = super::super::bookkeeper::PositionKey::new(11, 0, 0);
+        ann.bookkeeper.set_position_key(Some(pk));
+        let dictdef = super::super::dictdef::DictDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let s_dict = SomeValue::Dict(super::super::model::SomeDict::new(dictdef));
+        let SomeValue::BuiltinMethod(insert) = s_dict.find_method("insert").unwrap() else {
+            panic!("dict.insert must be recognized");
+        };
+        let args = super::super::argument::ArgumentsForTranslation::new(
+            vec![
+                Some(SomeValue::Integer(SomeInteger::default())),
+                Some(SomeValue::Integer(SomeInteger::default())),
+            ],
+            None,
+            None,
+        );
+        let err = call_builtin_method(&ann, &insert, &args)
+            .expect_err("integer-valued insert must fail annotation");
+        let msg = err.msg.unwrap_or_default();
+        assert!(
+            msg.contains("cannot represent None"),
+            "expected noneify miss diagnostic, got {msg}"
         );
     }
 

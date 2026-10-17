@@ -2626,11 +2626,11 @@ pub fn scan(
             opaque_reason.get_or_insert("no-pin-in-body");
         }
 
+        // Every block, including a non-forward cleanup, is a predecessor of
+        // its terminator's successors. Jacobi intersected those outs — zero
+        // when the predecessor is not forward — into each successor.
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
         for b in 0..n {
-            if !reachable.contains(&b) {
-                continue;
-            }
             if let Some(t) = &terms[b] {
                 for s in successors(t, &forward) {
                     if (s as usize) < n {
@@ -2827,14 +2827,19 @@ pub fn scan(
                 match *xfer {
                     PinXfer::Kill(li) => clear_local_pins(bits, li),
                     PinXfer::Copy { src, dest } => {
-                        let mut saved = vec![false; nscopes];
+                        if src == dest {
+                            continue;
+                        }
+                        let mut saved = vec![0u8; nscopes.div_ceil(8)];
                         for si in 0..nscopes {
                             let i = src * nscopes + si;
-                            saved[si] = bits[i / 64] >> (i % 64) & 1 == 1;
+                            if bits[i / 64] >> (i % 64) & 1 == 1 {
+                                saved[si / 8] |= 1 << (si % 8);
+                            }
                         }
                         clear_local_pins(bits, dest);
                         for si in 0..nscopes {
-                            if saved[si] {
+                            if saved[si / 8] & (1 << (si % 8)) != 0 {
                                 let i = dest * nscopes + si;
                                 bits[i / 64] |= 1u64 << (i % 64);
                             }
@@ -2843,10 +2848,15 @@ pub fn scan(
                 }
             }
         };
-        // Block-indexed buffers, allocated once rather than per round.
+        // Block-indexed in-sets. Entry, unreachable, and predecessor-less
+        // blocks stay empty. Every other forward block starts at the
+        // universe and shrinks by intersecting predecessor outs. The meet
+        // is monotone, so a worklist that reapplies a smaller out reaches
+        // the same greatest fixpoint as a round of every block at once.
+        // A long MIR chain otherwise needs one synchronous round per hop.
         let mut pinned_in = vec![0u64; n * words];
         for b in 0..n {
-            if b == 0 || !reachable.contains(&b) {
+            if b == 0 || !reachable.contains(&b) || preds[b].is_empty() {
                 continue;
             }
             let blk = &mut pinned_in[b * words..(b + 1) * words];
@@ -2859,61 +2869,66 @@ pub fn scan(
                 }
             }
         }
-        let mut outs = vec![0u64; n * words];
-        let mut next = vec![0u64; n * words];
-        for _round in 0..n + 8 {
-            for b in 0..n {
-                let at = b * words;
-                if !is_forward(&forward, b) {
-                    outs[at..at + words].fill(0);
-                    continue;
-                }
-                outs[at..at + words].copy_from_slice(&pinned_in[at..at + words]);
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (s, ps) in preds.iter().enumerate() {
+            for &p in ps {
+                succs[p].push(s);
+            }
+        }
+        let mut queued = vec![false; n];
+        let mut work = VecDeque::new();
+        // Every block is processed at least once so a non-forward
+        // predecessor's zero out-set meets each successor. Requeue is
+        // shrink-only, and those in-sets start empty and never shrink.
+        for b in 0..n {
+            queued[b] = true;
+            work.push_back(b);
+        }
+        let mut out = vec![0u64; words];
+        while let Some(b) = work.pop_front() {
+            queued[b] = false;
+            if words == 0 {
+                continue;
+            }
+            out.copy_from_slice(&pinned_in[b * words..(b + 1) * words]);
+            if is_forward(&forward, b) {
                 let e = &edits[b];
-                let o = &mut outs[at..at + words];
-                apply_pin_statements(o, &e.stmts);
+                apply_pin_statements(&mut out, &e.stmts);
                 if let Some(li) = e.call_dest_kill {
-                    clear_local_pins(o, li);
+                    clear_local_pins(&mut out, li);
                 }
                 if e.retire_all {
-                    o.fill(0);
+                    out.fill(0);
                 } else {
                     for &si in &e.retire_scopes {
-                        for (w, m) in o.iter_mut().zip(&scope_masks[si]) {
+                        for (w, m) in out.iter_mut().zip(&scope_masks[si]) {
                             *w &= !m;
                         }
                     }
                 }
                 for &i in &e.add_bits {
-                    bit_set(o, i);
+                    bit_set(&mut out, i);
                 }
+            } else {
+                out.fill(0);
             }
-            let mut changed = false;
-            for b in 0..n {
-                let at = b * words;
-                if b == 0 || !reachable.contains(&b) {
-                    next[at..at + words].fill(0);
-                } else if let Some(&first) = preds[b].first() {
-                    let src = first * words;
-                    for w in 0..words {
-                        next[at + w] = outs[src + w];
-                    }
-                    for &p in preds[b].iter().skip(1) {
-                        let src = p * words;
-                        for w in 0..words {
-                            next[at + w] &= outs[src + w];
-                        }
-                    }
-                } else {
-                    next[at..at + words].fill(0);
+            for &s in &succs[b] {
+                if s == 0 || !reachable.contains(&s) {
+                    continue;
                 }
-                if next[at..at + words] != pinned_in[at..at + words] {
-                    changed = true;
+                let sat = s * words;
+                let mut shrunk = false;
+                for w in 0..words {
+                    let v = pinned_in[sat + w] & out[w];
+                    if v != pinned_in[sat + w] {
+                        pinned_in[sat + w] = v;
+                        shrunk = true;
+                    }
                 }
-            }
-            std::mem::swap(&mut pinned_in, &mut next);
-            if !changed {
-                break;
+                if shrunk && !queued[s] {
+                    queued[s] = true;
+                    work.push_back(s);
+                }
             }
         }
 
@@ -5028,6 +5043,156 @@ mod tests {
             stats.short_brackets[0].missing,
             vec!["loaded".to_string()],
             "pinned={:?}",
+            stats.short_brackets[0].pinned
+        );
+    }
+
+    /// A successor that also has a non-forward predecessor must meet that
+    /// predecessor's zero out-set, as the Jacobi rounds did. The cleanup
+    /// block's in-set starts empty and never shrinks, so only a worklist
+    /// that processes every block applies the meet.
+    #[test]
+    fn a_non_forward_predecessor_clears_the_successor_pin() {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let gc_ty = serde_json::json!({"Deduplicated": 100});
+        let scope_ty = serde_json::json!({"Deduplicated": 200});
+        let gens = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place =
+            |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let call_bb = |fun: u64,
+                       args: serde_json::Value,
+                       dest: u64,
+                       dest_ty: &serde_json::Value,
+                       target: u64| {
+            serde_json::json!({
+                "statements": [],
+                "is_cleanup": false,
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
+                        "args": args,
+                        "dest": place(dest, dest_ty)
+                    },
+                    "target": target,
+                    "on_unwind": 5
+                }}}
+            })
+        };
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "holder"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span.clone(), "ty": scalar.clone()},
+                    {"index": 1, "name": "scope", "span": span.clone(), "ty": scope_ty.clone()},
+                    {"index": 2, "name": "obj", "span": span.clone(), "ty": gc_ty.clone()},
+                    {"index": 3, "name": "tmp", "span": span.clone(), "ty": scalar.clone()}
+                ]},
+                "body": [
+                    call_bb(3, serde_json::json!([]), 1, &scope_ty, 1),
+                    call_bb(
+                        2,
+                        serde_json::json!([{"Copy": place(2, &gc_ty)}]),
+                        2,
+                        &gc_ty,
+                        2
+                    ),
+                    call_bb(1, serde_json::json!([]), 3, &scalar, 3),
+                    call_bb(
+                        4,
+                        serde_json::json!([{"Copy": place(2, &gc_ty)}]),
+                        3,
+                        &scalar,
+                        4
+                    ),
+                    {"statements": [], "is_cleanup": false, "terminator": {
+                        "span": span.clone(), "kind": "Return"
+                    }},
+                    {"statements": [], "is_cleanup": true, "terminator": {
+                        "span": span.clone(), "kind": {"Goto": {"target": 2}}
+                    }}
+                ]
+            }}
+        });
+        let opaque = |id: u64, path: &[&str], output: &serde_json::Value| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(path),
+                "signature": {"is_unsafe": false, "inputs": [], "output": output.clone()},
+                "body": "Opaque"
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [
+                    holder,
+                    opaque(1, &["fixture", "collect"], &scalar),
+                    opaque(2, &["pyre_object", "gc_roots", "pin_root"], &gc_ty),
+                    opaque(3, &["pyre_object", "gc_roots", "push_roots"], &scope_ty),
+                    opaque(4, &["fixture", "touch"], &scalar)
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("non-forward pred fixture parses");
+        let cg = super::super::framework::build(&llbc);
+        let mut reach = HashSet::new();
+        reach.insert(0);
+        reach.insert(1);
+        let mut push_roots = HashSet::new();
+        push_roots.insert(3);
+        let mut gc_tys = HashSet::new();
+        gc_tys.insert(100);
+        let (_, stats) = scan(
+            &llbc,
+            &cg,
+            &reach,
+            &push_roots,
+            &gc_tys,
+            &HashSet::new(),
+            &[],
+        );
+        assert_eq!(
+            stats.unparsed_terminator_bodies, 0,
+            "terminators must parse"
+        );
+        assert_eq!(stats.unparsed_statement_bodies, 0, "statements must parse");
+        assert_eq!(
+            stats.withheld_contents_opaque, 0,
+            "pin transfer must be readable: {:?}",
+            stats.opaque_by_reason
+        );
+        assert_eq!(stats.withheld_under_a_bracket, 1);
+        assert_eq!(
+            stats.short_brackets.len(),
+            1,
+            "short={} covers={}",
+            stats.withheld_bracket_short,
+            stats.withheld_bracket_covers
+        );
+        assert_eq!(
+            stats.short_brackets[0].missing,
+            vec!["obj".to_string()],
+            "pinned={:?}",
+            stats.short_brackets[0].pinned
+        );
+        assert!(
+            stats.short_brackets[0].pinned.is_empty(),
+            "the successor in-set must be empty on the pin: {:?}",
             stats.short_brackets[0].pinned
         );
     }
