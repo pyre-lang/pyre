@@ -8,7 +8,10 @@
 use std::sync::OnceLock;
 
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::lower_function;
+use majit_translate::HostStaticAddrs;
+use majit_translate::front::mir::{
+    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
+};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind, VecFieldPart};
 
 const OBJECT_LLBC: &str = concat!(
@@ -67,6 +70,171 @@ fn kwargs_getitem_keeps_the_whole_field_and_reads_len() {
     assert_inline_len_of_pos0(&graph);
     assert_whole_field_of_pos0(&graph);
     assert_defined_link_args(&graph);
+}
+
+/// `KwargsDictStorage::default` is `(Vec::new(), Vec::new())`.
+/// `core::tuple::<Impl>::default` is not in CallRegistry; the front
+/// end emits `TupleRepr.newtuple`: a shaped Tuple constructor plus
+/// one setfield per empty `vec::Vec::new`.
+#[test]
+fn kwargs_get_empty_storage_is_newtuple_of_empty_vecs() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let graph = lower_function(llbc, "kwargsdict::<Impl>::get_empty_storage")
+        .expect("lower kwargsdict::<Impl>::get_empty_storage");
+    if let Ok(path) = std::env::var("DUMP_KWARGS_GET_EMPTY_STORAGE") {
+        std::fs::write(&path, graph.dump()).expect("write kwargs get_empty_storage dump");
+    }
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    let tuple_default_calls = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if is_core_tuple_default_call(target)
+            )
+        })
+        .count();
+    let newtuples = ops
+        .iter()
+        .filter(|op| matches!(&op.kind, OpKind::NewTuple { .. }))
+        .count();
+    let tuple_ctors = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if majit_ir::descr::is_shaped_tuple_name(name)
+            )
+        })
+        .count();
+    let pos_writes = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. }
+                    if field.name == "__pos_0" || field.name == "__pos_1"
+            )
+        })
+        .count();
+    let vec_news = ops
+        .iter()
+        .filter(|op| matches!(&op.kind, OpKind::Call { target, .. } if is_vec_new_call(target)))
+        .count();
+    assert_eq!(
+        tuple_default_calls,
+        0,
+        "tuple Default must not remain a residual CallRegistry miss\n{}",
+        graph.dump()
+    );
+    assert_eq!(
+        newtuples,
+        0,
+        "raw NewTuple must not survive; TupleRepr.newtuple is ctor + setfield\n{}",
+        graph.dump()
+    );
+    assert!(
+        tuple_ctors > 0,
+        "empty kwargs storage is a shaped Tuple constructor\n{}",
+        graph.dump()
+    );
+    assert!(
+        pos_writes >= 2,
+        "each tuple item is a setfield of the empty vec\n{}",
+        graph.dump()
+    );
+    assert!(
+        vec_news >= 2,
+        "each tuple element default is vec::Vec::new\n{}",
+        graph.dump()
+    );
+}
+
+/// `gc_alloc_young_storage_box` is one `dont_look_inside` body
+/// (`monomorphize: false`). Each concrete storage shape must call its
+/// own residual funcptr (`annlowlevel.specialize` / `getfunctionptr`,
+/// an `__inst_` suffix); kwargs Tuple and typed RDict must not share
+/// the unspecialized path.
+#[test]
+fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &[
+            "kwargsdict",
+            "dictmultiobject",
+            "gc_storage",
+            "identitydict",
+        ],
+        &["get_empty_storage"],
+    )
+    .expect("lower get_empty_storage callers");
+
+    let mut inst_leaves = std::collections::BTreeSet::new();
+    let mut unspecialized = 0usize;
+    for function in &program.functions {
+        if function.name.rsplit("::").next() != Some("get_empty_storage") {
+            continue;
+        }
+        for op in function
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            let Some(leaf) = segments.last() else {
+                continue;
+            };
+            if leaf == "gc_alloc_young_storage_box" {
+                unspecialized += 1;
+            } else if leaf.starts_with("gc_alloc_young_storage_box__inst_") {
+                inst_leaves.insert(leaf.clone());
+            }
+        }
+    }
+    assert_eq!(
+        unspecialized, 0,
+        "get_empty_storage must not call the unspecialized residual; inst leaves={inst_leaves:?}"
+    );
+    assert!(
+        inst_leaves.len() >= 2,
+        "kwargs Tuple and typed RDict must be distinct residual funcptrs, got {inst_leaves:?}"
+    );
+}
+
+fn is_core_tuple_default_call(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.join("::") == "core::tuple::<Impl>::default"
+        }
+        _ => false,
+    }
+}
+
+fn is_vec_new_call(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments.as_slice() == ["vec", "Vec", "new"],
+        _ => false,
+    }
 }
 
 fn assert_inline_len_of_pos0(graph: &FunctionGraph) {

@@ -356,6 +356,142 @@ macro_rules! register_type_object_fnaddr {
     };
 }
 
+/// One rustc vtable of a `DictStrategy` / `SetStrategy` impl.
+///
+/// `CallControl.graphs_from` / `CodeWriter.setup_indirectcalltargets`
+/// already listed every dyn-call target graph. This descriptor supplies
+/// the vtable pointer of each known impl so the runtime ICT map can key
+/// the slot the tracer loads (`jtransform.handle_getfield_typeptr`).
+#[derive(Clone, Copy)]
+pub struct DynImplVtableDesc {
+    pub impl_key: &'static str,
+    pub trait_leaf: &'static str,
+    pub vtable_fn: fn() -> *const (),
+}
+
+// Safety: `impl_key` / `trait_leaf` are `'static` and `vtable_fn` is a
+// plain `fn` pointer to process-global code; sharing across threads is sound.
+unsafe impl Sync for DynImplVtableDesc {}
+unsafe impl Send for DynImplVtableDesc {}
+
+/// Vtable word of a fat pointer (`&dyn Trait` / `*const dyn Trait`).
+pub fn fat_vtable_word<T: ?Sized>(fat: *const T) -> *const () {
+    let words: [*const (); 2] = unsafe { std::mem::transmute_copy(&fat) };
+    words[1]
+}
+
+/// Link-time registry of every `impl DictStrategy` / `impl SetStrategy`,
+/// populated by [`register_dyn_impl_vtable!`] so `dyn_impl_vtables` cannot
+/// go stale against a new impl. `distributed_slice` rejects `wasm32`, which
+/// carries the same set in [`WASM_DYN_IMPL_VTABLES`]; read both through
+/// [`for_each_dyn_impl_vtable`].
+#[cfg(not(target_arch = "wasm32"))]
+#[::linkme::distributed_slice]
+pub static PYRE_DYN_IMPL_VTABLES: [DynImplVtableDesc] = [..];
+
+/// The same registry on wasm32, populated at constructor time.
+#[cfg(target_arch = "wasm32")]
+pub static WASM_DYN_IMPL_VTABLES: std::sync::Mutex<Vec<DynImplVtableDesc>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Append one impl vtable to [`WASM_DYN_IMPL_VTABLES`].
+///
+/// Called only from the constructor [`register_dyn_impl_vtable!`] emits.
+#[cfg(target_arch = "wasm32")]
+pub fn register_dyn_impl_vtable(
+    impl_key: &'static str,
+    trait_leaf: &'static str,
+    vtable_fn: fn() -> *const (),
+) {
+    WASM_DYN_IMPL_VTABLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(DynImplVtableDesc {
+            impl_key,
+            trait_leaf,
+            vtable_fn,
+        });
+}
+
+/// Visit every registered strategy-impl vtable, whichever population the
+/// target carries.
+pub fn for_each_dyn_impl_vtable(mut visit: impl FnMut(DynImplVtableDesc)) {
+    #[cfg(not(target_arch = "wasm32"))]
+    for desc in PYRE_DYN_IMPL_VTABLES {
+        visit(*desc);
+    }
+    #[cfg(target_arch = "wasm32")]
+    for desc in WASM_DYN_IMPL_VTABLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
+        visit(*desc);
+    }
+}
+
+/// Publish the enclosing impl's rustc vtable for ICT slot binding.
+///
+/// Expanded beside every `impl DictStrategy for T` / `impl SetStrategy
+/// for T` (blanket instantiations included) so adding an impl needs no
+/// edit of the consumer table. `$static` is the unique link-section
+/// ident; `$ty` is the impl type.
+#[macro_export]
+macro_rules! register_dyn_impl_vtable {
+    ($static:ident, $ty:ty, DictStrategy) => {
+        $crate::__register_dyn_impl_vtable!(
+            $static,
+            $ty,
+            "DictStrategy",
+            $crate::dictmultiobject::DictStrategy
+        );
+    };
+    ($static:ident, $ty:ty, SetStrategy) => {
+        $crate::__register_dyn_impl_vtable!(
+            $static,
+            $ty,
+            "SetStrategy",
+            $crate::setobject::SetStrategy
+        );
+    };
+}
+
+/// [`register_dyn_impl_vtable!`] expansion. Not for direct use.
+#[macro_export]
+macro_rules! __register_dyn_impl_vtable {
+    ($static:ident, $ty:ty, $trait_leaf:expr, $trait:path) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[::linkme::distributed_slice($crate::lltype::PYRE_DYN_IMPL_VTABLES)]
+        #[allow(non_upper_case_globals)]
+        static $static: $crate::lltype::DynImplVtableDesc = $crate::lltype::DynImplVtableDesc {
+            impl_key: ::core::concat!(::core::module_path!(), "::", stringify!($ty)),
+            trait_leaf: $trait_leaf,
+            vtable_fn: {
+                fn vtable() -> *const () {
+                    let ptr: *const $ty = ::core::ptr::null();
+                    $crate::lltype::fat_vtable_word(ptr as *const dyn $trait)
+                }
+                vtable
+            },
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        #[::ctor::ctor(unsafe)]
+        #[allow(non_snake_case)]
+        fn $static() {
+            fn vtable() -> *const () {
+                let ptr: *const $ty = ::core::ptr::null();
+                $crate::lltype::fat_vtable_word(ptr as *const dyn $trait)
+            }
+            $crate::lltype::register_dyn_impl_vtable(
+                ::core::concat!(::core::module_path!(), "::", stringify!($ty)),
+                $trait_leaf,
+                vtable,
+            );
+        }
+    };
+}
+
 /// Compile-time bridge between a `#[pyre_class]` struct and its
 /// per-type static `PyType` / `PyreClassDescriptor`.  Implemented
 /// automatically by `#[pyre_class]`; consumed by `py_class_typed!`

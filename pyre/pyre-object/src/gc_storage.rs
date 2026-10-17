@@ -68,6 +68,11 @@ pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
 /// (`MAJIT_GC_YOUNG_RAWMALLOC=0`) is born old instead, and the barrier after
 /// the write keeps a filled table's children reachable in that case; it is a
 /// no-op on a young header.
+// `specialize:argtype(0)` (`specialize.py` `specialize_argtype`) gives each
+// payload shape its own residual graph, matching [`gc_alloc_storage_box`].
+// Charon extracts with `monomorphize: false`, so a generic body without
+// trait clauses is one unspecialized graph; the hint is what splits it.
+#[majit_macros::specialize_argtype(0)]
 #[majit_macros::dont_look_inside]
 #[inline(never)]
 pub fn gc_alloc_young_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {

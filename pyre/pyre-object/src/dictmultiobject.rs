@@ -1464,7 +1464,7 @@ pub unsafe fn module_dict_cell_slot_of(obj: PyObjectRef, name: &str) -> Option<u
         return None;
     }
     (*(md.dstorage as *const crate::celldict::ModuleDictStorage))
-        .entries
+        .0
         .index_of(name)
 }
 
@@ -1484,7 +1484,7 @@ pub unsafe fn module_dict_cell_at(obj: PyObjectRef, slot: usize) -> Option<PyObj
         return None;
     }
     (*(md.dstorage as *const crate::celldict::ModuleDictStorage))
-        .entries
+        .0
         .get_slot(slot)
         .map(|(_, v)| *v)
         .filter(|p| !p.is_null())
@@ -2648,15 +2648,15 @@ pub unsafe fn w_module_dict_walk_gc_cells(
             .visit_indexes(&mut |slot| visitor(unsafe { &mut *(slot as *mut PyObjectRef) }));
     } else {
         let storage = &mut *(md.dstorage as *mut crate::celldict::ModuleDictStorage);
-        for (key, value) in storage.entries.iter_mut_for_trace() {
+        for (key, value) in storage.0.iter_mut_for_trace() {
             // `ModuleDictStrategy` keys are the `str` block. The block does
             // not move; the visit keeps it alive.
             let key_ptr = key as *const crate::celldict::StrKey as *mut crate::celldict::StrKey;
             visitor(&mut *(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef));
             crate::celldict::walk_module_value_slot(value, visitor);
         }
-        visitor(unsafe { &mut *(storage.entries.entries_slot() as *mut PyObjectRef) });
-        storage.entries.visit_indexes(&mut |slot| {
+        visitor(unsafe { &mut *(storage.0.entries_slot() as *mut PyObjectRef) });
+        storage.0.visit_indexes(&mut |slot| {
             visitor(unsafe { &mut *(slot as *mut PyObjectRef) });
         });
         w_module_dict_module_strategy_mut(obj).walk_cache_cells(visitor);
@@ -5026,23 +5026,37 @@ pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
     w_dict_get_strategy(obj).length(obj)
 }
 
-/// Internal helper: `ObjectDictStrategy::length` body for pyre's
-/// W_DictObject — `len(self.unerase(w_dict.dstorage))` per
-/// `dictmultiobject.py length`. Called only from the strategy trait
-/// impl to avoid recursion through `w_dict_len`.
+/// Internal helper: `AbstractTypedStrategy.length` body —
+/// `len(self.unerase(w_dict.dstorage))`. Called only from the typed
+/// strategy `length` impls to avoid recursion through `w_dict_len`.
+///
+/// Object/Unicode/Int/Bytes storages are all `RDict<K, PyObjectRef, S>`
+/// with a ZST `BuildHasherDefault` hasher, so `num_live_items` sits at
+/// one offset (`rordereddict.rtype_len` `getfield`, no custom eq/hash).
+/// One function is the mixin method; three identically-bodied helpers
+/// ICF-fold onto one fnaddr.
 ///
 /// # Safety
-/// `obj` must point to a valid `W_DictObject`.
+/// `obj` must point to a valid `W_DictObject` whose `dstorage` is an
+/// `RDict` with `num_live_items` at the [`ObjectDictStorage`] offset.
 #[inline]
-pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
-    // `AbstractTypedStrategy.length`: `len(self.unerase(w_dict.dstorage))`.
-    // `rordereddict.rtype_len` is `getfield num_live_items` (no custom eq/hash
-    // on the typed tables; object-strategy `ll_dict_len` is the same field).
+pub unsafe fn w_dict_length_typed_strategy(obj: PyObjectRef) -> usize {
     // Two field reads, same shape as `w_list_len`: a getter call would
     // residualize and the walker would execute the 2-arg rustc vtable item.
     let dict = &*(obj as *const W_DictObject);
     (*(dict.dstorage as *const ObjectDictStorage)).num_live_items
 }
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(ObjectDictStorage, num_live_items)
+            == std::mem::offset_of!(IntDictStorage, num_live_items)
+    );
+    assert!(
+        std::mem::offset_of!(ObjectDictStorage, num_live_items)
+            == std::mem::offset_of!(BytesDictStorage, num_live_items)
+    );
+};
 
 /// Iterate over all (key, value) pairs without type assumptions.
 ///
@@ -5391,26 +5405,12 @@ pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) ->
     }
 }
 
-/// Internal helper: `IntDictStrategy::length` body —
-/// `dictmultiobject.py len(self.unerase(w_dict.dstorage))`.
-///
-/// # Safety
-/// `obj` must point to a valid `W_DictObject` on
-/// [`crate::dictmultiobject::INT_DICT_STRATEGY`].
-#[inline]
-pub unsafe fn w_dict_length_int_strategy(obj: PyObjectRef) -> usize {
-    // `AbstractTypedStrategy.length` / `IntDictStrategy`:
-    // `len(self.unerase(w_dict.dstorage))` → `getfield num_live_items`.
-    let dict = &*(obj as *const W_DictObject);
-    (*(dict.dstorage as *const IntDictStorage)).num_live_items
-}
-
 /// Internal helper: `IntDictStrategy::items` body —
 /// `dictmultiobject.py items` walks the typed storage and
 /// wraps each i64 key via `self.wrap` (`:1342 wrap=newint`).
 ///
 /// # Safety
-/// Same as [`w_dict_length_int_strategy`].
+/// Same as [`w_dict_int_storage`].
 pub unsafe fn w_dict_items_int_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
     // The result is a Rust-heap Vec the collector never walks and one key is
@@ -5467,7 +5467,7 @@ pub unsafe fn w_dict_nth_item_int_strategy(
 /// `dictmultiobject.py self.unerase(w_dict.dstorage).clear()`.
 ///
 /// # Safety
-/// Same as [`w_dict_length_int_strategy`].
+/// Same as [`w_dict_int_storage`].
 pub unsafe fn w_dict_clear_int_strategy(obj: PyObjectRef) {
     lock_dict_refs!(_dict_guard, obj);
     let dict = &mut *(obj as *mut W_DictObject);
@@ -5606,18 +5606,6 @@ pub unsafe fn w_dict_delitem_bytes_strategy(obj: PyObjectRef, key: PyObjectRef) 
     } else {
         false
     }
-}
-
-/// Internal helper: `BytesDictStrategy::length` body.
-///
-/// # Safety
-/// Same as [`w_dict_bytes_storage`].
-#[inline]
-pub unsafe fn w_dict_length_bytes_strategy(obj: PyObjectRef) -> usize {
-    // `AbstractTypedStrategy.length` / `BytesDictStrategy`:
-    // `len(self.unerase(w_dict.dstorage))` → `getfield num_live_items`.
-    let dict = &*(obj as *const W_DictObject);
-    (*(dict.dstorage as *const BytesDictStorage)).num_live_items
 }
 
 /// Internal helper: `BytesDictStrategy::items` body —
@@ -7368,6 +7356,11 @@ impl EmptyKwargsDictStrategy {
     }
 }
 
+crate::register_dyn_impl_vtable!(
+    DYN_IMPL_EmptyKwargsDictStrategy,
+    EmptyKwargsDictStrategy,
+    DictStrategy
+);
 impl DictStrategy for EmptyKwargsDictStrategy {
     fn strategy_kind(&self) -> StrategyKind {
         StrategyKind::EmptyKwargs
@@ -7473,6 +7466,7 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     }
 }
 
+crate::register_dyn_impl_vtable!(DYN_IMPL_EmptyDictStrategy, EmptyDictStrategy, DictStrategy);
 impl DictStrategy for EmptyDictStrategy {
     fn strategy_kind(&self) -> StrategyKind {
         StrategyKind::Empty
@@ -7671,6 +7665,11 @@ impl DictStrategy for EmptyDictStrategy {
 /// switched on without disturbing call sites.
 pub struct ObjectDictStrategy;
 
+crate::register_dyn_impl_vtable!(
+    DYN_IMPL_ObjectDictStrategy,
+    ObjectDictStrategy,
+    DictStrategy
+);
 impl DictStrategy for ObjectDictStrategy {
     fn strategy_kind(&self) -> StrategyKind {
         StrategyKind::Object
@@ -7736,10 +7735,10 @@ impl DictStrategy for ObjectDictStrategy {
     }
 
     /// `dictmultiobject.py length` — `len(self.unerase
-    /// (w_dict.dstorage))`; body in `w_dict_length_object_strategy` to
+    /// (w_dict.dstorage))`; body in `w_dict_length_typed_strategy` to
     /// avoid recursing through `w_dict_len`.
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
-        crate::dictmultiobject::w_dict_length_object_strategy(w_dict)
+        crate::dictmultiobject::w_dict_length_typed_strategy(w_dict)
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
@@ -7845,6 +7844,7 @@ impl DictStrategy for ObjectDictStrategy {
 /// backing — `unerase` is the block, `wrap` shares it.
 pub struct BytesDictStrategy;
 
+crate::register_dyn_impl_vtable!(DYN_IMPL_BytesDictStrategy, BytesDictStrategy, DictStrategy);
 impl DictStrategy for BytesDictStrategy {
     fn strategy_kind(&self) -> StrategyKind {
         StrategyKind::Bytes
@@ -7917,7 +7917,7 @@ impl DictStrategy for BytesDictStrategy {
     }
 
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
-        crate::dictmultiobject::w_dict_length_bytes_strategy(w_dict)
+        crate::dictmultiobject::w_dict_length_typed_strategy(w_dict)
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
@@ -8066,6 +8066,11 @@ impl DictStrategy for BytesDictStrategy {
 /// parity.
 pub struct UnicodeDictStrategy;
 
+crate::register_dyn_impl_vtable!(
+    DYN_IMPL_UnicodeDictStrategy,
+    UnicodeDictStrategy,
+    DictStrategy
+);
 impl DictStrategy for UnicodeDictStrategy {
     fn strategy_kind(&self) -> StrategyKind {
         StrategyKind::Unicode
@@ -8175,7 +8180,7 @@ impl DictStrategy for UnicodeDictStrategy {
     }
 
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
-        crate::dictmultiobject::w_dict_length_object_strategy(w_dict)
+        crate::dictmultiobject::w_dict_length_typed_strategy(w_dict)
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
@@ -8323,6 +8328,7 @@ impl IntDictStrategy {
     }
 }
 
+crate::register_dyn_impl_vtable!(DYN_IMPL_IntDictStrategy, IntDictStrategy, DictStrategy);
 impl DictStrategy for IntDictStrategy {
     fn strategy_kind(&self) -> StrategyKind {
         StrategyKind::Int
@@ -8390,7 +8396,7 @@ impl DictStrategy for IntDictStrategy {
     }
 
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
-        crate::dictmultiobject::w_dict_length_int_strategy(w_dict)
+        crate::dictmultiobject::w_dict_length_typed_strategy(w_dict)
     }
 
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {

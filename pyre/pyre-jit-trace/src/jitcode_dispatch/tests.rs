@@ -1415,6 +1415,40 @@ fn execution_context_recovery_records_a_non_elidable_call() {
     assert!(!call_descr.get_extra_info().check_can_raise(false));
 }
 
+/// A jitcode Ref register holds any GCREF (`MIFrame.setup_call` copies
+/// boxes untouched). The ICT inline path must keep every `r_args` word as
+/// `ConcreteValue::Ref` and not probe it as a PyObject.
+#[test]
+fn residual_arg_concretes_keep_non_pyobject_gcref_as_ref() {
+    use crate::state::ConcreteValue;
+
+    let addr = 0x100usize;
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let r_arg = tc.const_ref(addr as i64);
+    let mut regs_r = [r_arg];
+    let mut concrete_r = [ConcreteValue::Null];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            let concretes = residual_arg_concretes(wc, &[r_arg]);
+            assert_eq!(
+                concretes,
+                vec![ConcreteValue::Ref(addr as pyre_object::PyObjectRef)],
+            );
+        },
+    );
+}
+
 /// `GcRef::NO_CONCRETE` is "no runtime value". `opref_concrete` must answer
 /// `Null` for that sentinel, the same as `concrete_from_recorded_opref`.
 #[test]

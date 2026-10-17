@@ -6259,6 +6259,7 @@ pub static MAP_DICT_STRATEGY_REF: pyre_object::dictmultiobject::DictStrategyRef 
         owner: std::ptr::null_mut(),
     };
 
+pyre_object::register_dyn_impl_vtable!(DYN_IMPL_MapDictStrategy, MapDictStrategy, DictStrategy);
 impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     fn strategy_kind(&self) -> pyre_object::dictmultiobject::StrategyKind {
         pyre_object::dictmultiobject::StrategyKind::Map

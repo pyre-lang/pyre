@@ -286,6 +286,11 @@ impl IdentityDictStrategy {
     }
 }
 
+crate::register_dyn_impl_vtable!(
+    DYN_IMPL_IdentityDictStrategy,
+    IdentityDictStrategy,
+    DictStrategy
+);
 impl DictStrategy for IdentityDictStrategy {
     fn strategy_kind(&self) -> crate::dictmultiobject::StrategyKind {
         crate::dictmultiobject::StrategyKind::Identity

@@ -2003,6 +2003,14 @@ impl AbstractUnwrappedSetStrategy for IdentitySetStrategy {
     }
 }
 
+crate::register_dyn_impl_vtable!(DYN_IMPL_IntegerSetStrategy, IntegerSetStrategy, SetStrategy);
+crate::register_dyn_impl_vtable!(DYN_IMPL_BytesSetStrategy, BytesSetStrategy, SetStrategy);
+crate::register_dyn_impl_vtable!(DYN_IMPL_AsciiSetStrategy, AsciiSetStrategy, SetStrategy);
+crate::register_dyn_impl_vtable!(
+    DYN_IMPL_IdentitySetStrategy,
+    IdentitySetStrategy,
+    SetStrategy
+);
 impl<S> SetStrategy for S
 where
     S: AbstractUnwrappedSetStrategy,
@@ -3939,6 +3947,7 @@ fn same_erased_storage(left: PyObjectRef, right: PyObjectRef) -> bool {
         && std::ptr::eq(left.sstorage, right.sstorage)
 }
 
+crate::register_dyn_impl_vtable!(DYN_IMPL_EmptySetStrategy, EmptySetStrategy, SetStrategy);
 impl SetStrategy for EmptySetStrategy {
     fn strategy_kind(&self) -> SetStrategyKind {
         SetStrategyKind::Empty
@@ -4094,6 +4103,7 @@ impl SetStrategy for EmptySetStrategy {
     }
 }
 
+crate::register_dyn_impl_vtable!(DYN_IMPL_ObjectSetStrategy, ObjectSetStrategy, SetStrategy);
 impl SetStrategy for ObjectSetStrategy {
     fn strategy_kind(&self) -> SetStrategyKind {
         SetStrategyKind::Object

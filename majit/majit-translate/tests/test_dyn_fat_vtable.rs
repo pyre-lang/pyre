@@ -218,18 +218,6 @@ fn has_cast_int_to_ptr(graph: &FunctionGraph) -> bool {
     })
 }
 
-fn is_lltype_cast_int_to_ptr_call(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::FunctionPath { segments, .. } => {
-            segments.iter().any(|segment| segment == "lltype")
-                && segments
-                    .last()
-                    .is_some_and(|leaf| leaf == "cast_int_to_ptr")
-        }
-        _ => false,
-    }
-}
-
 #[test]
 fn w_dict_store_has_no_cast_int_to_ptr_of_vtable_word() {
     let Some(llbc) = object_llbc() else {

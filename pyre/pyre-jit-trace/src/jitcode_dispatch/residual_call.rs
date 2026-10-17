@@ -7854,20 +7854,17 @@ fn try_walker_lower_getexecutioncontext<Sym: WalkSym>(
 ///
 /// `MIFrame.setup_call` (`pyjitpl.py`) copies each `argbox` into the
 /// matching bank; a Const box keeps its recording-time value, which the
-/// callee body then folds.
-fn residual_arg_concretes<Sym: WalkSym>(
+/// callee body then folds. A jitcode Ref register holds any GCREF, so
+/// every Ref-bank word stays `ConcreteValue::Ref` — `from_pyobj` would
+/// probe a non-PyObject address (`is_bool` / `is_trace_plain_int` /
+/// `is_trace_plain_float`) and unbox a live PyObject that the callee
+/// still expects as a Ref.
+pub(crate) fn residual_arg_concretes<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     args: &[OpRef],
 ) -> Vec<ConcreteValue> {
     args.iter()
-        .map(|&b| match ctx.trace_ctx.box_value(b) {
-            Some(majit_ir::Value::Int(n)) => ConcreteValue::Int(n),
-            Some(majit_ir::Value::Float(n)) => ConcreteValue::Float(n),
-            Some(majit_ir::Value::Ref(gc_ref)) => {
-                crate::state::concrete_value_from_slot(gc_ref.0 as pyre_object::PyObjectRef)
-            }
-            Some(majit_ir::Value::Void) | None => ConcreteValue::Null,
-        })
+        .map(|&b| opref_concrete(ctx.trace_ctx.box_value(b)))
         .collect()
 }
 
