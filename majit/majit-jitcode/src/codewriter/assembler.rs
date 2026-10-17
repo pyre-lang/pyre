@@ -93,11 +93,12 @@ pub fn is_empty_array_const_sentinel(bits: u64) -> bool {
 /// 48 bits carry the [`super::jitcode::PrebuiltInstanceConstDescriptor`]
 /// ordinal.
 ///
-/// `rclass.py InstanceRepr.convert_const` mallocs an immortal instance
-/// (`create_instance` / `initialize_prebuilt_instance`, typeptr = the
-/// class vtable) and `assembler.py emit_const` stores that GCREF. The
-/// translator cannot allocate the runtime object, so the slot holds
-/// this sentinel until the load pass writes the immortal instance.
+/// `InstanceRepr.convert_const` mallocs an immortal instance
+/// (`create_instance` / `initialize_prebuilt_instance`) and
+/// `assembler.py emit_const` stores that GCREF, pooling by object
+/// identity. The translator cannot allocate the runtime object, so the
+/// slot holds this sentinel until the load pass writes the immortal
+/// instance whose layout the descriptor already carries.
 pub const PREBUILT_INSTANCE_CONST_SENTINEL_BASE: i64 = 0x7E5C_0000_0000_0000u64 as i64;
 
 /// `PREBUILT_INSTANCE_CONST_SENTINEL_BASE | ordinal`.
