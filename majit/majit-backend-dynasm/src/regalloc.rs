@@ -5913,23 +5913,20 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        assert!(matches!(args.len(), 1 | 2));
-        if args.len() == 2 {
+        // llsupport/regalloc.py `locs_for_call_assembler`.
+        let arglocs = if args.len() == 2 {
             let vable = args[1];
             let tp = self.tp(vable);
-            if tp == Type::Float {
-                self.xrm
-                    ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
-            } else {
-                self.rm
-                    ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
-            }
-        }
-
-        let mut arglocs = Vec::with_capacity(args.len());
-        for &arg in args {
-            arglocs.push(self.loc(arg, self.tp(arg)));
-        }
+            self.rm
+                ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
+            vec![
+                self.loc(args[0], self.tp(args[0])),
+                Loc::Frame(self.fm.loc(vable, tp, false, &mut self.longevity)),
+            ]
+        } else {
+            assert!(args.len() == 1);
+            vec![self.loc(args[0], self.tp(args[0]))]
+        };
 
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
@@ -7990,6 +7987,43 @@ mod tests {
             "missing MOV [frame slot], ebp: {output:?}"
         );
         assert_eq!(ra.rm.box_currently_in_frame_reg, None);
+    }
+
+    /// llsupport/regalloc.py `locs_for_call_assembler`: the virtualizable
+    /// argument is synced to the stack and passed as `self.fm.loc(arg1)`,
+    /// even while it is still in a register.
+    #[test]
+    fn call_assembler_vable_loc_is_its_frame_slot() {
+        let p0 = OpRef::input_arg_ref(0);
+        let p1 = OpRef::input_arg_ref(1);
+        let p2 = OpRef::ref_op(0);
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
+        let same = Op::new(OpCode::SameAsR, &[rb(p1)]);
+        same.pos().set(p2);
+        let call = Op::new(OpCode::CallAssemblerN, &[rb(p0), rb(p2)]);
+        call.pos().set(OpRef::void_op(1));
+        let finish = Op::new(OpCode::Finish, &[rb(p2)]);
+        finish.pos().set(OpRef::void_op(2));
+        let ops = rcs(vec![same, call, finish]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let output = ra.walk_operations().expect("walk_operations");
+        let arglocs = output
+            .iter()
+            .find_map(|op| match op {
+                RegAllocOp::Perform {
+                    op_index: 1,
+                    arglocs_start,
+                    arglocs_len,
+                    ..
+                } => Some(ra.arglocs(*arglocs_start, *arglocs_len).to_vec()),
+                _ => None,
+            })
+            .expect("CALL_ASSEMBLER perform");
+        assert!(
+            matches!(arglocs[1], Loc::Frame(_)),
+            "vable must be passed as its frame slot: {arglocs:?}"
+        );
     }
 
     #[test]
