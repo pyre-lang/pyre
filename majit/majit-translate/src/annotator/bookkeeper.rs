@@ -3988,6 +3988,11 @@ impl Bookkeeper {
                     | SomeValue::SingleFloat(_)
                     | SomeValue::Char(_)
                     | SomeValue::None_(_)
+                    // Opaque C pointee (`*mut TlsConnection`, `rffi.py`
+                    // Address of a type with no ClassDef). Impossible
+                    // here Blocks `getattr` of `Result::Ok.__pos_0`
+                    // (`native_result`).
+                    | SomeValue::Impossible
             ) {
                 crate::codewriter::annotation_state::record_classdef_less_mint(
                     "project_struct_field_type.raw_ptr_scalar",
@@ -6637,6 +6642,22 @@ mod tests {
             item.classdef.is_some(),
             "PyObject item must keep its ClassDef"
         );
+    }
+
+    #[test]
+    fn project_struct_field_type_raw_ptr_to_unregistered_pointee_is_classdef_less() {
+        // `*mut TlsConnection` is rffi Address of an opaque C type
+        // (`native_result` Ok payload). An unregistered pointee must not
+        // stay Impossible: getattr of Result::Ok.__pos_0 would Block.
+        use crate::annotator::model::SomeValue;
+        let bk = bk();
+        match bk.project_struct_field_type("*mut TlsConnection") {
+            SomeValue::Instance(inst) => assert!(
+                inst.classdef.is_none(),
+                "opaque C pointer is the classdef-less Ref fold"
+            ),
+            other => panic!("expected classdef-less instance, got {other:?}"),
+        }
     }
 
     #[test]

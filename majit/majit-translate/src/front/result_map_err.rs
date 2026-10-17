@@ -268,15 +268,22 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
     let (ok_block, ok_inputs) = graph.create_block_with_arg_vars(ok_sources.len());
     let (err_block, err_inputs) = graph.create_block_with_arg_vars(err_sources.len());
 
-    let receiver_ok = map_source(&ok_sources, &ok_inputs, &receiver)
-        .ok_or_else(|| format!("{name}: Result receiver not threaded into Ok arm"))?;
-    let ok_payload = read_payload(
-        graph,
-        ok_block,
-        receiver_ok,
-        &site.receiver_ok_owner,
-        site.ok_ty.clone(),
-    );
+    // `Ok(())`: no `__pos_0` field (`result_exc` `unit_ok`,
+    // `pairtype(Repr, VoidRepr).convert_from_to` Constant(None, Void)).
+    let ok_is_void = matches!(site.ok_ty, ValueType::Void);
+    let ok_payload = if ok_is_void {
+        emit_void_unit(graph, ok_block)
+    } else {
+        let receiver_ok = map_source(&ok_sources, &ok_inputs, &receiver)
+            .ok_or_else(|| format!("{name}: Result receiver not threaded into Ok arm"))?;
+        read_payload(
+            graph,
+            ok_block,
+            receiver_ok,
+            &site.receiver_ok_owner,
+            site.ok_ty.clone(),
+        )
+    };
     let ok_payload = emit_narrow(graph, ok_block, ok_payload, &site.ok_class_root);
     let ok_result = if exception_lowered {
         ok_payload
@@ -287,7 +294,11 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
             &site.result_owner,
             "Ok",
             0,
-            Some((&site.result_ok_owner, ok_payload, site.ok_ty.clone())),
+            if ok_is_void {
+                None
+            } else {
+                Some((&site.result_ok_owner, ok_payload, site.ok_ty.clone()))
+            },
         )
     };
     let ok_args = reproduce_exit_args(
@@ -545,6 +556,15 @@ fn bypass_rewrap_handler_args(
     Ok((exit.target, args))
 }
 
+fn emit_void_unit(graph: &mut FunctionGraph, block: crate::model::BlockId) -> Variable {
+    let unit = graph.alloc_value_var_with_type(crate::model::ConcreteType::Void);
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(unit.clone()),
+        kind: OpKind::ConstNone,
+    });
+    unit
+}
+
 fn read_payload(
     graph: &mut FunctionGraph,
     block: crate::model::BlockId,
@@ -728,6 +748,77 @@ mod tests {
                 matches!(target, CallTarget::SyntheticTransparentCtor { name, .. } if name == variant)
             }));
         }
+    }
+
+    #[test]
+    fn map_err_unit_ok_skips_payload_read() {
+        let mut graph = FunctionGraph::new("map_err_unit_ok");
+        let entry = graph.startblock;
+        let receiver = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let env = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("map_err", Some("Result".into())),
+                    args: crate::model::call_args(vec![receiver, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (join, _inputs) = graph.create_block_with_arg_vars(1);
+        graph.set_return(join, None);
+        graph.set_goto(entry, join, vec![result.clone()]);
+
+        let mut site = fixture_site(result);
+        site.ok_ty = ValueType::Void;
+        site.receiver_owner = "core::result::Result<(),str>".into();
+        site.receiver_ok_owner = "core::result::Result<(),str>::Ok".into();
+        site.receiver_err_owner = "core::result::Result<(),str>::Err".into();
+        site.result_owner = "core::result::Result<(),Error>".into();
+        site.result_ok_owner = "core::result::Result<(),Error>::Ok".into();
+        site.result_err_owner = "core::result::Result<(),Error>::Err".into();
+        site.closure_env_is_trivially_dropless = true;
+        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site]), 1);
+
+        let ok_arm = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name, .. }, .. }
+                            if name == "Ok"
+                    )
+                })
+            })
+            .expect("Ok arm");
+        assert!(
+            !ok_arm.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+                )
+            }),
+            "unit Ok has no payload field"
+        );
+        assert!(
+            !ok_arm.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "__pos_0"
+                )
+            }),
+            "unit Ok shell stores no __pos_0"
+        );
+        assert!(
+            ok_arm
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ConstNone))
+        );
     }
 
     #[test]
