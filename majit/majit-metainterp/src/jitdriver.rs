@@ -3916,8 +3916,14 @@ impl<S: JitState> JitDriver<S> {
         jump_args: &[OpRef],
         meta: S::Meta,
     ) -> crate::CompileOutcome {
-        let loop_header_pc = self.meta.trace_ctx().map(|c| c.header_pc);
-        let loop_green_key = self.current_trace_green_key();
+        let (loop_header_pc, loop_green_key, start_cell_key) = match self.meta.trace_ctx() {
+            Some(ctx) => (
+                Some(ctx.header_pc),
+                Some(ctx.green_key()),
+                Some(ctx.root_green_key()),
+            ),
+            None => (None, None, None),
+        };
         if crate::closedbg_enabled() {
             eprintln!(
                 "@@@CLOSE LOOP-COMPILE green_key={} header_pc={} jump_args={}",
@@ -3927,6 +3933,24 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         let outcome = self.meta.compile_loop(jump_args, meta);
+        // warmstate.py `bound_reached` holds the starting `cell` across
+        // `compile_and_run_once` and `finally: cell.flags &= ~JC_TRACING`.
+        // `root_green_key` is that cell's `BaseJitCell::cell_key`, resolved
+        // at trace start (`cell_key_for`). A cloned `GreenKey` is not a
+        // handle: its Ref slots are raw addresses, neither rooted nor
+        // forwarded, while `comparekey_matches` reads
+        // `RetainedGreens::current_value`. `finish_tracing` looks the cell
+        // up by the stored key (`cell_by_key_mut`) and does not re-hash
+        // greens. Ref `get_uhash` uses `hash_whatever` →
+        // `gc_id_or_identityhash` (minimark `id_or_identityhash` shadow /
+        // old-gen address), so the number itself is move-stable too.
+        // `set_green_key` may have retargeted the live key.
+        if matches!(outcome, crate::CompileOutcome::Cancelled) && !self.meta.is_tracing() {
+            let jd_no = self.meta.active_jitdriver_sd.unwrap_or(0);
+            if let Some(gk) = start_cell_key {
+                self.meta.warm_state_for_driver(jd_no).finish_tracing(gk);
+            }
+        }
         if crate::closedbg_enabled() {
             eprintln!(
                 "@@@CLOSE LOOP-COMPILE outcome={:?}",
@@ -4809,15 +4833,10 @@ impl<S: JitState> JitDriver<S> {
                                 // compile_loop already drained tracing+session.
                             }
                             crate::CompileOutcome::Cancelled => {
-                                // pyjitpl.py:3018-3032 parity: cancel_count is
-                                // incremented inside compile_loop and tracing
-                                // continues unless `cancelled_too_many_times`
-                                // escalates to Aborted. The wrapper restored
-                                // session↔tracing alignment so no extra cleanup
-                                // is required here — either the early-Cancelled
-                                // path kept both live (tracing continues) or a
-                                // late-Cancelled path drained both (next bound
-                                // reaches begins a fresh session).
+                                // warmstate.py `bound_reached` `finally: cell.flags &= ~JC_TRACING`.
+                                // Early cancel keeps tracing. Post-take cancel
+                                // is finished in `compile_and_record_loop` and
+                                // stays Cancelled.
                             }
                             crate::CompileOutcome::Aborted => {
                                 self.meta.abort_trace(false);
@@ -5045,10 +5064,10 @@ impl<S: JitState> JitDriver<S> {
                                 );
                             }
                             crate::CompileOutcome::Cancelled => {
-                                // pyjitpl.py:3018-3032 parity: no explicit abort,
-                                // tracing continues (or is already drained inside
-                                // compile_loop for late-cancel cases). The wrapper
-                                // maintains the session↔tracing invariant.
+                                // warmstate.py `bound_reached` `finally: cell.flags &= ~JC_TRACING`.
+                                // Early cancel keeps tracing. Post-take cancel
+                                // is finished in `compile_and_record_loop` and
+                                // stays Cancelled.
                             }
                             crate::CompileOutcome::Aborted => {
                                 self.meta.abort_trace(false);
@@ -11645,7 +11664,7 @@ fn abort_blackhole_restore_banks<'a>(
 mod tests {
     use super::*;
     use crate::resume::ReconstructedFrame;
-    use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
+    use majit_ir::{GcRef, GreenType, OpCode, OpRef, Type, Value};
     use std::sync::Arc;
 
     // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
@@ -13590,6 +13609,7 @@ mod tests {
     #[derive(Default)]
     struct AcceptCloseState {
         selected: i64,
+        code_ptr: usize,
     }
 
     #[derive(Default)]
@@ -13621,6 +13641,10 @@ mod tests {
         }
 
         fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn code_ptr(&self) -> usize {
+            self.code_ptr
+        }
 
         fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
             vec![OpRef::input_arg_int(0)]
@@ -13691,6 +13715,225 @@ mod tests {
             "CloseLoopWithArgs must consume the latch"
         );
         assert!(driver.meta.trace_ctx().unwrap().take_merge_point_resumed());
+    }
+
+    /// A root-loop HEADER-CLOSE that cancels after `tracing.take()` must
+    /// leave the cell without `JC_TRACING`. `warmstate.py` `bound_reached`
+    /// `finally: cell.flags &= ~JC_TRACING`; discarding the tracer while
+    /// leaving the cell tracing swallows every later back-edge in
+    /// `JitDriver::try_empty_chain_tick`.
+    #[test]
+    fn close_loop_cancel_after_take_clears_tracing() {
+        let mut driver = JitDriver::<AcceptCloseState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        // Force the simple-loop retry so `normalize_root_loop_entry_contract`
+        // sees LABEL(inputargs) against a longer JUMP.
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_param_enable_opts("intbounds:heap");
+        let mut state = AcceptCloseState::default();
+        let key = 42u64;
+        driver.force_start_tracing(key, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(
+            driver.cell_is_tracing(key),
+            "force_start_tracing marks JC_TRACING"
+        );
+        let abort_count_before = driver
+            .meta
+            .warm_state_for_driver(0)
+            .cell_by_key(key)
+            .expect("force_start_tracing installs a cell")
+            .abort_count
+            .get();
+        {
+            let ctx = driver.meta.trace_ctx().expect("tracing");
+            let i0 = OpRef::input_arg_int(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+        driver.merge_point(|_meta, _sym| TraceAction::CloseLoopWithArgs {
+            // One recorded inputarg; two JUMP args fail the LABEL/JUMP contract
+            // after `tracing.take()`.
+            jump_args: vec![OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            loop_header_pc: None,
+        });
+        assert!(
+            !driver.has_compiled_loop(key),
+            "the arity mismatch must cancel the compile"
+        );
+        assert!(
+            !driver.is_tracing(),
+            "the session must be drained after a post-take cancel"
+        );
+        assert!(
+            !driver.cell_is_tracing(key),
+            "WarmEnterState.finish_tracing must clear JC_TRACING"
+        );
+        {
+            let cell = driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key(key)
+                .expect("the cancelled cell remains");
+            assert_eq!(
+                cell.abort_count.get(),
+                abort_count_before,
+                "bound_reached finally does not bump abort_count"
+            );
+            assert!(
+                !driver.meta.warm_state_for_driver(0).is_dont_trace_here(key),
+                "bound_reached finally does not set JC_DONT_TRACE_HERE"
+            );
+        }
+        assert!(!driver.meta.take_keep_tracing_after_close());
+        driver.force_start_tracing(key, 0, &mut state, &());
+        assert!(
+            driver.is_tracing(),
+            "a later trace must be able to start on the same key"
+        );
+        assert!(driver.cell_is_tracing(key));
+    }
+
+    /// A trace started at A and retargeted to B (`TraceCtx::set_green_key`)
+    /// still clears A's `JC_TRACING` on a post-take Cancelled close.
+    /// `warmstate.py` `bound_reached` keeps the original `cell` and clears
+    /// that cell in `finally`; the live green key is not the start cell.
+    #[test]
+    fn close_loop_cancel_after_take_clears_start_key_after_retarget() {
+        let mut driver = JitDriver::<AcceptCloseState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_param_enable_opts("intbounds:heap");
+        let mut state = AcceptCloseState::default();
+        let key_a = 42u64;
+        let key_b = 99u64;
+        driver.force_start_tracing(key_a, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(
+            driver.cell_is_tracing(key_a),
+            "force_start_tracing marks JC_TRACING on A"
+        );
+        {
+            let ctx = driver.meta.trace_ctx().expect("tracing");
+            let i0 = OpRef::input_arg_int(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+            ctx.set_green_key(key_b, (0, 1));
+        }
+        assert_eq!(
+            driver.current_trace_green_key(),
+            Some(key_b),
+            "set_green_key retargets the live key"
+        );
+        assert_eq!(
+            driver.meta.trace_ctx().expect("tracing").root_green_key(),
+            key_a,
+            "root_green_key keeps the start cell"
+        );
+        driver.merge_point(|_meta, _sym| TraceAction::CloseLoopWithArgs {
+            jump_args: vec![OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            loop_header_pc: None,
+        });
+        assert!(
+            !driver.has_compiled_loop(key_a),
+            "the arity mismatch must cancel the compile"
+        );
+        assert!(
+            !driver.is_tracing(),
+            "the session must be drained after a post-take cancel"
+        );
+        assert!(
+            !driver.cell_is_tracing(key_a),
+            "Cancelled cleanup must clear JC_TRACING on the start cell A"
+        );
+        assert!(
+            !driver.cell_is_tracing(key_b),
+            "retargeted B was never marked tracing"
+        );
+        assert!(!driver.meta.take_keep_tracing_after_close());
+        driver.force_start_tracing(key_a, 0, &mut state, &());
+        assert!(
+            driver.is_tracing(),
+            "a later trace must be able to start on A"
+        );
+        assert!(driver.cell_is_tracing(key_a));
+    }
+
+    /// Same post-take Cancelled cleanup as
+    /// `close_loop_cancel_after_take_clears_tracing`, but the start cell's
+    /// typed key carries a Ref green (`pypyjit` portal `[pc, profiled, code]`).
+    /// Cleanup must go through `finish_tracing(cell_key)`, not a cloned
+    /// `GreenKey` whose Ref slot is a raw address.
+    #[test]
+    fn close_loop_cancel_after_take_clears_tracing_with_ref_green() {
+        let mut driver = JitDriver::<AcceptCloseState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_param_enable_opts("intbounds:heap");
+        let target_pc = 0usize;
+        let code_ptr = 0x1234usize;
+        let key = majit_ir::pypyjit_greenkey_uhash(target_pc, false, code_ptr as u64);
+        let mut state = AcceptCloseState {
+            selected: 0,
+            code_ptr,
+        };
+        driver.force_start_tracing(key, target_pc, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(
+            driver.cell_is_tracing(key),
+            "force_start_tracing marks JC_TRACING"
+        );
+        {
+            let ctx = driver.meta.trace_ctx().expect("tracing");
+            let typed = ctx
+                .green_key_values()
+                .expect("non-zero code_ptr seeds a typed green key");
+            assert!(
+                typed.types.iter().any(|t| *t == GreenType::Ref),
+                "the typed start key carries a Ref green"
+            );
+            let i0 = OpRef::input_arg_int(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+        driver.merge_point(|_meta, _sym| TraceAction::CloseLoopWithArgs {
+            jump_args: vec![OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            loop_header_pc: None,
+        });
+        assert!(
+            !driver.has_compiled_loop(key),
+            "the arity mismatch must cancel the compile"
+        );
+        assert!(
+            !driver.is_tracing(),
+            "the session must be drained after a post-take cancel"
+        );
+        assert!(
+            !driver.cell_is_tracing(key),
+            "WarmEnterState.finish_tracing must clear JC_TRACING on a Ref-green cell"
+        );
+        assert!(!driver.meta.take_keep_tracing_after_close());
+        driver.force_start_tracing(key, target_pc, &mut state, &());
+        assert!(
+            driver.is_tracing(),
+            "a later trace must be able to start on the same key"
+        );
+        assert!(driver.cell_is_tracing(key));
     }
 
     /// Regression: the whole-circuit single-pass CloseLoop arm captures the
