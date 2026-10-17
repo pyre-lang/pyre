@@ -1442,6 +1442,81 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; cmp X(r0 as u8), X(r1 as u8));
     }
 
+    fn guard_value_stack_offset(loc: &Loc) -> i32 {
+        match loc {
+            ebp_loc_pat!(e) => e.value,
+            _ => panic!("emit_op_guard_value expects a stack location, got {loc:?}"),
+        }
+    }
+
+    /// aarch64/opassembler.py `emit_op_guard_value`.
+    /// Core: `CMP_rr`, with `ip0` holding an imm or stack arg1.
+    /// Vfp: `FCMP_dd`, with arg1 a vfp register (or `vfp_ip` when stacked).
+    /// The guard that follows branches on EQ.
+    fn emit_op_guard_value(&mut self, arglocs: &[Loc]) {
+        let v0 = arglocs[0];
+        let v1 = arglocs[1];
+        let ip0 = crate::aarch64::registers::IP0.value;
+        let vfp_ip = crate::aarch64::registers::VFP_IP.value;
+        if let Loc::Reg(r0) = v0
+            && r0.is_float()
+        {
+            let rhs = if let Loc::Reg(r1) = v1
+                && r1.is_float()
+            {
+                r1.value
+            } else {
+                assert!(
+                    v1.is_stack(),
+                    "emit_op_guard_value vfp arg1 must be a vfp register or stack, got {v1:?}"
+                );
+                self.emit_ldr_fp_d(vfp_ip, Self::guard_value_stack_offset(&v1));
+                vfp_ip
+            };
+            dynasm!(self.mc ; .arch aarch64 ; fcmp D(r0.value), D(rhs));
+            return;
+        }
+        // `ARMRegisterManager.return_constant` would have loaded a ConstInt
+        // arg0 into a core register. An immediate or stack slot left by the
+        // shared `return_constant` is compared from `ip1` so `ip0` stays
+        // available for arg1.
+        let lhs = if let Loc::Reg(r0) = v0
+            && r0.is_core_reg()
+        {
+            r0.value
+        } else {
+            let ip1 = crate::aarch64::registers::IP1.value;
+            match v0 {
+                Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                    self.emit_mov_imm64(u32::from(ip1), i.value);
+                }
+                _ if v0.is_stack() => {
+                    self.emit_ldr_fp(ip1, Self::guard_value_stack_offset(&v0));
+                }
+                _ => {
+                    panic!("emit_op_guard_value arg0 must be a register, imm, or stack, got {v0:?}")
+                }
+            }
+            ip1
+        };
+        let rhs = if let Loc::Reg(r1) = v1
+            && r1.is_core_reg()
+        {
+            r1.value
+        } else if let Loc::Immed(i) = v1 {
+            self.emit_mov_imm64(u32::from(ip0), i.value);
+            ip0
+        } else {
+            assert!(
+                v1.is_stack(),
+                "emit_op_guard_value core arg1 must be a core register, imm, or stack, got {v1:?}"
+            );
+            self.emit_ldr_fp(ip0, Self::guard_value_stack_offset(&v1));
+            ip0
+        };
+        dynasm!(self.mc ; .arch aarch64 ; cmp X(lhs), X(rhs));
+    }
+
     /// Emit: TEST loc, loc (for guard_true/guard_false)
     fn emit_test_loc(&mut self, loc: &Loc) {
         let r = match loc {
@@ -4328,9 +4403,10 @@ impl<'a> AssemblerARM64<'a> {
                     faillocs,
                 );
             }
+            // aarch64/opassembler.py `emit_op_guard_value`, then EQ.
             OpCode::GuardValue => {
                 if arglocs.len() >= 2 {
-                    self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
+                    self.emit_op_guard_value(arglocs);
                     self.guard_success_cc = Some(CC_E);
                 }
                 self.implement_guard_with_faillocs(

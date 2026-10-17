@@ -4208,6 +4208,75 @@ impl<'a> RegAlloc<'a> {
         self.perform_guard(op, i, [loc], None, output);
     }
 
+    /// `RegisterManager.return_constant` with `selected_reg` queues
+    /// `convert_to_imm`'s `ConstFloatLoc` into that xmm/vfp register, but
+    /// leaves the register in `free_regs`. A `TempVar` owns it afterwards
+    /// (`VFPRegisterManager.get_scratch_reg` / `temp_boxes`) so the next
+    /// ConstFloat in this instruction cannot reuse it. Binding first would
+    /// make `return_constant` spill the scratch: it only queues the move
+    /// while the register is still free.
+    fn const_float_in_reg(&mut self, v: OpRef, forbidden: &[OpRef]) -> Loc {
+        debug_assert!(v.is_constant() && self.tp(v) == Type::Float);
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.xrm.position, self.xrm.position));
+        let reg = if let Some(selected) = self.xrm.free_regs.last().copied() {
+            let loaded = self.xrm.return_constant(
+                v,
+                forbidden,
+                Some(selected),
+                &self.constants,
+                &mut self.longevity,
+                &mut self.fm,
+                &mut self.pending_moves,
+            );
+            let Loc::Reg(reg) = loaded else {
+                panic!("return_constant(selected_reg) must yield a register, got {loaded:?}");
+            };
+            self.force_allocate_reg(tmp, Type::Float, forbidden, Some(reg), false)
+        } else {
+            let reg = self.force_allocate_reg(tmp, Type::Float, forbidden, None, false);
+            let imm = self.xrm.convert_to_imm(v, &self.constants);
+            self.xrm.spill_moves.push((imm, Loc::Reg(reg)));
+            reg
+        };
+        self.xrm.temp_boxes.push(tmp);
+        Loc::Reg(reg)
+    }
+
+    /// aarch64/regalloc.py `prepare_op_guard_value`: arg in a register.
+    /// A ConstFloat is loaded by `ARMRegisterManager.return_constant`
+    /// (`FCMP_dd` has no immediate form).
+    #[cfg(target_arch = "aarch64")]
+    fn prepare_guard_value_arg(&mut self, v: OpRef, forbidden: &[OpRef]) -> Loc {
+        if v.is_constant() && self.tp(v) == Type::Float {
+            self.const_float_in_reg(v, forbidden)
+        } else {
+            self.make_sure_var_in_reg(v, self.tp(v), forbidden, None, false)
+        }
+    }
+
+    /// aarch64/regalloc.py `prepare_op_guard_value`.
+    #[cfg(target_arch = "aarch64")]
+    fn guard_value_locs(&mut self, lhs: OpRef, rhs: OpRef) -> (Loc, Loc) {
+        let arg = self.prepare_guard_value_arg(lhs, &[]);
+        let l1 = if arch_regalloc::check_imm_box(rhs) {
+            self.loc(rhs, self.tp(rhs))
+        } else {
+            self.prepare_guard_value_arg(rhs, &[lhs])
+        };
+        (arg, l1)
+    }
+
+    /// x86/regalloc.py `consider_guard_value`: arg0 in a register, arg1
+    /// stays `self.loc` (`UCOMISD` accepts that location code).
+    #[cfg(not(target_arch = "aarch64"))]
+    fn guard_value_locs(&mut self, lhs: OpRef, rhs: OpRef) -> (Loc, Loc) {
+        let x = self.make_sure_var_in_reg(lhs, self.tp(lhs), &[], None, false);
+        let y = self.loc(rhs, self.tp(rhs));
+        (x, y)
+    }
+
     fn consider_guard_value_j2(
         &mut self,
         lhs: OpRef,
@@ -4216,9 +4285,13 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let x = self.make_sure_var_in_reg(lhs, self.tp(lhs), &[], None, false);
-        let y = self.loc(rhs, self.tp(rhs));
+        let (x, y) = self.guard_value_locs(lhs, rhs);
         self.perform_guard(op, i, vec![x, y], None, output);
+        #[cfg(target_arch = "aarch64")]
+        {
+            // `get_scratch_reg` temps die with this instruction.
+            self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
+        }
     }
 
     fn consider_guard_class_j2(
@@ -4839,6 +4912,18 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, [loc0], Some(result_loc), output);
     }
 
+    /// x86/regalloc.py `consider_cast_float_to_int` calls
+    /// `xrm.make_sure_var_in_reg`. On x86, `RegAlloc::make_sure_var_in_reg`
+    /// returns `FloatImmedLoc` for a ConstFloat before that call, and
+    /// `CVTTSD2SI` / `FCVTZS` only encode a register source.
+    fn cast_float_src_in_reg(&mut self, arg: OpRef) -> Loc {
+        if arg.is_constant() {
+            self.const_float_in_reg(arg, &[])
+        } else {
+            self.make_sure_var_in_reg(arg, Type::Float, &[], None, false)
+        }
+    }
+
     fn consider_cast_float_to_int_j2(
         &mut self,
         dst: OpRef,
@@ -4846,9 +4931,11 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let loc0 = self.make_sure_var_in_reg(arg, Type::Float, &[], None, false);
+        // execute_cast_const lets a non-finite or out-of-range ConstFloat reach here.
+        let loc0 = self.cast_float_src_in_reg(arg);
         let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
         self.perform(i, [loc0], Some(result_loc), output);
+        self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
     }
 
     /// x86/regalloc.py `consider_cast_float_to_singlefloat`.
@@ -4864,7 +4951,8 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let loc0 = self.make_sure_var_in_reg(arg, Type::Float, &[], None, false);
+        // execute_cast_const lets a non-finite or out-of-range ConstFloat reach here.
+        let loc0 = self.cast_float_src_in_reg(arg);
         let loc1 = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
         let tmp = self.fresh_temp_var();
         self.longevity
@@ -4880,6 +4968,7 @@ impl<'a> RegAlloc<'a> {
         self.xrm
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Float);
         self.perform(i, [loc0, loctmp], Some(loc1), output);
+        self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
     }
 
     /// Memory load: getfield pattern (1 arg → result)

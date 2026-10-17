@@ -168,6 +168,41 @@ fn int_and_low32_mask_zero_extends() {
     assert_eq!(compile_and_run_int(OpCode::IntAnd, Some(-1), -1, 83), -1);
 }
 
+/// `load_effective_addr` with a constant base: `AddressLoc` folds the
+/// `ImmedLoc` into the static offset, directly when the sum fits a disp32 and
+/// through `_addr_as_reg_offset` when it does not.
+#[test]
+fn load_effective_address_folds_a_constant_base() {
+    for (token_id, base) in [(96i64, 0x1000i64), (97, 0x1234_5678_0000)] {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let token = JitCellToken::new(token_id);
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let i0 = inputargs[0].opref();
+        let lea = Op::new(
+            OpCode::LoadEffectiveAddress,
+            &[
+                rb(OpRef::const_int(base)),
+                rb(i0),
+                rb(OpRef::const_int(16)),
+                rb(OpRef::const_int(3)),
+            ],
+        );
+        lea.pos().set(OpRef::int_op(1));
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+        finish.pos().set(OpRef::void_op(2));
+        finish.set_fail_arg_types(vec![Type::Int]);
+        finish.setfailargs(vec![rb(OpRef::int_op(1))].into());
+        let ops = vec![OpRc::new(lea), OpRc::new(finish)];
+        backend
+            .compile_loop(&inputargs, &ops, &token)
+            .expect("compile LOAD_EFFECTIVE_ADDRESS");
+        let frame = backend.execute_token(&token, &[Value::Int(5)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), base + (5 << 3) + 16);
+    }
+}
+
 #[test]
 fn int_force_ge_zero_clamps_negatives() {
     // genop_int_force_ge_zero: negatives become 0, non-negatives pass through.
@@ -5271,4 +5306,79 @@ fn follow_jump_stops_on_a_non_e9_prefix() {
             .any(|window| window == r11_imm_call(real)),
         "the E9 after EB must not become the call target"
     );
+}
+
+/// `consider_uint_mul_high` under register pressure: every pair of fourteen
+/// live values feeds `UINT_MUL_HIGH`, so some multiplicand already sits in
+/// EDX when the result claims it. All fourteen stay live past the multiply.
+#[test]
+fn uint_mul_high_with_every_operand_register() {
+    const N: usize = 14;
+    let inputs: Vec<i64> = (0..N as i64)
+        .map(|k| (0x9E37_79B9_7F4A_7C15u64 as i64).wrapping_mul(k + 3))
+        .collect();
+    for p in 0..N {
+        for q in 0..N {
+            let mut backend = DynasmBackend::new();
+            backend.attach_default_test_descrs();
+            let token = JitCellToken::new(next_token_id());
+            let inputargs: Vec<InputArgRc> = (0..N as u32)
+                .map(|k| InputArg::from_type_rc(Type::Int, k))
+                .collect();
+            let mut ops = Vec::new();
+            let adds: Vec<OpRef> = (0..N as u32).map(|k| OpRef::int_op(100 + k)).collect();
+            for k in 0..N {
+                let add = Op::new(
+                    OpCode::IntAdd,
+                    &[rb(inputargs[k].opref()), rb(OpRef::const_int(1))],
+                );
+                add.pos().set(adds[k]);
+                ops.push(add);
+            }
+            let mul = Op::new(OpCode::UintMulHigh, &[rb(adds[p]), rb(adds[q])]);
+            mul.pos().set(OpRef::int_op(200));
+            ops.push(mul);
+            // `r < i64::MIN` never holds, so the guard always leaves with
+            // the result and every multiplicand as fail arguments.
+            let never = Op::new(
+                OpCode::IntLt,
+                &[rb(OpRef::int_op(200)), rb(OpRef::const_int(i64::MIN))],
+            );
+            never.pos().set(OpRef::int_op(201));
+            ops.push(never);
+            let mut fail_args = vec![rb(OpRef::int_op(200))];
+            fail_args.extend(adds.iter().map(|&a| rb(a)));
+            let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(201))]);
+            guard.pos().set(OpRef::void_op(202));
+            guard.set_fail_arg_types(vec![Type::Int; N + 1]);
+            guard.setfailargs(fail_args.into());
+            ops.push(guard);
+            let finish = Op::new(OpCode::Finish, &[]);
+            finish.pos().set(OpRef::void_op(203));
+            finish.set_fail_arg_types(vec![]);
+            finish.setfailargs(vec![].into());
+            ops.push(finish);
+            let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+            backend
+                .compile_loop(&inputargs, &ops, &token)
+                .unwrap_or_else(|err| panic!("compile uint_mul_high({p}, {q}): {err:?}"));
+            let args: Vec<Value> = inputs.iter().map(|&v| Value::Int(v)).collect();
+            let frame = backend.execute_token(&token, &args);
+            assert!(!backend.get_latest_descr(&frame).is_finish());
+            let a = inputs[p].wrapping_add(1) as u64 as u128;
+            let b = inputs[q].wrapping_add(1) as u64 as u128;
+            assert_eq!(
+                backend.get_int_value(&frame, 0),
+                ((a * b) >> 64) as u64 as i64,
+                "uint_mul_high(a{p}, a{q})"
+            );
+            for k in 0..N {
+                assert_eq!(
+                    backend.get_int_value(&frame, k + 1),
+                    inputs[k].wrapping_add(1),
+                    "a{k} after uint_mul_high(a{p}, a{q})"
+                );
+            }
+        }
+    }
 }
