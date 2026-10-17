@@ -6605,10 +6605,27 @@ impl<'a> RegAlloc<'a> {
             }
         }
 
+        // x86/regalloc.py `consider_label`: we need to make sure that no
+        // variable is stored in ebp
+        #[cfg(target_arch = "x86_64")]
+        {
+            let ebp = self.rm.frame_reg;
+            for &arg in args {
+                let tp = self.tp(arg);
+                if matches!(self.loc(arg, tp), Loc::Reg(r) if r == ebp) {
+                    let loc2 = self.fm.loc(arg, tp, false, &mut self.longevity);
+                    self.rm.spill_moves.push((Loc::Reg(ebp), Loc::Frame(loc2)));
+                }
+            }
+            self.rm.box_currently_in_frame_reg = None;
+        }
+
         let mut locs = Vec::new();
         for &arg in args {
             let tp = self.tp(arg);
             let loc = self.loc(arg, tp);
+            #[cfg(target_arch = "x86_64")]
+            debug_assert!(!matches!(loc, Loc::Reg(r) if r == self.rm.frame_reg));
             if let Loc::Reg(_) = loc {
                 self.fm.mark_as_free(arg, tp, &mut self.longevity)
             }
@@ -7919,6 +7936,60 @@ mod tests {
             "failarg {fail_reg:?} must be freed before arg {arg_reg:?}: {:?}",
             ra.rm.free_regs
         );
+    }
+
+    /// x86/regalloc.py `consider_label`: a LABEL argument located in ebp
+    /// (a bridge input bound by `_update_bindings`) is stored to its frame
+    /// slot, `box_currently_in_frame_reg` is reset, and the label's
+    /// location is that slot.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn label_moves_ebp_argument_to_its_frame_slot() {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::int_op(1);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let label = Op::new(OpCode::Label, &[rb(i0)]);
+        label.pos().set(OpRef::void_op(0));
+        let ops = rcs(vec![
+            label,
+            make_op(OpCode::IntAdd, 1, &[i0, OpRef::const_int(1)]),
+            make_op(OpCode::Finish, 2, &[i1]),
+        ]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_bridge(&[Loc::Reg(EBP)]);
+        assert_eq!(ra.rm.box_currently_in_frame_reg, Some(i0));
+        let output = ra.walk_operations().expect("walk_operations");
+        let label_pos = output
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    RegAllocOp::Perform { op_index: 0, .. }
+                        | RegAllocOp::Perform1 { op_index: 0, .. }
+                )
+            })
+            .expect("LABEL perform");
+        let label_loc = match &output[label_pos] {
+            RegAllocOp::Perform1 { loc, .. } => *loc,
+            RegAllocOp::Perform {
+                arglocs_start,
+                arglocs_len,
+                ..
+            } => ra.arglocs(*arglocs_start, *arglocs_len)[0],
+            _ => unreachable!(),
+        };
+        let Loc::Frame(slot) = label_loc else {
+            panic!("LABEL argument must be its frame slot, got {label_loc:?}");
+        };
+        assert!(
+            output[..label_pos].iter().any(|op| matches!(
+                op,
+                RegAllocOp::Move { src: Loc::Reg(r), dst: Loc::Frame(f) }
+                    if *r == EBP && f.position == slot.position
+            )),
+            "missing MOV [frame slot], ebp: {output:?}"
+        );
+        assert_eq!(ra.rm.box_currently_in_frame_reg, None);
     }
 
     #[test]
