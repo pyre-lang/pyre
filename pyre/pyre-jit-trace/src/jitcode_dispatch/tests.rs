@@ -14656,6 +14656,777 @@ fn helper_descent_runs_the_limit_check_per_step() {
     );
 }
 
+/// A crossing helper with executed effects and no blackhole latch must not
+/// return `TraceTooLong`.
+///
+/// `trace_too_long_abort_safe` is false when the latch failed and
+/// `fbw_executed_effect_count() > 0`.  Aborting anyway leaves
+/// `SwitchToBlackhole(ABORT_TOO_LONG)` with no image:
+/// `try_adopt_single_frame_blackhole` declines (`crossed_inline_subwalk` /
+/// missing image), journals roll back, and the interpreter resumes at the
+/// pre-walk `last_instr` — replaying unjournaled writes.  PyPy's
+/// `convert_and_run_from_pyjitpl` always has a resume; without one this
+/// walk finishes its bounded body instead of aborting unsoundly.
+/// Production: a helper with no executed unjournaled write returns
+/// `TraceTooLong` and the enclosing Python walk latches at the CALL
+/// (`latch_abort_blackhole`, origin `mod2730-too-long`). This fixture is
+/// non-authoritative and has no entry mark, so it takes the keep-recording
+/// leftover path.
+#[test]
+fn helper_that_crosses_trace_limit_with_effects_does_not_abort_without_a_latch() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let code = [
+        int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, void_ret,
+    ];
+    let mut tc = fresh_trace_ctx();
+    let a = dummy_int_add_box(&mut tc);
+    let b = dummy_int_add_box(&mut tc);
+    let ops_at_entry = tc.num_recorded_ops();
+    let regs_i = [a, b, a];
+    let mut concrete_i = [
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+    ];
+    tc.set_trace_limit(ops_at_entry + 1);
+    assert!(
+        !tc.is_too_long(),
+        "the helper must enter under budget so the cut is this walk's"
+    );
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    fbw_bump_executed_effect("test-crossing-helper-effects");
+    assert!(
+        fbw_executed_effect_count() > 0,
+        "the fixture must be the effects-and-no-latch case"
+    );
+    let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(&code, 0, &mut wc);
+    assert!(
+        result.is_ok(),
+        "effects and no latch must not TraceTooLong: {result:?}"
+    );
+    fbw_store_journal_reset();
+}
+
+/// An authoritative crossing helper whose odometer bump is this helper's
+/// own unjournaled write cannot be converted without a blackhole image.
+/// FLAG (`fbw_has_unjournaled_effect`) is recorded-but-unexecuted and is
+/// not that write; `transparent_helper_effects_at_entry: Some(0)` makes
+/// the bump a helper-delta. PyPy's `convert_and_run_from_pyjitpl` always
+/// has a resume; without a latch this walk keeps recording rather than
+/// aborting into interpreter replay of the write.
+/// A 0-delta helper returns `TraceTooLong` instead (see the next test).
+#[test]
+fn authoritative_crossing_helper_without_a_latch_keeps_recording() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let code = [
+        int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, void_ret,
+    ];
+    let mut tc = fresh_trace_ctx();
+    let a = dummy_int_add_box(&mut tc);
+    let b = dummy_int_add_box(&mut tc);
+    let ops_at_entry = tc.num_recorded_ops();
+    let regs_i = [a, b, a];
+    let mut concrete_i = [
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+    ];
+    tc.set_trace_limit(ops_at_entry + 1);
+    assert!(
+        !tc.is_too_long(),
+        "the helper must enter under budget so the cut is this walk's"
+    );
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    fbw_bump_executed_effect("test-crossing-helper-authoritative");
+    assert!(
+        fbw_executed_effect_count() > 0,
+        "the fixture is the helper-delta unjournaled-write case"
+    );
+    let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_effects_at_entry: Some(0),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(&code, 0, &mut wc);
+    assert!(
+        result.is_ok(),
+        "an authoritative crossing helper with a helper-delta write and no latch \
+         must keep recording: {result:?}"
+    );
+    fbw_store_journal_reset();
+}
+
+/// Keep-recording after a declined latch must not stack another helper
+/// walk. `_interpret` / `blackhole_if_trace_too_long` (`pyjitpl.py`)
+/// has already raised; `convert_and_run_from_pyjitpl` runs the rest in
+/// the blackhole. A self-`inline_call` after the cut would otherwise
+/// recurse without bound. The walk residualizes the CALL
+/// (`OrthodoxSubWalkTraceUnsupported`) and finishes the body.
+#[test]
+fn crossed_helper_does_not_descend_a_nested_helper_after_the_limit() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let inline_byte = *insns_opname_to_byte()
+        .get("inline_call_ir_v/dIR")
+        .expect("`inline_call_ir_v/dIR` must be in insns table");
+    // int_add crosses the limit, then a self-call, then return.
+    let code: &'static [u8] = Box::leak(Box::new([
+        int_add,
+        0,
+        1,
+        2,
+        inline_byte,
+        0x07,
+        0x00,
+        0x02,
+        0x00,
+        0x01,
+        0x01,
+        0x00,
+        void_ret,
+    ]));
+    let sub_body = SubJitCodeBody {
+        code,
+        num_regs_r: 1,
+        num_regs_i: 3,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+    };
+    let lookup = {
+        let sub_body = sub_body.clone();
+        move |idx: usize| (idx == 7).then(|| sub_body.clone())
+    };
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let a = dummy_int_add_box(&mut tc);
+    let b = dummy_int_add_box(&mut tc);
+    let ops_at_entry = tc.num_recorded_ops();
+    let regs_i = [a, b, a];
+    let mut concrete_i = [
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+    ];
+    tc.set_trace_limit(ops_at_entry + 1);
+    assert!(
+        !tc.is_too_long(),
+        "the helper must enter under budget so the cut is this walk's"
+    );
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    fbw_bump_executed_effect("test-crossed-helper-nested-refuse");
+    assert!(
+        fbw_executed_effect_count() > 0,
+        "the fixture is the helper-delta unjournaled-write keep-recording case"
+    );
+    let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    descr_pool[7] = make_jitcode_descr(7);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_effects_at_entry: Some(0),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(code, 0, &mut wc);
+    assert!(
+        result.is_ok()
+            || matches!(
+                result,
+                Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
+            ),
+        "a crossed helper must residualize a nested CALL rather than \
+         recurse: {result:?}"
+    );
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+}
+
+/// Enclosing Python effects with a 0 helper-delta are not an executed
+/// unjournaled helper write. The helper returns `TraceTooLong` so the
+/// enclosing walk's `Err(TraceTooLong)` arm can latch at the CALL
+/// (`latch_abort_blackhole` builds a multi-frame image when that CALL
+/// sits under inlined Python). The harness cannot seed that framestack.
+#[test]
+fn authoritative_crossing_helper_with_enclosing_effects_returns_trace_too_long() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let code = [
+        int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, void_ret,
+    ];
+    let mut tc = fresh_trace_ctx();
+    let a = dummy_int_add_box(&mut tc);
+    let b = dummy_int_add_box(&mut tc);
+    let ops_at_entry = tc.num_recorded_ops();
+    let regs_i = [a, b, a];
+    let mut concrete_i = [
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+    ];
+    tc.set_trace_limit(ops_at_entry + 1);
+    assert!(
+        !tc.is_too_long(),
+        "the helper must enter under budget so the cut is this walk's"
+    );
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    fbw_bump_executed_effect("test-crossing-helper-enclosing-effects");
+    let effects_at_entry = fbw_executed_effect_count();
+    assert!(
+        effects_at_entry > 0,
+        "the fixture is the enclosing-effects 0-helper-delta case"
+    );
+    let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_effects_at_entry: Some(effects_at_entry),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(&code, 0, &mut wc);
+    assert!(
+        matches!(result, Err(DispatchError::TraceTooLong { .. })),
+        "0 helper-delta must TraceTooLong so the enclosing CALL can latch: {result:?}"
+    );
+    fbw_store_journal_reset();
+}
+
+/// Finding 1: a 0-delta helper `TraceTooLong` must reach the enclosing Python
+/// walk so `note_root_trace_too_long` / `WalkSession::trace_too_long` run.
+/// Residualizing the CALL used to swallow that abort.
+#[test]
+fn python_walk_notes_root_when_a_helper_crosses_the_limit() {
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let inline_byte = *insns_opname_to_byte()
+        .get("inline_call_ir_v/dIR")
+        .expect("`inline_call_ir_v/dIR` must be in insns table");
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let callee_code: &'static [u8] = Box::leak(Box::new([
+        int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, void_ret,
+    ]));
+    let sub_body = SubJitCodeBody {
+        code: callee_code,
+        num_regs_r: 1,
+        num_regs_i: 3,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+    };
+    let lookup = {
+        let sub_body = sub_body.clone();
+        move |idx: usize| (idx == 7).then(|| sub_body.clone())
+    };
+    // dIR: 2B descr(7) + I-list(len=2, i0, i1) + R-list(len=1, r0)
+    let caller_code = [
+        inline_byte,
+        0x07,
+        0x00,
+        0x02,
+        0x00,
+        0x01,
+        0x01,
+        0x00,
+        void_ret,
+    ];
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let a = dummy_int_add_box(&mut tc);
+    let b = dummy_int_add_box(&mut tc);
+    let ops_at_entry = tc.num_recorded_ops();
+    let mut concrete_i = [
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+    ];
+    let regs_i = [a, b, a];
+    tc.set_trace_limit(ops_at_entry + 1);
+    assert!(
+        !tc.is_too_long(),
+        "the Python walk must enter under budget so the cut is the helper's"
+    );
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    descr_pool[7] = make_jitcode_descr(7);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(&caller_code, 0, &mut wc);
+    assert!(
+        matches!(result, Err(DispatchError::TraceTooLong { .. })),
+        "a helper that crosses the limit must not residualize the CALL: {result:?}"
+    );
+    assert!(
+        session.borrow().trace_too_long,
+        "the enclosing Python walk must run ABORT_TOO_LONG bookkeeping"
+    );
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+}
+
+/// Findings 3–4: a nested helper `TraceTooLong` must not replay the parent
+/// CALL (`SubWalkDriver` completed-result path). Replay would sample
+/// `effects_before` after the child's writes and misclassify the CALL as
+/// effect-free, then re-apply ancestor helper journals.
+#[test]
+fn nested_helper_trace_too_long_does_not_replay_the_parent_call() {
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let inline_byte = *insns_opname_to_byte()
+        .get("inline_call_ir_v/dIR")
+        .expect("`inline_call_ir_v/dIR` must be in insns table");
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let grandchild_code: &'static [u8] = Box::leak(Box::new([
+        int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, int_add, 0, 1, 2, void_ret,
+    ]));
+    // dIR descr 8: I-list(len=2, i0, i1) + R-list(len=1, r0)
+    let child_code: &'static [u8] = Box::leak(Box::new([
+        inline_byte,
+        0x08,
+        0x00,
+        0x02,
+        0x00,
+        0x01,
+        0x01,
+        0x00,
+        void_ret,
+    ]));
+    let grandchild_body = SubJitCodeBody {
+        code: grandchild_code,
+        num_regs_r: 1,
+        num_regs_i: 3,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+    };
+    let child_body = SubJitCodeBody {
+        code: child_code,
+        num_regs_r: 1,
+        num_regs_i: 3,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+    };
+    let lookup = {
+        let child_body = child_body.clone();
+        let grandchild_body = grandchild_body.clone();
+        move |idx: usize| match idx {
+            7 => Some(child_body.clone()),
+            8 => Some(grandchild_body.clone()),
+            _ => None,
+        }
+    };
+    let caller_code = [
+        inline_byte,
+        0x07,
+        0x00,
+        0x02,
+        0x00,
+        0x01,
+        0x01,
+        0x00,
+        void_ret,
+    ];
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let a = dummy_int_add_box(&mut tc);
+    let b = dummy_int_add_box(&mut tc);
+    let ops_at_entry = tc.num_recorded_ops();
+    let mut concrete_i = [
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+    ];
+    let regs_i = [a, b, a];
+    tc.set_trace_limit(ops_at_entry + 1);
+    assert!(
+        !tc.is_too_long(),
+        "the cut must belong to the nested helper"
+    );
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    descr_pool[7] = make_jitcode_descr(7);
+    descr_pool[8] = make_jitcode_descr(8);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let (_direct_before, replay_before) = super::subwalk_resume_counts();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_effects_at_entry: Some(fbw_executed_effect_count()),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(&caller_code, 0, &mut wc);
+    let (_direct_after, replay_after) = super::subwalk_resume_counts();
+    assert!(
+        matches!(result, Err(DispatchError::TraceTooLong { .. })),
+        "a nested helper too-long must stay TraceTooLong: {result:?}"
+    );
+    assert_eq!(
+        replay_after, replay_before,
+        "SubWalkDriver must not replay the parent CALL after a nested too-long"
+    );
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+}
+
+/// Finding 2: a helper JitCode is a real `MIFrame` identity. Filling its
+/// banks at a post-step pc is what `_copy_data_from_miframe` does for that
+/// frame; the blackhole then `setposition`s onto the helper body.
+#[test]
+fn helper_jitcode_fills_a_trace_too_long_miframe() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let code = vec![int_add, 0, 1, 2, void_ret];
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("helper_too_long_fill");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: code.clone(),
+        startpoints: Some([0_usize, 4].into_iter().collect()),
+        c_num_regs_i: 3,
+        c_num_regs_r: 1,
+        ..Default::default()
+    });
+    let jitcode = std::sync::Arc::new(runtime_jc);
+    // A null `code` key collides with a reserved build-time skeleton;
+    // `helper_jitcode_arc` then prefers `get_runtime_jitcode_by_index`
+    // and would fill the canonical portal instead of this helper.
+    let key = Box::leak(Box::new(0x6865_6c70_u64)) as *const u64 as *const ();
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = jitcode.clone();
+    let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*installed).index as usize };
+    assert!(
+        index >= crate::jitcode_runtime::jitcode_count(),
+        "test helper must sit above the build-time table, got {index}"
+    );
+    let resolved = super::residual_call::helper_jitcode_arc(index)
+        .expect("installed helper jitcode must resolve");
+    assert_eq!(resolved.name(), "helper_too_long_fill");
+    let mut tc = fresh_trace_ctx();
+    let a = dummy_int_add_box(&mut tc);
+    let b = dummy_int_add_box(&mut tc);
+    let regs_i = [a, b, a];
+    let mut concrete_i = [
+        ConcreteValue::Int(1),
+        ConcreteValue::Int(2),
+        ConcreteValue::Int(3),
+    ];
+    let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: Some(index),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let miframe = super::residual_call::build_trace_too_long_single_frame_miframe(&wc, jitcode, 4)
+        .expect("helper banks must fill at a post-step pc");
+    assert_eq!(miframe.pc, 4);
+    assert_eq!(miframe.jitcode.name(), "helper_too_long_fill");
+}
+
 #[test]
 fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     // codewriter shape contract says `R-list.len() <=
