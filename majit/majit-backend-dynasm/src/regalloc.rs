@@ -2460,7 +2460,6 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py perform_guard
-    #[allow(dead_code)] // x86/regalloc.py perform_guard
     fn perform_guard(
         &mut self,
         op: &Op,
@@ -2479,6 +2478,10 @@ impl<'a> RegAlloc<'a> {
             faillocs_len,
             output,
         );
+        // self.possibly_free_vars(guard_op.getfailargs())
+        if let Some(fail_args) = op.guard_fail_args() {
+            self._possibly_free_j2_vars(fail_args.iter().map(|a| a.to_opref()));
+        }
     }
 
     fn push_perform_guard(
@@ -2795,11 +2798,9 @@ impl<'a> RegAlloc<'a> {
                 self._possibly_free_j2_vars(std::iter::once(*arg));
                 (Some(*dst), Type::Int)
             }
+            // `perform_guard` already freed `getfailargs()`.
             LirOp::Guard { args, .. } => {
                 self._possibly_free_j2_vars(args.iter().copied());
-                if let Some(fa) = raw_op.guard_fail_args() {
-                    self._possibly_free_j2_vars(fa.iter().map(|a| a.to_opref()));
-                }
                 (None, raw_op.opcode.result_type())
             }
             LirOp::Load {
@@ -7873,6 +7874,51 @@ mod tests {
             has_move_from(&ra_ops, &expected_argloc),
             "generic j2 opcode dispatch should materialize the LIR arg, not the raw Op arg: {:?}",
             ra_ops
+        );
+    }
+
+    /// x86/regalloc.py `perform_guard` frees `getfailargs()` before
+    /// `walk_operations` reaches `possibly_free_vars_for_op(op)`, so a
+    /// failarg's register goes back to `free_regs` ahead of the guard
+    /// argument's, and the argument's register is picked first afterwards.
+    #[test]
+    fn guard_frees_failargs_before_args() {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let i2 = OpRef::int_op(0);
+        let i3 = OpRef::int_op(1);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(3));
+        let ops = rcs(vec![
+            make_op(OpCode::IntAdd, 0, &[i0, OpRef::const_int(1)]),
+            make_op(OpCode::IntAdd, 1, &[i1, OpRef::const_int(1)]),
+            make_guard(OpCode::GuardTrue, 2, &[i2], &[i3]),
+            finish,
+        ]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let output = ra.walk_operations().expect("walk_operations");
+        let (arg_loc, fail_loc) = output
+            .iter()
+            .find_map(|op| match op {
+                RegAllocOp::PerformGuard1 {
+                    loc,
+                    faillocs_start,
+                    faillocs_len,
+                    ..
+                } => Some((*loc, ra.faillocs(*faillocs_start, *faillocs_len)[0])),
+                _ => None,
+            })
+            .expect("GUARD_TRUE must be a PerformGuard1");
+        let (Loc::Reg(arg_reg), Some(Loc::Reg(fail_reg))) = (arg_loc, fail_loc) else {
+            panic!("both guard operands must be in registers: {arg_loc:?} {fail_loc:?}");
+        };
+        let pos = |r: RegLoc| ra.rm.free_regs.iter().position(|&f| f == r).unwrap();
+        assert!(
+            pos(fail_reg) < pos(arg_reg),
+            "failarg {fail_reg:?} must be freed before arg {arg_reg:?}: {:?}",
+            ra.rm.free_regs
         );
     }
 
