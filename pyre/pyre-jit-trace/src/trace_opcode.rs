@@ -1637,9 +1637,17 @@ impl MIFrame {
                     // An unmapped bridge inputarg the shadow no longer
                     // holds is not a merge-point loop inputarg. One the
                     // shadow still names is.
+                    //
+                    // Outside the loop-close window no walked register is
+                    // at hand, and `registers_r_bank[color]` for an unmapped
+                    // color is a leftover local, not the register. Empty
+                    // pcdep (skeleton fixtures) has no color map, so keep
+                    // the raw box there.
                     if let Some(walked) = walked {
                         walked
                     } else if !mapped && raw.is_input_arg() && !shadow_holds {
+                        ctx.const_ref(0)
+                    } else if !mapped && !pcdep_entries.is_empty() && !raw.is_input_arg() {
                         ctx.const_ref(0)
                     } else {
                         raw
@@ -3777,7 +3785,7 @@ mod tests {
     }
 
     #[test]
-    fn get_list_of_active_boxes_reads_an_unmapped_merge_point_color_from_the_walked_register() {
+    fn get_list_of_active_boxes_reads_an_unmapped_color_from_the_walked_register_or_nulls_it() {
         use indexmap::IndexMap;
         use majit_jitcode::liveness::encode_liveness;
         use std::sync::Arc;
@@ -3834,6 +3842,7 @@ mod tests {
             .replace(vec![OpRef::NONE, mapped, stale_slot]);
 
         let mut ctx = crate::trace_ctx_for_test(1);
+        let null_ref = ctx.const_ref(0);
         let mut frame = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
@@ -3855,6 +3864,12 @@ mod tests {
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false, None);
         assert_eq!(active, vec![mapped, walked_green]);
+
+        // Outside the loop-close window there is no walked register, and the
+        // unmapped color does not record the mirror's unrelated slot box.
+        frame.loop_close_registers_r = Vec::new();
+        let active = frame.get_list_of_active_boxes(&mut ctx, false, false, None);
+        assert_eq!(active, vec![mapped, null_ref]);
 
         unsafe {
             let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
