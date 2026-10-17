@@ -1344,7 +1344,7 @@ impl MIFrame {
                 self.materialize_fail_arg_slot(ctx, semantic_value, Type::Ref, semantic_idx);
             bank_materializations.push((bank, idx, bank_value));
         }
-        let (registers_i, registers_r_bank, registers_r_semantic, registers_f) = {
+        let (registers_i, registers_r_bank, _registers_r_semantic, registers_f) = {
             let s = self.sym();
             // Unified abstract register file view.
             // When a guard is being captured mid-opcode, read from
@@ -1616,7 +1616,19 @@ impl MIFrame {
                     // An unmapped bridge inputarg the shadow no longer
                     // holds is not a merge-point loop inputarg. One the
                     // shadow still names is.
+                    //
+                    // A drained jitcode's `-live-` marker is the union of
+                    // a PC range (`liveness.py`). An unmapped color at this
+                    // PC is dead here. The semantic `registers_r` mirror is
+                    // slot-indexed, so `registers_r[color]` is a leftover
+                    // local — a pre-cut `NEW_WITH_VTABLE` that
+                    // `virtualizable_boxes` already replaced. Naming it
+                    // past `reached_loop_header` fails `TraceIterator._get`
+                    // (`opencoder.py`). Empty pcdep (skeleton fixtures)
+                    // has no color map, so keep the raw box.
                     if !mapped && raw.is_input_arg() && !shadow_holds {
+                        ctx.const_ref(0)
+                    } else if !mapped && !pcdep_entries.is_empty() && !raw.is_input_arg() {
                         ctx.const_ref(0)
                     } else {
                         raw
@@ -3742,6 +3754,88 @@ mod tests {
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false, None);
         assert_eq!(active, vec![int_box, ref_box, float_box]);
+
+        unsafe {
+            let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
+        }
+    }
+
+    #[test]
+    fn get_list_of_active_boxes_nulls_unmapped_leftover_when_pcdep_is_present() {
+        use indexmap::IndexMap;
+        use majit_jitcode::liveness::encode_liveness;
+        use std::sync::Arc;
+
+        let mut all_liveness = vec![0, 2, 0];
+        all_liveness.extend(encode_liveness(&[1, 2]));
+        let mut insns: IndexMap<String, u8> = IndexMap::new();
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
+        crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
+
+        let runtime_jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new(
+                "get_list_of_active_boxes_unmapped_leftover_test",
+            );
+            inner.set_body(majit_jitcode::jitcode::JitCodeBody {
+                code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
+                c_num_regs_r: 3,
+                startpoints: Some([0_usize].into_iter().collect()),
+                ..Default::default()
+            });
+            inner
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.jitcode = Arc::new(runtime_jc);
+        pyjit.metadata.n_py_instrs = 1;
+        pyjit.metadata.block_head_py_by_jit_pc = vec![(0, 0)];
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0)];
+        pyjit.metadata.is_drained = true;
+        pyjit.metadata.has_color_map = true;
+        // Color 1 owns local slot 1; color 2 is union-liveness-only and
+        // has no slot at this PC (`semantic_ref_slot_for_reg_color`).
+        pyjit.metadata.pcdep_by_jit_pc.push((0, vec![(1, 1, 1)]));
+        pyjit.metadata.depth_pred_by_jit_pc.push((0, 0));
+        let inner_jc = crate::state::JitCode {
+            index: 0,
+            payload: Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+
+        let mapped = OpRef::ref_op(20);
+        let leftover = OpRef::ref_op(99);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = inner_jc_ptr;
+        sym.nlocals = 2;
+        sym.valuestackdepth = 2;
+        sym.execution_context = OpRef::input_arg_ref(0);
+        // Slot-indexed semantic mirror: index 2 coincides with live
+        // color 2, the leftover a pre-cut `NEW_WITH_VTABLE` would occupy
+        // after `put_back_list_of_boxes3` wrote only the mapped reds.
+        sym.registers_r.replace(vec![OpRef::NONE, mapped, leftover]);
+
+        let mut ctx = crate::trace_ctx_for_test(1);
+        let null_ref = ctx.const_ref(0);
+        let mut frame = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            residual_call_pc: None,
+            loop_close_marker_jit_pc: Some(0),
+            close_merge_point_vsd: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        };
+
+        let active = frame.get_list_of_active_boxes(&mut ctx, false, false, None);
+        assert_eq!(active, vec![mapped, null_ref]);
 
         unsafe {
             let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);

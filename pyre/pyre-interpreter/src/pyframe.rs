@@ -2166,21 +2166,13 @@ impl FrameBox {
         }
         // generator.py:22-23 stores the function's existing `_name` /
         // `_qualname` objects directly on the generator.
-        if name.is_some() {
-            unsafe {
-                pyre_object::generator::w_generator_set_name(
-                    generator,
-                    pyre_object::gc_roots::shadow_stack_get(name_slot),
-                )
-            };
+        let name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+        if !name.is_null() {
+            unsafe { pyre_object::generator::w_generator_set_name(generator, name) };
         }
-        if qualname.is_some() {
-            unsafe {
-                pyre_object::generator::w_generator_set_qualname(
-                    generator,
-                    pyre_object::gc_roots::shadow_stack_get(qualname_slot),
-                )
-            };
+        let qualname = pyre_object::gc_roots::shadow_stack_get(qualname_slot);
+        if !qualname.is_null() {
+            unsafe { pyre_object::generator::w_generator_set_qualname(generator, qualname) };
         }
         // pyframe.py `initialize_as_generator`: `self.f_generator_wref =
         // rweakref.ref(gen)`.  The WEAKREF allocation can move the generator

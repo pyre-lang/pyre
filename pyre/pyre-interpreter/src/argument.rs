@@ -236,12 +236,10 @@ fn find_duplicate_kwarg(
 pub fn do_combine_starstarargs_wrapped(
     keys_w: &[PyObjectRef],
     w_starstararg: PyObjectRef,
-    keyword_names_w: &mut [PyObjectRef],
-    keywords_w: &mut [PyObjectRef],
     existingkeywords_w: Option<&[PyObjectRef]>,
     is_dict: bool,
     w_function: PyObjectRef,
-) -> Result<(), crate::PyError> {
+) -> Result<(Vec<PyObjectRef>, Vec<PyObjectRef>), crate::PyError> {
     // argument.py `seen = {}` — Python dict with None values.  Map
     // to `HashMap<String, ()>` rather than `HashSet` so the shape
     // matches PyPy's `dict` (key membership tested via `in`, value slot
@@ -250,30 +248,29 @@ pub fn do_combine_starstarargs_wrapped(
         std::collections::HashMap::new();
     // The per-key value lookup below runs `__getitem__` (or the dict
     // descriptor, which hashes the key), so every turn is a collection point.
-    // The key list, the mapping, the callable, the names the caller already
-    // accepted and the pairs filled so far are native locals no root walker
-    // updates, so publish the whole set and read each one back on the turn
-    // that uses it.  The two output slices are written from the published
-    // pairs once the loop is done.
+    // `gctransform/framework.py push_roots` stores every live GCREF before
+    // that call; `pop_roots` / `expand_pop_roots` writes each one back.
+    // `argument.py _do_combine_starstarargs_wrapped` writes
+    // `keyword_names_w[i] = w_key` / `keywords_w[i] = w_value` into GC lists;
+    // those lists are the pair slots here. The native out-slices are built
+    // from the slots once the loop is done, so they are not live across
+    // `contains_w_names` / `getitem`.
     let _roots = pyre_object::gc_roots::push_roots();
     let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
-    let mut live = Vec::with_capacity(2 + existing_len + keys_w.len());
-    live.push(w_starstararg);
-    live.push(w_function);
-    if let Some(existing) = existingkeywords_w {
-        live.extend_from_slice(existing);
-    }
-    live.extend_from_slice(keys_w);
-    let root_base = pyre_object::gc_roots::pin_roots(&live);
-    let existing_base = root_base + 2;
-    let keys_base = existing_base + existing_len;
+    let n = keys_w.len();
+    let root_base = pyre_object::gc_roots::publish_roots(&[w_starstararg, w_function]);
+    let existing_base =
+        pyre_object::gc_roots::publish_roots(existingkeywords_w.unwrap_or_default());
+    let keys_base = pyre_object::gc_roots::publish_roots(keys_w);
     let pairs_base = pyre_object::gc_roots::shadow_stack_len();
-    for _ in 0..2 * keys_w.len() {
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+    for _ in 0..2 * n {
+        pyre_object::gc_roots::publish_roots(&[pyre_object::PY_NULL]);
     }
+    pyre_object::gc_roots::normalize_roots(root_base, 2 + existing_len + 3 * n);
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-    for i in 0..keys_w.len() {
+    let mut existing_now = vec![pyre_object::PY_NULL; existing_len];
+    for i in 0..n {
         let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py — `key = space.text_w(w_key)`; raise TypeError
         // if w_key is not a string.  `_PyStack_UnpackDict` reports this
@@ -292,9 +289,7 @@ pub fn do_combine_starstarargs_wrapped(
         // argument.py:439-445 — duplicate check against existing kwargs +
         // already-seen names in this iteration.
         let already_in_existing = existing_len != 0 && {
-            let existing_now: Vec<PyObjectRef> = (0..existing_len)
-                .map(|j| pyre_object::gc_roots::shadow_stack_get(existing_base + j))
-                .collect();
+            pyre_object::gc_roots::shadow_stack_copy_range(existing_base, &mut existing_now);
             contains_w_names(w_key, &existing_now)
         };
         if already_in_existing || seen.contains_key(&key) {
@@ -335,16 +330,19 @@ pub fn do_combine_starstarargs_wrapped(
             // argument.py:457 — `w_value = space.getitem(...)`.
             crate::baseobjspace::getitem(w_starstararg(), w_key)?
         };
+        // argument.py — `keywords_w[i] = w_value`.
         pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i + 1, w_value);
         // argument.py `seen[key] = None` — record key, value slot
         // is unread.
         seen.insert(key, ());
     }
-    for i in 0..keys_w.len() {
+    let mut keyword_names_w = vec![pyre_object::PY_NULL; n];
+    let mut keywords_w = vec![pyre_object::PY_NULL; n];
+    for i in 0..n {
         keyword_names_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
         keywords_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
     }
-    Ok(())
+    Ok((keyword_names_w, keywords_w))
 }
 
 /// pypy/interpreter/argument.py `_combine_starargs_wrapped`.
@@ -598,10 +596,6 @@ pub fn combine_starstarargs_wrapped(
         };
         crate::baseobjspace::unpackiterable(w_keys, -1)?
     };
-    // argument.py:140-141 — pre-allocate parallel name/value buffers.
-    let n = keys_w.len();
-    let mut keyword_names_w: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; n];
-    let mut keywords_w: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; n];
     // argument.py:142-144 — slow-path body fills name/value buffers,
     // checking for duplicates against keyword_names_out (existing).
     refresh_out(keyword_names_out, keywords_out);
@@ -610,15 +604,8 @@ pub fn combine_starstarargs_wrapped(
     } else {
         Some(keyword_names_out.as_slice())
     };
-    do_combine_starstarargs_wrapped(
-        &keys_w,
-        w_starstararg(),
-        &mut keyword_names_w,
-        &mut keywords_w,
-        existing,
-        is_dict,
-        w_function(),
-    )?;
+    let (keyword_names_w, keywords_w) =
+        do_combine_starstarargs_wrapped(&keys_w, w_starstararg(), existing, is_dict, w_function())?;
     // argument.py:145-150 — merge into the running output buffers.
     refresh_out(keyword_names_out, keywords_out);
     keyword_names_out.extend(keyword_names_w);

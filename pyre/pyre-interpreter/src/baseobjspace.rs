@@ -22798,27 +22798,31 @@ pub unsafe fn generator_invoke_execute_frame(
     }
     // The frame body returned. A jd2 walk that aborts after this must not
     // resume the generator again.
-    let mut note_gen = pyre_object::gc_roots::shadow_stack_get(gen_slot);
-    let (note_err, note_word) = match &mut raised {
-        Some(err) => {
-            // Materialize on `err` itself so the returned error and the
-            // note name one exception object.
+    // `raised` and `yielded` are mutually exclusive: `_invoke_execute_frame`
+    // re-raises or returns `w_result`. Consume them on separate arms so
+    // `to_exc_object` does not hold the other unrooted; pin the live handle
+    // / word and read it back (`gctransform/framework.py push_roots` /
+    // `pop_roots`).
+    let (note_err, note_word, result) = match (raised, yielded) {
+        (Some(mut err), _) => {
+            let slot = err.pin(&_roots);
             let obj = if err.exc_object.is_null() {
-                pyre_object::with_roots!(note_gen => err.to_exc_object())
+                err.to_exc_object()
             } else {
                 err.exc_object
             };
-            (true, obj as u64)
+            err.reload(&_roots, slot);
+            (true, obj as u64, Err(err))
         }
-        None => (false, yielded.unwrap_or(pyre_object::PY_NULL) as u64),
+        (None, y) => {
+            let word = y.unwrap_or(pyre_object::PY_NULL);
+            (false, word as u64, Ok(word))
+        }
     };
+    let note_gen = pyre_object::gc_roots::shadow_stack_get(gen_slot);
     crate::call::genentry_resume_note_finish(note_gen, note_err, note_word);
     crate::eval::frame_anchor_release(frame_depth);
-    if let Some(err) = raised {
-        Err(err)
-    } else {
-        Ok(yielded.unwrap_or(pyre_object::PY_NULL))
-    }
+    result
 }
 
 /// The `SApplicationException` arm of `generator.py` `w_arg_or_err`: the
