@@ -6911,14 +6911,14 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
-        green_key_values: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         self.bound_reached(
             green_key,
             green_key_raw,
-            green_key_values.map(|make_key| make_key()),
+            green_key_values,
             driver_descriptor.cloned(),
             live_values,
         )
@@ -6926,13 +6926,14 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Compatibility wrapper that performs both halves in one call.
     ///
-    /// `green_key_values` and `driver_descriptor` still arrive as a factory
-    /// and a borrow because only the `StartTracing` arm consumes them.
+    /// `green_key_values` and `driver_descriptor` still arrive as an owned
+    /// key and a borrow because only the `StartTracing` arm consumes them
+    /// (`JitCell(*greenargs)` store).
     pub fn on_back_edge_typed(
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
-        green_key_values: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
@@ -15643,15 +15644,16 @@ impl<M: Clone> MetaInterp<M> {
     /// wants the metadata's VALUE, so testing its presence separately would
     /// probe the same map twice for one entry.
     ///
-    /// `make_green_key` is consulted only on an ambiguous bucket, and a caller
-    /// that holds no structured key passes `None` — see
-    /// [`Self::resolve_cell_key`], whose key this reports.
+    /// `greenargs` is `*greenargs` already in hand
+    /// (`JitCell.comparekey(*greenargs2)`). A caller that holds no structured
+    /// greens passes `None` — see [`Self::resolve_cell_key`], whose key this
+    /// reports. Comparison never builds a `GreenKey`.
     pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
-        make_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
     ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
-        self.resolved_entry_procedure_token_on_driver(0, green_key_hash, make_green_key)
+        self.resolved_entry_procedure_token_on_driver(0, green_key_hash, greenargs)
     }
 
     /// `warmstate.py maybe_compile_and_run` token read on that driver's
@@ -15663,12 +15665,12 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         jd_no: usize,
         green_key_hash: u64,
-        make_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
     ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
         let Some(warm) = self.warm_state_ref_for_driver(jd_no) else {
             return (green_key_hash, None);
         };
-        let (cell_key, token) = warm.resolved_cell_procedure_token(green_key_hash, make_green_key);
+        let (cell_key, token) = warm.resolved_cell_procedure_token(green_key_hash, greenargs);
         (cell_key, token.filter(|token| token.has_compiled_code()))
     }
 

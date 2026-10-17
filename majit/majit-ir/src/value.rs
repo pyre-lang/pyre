@@ -1555,6 +1555,18 @@ impl GreenKey {
         GreenKey { values, types }
     }
 
+    /// Owned key from greens already in hand.
+    ///
+    /// `JitCell(*greenargs)` stores this; `comparekey` compares the slices
+    /// without building it. Inline while `values.len() <= GREEN_INLINE`.
+    pub fn from_greenargs(values: &[i64], types: &[GreenType]) -> Self {
+        debug_assert_eq!(values.len(), types.len());
+        GreenKey {
+            values: SmallVec::from_slice(values),
+            types: SmallVec::from_slice(types),
+        }
+    }
+
     /// Single Int green key.
     pub fn single(value: i64) -> Self {
         let mut values = SmallVec::new();
@@ -2059,6 +2071,7 @@ mod tests {
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
         assert_eq!(k1.hash_u64(), k2.hash_u64());
+        assert_eq!(k1, GreenKey::from_greenargs(&k1.values, &k1.types));
     }
 
     #[test]

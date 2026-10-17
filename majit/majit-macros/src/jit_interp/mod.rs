@@ -3195,10 +3195,11 @@ fn emit_portal_runner(
             // `execute_assembler`'s DoneWithThisFrame fast path return without
             // entering the portal body.
             {
-                let (__green_hash, __make_key) = #key;
+                let (__green_hash, __green_values, __green_types) = #key;
                 match #driver.function_entry_runner(
                     __green_hash,
-                    __make_key,
+                    &__green_values,
+                    &__green_types,
                     #pc,
                     &mut #state,
                     #env,
@@ -3831,8 +3832,8 @@ fn rewrite_body(
                 .collect();
             // Each green's `(i64, GreenType)` pair is bound to a local
             // ONCE — the green expressions must not be re-evaluated, so
-            // the deferred key builder below closes over these `Copy`
-            // locals rather than over the expressions.
+            // the stack arrays below close over these `Copy` locals
+            // rather than over the expressions.
             //
             // The slots ARE the declared greens (`pyjitpl.py`
             // `original_boxes[:num_green_args]` / `warmstate.py`
@@ -3865,20 +3866,20 @@ fn rewrite_body(
                 .collect();
             let values: Vec<TokenStream> = slots.iter().map(|slot| quote! { #slot.0 }).collect();
             let types: Vec<TokenStream> = slots.iter().map(|slot| quote! { #slot.1 }).collect();
-            // `(hash, make_key)`: the hash is needed on every back edge, the
-            // typed key only where a cell is installed.
+            let n = slots.len();
+            // `(hash, values, types)`: `JitCell.get_uhash(*greenargs)` on
+            // every back edge, `JitCell.comparekey(*greenargs2)` against
+            // these stack arrays. An owned `GreenKey` is built from the
+            // same arrays only where a cell is installed
+            // (`JitCell(*greenargs)` / `GreenKey::from_greenargs`).
             Some(quote! {
                 {
                     #(#bind)*
                     let mut __green_hash: u64 = majit_ir::GREEN_UHASH_SEED;
                     #(#fold)*
-                    (
-                        __green_hash,
-                        move || majit_ir::GreenKey::with_types(
-                            ::std::vec![#(#values),*],
-                            ::std::vec![#(#types),*],
-                        ),
-                    )
+                    let __green_values: [i64; #n] = [#(#values),*];
+                    let __green_types: [majit_ir::GreenType; #n] = [#(#types),*];
+                    (__green_hash, __green_values, __green_types)
                 }
             })
         }
@@ -4364,8 +4365,8 @@ fn rewrite_body(
                             {
                                 quote! {
                                     {
-                                        let (__green_hash, __green_key) = #green_key;
-                                        #driver_expr.back_edge_structured(__green_hash, __green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr)
+                                        let (__green_hash, __green_values, __green_types) = #green_key;
+                                        #driver_expr.back_edge_structured(__green_hash, &__green_values, &__green_types, #target_expr, #state_expr, #env_expr, #pre_run_expr)
                                     }
                                 }
                             } else {
@@ -4543,10 +4544,11 @@ fn rewrite_body(
                 if insert_entry_door {
                     quote! {
                         {
-                            let (__green_hash, __make_key) = #key;
+                            let (__green_hash, __green_values, __green_types) = #key;
                             let __run_dispatch = match #driver.function_entry_structured(
                                 __green_hash,
-                                __make_key,
+                                &__green_values,
+                                &__green_types,
                                 #pc,
                                 &mut #state,
                                 #env,

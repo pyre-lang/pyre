@@ -5804,20 +5804,17 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
-    /// Takes the green key's hash eagerly and the key itself lazily.
+    /// Takes the green key's hash and the greens already in hand.
     ///
     /// Only the hash is needed unconditionally — it selects the cell and
-    /// answers `has_compiled_loop`. The typed [`GreenKey`] is read only by the
-    /// cell-resolution/decision path and, on a tracing start, by the tracing
-    /// commit. Both are reached only after `back_edge_internal`'s early returns
-    /// (already tracing, `!can_trace`, cross-loop-cut decline, and the whole
-    /// `has_compiled_loop` branch — i.e. every entry into compiled code).
-    /// Building it eagerly spent the key's `values` / `types` vectors on those
-    /// paths and dropped them unread.
+    /// answers `has_compiled_loop`. Comparison is
+    /// `JitCell.comparekey(*greenargs2)` against these slices, so a compiled
+    /// back edge never builds a [`GreenKey`]. An owned key is built from the
+    /// same slices only when a cell is installed (`JitCell(*greenargs)`).
     ///
     /// This is upstream's split: `get_uhash(*greenargs)` hashes the greens in
     /// place on every back edge, and the greens are stored on the cell only
-    /// when one is installed (warmstate.py).
+    /// when one is installed (`warmstate.py`).
     ///
     /// Not `#[cold]`: this is the interpreter's per-iteration door, and the
     /// empty-chain arm (`warmstate.py`) is the common path. The
@@ -5827,20 +5824,22 @@ impl<S: JitState> JitDriver<S> {
     pub fn back_edge_structured(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
+        let greenargs = Some((green_values, green_types));
         if let Some(handled) =
-            self.try_empty_chain_tick(green_key_hash, Some(&make_green_key), target_pc, state, env)
+            self.try_empty_chain_tick(green_key_hash, greenargs, target_pc, state, env)
         {
             return handled.map(continue_at_pc);
         }
         self.back_edge_internal(
             green_key_hash,
-            Some(&make_green_key),
+            greenargs,
             None,
             target_pc,
             state,
@@ -6022,7 +6021,8 @@ impl<S: JitState> JitDriver<S> {
         Ok(self
             .back_edge_structured(
                 green_key.hash_u64(),
-                || green_key.clone(),
+                &green_key.values,
+                &green_key.types,
                 target_pc,
                 state,
                 env,
@@ -6739,7 +6739,7 @@ impl<S: JitState> JitDriver<S> {
     fn try_empty_chain_tick(
         &mut self,
         green_key_hash: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -6797,13 +6797,7 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .warm_state_for_driver(jd_no)
             .tick_empty_chain(green_key_hash)
-            && self.commit_start_tracing(
-                green_key_hash,
-                structured_green_key,
-                target_pc,
-                state,
-                env,
-            )
+            && self.commit_start_tracing(green_key_hash, greenargs, target_pc, state, env)
         {
             return Some(Some(target_pc));
         }
@@ -6824,7 +6818,7 @@ impl<S: JitState> JitDriver<S> {
     fn back_edge_internal(
         &mut self,
         green_key_hash: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         carried_procedure_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
         target_pc: usize,
         state: &mut S,
@@ -6842,9 +6836,9 @@ impl<S: JitState> JitDriver<S> {
         // `compiled_loops` meta the runner executes, the invalidation on a
         // shape mismatch and the front-target tables all read through this one
         // number, so they cannot name different cells the way a bucket hash
-        // let them (`warmstate.py:458-464` resolves once and :483/:511 carries
-        // the resolved token onward for the same reason). Identity for every
-        // unchained bucket, so the collision-free path is unchanged.
+        // let them (`warmstate.py maybe_compile_and_run` resolves once and
+        // carries the resolved token onward for the same reason). Identity for
+        // every unchained bucket, so the collision-free path is unchanged.
         //
         // A caller arriving with `carried_procedure_token` has already done
         // this step and read its token from the result, so `green_key_hash` is
@@ -6871,7 +6865,7 @@ impl<S: JitState> JitDriver<S> {
         // run (`maybe_compile_and_run`). Carry the upgraded Arc the same way.
         let (green_key, entry_procedure_token) = match carried_procedure_token {
             Some(token) => (green_key_hash, Some(token)),
-            None => self.resolved_entry_procedure_token(green_key_hash, structured_green_key),
+            None => self.resolved_entry_procedure_token(green_key_hash, greenargs),
         };
         // Single-pass label handoff must stay ahead of the counter so a
         // CloseLoop arm's pending LABEL entry is consumed on the next back
@@ -7344,7 +7338,7 @@ impl<S: JitState> JitDriver<S> {
         // Occupied bucket, no enterable token: the typed comparekey walk
         // (`on_back_edge_typed_decision`) ticks the cell the greens own.
         // Frontend snapshot work stays behind `StartTracing`.
-        if self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env) {
+        if self.maybe_start_tracing(green_key, greenargs, target_pc, state, env) {
             return Some(continue_at_pc(target_pc));
         }
         None
@@ -8355,7 +8349,7 @@ impl<S: JitState> JitDriver<S> {
     fn back_edge_or_run_compiled_internal(
         &mut self,
         green_key: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -8365,7 +8359,7 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
         if let Some(handled) =
-            self.try_empty_chain_tick(green_key, structured_green_key, target_pc, state, env)
+            self.try_empty_chain_tick(green_key, greenargs, target_pc, state, env)
         {
             let _ = handled;
             return None;
@@ -8396,7 +8390,7 @@ impl<S: JitState> JitDriver<S> {
             ));
         }
 
-        self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
+        self.maybe_start_tracing(green_key, greenargs, target_pc, state, env);
         None
     }
 
@@ -8527,7 +8521,7 @@ impl<S: JitState> JitDriver<S> {
     fn maybe_start_tracing(
         &mut self,
         green_key: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -8542,7 +8536,7 @@ impl<S: JitState> JitDriver<S> {
             (state.code_ptr(), target_pc),
         ) {
             HotResult::StartTracing => {
-                self.commit_start_tracing(green_key, structured_green_key, target_pc, state, env)
+                self.commit_start_tracing(green_key, greenargs, target_pc, state, env)
             }
             _ => false,
         }
@@ -8605,12 +8599,19 @@ impl<S: JitState> JitDriver<S> {
     pub fn commit_back_edge_trace(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
     ) -> bool {
-        self.commit_start_tracing(green_key_hash, Some(&make_green_key), target_pc, state, env)
+        self.commit_start_tracing(
+            green_key_hash,
+            Some((green_values, green_types)),
+            target_pc,
+            state,
+            env,
+        )
     }
 
     /// `warmstate.py bound_reached`: the tick has already fired, so build
@@ -8622,7 +8623,7 @@ impl<S: JitState> JitDriver<S> {
     fn commit_start_tracing(
         &mut self,
         green_key: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -8691,9 +8692,8 @@ impl<S: JitState> JitDriver<S> {
             (state.code_ptr(), target_pc),
             // Neither the typed key nor the descriptor is built before the
             // counter decision. Both are consumed only while committing its
-            // `StartTracing` answer, so the factory and a borrow avoid a deep
-            // clone until this cold arm.
-            structured_green_key,
+            // `StartTracing` answer (`JitCell(*greenargs)` store).
+            greenargs.map(|(values, types)| GreenKey::from_greenargs(values, types)),
             descriptor.as_deref(),
             &live_values,
         ) {
@@ -9872,16 +9872,21 @@ impl<S: JitState> JitDriver<S> {
     /// travels back so the caller can take it: a door that goes on to run needs
     /// that map's VALUE, so a presence test here would probe it twice for one
     /// entry, and a door that declines is answered by the walk alone.
+    ///
+    /// `greenargs` is `*greenargs` already in hand
+    /// (`JitCell.comparekey(*greenargs2)`). Comparison never builds a
+    /// `GreenKey`. A unique-hash occupant is still accepted only after
+    /// `comparekey` matches.
     #[inline]
     pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
-        make_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
     ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
         self.meta.resolved_entry_procedure_token_on_driver(
             self.index().unwrap_or(0),
             green_key_hash,
-            make_green_key,
+            greenargs,
         )
     }
 
@@ -10016,12 +10021,20 @@ impl<S: JitState> JitDriver<S> {
     pub fn function_entry_structured(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
     ) -> Option<usize> {
-        match self.function_entry_runner(green_key_hash, make_green_key, target_pc, state, env) {
+        match self.function_entry_runner(
+            green_key_hash,
+            green_values,
+            green_types,
+            target_pc,
+            state,
+            env,
+        ) {
             FunctionEntryRunner::Finished(value) => {
                 self.meta.back_edge_finish_word = Some(value);
                 Some(target_pc)
@@ -10044,7 +10057,8 @@ impl<S: JitState> JitDriver<S> {
     pub fn function_entry_runner(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -10081,7 +10095,8 @@ impl<S: JitState> JitDriver<S> {
             SteadyCompiledEntry::NeedsInternal => {
                 return map_runner_resume(self.function_entry_internal(
                     green_key_hash,
-                    make_green_key,
+                    green_values,
+                    green_types,
                     target_pc,
                     state,
                     env,
@@ -10092,7 +10107,8 @@ impl<S: JitState> JitDriver<S> {
         }
         if let Some(handled) = self.try_function_entry_cold_tick(
             green_key_hash,
-            &make_green_key,
+            green_values,
+            green_types,
             target_pc,
             state,
             env,
@@ -10101,7 +10117,8 @@ impl<S: JitState> JitDriver<S> {
         }
         map_runner_resume(self.function_entry_internal(
             green_key_hash,
-            make_green_key,
+            green_values,
+            green_types,
             target_pc,
             state,
             env,
@@ -10506,7 +10523,8 @@ impl<S: JitState> JitDriver<S> {
     fn try_function_entry_cold_tick(
         &mut self,
         green_key_hash: u64,
-        make_green_key: &impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -10558,7 +10576,8 @@ impl<S: JitState> JitDriver<S> {
         {
             return Some(self.function_entry_internal(
                 green_key_hash,
-                make_green_key,
+                green_values,
+                green_types,
                 target_pc,
                 state,
                 env,
@@ -10579,13 +10598,16 @@ impl<S: JitState> JitDriver<S> {
     fn function_entry_internal(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         already_ticked: bool,
     ) -> Option<usize> {
-        let cell_key = self.resolve_cell_key(green_key_hash, make_green_key);
+        let cell_key = self.resolve_cell_key(green_key_hash, || {
+            GreenKey::from_greenargs(green_values, green_types)
+        });
         let step = if already_ticked {
             FunctionEntryStep::Proceed
         } else {
@@ -12353,14 +12375,10 @@ mod tests {
             .set_confirm_enter_jit(Some(refuse));
         let mut pre_ran = false;
 
-        let outcome = driver.back_edge_structured(
-            hash,
-            || key.clone(),
-            19,
-            &mut state,
-            &(),
-            || pre_ran = true,
-        );
+        let outcome =
+            driver.back_edge_structured(hash, &key.values, &key.types, 19, &mut state, &(), || {
+                pre_ran = true
+            });
 
         assert_eq!(outcome, None);
         assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -12395,14 +12413,10 @@ mod tests {
             .set_confirm_enter_jit(Some(allow));
         let mut pre_ran = false;
 
-        let outcome = driver.back_edge_structured(
-            hash,
-            || key.clone(),
-            19,
-            &mut state,
-            &(),
-            || pre_ran = true,
-        );
+        let outcome =
+            driver.back_edge_structured(hash, &key.values, &key.types, 19, &mut state, &(), || {
+                pre_ran = true
+            });
 
         assert!(outcome.is_some(), "the permissive door executes the loop");
         assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -12730,7 +12744,8 @@ mod tests {
             .warm_state_for_driver(0)
             .set_function_threshold(2);
         let hash = 0xA11u64;
-        let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
+        let values = [hash as i64];
+        let types = [GreenType::Int];
         let mut state = CountingDoorState {
             build_meta_calls: std::cell::Cell::new(0),
             extract_live_values_calls: std::cell::Cell::new(0),
@@ -12738,7 +12753,7 @@ mod tests {
         };
         assert!(
             driver
-                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -12747,7 +12762,7 @@ mod tests {
         );
         assert!(
             driver
-                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -13519,7 +13534,8 @@ mod tests {
             .warm_state_for_driver(0)
             .set_function_threshold(1);
         let hash = 0xB0Du64;
-        let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
+        let values = [hash as i64];
+        let types = [GreenType::Int];
         let mut state = CountingDoorState {
             build_meta_calls: std::cell::Cell::new(0),
             extract_live_values_calls: std::cell::Cell::new(0),
@@ -13528,7 +13544,7 @@ mod tests {
         driver.suppress_function_entry();
         assert!(
             driver
-                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -13537,7 +13553,7 @@ mod tests {
         );
         assert!(
             driver
-                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
                 .is_none()
         );
         assert!(
