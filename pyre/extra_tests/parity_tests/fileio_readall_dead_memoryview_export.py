@@ -1,16 +1,13 @@
 # CPython-suite gap: test_io.PyTextIOWrapperTest.test_seek_and_tell
 # parity-tests reason: `_pyio.FileIO.readall` resizes a bytearray after
-# `os.readinto(fd, memoryview(result)[n:])`; an unreachable memoryview must
-# not keep the bytearray export and raise BufferError.
+# `os.readinto` into a slice of it; the temporary memoryview is released
+# before that resize so the export cannot raise BufferError.
 
-"""A dead memoryview export must not block FileIO.readall's trailing resize.
+"""FileIO.readall must release its temporary memoryview before resize.
 
-`_pyio.FileIO.readall` builds a temporary `memoryview(result)[bytes_read:]`
-for each `os.readinto`, then `result.resize(bytes_read)`.  The view and
-its owning parent are unreachable before the resize.  A GC that still
-traces the parent from a popped operand slot on an inlined or
-CALL_ASSEMBLER frame keeps `bytearray._exports` raised and the resize
-raises BufferError.
+`_pyio.FileIO.readall` reads into a slice of `result`, then
+`result.resize(bytes_read)`.  The view is released before the resize so
+`bytearray._exports` is not still raised.
 """
 
 import codecs
