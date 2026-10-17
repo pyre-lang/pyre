@@ -1185,25 +1185,36 @@ fn int_truediv_ovf2long(va: i64, vb: i64) -> PyResult {
 unsafe fn long_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // `fromint` of a machine-int operand collects before the other operand
     // is read. `descr_truediv` keeps both live (`gct_direct_call` /
-    // `get_livevars_for_roots`).
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let a = || pyre_object::gc_roots::shadow_stack_get(base);
-    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-    if !is_long(b()) && as_float(b()) == 0.0 {
+    // `get_livevars_for_roots`). Each read is `_scope.get` in this function:
+    // a `|| shadow_stack_get` closure has no lifted counterpart (`with_roots!`),
+    // so the walk would residualise `root_scope_close` and abort
+    // `ResidualCallArgUnbound`.
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = _scope.pin_roots(&[a, b]);
+    if !is_long(_scope.get(base + 1)) && as_float(_scope.get(base + 1)) == 0.0 {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    let va = if is_long(a()) {
-        live_long_num(a())
+    let va = if is_long(_scope.get(base)) {
+        live_long_num(_scope.get(base))
     } else {
-        RBigIntGcRoot::new(BigInt::from(int_value(a())))
+        RBigIntGcRoot::new(BigInt::from(int_value(_scope.get(base))))
     };
-    let vb = if is_long(b()) {
-        live_long_num(b())
+    let vb = if is_long(_scope.get(base + 1)) {
+        live_long_num(_scope.get(base + 1))
     } else {
-        RBigIntGcRoot::new(BigInt::from(int_value(b())))
+        RBigIntGcRoot::new(BigInt::from(int_value(_scope.get(base + 1))))
     };
-    Ok(w_float_new(bigint_truediv(&va, &vb)?))
+    // `W_AbstractLongObject._truediv` `space.newfloat(f)`. The constructor
+    // lives here so `fuse_boxing_alloc` rewrites `malloc_typed_managed` to
+    // `new_with_vtable` + `setfield_gc_f` (`_truediv`, `newfloat`).
+    let value = bigint_truediv(&va, &vb)?;
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: value,
+    }) as PyObjectRef)
 }
 
 unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1834,6 +1845,36 @@ unsafe fn float_operands(a: PyObjectRef, b: PyObjectRef) -> Result<(f64, f64), P
     Ok((va, vb))
 }
 
+/// Both operands of a complex operator as doubles (`complexobject.py`
+/// `descr_add` / `descr_sub` / `descr_mul` / `descr_truediv` / `descr_pow`
+/// after converting each side).
+///
+/// A long operand's conversion allocates (`rbigint.tofloat`), so both
+/// operands stay on the shadow stack and are read back after each
+/// conversion — the same bracket as [`float_operands`].  Each read is
+/// `roots.get` in this function: a `|| shadow_stack_get` closure has no
+/// lifted counterpart (`with_roots!`).
+unsafe fn complex_operands(
+    a: PyObjectRef,
+    b: PyObjectRef,
+) -> Result<((f64, f64, bool), (f64, f64, bool)), PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(a);
+    let _ = roots.pin_root(b);
+    let (ar, ai) = complex_val(roots.get(base)).unwrap();
+    let a_overflows = is_long(roots.get(base)) && !ar.is_finite();
+    let a_complex = is_complex(roots.get(base));
+    let (br, bi) = complex_val(roots.get(base + 1)).unwrap();
+    let b_overflows = is_long(roots.get(base + 1)) && !br.is_finite();
+    let b_complex = is_complex(roots.get(base + 1));
+    drop(roots);
+    if a_overflows || b_overflows {
+        return Err(PyError::overflow_error("int too large to convert to float"));
+    }
+    Ok(((ar, ai, a_complex), (br, bi, b_complex)))
+}
+
 /// A `float`/`complex` power coerces each `int` operand to a double before the
 /// power is computed, so an over-range `int` (base or exponent) raises
 /// OverflowError up front — even for `1.0 ** huge`, which never reaches the
@@ -2071,25 +2112,25 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // Building either `rbigint` allocates a digit block (`fromint` ->
     // `RBigInt::new` -> `Digits::new`), so it collects before the other operand
     // is read.  Both operands stay on the shadow stack for the whole body and
-    // every read comes back out of its slot.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let a = || pyre_object::gc_roots::shadow_stack_get(base);
-    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let vb = RBigIntGcRoot::new(if is_long(b()) {
-        w_long_get_value(b()).translated_alias()
+    // every read comes back out of its slot. Gets stay in this function: a
+    // `|| shadow_stack_get` closure has no lifted counterpart (`with_roots!`).
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = _scope.pin_roots(&[a, b]);
+    let vb = RBigIntGcRoot::new(if is_long(_scope.get(base + 1)) {
+        w_long_get_value(_scope.get(base + 1)).translated_alias()
     } else {
-        BigInt::from(int_value(b()))
+        BigInt::from(int_value(_scope.get(base + 1)))
     });
     if vb.get_sign() < 0 {
         // longobject.py calls descr_float on both integer operands
         // before float pow.  RBigInt::tofloat raises on an out-of-range value;
         // do not silently pass the infinity sentinel from as_float onward.
-        reject_pow_operand_overflow(a())?;
-        reject_pow_operand_overflow(b())?;
-        let fa = as_float(a());
-        let fb = as_float(b());
-        return Ok(w_float_new(float_pow_raw(fa, fb)?));
+        reject_pow_operand_overflow(_scope.get(base))?;
+        reject_pow_operand_overflow(_scope.get(base + 1))?;
+        let fa = as_float(_scope.get(base));
+        let fb = as_float(_scope.get(base + 1));
+        // `descr_pow` then `space.newfloat`; [`float_pow_impl`] is that box.
+        return float_pow_impl(fa, fb);
     }
     // longobject.py: `if not exp_bigint: return int_pow(0)` → 1. `descr_pow`
     // wraps every branch as `W_LongObject`, so a long base keeps the long
@@ -2098,16 +2139,16 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_long_new(BigInt::from(1)));
     }
     // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
-    let va = RBigIntGcRoot::new(if is_long(a()) {
-        w_long_get_value(a()).translated_alias()
+    let va = RBigIntGcRoot::new(if is_long(_scope.get(base)) {
+        w_long_get_value(_scope.get(base)).translated_alias()
     } else {
-        BigInt::from(int_value(a()))
+        BigInt::from(int_value(_scope.get(base)))
     });
     // Both rbigint.int_pow(1) and rbigint.pow(ONERBIGINT) return the base
     // reference after the zero-base check. W_LongObject adds only a wrapper.
-    if is_long(a()) && va.get_sign() != 0 && vb.int_eq(1) {
+    if is_long(_scope.get(base)) && va.get_sign() != 0 && vb.int_eq(1) {
         return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(a()),
+            w_long_get_raw_value(_scope.get(base)),
         ));
     }
     if va.get_sign() == 0 {
@@ -2123,8 +2164,11 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // longobject.py: `descr_pow` keeps a `W_IntObject` exponent
     // unwrapped (`exp_bigint` stays None) and calls `rbigint.int_pow`; only a
     // long exponent reaches `rbigint.pow`.
-    if is_int_like(b()) {
-        return Ok(w_long_new(bigint_int_pow_nomod(&va, int_value(b()))?));
+    if is_int_like(_scope.get(base + 1)) {
+        return Ok(w_long_new(bigint_int_pow_nomod(
+            &va,
+            int_value(_scope.get(base + 1)),
+        )?));
     }
     Ok(w_long_new(bigint_pow_nomod(&va, &vb)?))
 }
@@ -3438,21 +3482,14 @@ unsafe fn is_complex_operand(obj: PyObjectRef) -> bool {
 }
 
 unsafe fn complex_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let a = || pyre_object::gc_roots::shadow_stack_get(base);
-    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let (ar, ai) = complex_val(a()).unwrap();
-    let (br, bi) = complex_val(b()).unwrap();
-    reject_float_coercion_overflow(a(), ar)?;
-    reject_float_coercion_overflow(b(), br)?;
-    // CPython 3.14 complexobject.c COMPLEX_BINOP(add, sum): mixed real /
-    // complex addition uses _Py_cr_sum / _Py_rc_sum and leaves the complex
-    // imaginary lane untouched.  Besides matching C11 Annex G mixed-mode
-    // arithmetic, this preserves the sign of an imaginary zero.
-    if is_complex(a()) && is_complex(b()) {
+    let ((ar, ai, a_complex), (br, bi, b_complex)) = complex_operands(a, b)?;
+    // COMPLEX_BINOP(add, sum): mixed real / complex addition uses
+    // `_Py_cr_sum` / `_Py_rc_sum` and leaves the complex imaginary lane
+    // untouched.  Besides matching C11 Annex G mixed-mode arithmetic, this
+    // preserves the sign of an imaginary zero.
+    if a_complex && b_complex {
         Ok(w_complex_new(ar + br, ai + bi))
-    } else if is_complex(a()) {
+    } else if a_complex {
         Ok(w_complex_new(ar + br, ai))
     } else {
         Ok(w_complex_new(ar + br, bi))
@@ -3460,20 +3497,13 @@ unsafe fn complex_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn complex_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let a = || pyre_object::gc_roots::shadow_stack_get(base);
-    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let (ar, ai) = complex_val(a()).unwrap();
-    let (br, bi) = complex_val(b()).unwrap();
-    reject_float_coercion_overflow(a(), ar)?;
-    reject_float_coercion_overflow(b(), br)?;
-    // CPython 3.14 _Py_c_diff / _Py_cr_diff / _Py_rc_diff.  In the mixed
-    // cases only the real lane is combined; real-complex negates the complex
+    let ((ar, ai, a_complex), (br, bi, b_complex)) = complex_operands(a, b)?;
+    // `_Py_c_diff` / `_Py_cr_diff` / `_Py_rc_diff`.  In the mixed cases
+    // only the real lane is combined; real-complex negates the complex
     // imaginary lane directly instead of subtracting it from +0.0.
-    if is_complex(a()) && is_complex(b()) {
+    if a_complex && b_complex {
         Ok(w_complex_new(ar - br, ai - bi))
-    } else if is_complex(a()) {
+    } else if a_complex {
         Ok(w_complex_new(ar - br, ai))
     } else {
         Ok(w_complex_new(ar - br, -bi))
@@ -3481,22 +3511,15 @@ unsafe fn complex_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn complex_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let a = || pyre_object::gc_roots::shadow_stack_get(base);
-    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let (ar, ai) = complex_val(a()).unwrap();
-    let (br, bi) = complex_val(b()).unwrap();
-    reject_float_coercion_overflow(a(), ar)?;
-    reject_float_coercion_overflow(b(), br)?;
-    if is_complex(a()) && is_complex(b()) {
+    let ((ar, ai, a_complex), (br, bi, b_complex)) = complex_operands(a, b)?;
+    if a_complex && b_complex {
         Ok(complex_prod(ar, ai, br, bi))
-    } else if is_complex(a()) {
-        // CPython 3.14 _Py_cr_prod: multiply each existing complex lane by
-        // the real operand, without manufacturing a zero imaginary lane.
+    } else if a_complex {
+        // `_Py_cr_prod`: multiply each existing complex lane by the real
+        // operand, without manufacturing a zero imaginary lane.
         Ok(w_complex_new(ar * br, ai * br))
     } else {
-        // _Py_rc_prod(a, b) delegates to _Py_cr_prod(b, a).
+        // `_Py_rc_prod(a, b)` delegates to `_Py_cr_prod(b, a)`.
         Ok(w_complex_new(br * ar, bi * ar))
     }
 }
@@ -3639,29 +3662,21 @@ unsafe fn real_complex_quot(a: f64, br: f64, bi: f64) -> PyObjectRef {
 }
 
 unsafe fn complex_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let a = || pyre_object::gc_roots::shadow_stack_get(base);
-    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let (ar, ai) = complex_val(a()).unwrap();
-    let (br, bi) = complex_val(b()).unwrap();
-    reject_float_coercion_overflow(a(), ar)?;
-    reject_float_coercion_overflow(b(), br)?;
+    let ((ar, ai, a_complex), (br, bi, b_complex)) = complex_operands(a, b)?;
     if br == 0.0 && bi == 0.0 {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    if is_complex(a()) && is_complex(b()) {
+    if a_complex && b_complex {
         Ok(complex_quot(ar, ai, br, bi))
-    } else if is_complex(a()) {
-        // CPython 3.14 _Py_cr_quot.
+    } else if a_complex {
+        // `_Py_cr_quot`.
         Ok(w_complex_new(ar / br, ai / br))
     } else {
         Ok(real_complex_quot(ar, br, bi))
     }
 }
 
-unsafe fn complex_powi(a: PyObjectRef, exponent: i64) -> PyResult {
-    let (mut base_real, mut base_imag) = complex_val(a).unwrap();
+unsafe fn complex_powi(mut base_real: f64, mut base_imag: f64, exponent: i64) -> PyResult {
     let mut result_real = 1.0;
     let mut result_imag = 0.0;
     let mut n = exponent.unsigned_abs();
@@ -3698,14 +3713,9 @@ unsafe fn complex_powi(a: PyObjectRef, exponent: i64) -> PyResult {
     }
 }
 
-/// `complexobject.c _Py_c_pow`.
+/// `_Py_c_pow`.
 unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let a = || pyre_object::gc_roots::shadow_stack_get(base);
-    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let (ar, ai) = complex_val(a()).unwrap();
-    let (br, bi) = complex_val(b()).unwrap();
+    let ((ar, ai, _), (br, bi, _)) = complex_operands(a, b)?;
     let (real, imag) = if br == 0.0 && bi == 0.0 {
         (1.0, 0.0)
     } else if ar == 0.0 && ai == 0.0 {
@@ -3716,7 +3726,7 @@ unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         (0.0, 0.0)
     } else if bi == 0.0 && (-100.0..=100.0).contains(&br) && br == br.trunc() {
-        return complex_powi(a(), br as i64);
+        return complex_powi(ar, ai, br as i64);
     } else {
         let vabs = ar.hypot(ai);
         let mut len = vabs.powf(br);
@@ -5426,27 +5436,17 @@ fn pow_binary(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyE
             };
         }
         if is_float_pair(a, b) {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-            let a = || pyre_object::gc_roots::shadow_stack_get(base);
-            let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-            reject_pow_operand_overflow(a())?;
-            reject_pow_operand_overflow(b())?;
-            let fa = as_float(a());
-            let fb = as_float(b());
+            // `W_FloatObject.descr_pow` `_to_float` then `_pow`. The long
+            // conversion allocates (`rbigint.tofloat`); [`float_operands`]
+            // re-reads both operands after it.
+            let (fa, fb) = float_operands(a, b)?;
             return match float_pow_impl(fa, fb) {
                 Ok(result) => Ok(Some(result)),
                 Err(err) => Err(err),
             };
         }
         if is_complex_pair(a, b) {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-            let a = || pyre_object::gc_roots::shadow_stack_get(base);
-            let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-            reject_pow_operand_overflow(a())?;
-            reject_pow_operand_overflow(b())?;
-            return match complex_pow(a(), b()) {
+            return match complex_pow(a, b) {
                 Ok(result) => Ok(Some(result)),
                 Err(err) => Err(err),
             };
@@ -5617,20 +5617,12 @@ pub(crate) fn pow_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && is_int_or_long(b) {
             return long_pow(a, b);
         }
-        if is_float_pair(a, b) || is_complex_pair(a, b) {
-            let is_float_operands = is_float_pair(a, b);
-            let _roots = pyre_object::gc_roots::push_roots();
-            let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-            let a = || pyre_object::gc_roots::shadow_stack_get(base);
-            let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
-            reject_pow_operand_overflow(a())?;
-            reject_pow_operand_overflow(b())?;
-            if is_float_operands {
-                let fa = as_float(a());
-                let fb = as_float(b());
-                return float_pow_impl(fa, fb);
-            }
-            return complex_pow(a(), b());
+        if is_float_pair(a, b) {
+            let (fa, fb) = float_operands(a, b)?;
+            return float_pow_impl(fa, fb);
+        }
+        if is_complex_pair(a, b) {
+            return complex_pow(a, b);
         }
         Ok(w_not_implemented())
     }
