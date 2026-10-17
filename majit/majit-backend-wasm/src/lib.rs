@@ -687,7 +687,12 @@ fn frozen_slot_count(n: usize) -> usize {
 /// with `return_call_indirect` on the shared table, and that type-checks the
 /// callee against the *calling* module's type index, so two modules cannot
 /// each pick their own width.
-pub const FROZEN_LABEL_PARAM_ARITY: usize = 16;
+///
+/// A peeled preamble's LABEL is the header live set plus the prefix's extra
+/// values, so the JUMP that resumes there is that wide. 16 left a 17-arg JUMP
+/// on the frame-slot path; 24 covers it and still rounds `ARITY + 1` to the
+/// same 32-slot frozen granule (`frozen_slot_count`).
+pub const FROZEN_LABEL_PARAM_ARITY: usize = 24;
 
 /// An op whose result advances loop-carried state. A value produced inside the
 /// re-running region by arithmetic or by a heap load is fresh on each pass, so
@@ -3255,6 +3260,15 @@ fn register_pending_inline(
     owner_module_bytes: u32,
     remap: Option<(u64, u32)>,
 ) -> codegen::InlineTripProbe {
+    // A region placed outside the loop re-enters its prefix every iteration
+    // (`jump_to_preamble`), so the owner-size term would postpone the merge
+    // while those crossings keep accumulating. Header-resuming regions still
+    // price the re-emission against owner bytes (`inline_trip_threshold_for`).
+    let threshold = if region.outside_loop {
+        INLINE_TRIP_THRESHOLD
+    } else {
+        inline_trip_threshold_for(owner_module_bytes)
+    };
     let (pending_slot, counter_addr) = asm_resources.alloc_pending_inline(PendingInline {
         owner: Arc::downgrade(&owner),
         region,
@@ -3263,7 +3277,7 @@ fn register_pending_inline(
     });
     codegen::InlineTripProbe {
         counter_addr,
-        threshold: inline_trip_threshold_for(owner_module_bytes),
+        threshold,
         trip_fn_ptr: inline_trip_helper_slot() as i64,
         pending_slot: pending_slot as i64,
     }

@@ -833,14 +833,79 @@ impl CallRegistry {
             if let Some(entry) = self.lookup_registered(&stripped_key) {
                 return Some(entry);
             }
+            if let Some(entry) = self.materialize_residual_inst(&stripped_key) {
+                return Some(entry);
+            }
             if let Some(getdesc) = self.getdesc.borrow().clone()
                 && let Some(entry) = getdesc(&stripped_key)
             {
                 return Some(entry);
             }
         }
+        if let Some(entry) = self.materialize_residual_inst(key) {
+            return Some(entry);
+        }
         let getdesc = self.getdesc.borrow().clone()?;
         getdesc(key)
+    }
+
+    /// Bind a generic `dont_look_inside` residual instantiation to its
+    /// own FunctionDesc.
+    ///
+    /// `residual_generic_fun_segments` names the call
+    /// `leaf__inst_<types>` (`annlowlevel.specialize` /
+    /// `getfunctionptr`); `collect_policy_opaque_fn_stubs_from_llbc`
+    /// only registers the template FunDecl. Copy the template's
+    /// residual signature and annotator stub graph onto this path so
+    /// the caller can annotate, while the instantiation keeps a
+    /// distinct callable identity.
+    fn materialize_residual_inst(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
+        let template_segs = residual_inst_template_segments(key.segments())?;
+        let template = self.lookup_residual_template(&template_segs)?;
+        if let Some(existing) = self.lookup_registered(key) {
+            return Some(existing);
+        }
+        let signature = template.function_desc.borrow().signature.clone();
+        let pygraph = template
+            .function_desc
+            .borrow()
+            .cache
+            .borrow()
+            .get(&GraphCacheKey::None)
+            .cloned();
+        let declared = template.declared_funcptr_type.borrow().clone();
+        let annsignature = template.function_desc.borrow().annsignature.clone();
+        let graph_func = GraphFunc::new(
+            key.name().to_string(),
+            Constant::new(ConstValue::Dict(HashMap::new())),
+        );
+        let entry = self.get_or_register_with_func(key.clone(), signature, graph_func);
+        if let Some(pygraph) = pygraph {
+            entry.prefill_default_cache(pygraph);
+        }
+        *entry.declared_funcptr_type.borrow_mut() = declared;
+        entry.function_desc.borrow_mut().annsignature = annsignature;
+        Some(entry)
+    }
+
+    fn lookup_residual_template(&self, template_segs: &[String]) -> Option<Rc<FunctionEntry>> {
+        let direct = FunctionPathKey::from_segments(template_segs.iter().cloned());
+        if let Some(entry) = self.lookup_registered(&direct) {
+            return Some(entry);
+        }
+        let mut roots = crate::local_crates::local_crate_roots();
+        if !roots.iter().any(|root| root == "crate") {
+            roots.push("crate".to_string());
+        }
+        for root in roots {
+            let mut segs = Vec::with_capacity(template_segs.len() + 1);
+            segs.push(root);
+            segs.extend(template_segs.iter().cloned());
+            if let Some(entry) = self.lookup_registered(&FunctionPathKey::from_segments(segs)) {
+                return Some(entry);
+            }
+        }
+        None
     }
 
     /// [`Self::lookup`] over the entries made so far.
@@ -1275,6 +1340,31 @@ fn strip_local_crate_prefix(segments: &[String]) -> Option<Vec<String>> {
     Some(segments[1..].to_vec())
 }
 
+/// Stem of a leaf produced by `residual_inst_suffix` (`helper_fnaddr.rs`).
+///
+/// `ll_dict_grow_trampoline__inst_K_V_S` → `Some("ll_dict_grow_trampoline")`.
+/// The annotator looks up that template's residual stub
+/// (`annlowlevel.specialize` shares the specialized graph's signature
+/// with the declaration) and binds each instantiation to its own
+/// FunctionDesc (`getfunctionptr`).
+fn residual_inst_template_leaf(leaf: &str) -> Option<&str> {
+    let (stem, rest) = leaf.split_once("__inst_")?;
+    if stem.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some(stem)
+}
+
+/// Rewrite a residual instantiation path to the template FunDecl path
+/// `collect_policy_opaque_fn_stubs_from_llbc` registers.
+fn residual_inst_template_segments(segments: &[String]) -> Option<Vec<String>> {
+    let leaf = segments.last()?;
+    let stem = residual_inst_template_leaf(leaf)?;
+    let mut segs = segments.to_vec();
+    *segs.last_mut()? = stem.to_string();
+    Some(segs)
+}
+
 /// Rust naming convention shape check: PascalCase / leading-uppercase
 /// idents are type / struct / enum names (impl method receivers); all-
 /// snake_case idents are modules / functions / primitives.  Used by
@@ -1364,6 +1454,77 @@ mod tests {
             assert!(
                 Rc::ptr_eq(&registered, &crate_hit) && Rc::ptr_eq(&registered, &local_hit),
                 "stripped lookup must return the same FunctionEntry"
+            );
+        });
+    }
+
+    #[test]
+    fn residual_inst_template_leaf_strips_instantiation_suffix() {
+        assert_eq!(
+            residual_inst_template_leaf("ll_dict_grow_trampoline__inst_i64_PyObject_IntKeyHasher"),
+            Some("ll_dict_grow_trampoline")
+        );
+        assert_eq!(residual_inst_template_leaf("ll_dict_grow_trampoline"), None);
+        assert_eq!(residual_inst_template_leaf("__inst_i64"), None);
+    }
+
+    #[test]
+    fn lookup_materializes_residual_inst_from_template_stub() {
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            let bk = Rc::new(Bookkeeper::new());
+            let registry = CallRegistry::new(bk);
+            let template_sig = signature(&["d"]);
+            let template = registry.get_or_register(
+                FunctionPathKey::from_segments([
+                    "pyre_object",
+                    "rordereddict",
+                    "ll_dict_grow_trampoline",
+                ]),
+                template_sig.clone(),
+            );
+            let identity = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "rordereddict",
+                    "ll_dict_grow_trampoline__inst_IdentityKey_PyObject_RandomState",
+                ]))
+                .expect("crate-stripped residual inst must bind the template stub");
+            let ints = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "rordereddict",
+                    "ll_dict_grow_trampoline__inst_i64_PyObject_IntKeyHasher",
+                ]))
+                .expect("second instantiation must bind its own FunctionDesc");
+            assert_eq!(
+                identity.function_desc.borrow().signature,
+                template_sig,
+                "instantiation shares the template residual signature"
+            );
+            assert!(
+                !Rc::ptr_eq(&identity, &template) && !Rc::ptr_eq(&ints, &template),
+                "getfunctionptr identity is per instantiation"
+            );
+            assert!(
+                !Rc::ptr_eq(&identity, &ints),
+                "distinct instantiations must not share a FunctionDesc"
+            );
+            let again = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "rordereddict",
+                    "ll_dict_grow_trampoline__inst_IdentityKey_PyObject_RandomState",
+                ]))
+                .expect("repeat lookup");
+            assert!(
+                Rc::ptr_eq(&identity, &again),
+                "repeat lookup must keep the instantiation FunctionDesc"
+            );
+            assert!(
+                registry
+                    .lookup(&FunctionPathKey::from_segments([
+                        "rordereddict",
+                        "missing_helper__inst_i64",
+                    ]))
+                    .is_none(),
+                "a residual inst with no template stub stays unregistered"
             );
         });
     }

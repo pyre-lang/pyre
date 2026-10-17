@@ -2019,17 +2019,22 @@ fn cast_instance_intrinsic(
         // is `*mut Entry`, the address of that tail.
         SomeValue::List(list) => {
             let item = list.listdef.read_item(None);
-            if !matches!(item, SomeValue::Impossible) {
-                return Err(AnnotatorError::new(format!(
-                    "__cast_instance_intrinsic: non-pointer operand for root {root:?}: {operand:?}"
+            if matches!(item, SomeValue::Impossible) {
+                let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
+                return Ok(SomeValue::Instance(super::model::SomeInstance::new(
+                    Some(classdef),
+                    operand_can_be_none,
+                    std::collections::BTreeMap::new(),
                 )));
             }
-            let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
-            return Ok(SomeValue::Instance(super::model::SomeInstance::new(
-                Some(classdef),
-                operand_can_be_none,
-                std::collections::BTreeMap::new(),
-            )));
+            // `GcArray` is a GCREF (`rlist.py`). `pin_root(p as PyObjectRef)`
+            // is `rgc.pin` of that word (`rgc.py`).
+            return Ok(operand.clone());
+        }
+        SomeValue::String(_) => {
+            // `STR` is `Ptr(GcStruct)` (`rstr.py`). `pin_root(p as PyObjectRef)`
+            // is `rgc.pin` of that GCREF (`rgc.py`).
+            return Ok(operand.clone());
         }
         other => {
             // A root the bookkeeper models as a list or string (a
@@ -3810,6 +3815,52 @@ mod tests {
         assert!(
             matches!(out, SomeValue::String(_)),
             "Wtf8 root must project dest as SomeString, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_object_root_accepts_str_gcref() {
+        let bk = bk();
+        let s_str = SomeValue::String(SomeString::default());
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("PyObject"))
+            .expect("PyObject root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_str), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("pin_root of STR is rgc.pin");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "STR GCREF must stay SomeString, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_object_root_accepts_char_gcarray() {
+        let bk = bk();
+        let listdef = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            super::super::model::s_uint(),
+            false,
+            false,
+        );
+        let s_list = SomeValue::List(super::super::model::SomeList::new(listdef));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("PyObject"))
+            .expect("PyObject root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_list), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("pin_root of GcArray is rgc.pin");
+        assert!(
+            matches!(out, SomeValue::List(_)),
+            "GcArray GCREF must stay SomeList, got {out:?}"
         );
     }
 

@@ -12087,6 +12087,21 @@ fn field_metadata(
     }
 }
 
+/// Leaf of a type spelling that occupies no storage.
+///
+/// `PhantomData<T>` and `BuildHasherDefault<H>` are `lltype.Void`
+/// (`heaptracker.py` `_names_without_voids`). Charon emits the std
+/// path (`core::hash::BuildHasherDefault<…>`) as Opaque without a
+/// layout, so the matcher uses the leaf rather than `layout.size`.
+pub(crate) fn type_str_leaf_is_void_zst(type_str: &str) -> bool {
+    if type_str == "()" {
+        return true;
+    }
+    let leaf = type_str.rsplit("::").next().unwrap_or(type_str);
+    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    leaf == "PhantomData" || leaf == "BuildHasherDefault"
+}
+
 pub(crate) fn get_type_flag(
     type_str: &str,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
@@ -12208,9 +12223,7 @@ pub(crate) fn get_type_flag(
         }
         // Zero-sized types occupy no storage and contribute no field slot
         // (heaptracker.py:60-62; lltype.py `_names_without_voids()`).
-        s if s == "()" || s == "PhantomData" || s.starts_with("PhantomData<") => {
-            (ArrayFlag::Void, majit_ir::value::Type::Void, 0)
-        }
+        s if type_str_leaf_is_void_zst(s) => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
         s if let Some(leaf) = atomic_wrapper_leaf(s) => leaf,
         // Unknown type — treat as GC pointer (conservative)
         _ => (
@@ -12804,6 +12817,24 @@ mod tests {
         assert_eq!(flag, majit_ir::descr::ArrayFlag::Unsigned);
         assert_eq!(ty, majit_ir::value::Type::Int);
         assert_eq!(size, 4);
+    }
+
+    /// `BuildHasherDefault<H>` is `PhantomData` (`hash.rs`); RPython's
+    /// `RDict` has no hasher field (`rordereddict.py`).
+    #[test]
+    fn get_type_flag_build_hasher_default_is_void() {
+        for spelling in [
+            "BuildHasherDefault",
+            "BuildHasherDefault<ObjectKeyHasher>",
+            "core::hash::BuildHasherDefault<ObjectKeyHasher>",
+            "std::hash::BuildHasherDefault",
+            "core::marker::PhantomData<u8>",
+        ] {
+            let (flag, ty, size) = get_type_flag(spelling);
+            assert_eq!(flag, majit_ir::descr::ArrayFlag::Void, "{spelling}");
+            assert_eq!(ty, majit_ir::value::Type::Void, "{spelling}");
+            assert_eq!(size, 0, "{spelling}");
+        }
     }
 
     /// An earlier alias's hint set is unioned with a later one, not replaced.

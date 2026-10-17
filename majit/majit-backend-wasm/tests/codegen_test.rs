@@ -6403,6 +6403,42 @@ fn a_loop_closing_jump_passes_its_args_to_a_published_wide_entry() {
     );
 }
 
+/// A JUMP whose arity sits between the old 16-word ceiling and the frozen
+/// granule still takes the wide parameter entry. Storing those args into
+/// frame slots only to have the shim load them back is the round trip
+/// `closing_jump` avoids by handing them in registers.
+#[test]
+fn a_jump_wider_than_sixteen_args_uses_the_wide_entry() {
+    let n = 17usize;
+    assert!(
+        n <= majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY,
+        "17 must fit the published wide type"
+    );
+    let inputargs: Vec<_> = (0..n)
+        .map(|i| InputArg::from_type_rc(Type::Int, i as u32))
+        .collect();
+    let jump_args: Vec<_> = (0..n).map(|i| rb(OpRef::input_arg_int(i as u32))).collect();
+    let ops = vec![Op::new(OpCode::Jump, &jump_args)];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+
+    let (wide_bytes, _) = build_external_jump_module(&inputargs, &ops, &constants, 7, 3, 8);
+    validate_wasm(&wide_bytes);
+    let (wide_stores, wide_call) = external_jump_tail(&wide_bytes);
+    assert_eq!(
+        wide_stores, 1,
+        "only the dispatch key still goes through the frame"
+    );
+    let (types, ..) = module_shape(&wide_bytes);
+    let (wide_slot, wide_type) = wide_call.expect("the wide arm tail-calls its target");
+    assert_eq!(wide_slot, 8, "the JUMP names the published wide slot");
+    assert_eq!(
+        types[wide_type as usize],
+        (1 + majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY, 1),
+        "the call type is the target's parameter entry: frame_ptr plus the \
+         fixed label parameters"
+    );
+}
+
 /// A bridge on geometry GA tail-calls a LABEL of a loop on geometry GB.
 /// Args land at GB's spill slots, the dispatch key at GB's key offset, and
 /// the prologue compares `_check_frame_depth` against GB when that frame is

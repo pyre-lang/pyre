@@ -586,6 +586,52 @@ fn lookup_link_arg(
     }
 }
 
+/// `rarithmetic.intmask`: an unsigned constant stored into a signed
+/// field is the signed word. Charon records unsuffixed `0` as
+/// `ConstUInt`; `W_ListObject.allocated` is `isize` (`rlist.py`
+/// `ll_newlist`). `positional_ctor_field_value_type` only knows tuple
+/// shapes, so the fused boxing `FieldWrite` can carry `Ref(None)` even
+/// when the destination is that signed field — the field name still
+/// intmasks.
+fn intmask_unsigned_store(
+    dest_ty: &crate::model::ValueType,
+    field_name: &str,
+    value: Hlvalue,
+) -> Hlvalue {
+    let signed_dest = matches!(dest_ty, crate::model::ValueType::Int) || field_name == "allocated";
+    if !signed_dest {
+        return value;
+    }
+    let Hlvalue::Constant(c) = &value else {
+        return value;
+    };
+    // Charon records unsuffixed `0` as `ConstUInt` and may leave
+    // `concretetype` unset until a later stamp. `intmask` is the signed
+    // word either way (`ll_newlist` `allocated` is Signed).
+    let already_signed = matches!(
+        c.concretetype,
+        Some(LowLevelType::Signed)
+            | Some(LowLevelType::SignedLongLong)
+            | Some(LowLevelType::SignedLongLongLong)
+    );
+    if already_signed {
+        return value;
+    }
+    match &c.value {
+        ConstValue::Int(n) => Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(*n),
+            LowLevelType::Signed,
+        )),
+        ConstValue::Int128(v) if *v >= i64::MIN as i128 && *v <= i64::MAX as i128 => {
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(*v as i64),
+                LowLevelType::Signed,
+            ))
+        }
+        _ => value,
+    }
+}
+
 /// Resolve the `Hlvalue` result slot for a legacy op. When the op has
 /// no result (`Option::None`), allocate a fresh anonymous Variable per
 /// RPython convention (every `SpaceOperation.result` slot is non-None
@@ -2322,7 +2368,9 @@ pub fn translate_op(
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new("len", vec![base_hl], result)])
         }
-        OpKind::FieldRead { base, field, .. } => {
+        OpKind::FieldRead {
+            base, field, ty, ..
+        } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             // `retarget_vec_operand` reuses this FieldRead's result as the
@@ -2511,6 +2559,48 @@ pub fn translate_op(
                     ),
                 ]);
             }
+            // `W_BytesObject.data` as `rstr.py` STR (`BytesKey` is
+            // `SomeString`). The classdef field is `[u8]` (`Array(Char)`);
+            // `cast_instance_intrinsic` of a string root recasts that list
+            // to `SomeString` (`AbstractBaseListRepr.recast` /
+            // `pairtype(GCRefRepr, Repr).convert_from_to`). Only this
+            // bytes payload: a ty:Str FieldRead of `Utf8Str.chars` is
+            // already the STR chars array.
+            if *ty == crate::model::ValueType::Str
+                && field.name == "data"
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(|o| o.rsplit("::").next() == Some("W_BytesObject"))
+            {
+                let callable_host = HOST_ENV
+                    .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+                    .ok_or_else(|| {
+                        TyperError::message(
+                            "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+                        )
+                    })?;
+                let list = Hlvalue::Variable(Variable::new());
+                return Ok(vec![
+                    FlowspaceOp::new(
+                        "getattr",
+                        vec![
+                            base_hl,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                        ],
+                        list.clone(),
+                    ),
+                    FlowspaceOp::new(
+                        "simple_call",
+                        vec![
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                            list,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str("Utf8Str"))),
+                        ],
+                        result,
+                    ),
+                ]);
+            }
             Ok(vec![FlowspaceOp::new(
                 "getattr",
                 vec![
@@ -2521,7 +2611,10 @@ pub fn translate_op(
             )])
         }
         OpKind::FieldWrite {
-            base, field, value, ..
+            base,
+            field,
+            value,
+            ty,
         } => {
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             // The stored value is an `AbstractValue` — a `Variable`
@@ -2531,6 +2624,7 @@ pub fn translate_op(
                 crate::model::LinkArg::Value(var) => lookup_operand(value_map, var, op, "value")?,
                 crate::model::LinkArg::Const(c) => Hlvalue::Constant(c.clone()),
             };
+            let value_hl = intmask_unsigned_store(ty, &field.name, value_hl);
             let result = resolve_result_hlvalue(op, value_map)?;
             let name = Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name)));
             let variant_owner = field.owner_root.as_deref().filter(|root| {
@@ -10528,6 +10622,40 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_bytes_data_str_field_casts_to_string() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("data", Some("W_BytesObject".into())),
+                ty: ValueType::Str,
+                pure: false,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("Str FieldRead must recast");
+        assert_eq!(
+            translated
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getattr", "simple_call"]
+        );
+        let Hlvalue::Constant(ref root) = translated[1].args[2] else {
+            panic!("string root");
+        };
+        assert!(matches!(
+            root.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"Utf8Str"
+        ));
+    }
+
+    #[test]
     fn translate_op_closure_pos_field_stays_getattr() {
         // `<Impl>` is not a type-argument instantiation. A registered
         // `__pos_0` on the closure must stay `getattr`; interning it as a
@@ -10660,6 +10788,68 @@ mod tests {
             name_const.value,
             ConstValue::ByteStr(ref bytes) if bytes == b"g"
         ));
+    }
+
+    #[test]
+    fn translate_op_signed_field_write_intmasks_unsigned_zero() {
+        // Charon `ConstUInt` 0 into `isize` (`rarithmetic.intmask`;
+        // `W_ListObject.allocated` / `rlist.py` `ll_newlist`).
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(
+            vars[2].clone(),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(0),
+                LowLevelType::Unsigned,
+            )),
+        );
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("allocated", Some("W_ListObject".into())),
+                value: crate::model::LinkArg::Value(vars[2].clone()),
+                ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("signed field store must intmask");
+        let Hlvalue::Constant(ref stored) = translated[0].args[2] else {
+            panic!("stored value");
+        };
+        assert!(matches!(stored.value, ConstValue::Int(0)));
+        assert_eq!(stored.concretetype.as_ref(), Some(&LowLevelType::Signed));
+    }
+
+    #[test]
+    fn translate_op_signed_field_write_intmasks_untyped_zero() {
+        // Charon may leave `concretetype` unset until a later stamp.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(
+            vars[2].clone(),
+            Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+        );
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("allocated", Some("W_ListObject".into())),
+                value: crate::model::LinkArg::Value(vars[2].clone()),
+                ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("untyped allocated store must intmask");
+        let Hlvalue::Constant(ref stored) = translated[0].args[2] else {
+            panic!("stored value");
+        };
+        assert!(matches!(stored.value, ConstValue::Int(0)));
+        assert_eq!(stored.concretetype.as_ref(), Some(&LowLevelType::Signed));
     }
 
     #[test]

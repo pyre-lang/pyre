@@ -219,3 +219,46 @@ fn identity_length_reads_num_live_items() {
         "identity length must not call ll_vec_length of the first storage word\n{dump}"
     );
 }
+
+#[test]
+fn module_dict_len_reads_num_live_items() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let graph = lower_function(llbc, "celldict::<Impl>::len").expect("lower celldict::<Impl>::len");
+    dump_if_requested("celldict_len", &graph);
+    let mut live_reads = 0usize;
+    let mut ll_vec_length = 0usize;
+    count_length_ops(&graph, &mut live_reads, &mut ll_vec_length);
+    let mut seen = HashSet::new();
+    let mut pending = callee_fun_decl_ids(&graph);
+    let context = LowerContext::new(llbc);
+    let mut dumps = vec![graph.dump()];
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(fd) = llbc.fn_by_id(id) else {
+            continue;
+        };
+        let path = fd.item_meta.name_path();
+        if !(path.contains("rordereddict") || path.contains("celldict")) {
+            continue;
+        }
+        let Ok(callee) = lower_fun_decl(&context, fd) else {
+            continue;
+        };
+        count_length_ops(&callee, &mut live_reads, &mut ll_vec_length);
+        pending.extend(callee_fun_decl_ids(&callee));
+        dumps.push(callee.dump());
+    }
+    let dump = dumps.join("\n--- callee ---\n");
+    assert!(
+        live_reads > 0,
+        "module dict length must getfield num_live_items (`rordereddict.rtype_len`) somewhere in its call chain\n{dump}"
+    );
+    assert_eq!(
+        ll_vec_length, 0,
+        "module dict length must not call ll_vec_length of the first storage word\n{dump}"
+    );
+}
