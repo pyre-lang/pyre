@@ -6474,6 +6474,24 @@ pub(crate) fn set_contains_checked(
     item: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
     unsafe {
+        // `IntegerSetStrategy.has_key` with `is_correct_type(w_key)`:
+        // `self.unwrap(w_key) in d`. Hashing an exact int runs no user code,
+        // so the lookup needs no `try_hash_value` first.
+        if (*(set as *const pyre_object::setobject::W_SetObject))
+            .strategy
+            .kind
+            == pyre_object::setobject::SetStrategyKind::Int
+            && pyre_object::listobject::is_plain_int1(item)
+            && pyre_object::is_int(item)
+        {
+            let found = pyre_object::setobject::jit_int_set_has_key(
+                set,
+                pyre_object::w_int_get_value(item),
+            );
+            if found >= 0 {
+                return Ok(found != 0);
+            }
+        }
         set_lookup_checked(
             set,
             item,

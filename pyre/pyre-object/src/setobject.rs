@@ -2316,6 +2316,27 @@ pub fn plain_int_already_in_int_set(set: PyObjectRef, value: PyObjectRef) -> boo
     }
 }
 
+/// `IntegerSetStrategy.has_key` for a key that `is_correct_type`:
+/// `self.unwrap(w_key) in self.unerase(w_set.sstorage)`. The int-keyed lookup
+/// runs no `__hash__` or `__eq__`, so this cannot raise or force.
+///
+/// Answers `1` or `0`. `-1` means the set no longer holds
+/// `IntegerSetStrategy` or its stripe is contended; the caller then takes
+/// `strategy.has_key` with the wrapped key.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_int_set_has_key(set: PyObjectRef, key: i64) -> i64 {
+    unsafe {
+        let Some(_guard) = try_w_set_lock(set) else {
+            return -1;
+        };
+        let set_obj = &*(set as *const W_SetObject);
+        if set_obj.strategy.kind != SetStrategyKind::Int || set_obj.sstorage.is_null() {
+            return -1;
+        }
+        i64::from((*(set_obj.sstorage as *const IntSetStorage)).contains_key(&key))
+    }
+}
+
 /// Lock two sets in stripe order. A shared stripe is acquired once.
 #[majit_macros::dont_look_inside]
 unsafe fn w_set_lock_pair(left: PyObjectRef, right: PyObjectRef) -> (SetGuard, Option<SetGuard>) {
@@ -4924,10 +4945,13 @@ mod tests {
         assert!(!plain_int_already_in_int_set(std::ptr::null_mut(), one));
         assert!(!plain_int_already_in_int_set(s, std::ptr::null_mut()));
         assert!(!plain_int_already_in_int_set(s, one));
+        assert_eq!(jit_int_set_has_key(s, 1), -1);
         unsafe { w_set_add(s, one) };
         assert!(plain_int_already_in_int_set(s, one));
         assert!(!plain_int_already_in_int_set(s, w_int_new(2)));
         assert!(!plain_int_already_in_int_set(s, crate::w_bool_from(true)));
+        assert_eq!(jit_int_set_has_key(s, 1), 1);
+        assert_eq!(jit_int_set_has_key(s, 2), 0);
         assert_eq!(unsafe { w_set_len(s) }, 1);
         unsafe { w_set_add(s, crate::w_bool_from(true)) };
         assert_eq!(
@@ -4935,6 +4959,7 @@ mod tests {
             SetStrategyKind::Object
         );
         assert!(!plain_int_already_in_int_set(s, one));
+        assert_eq!(jit_int_set_has_key(s, 1), -1);
     }
 
     #[test]

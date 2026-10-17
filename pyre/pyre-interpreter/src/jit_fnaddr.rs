@@ -4410,6 +4410,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_list_contains_int",
         crate::listobject::jit_list_contains_int,
     );
+    cpa2!(
+        &mut entries,
+        "pyre_object::setobject::jit_int_set_has_key",
+        "pyre_object::jit_int_set_has_key",
+        pyre_object::setobject::jit_int_set_has_key,
+    );
     cpa1!(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_is_true",
@@ -8178,6 +8184,12 @@ mod tests {
             bindings["pyre_interpreter::jit_list_contains_int"],
             list_int
         );
+        let set_int = pyre_object::setobject::jit_int_set_has_key as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::setobject::jit_int_set_has_key"],
+            set_int
+        );
+        assert_eq!(bindings["pyre_object::jit_int_set_has_key"], set_int);
     }
 
     #[test]

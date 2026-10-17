@@ -3663,10 +3663,19 @@ pub(crate) fn sequence_count(w_container: PyObjectRef, mut w_item: PyObjectRef) 
 /// `w_item` (`w is w_item or w == w_item`), scanning `w_container` through the
 /// iterator protocol.
 pub(crate) fn sequence_contains(
-    w_container: PyObjectRef,
+    mut w_container: PyObjectRef,
     mut w_item: PyObjectRef,
 ) -> Result<bool, PyError> {
-    let w_iter = pyre_object::with_roots!(w_item => iter(w_container))?;
+    let w_iter = match pyre_object::with_roots!(w_container, w_item => iter(w_container)) {
+        Ok(w_iter) => w_iter,
+        // CPython 3.14 `PySequence_Contains` replaces an iterator-acquisition
+        // TypeError (including one raised by user `__iter__`) with its
+        // membership-specific diagnostic.  Other exceptions propagate.
+        Err(err) if err.kind == PyErrorKind::TypeError => {
+            return Err(not_container_or_iterable_error(w_container));
+        }
+        Err(err) => return Err(err),
+    };
     // `next`/`eq_w` re-enter Python and may collect; a raw local is not a root,
     // so the iterator and needle live on the shadow stack.
     let _roots = pyre_object::gc_roots::push_roots();
@@ -24974,6 +24983,56 @@ fn contains_dict(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyE
     }
 }
 
+/// `dictmultiobject.py W_DictViewItemsObject.descr_contains`: a 2-tuple
+/// `(key, value)` is contained when `key` maps to a value `eq_w` to `value`.
+#[inline(never)]
+fn contains_dict_items(dict: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    use pyre_object::*;
+    unsafe {
+        if !is_tuple(needle) || w_tuple_len(needle) != 2 {
+            return Ok(false);
+        }
+        // One root scope with every slot reserved up front: a specialised
+        // `_ii` tuple boxes each item through `w_int_new`, so the key is
+        // rooted before the value is read, and `w_found` before `eq_w`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[dict, needle, PY_NULL, PY_NULL, PY_NULL]);
+        let (dict_slot, item_slot, key_slot, value_slot, found_slot) =
+            (base, base + 1, base + 2, base + 3, base + 4);
+        // `space.fixedview_unroll(w_item, 2)`.
+        let Some(w_key) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(item_slot), 0)
+        else {
+            return Ok(false);
+        };
+        pyre_object::gc_roots::shadow_stack_set(key_slot, w_key);
+        let Some(w_value) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(item_slot), 1)
+        else {
+            return Ok(false);
+        };
+        pyre_object::gc_roots::shadow_stack_set(value_slot, w_value);
+        // `w_found = self.w_dict.getitem(w_key)`.
+        let w_found = match pyre_object::dictmultiobject::w_dict_lookup_checked(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+        ) {
+            Ok(w_found) => w_found,
+            Err(_) => {
+                return Err(take_pending_dict_key_error(
+                    pyre_object::gc_roots::shadow_stack_get(key_slot),
+                ));
+            }
+        };
+        let Some(w_found) = w_found else {
+            return Ok(false);
+        };
+        pyre_object::gc_roots::shadow_stack_set(found_slot, w_found);
+        eq_w(
+            pyre_object::gc_roots::shadow_stack_get(found_slot),
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        )
+    }
+}
+
 /// `setobject.py W_BaseSetObject.descr_contains`.
 #[inline(never)]
 fn contains_set(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
@@ -25014,15 +25073,8 @@ pub(crate) fn contains_slot(
             haystack
         }
     };
-    // `pypy/objspace/std/dictmultiobject.py`
-    // `W_DictViewKeysObject.descr_contains` →
-    // `space.contains(self.w_dict, w_key)`.
-    // `W_DictViewItemsObject.descr_contains` matches a (k, v)
-    // tuple via dict lookup + value equality.  `W_DictViewValuesObject`
-    // has no `__contains__` slot in PyPy — pyre delegates the
-    // fall-through to the standard `iter`-based scan further down so
-    // `v in d.values()` still works (as in PyPy where the missing
-    // slot triggers the iter fallback).
+    // `dictmultiobject.py` dict views: keys and items define
+    // `descr_contains`; values does not and takes `space.sequence_contains`.
     unsafe {
         if pyre_object::dictmultiobject::is_dict_view(haystack) {
             let kind = pyre_object::dictmultiobject::w_dict_view_get_kind(haystack);
@@ -25031,96 +25083,18 @@ pub(crate) fn contains_slot(
                 return Ok(false);
             }
             match kind {
+                // `W_DictViewKeysObject.descr_contains` →
+                // `self.w_dict.descr_contains(space, w_key)`.
                 pyre_object::dictmultiobject::DictViewKind::Keys => {
-                    // `w_dict_lookup_checked` runs the key's `__eq__` and may
-                    // collect; `needle` and the source dict are raw locals.
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let pair = pyre_object::gc_roots::pin_roots(&[needle, dict]);
-                    let needle_slot = pair;
-                    let dict_slot = pair + 1;
-                    return match unsafe {
-                        pyre_object::dictmultiobject::w_dict_lookup_checked(
-                            pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                            pyre_object::gc_roots::shadow_stack_get(needle_slot),
-                        )
-                    } {
-                        Ok(v) => Ok(v.is_some()),
-                        Err(_) => Err(take_pending_dict_key_error(
-                            pyre_object::gc_roots::shadow_stack_get(needle_slot),
-                        )),
-                    };
+                    return contains_dict(dict, needle);
                 }
                 pyre_object::dictmultiobject::DictViewKind::Items => {
-                    // Specialised `_ii` boxes through `w_int_new`.  Pin the
-                    // needle, the source dict, and the first box before the
-                    // second getitem.
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let pair0 = pyre_object::gc_roots::pin_roots(&[needle, dict]);
-                    let needle_slot = pair0;
-                    let dict_slot = pair0 + 1;
-                    if !is_tuple(pyre_object::gc_roots::shadow_stack_get(needle_slot))
-                        || w_tuple_len(pyre_object::gc_roots::shadow_stack_get(needle_slot)) != 2
-                    {
-                        return Ok(false);
-                    }
-                    let k = match w_tuple_getitem(
-                        pyre_object::gc_roots::shadow_stack_get(needle_slot),
-                        0,
-                    ) {
-                        Some(k) => k,
-                        None => return Ok(false),
-                    };
-                    let pair = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(k);
-                    let want = match w_tuple_getitem(
-                        pyre_object::gc_roots::shadow_stack_get(needle_slot),
-                        1,
-                    ) {
-                        Some(v) => v,
-                        None => return Ok(false),
-                    };
-                    let _ = pyre_object::gc_roots::pin_root(want);
-                    let k_slot = pair;
-                    let want_slot = pair + 1;
-                    return match unsafe {
-                        pyre_object::dictmultiobject::w_dict_lookup_checked(
-                            pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                            pyre_object::gc_roots::shadow_stack_get(k_slot),
-                        )
-                    } {
-                        Ok(Some(have)) => {
-                            let _have_roots = pyre_object::gc_roots::push_roots();
-                            let have = pyre_object::gc_roots::pin_root(have);
-                            eq_w(have, pyre_object::gc_roots::shadow_stack_get(want_slot))
-                        }
-                        Ok(None) => Ok(false),
-                        Err(_) => Err(take_pending_dict_key_error(
-                            pyre_object::gc_roots::shadow_stack_get(k_slot),
-                        )),
-                    };
+                    return contains_dict_items(dict, needle);
                 }
+                // `W_DictViewValuesObject` has no `__contains__`:
+                // `space.sequence_contains` over the view.
                 pyre_object::dictmultiobject::DictViewKind::Values => {
-                    // values view: PyPy uses iter-based scan.  `eq_w` re-enters
-                    // Python and may collect; the snapshot's values and the
-                    // needle are raw locals, so pin them on the shadow stack.
-                    let items = pyre_object::w_dict_items(dict);
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let mut live = Vec::with_capacity(items.len() + 1);
-                    live.push(needle);
-                    for (_, v) in &items {
-                        live.push(*v);
-                    }
-                    let needle_slot = pyre_object::gc_roots::pin_roots(&live);
-                    let base = needle_slot + 1;
-                    for j in 0..items.len() {
-                        if eq_w(
-                            pyre_object::gc_roots::shadow_stack_get(base + j),
-                            pyre_object::gc_roots::shadow_stack_get(needle_slot),
-                        )? {
-                            return Ok(true);
-                        }
-                    }
-                    return Ok(false);
+                    return sequence_contains(haystack, needle);
                 }
             }
         }
@@ -25200,45 +25174,9 @@ pub(crate) fn contains_slot(
             return is_true(result);
         }
     }
-    // PyPy `descroperation.py sequence_contains`: obtain the
-    // iterator first, then repeatedly call `space.next`.  The iterator may
-    // itself be the sequence iterator produced by `iter()`'s `__getitem__`
-    // fallback, but an explicit `__iter__` must take precedence.
-    let iterator = match pyre_object::with_roots!(haystack, needle => iter(haystack)) {
-        Ok(iterator) => iterator,
-        // CPython 3.14 `PySequence_Contains` replaces an iterator-acquisition
-        // TypeError (including one raised by user `__iter__`) with its
-        // membership-specific diagnostic.  Other exceptions propagate.
-        Err(err) if err.kind == PyErrorKind::TypeError => {
-            return Err(not_container_or_iterable_error(haystack));
-        }
-        Err(err) => return Err(err),
-    };
-    // `next`/`eq_w` re-enter Python and may collect; the iterator and needle
-    // are raw locals, so pin them on the shadow stack across the scan.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let pair = pyre_object::gc_roots::pin_roots(&[iterator, needle]);
-    let iter_slot = pair;
-    let needle_slot = pair + 1;
-    loop {
-        match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
-            Ok(item) => {
-                let _item_roots = pyre_object::gc_roots::push_roots();
-                let item = pyre_object::gc_roots::pin_root(item);
-                if eq_w(item, pyre_object::gc_roots::shadow_stack_get(needle_slot))? {
-                    return Ok(true);
-                }
-            }
-            Err(e) => {
-                let (stop, e) = e.matches_stop_iteration_keep();
-                if stop {
-                    return Ok(false);
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    }
+    // `descroperation.py contains`: no `__contains__` →
+    // `space.sequence_contains`.
+    sequence_contains(haystack, needle)
 }
 
 fn not_container_error(obj: PyObjectRef) -> PyError {

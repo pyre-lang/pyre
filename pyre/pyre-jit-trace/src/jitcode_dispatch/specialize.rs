@@ -20420,9 +20420,24 @@ fn walker_contains_descent_callback_free(
                 && pyre_object::is_int(needle)
         };
     }
-    // A `set` stays on the residual even for a plain int needle: its single
-    // object strategy can hold a user object whose `__hash__` collides with
-    // the needle's, and the same-hash probe then runs that object's `__eq__`.
+    // setobject.py `IntegerSetStrategy.has_key`: a plain int key is
+    // `self.unwrap(w_key) in d`, a lookup on an int-keyed dict that calls
+    // no `__hash__`/`__eq__`. Every other set strategy, or a key that is not
+    // `is_correct_type`, can reach a user `__eq__` (ObjectSetStrategy's
+    // same-hash probe, or `switch_to_object_strategy`), so it stays on the
+    // residual.
+    if exact(haystack, &pyre_object::setobject::SET_TYPE)
+        || exact(haystack, &pyre_object::setobject::FROZENSET_TYPE)
+    {
+        return unsafe {
+            (*(haystack as *const pyre_object::setobject::W_SetObject))
+                .strategy
+                .kind
+                == pyre_object::setobject::SetStrategyKind::Int
+                && pyre_object::listobject::is_plain_int1(needle)
+                && pyre_object::is_int(needle)
+        };
+    }
     false
 }
 
