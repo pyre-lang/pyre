@@ -5127,19 +5127,26 @@ pub(crate) fn frame_array_write_barrier(
 /// Write one decoded Ref back into the live frame's locals_cells_stack_w
 /// (the GC-rooted virtualizable array), re-asserting the resume-decoded
 /// vable image after the guard-failure vsd correction cleared root slots
-/// in callee coordinates.  A no-op for a null frame/array, an out-of-range
-/// slot, or a non-Ref value.
+/// in callee coordinates.  A no-op for a non-Ref value (`locals_cells_stack_w`
+/// is a Ref array). `virtualizable.py write_boxes` writes every slot;
+/// `write_box_at` asserts `0 <= index < len(boxes)-1`.
 pub(crate) fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: majit_ir::Value) {
     let majit_ir::Value::Ref(r) = value else {
         return;
     };
     let Some((_frame, lp)) = current_live_frame_array(vable_ptr) else {
-        return;
+        panic!(
+            "store_live_frame_array_slot: null frame or array (vable_ptr={vable_ptr:#x}); \
+             virtualizable.py write_boxes writes every slot"
+        );
     };
     let arr = unsafe { &mut *lp };
-    if slot >= arr.len() {
-        return;
-    }
+    assert!(
+        slot < arr.len(),
+        "store_live_frame_array_slot: slot {slot} >= len {}; \
+         virtualizable.py write_box_at asserts 0 <= index < len(boxes)-1",
+        arr.len()
+    );
     // `setarrayitem_gc` on the GcArray of GCREF: barrier the array
     // (`write_barrier_from_array`), not a raw slot write.
     let stored = majit_gc::gc_current_object_address(r.as_usize()) as pyre_object::PyObjectRef;

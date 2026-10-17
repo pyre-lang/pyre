@@ -1744,6 +1744,27 @@ mod tests {
     }
 
     #[test]
+    fn test_get_iter_seeds_sparse_inputarg_positions() {
+        // `History.set_inputargs` drops a dead fail arg and keeps the
+        // surviving boxes' original `get_position()`. `Trace.get_iter`
+        // must seed `_cache` at those positions (`opencoder.py
+        // TraceIterator.__init__`), not compact 0..len. Compact
+        // `TraceIterator::new` would miss cache[2] and panic.
+        // Fresh boxes remint from `start_fresh=0`, so original
+        // InputArgInt(2) becomes the second live inputarg at 1.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(2)];
+        let mut add = Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(2)]);
+        add.pos().set(iop(3));
+        let ops = vec![add, Op::new(OpCode::Jump, &[iop_box(3)])];
+        let trace = TreeLoop::new(inputargs, ops);
+        let mut iter = trace.get_iter();
+        let r = iter.next().unwrap();
+        assert_eq!(r.arg(0).to_opref(), iarg(0));
+        assert_eq!(r.arg(1).to_opref(), iarg(1));
+        assert_eq!(r.pos().get(), iop(2));
+    }
+
+    #[test]
     fn test_inputarg_types_all() {
         let inputargs = vec![
             InputArg::new_int(0),

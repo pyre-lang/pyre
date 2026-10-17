@@ -15970,9 +15970,13 @@ fn write_barrier_after_ref_store(container: i64) {
 /// The width dispatch is the CPU model's, not this object model's, so
 /// it is not repeated here.
 fn bh_setfield_gc_int_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-    if struct_ptr == 0 {
-        return;
-    }
+    // `llmodel.py bh_setfield_gc_i` → `write_int_at_mem` writes
+    // unconditionally. A null struct is UB in Rust, so assert rather
+    // than skip.
+    assert!(
+        struct_ptr != 0,
+        "bh_setfield_gc_i: null struct; llmodel.py bh_setfield_gc_i writes via write_int_at_mem"
+    );
     majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 8);
     // SAFETY: `struct_ptr` is a materialized virtual; offset and size come
     // from the field descriptor that described the store being replayed.
@@ -16099,9 +16103,13 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     }
 
     fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-        if struct_ptr == 0 {
-            return;
-        }
+        // `llmodel.py bh_setfield_gc_r` → `write_ref_at_mem` writes
+        // unconditionally. A null struct is UB in Rust, so assert rather
+        // than skip.
+        assert!(
+            struct_ptr != 0,
+            "bh_setfield_gc_r: null struct; llmodel.py bh_setfield_gc_r writes via write_ref_at_mem"
+        );
         // `resume.py` dispatches to `cpu.bh_setfield_gc_r`, whose
         // `write_ref_at_mem` (llmodel.py) carries the framework GC
         // transformer's write barrier around the ref store. This override
@@ -16128,9 +16136,13 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-        if struct_ptr == 0 {
-            return;
-        }
+        // `llmodel.py bh_setfield_gc_f` → `write_float_at_mem` writes
+        // unconditionally. A null struct is UB in Rust, so assert rather
+        // than skip.
+        assert!(
+            struct_ptr != 0,
+            "bh_setfield_gc_f: null struct; llmodel.py bh_setfield_gc_f writes via write_float_at_mem"
+        );
         majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 8);
         // `resume.py:1515` → `llmodel.py bh_setfield_gc_f`, which
         // unpacks only the offset: float fields are excluded from the size
