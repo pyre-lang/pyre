@@ -906,12 +906,9 @@ fn derive_pc_live_indices_from_sparse(
     // Branch guards (`goto_if_not` / `goto_if_not_*` / `switch`) resume at
     // orgpc = the guard's OWN bytecode pc — i.e. the opcode START,
     // which is exactly the PC's first-insn keying (the default above).  The
-    // guard's leading `-live-` (immediately before the terminator) is NOT a
-    // valid resume target under pyre's Ref-only resume contract: the
-    // condition is an unboxed `Int` produced mid-opcode by the `truth`
-    // call, and `clear_unboxed_banks` strips it at that marker.  Resuming
-    // there reads a cleared condition and takes the wrong arm.  Resuming at
-    // the opcode-start marker instead keeps the boxed operand (the compare
+    // guard's leading `-live-` (immediately before the terminator) follows
+    // the mid-opcode `truth` call that produces the unboxed `Int` condition.
+    // Resuming at the opcode-start marker keeps the boxed operand (the compare
     // result the `truth` consumes) live, so re-executing the opcode
     // forward re-derives the condition correctly — mirroring the blackhole
     // re-running the bytecode opcode from orgpc.  So leave `pos_for_pc` at
@@ -5097,6 +5094,11 @@ fn catch_live_coverage_census(
 /// `Label("pcN")` + `-live-` pair per Python PC, including dead
 /// bytecodes that never execute, whereas upstream RPython only
 /// flattens reachable flow-graph blocks.
+///
+/// `splice_path` gates the portal-red re-add (`interp_jit.py` reds
+/// `['frame', 'ec']`) that restores the walker's force-alive shape on
+/// the splice path. The walker path already carries those registers on
+/// every `-live-` marker.
 fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
@@ -5105,7 +5107,7 @@ fn filter_liveness_in_place(
     portal_ec_reg: u16,
     walker_tracked_pc_live_indices: Option<&[usize]>,
     walker_after_call_pc_indices: Option<&[Option<usize>]>,
-    clear_unboxed_banks: bool,
+    splice_path: bool,
 ) -> (
     Vec<usize>,
     Vec<Option<usize>>,
@@ -5446,9 +5448,9 @@ fn filter_liveness_in_place(
             // bridge resume (`state.rs::setup_bridge_sym`) indexes
             // `registers_r` by `portal_ec_reg`, so the slot MUST be present.
             // Re-add the portal reds to reproduce the walker's force-alive
-            // shape; splice-only (`clear_unboxed_banks`) so the walker path
+            // shape; splice-only (`splice_path`) so the walker path
             // stays byte-identical.
-            if clear_unboxed_banks {
+            if splice_path {
                 if portal_frame_reg != u16::MAX && !pc_live_r.contains(&portal_frame_reg) {
                     pc_live_r.push(portal_frame_reg);
                 }
@@ -5457,27 +5459,6 @@ fn filter_liveness_in_place(
                 }
             }
 
-            // The Ref bank is the only bank in pyre's opcode-entry resume
-            // snapshot: pyre boxes every value before a Python opcode
-            // completes, so locals / stack hold PyObjectRefs and the
-            // resumed interpreter re-derives any unboxed int/float scratch
-            // from those boxes rather than reading it back.  The walker's
-            // per-PC `-live-` markers reflect this — they carry no Int or
-            // Float registers for any production graph.  The canonical
-            // `flatten_graph` stream, by contrast, is a jitcode-level SSA
-            // form whose backward liveness DOES surface unboxed int/float
-            // temporaries spanning the marker; under the splice those colors
-            // reach `collect_outer_active_boxes` as liveness-active
-            // registers the trace never populated (`registers_i[c] ==
-            // OpRef::NONE`) → panic.  Drop them so the spliced resume
-            // snapshot matches the interpreter-frame contract — symmetric
-            // with the Ref scratch drop above, but total, since pyre has no
-            // int/float frame slots.  `clear_unboxed_banks` is the splice
-            // path only, so the walker path stays byte-identical.
-            if clear_unboxed_banks {
-                pc_live_i.clear();
-                pc_live_f.clear();
-            }
             union_i.extend(pc_live_i);
             union_r.extend(pc_live_r);
             union_f.extend(pc_live_f);
@@ -18085,13 +18066,13 @@ mod tests {
     }
 
     #[test]
-    fn filter_liveness_clears_int_float_banks_under_splice() {
+    fn filter_liveness_keeps_int_float_banks_under_splice() {
         // Mirror of `filter_liveness_keeps_ssa_live_ref_color_with_no_frame_slot`
-        // but with `clear_unboxed_banks = true` (the splice path).  Under
-        // the splice, the canonical jitcode-level stream surfaces unboxed
-        // int/float temporaries the interpreter-frame resume cannot supply;
-        // they must be dropped so `collect_outer_active_boxes` never reads a
-        // liveness-active int/float register the trace never populated.
+        // but with `splice_path = true`.  Upstream `liveness.py compute_liveness`
+        // keeps every live int/float register in `-live-`; `pyjitpl.py`
+        // `MIFrame.get_list_of_active_boxes` snapshots `registers_i` /
+        // `registers_f` from it.  Registers live at the marker stay in the
+        // splice-path `-live-`.
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
         let reachable_pc = (0..code.instructions.len())
@@ -18111,7 +18092,7 @@ mod tests {
         }
 
         // Drive `lv_live` via the per-PC map (color 0 = live local `x`), then
-        // assert the splice path clears the Int/Float banks.
+        // assert the splice path keeps the live Int/Float registers.
         let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
             vec![vec![(1, 0, 0)]; code.instructions.len()];
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
@@ -18130,18 +18111,29 @@ mod tests {
         let live_args = ssarepr.insns[live_idx]
             .live_args()
             .expect("reachable pc must keep a -live- marker");
-        let non_ref: Vec<&Operand> = live_args
+        let ints: std::collections::BTreeSet<u16> = live_args
             .iter()
-            .filter(|op| {
-                matches!(
-                    op,
-                    Operand::Register(reg) if reg.kind == Kind::Int || reg.kind == Kind::Float
-                )
+            .filter_map(|op| match op {
+                Operand::Register(reg) if reg.kind == Kind::Int => Some(reg.index),
+                _ => None,
             })
             .collect();
-        assert!(
-            non_ref.is_empty(),
-            "splice path must clear Int/Float banks; found {non_ref:?}",
+        assert_eq!(
+            ints,
+            std::collections::BTreeSet::from([3]),
+            "splice path must keep live Int registers in -live-",
+        );
+        let floats: std::collections::BTreeSet<u16> = live_args
+            .iter()
+            .filter_map(|op| match op {
+                Operand::Register(reg) if reg.kind == Kind::Float => Some(reg.index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            floats,
+            std::collections::BTreeSet::from([4]),
+            "splice path must keep live Float registers in -live-",
         );
     }
 
