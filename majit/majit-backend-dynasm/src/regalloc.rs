@@ -29,10 +29,11 @@ use smallvec::SmallVec;
 /// regalloc.py:909
 pub const UNDEF_POS: i32 = -42;
 
-/// regalloc.py:26-28
+/// llsupport/regalloc.py `SAVE_DEFAULT_REGS` / `SAVE_GCREF_REGS` /
+/// `SAVE_ALL_REGS`.
 pub const SAVE_DEFAULT_REGS: u8 = 0;
-pub const SAVE_GCREF_REGS: u8 = 1;
-pub const SAVE_ALL_REGS: u8 = 2;
+pub const SAVE_GCREF_REGS: u8 = 2;
+pub const SAVE_ALL_REGS: u8 = 1;
 
 /// `save_all_regs` for the CALL_MALLOC_NURSERY_VARSIZE spill. x86
 /// `consider_call_malloc_nursery_varsize` uses the default: the

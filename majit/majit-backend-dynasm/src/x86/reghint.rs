@@ -4,17 +4,12 @@
 //! for specific opcodes.  Runs as a pre-pass before the main regalloc
 //! walk (invoked from `RegAlloc::_prepare`).
 
-use crate::regalloc::LifetimeManager;
+use crate::regalloc::{LifetimeManager, SAVE_ALL_REGS, SAVE_DEFAULT_REGS, SAVE_GCREF_REGS};
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
 use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
 use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRef, Type};
-
-/// regalloc.py:26-28.
-pub const SAVE_DEFAULT_REGS: u8 = 0;
-pub const SAVE_GCREF_REGS: u8 = 1;
-pub const SAVE_ALL_REGS: u8 = 2;
 
 /// reghint.py X86RegisterHints.
 pub struct RegisterHints {
