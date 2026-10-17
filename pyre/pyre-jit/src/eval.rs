@@ -8172,9 +8172,9 @@ fn unpack_merge_point_jit(
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX;
         let reds = confirm_reds_if_installed(driver, jd_no, || {
-            pyre_jit_trace::unpack_state::jd1_live_values_at(
-                pyre_jit_trace::unpack_state::jd1_root_base(),
-            )
+            let (_save_point, root_base, _items_slot) =
+                pyre_jit_trace::unpack_state::jd1_root_base();
+            pyre_jit_trace::unpack_state::jd1_live_values_at(root_base)
         });
         driver
             .meta_interp_mut()
@@ -8882,10 +8882,11 @@ fn drive_unpack_iterable_trace(
     // shared global build-time pool, so install it before the walk reads the
     // first descr (idempotent OnceLock).
     let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
-    // Portal pins are the two slots under this hook. Capture them before
-    // ResidualExceptionScope::park can pin a standing exception on top;
-    // otherwise jd1_root_base's `len - 2` names those parked roots.
-    let portal_root_base = pyre_object::gc_roots::shadow_stack_len().saturating_sub(2) as i64;
+    // Portal pins three objects (w_iterator, items, greenkey) under this hook.
+    // Capture them before ResidualExceptionScope::park can pin a standing
+    // exception on top; otherwise jd1_root_base's `len - 3` names those
+    // parked roots.
+    let (save_point, portal_root_base, items_slot) = pyre_jit_trace::unpack_state::jd1_root_base();
     // The walk below executes each residual concretely, so the raise that ends
     // the unpack is recorded into the residual-call exception cells. Those are
     // pyre's per-thread stand-in for `metainterp.last_exc_value`, which
@@ -8956,7 +8957,7 @@ fn drive_unpack_iterable_trace(
         return;
     }
 
-    // Extracted merge-point reds: root_base, items_slot, RootScope cell.
+    // Extracted merge-point reds: save_point, root_base, items_slot.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
@@ -9153,35 +9154,34 @@ fn drive_unpack_iterable_trace(
     }
 
     // Seed every bank the extracted `jit_merge_point` names.  Green is
-    // the type object; reds are root_base / items_slot / RootScope cell.
+    // the type object; reds are save_point, root_base, items_slot.
     let green_args = [(
         majit_metainterp::JitArgKind::Ref,
         greenkey_raw as usize as i64,
     )];
-    let root_base = portal_root_base;
     let red_args = [
         (
             majit_metainterp::JitArgKind::Int,
             majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
-            root_base,
+            save_point,
         ),
         (
             majit_metainterp::JitArgKind::Int,
             majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-            root_base + 1,
+            portal_root_base,
         ),
         (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
-            pyre_object::gc_roots::shadow_stack_cell() as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+            items_slot,
         ),
     ];
 
     let mut sym = pyre_jit_trace::unpack_state::UnpackSym {
         greenkey: pyre_object::PY_NULL,
-        root_base: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
-        items_slot: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+        save_point: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+        root_base: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+        items_slot: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
     };
 
     // The `jit_merge_point` opcode byte offset in the extracted body — the
@@ -10615,8 +10615,8 @@ fn generatorentry_portal_runner(
 ///
 /// `bhimpl_jit_merge_point` raises `ContinueRunningNormally(*args)` as the
 /// six banks; `handle_jitexception` walks `portalfunc_ARGS` and calls
-/// `portal_ptr(*args)`. The extracted portal's reds are `root_base`,
-/// `items_slot`, and the `RootScope` cell — not `w_iterator`/`items`.
+/// `portal_ptr(*args)`. The extracted portal's reds are save_point,
+/// root_base, and items_slot — not `w_iterator`/`items`.
 /// Reload those pinned objects the portal function still takes.
 fn unpackiterable_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
@@ -10631,8 +10631,9 @@ fn unpackiterable_portal_runner(
         return Ok((BhReturnType::Void, 0));
     };
     let greenkey = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let root_base = args.red_int.first().copied().unwrap_or(0) as usize;
-    let items_slot = args.red_int.get(1).copied().unwrap_or(0) as usize;
+    // red_int[0] is save_point; the portal re-enters and push_roots again.
+    let root_base = args.red_int.get(1).copied().unwrap_or(0) as usize;
+    let items_slot = args.red_int.get(2).copied().unwrap_or(0) as usize;
     let w_iterator = pyre_object::gc_roots::shadow_stack_get(root_base);
     let items = pyre_object::gc_roots::shadow_stack_get(items_slot);
     assert!(

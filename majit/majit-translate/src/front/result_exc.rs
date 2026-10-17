@@ -795,7 +795,7 @@ fn lower_result_exc_returns_inner(
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
         // call otherwise. RootScope closes (`drop_in_place` or the named
-        // `root_scope_close` residual) and FrameAnchor closes are re-emitted
+        // `root_scope_close_word` residual) and FrameAnchor closes are re-emitted
         // at the raise site rather than left in a tail the rewrite bypasses.
         let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
             match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
@@ -4973,7 +4973,7 @@ fn describe_var_residence(graph: &FunctionGraph, r: &Variable) -> VarResidence {
 
 /// One block between a scoped call and its `Result::branch`.
 ///
-/// `with_roots` drops the guard before `?`, so `root_scope_close` (and the
+/// `with_roots` drops the guard before `?`, so `root_scope_close_word` (and the
 /// `RootScope::get` that restores the pointer) sits on the forward edge.
 /// The block does not read the `Result`; both the normal edge and the
 /// exception edge have to run it (`guessexception` still raises at the call).
@@ -5390,7 +5390,7 @@ fn is_transparent_result_hop(graph: &FunctionGraph, block: usize, tracked: &Vari
 /// [`is_transparent_result_hop`] without the single-predecessor requirement.
 ///
 /// `catch_and_rewrap` lands both rebuilt shells on the same `with_roots!`
-/// restore chain (`RootScope::get` / `root_scope_close`), so the first hop
+/// restore chain (`RootScope::get` / `root_scope_close_word`), so the first hop
 /// has two predecessors until [`collapse_rebuilt_shell_match`] splits it.
 /// `exceptiontransform.py` `ExceptionTransformer.transform_completely`
 /// keeps those post-call restores on both the normal and except edges.
@@ -6057,7 +6057,7 @@ fn rewire_one_call_site(
         )
     });
     let Some(branch_op_idx) = branch_op_idx else {
-        // `with_roots!(...)?` puts `RootScope::get` and `root_scope_close`
+        // `with_roots!(...)?` puts `RootScope::get` and `root_scope_close_word`
         // between the call and `Result::branch`. The immediate successor
         // is that hop, not the branch.
         if let Some(site) = walk_hops_to_question(graph, b, &r_b) {
@@ -6948,7 +6948,7 @@ fn arm_shell_vars_from_args(
 /// the handler on the `PyError`, which is the value `err.match` reads.
 ///
 /// `with_roots!(w_index => int_w(w_index))` puts `RootScope::get` /
-/// `root_scope_close` hops between the call and that match. Those hops
+/// `root_scope_close_word` hops between the call and that match. Those hops
 /// have to run on both edges (`exceptiontransform.py`
 /// `ExceptionTransformer.transform_completely`); a shared chain is split
 /// the way [`rewire_question_site`] replays hops for `?`.
@@ -18555,7 +18555,11 @@ mod merged_continue_tests {
         graph.push_op_var(
             merge,
             OpKind::Call {
-                target: CallTarget::function_path(["pyre_object", "gc_roots", "root_scope_close"]),
+                target: CallTarget::function_path([
+                    "pyre_object",
+                    "gc_roots",
+                    "root_scope_close_word",
+                ]),
                 args: crate::model::call_args(vec![merge_args[1].clone()]),
                 result_ty: ValueType::Void,
             },
@@ -18757,7 +18761,7 @@ mod merged_continue_tests {
     }
 
     /// `with_roots!(value => force(obj))?` lowers the guard's `get` and
-    /// `root_scope_close` between the call and a fused `branch` + discriminant
+    /// `root_scope_close_word` between the call and a fused `branch` + discriminant
     /// switch. Both edges run the hops; the `?` becomes `LastException`.
     #[test]
     fn question_through_restore_hops_and_fused_disc_becomes_exception_links() {
@@ -18795,7 +18799,7 @@ mod merged_continue_tests {
         graph.push_op_var(
             hop_close,
             OpKind::Call {
-                target: CallTarget::function_path(["root_scope_close"]),
+                target: CallTarget::function_path(["root_scope_close_word"]),
                 args: crate::model::call_args(vec![hop_close_args[0].clone()]),
                 result_ty: ValueType::Void,
             },
@@ -18944,7 +18948,7 @@ mod merged_continue_tests {
                 block
                     .operations
                     .iter()
-                    .any(|op| call_leaf(op, "root_scope_close"))
+                    .any(|op| call_leaf(op, "root_scope_close_word"))
             })
             .count();
         let gets = graph
@@ -18965,7 +18969,7 @@ mod merged_continue_tests {
                 block
                     .operations
                     .iter()
-                    .any(|op| call_leaf(op, "root_scope_close"))
+                    .any(|op| call_leaf(op, "root_scope_close_word"))
                     && block
                         .exits
                         .iter()
@@ -19052,7 +19056,7 @@ mod merged_continue_tests {
         graph.push_op_var(
             hop_close,
             OpKind::Call {
-                target: CallTarget::function_path(["root_scope_close"]),
+                target: CallTarget::function_path(["root_scope_close_word"]),
                 args: crate::model::call_args(vec![hop_close_args[0].clone()]),
                 result_ty: ValueType::Void,
             },
@@ -19199,7 +19203,7 @@ mod merged_continue_tests {
                 block
                     .operations
                     .iter()
-                    .any(|op| call_leaf(op, "root_scope_close"))
+                    .any(|op| call_leaf(op, "root_scope_close_word"))
                     && block.exits.iter().any(|link| link.target == cont)
             }),
             "the normal-edge close lands on the join"
@@ -19209,7 +19213,7 @@ mod merged_continue_tests {
                 block
                     .operations
                     .iter()
-                    .any(|op| call_leaf(op, "root_scope_close"))
+                    .any(|op| call_leaf(op, "root_scope_close_word"))
                     && block
                         .exits
                         .iter()

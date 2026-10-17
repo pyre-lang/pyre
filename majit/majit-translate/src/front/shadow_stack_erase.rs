@@ -46,8 +46,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
-    FunDecl, Operand, Place, PlaceKind, ProjectionElem, Rvalue, SpanRef, StmtKind, TermKind, TyRef,
-    Unstructured, UnwindKind,
+    FunDecl, Operand, Place, PlaceKind, ProjectionElem, Rvalue, SpanRef, Statement, StmtKind,
+    TermKind, TyRef, Unstructured, UnwindKind,
 };
 use serde_json::{Value, json};
 
@@ -65,9 +65,10 @@ enum Leaf {
     Get,
     Set,
     ReloadTop,
-    /// `shadow_stack_copy_range`. Erase rewrites a copy of a
-    /// [`Special::SliceBase`] as a no-op (the slice is the live array);
-    /// any other copy is Unmodeled.
+    /// `shadow_stack_copy_range`. A copy whose destination is the
+    /// published slice is a no-op (the slice is already the live array).
+    /// A copy into any other buffer is refused: dest would keep stale
+    /// words (`framework.py` `pop_roots` reloads the livevars).
     CopyRange,
     /// `shadow_stack_copy_range_into_vec`: a fresh Vec, not the aliased
     /// slice. Erase refuses the body.
@@ -163,6 +164,7 @@ fn classify_call(
         "pin_root" => Leaf::Pin,
         "pin_roots" | "publish_roots" => Leaf::Publish,
         "normalize_roots" => Leaf::Normalize,
+        "normalize_roots_moved" => Leaf::NormalizeMoved,
         "shadow_stack_len" => Leaf::Len,
         "shadow_stack_get" => Leaf::Get,
         "shadow_stack_set" => Leaf::Set,
@@ -193,9 +195,12 @@ enum Special {
     Index(usize),
     /// A checked-add pair whose `.0` is this offset.
     IndexPair(usize),
-    /// `pin_roots` / `publish_roots` of a live slice (parameter, field, or
-    /// local). The dest usize aliases that slice: `get(base + k)` is
-    /// `slice[k]`. Depth does not grow; Close does not rewind the slice.
+    /// `pin_roots` / `publish_roots` of an incoming `&[PyObjectRef]`
+    /// parameter (or a copy / reborrow / unsize of one). The dest usize
+    /// aliases that parameter: `get(base + k)` is `slice[k]`. A local
+    /// `Vec` buffer is not a GC object (`gcarray_from_pyobject_vec_jit_abi`);
+    /// those publishes are refused. Depth does not grow; Close does not
+    /// rewind the slice.
     SliceBase(usize),
     /// `base + k` of a [`Self::SliceBase`].
     SliceOffset { slice: usize, k: usize },
@@ -330,6 +335,41 @@ fn local_def_counts(body: &Unstructured, llbc: &Llbc, forward_blocks: &[bool]) -
                 }
                 StmtKind::StorageLive(_) | StmtKind::StorageDead(_) => {}
                 _ => {}
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) {
+            bump(&mut counts, place_local(&call.dest));
+        }
+    }
+    counts
+}
+
+/// Assignments of each local plus call destinations that write it.
+/// [`Special::SliceIndex`] stores this local number and the rewritten
+/// load re-reads it (`slice_offset_operand_json`); a second write
+/// (`slot = base + i; i += 1; get(slot)`) would index a different
+/// element than the slot `push_roots` published.
+fn local_assign_or_call_dest_counts(
+    body: &Unstructured,
+    llbc: &Llbc,
+    forward_blocks: &[bool],
+) -> Vec<u32> {
+    let n = body.locals.locals.len();
+    let mut counts = vec![0u32; n];
+    let bump = |counts: &mut [u32], l: Option<usize>| {
+        if let Some(l) = l
+            && let Some(c) = counts.get_mut(l)
+        {
+            *c = c.saturating_add(1);
+        }
+    };
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
+        for stmt in &block.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
+                bump(&mut counts, place_local(place));
             }
         }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) {
@@ -567,6 +607,7 @@ fn assert_is_slot_index_bounds_check(
 fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
     let mut classified: HashMap<usize, (Leaf, bool)> = HashMap::new();
     let forward_blocks = super::forward_reachable_mask(llbc, body);
     for (bb, block) in body.body.iter().enumerate() {
@@ -629,6 +670,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let slot_local = |k: usize| n_locals + k;
 
     let def_counts = local_def_counts(body, llbc, &forward_blocks);
+    let assign_counts = forward_assign_counts(body, &forward_blocks);
+    let index_assign_counts = local_assign_or_call_dest_counts(body, llbc, &forward_blocks);
     let single_def = |dest: usize| def_counts.get(dest).copied() == Some(1);
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
@@ -640,6 +683,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     depth_in[0] = Some(0);
     queue.push_back(0);
     let mut visited = vec![false; n_blocks];
+    let mut slice_set_sites: Vec<SliceSetSite> = Vec::new();
+    let mut slice_op_bbs: HashSet<usize> = HashSet::new();
     let reach = |depth_in: &mut Vec<Option<usize>>,
                  queue: &mut VecDeque<usize>,
                  target: u64,
@@ -861,6 +906,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 _ => None,
             };
             if let Some(special) = special {
+                match special {
+                    Special::SliceIndex { index, .. } | Special::SliceIndexPair { index, .. } => {
+                        if index_assign_counts.get(index).copied() != Some(1) {
+                            return Err("slice-index-reassigned");
+                        }
+                    }
+                    _ => {}
+                }
                 bind(&mut plan.specials, dest, special)?;
                 plan.removed.entry(bb).or_default().push(si);
             }
@@ -1014,9 +1067,22 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         } else {
                             let slice_local = resolve_published_slice_local(block, slice)
                                 .ok_or("publish-array-unresolved")?;
+                            // Only an incoming `&[T]` (and copies of it) is
+                            // already in the jitframe gcmap. A local `Vec`
+                            // buffer is not: `pop_roots` / `expand_pop_roots`
+                            // reloads livevars, not that buffer.
+                            let incoming = incoming_slice_root(
+                                body,
+                                slice_local,
+                                arg_count,
+                                &assign_counts,
+                                &forward_blocks,
+                            )
+                            .ok_or("publish-slice-not-incoming")?;
                             if let Some(dest) = dest {
-                                bind(&mut plan.specials, dest, Special::SliceBase(slice_local))?;
+                                bind(&mut plan.specials, dest, Special::SliceBase(incoming))?;
                             }
+                            slice_op_bbs.insert(bb);
                         }
                     }
                     Leaf::Normalize => {}
@@ -1029,6 +1095,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     }
                     Leaf::Get => {
                         if let Some(src) = slice_src(arg0) {
+                            slice_op_bbs.insert(bb);
                             let slice_ty = slice_ty_of(src.slice)?;
                             let elem_ty = dest_json
                                 .get("ty")
@@ -1055,6 +1122,14 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     }
                     Leaf::Set => {
                         if let Some(src) = slice_src(arg0) {
+                            slice_op_bbs.insert(bb);
+                            slice_set_sites.push(SliceSetSite {
+                                bb,
+                                succ: *target as usize,
+                                slice: src.slice,
+                                offset: src.offset,
+                                value_local: call.args.get(arg0 + 1).and_then(operand_local),
+                            });
                             let slice_ty = slice_ty_of(src.slice)?;
                             let value = &args_json[arg0 + 1];
                             let elem_ty = value
@@ -1093,8 +1168,28 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         ));
                     }
                     Leaf::CopyRange => {
-                        if slice_src(arg0).is_none() {
+                        let Some(src) = slice_src(arg0) else {
                             return Err("unmodeled-stack-op");
+                        };
+                        slice_op_bbs.insert(bb);
+                        // Identity only when dest aliases that published
+                        // incoming slice at offset 0. `copy_range(base,
+                        // &mut other)` is `expand_pop_roots` /
+                        // `gc_restore_root` of a distinct buffer.
+                        let dest_is_published = matches!(src.offset, SliceOff::Const(0))
+                            && call.args.get(arg0 + 1).and_then(operand_local).is_some_and(
+                                |dest| {
+                                    incoming_slice_root(
+                                        body,
+                                        dest,
+                                        arg_count,
+                                        &assign_counts,
+                                        &forward_blocks,
+                                    ) == Some(src.slice)
+                                },
+                            );
+                        if !dest_is_published {
+                            return Err("copy-range-dest-not-published-slice");
                         }
                     }
                     Leaf::Unmodeled
@@ -1195,15 +1290,91 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // answers a slot (`pin_self`: pin, then `shadow_stack_len() - 1`).
     // The Sub/Len statements that defined it are stripped as specials, and
     // `Return` does not mention local 0, so the rewritten body would return
-    // an unbound local. Callers keep that index (`from_slot`) and lower the
+    // an unbound local. A SliceBase / Offset / Index special is the same
+    // hole: the publish and the `base + i` are stripped, and local 0 is
+    // unbound. Callers keep that index (`from_slot`) and lower the
     // call as `getattr(recv, method)` (`CallTarget::Method`); a broken
     // callee graph blocks that getattr. Refuse: the Pin lives in the
     // caller's RootScope and is only erasable if the helper is inlined.
     if matches!(
         plan.specials.get(&0),
-        Some(Special::Index(_) | Special::IndexPair(_))
+        Some(
+            Special::Index(_)
+                | Special::IndexPair(_)
+                | Special::SliceBase(_)
+                | Special::SliceOffset { .. }
+                | Special::SliceIndex { .. }
+                | Special::SliceOffsetPair { .. }
+                | Special::SliceIndexPair { .. }
+        )
     ) {
         return Err("returns-slot-index");
+    }
+
+    // `shadow_stack_set` publishes into a root slot (`push_roots` copied
+    // the source word there). Rewriting it as `slice[k] = v` mutates the
+    // source; a later mention of that parameter would see the new word
+    // before `pop_roots` / `expand_pop_roots` (`gc_restore_root`) copy
+    // the slot back. A body that mirrors every alias Set with
+    // `slice[idx] = v` of the same value keeps source == roots, so later
+    // reads (and calls) of the incoming slice stay equivalent. An
+    // unmirrored Set still refuses a later source mention.
+    if !slice_set_sites.is_empty() {
+        let (copy_src, const_of) = unique_use_origins(body, llbc, &forward_blocks);
+        let mut mirrored_stmts: HashSet<(usize, usize)> = HashSet::new();
+        let mut unmirrored = false;
+        for site in &slice_set_sites {
+            match find_mirror_store(
+                body,
+                llbc,
+                site,
+                &copy_src,
+                &const_of,
+                &forward_blocks,
+                &visited,
+            ) {
+                Some(loc) => {
+                    mirrored_stmts.insert(loc);
+                }
+                None => unmirrored = true,
+            }
+        }
+        if unmirrored {
+            let mut watched = bit_set::BitSet::new();
+            for site in &slice_set_sites {
+                watched.insert(site.slice);
+            }
+            for (bb, block) in body.body.iter().enumerate() {
+                if !forward_blocks[bb] {
+                    continue;
+                }
+                if !visited[bb] {
+                    continue;
+                }
+                for (si, stmt) in block.statements.iter().enumerate() {
+                    if mirrored_stmts.contains(&(bb, si)) {
+                        continue;
+                    }
+                    if matches!(
+                        stmt.stmt_kind_ref(),
+                        Ok(StmtKind::StorageLive(_)
+                            | StmtKind::StorageDead(_)
+                            | StmtKind::Borrowck(_))
+                    ) {
+                        continue;
+                    }
+                    if super::mentions_local(stmt.kind_value(), &watched) {
+                        return Err("set-slice-source-read");
+                    }
+                }
+                if slice_op_bbs.contains(&bb) {
+                    continue;
+                }
+                if super::mentions_local(block.terminator.kind_value(), &watched) {
+                    return Err("set-slice-source-read");
+                }
+            }
+        }
     }
 
     // Every surviving mention of a guard, borrow or index has to be one of the
@@ -1348,9 +1519,94 @@ fn resolve_published_array(
     None
 }
 
+/// Locals `1..=arg_count` are the body's incoming arguments (local 0 is
+/// the return place).
+fn is_incoming_arg(local: usize, arg_count: usize) -> bool {
+    local >= 1 && local <= arg_count
+}
+
+/// Assignments of a bare local in forward blocks. Mut borrows and call
+/// destinations are not counted: those are not the copy/reborrow chain
+/// from an incoming `&[T]` (`pin_roots_incoming_slice`).
+fn forward_assign_counts(body: &Unstructured, forward_blocks: &[bool]) -> Vec<u32> {
+    let n = body.locals.locals.len();
+    let mut counts = vec![0u32; n];
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks.get(bb).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let Some(l) = place_local(place)
+                && let Some(c) = counts.get_mut(l)
+            {
+                *c = c.saturating_add(1);
+            }
+        }
+    }
+    counts
+}
+
+/// Walk copies, unsizing casts and reborrows of `local` to the incoming
+/// `&[T]` parameter they alias, if any.
+///
+/// rustc moves a slice argument into a fresh temporary before
+/// `pin_roots`; that temp is still the jitframe-rooted list. A local
+/// `Vec` buffer is a different allocation: `push_roots` copies its
+/// words onto the shadow stack and `pop_roots` / `expand_pop_roots`
+/// (`gc_restore_root`) write them back into livevars, not into that
+/// buffer.
+fn incoming_slice_root(
+    body: &Unstructured,
+    mut local: usize,
+    arg_count: usize,
+    assign_counts: &[u32],
+    forward_blocks: &[bool],
+) -> Option<usize> {
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(local) {
+            return None;
+        }
+        let assigns = assign_counts.get(local).copied().unwrap_or(0);
+        if assigns == 0 {
+            return is_incoming_arg(local, arg_count).then_some(local);
+        }
+        if assigns != 1 {
+            return None;
+        }
+        let mut next = None;
+        'blocks: for (bb, block) in body.body.iter().enumerate() {
+            if !forward_blocks.get(bb).copied().unwrap_or(false) {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                if place_local(place) != Some(local) {
+                    continue;
+                }
+                next = match rvalue {
+                    Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
+                        operand_local(op)
+                    }
+                    Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+                        place_local(src).or_else(|| deref_of_local(src))
+                    }
+                    _ => None,
+                };
+                break 'blocks;
+            }
+        }
+        local = next?;
+    }
+}
+
 /// Follow a published slice through copies, reborrows and unsizing in this
 /// block. Unlike [`resolve_published_array`], a non-literal slice (incoming
-/// `&[T]`, a field, a local `Vec`) is the answer: erase aliases that local.
+/// `&[T]`, or a copy of one) is the answer: [`incoming_slice_root`] then
+/// checks that it aliases a parameter.
 fn resolve_published_slice_local(
     block: &majit_charon_reader::ullbc::BasicBlock,
     slice: Option<usize>,
@@ -1382,9 +1638,19 @@ struct SliceSrc {
     offset: SliceOff,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SliceOff {
     Const(usize),
     Local(usize),
+}
+
+/// One `shadow_stack_set` whose slot is a published incoming slice.
+struct SliceSetSite {
+    bb: usize,
+    succ: usize,
+    slice: usize,
+    offset: SliceOff,
+    value_local: Option<usize>,
 }
 
 fn slice_offset_operand_json(src: &SliceSrc, ty: &Value) -> Value {
@@ -1407,6 +1673,367 @@ fn index_place_json(slice: usize, slice_ty: &Value, offset: Value, elem_ty: &Val
         },
         "ty": elem_ty
     })
+}
+
+/// Unique `Use(Copy/Move(src))` and `Use(Const k)` origins of each local.
+/// A second assign or a call destination is not a copy.
+fn unique_use_origins(
+    body: &Unstructured,
+    llbc: &Llbc,
+    forward_blocks: &[bool],
+) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let n = body.locals.locals.len();
+    let mut counts = vec![0u32; n];
+    let mut copy_src = vec![None; n];
+    let mut const_of = vec![None; n];
+    let mut call_dest = vec![false; n];
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks.get(bb).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let Some(l) = place_local(place) else {
+                continue;
+            };
+            if l >= n {
+                continue;
+            }
+            counts[l] = counts[l].saturating_add(1);
+            if counts[l] == 1 {
+                match rvalue {
+                    Rvalue::Use(op, _) => {
+                        copy_src[l] = operand_local(op);
+                        const_of[l] = const_usize(op, llbc);
+                    }
+                    _ => {
+                        copy_src[l] = None;
+                        const_of[l] = None;
+                    }
+                }
+            } else {
+                copy_src[l] = None;
+                const_of[l] = None;
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
+            && let Some(l) = place_local(&call.dest)
+            && l < n
+        {
+            call_dest[l] = true;
+        }
+    }
+    for l in 0..n {
+        if call_dest[l] || counts[l] != 1 {
+            copy_src[l] = None;
+            const_of[l] = None;
+        }
+    }
+    (copy_src, const_of)
+}
+
+fn peel_copy_src(copy_src: &[Option<usize>], mut local: usize) -> usize {
+    let mut seen = HashSet::new();
+    while seen.insert(local) {
+        match copy_src.get(local).copied().flatten() {
+            Some(src) => local = src,
+            None => break,
+        }
+    }
+    local
+}
+
+/// `(*slice)[offset]` with `from_end` false, the rustc spelling of `slice[idx] = v`.
+fn index_dest_slice_and_offset(place: &Place) -> Option<(usize, Operand)> {
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(elem)) = &place.kind else {
+        return None;
+    };
+    let index = elem.get("Index")?;
+    if index.get("from_end").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let offset = serde_json::from_value(index.get("offset")?.clone()).ok()?;
+    let slice = deref_of_local(inner)?;
+    Some((slice, offset))
+}
+
+fn ptr_metadata_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, ProjectionElem::Atom(elem)) = &place.kind else {
+        return None;
+    };
+    (elem == "PtrMetadata")
+        .then(|| place_local(inner).or_else(|| deref_of_local(inner)))
+        .flatten()
+}
+
+fn binop_is_lt(op: &Value) -> bool {
+    match op {
+        Value::String(s) => s == "Lt",
+        Value::Object(m) => m.contains_key("Lt"),
+        _ => false,
+    }
+}
+
+fn operand_offset_matches(
+    offset: &Operand,
+    want: SliceOff,
+    copy_src: &[Option<usize>],
+    const_of: &[Option<usize>],
+    llbc: &Llbc,
+) -> bool {
+    match want {
+        SliceOff::Const(k) => {
+            if const_usize(offset, llbc) == Some(k) {
+                return true;
+            }
+            let Some(l) = operand_local(offset) else {
+                return false;
+            };
+            let p = peel_copy_src(copy_src, l);
+            const_of.get(p).copied().flatten() == Some(k)
+                || const_of.get(l).copied().flatten() == Some(k)
+        }
+        SliceOff::Local(idx) => operand_local(offset)
+            .is_some_and(|l| peel_copy_src(copy_src, l) == peel_copy_src(copy_src, idx)),
+    }
+}
+
+fn is_mirror_index_store(
+    stmt: &Statement,
+    site: &SliceSetSite,
+    copy_src: &[Option<usize>],
+    const_of: &[Option<usize>],
+    llbc: &Llbc,
+) -> bool {
+    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+        return false;
+    };
+    let Rvalue::Use(value_op, _) = rvalue else {
+        return false;
+    };
+    let Some((slice, offset_op)) = index_dest_slice_and_offset(place) else {
+        return false;
+    };
+    if slice != site.slice {
+        return false;
+    }
+    let Some(value_local) = site.value_local else {
+        return false;
+    };
+    let value_ok = operand_local(value_op)
+        .is_some_and(|l| peel_copy_src(copy_src, l) == peel_copy_src(copy_src, value_local));
+    value_ok && operand_offset_matches(&offset_op, site.offset, copy_src, const_of, llbc)
+}
+
+fn place_is_incoming_slice(place: &Place, slice: usize) -> bool {
+    place_local(place) == Some(slice) || deref_of_local(place) == Some(slice)
+}
+
+/// rustc's slice-index bounds-check preamble: copies of the value/index,
+/// `RawPtr` of `Deref(slice)`, `PtrMetadata`, `Lt`.
+fn is_mirror_preamble(
+    stmt: &Statement,
+    slice: usize,
+    value_root: Option<usize>,
+    index_root: Option<usize>,
+    temps: &mut HashSet<usize>,
+    copy_src: &[Option<usize>],
+) -> bool {
+    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+        return false;
+    };
+    let dest = place_local(place);
+    let mark = |temps: &mut HashSet<usize>| {
+        if let Some(d) = dest {
+            temps.insert(d);
+        }
+        true
+    };
+    match rvalue {
+        Rvalue::Use(op, _) => {
+            if let Some(src) = operand_local(op) {
+                let p = peel_copy_src(copy_src, src);
+                if value_root == Some(p)
+                    || index_root == Some(p)
+                    || temps.contains(&src)
+                    || temps.contains(&p)
+                {
+                    return mark(temps);
+                }
+            }
+            if let Operand::Copy(p) | Operand::Move(p) = op
+                && let Some(base) = ptr_metadata_local(p)
+                && (base == slice || temps.contains(&base))
+            {
+                return mark(temps);
+            }
+            false
+        }
+        Rvalue::RawPtr {
+            place: src, kind, ..
+        }
+        | Rvalue::Ref {
+            place: src, kind, ..
+        } if !ref_kind_mutates(kind) && place_is_incoming_slice(src, slice) => mark(temps),
+        Rvalue::Len(src) if place_is_incoming_slice(src, slice) => mark(temps),
+        Rvalue::BinaryOp(op, _, _) if binop_is_lt(op) => mark(temps),
+        _ => false,
+    }
+}
+
+fn stmt_mentions_slice(stmt: &Statement, slice: usize) -> bool {
+    let mut watched = bit_set::BitSet::new();
+    watched.insert(slice);
+    super::mentions_local(stmt.kind_value(), &watched)
+}
+
+enum MirrorScan {
+    Found(usize),
+    Stop,
+    Miss,
+}
+
+fn scan_block_for_mirror(
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    site: &SliceSetSite,
+    copy_src: &[Option<usize>],
+    const_of: &[Option<usize>],
+    llbc: &Llbc,
+    reverse: bool,
+    temps: &mut HashSet<usize>,
+) -> MirrorScan {
+    let value_root = site.value_local.map(|l| peel_copy_src(copy_src, l));
+    let index_root = match site.offset {
+        SliceOff::Local(idx) => Some(peel_copy_src(copy_src, idx)),
+        SliceOff::Const(_) => None,
+    };
+    let n = block.statements.len();
+    let indices: Vec<usize> = if reverse {
+        (0..n).rev().collect()
+    } else {
+        (0..n).collect()
+    };
+    for si in indices {
+        let stmt = &block.statements[si];
+        if matches!(
+            stmt.stmt_kind_ref(),
+            Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_))
+        ) {
+            continue;
+        }
+        if is_mirror_index_store(stmt, site, copy_src, const_of, llbc) {
+            return MirrorScan::Found(si);
+        }
+        if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+            && let Some(dest) = place_local(place)
+            && (value_root == Some(dest) || index_root == Some(dest))
+        {
+            return MirrorScan::Stop;
+        }
+        if is_mirror_preamble(stmt, site.slice, value_root, index_root, temps, copy_src) {
+            continue;
+        }
+        if stmt_mentions_slice(stmt, site.slice) {
+            return MirrorScan::Stop;
+        }
+    }
+    MirrorScan::Miss
+}
+
+fn unique_linear_pred(
+    body: &Unstructured,
+    llbc: &Llbc,
+    dest_bb: usize,
+    forward_blocks: &[bool],
+    visited: &[bool],
+) -> Option<usize> {
+    let mut found = None;
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks.get(bb).copied().unwrap_or(false) {
+            continue;
+        }
+        if !visited.get(bb).copied().unwrap_or(false) {
+            continue;
+        }
+        let hits = match block.term_ref(llbc) {
+            Ok(TermKind::Goto { target }) => *target as usize == dest_bb,
+            Ok(TermKind::Assert { target, .. }) => *target as usize == dest_bb,
+            _ => false,
+        };
+        if hits {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(bb);
+        }
+    }
+    found
+}
+
+fn unique_goto_or_assert_succ(
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    llbc: &Llbc,
+) -> Option<usize> {
+    match block.term_ref(llbc) {
+        Ok(TermKind::Goto { target }) => Some(*target as usize),
+        Ok(TermKind::Assert { target, .. }) => Some(*target as usize),
+        _ => None,
+    }
+}
+
+/// A slice-alias Set is mirrored when `slice[idx] = value` of the same
+/// operands sits in the Set block or immediately across its Goto/Assert
+/// boundary. rustc emits the Set as a Call terminator, then a BoundsCheck
+/// Assert (`RawPtr` of `Deref(slice)` + `PtrMetadata` + `Lt`), then the
+/// Index store; each side's temps are fresh copies of the same sources
+/// (`match_signature`).
+fn find_mirror_store(
+    body: &Unstructured,
+    llbc: &Llbc,
+    site: &SliceSetSite,
+    copy_src: &[Option<usize>],
+    const_of: &[Option<usize>],
+    forward_blocks: &[bool],
+    visited: &[bool],
+) -> Option<(usize, usize)> {
+    let scan = |bb: usize, reverse: bool, temps: &mut HashSet<usize>| -> MirrorScan {
+        let Some(block) = body.body.get(bb) else {
+            return MirrorScan::Miss;
+        };
+        scan_block_for_mirror(block, site, copy_src, const_of, llbc, reverse, temps)
+    };
+    let mut before_temps = HashSet::new();
+    if let MirrorScan::Found(si) = scan(site.bb, true, &mut before_temps) {
+        return Some((site.bb, si));
+    }
+    if let Some(pred) = unique_linear_pred(body, llbc, site.bb, forward_blocks, visited) {
+        let mut pred_temps = HashSet::new();
+        if let MirrorScan::Found(si) = scan(pred, true, &mut pred_temps) {
+            return Some((pred, si));
+        }
+    }
+    let mut bb = site.succ;
+    let mut temps = HashSet::new();
+    for _ in 0..6 {
+        if bb >= body.body.len() {
+            break;
+        }
+        if !forward_blocks.get(bb).copied().unwrap_or(false) {
+            break;
+        }
+        match scan(bb, false, &mut temps) {
+            MirrorScan::Found(si) => return Some((bb, si)),
+            MirrorScan::Stop => return None,
+            MirrorScan::Miss => {}
+        }
+        match unique_goto_or_assert_succ(&body.body[bb], llbc) {
+            Some(next) => bb = next,
+            None => break,
+        }
+    }
+    None
 }
 
 /// Rewrite `fd`'s body with its root brackets scalar-replaced.
@@ -1923,7 +2550,8 @@ struct StackWalk {
     /// Parameter positions this body uses as shadow-stack indices.
     param_slots: Vec<u8>,
     /// Every reachable `Return` yields a local-0 own index (the value
-    /// itself or a struct field) with a lower bound relative to entry.
+    /// itself, a struct field, or a slice-derived index in `slice_bases`)
+    /// with a lower bound relative to entry.
     returns_index: bool,
 }
 
@@ -2031,6 +2659,8 @@ fn stack_walk(
     let mut field_params: HashMap<(usize, u64), u8> = HashMap::new();
     let mut slice_bases: HashSet<usize> = HashSet::new();
     let arg_count = body.locals.arg_count as usize;
+    let forward_blocks = super::forward_reachable_mask(llbc, body);
+    let assign_counts = forward_assign_counts(body, &forward_blocks);
     for i in 1..=arg_count {
         if let Ok(p) = u8::try_from(i - 1) {
             params.insert(i, p);
@@ -2198,6 +2828,8 @@ fn stack_walk(
                             operand_local(op).and_then(|l| params.get(&l).copied())
                         {
                             params.insert(dest, p);
+                        } else if operand_local(op).is_some_and(|l| slice_bases.contains(&l)) {
+                            slice_bases.insert(dest);
                         }
                     }
                 }
@@ -2345,9 +2977,20 @@ fn stack_walk(
                                         indices.insert(dest, depth);
                                     }
                                     depth = depth.add(n);
-                                } else if resolve_published_slice_local(block, slice).is_some() {
-                                    // Incoming / field slice: dest aliases that
-                                    // slice. Depth does not grow.
+                                } else if resolve_published_slice_local(block, slice)
+                                    .and_then(|l| {
+                                        incoming_slice_root(
+                                            body,
+                                            l,
+                                            arg_count,
+                                            &assign_counts,
+                                            &forward_blocks,
+                                        )
+                                    })
+                                    .is_some()
+                                {
+                                    // Incoming slice parameter: dest aliases
+                                    // that slice. Depth does not grow.
                                     if let Some(dest) = place_local(&call.dest) {
                                         slice_bases.insert(dest);
                                     }
@@ -2479,10 +3122,20 @@ fn stack_walk(
                 }
             },
             Ok(TermKind::Return) => {
+                // `indices` / `field_indices` are Len/Base/array-publish
+                // slot offsets. Incoming-slice aliases live in
+                // `slice_bases` (SliceBase / Offset / Index). A Return of
+                // one is the same "answers a slot index" fact: the caller
+                // would keep that index and the rewritten callee would
+                // leave local 0 unbound (`returns-slot-index`). Struct
+                // fields are not in `slice_bases`; a field of local 0
+                // carrying a slice index is therefore invisible here, so
+                // that helper is not classified `returns_index`.
                 let this_returns_index = indices.get(&0).is_some_and(|d| d.lower_bound().is_some())
                     || field_indices
                         .iter()
-                        .any(|((l, _), d)| *l == 0 && d.lower_bound().is_some());
+                        .any(|((l, _), d)| *l == 0 && d.lower_bound().is_some())
+                    || slice_bases.contains(&0);
                 returns_index = Some(returns_index.unwrap_or(true) && this_returns_index);
                 note_exit(
                     depth,
@@ -3124,7 +3777,7 @@ mod tests {
         }
     }
 
-    /// `pin_roots` of an incoming slice (parameter / field), not a same-block
+    /// `pin_roots` of an incoming slice parameter, not a same-block
     /// array literal. Erase aliases that local as [`Special::SliceBase`].
     #[test]
     fn erase_accepts_pin_roots_of_incoming_slice() {
@@ -3187,6 +3840,240 @@ mod tests {
             Ok(Some(_)) => {}
             Ok(None) => panic!("expected accepted erase, got no bracket"),
             Err(reason) => panic!("expected accepted erase of incoming-slice pin, got {reason}"),
+        }
+    }
+
+    /// rustc copies a slice argument into a fresh temporary before
+    /// `pin_roots`. That temp still aliases the jitframe-rooted parameter.
+    #[test]
+    fn erase_accepts_pin_roots_of_copy_of_incoming_slice() {
+        let ty = json!({"Deduplicated": 0});
+        let place = |i: u64| json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64| json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let stmt = |kind: Value| json!({"span": span(), "kind": kind});
+        let bb = |statements: Vec<Value>, kind: Value| {
+            json!({
+                "statements": statements,
+                "terminator": {"span": span(), "kind": kind},
+                "is_cleanup": false
+            })
+        };
+        let call = |fun: u64, args: Vec<Value>, dest: u64, target: u64, on_unwind: u64| {
+            json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": on_unwind
+            }})
+        };
+        let copy_arg = json!({"Assign": [
+            place(4),
+            {"Use": [{"Copy": place(1)}, "Yes"]}
+        ]});
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": (0..6).map(local).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(vec![stmt(copy_arg)], call(1, vec![], 2, 1, 3)),
+                bb(vec![], call(2, vec![json!({"Copy": place(4)})], 3, 2, 3)),
+                bb(vec![], json!("UndefinedBehavior")),
+                bb(vec![], json!("UnwindResume"))
+            ]
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(
+                        3,
+                        &["pyre_object", "celldict", "write_cell"],
+                        json!({ "Unstructured": unstructured })
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let fd = llbc.fn_by_id(3).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => {
+                panic!("expected accepted erase of copied incoming-slice pin, got {reason}")
+            }
+        }
+    }
+
+    /// `pin_roots` of a local `Vec` (not a parameter). The vec buffer is
+    /// not a GC object; erase must keep the real copy onto the shadow stack.
+    #[test]
+    fn erase_refuses_pin_roots_of_local_vec() {
+        let ty = json!({"Deduplicated": 0});
+        let place = |i: u64| json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64| json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let bb = |kind: Value| {
+            json!({
+                "statements": [],
+                "terminator": {"span": span(), "kind": kind},
+                "is_cleanup": false
+            })
+        };
+        let call = |fun: u64, args: Vec<Value>, dest: u64, target: u64, on_unwind: u64| {
+            json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": on_unwind
+            }})
+        };
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": (0..5).map(local).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(call(1, vec![], 2, 1, 3)),
+                bb(call(2, vec![json!({"Copy": place(4)})], 3, 2, 3)),
+                bb(json!("UndefinedBehavior")),
+                bb(json!("UnwindResume"))
+            ]
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(
+                        3,
+                        &["pyre_object", "celldict", "write_cell"],
+                        json!({ "Unstructured": unstructured })
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let fd = llbc.fn_by_id(3).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Err("publish-slice-not-incoming") => {}
+            other => panic!("expected publish-slice-not-incoming, got {other:?}"),
+        }
+    }
+
+    fn copy_range_llbc(dest_local: u64) -> Llbc {
+        let ty = json!({"Deduplicated": 0});
+        let place = |i: u64| json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64| json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let bb = |kind: Value| {
+            json!({
+                "statements": [],
+                "terminator": {"span": span(), "kind": kind},
+                "is_cleanup": false
+            })
+        };
+        let call = |fun: u64, args: Vec<Value>, dest: u64, target: u64, on_unwind: u64| {
+            json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": on_unwind
+            }})
+        };
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": (0..8).map(local).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(call(1, vec![], 2, 1, 4)),
+                bb(call(2, vec![json!({"Copy": place(1)})], 3, 2, 4)),
+                bb(call(
+                    3,
+                    vec![json!({"Copy": place(3)}), json!({"Copy": place(dest_local)})],
+                    5,
+                    3,
+                    4
+                )),
+                bb(json!("UndefinedBehavior")),
+                bb(json!("UnwindResume"))
+            ]
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(
+                        3,
+                        &["pyre_object", "gc_roots", "shadow_stack_copy_range"],
+                        json!("Opaque")
+                    ),
+                    opaque_fun(
+                        4,
+                        &["pyre_object", "celldict", "write_cell"],
+                        json!({ "Unstructured": unstructured })
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    /// `copy_range` onto the published incoming slice is identity after
+    /// erase: the slice is already the live array.
+    #[test]
+    fn erase_accepts_copy_range_onto_published_slice() {
+        let llbc = copy_range_llbc(1);
+        let fd = llbc.fn_by_id(4).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted copy_range onto the slice, got {reason}"),
+        }
+    }
+
+    /// `copy_range` into a distinct buffer is the pop_roots reload. Erase
+    /// must keep it: a no-op leaves dest holding stale words.
+    #[test]
+    fn erase_refuses_copy_range_dest_not_published_slice() {
+        let llbc = copy_range_llbc(4);
+        let fd = llbc.fn_by_id(4).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Err("copy-range-dest-not-published-slice") => {}
+            other => panic!("expected copy-range-dest-not-published-slice, got {other:?}"),
         }
     }
 
@@ -4145,10 +5032,10 @@ mod tests {
                 bb(call_fun(1, vec![], 2, 1)),
                 bb(call_fun(6, vec![copy(1)], 3, 2)),
                 bb_stmts(
-                    vec![assign_local(
-                        5,
-                        json!({"BinaryOp": ["AddChecked", copy(3), copy(4)]}),
-                    )],
+                    vec![
+                        assign_local(4, json!({"Use": [usize_lit(0), "Yes"]})),
+                        assign_local(5, json!({"BinaryOp": ["AddChecked", copy(3), copy(4)]})),
+                    ],
                     json!({"Goto": {"target": 3}}),
                 ),
                 bb_stmts(
@@ -4220,5 +5107,279 @@ mod tests {
             assert_is_slot_index_bounds_check(&assert, &specials, &HashMap::new(), &fixture_llbc()),
             "index 0 of a 3-slot erased array is true by construction"
         );
+    }
+
+    fn slice_ops_llbc() -> Llbc {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "shadow_stack_set"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    fn slice_index_get_body(reassign_index: bool) -> Unstructured {
+        let copy = |i| json!({"Copy": place(i)});
+        let mut stmts = vec![
+            assign_local(4, json!({"Use": [usize_lit(0), "Yes"]})),
+            assign_local(5, json!({"BinaryOp": ["Add", copy(3), copy(4)]})),
+        ];
+        if reassign_index {
+            stmts.push(assign_local(4, json!({"Use": [usize_lit(1), "Yes"]})));
+        }
+        body_of_args(
+            1,
+            7,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(2, vec![copy(1)], 3, 2)),
+                bb_stmts(stmts, call_fun(3, vec![copy(5)], 6, 3)),
+                bb(drop_local(2, 4)),
+                bb(json!("Return")),
+            ],
+        )
+    }
+
+    /// `SliceIndex` stores the index local number; the rewritten load
+    /// re-reads it. A second assign (`i += 1`) would pick a different
+    /// element than the slot `push_roots` published.
+    #[test]
+    fn erase_refuses_slice_index_when_index_local_is_reassigned() {
+        let llbc = slice_ops_llbc();
+        match analyze(&slice_index_get_body(true), &llbc) {
+            Err("slice-index-reassigned") => {}
+            Ok(Some(_)) => panic!("expected slice-index-reassigned, got accepted"),
+            Ok(None) => panic!("expected slice-index-reassigned, got no bracket"),
+            Err(reason) => panic!("expected slice-index-reassigned, got {reason}"),
+        }
+        match analyze(&slice_index_get_body(false), &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                panic!("expected accepted erase of single-assign SliceIndex, got no bracket")
+            }
+            Err(reason) => {
+                panic!("expected accepted erase of single-assign SliceIndex, got {reason}")
+            }
+        }
+    }
+
+    /// Returning the `pin_roots` dest (a `SliceBase`) strips its
+    /// assignment and leaves local 0 unbound, the same hole as
+    /// `pin_self`'s `len - 1`.
+    #[test]
+    fn erase_refuses_returning_a_slice_derived_index() {
+        let llbc = slice_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of_args(
+            1,
+            2,
+            vec![bb(call_fun(2, vec![copy(1)], 0, 1)), bb(json!("Return"))],
+        );
+        match analyze(&body, &llbc) {
+            Err("returns-slot-index") => {}
+            Ok(Some(_)) => panic!("expected returns-slot-index, got accepted"),
+            Ok(None) => panic!("expected returns-slot-index, got no bracket"),
+            Err(reason) => panic!("expected returns-slot-index, got {reason}"),
+        }
+        let walk = stack_walk(&body, &llbc, &|_| CalleeEffect::none());
+        assert!(
+            walk.returns_index,
+            "a helper that returns a SliceBase dest is returns_index: {:?}",
+            walk.effect()
+        );
+    }
+
+    fn slice_set_body(mention_source: bool) -> Unstructured {
+        let copy = |i| json!({"Copy": place(i)});
+        let set = call_fun(4, vec![copy(3), copy(5)], 6, 3);
+        let stmts = if mention_source {
+            vec![assign_local(4, json!({"Use": [copy(1), "Yes"]}))]
+        } else {
+            vec![]
+        };
+        body_of_args(
+            1,
+            7,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(2, vec![copy(1)], 3, 2)),
+                bb_stmts(stmts, set),
+                bb(drop_local(2, 4)),
+                bb(json!("Return")),
+            ],
+        )
+    }
+
+    /// `shadow_stack_set` through a slice alias becomes `slice[k] = v`.
+    /// A remaining mention of the incoming slice would see that write
+    /// before `pop_roots` copies the root slot back.
+    #[test]
+    fn erase_refuses_set_through_slice_when_source_is_mentioned() {
+        let llbc = slice_ops_llbc();
+        match analyze(&slice_set_body(true), &llbc) {
+            Err("set-slice-source-read") => {}
+            Ok(Some(_)) => panic!("expected set-slice-source-read, got accepted"),
+            Ok(None) => panic!("expected set-slice-source-read, got no bracket"),
+            Err(reason) => panic!("expected set-slice-source-read, got {reason}"),
+        }
+        match analyze(&slice_set_body(false), &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase of Set through slice, got no bracket"),
+            Err(reason) => panic!("expected accepted erase of Set through slice, got {reason}"),
+        }
+        match analyze(&slice_index_get_body(false), &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase of incoming-slice Get, got no bracket"),
+            Err(reason) => panic!("expected accepted erase of incoming-slice Get, got {reason}"),
+        }
+    }
+
+    fn deref_place(local: u64) -> Value {
+        json!({"kind": {"Projection": [place(local), "Deref"]}, "ty": ty()})
+    }
+
+    fn index_place(slice: u64, offset: Value) -> Value {
+        json!({
+            "kind": {
+                "Projection": [
+                    deref_place(slice),
+                    {"Index": {"offset": offset, "from_end": false}}
+                ]
+            },
+            "ty": ty()
+        })
+    }
+
+    fn assign_place(dest: Value, rvalue: Value) -> Value {
+        json!({
+            "kind": {"Assign": [dest, rvalue]},
+            "comments_before": [],
+            "span": span()
+        })
+    }
+
+    fn pair_field(local: u64, field: u64) -> Value {
+        json!({"kind": {"Projection": [place(local), {"Field": [null, field]}]}, "ty": ty()})
+    }
+
+    /// `shadow_stack_set(base + i, v)` paired with `slice[i] = v` of the
+    /// same value: rustc's Call / BoundsCheck / Index-store split, with
+    /// fresh copies of the value and index on each side. A later mention
+    /// of the incoming slice is then a no-op against the roots.
+    #[test]
+    fn erase_accepts_mirrored_set_through_slice_when_source_is_mentioned() {
+        let llbc = slice_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let ptr_meta =
+            |local: u64| json!({"kind": {"Projection": [place(local), "PtrMetadata"]}, "ty": ty()});
+        let body = body_of_args(
+            1,
+            16,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(2, vec![copy(1)], 3, 2)),
+                bb_stmts(
+                    vec![
+                        assign_local(4, json!({"Use": [usize_lit(0), "Yes"]})),
+                        assign_local(6, json!({"BinaryOp": ["AddChecked", copy(3), copy(4)]})),
+                    ],
+                    json!({"Goto": {"target": 3}}),
+                ),
+                bb_stmts(
+                    vec![
+                        assign_local(7, json!({"Use": [{"Move": pair_field(6, 0)}, "Yes"]})),
+                        assign_local(8, json!({"Use": [copy(5), "Yes"]})),
+                    ],
+                    call_fun(4, vec![copy(7), copy(8)], 15, 4),
+                ),
+                bb_stmts(
+                    vec![
+                        assign_local(9, json!({"Use": [copy(5), "Yes"]})),
+                        assign_local(10, json!({"Use": [copy(4), "Yes"]})),
+                        assign_local(
+                            11,
+                            json!({"RawPtr": {
+                                "place": deref_place(1),
+                                "kind": "Shared",
+                                "ptr_metadata": {"Copy": ptr_meta(1)}
+                            }}),
+                        ),
+                        assign_local(12, json!({"Use": [{"Copy": ptr_meta(11)}, "Yes"]})),
+                        assign_local(13, json!({"BinaryOp": ["Lt", copy(10), copy(12)]})),
+                    ],
+                    json!({"Assert": {
+                        "assert": {
+                            "cond": {"Copy": place(13)},
+                            "expected": true,
+                            "check_kind": {"BoundsCheck": {
+                                "len": {"Copy": place(12)},
+                                "index": {"Copy": place(10)}
+                            }}
+                        },
+                        "target": 5,
+                        "on_unwind": 99
+                    }}),
+                ),
+                bb_stmts(
+                    vec![
+                        assign_place(
+                            index_place(1, copy(10)),
+                            json!({"Use": [{"Move": place(9)}, "Yes"]}),
+                        ),
+                        assign_local(14, json!({"Use": [copy(1), "Yes"]})),
+                    ],
+                    json!({"Goto": {"target": 6}}),
+                ),
+                bb(drop_local(2, 7)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase of mirrored Set, got no bracket"),
+            Err(reason) => panic!("expected accepted erase of mirrored Set, got {reason}"),
+        }
+
+        let const_mirror = body_of_args(
+            1,
+            8,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(2, vec![copy(1)], 3, 2)),
+                bb(call_fun(4, vec![copy(3), copy(5)], 6, 3)),
+                bb_stmts(
+                    vec![
+                        assign_place(
+                            index_place(1, usize_lit(0)),
+                            json!({"Use": [copy(5), "Yes"]}),
+                        ),
+                        assign_local(4, json!({"Use": [copy(1), "Yes"]})),
+                    ],
+                    json!({"Goto": {"target": 4}}),
+                ),
+                bb(drop_local(2, 5)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&const_mirror, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                panic!("expected accepted erase of const-offset mirrored Set, got no bracket")
+            }
+            Err(reason) => {
+                panic!("expected accepted erase of const-offset mirrored Set, got {reason}")
+            }
+        }
     }
 }

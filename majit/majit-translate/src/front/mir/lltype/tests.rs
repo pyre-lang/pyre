@@ -4183,6 +4183,52 @@ fn build_hasher_default_without_layout_is_void_zst() {
     );
 }
 
+/// A published field keeps `{"id": {"Path": "core::marker::PhantomData"}}`
+/// when the dest crate has no matching TypeDecl. That spelling is
+/// still Void (`type_str_leaf_is_void_zst`).
+#[test]
+fn path_form_phantomdata_without_local_decl_is_void_zst() {
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "Adt": {
+            "id": {"Path": "core::marker::PhantomData"},
+            "generics": {
+                "regions": [],
+                "types": [{
+                    "RawPtr": [
+                        {"Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}},
+                        "Shared"
+                    ]
+                }],
+                "const_generics": [],
+                "trait_refs": []
+            },
+            "builtin": null
+        }
+    }))
+    .expect("path-form PhantomData TyRef parses");
+    assert!(
+        super::field_is_zst(&ty, &llbc),
+        "Path-form PhantomData is a ZST marker"
+    );
+    assert!(
+        super::tyref_is_zero_sized(&ty, &llbc),
+        "Path-form PhantomData is Void"
+    );
+}
+
 #[test]
 fn empty_tuple_tyref_is_void() {
     // `()` is `lltype.Void` (`history.py` `getkind`). Charon emits
@@ -5023,6 +5069,7 @@ fn linked_transparent_definition_types_opaque_dependency_view() {
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();
     super::build_semantic_program_from_llbc_with_static_addrs_filtered(
         &llbcs[1],
+        &[],
         crate::HostStaticAddrs::default(),
         &jitdriver_receiver_roots,
         None,
