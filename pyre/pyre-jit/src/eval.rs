@@ -13244,17 +13244,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 }
             }
         }
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][func-entry] run compiled frame=0x{:x} locals=0x{:x} key={} arg0={:?} depth={} raw_finish_known={}",
-                frame_root.frame() as *mut PyFrame as usize,
-                frame_root.frame().locals_cells_stack_w as usize,
-                green_key,
-                debug_first_arg_int(frame_root.frame()),
-                call_depth(),
-                driver.has_raw_int_finish()
-            );
-        }
+        // `interp_jit.py` / `warmstate.py bound_reached` have no per-iteration
+        // print on the compiled entry. `MAJIT_LOG=1` would otherwise write
+        // one line per remaining iteration and starve `logger.py log_loop`.
         let env = PyreEnv;
         // Same concrete boundary as `execute_assembler`: a function-entry
         // compiled trace reads its arg locals as heap `W_IntObject`
@@ -13282,22 +13274,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // `_build_stack_check_slowpath`), not in this slot.
         if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
             return Some(Err(exc));
-        }
-        if majit_metainterp::majit_log_enabled() {
-            let kind = match &outcome {
-                DetailedDriverRunOutcome::Finished { .. } => "finished",
-                DetailedDriverRunOutcome::Jump { .. } => "jump",
-                DetailedDriverRunOutcome::Abort { .. } => "abort",
-                DetailedDriverRunOutcome::GuardFailure { .. } => "guard-failure",
-            };
-            eprintln!(
-                "[jit][func-entry] compiled outcome frame=0x{:x} locals=0x{:x} key={} arg0={:?} kind={}",
-                frame_root.frame() as *mut PyFrame as usize,
-                frame_root.frame().locals_cells_stack_w as usize,
-                green_key,
-                debug_first_arg_int(frame_root.frame()),
-                kind
-            );
         }
 
         // compile.py handle_fail parity.
