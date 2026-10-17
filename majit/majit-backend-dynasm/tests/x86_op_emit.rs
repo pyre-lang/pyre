@@ -3496,6 +3496,35 @@ fn compile_input_finish(backend: &mut DynasmBackend) -> JitCellToken {
     token
 }
 
+/// `_call_header_shadowstack` pushes through `ebx`; `_call_footer` does
+/// `MOV eax, ebp` and then `_call_footer_shadowstack`, which is
+/// `SUB_ji8(rst, 16)` or `MOV ebx, rst; SUB [ebx], 16`.
+#[test]
+fn shadowstack_header_and_footer_go_through_ebx() {
+    let mut backend = fresh_backend();
+    let token = compile_input_finish(&mut backend);
+    let code = compiled_bytes(&token);
+    let header = [
+        &[0x48, 0xC7, 0x03, 0x01, 0x00, 0x00, 0x00][..],
+        &[0x48, 0x89, 0x6B, 0x08],
+        &[0x48, 0x83, 0xC3, 0x10],
+    ]
+    .concat();
+    assert_has(code, &header, "MOV [ebx], 1; MOV [ebx+8], ebp; ADD ebx, 16");
+    let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+    let mut footer = vec![0x48, 0x89, 0xE8];
+    if i32::try_from(rst).is_ok() {
+        footer.extend_from_slice(&[0x48, 0x83, 0x2C, 0x25]);
+        footer.extend_from_slice(&(rst as i32).to_le_bytes());
+        footer.push(0x10);
+    } else {
+        footer.extend_from_slice(&[0x48, 0xBB]);
+        footer.extend_from_slice(&rst.to_le_bytes());
+        footer.extend_from_slice(&[0x48, 0x83, 0x2B, 0x10]);
+    }
+    assert_has(code, &footer, "MOV eax, ebp; then SUB [rootstacktop], 16");
+}
+
 fn count_bytes(code: &[u8], needle: &[u8]) -> usize {
     code.windows(needle.len())
         .filter(|window| *window == needle)
@@ -3552,9 +3581,9 @@ fn stack_check_slowpath_once_per_process() {
     // compile must retry `ensure_stack_check_slowpath`.
     let token = compile_input_finish(&mut backend);
     assert_stack_probe(compiled_bytes(&token));
-    // `_call_header_shadowstack` (`mov [rax+8], rbp`) precedes the probe.
+    // `_call_header_shadowstack` (`mov [rbx+8], rbp`) precedes the probe.
     assert!(
-        unique_bytes(compiled_bytes(&token), &[0x48, 0x89, 0x68, 0x08])
+        unique_bytes(compiled_bytes(&token), &[0x48, 0x89, 0x6B, 0x08])
             < unique_bytes(compiled_bytes(&token), &[0x48, 0x29, 0xE0]),
         "the stack check follows the shadow-stack push"
     );

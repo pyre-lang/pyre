@@ -833,12 +833,15 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
 /// `emit_call_footer_raw`, which the standalone propagate / malloc
 /// slowpath trampolines reach for).  Subtracts `2 * WORD` from the
 /// shadow-stack top, undoing the `gen_shadowstack_header` push that
-/// the trace prologue emitted.
+/// the trace prologue emitted. `ebx` is restored by the footer after it.
 pub(crate) fn emit_footer_shadowstack_raw(asm: &mut Assembler) {
     let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
-    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-    rx86::mov_ri(asm, scratch, rst);
-    rx86::sub_mi(asm, (scratch, 0), 16);
+    if rx86::fits_in_32bits(rst) {
+        rx86::sub_ji8(asm, rst as i32, (WORD * 2) as i32); // SUB [rootstacktop], WORD * 2
+    } else {
+        rx86::mov_ri(asm, rx86::EBX, rst); // MOV ebx, rootstacktop
+        rx86::sub_mi(asm, (rx86::EBX, 0), (WORD * 2) as i32); // SUB [ebx], WORD * 2
+    }
 }
 
 /// `CPU_X86_64.CALLEE_SAVE_REGISTERS`. Win64 index 4/5 are not contiguous:
@@ -894,8 +897,9 @@ fn emit_restore_callee_saves(asm: &mut Assembler) {
 /// at trace-body alignment (i.e. the same value the trace's
 /// `_call_header` left after its `SUB rsp, FRAME_FIXED_SIZE * WORD`).
 pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
-    emit_footer_shadowstack_raw(asm);
+    // the return value is the jitframe
     dynasm!(asm ; .arch x64 ; mov rax, rbp);
+    emit_footer_shadowstack_raw(asm);
     emit_restore_callee_saves(asm);
     dynasm!(asm ; .arch x64 ; ret);
 }
@@ -3428,7 +3432,7 @@ impl<'a> Assembler386<'a> {
     /// sequences when exiting through `propagate_exception_descr`.
     fn _call_footer(&mut self) {
         emit_call_footer_raw(&mut self.mc);
-        // `emit_footer_shadowstack_raw` writes `X86_64_SCRATCH_REG` and returns.
+        // `RET` ends the basic block.
         self.forget_scratch_register();
     }
 
@@ -3513,20 +3517,19 @@ impl<'a> Assembler386<'a> {
     /// minor-collect to update jf pointers — without it, a minor GC
     /// inside a recursive call (e.g. fib_recursive) leaves rbp dangling
     /// at the freed nursery slot.
+    ///
+    /// `_call_header_shadowstack`: `_load_shadowstack_top_in_ebx`, then
+    /// the two stores through `ebx`, which `_call_header` has saved.
     fn gen_shadowstack_header(&mut self) {
         let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
         let (sr, so) = self.addr_as_reg_offset(rst);
-        rx86::mov_rm(&mut self.mc, rx86::EAX, (sr, so)); // rax = *rst = top
-        dynasm!(self.mc ; .arch x64
-        ; mov QWORD [rax], 1        // [top] = 1 (is_minor marker)
-        );
-        dynasm!(self.mc ; .arch x64
-        ; mov [rax + 8], rbp        // [top + WORD] = rbp (jf_ptr)
-        );
-        dynasm!(self.mc ; .arch x64
-            ; add rax, 16               // top += 2*WORD
-        );
-        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EAX); // *rst = top
+        rx86::mov_rm(&mut self.mc, rx86::EBX, (sr, so)); // MOV ebx, [rootstacktop]
+        // the '1' is to benefit from the shadowstack 'is_minor' optimization
+        rx86::mov_mi(&mut self.mc, (rx86::EBX, 0), 1); // MOV [ebx], 1
+        rx86::mov_mr(&mut self.mc, (rx86::EBX, WORD as i32), rx86::EBP); // MOV [ebx + WORD], ebp
+        rx86::add_ri(&mut self.mc, rx86::EBX, (WORD * 2) as i32);
+        let (sr, so) = self.addr_as_reg_offset(rst);
+        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EBX); // MOV [rootstacktop], ebx
     }
 
     /// x86/assembler.py `_call_footer_shadowstack` parity:
