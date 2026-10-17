@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=12
+# pyre-check: max-pypy-ratio=3.5
 # set.remove(missing) raises KeyError carrying the missing key itself (so its
 # repr shows), matching dict[missing]; ord() on a non-string names the argument's
 # real type. A warmup loop exercises the working set-membership and ord fast
@@ -20,7 +20,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(1800000))
+    print("warm", warm(10800000))
     m("remove_int", lambda: {1, 2}.remove(9))
     m("remove_str", lambda: {1, 2}.remove("x"))
     m("remove_tuple", lambda: {(1, 2)}.remove((3, 4)))
