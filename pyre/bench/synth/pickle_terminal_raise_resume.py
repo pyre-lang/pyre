@@ -24,14 +24,27 @@
 # The list getitem path records the list-strategy guard
 # (`W_ListObject.descr_getitem` -> strategy `getitem`); its failures on
 # other-strategy lists are part of guard_failures.
+#
+# Import pickle (and its stdlib graph) before dropping the thresholds.
+# At `function_threshold=1`, nested `warmstate.py maybe_compile_and_run`
+# compiles every function entry the import walks. That walk is `_find_spec`
+# over `sys.meta_path`, and the first finder is not the same on every binary:
+# `_pypy_abi3_tags.install` inserts `_Abi3TagsFinder` at `meta_path[0]` iff
+# `'.abi3.so'` is in `_imp.extension_suffixes()`. The product dynasm binary
+# lists that suffix (cpyext); the core cranelift binary lists none, and
+# `install` returns on win32. PYRE_FBW_INLINE_DIAG then resolves
+# `finder.find_spec` to `_Abi3TagsFinder.find_spec` versus
+# `BuiltinImporter.find_spec`, so the compiled importlib set (including
+# wasm's extra `get_data`) is a function of that finder. The subject loops
+# below still compile pickle's own `save`/`load_*` entries at threshold 1.
+import pickle
+
 try:
     import pypyjit
 
     pypyjit.set_param("threshold=1,function_threshold=1")
 except ImportError:
     pass
-
-import pickle
 
 
 checksum = 0

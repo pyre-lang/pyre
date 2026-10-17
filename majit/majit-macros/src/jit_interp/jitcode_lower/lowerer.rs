@@ -846,14 +846,11 @@ impl<'c> Lowerer<'c> {
                 );
             }
         } else {
-            // An int-result target is registered through its widening shim;
-            // see `word_result_addr_tokens`.  A void- or ref-result target has
-            // no narrow return to widen and registers its own address.
-            //
-            // Only the shim is word-spelled, so only the shim is registered as
-            // such: the helper's own address is whatever its Rust signature
-            // says, and a `usize` or `&T` parameter there is narrower than the
-            // word a compiled call passes.
+            // An int- or ref-result target is registered through its word
+            // shim; see `word_result_addr_tokens`. A void-result target has
+            // no result to widen and registers through `word_void_addr_tokens`
+            // at the call site. The helper's own address still spells
+            // `usize` / `&T` as wasm i32, which is not the descr FUNC.
             match word_result_addr {
                 Some(shim_addr) => quote! {
                     let __fn_idx =

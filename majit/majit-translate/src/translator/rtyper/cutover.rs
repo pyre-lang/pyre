@@ -2295,6 +2295,41 @@ fn seed_declared_funcptr_type(graph: &LegacyGraph, entry: &FunctionEntry) {
     }
 }
 
+/// Prefill a residual cachedgraph for a raw-storage impl method.
+///
+/// `Lowering::impl_method_owner` declines `CallTarget::Method` for a raw
+/// ADT (`executioncontext.py` `ExecutionContext` is an address, not a GC
+/// instance), so callsites are `FunctionPath`.  Walking the body then
+/// getattr's sibling methods (`_trace`) off a classdef whose classdict
+/// was never seeded — Pass 3 requires `is_known_struct_root`, and a raw
+/// struct is not a GC class.  The annotator-only stub is the
+/// `register_external` analog (`extfunc.py`); the graph stays a dual-gate
+/// compile candidate.  `leave` / `return_trace` / `enter` have no
+/// `@jit.dont_look_inside`.
+///
+/// `PyError::pin` / `reload` getattr the tuple field `value` off a
+/// `PyErrorObject` classdef (the handle was interned as the object).
+/// RPython's GC transform roots `OperationError` locals; these handle
+/// methods do not exist upstream.
+fn annotator_residual_raw_method(key: &FunctionPathKey) -> bool {
+    let segs = key.segments();
+    let [.., owner, method] = segs else {
+        return false;
+    };
+    if owner == "ExecutionContext" {
+        return true;
+    }
+    if owner == "<Impl>" && segs.iter().any(|s| s == "executioncontext") {
+        return true;
+    }
+    if matches!(method.as_str(), "pin" | "reload")
+        && (owner == "PyError" || (owner == "<Impl>" && segs.iter().any(|s| s == "error")))
+    {
+        return true;
+    }
+    false
+}
+
 /// Give the registry entry of a funcobj the lowered body its default
 /// graph is built from (Pass 2 of
 /// [`populate_call_registry_from_call_graphs`]).
@@ -2330,7 +2365,8 @@ fn install_source_graph(
         return;
     }
     let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
-        || graph.hints.iter().any(|h| h == "elidable");
+        || graph.hints.iter().any(|h| h == "elidable")
+        || annotator_residual_raw_method(key);
     if residualize {
         // The materialisers' raw `*mut PyObject` return is only their
         // residual-call ABI.  Their FunctionDesc carries the orthodox

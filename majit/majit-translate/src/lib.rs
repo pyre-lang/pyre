@@ -388,6 +388,13 @@ fn build_semantic_program_via_active_frontend(
                     &gc_struct_ids,
                     static_addrs.error_carrier,
                 ));
+                unsafe_fn_stubs.extend(
+                    front::mir::collect_raw_storage_impl_method_stubs_from_llbc(
+                        &llbc,
+                        &gc_struct_ids,
+                        static_addrs.error_carrier,
+                    ),
+                );
                 unsafe_fn_stubs
                     .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
                 foreign_opaque_method_externals

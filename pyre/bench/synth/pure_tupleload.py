@@ -1,9 +1,12 @@
-# pyre-check: max-pypy-ratio=4
-# The ceiling sits between the two measured states: served this runs 2.6x pypy,
-# and with the arity-2 reader off the loop pays the opaque residual (about 198x
-# when the retired `subscr_specialised_pair` fold was the only reader).
+# pyre-check: max-pypy-ratio=2.9
 # #171/#11 Approach C, SUBSCRIPT slice: canonical-tuple `t[i]` emits a PURE
 # getarrayitem in the JIT walker (OptPure CSEs / const-folds the element load).
+# Nested tracing compiles the getitem helpers, so dynasm sits at pypy parity
+# (~1.0x). A ceiling of 4 arms a 1x floor (`perf_gate_floor`) that fails that
+# knife-edge. 2.9 derives no floor (under 3) and still covers cranelift ~1.0x /
+# wasm ~1.7x. With the arity-2 reader off, the loop pays the opaque residual
+# (about 198x when the retired `subscr_specialised_pair` fold was the only
+# reader).
 #
 # Case A exercises the canonical array-backed `W_TupleObject` (arity > 2) on the
 # hot path — the pure element load is the point of this slice.

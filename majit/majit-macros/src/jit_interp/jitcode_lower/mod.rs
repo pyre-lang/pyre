@@ -4753,12 +4753,10 @@ mod tests {
         assert!(body.contains("add_word_abi_fn_ptr"), "{body}");
     }
 
-    /// A ref result is a pointer and a void result is never read, so neither
-    /// has anything to widen. The ref arm therefore registers the callee's own
-    /// address; the void arm goes through the void registration, whose target
-    /// is still that same address wherever a pointer already fills a word.
+    /// A ref result is a pointer word: register the same word shim an int
+    /// result uses, so the table type is the descr FUNC on wasm32.
     #[test]
-    fn non_int_result_calls_register_the_callee_address() {
+    fn non_int_result_calls_publish_the_callee_word() {
         let call = parse_call("helper(1)");
         let mut lowerer =
             lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualRef);
@@ -4767,8 +4765,8 @@ mod tests {
             .expect("residual ref call should lower");
         let statements = &lowerer.statements;
         let body = quote! { #(#statements)* }.to_string();
-        assert!(body.contains("add_fn_ptr (helper as * const ())"));
-        assert!(!body.contains("into_call_word"));
+        assert!(body.contains("add_word_abi_fn_ptr"), "{body}");
+        assert!(body.contains("into_call_word"), "{body}");
 
         let expr: syn::Expr = syn::parse_quote! { helper(1) };
         let mut lowerer =

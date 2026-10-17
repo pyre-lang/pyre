@@ -3101,6 +3101,7 @@ pub trait WalkSym {
     fn frame(&self) -> OpRef;
     fn execution_context(&self) -> OpRef;
     fn set_execution_context(&mut self, value: OpRef);
+    fn set_frame(&mut self, value: OpRef);
     fn registers_i(&self) -> &[OpRef];
     fn registers_i_mut(&mut self) -> &mut Vec<OpRef>;
     fn registers_r(&self) -> &crate::jitcode_dispatch::RegisterList;
@@ -3155,6 +3156,7 @@ pub trait WalkSym {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
         merge_point_registers_r: &[OpRef],
+        emit_future_condition: bool,
     ) -> Vec<OpRef>;
 }
 
@@ -3172,6 +3174,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn set_execution_context(&mut self, value: OpRef) {
         self.execution_context = value;
+    }
+
+    #[inline]
+    fn set_frame(&mut self, value: OpRef) {
+        self.frame = value;
     }
 
     #[inline]
@@ -3366,6 +3373,7 @@ impl WalkSym for PyreSym {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
         merge_point_registers_r: &[OpRef],
+        emit_future_condition: bool,
     ) -> Vec<OpRef> {
         let mut frame = MIFrame::from_sym(ctx, self, concrete_frame, orgpc, orgpc);
         frame.close_loop_args_at(
@@ -3373,6 +3381,7 @@ impl WalkSym for PyreSym {
             target_pc,
             header_marker_jit_pc,
             merge_point_registers_r,
+            emit_future_condition,
         )
     }
 }
@@ -6014,6 +6023,143 @@ pub(crate) fn concrete_frame_local_is_writable(value: &Value) -> bool {
     !matches!(value, Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE)
 }
 
+/// Write every static field then every array item `0..len(lst)` onto `frame`.
+///
+/// `virtualizable.py VirtualizableInfo.write_boxes` walks `unroll_static_fields`
+/// then each array's items `for j in range(len(lst))`. `pyjitpl.py
+/// MetaInterp.synchronize_virtualizable` is the caller of that write. pyre's
+/// `synchronize_virtualizable` targets `virtualizable_heap_ptr` (the
+/// `snapshot_for_tracing` copy; `TraceCtx::standard_virtualizable_ptr` is the
+/// live identity), so the interpreter frame lags until this write.
+/// `setarrayitem_vable` already mirrors array items onto the live frame
+/// (`own_frame_array_store_target` → `store_live_frame_array_slot`); this
+/// write still covers every slot, including those above `valuestackdepth`
+/// (`pyframe.py popvalue` stores None there). `write_boxes` unwraps every
+/// box: `Void` / `NO_CONCRETE` / a missing entry never reached this helper
+/// (556 residual flushes across 80 synth fixtures). A `debug_assert!` names
+/// that invariant; release still skips so boxing cannot store `PY_NULL`.
+pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usize) {
+    if frame == 0 {
+        return;
+    }
+    let Some(info) = ctx.virtualizable_info() else {
+        return;
+    };
+    let static_count = info.num_static_extra_boxes;
+    for index in 0..static_count {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(index) else {
+            debug_assert!(
+                false,
+                "write_boxes: static slot {index} must have a virtualizable box"
+            );
+            continue;
+        };
+        let bits = known_vable_bits(&value);
+        debug_assert!(
+            bits.is_some(),
+            "write_boxes: static slot {index} must carry a runtime concrete (not Void/NO_CONCRETE)"
+        );
+        let Some(bits) = bits else {
+            continue;
+        };
+        match info.static_fields.get(index).map(|field| field.field_type) {
+            Some(Type::Int) => store_live_frame_static_int(frame, index, bits),
+            _ => unsafe {
+                info.write_field(frame as *mut u8, index, bits);
+            },
+        }
+        frame = pyre_object::gc_hook::try_gc_current_object_address(
+            frame as pyre_object::gc_hook::GCREF,
+        ) as usize;
+        if frame == 0 {
+            return;
+        }
+    }
+    let Some(len) = concrete_frame_array_len(frame) else {
+        return;
+    };
+    let base = static_count;
+    for j in 0..len {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + j) else {
+            debug_assert!(
+                false,
+                "write_boxes: array item {j} must have a virtualizable box"
+            );
+            continue;
+        };
+        debug_assert!(
+            known_vable_bits(&value).is_some(),
+            "write_boxes: array item {j} must carry a runtime concrete (not Void/NO_CONCRETE)"
+        );
+        let Some(_) = known_vable_bits(&value) else {
+            continue;
+        };
+        frame = pyre_object::gc_hook::try_gc_current_object_address(
+            frame as pyre_object::gc_hook::GCREF,
+        ) as usize;
+        if frame == 0 {
+            return;
+        }
+        // GCREF array items (`write_boxes` unwrap + setarrayitem) are
+        // already boxed; `store_live_frame_array_slot` is the same
+        // store `setarrayitem_vable` uses. Int/Float still box, and
+        // boxing can move a nursery frame — take the returned address.
+        match &value {
+            Value::Ref(_) => store_live_frame_array_slot(frame, j, value),
+            _ => {
+                if let Some(frame_now) = store_boxed_frame_local(frame, j, &value) {
+                    frame = frame_now;
+                }
+            }
+        }
+    }
+}
+
+fn known_vable_bits(value: &Value) -> Option<i64> {
+    match value {
+        Value::Void => None,
+        Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE => None,
+        Value::Int(v) => Some(*v),
+        Value::Float(f) => Some(f.to_bits() as i64),
+        Value::Ref(r) => Some(r.as_usize() as i64),
+    }
+}
+
+/// Write one local when its concrete value is a real object.
+///
+/// `Value::Void` and `Ref(NO_CONCRETE)` are skipped: boxing either would
+/// store a null or a sentinel over the slot.  Returns the frame's current
+/// address after the store (see [`store_boxed_frame_local`]); a caller that
+/// touches the frame again must use it instead of `frame`.
+pub(crate) fn store_frame_local_value(frame: usize, abs: usize, value: &Value) -> Option<usize> {
+    if frame == 0 || matches!(value, Value::Void) {
+        return None;
+    }
+    if matches!(value, Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE) {
+        return None;
+    }
+    let nlocals = concrete_nlocals(frame)?;
+    if abs >= nlocals {
+        return None;
+    }
+    let frame_ptr = frame as *const u8;
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() <= abs {
+        return None;
+    }
+    store_boxed_frame_local(frame, abs, value)
+}
+
+/// Boxing an Int/Float local allocates. Pin the slot first
+/// (`store_pinned_frame_locals`) so a minor cannot leave a from-space
+/// shadow word.
+fn store_boxed_frame_local(frame: usize, abs: usize, value: &Value) -> Option<usize> {
+    store_pinned_frame_locals(frame, &[(abs, *value)])
+}
+
 /// One shadow slot held across a boxing loop.
 ///
 /// `Ref` pins are owner-roots for the whole loop. `w_int_new` and
@@ -7411,7 +7557,7 @@ impl PyreSym {
             // an already-seeded `initialize_virtualizable` layout: that
             // length is the LABEL `inputarg_types`, and a shorter re-seed
             // made the walker JUMP one box short of it.
-            let mut array_len = concrete_frame_array_len(self.live_vable_frame_addr)
+            let mut array_len = concrete_frame_array_len(self.current_live_vable_frame())
                 .or_else(|| concrete_frame_array_len(concrete_frame))
                 .or_else(|| {
                     (!self.jitcode.is_null()).then(|| {
@@ -8602,36 +8748,42 @@ fn reconstruct_inline_recipe(
         Some(d) => d,
         None => decline!("NoStackDepthAtPc"),
     };
+    // `get_list_of_active_boxes` (`pyjitpl.py`): when `in_a_call`, the
+    // destination is the call's last operand (`self.bytecode[self.pc - 1]`)
+    // and the bank is `self._result_argcode`. `frame.pc` is the post-call
+    // `-live-` coordinate, so the call is the op that ends there. The
+    // after-residual color table is keyed by the CALL offset
+    // (`result_color_after_residual_for_jitcode_pc`); feeding it this
+    // resume pc would read the next Python instruction's TOS.
+    // A miss is not a reconstruct decline — `consume_boxes` still fills
+    // every live register. `opimpl_jit_merge_point` residualizes
+    // CALL_ASSEMBLER at a loop header that has no result at all, so a
+    // deeper frame does not by itself mean this pause has a pending CALL
+    // dest.
     let pending_result_color = if in_a_call {
-        let Some(pc) = usize::try_from(frame.pc).ok() else {
-            decline!("NoPendingResultColor");
-        };
-        // `MIFrame.get_list_of_active_boxes` (`pyjitpl.py`): when
-        // `in_a_call`, the destination is the call's last operand
-        // (`self.bytecode[self.pc - 1]`) and the bank is
-        // `self._result_argcode`. `frame.pc` is the post-call `-live-`
-        // coordinate, so the call is the op that ends there. The
-        // after-residual color table is keyed by the CALL offset
-        // (`result_color_after_residual_for_jitcode_pc`); feeding it
-        // this resume pc would read the next Python instruction's TOS.
-        let Some(p) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
-            decline!("NoPendingResultColor");
-        };
-        use crate::jitcode_dispatch::CallResultRegister;
-        match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
-            CallResultRegister::Reg('r', color) => Some(color),
-            CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
-            CallResultRegister::Void => None,
-            // The paused `MIFrame` keeps its `_result_argcode`; a call op
-            // that does not decode at the resume pc leaves no bank to clear.
-            CallResultRegister::Unknown => decline!("NoPendingResultColor"),
+        if let (Some(pc), Some(p)) = (
+            usize::try_from(frame.pc).ok(),
+            pyjitcode_for_jitcode_index(frame.jitcode_index),
+        ) {
+            use crate::jitcode_dispatch::CallResultRegister;
+            match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
+                CallResultRegister::Reg('r', color) => Some(color),
+                CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
+                CallResultRegister::Void => None,
+                CallResultRegister::Unknown => None,
+            }
+        } else {
+            None
         }
     } else {
         None
     };
     // `MIFrame.get_list_of_active_boxes` clears a destination only for a
     // result bank (`'i'`, `'r'`, `'f'`); a void call reserves no result slot.
-    let pending_result_abs_slot = if pending_result_color.is_some() && stack_only > 0 {
+    // Rebind so a loop-header CALL_ASSEMBLER (no result register) is not
+    // treated as an in-flight residual dest.
+    let in_a_call = pending_result_color.is_some();
+    let pending_result_abs_slot = if in_a_call && stack_only > 0 {
         Some(nlocals + stack_only - 1)
     } else {
         None
@@ -8647,16 +8799,11 @@ fn reconstruct_inline_recipe(
     // whole region from the mandatory-operand demand below, not just its
     // topmost slot: with one argument or more the top slot alone left the
     // callable and the arguments demanded, so every argument-taking inlined
-    // call declined and its guard was blacklisted.  A void call consumes its
-    // operands the same way, so the exemption follows `in_a_call`; only a
-    // result-bank call's result occupies the topmost post-call slot, so a void
-    // call's floor stays at the post-call depth and keeps every slot below it
-    // demanded.
+    // call declined and its guard was blacklisted.
     let unreconstructable_operand_floor = if in_a_call {
-        let result_slots = usize::from(pending_result_color.is_some());
         liveness
             .stack_depth_at(py_pc + 1)
-            .map(|post| nlocals + post.saturating_sub(result_slots))
+            .map(|post| nlocals + post.saturating_sub(1))
     } else {
         None
     };
@@ -16108,7 +16255,8 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[]));
+        let jump_args =
+            state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[], true));
 
         assert_eq!(jump_args.len(), 9);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
@@ -16220,7 +16368,8 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[]));
+        let jump_args =
+            state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[], true));
 
         assert_eq!(
             jump_args.len(),
@@ -16775,7 +16924,11 @@ fn emit_reconstructed_callee_pyframe(
     let freevar_cells: Vec<OpRef> = recipe.registers_r[nlocals..stack_base].to_vec();
     // The operands live at the guard, at their `locals_cells_stack_w` slots:
     // the walk resumes mid-body and reads the frame image there (a callee
-    // loop header's FOR_ITER reads its iterator from the stack slot).
+    // loop header's FOR_ITER peeks `array[valuestackdepth - 1]`, pyframe.py
+    // `peekvalue`). Store the slots *and* the absolute depth; a prefix-only
+    // `valuestackdepth` (`stack_base`) makes that peek a local/cell instead
+    // of the iterator (`rebuild_from_resumedata` / `consume_boxes` refill
+    // the rebuilt MIFrame's live image, including operand-stack depth).
     let stack_items: Vec<OpRef> = recipe.registers_r[stack_base..recipe.valuestackdepth].to_vec();
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
     crate::helpers::emit_new_pyframe_inline_with_params(
@@ -16785,7 +16938,7 @@ fn emit_reconstructed_callee_pyframe(
         &stack_items,
         nlocals,
         frame_array_size,
-        stack_base,
+        recipe.valuestackdepth,
         pycode_const,
         w_globals_const,
     )
@@ -17149,11 +17302,18 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // frame red can execute while tracing. Without this value the very first
         // such residual sees a symbolic-only Ref and the carrier sub-walk aborts.
         //
-        // Root the code, globals, and every reconstructed prefix slot before the
-        // closure tuple/frame allocations. This is the same shadow-stack shape as
-        // the forward-inline constructor in `inline_call.rs`; the resulting
-        // GC-managed FrameBox relinquishes only its host handle after the frontend
-        // op becomes its trace root.
+        // Root the code, globals, optional original frame, the locals/cells
+        // prefix, and one slot per operand position before any allocation.
+        // Operand k lives at the fixed index `slot_root+k` (the Ref value or
+        // PY_NULL). The cell tuple is allocated after those pins and sits at
+        // `slot_root+valuestackdepth`, so a freevar callee with a FOR_ITER
+        // iterator on the stack does not hand the iterator to the frame as
+        // its closure.
+        // `resume.py rebuild_from_resumedata` / `consume_boxes` fill the
+        // rebuilt frame from the current box values; the shadow-stack slot
+        // is the box value that survives a collection. The resulting
+        // GC-managed FrameBox relinquishes only its host handle after the
+        // frontend op becomes its trace root.
         let concrete_roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
@@ -17161,15 +17321,12 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // Pin the parent-trace frame before reading it: a nursery object
         // moves on the FrameBox allocation below. Dead locals at the
         // loop-header live list (`get_list_of_active_boxes`) still sit in
-        // that array; `consume_virtualizable_boxes` does not write them.
+        // that array; `consume_virtualizable_boxes` does not write them,
+        // and the prefix and operand pins both fall back to it.
         let orig_frame = original_callee_concrete_frame(ctx, recipe, w_code, stack_base);
-        let orig_pin = if let Some(orig) = orig_frame {
-            let idx = pyre_object::gc_roots::shadow_stack_len();
+        if let Some(orig) = orig_frame {
             let _ = pyre_object::gc_roots::pin_root(orig as pyre_object::PyObjectRef);
-            Some(idx)
-        } else {
-            None
-        };
+        }
         let slot_root = pyre_object::gc_roots::shadow_stack_len();
         for (slot, &captured) in recipe.concrete_r[..stack_base].iter().enumerate() {
             let opref = recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE);
@@ -17192,6 +17349,27 @@ pub(crate) fn setup_reconstructed_callee_frame(
             };
             let _ = pyre_object::gc_roots::pin_root(value);
         }
+        for k in stack_base..valuestackdepth {
+            let from_recipe = recipe
+                .concrete_r
+                .get(k)
+                .and_then(|&captured| match captured {
+                    majit_ir::Value::Ref(gc)
+                        if gc != majit_ir::GcRef::NO_CONCRETE && !gc.is_null() =>
+                    {
+                        Some(gc.as_usize() as pyre_object::PyObjectRef)
+                    }
+                    _ => None,
+                });
+            let from_orig = orig_frame
+                .and_then(|orig| concrete_stack_value(orig as usize, k).filter(|p| !p.is_null()));
+            let value = match (from_recipe, from_orig) {
+                (Some(ptr), _) => ptr,
+                (None, Some(ptr)) => ptr,
+                (None, None) => pyre_object::PY_NULL,
+            };
+            let _ = pyre_object::gc_roots::pin_root(value);
+        }
         // `initialize_frame_scopes` reads the closure as the freevar cells
         // alone and allocates each pure cellvar itself; the rebuilt cells of
         // both bands are stored over the array by
@@ -17204,10 +17382,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
                 .collect();
             let closure = pyre_object::w_tuple_new(cells);
-            let closure = pyre_object::gc_roots::pin_root(closure);
-            closure
+            pyre_object::gc_roots::pin_root(closure)
         };
-        let closure_root = (stack_base != freevar_base).then_some(slot_root + stack_base);
+        let closure_root = (stack_base != freevar_base).then_some(slot_root + valuestackdepth);
         let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
             .collect();
@@ -17216,18 +17393,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
         let current_closure = closure_root
             .map(pyre_object::gc_roots::shadow_stack_get)
             .unwrap_or(closure);
-        for k in stack_base..valuestackdepth.min(recipe.concrete_r.len()) {
-            let opref = recipe.registers_r.get(k).copied().unwrap_or(OpRef::NONE);
-            let captured = recipe.concrete_r[k];
-            let live = rooted_recipe_ref(ctx, opref, captured);
-            let value = match live {
-                majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
-                    gc.as_usize() as pyre_object::PyObjectRef
-                }
-                _ => pyre_object::PY_NULL,
-            };
-            let _ = pyre_object::gc_roots::pin_root(value);
-        }
         let mut concrete_frame = pyre_interpreter::pyframe::FrameBox::new(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
                 current_code,
@@ -17248,35 +17413,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
         if !concrete_frame.is_gc_owned() {
             return None;
         }
-        let concrete_frame_ptr = concrete_frame.as_mut_ptr();
-        ctx.set_opref_concrete(
-            frame_vable,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
-        );
-        // FrameBox::new may have moved the parent-trace frame. Re-read it
-        // from the pin and copy any slot the live-list left null — the
-        // iterator lives past `stack_base`, and `e` is a dead local.
-        if let Some(orig_pin) = orig_pin {
-            let orig_now = pyre_object::gc_roots::shadow_stack_get(orig_pin) as usize;
-            let dst_arr = unsafe { (*concrete_frame_ptr).locals_cells_stack_w };
-            let src_arr =
-                unsafe { (*(orig_now as *const pyre_interpreter::PyFrame)).locals_cells_stack_w };
-            if !dst_arr.is_null() && !src_arr.is_null() {
-                let copy_end = valuestackdepth
-                    .min(unsafe { (*dst_arr).len() })
-                    .min(unsafe { (*src_arr).len() });
-                for k in 0..copy_end {
-                    let dst = unsafe { (*dst_arr).as_slice()[k] };
-                    if dst.is_null() {
-                        let src = unsafe { (*src_arr).as_slice()[k] };
-                        if !src.is_null() {
-                            unsafe { (*dst_arr).set_ref(k, src) };
-                        }
-                    }
-                }
-                frame_array_write_barrier(concrete_frame_ptr as *mut u8, dst_arr);
-            }
-        }
         // FrameBox::new (and w_tuple_new) may have moved young objects; the
         // pinned slots hold the forwarded addresses, recipe.concrete_r does not.
         let live_prefix: Vec<majit_ir::Value> = (0..stack_base)
@@ -17286,9 +17422,40 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 ) as usize))
             })
             .collect();
-        stack_slot_root = closure_root
-            .map(|i| i + 1)
-            .unwrap_or(slot_root + stack_base);
+        let mut live_stack = vec![majit_ir::Value::Void; valuestackdepth];
+        for k in 0..stack_base.min(valuestackdepth) {
+            live_stack[k] = live_prefix[k];
+        }
+        for k in stack_base..valuestackdepth {
+            let pinned = pyre_object::gc_roots::shadow_stack_get(slot_root + k);
+            live_stack[k] = if !pinned.is_null() {
+                majit_ir::Value::Ref(majit_ir::GcRef(pinned as usize))
+            } else {
+                match recipe.concrete_r.get(k).copied() {
+                    Some(majit_ir::Value::Ref(_)) | None => majit_ir::Value::Void,
+                    Some(other) => other,
+                }
+            };
+        }
+        // `PyFrame::new_for_call_*` leaves `valuestackdepth` at the locals/cells
+        // prefix. Write the operand stack from the shadow-stack slots (`consume_boxes`
+        // fills the rebuilt frame from the current box values) and bump the depth
+        // so a residual `FOR_ITER` peek on this recording-time frame sees
+        // the same iterator the symbolic image holds.
+        let frame_ptr = concrete_frame.as_mut_ptr() as usize;
+        for k in stack_base..valuestackdepth {
+            store_live_frame_array_slot(frame_ptr, k, live_stack[k]);
+        }
+        store_live_frame_static_int(frame_ptr, 2, valuestackdepth as i64);
+        let concrete_frame_ptr = concrete_frame.as_mut_ptr();
+        ctx.set_opref_concrete(
+            frame_vable,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
+        );
+        // Pins sit at `slot_root+k` (before the closure tuple). Later
+        // `stack_slot_root + (k - stack_base)` therefore equals `slot_root+k`
+        // for every live register, locals included.
+        stack_slot_root = slot_root + stack_base;
         store_reconstructed_callee_array_image(
             ctx,
             frame_vable,
@@ -17336,20 +17503,24 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // removal a live operand-stack slot's color is per-program-point
     // (`pcdep_color_slots`) and need not equal `nlocals + d` — the encoder
     // (`get_list_of_active_boxes`) maps color→slot via
-    // `semantic_ref_slot_for_reg_color`, so invert it here to land each stack
-    // value at the color the dispatcher will touch. Placing it at the raw slot
-    // index (the old identity assumption) lands it under the wrong register and
-    // leaves the true color still holding the portal-red seed (frame/ec) whose
-    // color the register allocator reused for this stack slot. Runs AFTER the
-    // frame/ec seeding so a reused color resolves to the live stack value.
+    // `semantic_ref_slot_for_reg_color`, so invert it here to land each live
+    // slot at the color the dispatcher will touch. `consume_boxes` writes
+    // every live register of the rebuilt MIFrame, locals included; a
+    // stack-only copy left those colors `NONE` and the walk reloaded them
+    // from the frame image. Placing a slot at the raw index (the old
+    // identity assumption) lands it under the wrong register and leaves
+    // the true color still holding the portal-red seed (frame/ec) whose
+    // color the register allocator reused for this slot. Runs AFTER the
+    // frame/ec seeding so a reused color resolves to the live slot value.
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
     let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
-    // The allocate path re-reads Refs from the still-live shadow-stack pins
-    // after every collecting call. The resume path uses the recorder cell
-    // (`rooted_recipe_ref`) so a copy in `recipe.concrete_r` cannot go stale
-    // across `assemble_bridge_inline_pending`.
-    for k in stack_base..valuestackdepth {
+    // The allocate path re-reads the locals prefix and the stack Refs from
+    // roots taken before FrameBox::new. The resume path uses the recorder
+    // cell (`rooted_recipe_ref`) so a copy in `recipe.concrete_r` cannot go
+    // stale across `assemble_bridge_inline_pending`. `consume_boxes` writes
+    // every live register of the rebuilt MIFrame, locals included.
+    for k in 0..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
             continue;
@@ -17390,8 +17561,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 // example the non-null callable pinned by GUARD_VALUE), just
                 // as the locals-prefix restamp above does.
                 let live = if held_callee_roots.is_some() {
+                    // `stack_slot_root` is `slot_root + stack_base`, so this is
+                    // `slot_root + k` for locals and stack alike (`consume_boxes`).
                     majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::gc_roots::shadow_stack_get(
-                        stack_slot_root + (k - stack_base),
+                        stack_slot_root + k - stack_base,
                     ) as usize))
                 } else {
                     rooted_recipe_ref(ctx, opref, majit_ir::Value::Ref(gc))

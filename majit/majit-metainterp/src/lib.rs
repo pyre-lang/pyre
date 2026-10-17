@@ -2463,3 +2463,20 @@ mod struct_type_id_spellings {
         }
     }
 }
+
+/// The ConstPtr table's wave id and whole-table walk are process-global.
+/// A collection is stop-the-world in production, so `walk` and `Wave::enter`
+/// never overlap. cargo test runs this crate's lib tests in parallel, and a
+/// whole-table walk on one thread claims slots for whatever WAVE another
+/// test currently holds, so that test's own `trace_index` skips them.
+/// Tests that call `const_ptr_table::walk` or `Wave::enter` take this lock
+/// for their whole body.
+#[cfg(test)]
+static CONST_PTR_TABLE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Hold [`CONST_PTR_TABLE_TEST_LOCK`] for a test that walks the ConstPtr
+/// table or enters a Wave.
+#[cfg(test)]
+pub(crate) fn const_ptr_table_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    CONST_PTR_TABLE_TEST_LOCK.lock()
+}

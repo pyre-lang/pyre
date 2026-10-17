@@ -1344,63 +1344,87 @@ define_flat_ref_helper!(
 /// build error: writing `3` for `jit_call_callable_2` reports a mismatched
 /// fn-pointer type naming `jit_call_callable_2` at the call site.
 macro_rules! residual_extern_addr_fns {
-    ($($name:ident($($a:ident),*);)*) => {$(
+    ($($name:ident, $word:ident ($($a:ident),*);)*) => {$(
         #[inline]
-        fn $name<$($a: crate::jit_fnaddr::ResidualSlot,)* R: crate::jit_fnaddr::ResidualRet>(
-            f: extern "C" fn($($a),*) -> R,
-        ) -> *const () {
-            f as *const ()
+        fn $name<F, $($a: crate::jit_fnaddr::ResidualSlot + crate::jit_fnaddr::WasmWord,)* R: crate::jit_fnaddr::ResidualRet + crate::jit_fnaddr::WasmWord>(
+            item: F,
+            proof: extern "C" fn($($a),*) -> R,
+        ) -> *const ()
+        where
+            F: Fn($($a),*) -> R + Copy,
+        {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = item;
+                proof as *const ()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                crate::jit_fnaddr::word_publish::$word(item, proof)
+            }
         }
     )*};
 }
 
 residual_extern_addr_fns! {
-    residual_extern_addr_0();
-    residual_extern_addr_1(A1);
-    residual_extern_addr_2(A1, A2);
-    residual_extern_addr_3(A1, A2, A3);
-    residual_extern_addr_4(A1, A2, A3, A4);
-    residual_extern_addr_5(A1, A2, A3, A4, A5);
-    residual_extern_addr_6(A1, A2, A3, A4, A5, A6);
-    residual_extern_addr_7(A1, A2, A3, A4, A5, A6, A7);
-    residual_extern_addr_8(A1, A2, A3, A4, A5, A6, A7, A8);
-    residual_extern_addr_9(A1, A2, A3, A4, A5, A6, A7, A8, A9);
-    residual_extern_addr_10(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
+    residual_extern_addr_0, extern_addr0 ();
+    residual_extern_addr_1, extern_addr1 (A1);
+    residual_extern_addr_2, extern_addr2 (A1, A2);
+    residual_extern_addr_3, extern_addr3 (A1, A2, A3);
+    residual_extern_addr_4, extern_addr4 (A1, A2, A3, A4);
+    residual_extern_addr_5, extern_addr5 (A1, A2, A3, A4, A5);
+    residual_extern_addr_6, extern_addr6 (A1, A2, A3, A4, A5, A6);
+    residual_extern_addr_7, extern_addr7 (A1, A2, A3, A4, A5, A6, A7);
+    residual_extern_addr_8, extern_addr8 (A1, A2, A3, A4, A5, A6, A7, A8);
+    residual_extern_addr_9, extern_addr9 (A1, A2, A3, A4, A5, A6, A7, A8, A9);
+    residual_extern_addr_10, extern_addr10 (A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
 }
 
 macro_rules! word_fn_addr {
     ($f:ident, 0) => {
-        residual_extern_addr_0($f)
+        residual_extern_addr_0(|| $f(), $f)
     };
     ($f:ident, 1) => {
-        residual_extern_addr_1($f)
+        residual_extern_addr_1(|a0| $f(a0), $f)
     };
     ($f:ident, 2) => {
-        residual_extern_addr_2($f)
+        residual_extern_addr_2(|a0, a1| $f(a0, a1), $f)
     };
     ($f:ident, 3) => {
-        residual_extern_addr_3($f)
+        residual_extern_addr_3(|a0, a1, a2| $f(a0, a1, a2), $f)
     };
     ($f:ident, 4) => {
-        residual_extern_addr_4($f)
+        residual_extern_addr_4(|a0, a1, a2, a3| $f(a0, a1, a2, a3), $f)
     };
     ($f:ident, 5) => {
-        residual_extern_addr_5($f)
+        residual_extern_addr_5(|a0, a1, a2, a3, a4| $f(a0, a1, a2, a3, a4), $f)
     };
     ($f:ident, 6) => {
-        residual_extern_addr_6($f)
+        residual_extern_addr_6(|a0, a1, a2, a3, a4, a5| $f(a0, a1, a2, a3, a4, a5), $f)
     };
     ($f:ident, 7) => {
-        residual_extern_addr_7($f)
+        residual_extern_addr_7(
+            |a0, a1, a2, a3, a4, a5, a6| $f(a0, a1, a2, a3, a4, a5, a6),
+            $f,
+        )
     };
     ($f:ident, 8) => {
-        residual_extern_addr_8($f)
+        residual_extern_addr_8(
+            |a0, a1, a2, a3, a4, a5, a6, a7| $f(a0, a1, a2, a3, a4, a5, a6, a7),
+            $f,
+        )
     };
     ($f:ident, 9) => {
-        residual_extern_addr_9($f)
+        residual_extern_addr_9(
+            |a0, a1, a2, a3, a4, a5, a6, a7, a8| $f(a0, a1, a2, a3, a4, a5, a6, a7, a8),
+            $f,
+        )
     };
     ($f:ident, 10) => {
-        residual_extern_addr_10($f)
+        residual_extern_addr_10(
+            |a0, a1, a2, a3, a4, a5, a6, a7, a8, a9| $f(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+            $f,
+        )
     };
 }
 
@@ -2303,16 +2327,17 @@ pub extern "C" fn jit_exception_match(exc: PyObjectRef, match_class: PyObjectRef
 /// StopIteration.  `jit_next`'s null-for-StopIteration convention exists for
 /// `FOR_ITER`'s `GuardNonnull` and is wrong here.
 #[majit_macros::jit_may_force]
-pub extern "C" fn bh_next(iter: PyObjectRef) -> PyObjectRef {
+pub extern "C" fn bh_next(iter: i64) -> i64 {
+    let iter = iter as usize as PyObjectRef;
     match crate::baseobjspace::next(iter) {
-        Ok(value) => value,
+        Ok(value) => value as usize as i64,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
             if exc_obj != PY_NULL {
                 majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
             }
             jit_publish_exception(exc_obj);
-            PY_NULL
+            PY_NULL as usize as i64
         }
     }
 }
