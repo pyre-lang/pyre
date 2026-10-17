@@ -4788,12 +4788,11 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let args = [src];
         let loc = self.xrm.force_result_in_reg(
             dst,
             src,
             Type::Float,
-            &args,
+            &[],
             &mut self.longevity,
             &mut self.fm,
             &self.constants,
@@ -4826,12 +4825,11 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let args = [arg];
         let loc = self.xrm.force_result_in_reg(
             dst,
             arg,
             Type::Float,
-            &args,
+            &[],
             &mut self.longevity,
             &mut self.fm,
             &self.constants,

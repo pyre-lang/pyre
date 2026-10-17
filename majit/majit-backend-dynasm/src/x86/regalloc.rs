@@ -328,12 +328,11 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let args = [arg];
         let loc = self.rm.force_result_in_reg(
             dst,
             arg,
             Type::Int,
-            &args,
+            &[],
             &mut self.longevity,
             &mut self.fm,
             &self.constants,
