@@ -50,7 +50,17 @@ impl crate::rordereddict::EntryDummy for IdentityKey {
 /// `IdentityDictStrategy` backing — erased identity-keyed `{}`
 /// (`identitydict.py`). GC-managed storage box (mirrors the other
 /// dict strategies; see `dictmultiobject::ObjectDictStorage`).
-pub type IdentityDictStorage = crate::rordereddict::RDict<IdentityKey, PyObjectRef>;
+///
+/// An instance-keyed `{}` hashes with `compute_identity_hash` and nothing
+/// else, so the table takes the identity hash as is
+/// ([`ObjectKeyBuildHasher`](crate::dictmultiobject::ObjectKeyBuildHasher))
+/// and carries no hasher state: `rclass.ll_inst_hash` is
+/// `lltype.identityhash(ins)`.
+pub type IdentityDictStorage = crate::rordereddict::RDict<
+    IdentityKey,
+    PyObjectRef,
+    crate::dictmultiobject::ObjectKeyBuildHasher,
+>;
 
 /// Runtime-assigned GC type id for the [`IdentityDictStorage`] box.
 static IDENTITY_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
