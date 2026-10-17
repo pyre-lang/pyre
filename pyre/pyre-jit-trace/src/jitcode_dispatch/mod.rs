@@ -4851,6 +4851,16 @@ pub fn walk<Sym: WalkSym>(
             // produces SubReturn/SubRaise, matching PyPy's one `_interpret`
             // loop over `metainterp.framestack`.
             Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
+            Err(error @ DispatchError::TraceTooLong { .. }) => {
+                // Nested helper already ran `note_root_trace_too_long`. This
+                // frame owns the Python resume coordinate; latch it the same
+                // way the post-step too-long arm does. The CALL did not
+                // finish, so the coordinate is `opcode_position`.
+                if !ctx.fbw_mode.transparent_helper_subwalk && !abort_blackhole_latched() {
+                    let _ = latch_abort_blackhole(ctx, opcode_position, "mod2730-too-long");
+                }
+                return Err(error);
+            }
             Err(error) => {
                 // `pyjitpl.py run_blackhole_interp_to_cancel_tracing`
                 // parity.  Upstream has ONE abort path: every abort inside
@@ -4928,8 +4938,9 @@ pub fn walk<Sym: WalkSym>(
                 // latch here, `build_multi_frame_miframe` appends the helper's
                 // r0 args-slice as though it were a Python red frame and the
                 // blackhole resume loses per-frame identity.  This is the
-                // abort counterpart of the transparent-helper guard snapshot
-                // and trace-limit handling below.
+                // abort counterpart of the transparent-helper guard snapshot.
+                // Trace-length is not deferred: `_interpret` checks it on the
+                // helper MIFrame itself, and the post-step arm below does too.
                 //
                 // A seeded inline whose abort is a modeling gap rather than a
                 // missing value latches even when the root allow-list has not
@@ -5000,22 +5011,15 @@ pub fn walk<Sym: WalkSym>(
         if let DispatchOutcome::SegmentTrace { .. } = outcome {
             return Ok((outcome, pc));
         }
-        // A translated builtin gateway is transparent to the Python MIFrame
-        // stack and has no blackhole entry point of its own. Its bytecode is
-        // one implementation detail of the enclosing Python CALL step, so do
-        // not split the trace in the middle of it: doing so would have to pair
-        // helper registers with a Python JitCode's red-frame register. Finish
-        // the helper and let the enclosing Python `walk()` perform this same
-        // post-step limit check at its real per-frame coordinate, matching
-        // RPython's one-red-frame ownership.
-        //
-        // The exemption defers the abort, it does not drop it. `is_too_long`
-        // is a `num_ops > trace_limit` comparison over the shared `TraceCtx`,
-        // so it still holds when the helper returns and the enclosing frame
-        // runs this check. Aborting inside the helper is what turns one
-        // overflow into a retrace storm: the helper has no merge point that
-        // can close a segment, and the tokenless cell keeps counting.
-        if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
+        // pyjitpl.py `_interpret` calls `blackhole_if_trace_too_long` after
+        // every `run_one_step` of whichever MIFrame is on top. Inlined helper
+        // frames are ordinary MIFrames, so a transparent helper subwalk runs
+        // this same post-step check. Deferring it to the enclosing Python
+        // walk never comes back when the helper keeps descending (nested-tuple
+        // `isinstance` via `walk_translated_builtin_wrapper`). The abort below
+        // is the same `note_root_trace_too_long` + `TraceTooLong` path the
+        // enclosing frame already takes.
+        if ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
             // frame transition: in particular, `SubRaise` may enter this
@@ -5033,7 +5037,15 @@ pub fn walk<Sym: WalkSym>(
             if snapshot_safe {
                 reconcile_vstack_to_resume_pc(ctx, pc);
             }
-            let mut blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
+            // A translated helper is not a Python resume coordinate; latching
+            // here would pair helper pc with the enclosing JitCode. Unwind
+            // `TraceTooLong` to the enclosing Python walk, which latches its
+            // own banks at the CALL (the Err arm above). `abort_safe` still
+            // fires on a zero-effect helper Continue, which is what stops
+            // nested-tuple `isinstance` from descending forever.
+            let mut blackhole_latched = snapshot_safe
+                && !ctx.fbw_mode.transparent_helper_subwalk
+                && latch_abort_blackhole(ctx, pc, "mod2786");
             // Root-walk too-long publishes the walker mirror (`_copy_data_from_miframe`
             // equivalent).  Ask the height check here, while a refusal can still
             // unstage: a preflighted adopt treats a later decline as an assert.
@@ -12794,18 +12806,12 @@ fn guarded_branch_core<Sym: WalkSym>(
     other_pc: usize,
     result_write: Option<(usize, OpRef)>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Resume-data capture (`capture_resumedata(resumepc=orgpc)` at
-    // `pyjitpl.py`) is threaded via
-    // `walker_capture_snapshot_for_last_guard(other_target)`.
-    // Branch guards resume at the runtime jump destination — the
-    // branch NOT taken in the trace — not the `goto_if_not` opcode
-    // itself (`trace_opcode.rs`, `resume_pc =
-    // other_target`).  The trace took the `switchcase` direction;
-    // a guard failure flips to the other arm, where the Python
-    // interpreter has already popped the comparison truth, so the
-    // blackhole must re-enter past `POP_JUMP_IF_*`.  GuardTrue
-    // (trace fell through to `op.next_pc`) → resume at `target`;
-    // GuardFalse (trace jumped to `target`) → resume at `op.next_pc`.
+    // `pyjitpl.py` `opimpl_goto_if_not` / `generate_guard(resumepc=orgpc)`:
+    // a branch guard resumes AT the conditional jump, and blackhole
+    // `bhimpl_goto_if_not` re-evaluates the restored condition.
+    // `other_target` is still the not-taken arm (kept-stack trampoline
+    // decode, depth gate, unrestorable-arm decline). Depth-0 capture
+    // below keys the jump itself rather than this destination.
     let other_target = resolve_branch_target_through_trampoline(code, other_pc);
     {
         // #124/#281: a branch guard whose resume target still holds a
@@ -13168,11 +13174,6 @@ fn guarded_branch_core<Sym: WalkSym>(
         // operand-stack values from the guard-pc register file (the
         // resume coordinate `other_target` names a merge point whose
         // live colors the walk has not written at the guard point).
-        // A depth-0 branch resumes losslessly at `other_target` via
-        // the baseline `py_pc → jitcode` resume-translation path;
-        // routing it through the
-        // guard-pc carrier would resume one opcode early (re-running
-        // `goto_if_not`) and desync the decoded box layout.
         // Feed the snapshot encoder the SAME resolved set the gate
         // checked (resolved above, before `record_guard`): each
         // `(dst, live guard value)`, sources already filtered to live
@@ -13183,9 +13184,23 @@ fn guarded_branch_core<Sym: WalkSym>(
         } else {
             Vec::new()
         };
+        // Depth-0: `pyjitpl.py` `opimpl_goto_if_not` /
+        // `generate_guard(resumepc=orgpc)`. Capture at the jump's
+        // `-live-` BEFORE (`ctx.live_before_jit_pc`), the same
+        // coordinate JUMP_BACKWARD already publishes, so the snapshot
+        // boxes are the live set before `goto_if_not` (condition
+        // included) and blackhole re-evaluates the branch. Kept-stack
+        // (depth>0 trampoline) still snapshots `other_target`.
+        let capture_pc = if kept_stack {
+            other_target
+        } else if ctx.live_before_jit_pc != usize::MAX {
+            ctx.live_before_jit_pc
+        } else {
+            op.pc
+        };
         walker_capture_snapshot_for_last_guard_scoped(
             ctx,
-            other_target,
+            capture_pc,
             GuardCaptureScope {
                 branch_guard_jitcode_pc: kept_stack.then_some(op.pc),
                 branch_guard_kept_recovered: &kept,

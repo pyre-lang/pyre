@@ -145,6 +145,12 @@ fn fresh_wide_stored(stored: WideStored) -> u64 {
     u64::from(id)
 }
 
+/// Snapshot of [`NEXT_WIDE_ID`]. Tests use this to prove a path did not mint.
+#[doc(hidden)]
+pub fn wide_ids_minted() -> u32 {
+    NEXT_WIDE_ID.load(Ordering::Relaxed)
+}
+
 pub(crate) fn wide_value(id: u64) -> Value {
     match wide_slot(id as u32).get() {
         WideStored::Int(v) => Value::Int(v),
