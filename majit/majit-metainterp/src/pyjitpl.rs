@@ -31384,6 +31384,7 @@ mod tests {
     /// publication barrier fires, and remains visible to every major walk.
     #[test]
     fn compiled_graph_root_walk_consumes_its_aggregate_minor_barrier() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
         let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
@@ -31477,6 +31478,7 @@ mod tests {
     /// live-plus-previous set it already uses for descr pools.
     #[test]
     fn compiled_graph_root_walk_visits_predecessor_target_token_attrs() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
         let pred_tt = crate::history::TargetToken::new_loop(11);
@@ -31520,6 +31522,7 @@ mod tests {
     /// walker follows `keepalive_tokens` to the same TargetToken attrs.
     #[test]
     fn compiled_graph_root_walk_visits_keepalive_target_token_attrs() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
         let kept_tt = crate::history::TargetToken::new_loop(12);
@@ -31566,6 +31569,7 @@ mod tests {
     /// the token can outlive the creating thread (`thread_die`).
     #[test]
     fn compiled_graph_root_walk_stamps_virtual_state_constptr_indexes() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
         use majit_ir::const_ptr_table::resolve;
@@ -31622,6 +31626,7 @@ mod tests {
     /// `compile_target_tokens` slot is that window.
     #[test]
     fn walk_rd_consts_refs_visits_in_flight_compile_target_tokens() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
@@ -31649,6 +31654,7 @@ mod tests {
     /// `walk_rd_consts_refs` is the extra-root walk that stamps it.
     #[test]
     fn walk_rd_consts_refs_stamps_resume_storage_constptr() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
         use majit_ir::const_ptr_table::resolve;
 

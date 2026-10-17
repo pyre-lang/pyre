@@ -4564,6 +4564,7 @@ mod tests {
     /// address with a fresh one.
     #[test]
     fn walking_the_memo_forwards_its_ref_consts_and_rekeys_the_cache() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         let mut memo = super::ResumeDataLoopMemo::new();
         let before = 0x9B_0000_1000i64;
         let after = 0x9B_0000_2000i64;
