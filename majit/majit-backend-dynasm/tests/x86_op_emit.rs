@@ -168,6 +168,41 @@ fn int_and_low32_mask_zero_extends() {
     assert_eq!(compile_and_run_int(OpCode::IntAnd, Some(-1), -1, 83), -1);
 }
 
+/// `load_effective_addr` with a constant base: `AddressLoc` folds the
+/// `ImmedLoc` into the static offset, directly when the sum fits a disp32 and
+/// through `_addr_as_reg_offset` when it does not.
+#[test]
+fn load_effective_address_folds_a_constant_base() {
+    for (token_id, base) in [(96i64, 0x1000i64), (97, 0x1234_5678_0000)] {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let token = JitCellToken::new(token_id);
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let i0 = inputargs[0].opref();
+        let lea = Op::new(
+            OpCode::LoadEffectiveAddress,
+            &[
+                rb(OpRef::const_int(base)),
+                rb(i0),
+                rb(OpRef::const_int(16)),
+                rb(OpRef::const_int(3)),
+            ],
+        );
+        lea.pos().set(OpRef::int_op(1));
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+        finish.pos().set(OpRef::void_op(2));
+        finish.set_fail_arg_types(vec![Type::Int]);
+        finish.setfailargs(vec![rb(OpRef::int_op(1))].into());
+        let ops = vec![OpRc::new(lea), OpRc::new(finish)];
+        backend
+            .compile_loop(&inputargs, &ops, &token)
+            .expect("compile LOAD_EFFECTIVE_ADDRESS");
+        let frame = backend.execute_token(&token, &[Value::Int(5)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), base + (5 << 3) + 16);
+    }
+}
+
 #[test]
 fn int_force_ge_zero_clamps_negatives() {
     // genop_int_force_ge_zero: negatives become 0, non-negatives pass through.

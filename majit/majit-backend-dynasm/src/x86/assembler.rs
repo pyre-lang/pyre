@@ -10906,35 +10906,31 @@ impl<'a> Assembler386<'a> {
                  consider_load_effective_address, got {other:?}"
             ),
         };
-        // `make_sure_var_in_reg` hands a constant back as an immediate, and
-        // `addr_add` takes an `ImmedLoc` base; the scratch register is never
-        // allocated, so it cannot alias `dst` or the index.
-        let base_reg = match base {
-            Loc::Reg(r) if !r.is_xmm => r.value,
-            Loc::Immed(i) => {
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                let imm = i.value;
-                self.load_scratch(imm);
-                scratch
+        let shift = match shift_amt {
+            0..=3 => shift_amt as u8,
+            other => panic!(
+                "LoadEffectiveAddress shift must be 0..=3 (rewrite.py itemscale), got {other}"
+            ),
+        };
+        // `load_effective_addr`: `LEA(result, addr_add(frm, sizereg,
+        // baseofs, scale))`. `make_sure_var_in_reg` hands a constant base
+        // back as an `ImmedLoc`, which `AddressLoc` folds into the static
+        // offset (`NO_BASE_REGISTER`, location code `'a'`).
+        let addr = match base {
+            Loc::Reg(r) if !r.is_xmm => {
+                let disp = i32::try_from(ofs).expect(
+                    "LoadEffectiveAddress baseofs must fit signed disp32 (rewrite.py str/unicode basesize)",
+                );
+                (i16::from(r.value), index_reg, shift, disp)
             }
+            Loc::Immed(i) => self.addr_add_imm_index(index_reg, shift, i.value.wrapping_add(ofs)),
             other => panic!(
                 "LoadEffectiveAddress base must be Loc::Reg or Loc::Immed after \
                  consider_load_effective_address, got {other:?}"
             ),
         };
-        let scale = match shift_amt {
-            0 => 1,
-            1 => 2,
-            2 => 4,
-            3 => 8,
-            other => panic!(
-                "LoadEffectiveAddress shift must be 0..=3 (rewrite.py itemscale), got {other}"
-            ),
-        };
-        let disp = i32::try_from(ofs).expect(
-            "LoadEffectiveAddress baseofs must fit signed disp32 (rewrite.py str/unicode basesize)",
-        );
-        self.emit_lea_sib(dst.value, base_reg, index_reg, scale, disp);
+        self.forget_if_scratch_written(dst.value);
+        rx86::lea_ra(&mut self.mc, dst.value, addr);
     }
 
     fn emit_lea_base_plus_disp(&mut self, dst: u8, base: &Loc, disp: i64) {
@@ -10971,18 +10967,6 @@ impl<'a> Assembler386<'a> {
                 }
             }
         }
-    }
-
-    fn emit_lea_sib(&mut self, dst: u8, base: u8, index: u8, scale: i64, disp: i32) {
-        let shift = match scale {
-            1 => 0,
-            2 => 1,
-            4 => 2,
-            8 => 3,
-            other => panic!("emit_lea_sib scale must be 1/2/4/8, got {other}"),
-        };
-        self.forget_if_scratch_written(dst);
-        rx86::lea_ra(&mut self.mc, dst, (i16::from(base), index, shift, disp));
     }
 
     /// NEWSTR: allocate a byte string of given length.
