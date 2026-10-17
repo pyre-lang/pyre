@@ -896,14 +896,14 @@ pub fn materialize_empty_array_consts(jitcodes: &mut [Arc<JitCode>]) {
 }
 
 /// Materialize every deferred prebuilt empty-class instance
-/// ([`materialize_str_consts`]' sibling for `InstanceRepr.convert_const`).
-/// Each descriptor names a `constants_r` slot holding a non-canonical
-/// sentinel; overwrite it with one immortal instance per class, whose
-/// first word is the class vtable (`ClassRepr.getvtable` /
-/// `initialize_prebuilt_instance` typeptr). Intern one instance per
-/// class, matching [`materialize_empty_array_consts`].
+/// ([`materialize_str_consts`]' sibling for `InstanceRepr.convert_const` /
+/// `convert_const_exact`). Each descriptor names a `constants_r` slot
+/// holding a non-canonical sentinel; overwrite it with the immortal
+/// instance `create_instance` would malloc. Intern one instance per
+/// HostObject identity (`iprebuiltinstances[value]`, `emit_const`'s
+/// `value._obj.container`).
 pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
-    static CELLS: LazyLock<std::sync::Mutex<Vec<(String, i64)>>> =
+    static CELLS: LazyLock<std::sync::Mutex<Vec<(u64, i64)>>> =
         LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
     for arc in jitcodes.iter_mut() {
         if arc
@@ -918,15 +918,29 @@ pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
         );
         let body = jc.body_mut();
         for i in 0..body.prebuilt_instance_consts.len() {
-            let idx = body.prebuilt_instance_consts[i].constants_r_index;
-            let class_name = body.prebuilt_instance_consts[i].class_name.clone();
-            let addr = {
+            let desc = body.prebuilt_instance_consts[i].clone();
+            let idx = desc.constants_r_index;
+            let identity = desc.identity;
+            // Allocate outside the intern lock: `create_instance` can
+            // panic (`get_vtable_for_gcstruct` on a typeptr header with
+            // no registered vtable), and a std Mutex held across that
+            // panic poisons every later intern.
+            let cached = {
+                let cells = CELLS.lock().unwrap();
+                cells
+                    .iter()
+                    .find(|(id, _)| *id == identity)
+                    .map(|(_, a)| *a)
+            };
+            let addr = if let Some(a) = cached {
+                a
+            } else {
+                let a = prebuilt_empty_class_instance_addr(&desc);
                 let mut cells = CELLS.lock().unwrap();
-                if let Some((_, a)) = cells.iter().find(|(q, _)| *q == class_name) {
-                    *a
+                if let Some((_, existing)) = cells.iter().find(|(id, _)| *id == identity) {
+                    *existing
                 } else {
-                    let a = prebuilt_empty_class_instance_addr(&class_name);
-                    cells.push((class_name, a));
+                    cells.push((identity, a));
                     a
                 }
             };
@@ -942,44 +956,76 @@ pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
     }
 }
 
-/// Immortal rclass instance: `{ typeptr }`. `InstanceRepr.create_instance`
-/// mallocs `self.object_type` immortal; `initialize_prebuilt_instance`
-/// writes `self.rclass.getvtable()` into typeptr. The vtable is the
-/// `_cache_gcstruct2vtable` row `get_vtable_for_gcstruct` reads
-/// (`heaptracker.py`); mint one only when that row is empty, and register
-/// it there so later readers share it. Header tid is the class's collector
-/// id when the row has one.
-fn prebuilt_empty_class_instance_addr(class_name: &str) -> i64 {
-    let (vtable, type_id) = gcstruct_vtable_and_tid(class_name);
-    #[repr(C)]
-    struct EmptyClassInstance {
-        typeptr: usize,
+/// Immortal rclass instance. `InstanceRepr.create_instance` mallocs
+/// `self.object_type` immortal; `initialize_prebuilt_instance` writes
+/// `ClassRepr.getvtable` into typeptr when the STRUCT has one.
+///
+/// `rewrite_op_malloc` is `new_with_vtable` iff `has_gcstruct_a_vtable`;
+/// `get_vtable_for_gcstruct` only reads `_cache_gcstruct2vtable` (filled
+/// by `publish_pyre_class_vtables`) and never mints a vtable. A typeptr
+/// header with no registered row is a registration gap.
+fn prebuilt_empty_class_instance_addr(
+    desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
+) -> i64 {
+    let (vtable, tid) = prebuilt_instance_vtable_and_tid(desc);
+    let ptr =
+        majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(desc.size, tid) as usize;
+    assert!(ptr != 0, "prebuilt instance allocation failed");
+    if let Some(vtable) = vtable {
+        assert!(
+            desc.size >= std::mem::size_of::<usize>(),
+            "prebuilt instance typeptr header needs a word, size={}",
+            desc.size
+        );
+        unsafe {
+            *(ptr as *mut usize) = vtable;
+        }
     }
-    majit_gc::header::alloc_with_gc_header_immortal(EmptyClassInstance { typeptr: vtable }, type_id)
-        as i64
+    ptr as i64
 }
 
-/// `heaptracker.py get_vtable_for_gcstruct` plus the collector tid
-/// `setup_cache_gcstruct2vtable` stored beside it. `publish_pyre_class_vtables`
-/// fills each `#[pyre_class]` `pytype_ptr` first so a class that already
-/// has a vtable is not given a second one.
-fn gcstruct_vtable_and_tid(class_name: &str) -> (usize, u32) {
-    crate::descr::publish_pyre_class_vtables();
-    let cache_key = majit_ir::descr::path_hash(&majit_ir::descr::canonical_struct_name(class_name));
-    let mut gc = majit_ir::descr::gc_cache().lock();
-    if let Some((vt, tid)) = gc._cache_gcstruct2vtable.get(&cache_key).copied()
-        && vt != 0
-    {
-        let tid = if tid != 0 {
-            tid
-        } else {
-            crate::descr::OBJECT_GC_TYPE_ID
-        };
-        return (vt, tid);
+/// Size descr `OpKind::New` emits (`vtable: 0`, empty owner). Empty-class
+/// `all_fielddescrs` is empty; the instance is GC-managed. `bh_new` /
+/// `opimpl_new` write `resolve_gc_tid()` into the header.
+fn prebuilt_instance_size_descr(
+    desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
+) -> majit_jitcode::jitcode::BhDescr {
+    majit_jitcode::jitcode::BhDescr::Size {
+        size: desc.size,
+        type_id: desc.type_id,
+        vtable: 0,
+        owner: String::new(),
+        all_fielddescrs: Vec::new(),
+        is_gc_managed: true,
     }
-    let vt = Box::leak(Box::new(0usize)) as *mut usize as usize;
-    gc.register_gcstruct_vtable(cache_key, vt, crate::descr::OBJECT_GC_TYPE_ID);
-    (vt, crate::descr::OBJECT_GC_TYPE_ID)
+}
+
+/// Vtable word and collector tid for one prebuilt instance.
+///
+/// Header tid is `BhDescr::resolve_gc_tid` on the Size descr `new` uses.
+/// Typeptr-header: `_cache_gcstruct2vtable` after `publish_pyre_class_vtables`,
+/// the row `get_vtable_for_gcstruct` reads. Never minted.
+fn prebuilt_instance_vtable_and_tid(
+    desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
+) -> (Option<usize>, u32) {
+    let tid = prebuilt_instance_size_descr(desc).resolve_gc_tid();
+    if desc.has_vtable {
+        crate::descr::publish_pyre_class_vtables();
+        let found = {
+            let gc = majit_ir::descr::gc_cache().lock();
+            gc._cache_gcstruct2vtable.get(&desc.type_id).copied()
+        };
+        match found {
+            Some((vt, _)) if vt != 0 => (Some(vt), tid),
+            _ => panic!(
+                "prebuilt instance: typeptr-header struct type_id={:#x} has no registered vtable \
+                 (heaptracker.get_vtable_for_gcstruct reads _cache_gcstruct2vtable; it never mints one)",
+                desc.type_id
+            ),
+        }
+    } else {
+        (None, tid)
+    }
 }
 
 /// One immortal empty `GcArray` for `type_name` (`Array<T;0>`).
@@ -1365,116 +1411,123 @@ mod tests {
         assert_eq!(addr, pyre_object::prebuilt_empty_bytes_block() as i64);
     }
 
-    #[test]
-    fn materialize_prebuilt_instance_consts_overwrites_sentinel_with_typeptr_instance() {
-        use majit_jitcode::codewriter::assembler::PREBUILT_INSTANCE_CONST_SENTINEL_BASE;
-        use majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor;
-
-        let desc = PrebuiltInstanceConstDescriptor {
+    fn prebuilt_instance_desc(
+        identity: u64,
+        size: usize,
+        type_id: u64,
+        has_vtable: bool,
+    ) -> majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor {
+        majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor {
             constants_r_index: 0,
-            class_name: "dictmultiobject::DictKeyError".into(),
-        };
-        let jc = JitCode::new("dict_key_error");
+            identity,
+            size,
+            type_id,
+            has_vtable,
+        }
+    }
+
+    fn jitcode_with_prebuilt(
+        name: &str,
+        desc: majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
+    ) -> Arc<JitCode> {
+        use majit_jitcode::codewriter::assembler::PREBUILT_INSTANCE_CONST_SENTINEL_BASE;
+        let jc = JitCode::new(name);
         jc.set_body(JitCodeBody {
             prebuilt_instance_consts: vec![desc],
             constants_r: vec![PREBUILT_INSTANCE_CONST_SENTINEL_BASE.into()],
             ..Default::default()
         });
-        let mut jcs = vec![Arc::new(jc)];
+        Arc::new(jc)
+    }
+
+    #[test]
+    fn materialize_prebuilt_instance_consts_overwrites_sentinel_with_header_only_instance() {
+        use majit_jitcode::codewriter::assembler::PREBUILT_INSTANCE_CONST_SENTINEL_BASE;
+
+        let type_id = majit_ir::descr::path_hash("c1i::HeaderOnlyEmpty");
+        let desc = prebuilt_instance_desc(0xC110_0001, 0, type_id, false);
+        let mut jcs = vec![jitcode_with_prebuilt("dict_key_error", desc)];
         materialize_prebuilt_instance_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
         assert_ne!(addr, PREBUILT_INSTANCE_CONST_SENTINEL_BASE);
         assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
         assert_ne!(addr, 0);
-        let typeptr = unsafe { *(addr as *const usize) };
-        assert_ne!(typeptr, 0, "typeptr is the class vtable");
-        let cache_key = majit_ir::descr::path_hash(&majit_ir::descr::canonical_struct_name(
-            "dictmultiobject::DictKeyError",
-        ));
+        let hdr = unsafe { majit_gc::header::header_of(addr as usize) };
+        let expected_tid =
+            prebuilt_instance_size_descr(&prebuilt_instance_desc(0xC110_0001, 0, type_id, false))
+                .resolve_gc_tid();
+        assert_eq!(expected_tid, type_id as u32);
+        assert_eq!(unsafe { (*hdr).type_id() }, expected_tid);
         let registered = majit_ir::descr::gc_cache()
             .lock()
             ._cache_gcstruct2vtable
-            .get(&cache_key)
+            .get(&type_id)
             .copied();
-        assert_eq!(registered, Some((typeptr, crate::descr::OBJECT_GC_TYPE_ID)));
+        assert!(
+            registered.is_none(),
+            "header-only new does not mint a vtable (get_vtable_for_gcstruct only reads)"
+        );
     }
 
     #[test]
-    fn materialize_prebuilt_instance_consts_interns_one_instance_per_class() {
-        use majit_jitcode::codewriter::assembler::PREBUILT_INSTANCE_CONST_SENTINEL_BASE;
-        use majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor;
-
-        fn jc(name: &str) -> Arc<JitCode> {
-            let desc = PrebuiltInstanceConstDescriptor {
-                constants_r_index: 0,
-                class_name: "KwargsDictStrategy".into(),
-            };
-            let jc = JitCode::new(name);
-            jc.set_body(JitCodeBody {
-                prebuilt_instance_consts: vec![desc],
-                constants_r: vec![PREBUILT_INSTANCE_CONST_SENTINEL_BASE.into()],
-                ..Default::default()
-            });
-            Arc::new(jc)
-        }
-        let mut first = vec![jc("a")];
-        let mut second = vec![jc("b")];
+    fn materialize_prebuilt_instance_consts_interns_one_instance_per_identity() {
+        let type_id = majit_ir::descr::path_hash("c1i::InternByIdentity");
+        let same = prebuilt_instance_desc(0xC110_0002, 0, type_id, false);
+        let mut first = vec![jitcode_with_prebuilt("a", same.clone())];
+        let mut second = vec![jitcode_with_prebuilt("b", same)];
         materialize_prebuilt_instance_consts(&mut first);
         materialize_prebuilt_instance_consts(&mut second);
         assert_eq!(
             first[0].body().constants_r[0],
             second[0].body().constants_r[0],
-            "one class must resolve to one immortal instance"
+            "one HostObject identity must resolve to one immortal instance"
         );
         let addr_a = first[0].body().constants_r[0].get();
         let other = {
-            let desc = PrebuiltInstanceConstDescriptor {
-                constants_r_index: 0,
-                class_name: "PyreEnv".into(),
-            };
-            let jc = JitCode::new("other");
-            jc.set_body(JitCodeBody {
-                prebuilt_instance_consts: vec![desc],
-                constants_r: vec![PREBUILT_INSTANCE_CONST_SENTINEL_BASE.into()],
-                ..Default::default()
-            });
-            let mut jcs = vec![Arc::new(jc)];
+            let desc = prebuilt_instance_desc(0xC110_0003, 0, type_id, false);
+            let mut jcs = vec![jitcode_with_prebuilt("other", desc)];
             materialize_prebuilt_instance_consts(&mut jcs);
             jcs[0].body().constants_r[0].get()
         };
-        assert_ne!(addr_a, other, "distinct classes keep distinct instances");
-        let vt_a = unsafe { *(addr_a as *const usize) };
-        let vt_b = unsafe { *(other as *const usize) };
-        assert_ne!(vt_a, vt_b, "each class has its own vtable");
+        assert_ne!(
+            addr_a, other,
+            "distinct HostObjects keep distinct instances"
+        );
+    }
+
+    #[test]
+    fn materialize_prebuilt_instance_consts_two_identities_of_one_class_are_distinct() {
+        let type_id = majit_ir::descr::path_hash("c1i::TwoRuntimeHosts");
+        let a = prebuilt_instance_desc(0xC110_0006, 0, type_id, false);
+        let b = prebuilt_instance_desc(0xC110_0007, 0, type_id, false);
+        let mut jcs = vec![
+            jitcode_with_prebuilt("host_a", a),
+            jitcode_with_prebuilt("host_b", b),
+        ];
+        materialize_prebuilt_instance_consts(&mut jcs);
+        let addr_a = jcs[0].body().constants_r[0].get();
+        let addr_b = jcs[1].body().constants_r[0].get();
+        assert_ne!(
+            addr_a, addr_b,
+            "two HostObjects of one empty class are two runtime objects"
+        );
     }
 
     #[test]
     fn materialize_prebuilt_instance_consts_uses_registered_class_vtable() {
-        use majit_jitcode::codewriter::assembler::PREBUILT_INSTANCE_CONST_SENTINEL_BASE;
-        use majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor;
-
-        let class_name = "c1h2::RegisteredVtableEmpty";
-        let cache_key =
-            majit_ir::descr::path_hash(&majit_ir::descr::canonical_struct_name(class_name));
+        let type_id = majit_ir::descr::path_hash("c1i::RegisteredVtableEmpty");
         let real_vtable = Box::leak(Box::new(0xC1B2_0000_0001usize)) as *const usize as usize;
         let real_tid = 4242u32;
-        majit_ir::descr::gc_cache().lock().register_gcstruct_vtable(
-            cache_key,
-            real_vtable,
-            real_tid,
-        );
+        {
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            gc.register_gcstruct_vtable(type_id, real_vtable, real_tid);
+            // `new` / `bh_new` resolve the header tid from the SizeDescr
+            // `get_size_descr` stamps after `register_gcstruct_vtable`.
+            let _ = gc.get_size_descr(majit_ir::descr::LLType::Struct(type_id), 8, 0, false);
+        }
 
-        let desc = PrebuiltInstanceConstDescriptor {
-            constants_r_index: 0,
-            class_name: class_name.into(),
-        };
-        let jc = JitCode::new("registered_vtable");
-        jc.set_body(JitCodeBody {
-            prebuilt_instance_consts: vec![desc],
-            constants_r: vec![PREBUILT_INSTANCE_CONST_SENTINEL_BASE.into()],
-            ..Default::default()
-        });
-        let mut jcs = vec![Arc::new(jc)];
+        let desc = prebuilt_instance_desc(0xC110_0004, 8, type_id, true);
+        let mut jcs = vec![jitcode_with_prebuilt("registered_vtable", desc)];
         materialize_prebuilt_instance_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
         let typeptr = unsafe { *(addr as *const usize) };
@@ -1487,9 +1540,33 @@ mod tests {
         let registered = majit_ir::descr::gc_cache()
             .lock()
             ._cache_gcstruct2vtable
-            .get(&cache_key)
+            .get(&type_id)
             .copied();
         assert_eq!(registered, Some((real_vtable, real_tid)));
+    }
+
+    #[test]
+    #[should_panic(expected = "no registered vtable")]
+    fn materialize_prebuilt_instance_consts_panics_when_typeptr_header_has_no_vtable() {
+        let type_id = majit_ir::descr::path_hash("c1i::MissingVtableEmpty");
+        let desc = prebuilt_instance_desc(0xC110_0005, 8, type_id, true);
+        let mut jcs = vec![jitcode_with_prebuilt("missing_vtable", desc)];
+        materialize_prebuilt_instance_consts(&mut jcs);
+    }
+
+    #[test]
+    #[should_panic(expected = "foreign allocation layout")]
+    fn materialize_prebuilt_instance_consts_panics_on_foreign_allocation_layout() {
+        let type_id = majit_ir::descr::path_hash("c1i::ForeignLayoutEmpty");
+        let _ = majit_ir::descr::gc_cache().lock().get_size_descr(
+            majit_ir::descr::LLType::Struct(type_id),
+            16,
+            0,
+            false,
+        );
+        let desc = prebuilt_instance_desc(0xC110_0008, 0, type_id, false);
+        let mut jcs = vec![jitcode_with_prebuilt("foreign_layout", desc)];
+        materialize_prebuilt_instance_consts(&mut jcs);
     }
 
     /// Walker folds that recognise a residual by callee compare against this

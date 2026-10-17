@@ -188,19 +188,35 @@ pub struct EmptyArrayConstDescriptor {
 }
 
 /// A prebuilt empty-class instance whose runtime object is materialized
-/// at jitcode-load time. `rclass.py InstanceRepr.convert_const` mallocs
-/// immortal (`create_instance`) and `initialize_prebuilt_instance` writes
-/// the class vtable into `typeptr`; `assembler.py emit_const` stores that
-/// GCREF. The translator cannot allocate the runtime object, so the
-/// `constants_r` slot holds a non-canonical sentinel until the load pass
-/// writes one immortal instance per class.
+/// at jitcode-load time. `InstanceRepr.convert_const` / `convert_const_exact`
+/// mallocs immortal (`create_instance`) and
+/// `initialize_prebuilt_instance` writes `ClassRepr.getvtable` into
+/// typeptr when the STRUCT has one; `assembler.py emit_const` stores
+/// that GCREF, pooling by `value._obj.container`. The translator cannot
+/// allocate the runtime object, so the `constants_r` slot holds a
+/// non-canonical sentinel until the load pass writes the immortal
+/// instance. Layout (`size` / `type_id` / `has_vtable`) is resolved at
+/// assembly from the registered size spec (`rewrite_op_malloc`'s
+/// `new_with_vtable` vs `new`); the intern key is the source
+/// HostObject's identity (`convert_const_exact`'s `iprebuiltinstances`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PrebuiltInstanceConstDescriptor {
     /// Position in [`JitCodeBody::constants_r`] holding the sentinel.
     pub constants_r_index: usize,
-    /// Interned class qualname, the runtime dedup key: one immortal
-    /// instance and one class vtable per class.
-    pub class_name: String,
+    /// `HostObject::identity_id`. Distinct HostObjects of one class stay
+    /// distinct objects; one HostObject referenced from several jitcodes
+    /// resolves to one object.
+    pub identity: u64,
+    /// Payload size of `create_instance`'s `self.object_type`.
+    pub size: usize,
+    /// Size-descr STRUCT identity (`BhSizeSpec.type_id`). Runtime looks
+    /// up the collector tid and, when `has_vtable`, the
+    /// `_cache_gcstruct2vtable` row `get_vtable_for_gcstruct` reads.
+    pub type_id: u64,
+    /// `has_gcstruct_a_vtable`: typeptr-header structs are
+    /// `new_with_vtable` (registered vtable + class tid); others are
+    /// header-only `new` of this size-descr type id.
+    pub has_vtable: bool,
 }
 
 /// Body of a `JitCode` — populated once by the assembler after
@@ -364,8 +380,8 @@ pub struct JitCodeBody {
     #[serde(default)]
     pub empty_array_consts: Vec<EmptyArrayConstDescriptor>,
     /// Prebuilt empty-class instances deferred to runtime materialization —
-    /// [`Self::str_consts`]' shape for `InstanceRepr.convert_const`.
-    /// Default empty.
+    /// [`Self::str_consts`]' shape for `InstanceRepr.convert_const` /
+    /// `convert_const_exact`. Default empty.
     #[serde(default)]
     pub prebuilt_instance_consts: Vec<PrebuiltInstanceConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
