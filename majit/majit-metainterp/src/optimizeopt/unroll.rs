@@ -2765,7 +2765,7 @@ impl ExportedState {
             let mut pos = op.pos().get();
             visit_opref(&mut pos, visitor);
             op.pos().set(pos);
-            op.walk_const_ptr_refs_mut(visitor);
+            crate::optimizeopt::walk_live_op(op, visitor);
         }
 
         fn visit_op_info(
@@ -5533,17 +5533,14 @@ fn assemble_peeled_trace_with_jump_args(
     let extra_label_start_idx = full_label_args.len();
     full_label_args.extend(filtered_extra_label_args.iter().copied());
 
-    // RPython compile.py parity: after the loop label, only the loop-header
-    // contract is live. When `splice_redirected_tail` glues a redirected
-    // tail onto the body, the spliced output may mention OpRefs whose
-    // defining op was removed (the section between the splice point and
-    // the original Jump). Carry such "body use-before-def" references
-    // through the label so the assembled body doesn't contain dangling
-    // references. With Phase 2's disjoint OpRef namespace, body op args
-    // are pre-resolved through ctx.get_box_replacement, so the carried
-    // OpRef can be appended directly to full_label_args — the JUMP's
-    // mapped_base_args path picks up the corresponding fresh value on the
-    // next iteration. The filter only needs to skip filtered_extra_jump_args.
+    // RPython compile.py parity: after the loop label, the loop-header
+    // contract is `label_op` + `sb.used_boxes`. A preamble-defined box
+    // used after the LABEL is a used_box (see consider_arg below). When
+    // `splice_redirected_tail` glues a redirected tail onto the body, the
+    // spliced output may mention OpRefs whose defining op was removed.
+    // Those become extra_before_label SameAs ops, not extra LABEL args:
+    // `_jump_to_existing_trace` JUMP extras are only the remapped
+    // `used_boxes`. The filter only needs to skip filtered_extra_jump_args.
     let mut carried_source_slots: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     // `label_set` tracks which OpRefs are already carried by the label so
@@ -5644,8 +5641,26 @@ fn assemble_peeled_trace_with_jump_args(
                     constants,
                     ctx,
                 );
-                full_label_args.push(arg);
-                appended_label_args.push(arg);
+                // unroll.py `finalize_short_preamble`:
+                //   label_op.initarglist(label_op.getarglist() + sb.used_boxes)
+                // A preamble-defined box used after the loop LABEL is a
+                // used_box. IntBound.make_guards extra guards at JUMP
+                // (unroll.py `inline_short_preamble` / intutils.py make_guards, or
+                // vstring.py StrPtrInfo.make_guards) can mention it
+                // without the short-preamble builder having recorded it.
+                // `push_fallthrough_same_as` no-ops when `stream_defs`
+                // already contains the box, so the backend loc dies after
+                // the back edge unless the box is a LABEL/JUMP slot.
+                //
+                // A body use-before-def with no preamble producer stays
+                // extra_before_label (the SameAs above), not a LABEL slot:
+                // publishing that without a used_boxes entry makes every
+                // bridge JUMP (`_jump_to_existing_trace` `args + extra`)
+                // one arg short of the compiled LABEL.
+                if stream_defs.contains(&arg) {
+                    full_label_args.push(arg);
+                    appended_label_args.push(arg);
+                }
                 label_set.insert(arg);
             };
             for a in op.args_slice().iter() {
@@ -5803,7 +5818,11 @@ fn assemble_peeled_trace_with_jump_args(
             body_result_remap.insert(op.pos().get(), fresh);
         }
     }
-
+    // unroll.py `_map_args` rewrites body uses by explicit Box mapping,
+    // never by zipping the terminal JUMP against the LABEL. A use of a
+    // body-local box before its producer is a splice/forwarding defect;
+    // do not infer the LABEL live-in from JUMP[i] (`.find()` is first-slot
+    // on duplicates).
     let mut seen_body_defs = crate::FxIndexSet::default();
     let mut current_inner_label_index: Option<usize> = None;
     let mut defs_since_inner_label: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
@@ -6014,11 +6033,6 @@ fn assemble_peeled_trace_with_jump_args(
                 (jump_target_id, local_label_id),
                 (Some(jump_id), Some(label_id)) if jump_id == label_id
             );
-            let target_base_len = if current_inner_label_index.is_some() {
-                op.num_args()
-            } else {
-                label_args.len()
-            };
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] assemble_jump: inner_label={:?} redirected={} targets_local={} jump_target_descr={:?} local_label_descr={:?} original_args={:?} mapped_base_args={:?} label_args={:?} filtered_extra_jump_args={:?}",
@@ -6034,34 +6048,60 @@ fn assemble_peeled_trace_with_jump_args(
                 );
             }
             let mut jump_args = mapped_base_args;
-            if jump_was_redirected && jump_targets_local_label {
-                // compile.py:334: same-label closes require equal JUMP and LABEL
-                // arity. A JUMP redirected to another token already carries the
-                // arity produced by that token's virtual state (unroll.py:346-357)
-                // and must pass through unchanged.
-                if jump_args.len() > target_label_args.len() {
-                    jump_args.truncate(target_label_args.len());
+            if jump_targets_local_label {
+                // compile.py `compile_loop`:
+                //   if jump_op.getdescr() is loop_info.label_op.getdescr():
+                //       assert jump_op.numargs() == loop_info.label_op.numargs()
+                // unroll.py `_jump_to_existing_trace`:
+                //   jump_op.copy_and_change(rop.JUMP, args=args + extra, ...)
+                // `extra` is `inline_short_preamble` of `used_boxes`. A
+                // consider_arg used_box appended to the LABEL after that
+                // call is the same extra and is concatenated here; a
+                // missing virtual-state (base) slot is a producer bug.
+                if current_inner_label_index.is_none() && jump_args.len() < extra_label_start_idx {
+                    panic!(
+                        "JUMP args ({}) != target LABEL args ({}): jump={:?} label={:?}",
+                        jump_args.len(),
+                        target_label_args.len(),
+                        jump_args,
+                        target_label_args,
+                    );
                 }
-                // Pad if JUMP is shorter than the target label.
-                while jump_args.len() < target_label_args.len() {
-                    let extra_idx = jump_args.len().saturating_sub(target_base_len);
-                    // shortpreamble.py add_preamble_op
-                    // ExtendedShortPreambleBuilder.add_preamble_op:
-                    //
-                    //   self.label_args.append(op)
-                    //   self.jump_args.append(preamble_op.preamble_op)
-                    //
-                    // The extra LABEL slot receives the value produced by
-                    // replaying the short-preamble op on the back edge.  This
-                    // is equally true when the target is an inner/self LABEL;
-                    // passing `target_label_args[jump_args.len()]` there feeds
-                    // the LABEL's own input box back to itself and freezes the
-                    // entry value instead of re-reading a mutable field/array.
-                    let extra_arg = filtered_extra_jump_args
-                        .get(extra_idx)
-                        .copied()
-                        .unwrap_or(target_label_args[jump_args.len()]);
-                    jump_args.push(extra_arg);
+                if jump_args.len() < target_label_args.len() {
+                    if current_inner_label_index.is_none()
+                        && jump_args.len() >= extra_label_start_idx
+                    {
+                        let have = jump_args.len() - extra_label_start_idx;
+                        if have < filtered_extra_jump_args.len() {
+                            jump_args.extend(filtered_extra_jump_args[have..].iter().copied());
+                        }
+                        // consider_arg used_boxes appended to the LABEL
+                        // after `inline_short_preamble` ran: JUMP extra is
+                        // that box (`add_preamble_op` when preamble_op is
+                        // the used_box). Never fill a hole from the LABEL's
+                        // own input.
+                        let have = jump_args.len() - extra_label_start_idx;
+                        if have >= filtered_extra_jump_args.len() {
+                            let consider_have = have - filtered_extra_jump_args.len();
+                            if consider_have < appended_label_args.len() {
+                                jump_args
+                                    .extend(appended_label_args[consider_have..].iter().copied());
+                            }
+                        }
+                    } else if current_inner_label_index.is_some() {
+                        // extra_inner_sources were appended to this inner
+                        // LABEL; they are loop-carried unchanged.
+                        jump_args.extend(target_label_args[jump_args.len()..].iter().copied());
+                    }
+                }
+                if jump_args.len() != target_label_args.len() {
+                    panic!(
+                        "JUMP args ({}) != target LABEL args ({}): jump={:?} label={:?}",
+                        jump_args.len(),
+                        target_label_args.len(),
+                        jump_args,
+                        target_label_args,
+                    );
                 }
             }
             // unroll.py-style bulk replace: jump arity is finalized here.
@@ -9541,17 +9581,113 @@ mod tests {
         );
     }
 
+    fn assert_assembled_loop_ssa_and_label_contract(
+        ops: &[majit_ir::OpRc],
+        constants: &majit_ir::ConstMap<majit_ir::Value>,
+    ) {
+        let mut defined: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
+        let mut pre_label_defs: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
+        let mut label_args: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
+        let mut seen_loop_label = false;
+        let mut label_arity = 0usize;
+        let mut jump_arity = None;
+        // compile.py: if jump_op.getdescr() is loop_info.label_op.getdescr():
+        //     assert jump_op.numargs() == loop_info.label_op.numargs()
+        let mut labels_by_descr: Vec<(Option<u32>, usize)> = Vec::new();
+        for op in ops {
+            if op.opcode == OpCode::Label {
+                let args: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
+                for &arg in &args {
+                    if is_trace_runtime_ref(arg, constants) {
+                        defined.insert(arg);
+                    }
+                }
+                labels_by_descr.push((op.getdescr().map(|d| d.index()), args.len()));
+                if !seen_loop_label {
+                    label_args.extend(
+                        args.iter()
+                            .copied()
+                            .filter(|a| is_trace_runtime_ref(*a, constants)),
+                    );
+                    label_arity = args.len();
+                    seen_loop_label = true;
+                }
+            } else {
+                for a in op.args_slice() {
+                    let arg = a.to_opref();
+                    if is_trace_runtime_ref(arg, constants) {
+                        assert!(
+                            defined.contains(&arg),
+                            "use-before-def of {arg:?} in {:?}",
+                            op.opcode
+                        );
+                        if seen_loop_label && pre_label_defs.contains(&arg) {
+                            assert!(
+                                label_args.contains(&arg),
+                                "body reads pre-label {arg:?} that is not a LABEL arg"
+                            );
+                        }
+                    }
+                }
+                if let Some(fa) = op.guard_fail_args() {
+                    for a in fa.iter() {
+                        let arg = a.to_opref();
+                        if is_trace_runtime_ref(arg, constants) {
+                            assert!(
+                                defined.contains(&arg),
+                                "failarg use-before-def of {arg:?} in {:?}",
+                                op.opcode
+                            );
+                            if seen_loop_label && pre_label_defs.contains(&arg) {
+                                assert!(
+                                    label_args.contains(&arg),
+                                    "body failarg reads pre-label {arg:?} that is not a LABEL arg"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if op.result_type() != Type::Void && !op.pos().get().is_none() {
+                defined.insert(op.pos().get());
+                if !seen_loop_label {
+                    pre_label_defs.insert(op.pos().get());
+                }
+            }
+            if op.opcode == OpCode::Jump {
+                jump_arity = Some(op.num_args());
+                if let Some(jump_descr_idx) = op.getdescr().map(|d| d.index())
+                    && let Some((_, target_arity)) = labels_by_descr
+                        .iter()
+                        .find(|(idx, _)| *idx == Some(jump_descr_idx))
+                {
+                    assert_eq!(
+                        *target_arity,
+                        op.num_args(),
+                        "compile.py: jump_op.numargs() == label_op.numargs() for same-label close"
+                    );
+                }
+            }
+        }
+        if let Some(jump_arity) = jump_arity {
+            assert_eq!(
+                label_arity, jump_arity,
+                "compile.py: jump_op.numargs() == label_op.numargs()"
+            );
+        }
+    }
+
     #[test]
     fn test_assemble_peeled_trace_carries_body_value_used_before_local_def() {
-        // Production caller pre-resolves body args through
-        // ctx.get_box_replacement (`optimizer.rs`'s
-        // `propagate_from_pass_range`), so OpRef::int_op(0) (Phase 2 inputarg slot) would already be replaced
-        // with OpRef::int_op(10) (the label_arg for that slot) by the time
-        // it reaches the assembler. We mirror that here.
+        // unroll.py `_map_args` maps by explicit boxes: the body reads
+        // LABEL[i] until the local producer, then JUMP carries the new
+        // box. A GuardTrue of the later IntAdd's result box before that
+        // def is a splice/forwarding defect, not an assemble rewrite.
+        let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 64)]);
-                op.setfailargs(vec![rooted_resop_operand(Type::Int, 64)].into());
+                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 10)]);
+                op.setfailargs(vec![rooted_resop_operand(Type::Int, 10)].into());
                 op
             },
             {
@@ -9565,7 +9701,11 @@ mod tests {
                 op.pos().set(OpRef::int_op(64));
                 op
             },
-            Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 64)]),
+            {
+                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 64)]);
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
         ];
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
@@ -9580,38 +9720,246 @@ mod tests {
             &[],
             &constants,
             None,
-            None,
+            Some(loop_descr),
         );
 
-        assert_eq!(combined[0].opcode, OpCode::Label);
+        assert_assembled_loop_ssa_and_label_contract(&combined, &constants);
+
+        let label_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Label)
+            .expect("Label");
         assert_eq!(
-            combined[0]
+            combined[label_idx]
                 .args_slice()
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            &[OpRef::int_op(10), OpRef::int_op(64)]
+            &[OpRef::int_op(10)],
+            "loop-carried use stays the existing LABEL slot, not a new used_box"
         );
-        assert_eq!(combined[1].opcode, OpCode::GuardTrue);
+        assert!(
+            combined.iter().all(|op| !matches!(
+                op.opcode,
+                OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
+            )),
+            "body must not read a pre-label non-LABEL SameAs"
+        );
+        let body_start = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::GuardTrue)
+            .expect("GuardTrue");
+        assert!(body_start > label_idx);
         assert_eq!(
-            combined[1]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(64)]
+            combined[body_start].arg(0).to_opref(),
+            OpRef::int_op(10),
+            "GuardTrue reads the LABEL arg JUMP feeds, not the later IntAdd"
         );
         assert_eq!(
-            combined[1]
+            combined[body_start]
                 .guard_fail_args()
                 .expect("guard fail args")
                 .iter()
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
-            &[OpRef::int_op(64)]
+            vec![OpRef::int_op(10)]
         );
-        assert_eq!(combined[2].opcode, OpCode::IntAdd);
-        assert_ne!(combined[2].pos().get(), OpRef::int_op(64));
+        assert_eq!(combined[body_start + 1].opcode, OpCode::IntAdd);
+        assert_ne!(combined[body_start + 1].pos().get(), OpRef::int_op(64));
+        let jump_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Jump)
+            .expect("Jump");
+        assert_eq!(
+            combined[jump_idx].arg(0).to_opref(),
+            combined[body_start + 1].pos().get(),
+            "JUMP feeds the reminted IntAdd into LABEL slot 0"
+        );
+        assert_eq!(
+            combined[jump_idx].num_args(),
+            combined[label_idx].num_args()
+        );
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_carries_preamble_value_used_after_label() {
+        // Preamble defines v20. The body extra-guard at JUMP (ResumeAtPositionDescr
+        // from IntBound.make_guards / vstring.py StrPtrInfo.make_guards) uses v20
+        // after the loop LABEL. unroll.py finalize_short_preamble puts used_boxes
+        // on the LABEL; a preamble-defined box used after the LABEL is a used_box
+        // even when the short-preamble builder did not record it.
+        let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_resop_operand(Type::Int, 0),
+                    Operand::from_opref(OpRef::const_int(1)),
+                ],
+            );
+            op.pos().set(OpRef::int_op(20));
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(
+                    OpCode::IntGe,
+                    &[
+                        rooted_resop_operand(Type::Int, 20),
+                        Operand::from_opref(OpRef::const_int(1)),
+                    ],
+                );
+                op.pos().set(OpRef::int_op(30));
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 30)]);
+                op.setfailargs(vec![rooted_resop_operand(Type::Int, 10)].into());
+                op
+            },
+            {
+                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 10)]);
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
+        ];
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &majit_ir::ConstMap::default(),
+            None,
+            Some(loop_descr),
+        );
+
+        let label_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Label)
+            .expect("Label");
+        let label_args: Vec<_> = combined[label_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert!(label_args.contains(&OpRef::int_op(10)));
+        assert!(
+            label_args.contains(&OpRef::int_op(20)),
+            "preamble-defined body-used box must be a LABEL slot, got {label_args:?}"
+        );
+        let jump_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Jump)
+            .expect("Jump");
+        let jump_args: Vec<_> = combined[jump_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(jump_args.len(), label_args.len());
+        assert!(
+            jump_args.contains(&OpRef::int_op(20)),
+            "JUMP must carry the preamble box into the LABEL slot, got {jump_args:?}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_non_redirected_jump_matches_appended_label_arity() {
+        // consider_arg appends a preamble-defined box used after the LABEL
+        // (unroll.py finalize_short_preamble: label_op.initarglist(
+        // label_op.getarglist() + sb.used_boxes)). compile.py requires
+        // equal JUMP and LABEL arity for a same-label close, redirected or
+        // not. A non-redirected JUMP that still targets the local loop
+        // LABEL used to keep its Phase-2 args and was one slot short.
+        let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    Operand::from_opref(OpRef::const_int(0)),
+                    Operand::from_opref(OpRef::const_int(1)),
+                ],
+            );
+            op.pos().set(OpRef::int_op(20));
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(
+                    OpCode::IntGe,
+                    &[
+                        rooted_resop_operand(Type::Int, 20),
+                        Operand::from_opref(OpRef::const_int(1)),
+                    ],
+                );
+                op.pos().set(OpRef::int_op(30));
+                op
+            },
+            {
+                let mut op = Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 30)]);
+                op.setfailargs(vec![rooted_resop_operand(Type::Int, 10)].into());
+                op
+            },
+            {
+                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 10)]);
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
+        ];
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[],
+            1,
+            false,
+            &[],
+            &constants,
+            None,
+            Some(loop_descr),
+        );
+
+        assert_assembled_loop_ssa_and_label_contract(&combined, &constants);
+
+        let label_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Label)
+            .expect("Label");
+        let jump_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Jump)
+            .expect("Jump");
+        let label_args: Vec<_> = combined[label_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        let jump_args: Vec<_> = combined[jump_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert!(
+            label_args.contains(&OpRef::int_op(20)),
+            "preamble-defined body-used box must be a LABEL slot, got {label_args:?}"
+        );
+        assert_eq!(
+            jump_args.len(),
+            label_args.len(),
+            "compile.py: same-label JUMP arity must match LABEL"
+        );
+        // Producer stays in the preamble: the back-edge value is the LABEL
+        // arg itself (shortpreamble.py ExtendedShortPreambleBuilder.add_preamble_op
+        // loop-carried unchanged).
+        assert_eq!(jump_args, label_args);
     }
 
     #[test]
@@ -9957,9 +10305,16 @@ mod tests {
                 op
             },
             {
-                // The JUMP closes onto this trace's own LABEL, which is what
-                // makes the arity coercion below applicable.
-                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 200)]);
+                // `_jump_to_existing_trace` already emits `args + extra`.
+                // Assembly does not invent a missing virtual-state slot
+                // from the LABEL's own input.
+                let mut jump = Op::new(
+                    OpCode::Jump,
+                    &[
+                        rooted_resop_operand(Type::Int, 200),
+                        rooted_resop_operand(Type::Int, 300),
+                    ],
+                );
                 jump.setdescr(loop_descr.clone());
                 jump
             },

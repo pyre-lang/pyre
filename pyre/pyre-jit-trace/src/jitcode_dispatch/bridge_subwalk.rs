@@ -1256,8 +1256,13 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         target_pc,
         w_code,
         is_being_profiled,
+        false,
+        None,
     ) {
         Ok(Some(recorded)) => {
+            // `opimpl_jit_merge_point`: `finishframe(None, leave_portal_frame=False)`
+            // pops the rebuilt callee; Leave is recorded after `do_recursive_call`.
+            pop_reconstructed_portal_callee(ctx.trace_ctx, false);
             record_carrier_leave_portal_frame(ctx);
             if let Some((exc, exc_concrete)) = recorded.raised {
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, cont_pc))
@@ -1324,18 +1329,55 @@ fn publish_carrier_header_vsd<Sym: WalkSym>(
     crate::state::store_live_frame_static_int(gcref.0, 2, published as i64);
 }
 
-/// `MetaInterp.leave_portal_frame` after `do_recursive_call`. Record the
-/// op only: this bridge never took `newframe`, so the depth counter that
-/// function decrements was never incremented.
-fn record_carrier_leave_portal_frame<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+/// `MetaInterp.leave_portal_frame` onto the live history.
+///
+/// `leave_portal_frame` records only when `self.tracing` is live; FBW parks
+/// that recorder in `compile_tracing`, so write the op here.
+fn record_leave_portal_frame_on_ctx(ctx: &mut TraceCtx) {
     let Some(jitcode) = crate::jitcode_runtime::portal_metainterp_jitcode() else {
         return;
     };
     let Some(jd_no) = jitcode.jitdriver_sd() else {
         return;
     };
-    let jd_box = ctx.trace_ctx.const_int(jd_no as i64);
-    ctx.trace_ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
+    let jd_box = ctx.const_int(jd_no as i64);
+    ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
+}
+
+/// `MetaInterp.leave_portal_frame` after `do_recursive_call`.
+fn record_carrier_leave_portal_frame<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    record_leave_portal_frame_on_ctx(ctx.trace_ctx);
+}
+
+/// `popframe` for a portal frame `rebuild_portal_framestack_from_resumedata`
+/// pushed. Rebuild's `newframe(jitcode, None)` already incremented
+/// `portal_call_depth` and pushed `call_ids`; greenkey is None so there was
+/// no `ENTER_PORTAL_FRAME`. After the reconstructed callee returns, the
+/// caller continuation is a top-level `reached_loop_header` JUMP
+/// (`compile_root_from_carrier_result`). Leaving the leftover depth live
+/// makes that JUMP close at `DebugMergePoint` depth 1 onto the preamble
+/// compiled at depth 0 (`unroll.py jump_to_preamble` keeps the arglist).
+///
+/// `leave_portal_frame` is `finishframe`'s default; the reconstructed
+/// loop-header arm uses `finishframe(None, leave_portal_frame=False)` and
+/// records Leave after `CALL_ASSEMBLER` (`opimpl_jit_merge_point`).
+/// Never pops the root (`framestack` length 1 / `portal_call_depth` 0).
+pub(crate) fn pop_reconstructed_portal_callee(ctx: &mut TraceCtx, leave_portal_frame: bool) {
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return;
+    };
+    {
+        let meta = driver.meta_interp_mut();
+        if meta.portal_call_depth <= 0 || meta.framestack.frames.len() < 2 {
+            return;
+        }
+        // `popframe(leave_portal_frame=False)`: tracing may be parked in
+        // `compile_tracing`, so the Leave op is recorded on `ctx` below.
+        meta.popframe(false);
+    }
+    if leave_portal_frame {
+        record_leave_portal_frame_on_ctx(ctx);
+    }
 }
 
 /// Exception-guard resume of the deepest carrier frame.
