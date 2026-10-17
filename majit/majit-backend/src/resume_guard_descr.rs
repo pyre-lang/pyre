@@ -229,13 +229,6 @@ pub struct ResumeGuardDescr {
     /// attached bridge from.  Empty until codegen asks for the cell
     /// addresses or a bridge is attached.
     pub bridge: OnceLock<Box<BridgeDispatchCells>>,
-    /// Pyre-only: FOR_ITER green key protected by a walker-native range
-    /// class guard.  `handle_fail` reads it off the failing descr
-    /// (`Descr::range_foriter_green_key`) to demote the range
-    /// specialization on the first class mismatch, so the demotion no
-    /// longer depends on the guard's per-trace fail index.  `0` = not a
-    /// range guard.
-    pub range_foriter_key: AtomicU64,
     /// Pyre-only: FOR_ITER green key for guards emitted while inlining a user
     /// instance's `__next__`.  A bridge from one of these guards must retain
     /// the generic `jit_next` conversion path when it re-enters FOR_ITER.
@@ -355,12 +348,6 @@ impl Descr for ResumeGuardDescr {
     fn is_resume_guard(&self) -> bool {
         true
     }
-    fn range_foriter_green_key(&self) -> Option<u64> {
-        match self.range_foriter_key.load(Ordering::Relaxed) {
-            0 => None,
-            key => Some(key),
-        }
-    }
     fn instance_next_foriter_green_key(&self) -> Option<u64> {
         match self.instance_next_foriter_key.load(Ordering::Relaxed) {
             0 => None,
@@ -389,9 +376,9 @@ impl Descr for ResumeGuardDescr {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: OnceLock::new(),
-            // The clone guards the same FOR_ITER site; preserve either tag so
-            // guard-failure routing survives guard copying.
-            range_foriter_key: AtomicU64::new(self.range_foriter_key.load(Ordering::Relaxed)),
+            // The clone guards the same FOR_ITER site; preserve the
+            // instance-`__next__` tag so guard-failure routing survives
+            // guard copying.
             instance_next_foriter_key: AtomicU64::new(
                 self.instance_next_foriter_key.load(Ordering::Relaxed),
             ),
@@ -659,7 +646,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: OnceLock::new(),
-        range_foriter_key: AtomicU64::new(0),
         instance_next_foriter_key: AtomicU64::new(0),
     })
 }

@@ -12530,14 +12530,12 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
 static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
     sub_jitcode_body_by_index;
 
-/// Return the driver green key for this top-level FOR_ITER residual.
+/// Return the driver green key for this FOR_ITER residual.
 ///
 /// `op_pc` belongs to the current per-CodeObject JitCode, while the driver
-/// key is `(W_Code, python FOR_ITER pc)`.  The full-body snapshot root owns
-/// the outer JitCode metadata needed for that inversion.  Inlined sub-walks
-/// have a distinct callee JitCode but deliberately share the root snapshot;
-/// decline their range fold rather than associating a callee guard with the
-/// caller's key.
+/// key is `(W_Code, python FOR_ITER pc)`.  Inlined sub-walks resolve through
+/// the callee's JitCode (`InlineCalleeConsts`) so a `for` loop inside an
+/// inlined callee gets its own key.
 fn walker_foriter_green_key<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -12551,10 +12549,9 @@ fn walker_foriter_green_key<Sym: WalkSym>(
     // answers with a Python pc that belongs to neither loop.
     //
     // Reading the caller's tables was why this returned `None` for every
-    // sub-walk, and the FOR_ITER specializations that key their demotion descr
-    // off this green key declined with it: a `for` loop inside an inlined
-    // callee kept the opaque `ForIterNext` residual, which runs the iterator's
-    // `__next__` as a real frame in the plain interpreter.
+    // sub-walk, and `try_walker_specialize_instance_next` declined with it:
+    // a `for` loop inside an inlined callee kept the opaque `ForIterNext`
+    // residual.
     if let Some(consts) = ctx.inline_callee_consts {
         let w_code = ctx.inline_w_code() as *const ();
         if w_code.is_null() {

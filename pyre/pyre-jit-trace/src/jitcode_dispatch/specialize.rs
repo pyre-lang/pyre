@@ -14586,46 +14586,6 @@ fn walker_guard_fold_value_w_class<Sym: WalkSym>(
     walker_guard_fold_callable(ctx, pc, w_class_ref, unsafe { (*value).w_class })
 }
 
-/// Unstamped `GuardClass` tagged with a FOR_ITER green-key FailDescr when
-/// one is available. Skips when the box is constant or the class is already
-/// known; always stamps `class_now_known`.
-///
-/// The FailDescr is minted ahead of the guard so a runtime failure — a
-/// definitive polymorphism witness — demotes the specialization by descr
-/// identity, independent of the guard's per-trace fail index.
-/// `store_final_boxes_in_guard` preserves an existing `ResumeGuardDescr`
-/// (only refreshing `fail_arg_types`), so the tag survives optimizer
-/// guard-folding and unroll; a copied guard chases `prev` to this donor.
-/// With no green key the guard is untagged and the site is never demoted.
-fn walker_guard_fold_class_foriter<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    pc: usize,
-    obj: OpRef,
-    type_addr: i64,
-    green_key: Option<u64>,
-) -> Result<(), DispatchError> {
-    if !obj.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(type_addr);
-        match green_key {
-            Some(green_key) => {
-                let descr = majit_metainterp::make_resume_guard_descr_range_foriter(green_key);
-                ctx.trace_ctx.record_guard_with_descr(
-                    OpCode::GuardClass,
-                    &[obj, type_const],
-                    descr,
-                );
-            }
-            None => {
-                ctx.trace_ctx
-                    .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-            }
-        }
-        walker_capture_snapshot_for_last_guard(ctx, pc)?;
-    }
-    ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
-    Ok(())
-}
-
 /// Emit an unstamped `GuardClass` when the box's class is not yet known.
 /// Stamps `class_now_known` with the guard.
 fn walker_guard_fold_class_if_unknown<Sym: WalkSym>(
@@ -19977,14 +19937,17 @@ impl RangeStepOneShape {
 ///
 /// Step-1 `range` `FOR_ITER`. `stop` is immutable. The trace is that
 /// shape's own `next`: compare `current` with `stop`, advance, then box.
-/// The class guard uses the FOR_ITER green key. The cursor journal is the
+/// The class guard is an ordinary `GuardClass`, as
+/// `W_IntRangeOneArgIterator.next` (`functional.py`) has no JIT hint and
+/// a class mismatch is a bridge like any other guard
+/// (`compile.py ResumeGuardDescr.handle_fail` →
+/// `_trace_and_compile_from_bridge`). The cursor journal is the
 /// pre-advance `(current, remaining)` so a later abort can restore it.
 fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     iter_op: OpRef,
     iter_obj: pyre_object::PyObjectRef,
-    range_green_key: Option<u64>,
     shape: RangeStepOneShape,
 ) -> Result<Option<OpRef>, DispatchError> {
     let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(shape.next_path()) else {
@@ -20009,7 +19972,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     let type_addr = shape.type_addr();
     // The guard appends to `opencoder.py Trace._ops` and can minor-collect.
     let iter_pin = residual_call::owner_root_if_gc(iter_obj as usize);
-    walker_guard_fold_class_foriter(ctx, op_pc, iter_op, type_addr, range_green_key)?;
+    walker_guard_fold_class(ctx, op_pc, iter_op, type_addr)?;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
     let sym = unsafe { &*sym_ptr };
     let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
@@ -20117,14 +20080,6 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // A range class-guard failure at this FOR_ITER green key is a definitive
-    // polymorphism witness.  Once the failure path has demoted it, retain the
-    // generic residual rather than recreating the range guard on retrace.
-    let range_green_key = walker_foriter_green_key(ctx, op_pc);
-    if range_green_key.is_some_and(crate::trace::range_foriter_demoted) {
-        return Ok(None);
-    }
-
     let iter_op = r_args[0];
     let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
         return Ok(None);
@@ -20146,7 +20101,6 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
                 op_pc,
                 iter_op,
                 iter_obj,
-                range_green_key,
                 RangeStepOneShape::OneArg,
             )
         });
@@ -20158,7 +20112,6 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
                 op_pc,
                 iter_op,
                 iter_obj,
-                range_green_key,
                 RangeStepOneShape::StepOne,
             )
         });
@@ -20179,7 +20132,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
 
     // guard_class W_IntRangeIterator, unless the operand is already known.
     let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
-    walker_guard_fold_class_foriter(ctx, op_pc, iter_op, range_iter_type_addr, range_green_key)?;
+    walker_guard_fold_class(ctx, op_pc, iter_op, range_iter_type_addr)?;
 
     if !concrete_continues {
         // Exhausted arrival: the walker concretely reached remaining==0 (a nested

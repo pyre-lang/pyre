@@ -7453,7 +7453,7 @@ impl OptContext {
             op.getdescr().is_some_and(|d| d.is_resume_guard_copied())
         );
 
-        // Walker-native FOR_ITER guards can carry a pre-minted range or
+        // Walker-native FOR_ITER guards can carry a pre-minted
         // user-instance-next marker descr so failure routing is keyed by descr
         // identity.  `Op::clone` shares the descr Arc, so unroll's
         // phase-1/phase-2 emissions of the guard reach this function on the
@@ -7461,17 +7461,11 @@ impl OptContext {
         // emission — mirroring the `op.descr.is_none()` arm's fresh-per-emission
         // descr — so the once-per-descr `finish()` invariant below still holds
         // for it (and for every other guard).
-        let refinalize_marked_key = op
-            .getdescr()
-            .and_then(|d| d.range_foriter_green_key())
-            .filter(|_| op.resolved_rd_numb().is_some());
         let refinalize_instance_next_key = op
             .getdescr()
             .and_then(|d| d.instance_next_foriter_green_key())
             .filter(|_| op.resolved_rd_numb().is_some());
-        if let Some(key) = refinalize_marked_key {
-            op.setdescr(crate::compile::make_resume_guard_descr_range_foriter(key));
-        } else if let Some(key) = refinalize_instance_next_key {
+        if let Some(key) = refinalize_instance_next_key {
             op.setdescr(
                 crate::compile::make_resume_guard_descr_instance_next_foriter(Some(op.opcode), key),
             );

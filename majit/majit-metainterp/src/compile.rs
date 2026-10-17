@@ -3441,7 +3441,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
-        range_foriter_key: AtomicU64::new(0),
         instance_next_foriter_key: AtomicU64::new(0),
     })
 }
@@ -3524,28 +3523,8 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
-        range_foriter_key: AtomicU64::new(0),
         instance_next_foriter_key: AtomicU64::new(0),
     })
-}
-
-/// `make_resume_guard_descr_typed` variant that tags the descr with the
-/// FOR_ITER `green_key` its walker-native range class guard protects.
-/// `handle_fail` reads the tag (`Descr::range_foriter_green_key`) off the
-/// failing descr to demote the range specialization on the first class
-/// mismatch, so the demotion no longer depends on the guard's per-trace
-/// fail index (which optimizer guard-folding / unroll can shift).  Types
-/// start empty; `store_final_boxes_in_guard` fills them from numbering
-/// while preserving this descr (its `op.getdescr().is_some()` arm).
-pub fn make_resume_guard_descr_range_foriter(green_key: u64) -> DescrRef {
-    let descr = make_resume_guard_descr_typed(Vec::new());
-    descr
-        .as_any()
-        .and_then(|any| any.downcast_ref::<ResumeGuardDescr>())
-        .expect("make_resume_guard_descr_typed constructs a ResumeGuardDescr")
-        .range_foriter_key
-        .store(green_key, Ordering::Relaxed);
-    descr
 }
 
 /// Tag a guard emitted while inlining a user instance's `__next__` with the
@@ -3865,7 +3844,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
-            range_foriter_key: AtomicU64::new(0),
             instance_next_foriter_key: AtomicU64::new(0),
         },
     })
@@ -4045,13 +4023,10 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
     }
     /// Subclassing in RPython keeps the base attributes readable; a Rust
     /// newtype only exposes what it forwards, and the default accessor walks
-    /// `prev_descr`, which a wrapper does not have.  Forward both walker
-    /// marker keys explicitly: the FOR_ITER routes key failure handling on
-    /// them, and `store_final_boxes_in_guard` re-mints a marked descr on
-    /// unroll's second emission only while it can still read the key.
-    fn range_foriter_green_key(&self) -> Option<u64> {
-        self.inner.range_foriter_green_key()
-    }
+    /// `prev_descr`, which a wrapper does not have.  Forward the
+    /// instance-`__next__` FOR_ITER marker: `store_final_boxes_in_guard`
+    /// re-mints a marked descr on unroll's second emission only while it
+    /// can still read the key.
     fn instance_next_foriter_green_key(&self) -> Option<u64> {
         self.inner.instance_next_foriter_green_key()
     }
@@ -4278,7 +4253,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
-            range_foriter_key: AtomicU64::new(0),
             instance_next_foriter_key: AtomicU64::new(0),
         },
     })
@@ -4317,11 +4291,8 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
         true
     }
     /// The `ResumeGuardForcedDescr` reasoning applies here unchanged: a
-    /// newtype exposes only what it forwards, and both walker marker keys
-    /// have to stay readable through it.
-    fn range_foriter_green_key(&self) -> Option<u64> {
-        self.inner.range_foriter_green_key()
-    }
+    /// newtype exposes only what it forwards, and the instance-`__next__`
+    /// FOR_ITER marker has to stay readable through it.
     fn instance_next_foriter_green_key(&self) -> Option<u64> {
         self.inner.instance_next_foriter_green_key()
     }
@@ -4535,7 +4506,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
-            range_foriter_key: AtomicU64::new(0),
             instance_next_foriter_key: AtomicU64::new(0),
         },
     })
@@ -5527,7 +5497,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
-                range_foriter_key: AtomicU64::new(0),
                 instance_next_foriter_key: AtomicU64::new(0),
             },
         }))
@@ -5741,7 +5710,6 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
-            range_foriter_key: AtomicU64::new(0),
             instance_next_foriter_key: AtomicU64::new(0),
         },
     })
@@ -6374,7 +6342,6 @@ mod fail_descr_tests {
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
-                range_foriter_key: AtomicU64::new(0),
                 instance_next_foriter_key: AtomicU64::new(0),
             },
         }) as DescrRef;

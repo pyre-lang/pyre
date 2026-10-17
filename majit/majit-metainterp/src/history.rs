@@ -3002,8 +3002,8 @@ impl TraceCtx {
     /// `store_final_boxes_in_guard` preserves an existing descr (only
     /// refreshing its `fail_arg_types`), so a marker stamped on `descr`
     /// survives optimization guard-folding and unroll — used by the
-    /// walker-native range FOR_ITER specialization to tag its class guard
-    /// for demotion by descr identity (`Descr::range_foriter_green_key`).
+    /// user-instance `__next__` FOR_ITER inline to tag its class guard
+    /// (`Descr::instance_next_foriter_green_key`).
     pub fn record_guard_with_descr(
         &mut self,
         opcode: OpCode,
