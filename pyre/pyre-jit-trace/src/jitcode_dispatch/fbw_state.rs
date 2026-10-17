@@ -2739,6 +2739,24 @@ pub(crate) fn fbw_journaled_effect_lens() -> (usize, usize, usize) {
     )
 }
 
+/// How many odometer-bumping journal entries were pushed after `mark`.
+pub(crate) fn fbw_journaled_effect_delta_since(mark: FbwEffectJournalMark) -> usize {
+    let now = fbw_effect_journal_mark();
+    now.stores.saturating_sub(mark.stores)
+        + now.list_effects.saturating_sub(mark.list_effects)
+        + now.cells.saturating_sub(mark.cells)
+}
+
+/// Drop the recorded-but-unexecuted residual flags.  A helper walk that
+/// set them and then cut back to a residual CALL no longer owes those
+/// writes — the recorded declined ops were discarded with the cut.
+pub(crate) fn fbw_unjournaled_restore(had: bool) {
+    if !had {
+        FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
+        FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(false));
+    }
+}
+
 /// Mark the walk as carrying a recorded-but-unexecuted side effect only
 /// the legacy replay applies.
 ///

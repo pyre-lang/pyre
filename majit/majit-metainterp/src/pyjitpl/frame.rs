@@ -2026,8 +2026,9 @@ mod tests {
         }
 
         const OP_LIVE: u8 = 0x42;
-        let original = GcRef(0x96E2_A000);
-        let forwarded = GcRef(0x96E2_B000);
+        // Distinct from `pyjitpl` compile_live_op_vec intern keys.
+        let original = GcRef(0x96E4_A100);
+        let forwarded = GcRef(0x96E4_B100);
         let interned = OpRef::const_ptr(original);
         let index = interned.const_ptr_index().expect("non-null const ptr");
         let _restore = Restore {

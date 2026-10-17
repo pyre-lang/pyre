@@ -2802,6 +2802,13 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     // blackhole.py order: setup_insns, then setup_descrs.
     builder.setup_insns(insns_opname_to_byte());
     builder.setup_descrs(descr_table());
+    // Helper JitCodes (`from_canonical`) carry an empty `exec.descrs` and
+    // resolve `d`/`j` through `JitCode::descr_at` →
+    // `GLOBAL_BUILD_DESCR_POOL` (`assembler.py` `Assembler.descrs`).
+    // FBW abort (`trace.rs` `drive_multi_frame_blackhole`) uses this
+    // builder; without the pool, `inline_call` panics on the first helper
+    // `j` operand even though `setup_descrs` filled `bh.descrs`.
+    install_global_build_descr_pool();
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired: Vec<String> = builder
         .unwired_opnames()
@@ -2828,6 +2835,9 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// keys are registered by `build_inline_call_only_bh_builder`.
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
+    // Same `JitCode::descr_at` pool the FBW abort builder installs.
+    // Guard-failure resume (`eval.rs`) walks helper `inline_call` too.
+    install_global_build_descr_pool();
     // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys
     // take the byte this build's assembler gave them.
     // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`

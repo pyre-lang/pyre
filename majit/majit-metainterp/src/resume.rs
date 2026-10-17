@@ -4564,6 +4564,7 @@ mod tests {
     /// address with a fresh one.
     #[test]
     fn walking_the_memo_forwards_its_ref_consts_and_rekeys_the_cache() {
+        let _serial = majit_ir::const_ptr_table::lock_test_serial();
         let mut memo = super::ResumeDataLoopMemo::new();
         let before = 0x9B_0000_1000i64;
         let after = 0x9B_0000_2000i64;
