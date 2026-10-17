@@ -11794,16 +11794,6 @@ fn handle_fail(
         }
     }
 
-    // A keyed failure proves this FOR_ITER site's instance-`__next__`
-    // specialization unsuitable.  Deliberately discard the marker's bool:
-    // the first insertion retires the specialization, while later failures
-    // must leave it retired so the next walk compiles the generic residual.
-    // Do not override the ordinary bridge gate; `compile.py:702-703` makes
-    // `must_compile() && !stack_almost_full()` the complete decision.
-    if let Some(foriter_key) = descr_arc.instance_next_foriter_green_key() {
-        let _ = pyre_jit_trace::trace::instance_next_foriter_bridge_demote_once(foriter_key);
-    }
-
     // compile.py: must_compile() AND not stack_almost_full()
     if should_bridge && !stack_almost_full() {
         // compile.py try/finally: start_compiling() before

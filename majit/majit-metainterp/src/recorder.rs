@@ -1149,7 +1149,7 @@ impl Trace {
         };
         self.slots.push(FrontendSlot {
             opcode,
-            // Guard markers stay on the slot; the stream descr slot is
+            // Guard descrs stay on the slot; the stream descr slot is
             // `rd_resume_position`. Non-guard descrs live only in the
             // encoded stream (`_encode_descr`).
             descr: if opcode.is_guard() { descr } else { None },

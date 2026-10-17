@@ -3441,7 +3441,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
-        instance_next_foriter_key: AtomicU64::new(0),
     })
 }
 
@@ -3523,40 +3522,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
-        instance_next_foriter_key: AtomicU64::new(0),
     })
-}
-
-/// Tag a guard emitted while inlining a user instance's `__next__` with the
-/// caller FOR_ITER key.  A guard-failure bridge uses the tag to keep the
-/// exception-to-exhaustion conversion on the generic residual path.
-///
-/// `opcode` selects the subtype `compile.py invent_fail_descr_for_op`
-/// would have minted.  Stamping this descr fills `op.getdescr()`, and
-/// `store_final_boxes_in_guard` only invents on the empty arm — so a marker
-/// minted as a plain `ResumeGuardDescr` would cost a `GUARD_NOT_FORCED` its
-/// `is_guard_forced()` (which vetoes bridge compilation) or a
-/// `GUARD_NO_EXCEPTION` its `is_guard_exc()` (which routes the pending
-/// exception).  The whole inlined `__next__` body is tagged, residual guards
-/// included, so both opcodes reach here.
-pub fn make_resume_guard_descr_instance_next_foriter(
-    opcode: Option<OpCode>,
-    green_key: u64,
-) -> DescrRef {
-    let descr = match opcode {
-        Some(OpCode::GuardNotForced | OpCode::GuardNotForced2) => {
-            make_resume_guard_forced_descr_typed(Vec::new())
-        }
-        Some(OpCode::GuardException | OpCode::GuardNoException) => {
-            make_resume_guard_exc_descr_typed(Vec::new())
-        }
-        _ => make_resume_guard_descr_typed(Vec::new()),
-    };
-    resume_guard_descr(&descr)
-        .expect("every arm above constructs a ResumeGuardDescr or a newtype over one")
-        .instance_next_foriter_key
-        .store(green_key, Ordering::Relaxed);
-    descr
 }
 
 /// The `ResumeGuardDescr` inside a descr that either is one or is one of its
@@ -3844,7 +3810,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
-            instance_next_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -4020,15 +3985,6 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
     }
     fn is_resume_guard(&self) -> bool {
         true
-    }
-    /// Subclassing in RPython keeps the base attributes readable; a Rust
-    /// newtype only exposes what it forwards, and the default accessor walks
-    /// `prev_descr`, which a wrapper does not have.  Forward the
-    /// instance-`__next__` FOR_ITER marker: `store_final_boxes_in_guard`
-    /// re-mints a marked descr on unroll's second emission only while it
-    /// can still read the key.
-    fn instance_next_foriter_green_key(&self) -> Option<u64> {
-        self.inner.instance_next_foriter_green_key()
     }
     /// compile.py ResumeGuardDescr.clone() — `ResumeGuardForcedDescr`
     /// inherits the base implementation (no override at compile.py:939+),
@@ -4253,7 +4209,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
-            instance_next_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -4289,12 +4244,6 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
     }
     fn is_resume_guard(&self) -> bool {
         true
-    }
-    /// The `ResumeGuardForcedDescr` reasoning applies here unchanged: a
-    /// newtype exposes only what it forwards, and the instance-`__next__`
-    /// FOR_ITER marker has to stay readable through it.
-    fn instance_next_foriter_green_key(&self) -> Option<u64> {
-        self.inner.instance_next_foriter_green_key()
     }
     /// compile.py `class ResumeGuardExcDescr(ResumeGuardDescr): pass`
     /// — no clone() override, so inheriting compile.py
@@ -4506,7 +4455,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
-            instance_next_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -5497,7 +5445,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
-                instance_next_foriter_key: AtomicU64::new(0),
             },
         }))
     }
@@ -5710,7 +5657,6 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
-            instance_next_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -6342,7 +6288,6 @@ mod fail_descr_tests {
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
-                instance_next_foriter_key: AtomicU64::new(0),
             },
         }) as DescrRef;
         let lv_fi = lv.index();
@@ -6438,35 +6383,6 @@ mod fail_descr_tests {
             exc_clone.as_fail_descr().unwrap().fail_arg_types(),
             &[Type::Float]
         );
-    }
-
-    /// compile.py ResumeGuardCopiedDescr(prev) parity:
-    /// The instance-next FOR_ITER marker key must stay readable no matter
-    /// which subtype the guard's opcode selects.  Two consumers depend on it:
-    /// guard-failure routing keys the FOR_ITER handling on it, and
-    /// `store_final_boxes_in_guard` re-mints a marked descr for unroll's
-    /// second emission only while it can still read the key — without that
-    /// re-mint the second emission finalizes an already-finalized descr and
-    /// trips the once-per-descr `finish()` assert.
-    #[test]
-    fn test_instance_next_marker_survives_every_guard_subtype() {
-        const KEY: u64 = 0xF0_1D_ED;
-        for opcode in [
-            None,
-            Some(OpCode::GuardNotForced),
-            Some(OpCode::GuardNotForced2),
-            Some(OpCode::GuardException),
-            Some(OpCode::GuardNoException),
-            Some(OpCode::GuardClass),
-        ] {
-            let descr = make_resume_guard_descr_instance_next_foriter(opcode, KEY);
-            assert_eq!(
-                descr.instance_next_foriter_green_key(),
-                Some(KEY),
-                "opcode {opcode:?} minted a descr whose marker key is unreadable"
-            );
-            assert!(descr.is_resume_guard(), "opcode {opcode:?}");
-        }
     }
 
     /// `handle_guard_failure` arms `seen_loop_header_for_jdindex` from

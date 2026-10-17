@@ -2998,24 +2998,6 @@ impl TraceCtx {
         opref
     }
 
-    /// Record a guard carrying a pre-minted `ResumeGuardDescr`.
-    /// `store_final_boxes_in_guard` preserves an existing descr (only
-    /// refreshing its `fail_arg_types`), so a marker stamped on `descr`
-    /// survives optimization guard-folding and unroll — used by the
-    /// user-instance `__next__` FOR_ITER inline to tag its class guard
-    /// (`Descr::instance_next_foriter_green_key`).
-    pub fn record_guard_with_descr(
-        &mut self,
-        opcode: OpCode,
-        args: &[OpRef],
-        descr: DescrRef,
-    ) -> OpRef {
-        let opref = Self::do_record_guard(&mut self.recorder, opcode, args, Some(descr));
-        // pyjitpl.py:2581 — see record_guard.
-        self.profiler().count_ops(opcode, crate::counters::GUARDS);
-        opref
-    }
-
     //
     // Private `do_*` helpers take `(&mut Trace, ...)` so the caller
     // performs an explicit field borrow of `self.recorder`.

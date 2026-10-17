@@ -423,12 +423,6 @@ static SPEC_SUPPRESSED: [std::sync::atomic::AtomicU64; SPEC_FOLD_COUNT] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [Z; SPEC_FOLD_COUNT]
 };
-static INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// Set by [`spec_census_enable`], for a host that has no environment to read
 /// `PYRE_FBW_SPEC_CENSUS` from.
@@ -454,23 +448,6 @@ pub(crate) fn fbw_spec_census_enabled() -> bool {
         std::env::var_os("PYRE_FBW_SPEC_CENSUS").is_some()
             || SPEC_CENSUS_ARMED.load(std::sync::atomic::Ordering::Relaxed)
     })
-}
-
-pub(crate) fn spec_census_record_instance_next_route_guard_keyed() {
-    if fbw_spec_census_enabled() {
-        INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-pub(crate) fn spec_census_record_instance_next_callee_guard(keyed: bool) {
-    if !fbw_spec_census_enabled() {
-        return;
-    }
-    let ordering = std::sync::atomic::Ordering::Relaxed;
-    INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED.fetch_add(1, ordering);
-    if keyed {
-        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED.fetch_add(1, ordering);
-    }
 }
 
 const FBW_DEPTH_HIST_BUCKETS: usize = 32;
@@ -712,12 +689,6 @@ pub fn spec_census_summary() -> String {
         "[spec-census] folds={} consulted_total={consulted_total} fired_total={fired_total} suppressed_total={suppressed_total} suppressed_names={suppressed_names} suppress_unknown={suppress_unknown} subwalk_direct_resume={direct_resume} subwalk_call_replay={call_replay} subwalk_heap_clones={heap_clones}\n",
         rows.len(),
     );
-    summary.push_str(&format!(
-        "[spec-census] instance_next_foriter route_guards_keyed={} callee_guards_captured={} callee_guards_keyed={}\n",
-        INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED.load(ordering),
-        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED.load(ordering),
-        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED.load(ordering),
-    ));
     for (label, site, parent, consulted, fired, suppressed) in rows {
         summary.push_str(&format!(
             "[spec-census] fold={label} consulted={consulted} fired={fired} suppressed={suppressed} site={site} parent={parent}\n"

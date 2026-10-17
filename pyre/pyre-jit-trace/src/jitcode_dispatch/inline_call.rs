@@ -5035,7 +5035,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         None,
         None,
         false,
-        None,
+        false,
         None,
         None,
         star_args,
@@ -7626,7 +7626,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         constructor_result,
         None,
         false,
-        None,
+        false,
         None,
         None,
         None,
@@ -7683,7 +7683,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     mut constructor_result: Option<(OpRef, ConcreteValue)>,
     intermediate_result: Option<&mut Option<(OpRef, ConcreteValue)>>,
     require_exact_int_result: bool,
-    instance_next_foriter_green_key: Option<u64>,
+    instance_next_route: bool,
     attribute_error_context: Option<AttributeErrorInlineContext>,
     // The operator this call sits under, when its result is not the callee's
     // return value.  It decides two things together: the checks emitted over
@@ -8454,7 +8454,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             ctx,
             callee_frame_reg,
         );
-    let instance_next_seeded_route = instance_next_foriter_green_key.is_some();
     // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
     // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) pushes an MIFrame.
     // A seeded frame already exists here, and a walk abort converts through
@@ -8464,7 +8463,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // (`guards_the_callee_function`) — the greenkey `can_inline_callable`
     // unwraps — not function identity, so a fresh lambda with one code
     // object is admitted the same way a closure is.
-    if fbw_foriter_inflight_active() && !instance_next_seeded_route {
+    if fbw_foriter_inflight_active() && !instance_next_route {
         let seeded_callee_resume = (try_multiframe || strict_seed)
             && (callable_guard_op.is_constant()
                 || receiver_pinned_by_class
@@ -10118,8 +10117,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 inline_subwalk: true,
                 inline_caller_py_pc,
                 immediate_inline_caller_py_pc: immediate_inline_caller_py_pc(ctx, op.pc),
-                instance_next_foriter_green_key,
-                instance_next_foriter_census_active: instance_next_seeded_route,
                 // Callee MIFrame, not a translated helper. Do not inherit
                 // `transparent_helper_subwalk`: that flag is the helper-body
                 // snapshot / last_instr / abort-coordinate identity.
@@ -13292,7 +13289,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             None,
             None,
             false,
-            None,
+            false,
             // pyre's `getattr_str` (`baseobjspace.rs`) enriches the whole
             // `__getattribute__` / `__getattr__` chain, so the `load_attr_fn`
             // residual this route replaces filled the pair in here as well.
@@ -13543,7 +13540,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         None,
         None,
         false,
-        None,
+        false,
         // `StdObjSpace.getattr` (`objspace/std/objspace.py`) wraps
         // the `__getattr__` fallback call in `enrich_attribute_error`, which
         // the `load_attr_fn` residual this route replaces reached through
@@ -13680,7 +13677,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         Some(&mut handed),
         false,
-        None,
+        false,
         Some(attr_ctx),
         None,
         None,
@@ -13748,7 +13745,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         None,
         false,
-        None,
+        false,
         Some(attr_ctx),
         None,
         None,
@@ -14102,7 +14099,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         Some(&mut result),
         true,
-        None,
+        false,
         None,
         None,
         None,
@@ -14353,7 +14350,7 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         None,
         None,
         false,
-        None,
+        false,
         None,
         Some(crate::operator_continuation::OperatorTail::Len),
         None,
@@ -14599,7 +14596,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
         None,
         None,
         false,
-        None,
+        false,
         None,
         Some(crate::operator_continuation::OperatorTail::Truth),
         None,
@@ -14742,7 +14739,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         None,
         None,
         false,
-        None,
+        false,
         None,
         None,
         None,
@@ -14795,8 +14792,9 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
 ///
 /// The instance arm of `space.next` forwards the method's exception to the
 /// FOR_ITER catch arm.  The callee is resumed through a seeded multi-frame
-/// snapshot, and every route/callee guard is keyed so failure resumes in the
-/// blackhole without compiling the unsafe mid-callee exhaustion bridge.
+/// snapshot.  Guards on this route are ordinary (`pyjitpl.py generate_guard`);
+/// a failure compiles a bridge (`compile.py ResumeGuardDescr.handle_fail` →
+/// `_trace_and_compile_from_bridge`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -14809,18 +14807,6 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
-        return Ok(None);
-    }
-
-    // A sub-walk is admitted: `walker_foriter_green_key` keys the demotion off
-    // the JitCode the walk is executing, so a `for` loop in an inlined callee
-    // gets its own key rather than a caller offset read as a callee one.
-    let Some(foriter_green_key) = walker_foriter_green_key(ctx, op.pc) else {
-        return Ok(None);
-    };
-    if ctx.trace_ctx.is_bridge_trace
-        && crate::trace::instance_next_foriter_bridge_demoted(foriter_green_key)
-    {
         return Ok(None);
     }
 
@@ -14880,13 +14866,8 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let iter_layout = unsafe { (*iter_obj).ob_type } as i64;
     if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
         let type_const = ctx.trace_ctx.const_int(iter_layout);
-        let descr = majit_metainterp::make_resume_guard_descr_instance_next_foriter(
-            Some(OpCode::GuardClass),
-            foriter_green_key,
-        );
         ctx.trace_ctx
-            .record_guard_with_descr(OpCode::GuardClass, &[iter_op, type_const], descr);
-        spec_census_record_instance_next_route_guard_keyed();
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
     ctx.trace_ctx.heap_cache_mut().class_now_known(iter_op);
@@ -14924,7 +14905,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         None,
         false,
-        Some(foriter_green_key),
+        true,
         None,
         None,
         None,
@@ -17346,7 +17327,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         None,
         None,
         false,
-        None,
+        false,
         None,
         Some(crate::operator_continuation::OperatorTail::Format),
         None,

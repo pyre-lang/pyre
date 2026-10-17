@@ -4533,16 +4533,6 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     /// override.
     fn set_prev_descr(&self, _prev: DescrRef) {}
 
-    /// Pyre-only: the FOR_ITER green key whose user-instance `__next__`
-    /// inline emitted this guard, or `None`.  A shared-resume copied
-    /// guard carries no marker of its own, so the default chases `prev` to
-    /// the donor `ResumeGuardDescr` that holds the tag; `ResumeGuardDescr`
-    /// overrides to read its own slot.
-    fn instance_next_foriter_green_key(&self) -> Option<u64> {
-        self.prev_descr()
-            .and_then(|prev| prev.instance_next_foriter_green_key())
-    }
-
     /// intbounds.py: descr.is_integer_bounded() / get_integer_min/max.
     /// Returns (field_size_bytes, is_signed) if this is a field descriptor.
     /// Used by intbounds to narrow GETFIELD result bounds.

@@ -175,8 +175,7 @@ pub use call_descr::{
 };
 pub use compile::{
     AllVirtuals, exit_layout_for_descr, guard_resume_pc, make_fail_descr, make_fail_descr_typed,
-    make_finish_fail_descr_typed, make_resume_guard_descr_instance_next_foriter, raw_exit_values,
-    resume_guard_descr, set_all_virtuals_gc_type_id,
+    make_finish_fail_descr_typed, raw_exit_values, resume_guard_descr, set_all_virtuals_gc_type_id,
 };
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,

@@ -516,12 +516,6 @@ thread_local! {
     /// return a plain abort and rely on the normal hotness/abort machinery.
     static FBW_DECLINED_KEYS: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
-    /// FOR_ITER sites whose user-instance `__next__` inline has reached a
-    /// guard-failure bridge.  Only bridge walks consult this set: the primary
-    /// loop retains its inline, while the bridge records generic `jit_next` so
-    /// exhaustion is converted by the caller opcode.
-    static INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 pub(crate) fn fbw_declined(key: u64) -> bool {
@@ -548,17 +542,6 @@ fn abort_too_long_action() -> TraceAction {
         reason: majit_metainterp::counters::ABORT_TOO_LONG,
         raising_exception: false,
     })
-}
-
-pub(crate) fn instance_next_foriter_bridge_demoted(key: u64) -> bool {
-    INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED.with(|s| s.borrow().contains(&key))
-}
-
-/// Mark a user-instance `__next__` guard source so its bridge walk keeps the
-/// generic FOR_ITER residual.  The set is deliberately bridge-only; it does
-/// not retire the optimized loop or suppress the inline on a later root trace.
-pub fn instance_next_foriter_bridge_demote_once(green_key: u64) -> bool {
-    INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED.with(|s| s.borrow_mut().insert(green_key))
 }
 
 #[allow(dead_code)]
