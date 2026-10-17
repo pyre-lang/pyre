@@ -4594,7 +4594,7 @@ impl<'a> RegAlloc<'a> {
         let arg0 = op.arg(0).to_opref();
         let tp = self.tp(arg0);
         let loc = self.make_sure_var_in_reg(arg0, tp, &[], None, false);
-        self.perform(i, [loc], None, output);
+        self.perform_discard(i, vec![loc], output);
     }
 
     fn consider_check_memory_error_j2(
@@ -4603,12 +4603,10 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let Some(&arg) = args.first() else {
-            return self.perform(i, [], None, output);
-        };
-        let tp = self.tp(arg);
-        let loc = self.make_sure_var_in_reg(arg, tp, &[], None, false);
-        self.perform(i, [loc], None, output);
+        let x = args[0];
+        let tp = self.tp(x);
+        let loc = self.make_sure_var_in_reg(x, tp, &[], None, false);
+        self.perform_discard(i, vec![loc], output);
     }
 
     /// x86/regalloc.py consider_finish
@@ -8024,6 +8022,36 @@ mod tests {
         assert!(
             matches!(arglocs[1], Loc::Frame(_)),
             "vable must be passed as its frame slot: {arglocs:?}"
+        );
+    }
+
+    /// `consider_check_memory_error` is `perform_discard(op, [x])` with
+    /// `x` in a register.
+    #[test]
+    fn check_memory_error_is_a_discard() {
+        let p0 = OpRef::input_arg_ref(0);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let check = Op::new(OpCode::CheckMemoryError, &[rb(p0)]);
+        check.pos().set(OpRef::void_op(0));
+        let finish = Op::new(OpCode::Finish, &[rb(p0)]);
+        finish.pos().set(OpRef::void_op(1));
+        let ops = rcs(vec![check, finish]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let output = ra.walk_operations().expect("walk_operations");
+        let arglocs = output
+            .iter()
+            .find_map(|op| match op {
+                RegAllocOp::PerformDiscard {
+                    op_index: 0,
+                    arglocs,
+                } => Some(arglocs.clone()),
+                _ => None,
+            })
+            .expect("CHECK_MEMORY_ERROR perform_discard");
+        assert!(
+            matches!(arglocs[..], [Loc::Reg(r)] if !r.is_xmm),
+            "one GPR argloc: {arglocs:?}"
         );
     }
 
