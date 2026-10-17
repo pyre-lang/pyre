@@ -138,6 +138,7 @@ impl CallAssemblerTargetAddr {
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use majit_backend::{Backend, JitCellToken};
@@ -667,6 +668,65 @@ mod tests {
             immed_cards, expected,
             "each index must dirty exactly its own card, and nothing else"
         );
+    }
+
+    /// `push_gcmap(store=True)` is `MOV(raw_stack(ofs), imm(gcmap))`: a
+    /// 64-bit gcmap goes through `_load_scratch`, so a repeated gcmap reuses
+    /// r11 and a nearby one is `LEA r11, [r11+d]`.
+    #[test]
+    fn push_gcmap_loads_the_gcmap_through_the_scratch_cache() {
+        let stats = Arc::new(majit_backend::AsmMemoryManagerStats::default());
+        let arena = majit_backend::AsmMemoryManager::new_isolated(stats);
+        let inputargs: Vec<super::InputArgRc> = Vec::new();
+        let operations: Vec<OpRc> = Vec::new();
+        let mut asm = super::Assembler386::new(
+            arena,
+            0,
+            0,
+            Default::default(),
+            None,
+            None,
+            Default::default(),
+            None,
+            Default::default(),
+            crate::guard::AttachedDescrPtrs::default(),
+            Arc::new(crate::guard::CpuDescrCell::default()),
+            0,
+            0,
+            0,
+            [0; 5],
+            0,
+            0,
+            0,
+            [0; 4],
+            [0; 4],
+            &inputargs,
+            &operations,
+        );
+        let gcmap = 0x1234_5678_9abc_usize;
+        let store = {
+            let ofs = super::JF_GCMAP_OFS;
+            assert!((-128..128).contains(&ofs));
+            [0x4C, 0x89, 0x5D, ofs as u8]
+        };
+        let mut expected = vec![0x49, 0xBB];
+        expected.extend_from_slice(&(gcmap as u64).to_le_bytes());
+        expected.extend_from_slice(&store);
+        expected.extend_from_slice(&store);
+        expected.extend_from_slice(&[0x4D, 0x8D, 0x5B, 0x10]);
+        expected.extend_from_slice(&store);
+        expected.extend_from_slice(&[0x48, 0xC7, 0x45, store[3], 0x00, 0x10, 0x00, 0x00]);
+        asm.push_gcmap(gcmap as *mut usize);
+        asm.push_gcmap(gcmap as *mut usize);
+        asm.push_gcmap((gcmap + 16) as *mut usize);
+        asm.push_gcmap(0x1000 as *mut usize);
+        let code = std::mem::replace(&mut asm.mc, super::Assembler::new(0))
+            .finalize()
+            .expect("finalize push_gcmap bytes");
+        let entry = asm.self_entry_addr_ptr;
+        drop(asm);
+        drop(unsafe { Box::from_raw(entry) });
+        assert_eq!(code, expected);
     }
 }
 
@@ -3502,17 +3562,21 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// assembler.py:993 push_gcmap.
+    /// `push_gcmap(store=True)`: `MOV(raw_stack(ofs), imm(gcmap))`. A
+    /// 64-bit immediate goes through `insn_with_64_bit_immediate`, which
+    /// `_load_scratch`es it and stores the scratch register.
     fn push_gcmap(&mut self, gcmap: *mut usize) {
         let gcmap_ptr = gcmap as i64;
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.forget_if_scratch_written(scratch);
-        dynasm!(self.mc ; .arch x64
-        ; mov Rq(scratch), QWORD gcmap_ptr
-        );
-        dynasm!(self.mc ; .arch x64
-            ; mov [rbp + JF_GCMAP_OFS], Rq(scratch)
-        );
+        if rx86::fits_in_32bits(gcmap_ptr) {
+            rx86::mov_bi(&mut self.mc, JF_GCMAP_OFS, gcmap_ptr as i32);
+        } else {
+            self.load_scratch(gcmap_ptr);
+            rx86::mov_br(
+                &mut self.mc,
+                JF_GCMAP_OFS,
+                crate::regloc::X86_64_SCRATCH_REG.value,
+            );
+        }
     }
 
     /// assembler.py:1000 pop_gcmap.

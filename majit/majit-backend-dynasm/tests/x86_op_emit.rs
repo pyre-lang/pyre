@@ -1678,26 +1678,44 @@ fn loop_code(token: &JitCellToken, code_size: usize) -> &[u8] {
     unsafe { std::slice::from_raw_parts(token.ll_raw_start() as *const u8, code_size) }
 }
 
-/// `generate_cond_call_slowpath` loads the helper with `mov r11, imm64`
-/// and `call r11`. `push_gcmap` forgets the scratch cache first, so
-/// `load_scratch` is that `movabs`, not an `lea`.
+/// `generate_cond_call_slowpath` loads the helper with `_load_scratch` and
+/// `call r11`. Its `push_gcmap`, before the func immediate, has loaded the
+/// gcmap into r11 the same way, so the helper is either a `mov r11, imm64`
+/// or an `lea r11, [r11+d]` off that gcmap. Track r11 from the gcmap load.
 fn cond_call_slowpath_index(code: &[u8], func: u64) -> usize {
     let needle = func.to_le_bytes();
     let at = code
         .windows(8)
         .position(|window| window == needle)
         .unwrap_or_else(|| panic!("cond_call func immediate is missing"));
-    let tail = &code[at..];
+    let gcmap_load = code[..at]
+        .windows(2)
+        .rposition(|window| window == [0x49, 0xBB])
+        .unwrap_or_else(|| panic!("cond_call gcmap load is missing"));
+    let tail = &code[gcmap_load..];
+    let mut r11: Option<u64> = None;
     let mut i = 0;
-    while i + 13 <= tail.len() {
-        if tail[i] == 0x49
-            && tail[i + 1] == 0xBB
-            && tail[i + 10] == 0x41
-            && tail[i + 11] == 0xFF
-            && tail[i + 12] == 0xD3
-        {
-            let helper = u64::from_le_bytes(tail[i + 2..i + 10].try_into().unwrap());
-            return classify_cond_call_helper(helper);
+    while i + 3 <= tail.len() {
+        if tail[i..].starts_with(&[0x49, 0xBB]) && i + 10 <= tail.len() {
+            r11 = Some(u64::from_le_bytes(tail[i + 2..i + 10].try_into().unwrap()));
+            i += 10;
+            continue;
+        }
+        if let Some(value) = r11 {
+            if tail[i..].starts_with(&[0x4D, 0x8D, 0x5B]) && i + 4 <= tail.len() {
+                r11 = Some(value.wrapping_add(tail[i + 3] as i8 as i64 as u64));
+                i += 4;
+                continue;
+            }
+            if tail[i..].starts_with(&[0x4D, 0x8D, 0x9B]) && i + 7 <= tail.len() {
+                let d = i32::from_le_bytes(tail[i + 3..i + 7].try_into().unwrap());
+                r11 = Some(value.wrapping_add(d as i64 as u64));
+                i += 7;
+                continue;
+            }
+            if tail[i..].starts_with(&[0x41, 0xFF, 0xD3]) {
+                return classify_cond_call_helper(value);
+            }
         }
         i += 1;
     }
