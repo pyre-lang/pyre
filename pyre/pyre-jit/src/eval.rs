@@ -13663,14 +13663,16 @@ impl DirectVirtualsCache {
             .collect()
     }
 
-    /// `getvirtual_ptr` after `allocate`: the cache slot, not the raw
-    /// allocate result. A nested virtual's allocate can collect and
-    /// forward this slot in place; the caller's `Value::Ref` integer is
-    /// not a GC root (`resume.py` `v == cache` holds because `v` is a
-    /// traced stack local).
+    /// `getvirtual_ptr` / `getvirtual_int` after `allocate`: the cache
+    /// slot, not the raw allocate result. A nested virtual's allocate can
+    /// collect and forward this slot in place; the caller's `Value::Ref`
+    /// integer is not a GC root (`resume.py` `v == cache` holds because
+    /// `v` is a traced stack local). `getvirtual_int` returns the raw-
+    /// buffer address as an int (`VAbstractRawInfo.allocate_int`).
     fn live_ptr(&self, vidx: usize) -> usize {
         match self.get(vidx) {
             Some(Value::Ref(r)) => r.as_usize(),
+            Some(Value::Int(i)) => i as usize,
             _ => 0,
         }
     }
@@ -14213,14 +14215,24 @@ fn materialize_virtual_from_rd(
             } else {
                 majit_ir::effectinfo::OopSpecIndex::StrConcat
             };
-            let left_val = decode_tagged_fieldnum_int(
+            // `resume.py concat_strings` / `concat_unicodes`: `decode_ref`
+            // of `left` is a GC-traced local across `decode_ref` of
+            // `right` (`VStrConcatInfo.allocate` / `VUniConcatInfo.allocate`).
+            let left_value = decode_tagged_fieldnum(
                 fieldnums[0],
                 dead_frame,
                 num_failargs,
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
-            );
+            )
+            .unwrap_or(Value::Ref(majit_ir::GcRef::NULL));
+            let left_root = match left_value {
+                Value::Ref(r) if !r.is_null() => {
+                    Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
+                }
+                _ => None,
+            };
             let right_val = decode_tagged_fieldnum_int(
                 fieldnums[1],
                 dead_frame,
@@ -14247,6 +14259,12 @@ fn materialize_virtual_from_rd(
             let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py concat_strings / resume.py
             // concat_unicodes — cpu.bh_call_r(func, [left, right], descr).
+            // Re-read `left` after the right decode (and callinfo lookup) can
+            // allocate; `VStrConcatInfo.allocate` keeps it in a GC local.
+            let left_val = match &left_root {
+                Some(root) => root.get().0 as i64,
+                None => pending_source_raw_bits(left_value),
+            };
             let backend = driver.meta_interp().backend();
             let result = backend.bh_call_r(
                 func as i64,
@@ -16375,6 +16393,9 @@ mod tests {
             cache.as_direct_virtuals(),
             vec![Some(majit_ir::GcRef(0x2000))]
         );
+        cache.insert(0, Value::Int(0x3000));
+        // `resume.py getvirtual_int` returns the raw-buffer address as an int.
+        assert_eq!(cache.live_ptr(0), 0x3000);
     }
 
     /// Guard-failure `typed` / `resolved_vable` are host `Vec<Value>` copies.

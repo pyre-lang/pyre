@@ -15954,28 +15954,27 @@ impl<M: Clone> MetaInterp<M> {
     /// the same answer and hands it in rather than paying the weakref upgrade
     /// a second time inside one event.
     /// `compile.py must_compile` ticks `rd_loop_token.outermost_jitdriver_sd`.
-    /// A token that never recorded an index is the portal driver, not leftover
-    /// `active_jitdriver_sd` from a later compile.
+    /// `compile.py make_jitcell_token` always sets that field; a missing token
+    /// ticks the portal driver.
     pub(crate) fn jitdriver_index_for_failed_token(
         &self,
         token: Option<&majit_backend::JitCellToken>,
     ) -> usize {
-        token
-            .and_then(|token| token.outermost_jitdriver_index)
-            .unwrap_or(0)
+        match token {
+            Some(token) => token
+                .outermost_jitdriver_index
+                .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd"),
+            None => 0,
+        }
     }
 
     /// Integer key `must_compile` mixes into the GUARD_VALUE jitcounter hash
     /// for a TY_REF fail value.
     ///
-    /// Root across the call: `minimark.find_shadow` may collect while it
-    /// reserves the old-gen shadow (`optimizeopt/util.rs` ArgsKey).
+    /// `compile.py AbstractResumeGuardDescr.must_compile` uses
+    /// `lltype.cast_ptr_to_int` of the live pointer.
     fn ty_ref_jitcounter_intval(intval: i64) -> i64 {
-        if intval == 0 {
-            return 0;
-        }
-        let root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(intval as usize));
-        majit_gc::gc_id_or_identityhash(root.get().0) as i64
+        intval
     }
 
     /// `compile.py` `must_compile`: decode `status` into the jitcounter
@@ -34780,23 +34779,9 @@ mod tests {
     }
 
     #[test]
-    fn ty_ref_guard_value_hashes_by_identity_not_moving_address() {
-        // Two nursery addresses of one type must share the jitcounter bucket
-        // once `id_or_identityhash` has assigned the old-gen shadow.
-        fn identity_of_moved_type(addr: usize) -> usize {
-            match addr {
-                0x100 | 0x200 => 0xABC,
-                other => other,
-            }
-        }
-        struct RestoreIdentityHash;
-        impl Drop for RestoreIdentityHash {
-            fn drop(&mut self) {
-                majit_gc::set_active_gc_id_or_identityhash(None);
-            }
-        }
-        majit_gc::set_active_gc_id_or_identityhash(Some(identity_of_moved_type));
-        let _restore = RestoreIdentityHash;
+    fn ty_ref_guard_value_hashes_by_live_pointer_bits() {
+        // `compile.py AbstractResumeGuardDescr.must_compile`:
+        // `intval = lltype.cast_ptr_to_int(refval)`.
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.set_trace_eagerness(2);
@@ -34806,8 +34791,12 @@ mod tests {
 
         assert!(!meta.must_compile_with_values(&descr, &[], Some(0x100), 1).0);
         assert!(
-            meta.must_compile_with_values(&descr, &[], Some(0x200), 1).0,
-            "young and moved addresses of one type share the jitcounter bucket"
+            !meta.must_compile_with_values(&descr, &[], Some(0x200), 1).0,
+            "distinct live addresses hash into distinct jitcounter buckets"
+        );
+        assert!(
+            meta.must_compile_with_values(&descr, &[], Some(0x100), 1).0,
+            "the same live address ticks the same bucket"
         );
     }
 
@@ -35152,13 +35141,6 @@ mod tests {
             "must_compile ticks the failed token's driver timetable"
         );
 
-        let unindexed = majit_backend::JitCellToken::new(92);
-        assert!(unindexed.outermost_jitdriver_index.is_none());
-        assert_eq!(
-            meta.jitdriver_index_for_failed_token(Some(&unindexed)),
-            0,
-            "a token without outermost_jitdriver_index ticks the portal, not leftover active"
-        );
         assert_eq!(
             meta.jitdriver_index_for_failed_token(None),
             0,

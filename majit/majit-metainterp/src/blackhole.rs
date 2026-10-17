@@ -4608,6 +4608,28 @@ mod tests {
             assert_eq!(bh.registers_i[0], 0);
         }
 
+        /// `RefOp.getref_base` returns `_resref`, nullptr until `setref_base`.
+        /// A present live box with no stamped mirror must still write that
+        /// default: skipping the write leaves a pooled leftover.
+        #[test]
+        fn copy_data_from_miframe_writes_resref_default_for_unstamped_live_ref() {
+            use crate::pyjitpl::MIFrame;
+            use majit_ir::OpRef;
+
+            let mut b = JitCodeBuilder::default();
+            b.ref_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.ref_regs[0] = Some(OpRef::ref_op(5));
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.registers_r = vec![0x380000; 16];
+            bh.copy_data_from_miframe(&frame);
+
+            assert_eq!(bh.registers_r[0], 0);
+        }
+
         /// `BlackholeInterpreter._copy_data_from_miframe` reads each
         /// `registers_r[i].getref_base()`. For a ConstPtr that means the
         /// GC-forwarded value stored on the box, never pyre's execution mirror.

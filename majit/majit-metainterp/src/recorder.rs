@@ -571,6 +571,11 @@ impl Trace {
         self.trb.is_some()
     }
 
+    /// `history.py History.trace_tag_overflow` — `opencoder.py Trace.tag_overflow`.
+    pub fn tag_overflow(&self) -> bool {
+        self.trb.as_ref().is_some_and(|trb| trb.tag_overflow)
+    }
+
     /// opencoder.py `Trace.tracing_done` — `compile.py compile_trace`
     /// calls this before `optimize_trace`. A tag overflow becomes
     /// `SwitchToBlackhole(ABORT_TOO_LONG)`.

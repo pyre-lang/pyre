@@ -3232,11 +3232,11 @@ impl TraceCtx {
     }
 
     /// pyjitpl.py `blackhole_if_trace_too_long` check:
-    /// `length > warmrunnerstate.trace_limit`.  `num_ops` is
-    /// `History.length` (`trace._count - len(trace.inputargs)`);
+    /// `length > warmrunnerstate.trace_limit or history.trace_tag_overflow()`.
+    /// `num_ops` is `History.length` (`trace._count - len(trace.inputargs)`);
     /// `trace_limit` is cached from warmstate at trace start.
     pub fn is_too_long(&self) -> bool {
-        self.recorder.num_ops() > self.trace_limit
+        self.recorder.num_ops() > self.trace_limit || self.recorder.tag_overflow()
     }
 
     /// `History.length`: `trace._count - len(trace.inputargs)`.

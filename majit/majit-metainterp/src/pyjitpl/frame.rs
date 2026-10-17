@@ -190,20 +190,11 @@ impl MIFrame {
         }
     }
 
-    /// `history.py AbstractValue.getref_base()` for one entry of
-    /// `MIFrame.registers_r`.
-    ///
-    /// The symbolic register is the owner, just as the Box is upstream.  A
-    /// `ConstPtr` carries its GC-traced value in `const_ptr_table` and
-    /// `MetaInterp::walk_active_trace_refs` forwards that slot.
-    /// Non-constant boxes are rewritten to `ConstPtr` at abort
-    /// (`freeze_values_into_const_boxes`) so this read does not need the
-    /// recorder after `abort_trace`.
     /// `history.py AbstractValue.getint()` / `blackhole.py`
     /// `_copy_data_from_miframe` `box.getint()`. A `ConstInt` is inline.
-    /// A live `IntOp` is frozen to `ConstInt` by
-    /// `freeze_values_into_const_boxes`; an unfrozen live box defaults to
-    /// 0 as `IntOp.getint` does for an unstamped `_resint`.
+    /// `freeze_values_into_const_boxes` copies a stamped `_resint` onto
+    /// that Const; an unfrozen live box is `IntOp.getint` of unstamped
+    /// `_resint` (0).
     pub fn int_value_for_blackhole(&self, index: usize) -> Option<i64> {
         self.int_regs.get(index).copied().flatten().map(|op| {
             op.inline_const_to_value()
@@ -212,13 +203,16 @@ impl MIFrame {
         })
     }
 
+    /// `history.py AbstractValue.getref_base()` / `_copy_data_from_miframe`
+    /// `box.getref_base()`. Same box-owner rule as
+    /// [`Self::int_value_for_blackhole`]: a ConstPtr is inline; an unfrozen
+    /// live box is `RefOp.getref_base` of unstamped `_resref` (nullptr).
     pub fn ref_value_for_blackhole(&self, index: usize) -> Option<i64> {
-        self.ref_regs
-            .get(index)
-            .copied()
-            .flatten()
-            .and_then(|op| op.inline_const_to_value())
-            .map(|v| v.as_raw_i64())
+        self.ref_regs.get(index).copied().flatten().map(|op| {
+            op.inline_const_to_value()
+                .map(|v| v.as_raw_i64())
+                .unwrap_or(0)
+        })
     }
 
     /// `history.py AbstractValue.getfloatstorage()` /
@@ -1589,7 +1583,8 @@ mod tests {
         frame.ref_regs[1] = Some(OpRef::ref_op(7));
 
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xBEEF));
-        assert_eq!(frame.ref_value_for_blackhole(1), None);
+        // `RefOp.getref_base` of unstamped `_resref` is nullptr.
+        assert_eq!(frame.ref_value_for_blackhole(1), Some(0));
 
         let kept = frame.ref_regs[0];
         frame.set_forwarded_ref_value(0, 0xF00D);
