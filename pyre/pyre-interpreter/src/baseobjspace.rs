@@ -19808,7 +19808,7 @@ fn objects_from_root_slots(slots: &[usize]) -> Vec<PyObjectRef> {
 }
 
 /// `next(iterator)` — PyPy: space.next(w_iter)
-pub fn next(obj: PyObjectRef) -> PyResult {
+pub fn next(mut obj: PyObjectRef) -> PyResult {
     unsafe {
         if pyre_object::is_list_iter(obj) {
             let item = list_iter_descr_next(obj);
@@ -22248,18 +22248,33 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if pyre_object::interp_sre::is_sre_scanner(obj) {
             return crate::module::_sre::interp_sre::sre_scanner_next(obj);
         }
+        // `DescrOperation.next`: `w_obj` is a livevar across `space.lookup`
+        // (`__next__`) and `get_and_call_function`. `lookup_in_type_where`
+        // can collect (`compute_mro`, intern, method-cache fill). The
+        // caller's pin of the iterator does not reload this by-value copy;
+        // `push_roots` / `pop_roots` keep the word on the shadow stack.
+        let _next_roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         // `interp_struct.py W_UnpackIter.descr_next` — dispatch the
         // iterator's own `__next__` from its type.
         if crate::module::r#struct::is_unpack_iter(obj)
             && let Some(w_type) = crate::typedef::r#type(obj)
             && let Some(method) = lookup_in_type_where(w_type.as_ptr(), "__next__")
         {
-            return crate::call::call_function_impl_result(method, &[obj]);
+            return crate::call::call_function_impl_result(
+                method,
+                &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
+            );
         }
         // Instance __next__
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if is_instance(obj) {
             let w_type = w_instance_get_type(obj);
             if let Some(method) = lookup_in_type_where(w_type, "__next__") {
+                obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let w_type = w_instance_get_type(obj);
                 return get_and_call_function(method, obj, w_type, &[]);
             }
         }
@@ -22267,12 +22282,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // every W_Root object.  Typed-payload builtins are not INSTANCE_TYPE
         // layouts, so give them the same generic dispatch used by `iter`
         // above instead of requiring one hardcoded branch per iterator type.
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if !is_instance(obj)
             && let Some(w_type) = crate::typedef::r#type(obj)
             && let Some(method) = lookup_in_type_where(w_type.as_ptr(), "__next__")
         {
-            return crate::call::call_function_impl_result(method, &[obj]);
+            return crate::call::call_function_impl_result(
+                method,
+                &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
+            );
         }
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     }
     Err(PyError::type_error(format!(
         "'{}' object is not an iterator",
