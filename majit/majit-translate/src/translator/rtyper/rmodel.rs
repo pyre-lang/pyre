@@ -165,7 +165,7 @@ fn ptr_target_struct(target: &lltype::PtrTarget) -> Option<lltype::Struct> {
     }
 }
 
-fn ptr_target_func(target: &lltype::PtrTarget) -> Option<lltype::FuncType> {
+pub(crate) fn ptr_target_func(target: &lltype::PtrTarget) -> Option<lltype::FuncType> {
     match target {
         lltype::PtrTarget::Func(t) => Some(t.clone()),
         lltype::PtrTarget::ForwardReference(t) => match t.resolved() {
@@ -1968,7 +1968,7 @@ impl PtrRepr {
         }
     }
 
-    fn ptrtype(&self) -> &lltype::Ptr {
+    pub(crate) fn ptrtype(&self) -> &lltype::Ptr {
         ptr_type(&self.lltype)
     }
 }
@@ -2213,41 +2213,7 @@ impl Repr for PtrRepr {
     }
 
     fn rtype_simple_call(&self, hop: &HighLevelOp) -> RTypeResult {
-        let func_type = ptr_target_func(&self.ptrtype().TO).ok_or_else(|| {
-            TyperError::message(format!("calling a non-function {:?}", self.ptrtype().TO))
-        })?;
-        let args_r = hop.args_r.borrow().clone();
-        let mut vlist = Vec::with_capacity(args_r.len() + 1);
-        for (i, r_arg) in args_r.iter().enumerate() {
-            let r_arg = r_arg
-                .as_ref()
-                .ok_or_else(|| TyperError::message("PtrRepr.rtype_simple_call missing arg repr"))?;
-            vlist.push(hop.inputarg(r_arg, i)?);
-        }
-        let nexpected = func_type.args.len();
-        let nactual = vlist.len().saturating_sub(1);
-        if nactual != nexpected {
-            return Err(TyperError::message(format!(
-                "argcount mismatch:  expected {nexpected} got {nactual}"
-            )));
-        }
-        let opname = if let Some(Hlvalue::Constant(c_func)) = vlist.first() {
-            if let ConstValue::LLPtr(ptr) = &c_func.value
-                && let Ok(lltype::_ptr_obj::Func(func)) = ptr._obj()
-                && let Some(graph_id) = func.graph
-            {
-                hop.llops.borrow().record_extra_call_by_graph_id(graph_id)?;
-            }
-            "direct_call"
-        } else {
-            vlist.push(Hlvalue::Constant(HighLevelOp::inputconst(
-                &LowLevelType::Void,
-                &ConstValue::None,
-            )?));
-            "indirect_call"
-        };
-        hop.exception_is_here()?;
-        Ok(hop.genop(opname, vlist, GenopResult::LLType(func_type.result.clone())))
+        super::rptr::rtype_simple_call(self, hop)
     }
 }
 
@@ -3833,6 +3799,11 @@ mod tests {
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "indirect_call");
         assert_eq!(ops.ops[0].args.len(), 3);
+        let Hlvalue::Constant(c_graphs) = &ops.ops[0].args[2] else {
+            panic!("PtrRepr.rtype_simple_call last arg must be inputconst(Void, None)");
+        };
+        assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
+        assert_eq!(c_graphs.value, ConstValue::None);
     }
 
     #[test]

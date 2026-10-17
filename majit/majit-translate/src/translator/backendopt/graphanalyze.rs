@@ -339,10 +339,17 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
                 // Resolve through `TranslationContext.graphs` and
                 // iterate. None / unknown surfaces as
                 // `top_result()` (matching upstream `:120-122`).
+                // `PtrRepr.rtype_simple_call` (`rptr.py`) appends
+                // `inputconst(Void, None)` when the callee is not a
+                // Constant; `guess_call_kind` (`call.py`) then
+                // classifies `graphs is None` as residual.
                 let last = op.args.last();
                 let Some(Hlvalue::Constant(c)) = last else {
                     return R::top_result();
                 };
+                if matches!(c.value, ConstValue::None) {
+                    return R::top_result();
+                }
                 let ConstValue::Graphs(keys) = &c.value else {
                     return R::top_result();
                 };
@@ -743,6 +750,24 @@ mod tests {
             vec![
                 Hlvalue::Variable(Variable::named("fnptr")),
                 Hlvalue::Constant(Constant::new(ConstValue::Graphs(vec![usize::MAX]))),
+            ],
+            Hlvalue::Variable(Variable::named("result")),
+        );
+
+        assert!(analyzer.analyze(&op, None, &()));
+    }
+
+    #[test]
+    fn indirect_call_void_none_graphs_returns_top() {
+        // `PtrRepr.rtype_simple_call` (`rptr.py`) appends
+        // `inputconst(Void, None)` when the callee is not a Constant.
+        let translator = TranslationContext::new();
+        let mut analyzer = TrivialAnalyzer::new(&translator);
+        let op = SpaceOperation::new(
+            "indirect_call",
+            vec![
+                Hlvalue::Variable(Variable::named("fnptr")),
+                Hlvalue::Constant(Constant::new(ConstValue::None)),
             ],
             Hlvalue::Variable(Variable::named("result")),
         );

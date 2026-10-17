@@ -8037,6 +8037,9 @@ impl CallControl {
             OpKind::IndirectCall { graphs, .. } => {
                 // call.py:103-112 indirect_call branch.
                 // `graphs is None` (call.py:105) → residual.
+                // `PtrRepr.rtype_simple_call` (`rptr.py`) emits that
+                // shape as `inputconst(Void, None)` when the callee is
+                // not a Constant.
                 let graphs = graphs.as_ref()?;
                 let result: Vec<CallPath> = graphs
                     .iter()

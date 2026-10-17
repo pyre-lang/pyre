@@ -12157,6 +12157,11 @@ impl<'a> Transformer<'a> {
                 RewriteResult::Replace(ops)
             }
             crate::call::CallKind::Residual => {
+                // `rewrite_op_indirect_call` / `handle_residual_call`
+                // (`jtransform.py`); `guess_call_kind` (`call.py`)
+                // classifies `graphs is None` as residual — the
+                // `PtrRepr.rtype_simple_call` (`rptr.py`)
+                // `inputconst(Void, None)` shape.
                 let can_raise = descriptor.extra_info.check_can_raise(false);
                 self.calls_classified += 1;
                 self.notes.push(GraphTransformNote {
