@@ -378,9 +378,11 @@ impl<'a> RegAlloc<'a> {
             std::mem::swap(&mut arg1, &mut arg2);
         }
         self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
-        // Same-register square: arg1 is arg2, already in EAX. Freeing that
-        // binding below drops the location, so keep this snapshot.
-        let l1_same = self.loc(arg1, Type::Int);
+        // `l1 = self.loc(arg1)` before EAX and EDX are claimed. When arg1
+        // lives in EDX, claiming the result there spills it with a store
+        // emitted ahead of the `MUL`, so EDX still holds arg1 when `MUL`
+        // reads it.
+        let l1 = self.loc(arg1, Type::Int);
         self.possibly_free_var(arg2, Type::Int);
         let tmp = self.fresh_temp_var();
         self.longevity.set(
@@ -405,15 +407,6 @@ impl<'a> RegAlloc<'a> {
             &mut self.longevity,
             &mut self.fm,
         );
-        // MUL's high half is EDX. If arg1 already lived there, claiming the
-        // result spills it, and a snapshot taken before the claim still names
-        // EDX. Read the operand after the claim. A same-register square stays
-        // on the EAX snapshot: that binding was freed above.
-        let l1 = if arg1 == arg2 {
-            l1_same
-        } else {
-            self.loc(arg1, Type::Int)
-        };
         // x86/regalloc.py `consider_uint_mul_high` asserts l1 can be `MUL`'s operand:
         // it must not be an immediate (immediate would need a scratch
         // register to materialise, which the optimiser already folded),
