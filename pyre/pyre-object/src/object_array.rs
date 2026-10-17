@@ -206,21 +206,17 @@ pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef
 /// (`dont_look_inside`): `GCFLAG_TRACK_YOUNG_PTRS` is mutable, and looking
 /// inside `majit_gc::gc_write_barrier_from_array` can fold the clear bit
 /// from a young birth and skip the barrier after the array is promoted.
-/// `remember_frame_locals_array` is residual for the same reason. The
-/// from_array call stays residual: `framework.py transform_generic_set`
-/// emits it as `direct_call` and `jtransform.py` does not drop it.
+/// The nursery / flag / forwarded tests live first inside that hook, before
+/// the hybrid-heap hash. `remember_frame_locals_array` is residual for the
+/// same reason. The from_array call stays residual: `framework.py
+/// transform_generic_set` emits it as `direct_call` and `jtransform.py`
+/// does not drop it.
 ///
 /// # Safety
 /// `block` is a live `ItemsBlock` and `index` is in range.
 #[inline]
 pub unsafe fn items_block_set_ref(block: *mut ItemsBlock, index: usize, value: PyObjectRef) {
     debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
-    let header = unsafe { majit_gc::header::header_of(block as usize) };
-    if unsafe { (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) }
-        && unsafe { (*header).is_forwarded() }
-    {
-        stale_array_abort(block as usize, index);
-    }
     crate::gc_hook::try_gc_write_barrier_from_array(block as crate::gc_hook::GCREF, index);
     unsafe { *items_block_items_base(block).add(index) = value };
 }
@@ -1788,9 +1784,14 @@ impl FixedObjectArray {
     }
 
     /// Store a GC reference through the host interpreter's equivalent of
-    /// `setarrayitem_gc`: `write_barrier_from_array` then the store
-    /// (`items_block_set_ref`). The barrier is not a collection point, so
-    /// `value` needs no root across it.
+    /// `setarrayitem_gc`. Frame locals are a short `GcArray`; `rewrite.py
+    /// gen_write_barrier_array` uses a regular write barrier when the length
+    /// is under 130. The barrier is `gc_hook::try_gc_write_barrier`
+    /// (`dont_look_inside`): an inlined `TRACK_YOUNG_PTRS` test can fold the
+    /// clear bit from a young birth and skip the barrier after the array is
+    /// promoted (`incminimark.py write_barrier` reads it at the store).
+    /// `remember_frame_locals_array` is residual for the same reason. The
+    /// barrier is not a collection point, so `value` needs no root across it.
     #[inline]
     #[expect(
         clippy::not_unsafe_ptr_arg_deref,
@@ -1805,22 +1806,11 @@ impl FixedObjectArray {
             unsafe { self.items_mut_ptr().add(index).write(value) };
             return;
         }
-        // `setarrayitem_gc` / `items_block_set_ref`: the barrier is
-        // `gc_hook::try_gc_write_barrier_from_array` (`dont_look_inside`).
-        // An inlined TRACK_YOUNG_PTRS test can fold the clear bit from a
-        // young birth and skip the barrier after the array is promoted
-        // (`incminimark.py write_barrier` reads it at the store).
-        // `remember_frame_locals_array` is residual for the same reason.
-        let header = unsafe { majit_gc::header::header_of(self as *mut Self as usize) };
-        if unsafe { (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) }
-            && unsafe { (*header).is_forwarded() }
-        {
-            stale_array_abort(self as *mut Self as usize, index);
-        }
-        crate::gc_hook::try_gc_write_barrier_from_array(
-            self as *mut Self as crate::gc_hook::GCREF,
-            index,
-        );
+        // `setarrayitem_gc` on a short GcArray: regular WB (`rewrite.py
+        // gen_write_barrier_array` length<130). The TRACK test lives in
+        // `try_gc_write_barrier_managed` (`dont_look_inside`); the managed
+        // hook omits the hybrid-heap hash (`do_write_barrier_managed`).
+        crate::gc_hook::try_gc_write_barrier_managed(self as *mut Self as crate::gc_hook::GCREF);
         unsafe { self.items_mut_ptr().add(index).write(value) };
     }
 
@@ -1847,15 +1837,12 @@ impl FixedObjectArray {
     ) -> Result<PyObjectRef, PyObjectRef> {
         assert!(index < self.len);
         if !new.is_null() {
-            let header = unsafe { majit_gc::header::header_of(self as *const Self as usize) };
-            if unsafe { (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
-                if unsafe { (*header).is_forwarded() } {
-                    stale_array_abort(self as *const Self as usize, index);
-                }
-                crate::gc_hook::try_gc_write_barrier_managed(
-                    self as *const Self as crate::gc_hook::GCREF,
-                );
-            }
+            // The TRACK test lives in `try_gc_write_barrier_managed`
+            // (`dont_look_inside`): an inlined flag test can fold the clear
+            // bit from a young birth and skip the barrier after promotion.
+            crate::gc_hook::try_gc_write_barrier_managed(
+                self as *const Self as crate::gc_hook::GCREF,
+            );
         }
         self.item_atomic_ptr(index)
             .compare_exchange(current, new, success, failure)
@@ -1873,38 +1860,6 @@ impl FixedObjectArray {
     pub fn swap(&mut self, a: usize, b: usize) {
         self.as_mut_slice().swap(a, b);
     }
-}
-
-/// Out-of-line half of [`FixedObjectArray::set_ref`]'s forwarded-header check.
-///
-/// A forwarded header means the array is a nursery corpse: the collection that
-/// moved it left this holder's field naming the old copy.  Print the live copy
-/// and hand the address to whoever can name the holder before aborting, so the
-/// surviving question is only which field kept the pre-collection pointer.
-#[cold]
-#[inline(never)]
-fn stale_array_abort(array_addr: usize, index: usize) -> ! {
-    let header = unsafe { majit_gc::header::header_of(array_addr) };
-    let moved_to = unsafe { majit_gc::header::GcHeader::forwarding_address(header) };
-    eprintln!(
-        "STALE ARRAY: FixedObjectArray::set_ref(index={index}) reached {array_addr:#x}, \
-         already moved to {moved_to:#x}"
-    );
-    // The holder is not on the live frame chain in any observed occurrence, so
-    // the walk below cannot name it.  Capture the Rust stack here instead: this
-    // arm is `#[cold]` and ends the process, so the cost is irrelevant and the
-    // return addresses are the only thing that names the caller that kept the
-    // pre-collection pointer.
-    eprintln!(
-        "STALE ARRAY backtrace:\n{}",
-        std::backtrace::Backtrace::force_capture()
-    );
-    let named = crate::gc_hook::report_stale_array_holder(array_addr);
-    panic!(
-        "FixedObjectArray::set_ref on {array_addr:#x}: a minor collection moved this \
-         array to {moved_to:#x} and its holder kept the pre-collection pointer \
-         (holder named: {named})"
-    );
 }
 
 impl Index<usize> for FixedObjectArray {

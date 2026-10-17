@@ -850,15 +850,6 @@ fn intern_dict(
     unsafe { &mut *table.0 }
 }
 
-/// Characters that fit in this many bytes probe from a stack STR; longer
-/// values still heap-allocate the temporary key.
-const INTERN_LOOKUP_STACK_BYTES: usize = 256;
-
-/// 8-aligned rstr `STR` header plus room for [`INTERN_LOOKUP_STACK_BYTES`]
-/// characters and the trailing NUL `LOWLEVEL_STR_BASE_SIZE` already counts.
-#[repr(C, align(8))]
-struct InternLookupProbe([u8; LOWLEVEL_STR_BASE_SIZE + INTERN_LOOKUP_STACK_BYTES]);
-
 /// `interned_strings.get` (`ObjSpace.new_interned_str` / `new_interned_w_str`).
 /// Probe only: `ObjSpace.__init__` builds the table (`init_interned_strings` /
 /// `ll_new_weakdict`); a GET does not allocate it. A null table is a miss.
@@ -870,77 +861,23 @@ fn intern_lookup(llkey: crate::celldict::StrKey) -> Option<PyObjectRef> {
     unsafe { (*table.0).ll_get(llkey) }
 }
 
-/// Convert_const intern lookup: live referent whose stored valueref is a
-/// prebuilt weakref (`prebuilt_weakref`, not collector-owned). Probe only,
-/// same as [`intern_lookup`].
-fn intern_lookup_prebuilt(llkey: crate::celldict::StrKey) -> Option<PyObjectRef> {
+/// Byte-only `interned_strings.get`. Hash and eq run over `chars`
+/// (`objectmodel._hash_string` / `rstr.py ll_streq`) so a GET does not
+/// allocate a probe STR (`rordereddict.py` `ll_dict_lookup` of `r_key`).
+fn intern_lookup_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
     let table = lock_intern();
     if table.0.is_null() {
         return None;
     }
-    let dict = unsafe { &*table.0 };
-    let existing = dict.ll_get(llkey)?;
-    if dict.ll_valueref_is_prebuilt(llkey) {
-        Some(existing)
-    } else {
-        None
-    }
-}
-
-/// Fill `buf` as an rstr `STR` whose `chars` are `bytes`, then `ll_get`.
-///
-/// # Safety
-/// `buf` is aligned for [`Utf8Str`], `buf_len` is `LOWLEVEL_STR_BASE_SIZE +
-/// bytes.len()`, and the `buf_len` bytes are writable. `ll_strhash` may
-/// write `STR.hash`.
-unsafe fn intern_lookup_in(
-    bytes: &[u8],
-    buf: *mut u8,
-    buf_len: usize,
-    lookup: fn(crate::celldict::StrKey) -> Option<PyObjectRef>,
-) -> Option<PyObjectRef> {
-    debug_assert_eq!(buf_len, LOWLEVEL_STR_BASE_SIZE + bytes.len());
-    unsafe {
-        (buf as *mut usize).write(0);
-        (buf.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(bytes.len());
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            buf.add(LOWLEVEL_STRING_CHARS_OFFSET),
-            bytes.len(),
-        );
-        buf.add(LOWLEVEL_STRING_CHARS_OFFSET + bytes.len()).write(0);
-        lookup(crate::celldict::StrKey(buf as *mut UnicodeValueStorage))
-    }
-}
-
-/// Probe with a stack STR so `ll_get` takes `r_key`'s STR (`ll_get(d, llkey)`).
-fn intern_lookup_wtf8_with(
-    value: &Wtf8,
-    lookup: fn(crate::celldict::StrKey) -> Option<PyObjectRef>,
-) -> Option<PyObjectRef> {
-    let bytes = value.as_bytes();
-    let Some(total) = LOWLEVEL_STR_BASE_SIZE.checked_add(bytes.len()) else {
-        return None;
-    };
-    if bytes.len() <= INTERN_LOOKUP_STACK_BYTES {
-        let mut probe = std::mem::MaybeUninit::<InternLookupProbe>::uninit();
-        unsafe { intern_lookup_in(bytes, probe.as_mut_ptr() as *mut u8, total, lookup) }
-    } else {
-        let mut buf = vec![0u8; total];
-        unsafe { intern_lookup_in(bytes, buf.as_mut_ptr(), total, lookup) }
-    }
-}
-
-/// Byte-only `interned_strings.get`: the probe is an off-heap (stack, or Vec
-/// when longer than INTERN_LOOKUP_STACK_BYTES) STR that `ll_get` does not
-/// store. Off-heap so `ll_get` (`dont_look_inside`, no malloc) can hash/eq
-/// it without a root.
-fn intern_lookup_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
-    intern_lookup_wtf8_with(value, intern_lookup)
+    unsafe { (*table.0).ll_get_chars(value.as_bytes()) }
 }
 
 fn intern_lookup_wtf8_prebuilt(value: &Wtf8) -> Option<PyObjectRef> {
-    intern_lookup_wtf8_with(value, intern_lookup_prebuilt)
+    let table = lock_intern();
+    if table.0.is_null() {
+        return None;
+    }
+    unsafe { (*table.0).ll_get_chars_prebuilt(value.as_bytes()) }
 }
 
 /// `ll_new_weakdict` for `interned_strings`. Called after the WEAKDICT type
@@ -990,8 +927,9 @@ fn prebuilt_weakref(obj: PyObjectRef) -> *mut crate::weakref::Weakref {
 
 /// `convert_const` insert: prebuilt weakref to a never-freed target, keyed
 /// by that object's own STR. `prebuilt_weakref` is host `malloc_typed`.
-/// The intern table is write-barriered first so a safepoint that does
-/// collect still traces `d.entries`.
+/// Callers pass an immortal exact str (`w_str_from_wtf8_immortal` /
+/// `box_str_constant`); `ll_set_nonnull_valueref` may resize, and that
+/// malloc does not move those words.
 ///
 /// `replace_managed` is `box_str_constant`'s convert_const behaviour: a live
 /// `new_interned_w_str` entry (GC weakref, `w_weakref_new`) for the same key
@@ -1000,32 +938,17 @@ fn prebuilt_weakref(obj: PyObjectRef) -> *mut crate::weakref::Weakref {
 /// kept. `intern_wtf8_value` passes false and keeps any live entry of
 /// either kind.
 fn intern_publish_const(obj: PyObjectRef, replace_managed: bool) -> PyObjectRef {
-    // `_rweakvaldict.py ll_set_nonnull`: `d` is a livevar across
-    // `weakref_create` (`framework.py` `push_roots`). The intern table is
-    // old/prebuilt, so `incminimark.py` `write_barrier` enrolls it before
-    // the first safepoint; `prebuilt_weakref` is host `malloc_typed`.
-    let _roots = crate::gc_roots::push_roots();
-    crate::rweakvaldict::barrier_weakdict(interned_strings_dict_ptr());
-    let obj_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(obj);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let valueref = prebuilt_weakref(obj);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::celldict::StrKey(unsafe { w_str_storage(obj) });
-    let key_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(key.0 as PyObjectRef);
     let mut table = lock_intern();
     let dict = intern_dict(&mut table);
-    let key = crate::celldict::StrKey(
-        crate::gc_roots::shadow_stack_get(key_slot) as *mut UnicodeValueStorage
-    );
     if let Some(existing) = dict.ll_get(key)
         && (!replace_managed || dict.ll_valueref_is_prebuilt(key))
     {
         return existing;
     }
     dict.ll_set_nonnull_valueref(key, valueref);
-    crate::gc_roots::shadow_stack_get(obj_slot)
+    obj
 }
 
 /// `new_interned_w_str`: `ll_set_nonnull` for a program-created object.
@@ -1038,14 +961,12 @@ fn intern_publish_const(obj: PyObjectRef, replace_managed: bool) -> PyObjectRef 
 /// rewrites `weakptr`.
 ///
 /// `_rweakvaldict.py ll_set_nonnull` keeps `d` a livevar across
-/// `weakref_create` (`framework.py` `push_roots`). Write-barrier the intern
-/// table before the first safepoint so a minor traces `d.entries`
-/// (`incminimark.py` `remember_young_pointer`). The intern lock is not
-/// held across that malloc.
+/// `weakref_create` (`framework.py` `push_roots`). The intern lock is not
+/// held across that malloc; `obj` and the WEAKREF stay pinned across
+/// `intern_dict`, which may collect when the table is still null.
 #[majit_macros::dont_look_inside]
 fn intern_publish(obj: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::rweakvaldict::barrier_weakdict(interned_strings_dict_ptr());
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -1053,15 +974,13 @@ fn intern_publish(obj: PyObjectRef) -> PyObjectRef {
     let valueref = unsafe { crate::weakref::w_weakref_new(obj) };
     let valueref_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(valueref as PyObjectRef);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let key = crate::celldict::StrKey(unsafe { w_str_storage(obj) });
-    let key_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(key.0 as PyObjectRef);
     let mut table = lock_intern();
+    // A GET miss on a still-null table does not allocate it; `intern_dict`
+    // may collect here. Reload `obj` before reading its STR key.
     let dict = intern_dict(&mut table);
-    let key = crate::celldict::StrKey(
-        crate::gc_roots::shadow_stack_get(key_slot) as *mut UnicodeValueStorage
-    );
+    let key = crate::celldict::StrKey(unsafe {
+        w_str_storage(crate::gc_roots::shadow_stack_get(obj_slot))
+    });
     if let Some(existing) = dict.ll_get(key) {
         return existing;
     }
@@ -2231,13 +2150,13 @@ mod tests {
             }
         }
         {
-            // intern_lookup_heap_probe_above_stack_threshold
-            let long = "L".repeat(INTERN_LOOKUP_STACK_BYTES + 1);
+            // intern_lookup_long_name
+            let long = "L".repeat(257);
             let first = intern_str_value(&long);
             let second = intern_str_value(&long);
             assert!(std::ptr::eq(first, second));
             unsafe {
-                assert_eq!(w_str_len(first), INTERN_LOOKUP_STACK_BYTES + 1);
+                assert_eq!(w_str_len(first), 257);
             }
         }
     }

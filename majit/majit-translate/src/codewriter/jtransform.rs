@@ -911,10 +911,11 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
     matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
 }
 
-/// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` —
-/// the interpreter's spelling of `llop.gc_writebarrier`, which
-/// [`drop_guarded_gc_write_barriers`] drops when the store it guards
-/// follows. `try_gc_write_barrier_before_move` is a different op
+/// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` /
+/// `try_gc_write_barrier_prebuilt` — the interpreter's spelling of
+/// `llop.gc_writebarrier`, which [`drop_guarded_gc_write_barriers`]
+/// drops when the store it guards follows.
+/// `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
 /// `try_gc_write_barrier_from_array` is `write_barrier_from_array` and
 /// stays residual (`framework.py transform_generic_set`).
@@ -927,7 +928,9 @@ fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     module == "gc_hook"
         && matches!(
             leaf.as_str(),
-            "try_gc_write_barrier" | "try_gc_write_barrier_managed"
+            "try_gc_write_barrier"
+                | "try_gc_write_barrier_managed"
+                | "try_gc_write_barrier_prebuilt"
         )
 }
 
@@ -1111,7 +1114,8 @@ fn is_drop_guard_identity_op(kind: &OpKind) -> bool {
 /// call the JIT rewriter does not keep: `rewrite.py
 /// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
 /// `SETFIELD_GC` of a pointer. The interpreter spells that barrier as an
-/// explicit `try_gc_write_barrier(obj)` right before the store it guards,
+/// explicit `try_gc_write_barrier(obj)` /
+/// `try_gc_write_barrier_prebuilt(obj)` right before the store it guards,
 /// so the one-arg call is dropped only when the next non-identity op is a
 /// non-null GC `FieldWrite` / `ArrayWrite` of the same base: that store
 /// lowers to the op the backend barriers.
@@ -24947,7 +24951,8 @@ mod tests {
     }
 
     /// Only the `gc_hook` barrier is this op: a same-named leaf in another
-    /// module is an ordinary call. `write_cell` spells `try_gc_write_barrier`.
+    /// module is an ordinary call. `write_cell` spells
+    /// `try_gc_write_barrier_prebuilt`.
     #[test]
     fn gc_write_barrier_path_requires_gc_hook_module() {
         let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -24955,6 +24960,11 @@ mod tests {
             "pyre_object",
             "gc_hook",
             "try_gc_write_barrier"
+        ])));
+        assert!(is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "gc_hook",
+            "try_gc_write_barrier_prebuilt"
         ])));
         assert!(!is_gc_write_barrier_path(&path(&[
             "pyre_object",

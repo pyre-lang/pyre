@@ -1801,9 +1801,9 @@ fn list_gc_ref_items_block(list: &W_ListObject) -> crate::gc_hook::GCREF {
 }
 
 fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
+    // `write_barrier` is not a collection (`incminimark.py remember_young_pointer`):
+    // the list pointer is stable across it, so the list is not a shadow-stack
+    // livevar here.
     if managed {
         crate::gc_hook::try_gc_write_barrier_managed(obj as crate::gc_hook::GCREF);
     } else {
@@ -1814,16 +1814,13 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
     // already-old block's items — a young element just stored into an old block
     // would be missed. Barrier the block too so its varsize walker re-runs; the
     // collector no-ops the barrier on a still-young block (`TRACK_YOUNG_PTRS`
-    // unset). Inert while the block stays std::alloc (`try_gc_owns_object` false)
-    // or the strategy has no GCREF block yet (Empty ascii/bytes).
-    // The block is read through the list's slot.
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    // unset) or a std::alloc fallback. Empty ascii/bytes keep a null block.
     let list = unsafe { &*(obj as *const W_ListObject) };
     let block = list_gc_ref_items_block(list);
-    if !block.is_null() && crate::gc_hook::try_gc_owns_object(block) {
-        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let list = unsafe { &*(obj as *const W_ListObject) };
-        let block = list_gc_ref_items_block(list);
+    if !block.is_null() {
+        // `write_barrier` no-ops a young or unmanaged block (`incminimark.py`
+        // nursery return / hybrid-heap membership). Asking `owns_object`
+        // first would hash the rawmalloced set on every list store.
         crate::gc_hook::try_gc_write_barrier(block);
     }
 }
@@ -1841,35 +1838,21 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
 /// the returned list word.
 #[majit_macros::dont_look_inside]
 pub fn list_before_move_barrier(obj: PyObjectRef) -> PyObjectRef {
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::shadow_stack_len();
-    let _obj = crate::gc_roots::pin_root(obj);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    // `write_barrier_from_array` / `write_barrier_before_move` is not a
+    // collection (`incminimark.py`); the list pointer is stable across it.
     let list = unsafe { &*(obj as *const W_ListObject) };
     let block = list_gc_ref_items_block(list);
-    if !block.is_null() && crate::gc_hook::try_gc_owns_object(block) {
-        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        let list = unsafe { &*(obj as *const W_ListObject) };
-        let block = list_gc_ref_items_block(list);
+    if !block.is_null() {
         crate::gc_hook::try_gc_write_barrier_before_move(block);
     }
-    crate::gc_roots::shadow_stack_get(obj_slot)
+    obj
 }
 
-/// Run the list's pre-write barrier while keeping the value in a relocatable
-/// shadow-stack slot. A concurrent collector may run while the barrier waits
-/// for the GC operation gate, so the raw Rust argument must be reloaded before
-/// the following pointer store.
+/// Run the list's pre-write barrier and answer with `value`.
 ///
-/// `dont_look_inside`: the `push_roots` bracket around the barrier resolves the
-/// thread-local root stack and installs a `Drop` that truncates it — a
-/// shadow-stack shape with no RPython counterpart (the GC transform emits
-/// `ll_writebarrier` with no bracket at all) and no lowering in the tracer, so
-/// the object-append descent used to hit its unregistered zero-arg callee as a
-/// `symbolic_fnaddr_for_path` hash and decline the whole fold. Collapsing the
-/// bracket and the barrier into one registered residual keeps the Object arm's
-/// `set_len` / `setitem_fast` leaves foldable to native ops, and costs the same
-/// one residual call the barrier alone already did.
+/// `dont_look_inside`: the barrier residualizes via the registered fnaddr so
+/// the Object arm's `set_len` / `setitem_fast` leaves stay foldable to native
+/// ops (`framework.py` emits `ll_writebarrier` with no shadow-stack bracket).
 ///
 /// Returns `value`. The barrier is not a collection point
 /// (`remember_young_pointer`), so the returned word is the one passed in.
@@ -1884,12 +1867,8 @@ pub fn list_before_move_barrier(obj: PyObjectRef) -> PyObjectRef {
 /// is `(i32, i32) -> i32` on wasm32.
 #[majit_macros::dont_look_inside]
 pub fn prepare_list_ref_store(obj: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
-    let _roots = crate::gc_roots::push_roots();
-    let root_base = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::publish_roots(&[obj, value]);
-    crate::gc_roots::normalize_roots(root_base, 2);
-    list_write_barrier(crate::gc_roots::shadow_stack_get(root_base));
-    crate::gc_roots::shadow_stack_get(root_base + 1)
+    list_write_barrier(obj);
+    value
 }
 
 /// Resolve a GC reference after a residual safepoint may have moved it.
@@ -3522,7 +3501,8 @@ pub fn ll_list_ascii_set_len(l: &mut W_ListObject, n: usize) {
 /// `GCFLAG_TRACK_YOUNG_PTRS` is mutable, and looking inside
 /// `majit_gc::gc_write_barrier_from_array` can fold the clear bit from a
 /// young birth and skip the barrier after the array is promoted
-/// (`incminimark.py write_barrier_from_array`). The from_array call stays
+/// (`incminimark.py write_barrier_from_array`). The nursery / flag /
+/// forwarded tests live first inside that hook. The from_array call stays
 /// residual: `framework.py transform_generic_set` emits it as
 /// `direct_call` and `jtransform.py` does not drop it.
 #[majit_macros::oopspec("list.ascii_setitem(l, index, item)")]
@@ -3531,21 +3511,10 @@ pub fn ll_list_ascii_setitem_fast(
     index: usize,
     item: *const crate::unicodeobject::UnicodeValueStorage,
 ) {
-    unsafe {
-        let block = l.ascii_items.block;
-        debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
-        let header = majit_gc::header::header_of(block as usize);
-        if (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS)
-            && (*header).is_forwarded()
-        {
-            panic!(
-                "stale ascii ItemsBlock {:#x} at index {index}",
-                block as usize
-            );
-        }
-        crate::gc_hook::try_gc_write_barrier_from_array(block as crate::gc_hook::GCREF, index);
-        l.ascii_items[index] = item;
-    }
+    let block = l.ascii_items.block;
+    debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
+    crate::gc_hook::try_gc_write_barrier_from_array(block as crate::gc_hook::GCREF, index);
+    l.ascii_items[index] = item;
 }
 
 /// `rlist.py _ll_list_resize_hint_really` for Ascii storage.

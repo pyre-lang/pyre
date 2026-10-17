@@ -309,11 +309,10 @@ pub unsafe fn write_cell(
     match write {
         CellWrite::InPlaceObject(_) => {
             let cell = w_cell_word;
-            // Barrier before the store. A cell the collector does not own is
-            // handled inside the barrier, like a prebuilt object in
-            // `remember_young_pointer`. An in-place int store writes no
-            // `PyObjectRef` and needs none.
-            crate::gc_hook::try_gc_write_barrier(cell as crate::gc_hook::GCREF);
+            // Barrier before the store, the `remember_young_pointer` order. A
+            // cell the collector does not own dirties the prebuilt walk. An
+            // in-place int store writes no `PyObjectRef` and needs none.
+            crate::gc_hook::try_gc_write_barrier_prebuilt(cell as crate::gc_hook::GCREF);
             (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }
@@ -1653,6 +1652,10 @@ mod tests {
                 unsafe { crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict) };
             crate::gc_roots::clear_prebuilt_roots_dirty();
             module_dict_storage_set(storage, "k", crate::w_str_new("v"));
+            assert!(crate::gc_roots::prebuilt_roots_dirty());
+            let cell = crate::w_str_new("cell") as crate::gc_hook::GCREF;
+            crate::gc_roots::clear_prebuilt_roots_dirty();
+            crate::gc_hook::try_gc_write_barrier_prebuilt(cell);
             assert!(crate::gc_roots::prebuilt_roots_dirty());
         }
         {

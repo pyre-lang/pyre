@@ -258,6 +258,35 @@ fn hash_string_bytes(s: &[u8]) -> isize {
     x ^ (s.len() as isize)
 }
 
+/// `_ll_strhash` digest of `chars` without a STR: zero becomes the rstr
+/// sentinel so it matches a stored `STR.hash`.
+fn hash_chars(bytes: &[u8]) -> isize {
+    let mut x = hash_string_bytes(bytes);
+    if x == 0 {
+        x = 29872897;
+    }
+    x
+}
+
+/// `ll_streq` of a stored STR key against borrowed `chars`.
+fn ll_streq_chars(key: StrKey, bytes: &[u8]) -> bool {
+    if key.0.is_null() {
+        return false;
+    }
+    // `rstr.py ll_streq` over `chars`. Length then bytes, without the
+    // `dont_look_inside` payload helper.
+    let len = crate::lowlevel_string::bh_lowlevel_string_len(key.0 as i64);
+    if len != bytes.len() {
+        return false;
+    }
+    unsafe {
+        std::slice::from_raw_parts(
+            (key.0 as *const u8).add(crate::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET),
+            len,
+        ) == bytes
+    }
+}
+
 /// `LLHelpers._ll_strhash` (`rstr.py`). Zero is the uncomputed memo, so a
 /// real zero digest becomes `29872897` and is stored in `STR.hash`.
 #[majit_macros::dont_look_inside]
@@ -323,6 +352,12 @@ fn ll_streq(s1: StrKey, s2: StrKey) -> bool {
 /// the array sits in the remembered set (`collect_oldrefs_to_nursery`);
 /// `invalidate_young_weakrefs` then rewrites `weakptr`. A pre-hook
 /// immortal array is not collector-owned and keeps `write_barrier`.
+///
+/// The call is `gc_hook::try_gc_write_barrier_from_array`
+/// (`dont_look_inside`): an inlined `TRACK_YOUNG_PTRS` test can fold the
+/// clear bit from a young birth and skip the barrier after the array is
+/// promoted. The nursery / flag / forwarded tests live first inside that
+/// hook.
 fn barrier_entries<K>(entries: *mut WeakDictEntries<K>, i: usize) {
     if !entries.is_null() {
         crate::gc_hook::try_gc_write_barrier_from_array(entries as crate::gc_hook::GCREF, i);
@@ -474,12 +509,81 @@ fn ll_dict_lookup(d: &WeakDict<StrKey>, key: StrKey, hash: isize) -> usize {
     }
 }
 
+/// `rdict.py` `ll_dict_lookup` with the key as borrowed `chars`.
+///
+/// `interned_strings.get` takes an rstr `STR` (`r_key`); a byte-only
+/// caller would otherwise allocate a probe STR (`ll_get(d, llkey)`).
+/// Hash and eq are `_ll_strhash` / `ll_streq` over `chars`, so the
+/// probe is unnecessary (`objectmodel._hash_string`, `rstr.py ll_streq`).
+fn ll_dict_lookup_chars(d: &WeakDict<StrKey>, bytes: &[u8], hash: isize) -> usize {
+    let entries = d.entries;
+    let mask = unsafe { (*entries).length } - 1;
+    let mut i = (hash as usize) & mask;
+    let mut freeslot: isize;
+    if valid(entries, i) {
+        let checking = unsafe { (*entry(entries, i)).key };
+        if ll_hash(entries, i) == hash && ll_streq_chars(checking, bytes) {
+            return i;
+        }
+        freeslot = -1;
+    } else if everused(entries, i) {
+        freeslot = i as isize;
+    } else {
+        return i | HIGHEST_BIT;
+    }
+    let mut perturb = hash as usize;
+    loop {
+        i = (i << 2)
+            .wrapping_add(i)
+            .wrapping_add(perturb)
+            .wrapping_add(1)
+            & mask;
+        if !everused(entries, i) {
+            if freeslot == -1 {
+                freeslot = i as isize;
+            }
+            return (freeslot as usize) | HIGHEST_BIT;
+        } else if valid(entries, i) {
+            let checking = unsafe { (*entry(entries, i)).key };
+            if ll_hash(entries, i) == hash && ll_streq_chars(checking, bytes) {
+                return i;
+            }
+        } else if freeslot == -1 {
+            freeslot = i as isize;
+        }
+        perturb >>= PERTURB_SHIFT;
+    }
+}
+
 impl WeakDict<StrKey> {
     /// `ll_get(d, llkey)`. `None` is the null object pointer.
     #[majit_macros::dont_look_inside]
     pub fn ll_get(&self, llkey: StrKey) -> Option<crate::pyobject::PyObjectRef> {
         let hash = llkey.ll_keyhash();
         let i = ll_dict_lookup(self, llkey, hash) & (HIGHEST_BIT - 1);
+        self.ll_get_at(i)
+    }
+
+    /// `ll_get` whose key is borrowed `chars` rather than a STR probe.
+    #[majit_macros::dont_look_inside]
+    pub fn ll_get_chars(&self, bytes: &[u8]) -> Option<crate::pyobject::PyObjectRef> {
+        let hash = hash_chars(bytes);
+        let i = ll_dict_lookup_chars(self, bytes, hash) & (HIGHEST_BIT - 1);
+        self.ll_get_at(i)
+    }
+
+    /// Convert_const intern lookup keyed by borrowed `chars`.
+    #[majit_macros::dont_look_inside]
+    pub fn ll_get_chars_prebuilt(&self, bytes: &[u8]) -> Option<crate::pyobject::PyObjectRef> {
+        let hash = hash_chars(bytes);
+        let i = ll_dict_lookup_chars(self, bytes, hash) & (HIGHEST_BIT - 1);
+        if !valueref_is_prebuilt(unsafe { (*entry(self.entries, i)).value }) {
+            return None;
+        }
+        self.ll_get_at(i)
+    }
+
+    fn ll_get_at(&self, i: usize) -> Option<crate::pyobject::PyObjectRef> {
         let valueref = unsafe { (*entry(self.entries, i)).value };
         if valueref.is_null() {
             None

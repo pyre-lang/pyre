@@ -8031,8 +8031,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         // allocating it. A surrogate name still probes that dict when
         // one already exists. `W_BaseException.getdict` would allocate
         // on the same miss; [`exception_peek_dict_backing`] does not.
-        let w_dict = match pyre_object::with_roots!(obj, w_name, w_type => peek_existing_dict(obj))
-        {
+        let w_dict = match peek_existing_dict(obj) {
             Some(w_dict) => w_dict,
             None => pyre_object::with_roots!(obj, w_name, w_type => getdict_backing(obj))?,
         };
@@ -11451,35 +11450,24 @@ pub unsafe fn lookup_where_pair(
     // (`typeobject.py` `_lookup_where`); `ObjSpace.new_interned_str` is
     // code-object / constant creation. Probe only; a miss walks with the
     // borrowed name (`getitem_str`) and does not intern-insert.
-    let Some(mut w_name) = interned_lookup_w_name(Wtf8::new(name)) else {
+    let Some(w_name) = interned_lookup_w_name(Wtf8::new(name)) else {
         return lookup_where(w_type, name);
     };
-    // `_lookup_where` keeps `self` and `key` as livevars (`framework.py`
-    // `push_roots` / `shadowstack.py` `expand_pop_roots`). `key` is the
-    // str object; `_utf8` is recomputed from the reloaded object after
-    // each collecting residual (`rstr.py` chars after `pop_roots`).
-    let mut w_type = w_type;
     for _ in 0..8 {
         let tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
-        let value =
-            pyre_object::with_roots!(w_type, w_name => _lookup_in_type_uncached(w_type, w_name));
+        // `_lookup_where` is a dict/MRO walk, not a collecting malloc.
+        let value = _lookup_in_type_uncached(w_type, w_name);
         if value.is_null() {
             if pyre_object::typeobject::w_type_get_version_tag(w_type) == tag {
                 return None;
             }
             continue;
         }
-        let mut value = value;
-        let class = pyre_object::with_roots!(w_type, w_name, value => {
-            _lookup_where_class_uncached(w_type, w_name)
-        });
+        let class = _lookup_where_class_uncached(w_type, w_name);
         if class.is_null() {
             continue;
         }
-        let mut class = class;
-        let hit = pyre_object::with_roots!(w_type, w_name, value, class => {
-            crate::type_dict_lookup_wtf8_no_unwrapping(class, w_name_utf8(w_name))
-        });
+        let hit = crate::type_dict_lookup_wtf8_no_unwrapping(class, w_name_utf8(w_name));
         if hit == Some(value) {
             // `getdictvalue`'s unwrap, on the one entry both residuals agreed
             // on.  A type store parks a cell only around a live value, so the
@@ -11512,33 +11500,24 @@ pub(crate) unsafe fn lookup_where_pair_no_unwrapping(
     // the value half: the `&str` projections above cannot be published as
     // residual targets, and an unpublished callee blocks every descent whose
     // body reaches this arm. Probe only (`lookup_where` does not intern).
-    let Some(mut w_name) = interned_lookup_w_name(Wtf8::new(name)) else {
+    let Some(w_name) = interned_lookup_w_name(Wtf8::new(name)) else {
         return lookup_where_no_unwrapping(w_type, name);
     };
-    // Same livevars as [`lookup_where_pair`]: the str object, not a
-    // hoisted `&Wtf8` (`unicodeobject.py` `_utf8`).
-    let mut w_type = w_type;
     for _ in 0..8 {
         let tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
-        let value =
-            pyre_object::with_roots!(w_type, w_name => _lookup_in_type_uncached(w_type, w_name));
+        // `_lookup_where` is a dict/MRO walk, not a collecting malloc.
+        let value = _lookup_in_type_uncached(w_type, w_name);
         if value.is_null() {
             if pyre_object::typeobject::w_type_get_version_tag(w_type) == tag {
                 return None;
             }
             continue;
         }
-        let mut value = value;
-        let class = pyre_object::with_roots!(w_type, w_name, value => {
-            _lookup_where_class_uncached(w_type, w_name)
-        });
+        let class = _lookup_where_class_uncached(w_type, w_name);
         if class.is_null() {
             continue;
         }
-        let mut class = class;
-        let hit = pyre_object::with_roots!(w_type, w_name, value, class => {
-            crate::type_dict_lookup_wtf8_no_unwrapping(class, w_name_utf8(w_name))
-        });
+        let hit = crate::type_dict_lookup_wtf8_no_unwrapping(class, w_name_utf8(w_name));
         if hit == Some(value) {
             return Some((class, value));
         }
@@ -11623,12 +11602,10 @@ pub(crate) unsafe fn lookup_in_type_wtf8_uncached(
 /// `w_type` may be null or a non-type; `w_name` must be a live str object.
 #[majit_macros::dont_look_inside]
 pub(crate) unsafe fn _lookup_in_type_uncached(
-    mut w_type: *mut PyObject,
-    mut w_name: *mut PyObject,
+    w_type: *mut PyObject,
+    w_name: *mut PyObject,
 ) -> *mut PyObject {
-    pyre_object::with_roots!(w_type, w_name => {
-        lookup_in_type_wtf8_uncached(w_type, w_name_utf8(w_name)).unwrap_or(std::ptr::null_mut())
-    })
+    lookup_in_type_wtf8_uncached(w_type, w_name_utf8(w_name)).unwrap_or(std::ptr::null_mut())
 }
 
 /// Class-half twin of [`_lookup_in_type_uncached`] for traced code: the
@@ -11639,13 +11616,11 @@ pub(crate) unsafe fn _lookup_in_type_uncached(
 /// `w_type` may be null or a non-type; `w_name` must be a live str object.
 #[majit_macros::dont_look_inside]
 pub(crate) unsafe fn _lookup_where_class_uncached(
-    mut w_type: *mut PyObject,
-    mut w_name: *mut PyObject,
+    w_type: *mut PyObject,
+    w_name: *mut PyObject,
 ) -> *mut PyObject {
-    pyre_object::with_roots!(w_type, w_name => {
-        lookup_where_pair_wtf8_uncached(w_type, w_name_utf8(w_name))
-            .map_or(std::ptr::null_mut(), |(src, _value)| src)
-    })
+    lookup_where_pair_wtf8_uncached(w_type, w_name_utf8(w_name))
+        .map_or(std::ptr::null_mut(), |(src, _value)| src)
 }
 
 /// The uncached arms of [`lookup_in_type_where_wtf8`].  The ordinary

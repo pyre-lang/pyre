@@ -80486,13 +80486,13 @@ mod tests {
     }
 
     /// `write_cell`'s in-place `ObjectMutableCell` arm is
-    /// `try_gc_write_barrier(cell); cell.w_value = w_value`. It does not
-    /// call `try_gc_owns_object`. jtransform
+    /// `try_gc_write_barrier_prebuilt(cell); cell.w_value = w_value`. It does
+    /// not call `try_gc_owns_object` itself. jtransform
     /// `drop_guarded_gc_write_barriers` drops that `gc_hook` barrier
     /// when the store follows, so rewrite can put `COND_CALL_GC_WB` on
     /// the `setfield_gc`.
     #[test]
-    fn write_cell_calls_try_gc_write_barrier_before_w_value_setfield() {
+    fn write_cell_calls_try_gc_write_barrier_prebuilt_before_w_value_setfield() {
         use crate::model::{CallTarget, OpKind};
         let graph = lower_object_fn("pyre_object::celldict::write_cell");
         assert!(
@@ -80505,7 +80505,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if segments.last().is_some_and(|s| s == "try_gc_write_barrier")
+                } if segments.last().is_some_and(|s| s == "try_gc_write_barrier_prebuilt")
             )
         };
         let is_store = |kind: &OpKind| matches!(kind, OpKind::FieldWrite { field, .. } if field.name == "w_value");
@@ -80534,7 +80534,7 @@ mod tests {
         }
         assert!(
             barrier_before_store,
-            "write_cell's try_gc_write_barrier does not precede the w_value setfield"
+            "write_cell's try_gc_write_barrier_prebuilt does not precede the w_value setfield"
         );
     }
 
