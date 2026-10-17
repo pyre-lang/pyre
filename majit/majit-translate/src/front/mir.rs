@@ -38513,19 +38513,30 @@ impl<'a> Lowering<'a> {
             call_result_class: None,
             carrier_recv,
             recv_niche: false,
+            scalar_niche: false,
             result_niche: false,
+            result_scalar_niche: false,
             niche_null_cast: None,
             int_null: None,
         };
 
         if is_option {
-            let (option_owner, some_owner, payload_ty) =
+            let (option_owner, some_owner, mut payload_ty) =
                 self.resolve_option_consumer_owners(&recv_ty)?;
             site.recv_owner = option_owner;
             site.recv_tag1_owner = some_owner;
-            site.payload1_ty = payload_ty;
             site.payload1_class = self.option_payload_instance_class_root(&recv_ty);
             site.recv_niche = self.tyref_is_niche_option_ptr(&recv_ty);
+            let scalar_kind = if site.recv_niche {
+                None
+            } else {
+                option_nonzero_word_kind(&recv_ty, self.llbc)
+            };
+            site.scalar_niche = scalar_kind.is_some();
+            if let Some(kind) = scalar_kind {
+                payload_ty = kind;
+            }
+            site.payload1_ty = payload_ty;
             site.niche_null_cast = self.option_niche_null_cast(&recv_ty);
             site.int_null = self.option_niche_int_null(&recv_ty);
         } else {
@@ -38573,6 +38584,8 @@ impl<'a> Lowering<'a> {
                 site.result_payload1_ty = payload_ty;
                 site.result_payload1_class = self.option_payload_instance_class_root(dest_ty);
                 site.result_niche = self.tyref_is_niche_option_ptr(dest_ty);
+                site.result_scalar_niche =
+                    !site.result_niche && tyref_option_nonzero_scalar(dest_ty, self.llbc);
                 if let Some(cast) = self.option_niche_null_cast(dest_ty) {
                     site.niche_null_cast = Some(cast);
                 }
@@ -69787,10 +69800,13 @@ fn is_core_result_method(path: &str, leaf: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiscCombinator {
     OptionFilter,
+    /// `Option::ok_or(opt, err)`: `Some` rebuilds `Ok(payload)`, `None`
+    /// rebuilds `Err(err)`.  The receiver tag follows the Option's
+    /// representation (`emit_option_recv_tag`).
     OptionOkOr,
     /// `Option::ok_or_else(opt, f)`: `Some` rebuilds `Ok(payload)`, `None`
-    /// calls the niladic `f` and rebuilds `Err(f())`.  A niche `Option` is
-    /// the `rnone.py` `rtype_is_None` null test (`push_niche_is_some`).
+    /// calls the niladic `f` and rebuilds `Err(f())`.  The receiver tag
+    /// follows the Option's representation (`emit_option_recv_tag`).
     OptionOkOrElse,
     ResultMap,
     ResultAndThen,
@@ -69901,8 +69917,13 @@ struct DiscCombinatorSite {
     /// Receiver is a one-word niche `Option` (nullable pointer). Its tag is
     /// a null test, and the `Some` payload is the pointer itself.
     recv_niche: bool,
+    /// Receiver is `Option<NonZero*>`: `None` is 0 and `Some` is the integer
+    /// itself (`rint.py` `IntegerRepr.rtype_bool`).
+    scalar_niche: bool,
     /// The combinator's result is that same nullable pointer.
     result_niche: bool,
+    /// The combinator's result is an `Option<NonZero*>` word.
+    result_scalar_niche: bool,
     /// `None` narrowed to the payload class, when the null must share it
     /// (`option_niche_null_cast`).
     niche_null_cast: Option<(String, ValueType)>,
@@ -70446,20 +70467,10 @@ fn rewire_disc_combinator_diamond(
     for _ in ci..=remove_upto {
         graph.blocks[a].operations.remove(ci);
     }
-    // Niche `Option` is a nullable pointer: `rnone.py` `rtype_is_None`
-    // (`FunctionGraph::push_niche_is_some`).  A `__discriminant` field
-    // read would load the object header.
-    let disc = if site.recv_niche && site.kind == DiscCombinator::OptionOkOrElse {
-        emit_niche_some_tag(
-            graph,
-            a_id,
-            recv,
-            site.int_null.as_ref(),
-            &site.niche_null_cast,
-        )
-    } else {
-        emit_enum_disc_read(graph, a_id, recv, &site.recv_owner)
-    };
+    // Option receivers switch on their representation
+    // (`emit_option_recv_tag`). Result combinators fall through to
+    // `__discriminant`.
+    let disc = emit_option_recv_tag(graph, a_id, recv, site);
     if then_is_tag1 {
         graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
     } else {
@@ -70524,17 +70535,9 @@ fn rewire_option_filter_diamond(
     let (none_bb, none_inputs) = graph.create_block_with_arg_vars(none_sources.len());
 
     // A niche result is the pointer or null. An aggregate `None` would make
-    // the caller's null test read a live object.
-    let none = if site.result_niche {
-        emit_niche_null(
-            graph,
-            none_bb,
-            site.int_null.as_ref(),
-            &site.niche_null_cast,
-        )
-    } else {
-        emit_option_variant(graph, none_bb, &site.result_owner, 0, None)
-    };
+    // the caller's null test read a live object. A scalar niche is the
+    // integer 0 (`rint.py` `IntegerRepr.rtype_bool`).
+    let none = emit_option_result_none(graph, none_bb, site);
     let none_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -70548,19 +70551,9 @@ fn rewire_option_filter_diamond(
     let recv_in = map_source(&some_sources, &some_inputs, &recv)
         .ok_or_else(|| format!("{name}: filter receiver not threaded"))?;
     let env_in = disc_callable_env(site, &some_sources, &some_inputs, env.as_ref(), name)?;
-    // Niche `Some` stores the pointer in the option word. `__pos_0` would
-    // load a field of that object.
-    let payload = if site.recv_niche {
-        recv_in
-    } else {
-        emit_payload_read(
-            graph,
-            some_bb,
-            recv_in,
-            &site.recv_tag1_owner,
-            site.payload1_ty.clone(),
-        )
-    };
+    // Niche `Some` is the option word itself. `__pos_0` would load a field
+    // of that object (pointer) or of an integer (scalar).
+    let payload = option_recv_payload(graph, some_bb, recv_in, site);
     let pred = emit_disc_callable(
         graph,
         some_bb,
@@ -70582,7 +70575,7 @@ fn rewire_option_filter_diamond(
         .cloned()
         .ok_or_else(|| format!("{name}: filter keep arm missing payload"))?;
     let keep_payload = emit_narrow(graph, keep_bb, keep_payload, &site.result_payload1_class);
-    let some = if site.result_niche {
+    let some = if site.result_niche || site.result_scalar_niche {
         keep_payload
     } else {
         emit_option_variant(
@@ -70597,16 +70590,7 @@ fn rewire_option_filter_diamond(
             )),
         )
     };
-    let drop_none = if site.result_niche {
-        emit_niche_null(
-            graph,
-            drop_bb,
-            site.int_null.as_ref(),
-            &site.niche_null_cast,
-        )
-    } else {
-        emit_option_variant(graph, drop_bb, &site.result_owner, 0, None)
-    };
+    let drop_none = emit_option_result_none(graph, drop_bb, site);
 
     let mut keep_exit = Vec::new();
     let mut drop_exit = Vec::new();
@@ -70649,19 +70633,7 @@ fn rewire_option_filter_diamond(
     for _ in ci..=remove_upto {
         graph.blocks[a].operations.remove(ci);
     }
-    // Niche tag is `ptr` is not null (`Some` = 1). A `__discriminant`
-    // field read loads the object header.
-    let disc = if site.recv_niche {
-        emit_niche_some_tag(
-            graph,
-            a_id,
-            recv,
-            site.int_null.as_ref(),
-            &site.niche_null_cast,
-        )
-    } else {
-        emit_enum_disc_read(graph, a_id, recv, &site.recv_owner)
-    };
+    let disc = emit_option_recv_tag(graph, a_id, recv, site);
     graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, none_sources);
     Ok(())
 }
@@ -70732,19 +70704,7 @@ fn build_disc_arm(
         (DiscCombinator::OptionOkOr, true) | (DiscCombinator::OptionOkOrElse, true) => {
             let recv = map_source(sources, inputs, recv)
                 .ok_or_else(|| format!("{name}: ok_or receiver not threaded"))?;
-            // Niche `Some` stores the pointer in the option word. `__pos_0`
-            // would load a field of that object.
-            let payload = if site.recv_niche && site.kind == DiscCombinator::OptionOkOrElse {
-                recv
-            } else {
-                emit_payload_read(
-                    graph,
-                    block,
-                    recv,
-                    &site.recv_tag1_owner,
-                    site.payload1_ty.clone(),
-                )
-            };
+            let payload = option_recv_payload(graph, block, recv, site);
             let payload = emit_narrow(graph, block, payload, &site.payload1_class);
             Ok(emit_sum_variant(
                 graph,
@@ -71459,6 +71419,87 @@ fn drop_rebuilt_receiver_shell(
         vec![Link::new_mixed(e_exit_args, arm.raise.target, None)],
     );
     Ok(())
+}
+
+/// Option receiver tag by the Option's own representation, shared by
+/// `ok_or`, `ok_or_else`, and `filter`.
+///
+/// Pointer niche: `rnone.py` `rtype_is_None` / `CanBeNull.rtype_bool`
+/// (`ptr_nonzero`) via [`FunctionGraph::push_niche_is_some`]. Scalar
+/// niche: `rint.py` `IntegerRepr.rtype_bool` (`int_is_true`) as `ne`
+/// against 0. Aggregate: `__discriminant`.
+fn emit_option_recv_tag(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    site: &DiscCombinatorSite,
+) -> Variable {
+    if site.recv_niche {
+        emit_niche_some_tag(
+            graph,
+            block,
+            recv,
+            site.int_null.as_ref(),
+            &site.niche_null_cast,
+        )
+    } else if site.scalar_niche {
+        let disc = graph.alloc_value_var();
+        let zero = graph.alloc_value_var();
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: nonzero_option_zero(&site.recv_owner),
+        });
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: recv,
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        });
+        disc
+    } else {
+        emit_enum_disc_read(graph, block, recv, &site.recv_owner)
+    }
+}
+
+/// Niche payload is the option word. Aggregate `Some` is `__pos_0`.
+fn option_recv_payload(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    site: &DiscCombinatorSite,
+) -> Variable {
+    if site.recv_niche || site.scalar_niche {
+        recv
+    } else {
+        emit_payload_read(
+            graph,
+            block,
+            recv,
+            &site.recv_tag1_owner,
+            site.payload1_ty.clone(),
+        )
+    }
+}
+
+/// `None` of the combinator's result Option, by that Option's representation.
+fn emit_option_result_none(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    site: &DiscCombinatorSite,
+) -> Variable {
+    use crate::front::bool_then::emit_option_variant;
+    if site.result_niche {
+        emit_niche_null(graph, block, site.int_null.as_ref(), &site.niche_null_cast)
+    } else if site.result_scalar_niche {
+        graph
+            .push_op_var(block, nonzero_option_zero(&site.result_owner), true)
+            .expect("scalar None produces a value")
+    } else {
+        emit_option_variant(graph, block, &site.result_owner, 0, None)
+    }
 }
 
 /// `Some` tag of a niche `Option`: `eq(is_(ptr, null), false)`.
@@ -78791,7 +78832,9 @@ mod tests {
             call_result_class: None,
             carrier_recv: false,
             recv_niche: false,
+            scalar_niche: false,
             result_niche: false,
+            result_scalar_niche: false,
             niche_null_cast: None,
             int_null: None,
         };
@@ -106112,7 +106155,9 @@ mod tests {
             call_result_class: None,
             carrier_recv: false,
             recv_niche: false,
+            scalar_niche: false,
             result_niche: false,
+            result_scalar_niche: false,
             niche_null_cast: None,
             int_null: None,
         }
@@ -106362,6 +106407,147 @@ mod tests {
             "niche ok_or_else read Option Some.__pos_0"
         );
         assert!(saw_is, "niche ok_or_else did not null-test the pointer");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum OptionRecvRepr {
+        PointerNiche,
+        ScalarNiche,
+        Aggregate,
+    }
+
+    fn option_ok_or_family_site(
+        kind: super::DiscCombinator,
+        result_var: Variable,
+    ) -> super::DiscCombinatorSite {
+        let mut site = option_disc_site(kind, result_var);
+        site.result_owner = "core::result::Result".into();
+        site.result_tag0_owner = "core::result::Result::Ok".into();
+        site.result_tag1_owner = "core::result::Result::Err".into();
+        site.result_payload0_ty = ValueType::Ref(None);
+        site.result_payload1_ty = ValueType::Ref(None);
+        if kind == super::DiscCombinator::OptionOkOrElse {
+            site.call_result_ty = ValueType::Ref(None);
+        }
+        site
+    }
+
+    /// Pointer niche rtypes `is_` to `ptr_nonzero` (`rnone.py`
+    /// `rtype_is_None` / `CanBeNull.rtype_bool`). Scalar niche rtypes
+    /// `ne` 0 to `int_is_true` (`rint.py` `IntegerRepr.rtype_bool`).
+    /// Aggregate keeps `__discriminant` and `Some.__pos_0`.
+    fn assert_option_recv_repr(graph: &FunctionGraph, repr: OptionRecvRepr, method: &str) {
+        let mut saw_disc = false;
+        let mut saw_pos0_on_option = false;
+        let mut saw_is = false;
+        let mut saw_ne = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                        saw_disc = true;
+                    }
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "__pos_0"
+                            && field.owner_root.as_deref()
+                                == Some("core::option::Option::Some") =>
+                    {
+                        saw_pos0_on_option = true;
+                    }
+                    OpKind::BinOp { op, .. } if op == "is_" => saw_is = true,
+                    OpKind::BinOp { op, .. } if op == "ne" => saw_ne = true,
+                    _ => {}
+                }
+            }
+        }
+        match repr {
+            OptionRecvRepr::PointerNiche => {
+                assert!(!saw_disc, "{method} pointer niche read __discriminant");
+                assert!(
+                    !saw_pos0_on_option,
+                    "{method} pointer niche read Option Some.__pos_0"
+                );
+                assert!(
+                    saw_is,
+                    "{method} pointer niche missing rnone.py rtype_is_None null test"
+                );
+            }
+            OptionRecvRepr::ScalarNiche => {
+                assert!(!saw_disc, "{method} scalar niche read __discriminant");
+                assert!(
+                    !saw_pos0_on_option,
+                    "{method} scalar niche read Option Some.__pos_0"
+                );
+                assert!(
+                    saw_ne,
+                    "{method} scalar niche missing rint.py IntegerRepr.rtype_bool test"
+                );
+            }
+            OptionRecvRepr::Aggregate => {
+                assert!(
+                    saw_disc,
+                    "{method} aggregate Option missing __discriminant read"
+                );
+                assert!(
+                    saw_pos0_on_option,
+                    "{method} aggregate Option missing Some.__pos_0 read"
+                );
+            }
+        }
+    }
+
+    fn check_option_ok_or_family_repr(
+        kind: super::DiscCombinator,
+        method: &str,
+        repr: OptionRecvRepr,
+    ) {
+        let (mut graph, result) = build_two_arg_combinator(method);
+        let mut site = option_ok_or_family_site(kind, result);
+        match repr {
+            OptionRecvRepr::PointerNiche => {
+                site.recv_niche = true;
+                site.niche_null_cast = Some(("pyobject::PyObject".into(), ValueType::Ref(None)));
+            }
+            OptionRecvRepr::ScalarNiche => {
+                site.scalar_niche = true;
+                site.recv_owner = "core::option::Option<NonZeroUsize>".into();
+                site.payload1_ty = ValueType::Unsigned;
+            }
+            OptionRecvRepr::Aggregate => {}
+        }
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1, "{method} {repr:?} must rewrite");
+        assert_eq!(
+            count_method_calls(&graph, method),
+            0,
+            "{method} {repr:?} left a residual call"
+        );
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+        assert_option_recv_repr(&graph, repr, method);
+    }
+
+    /// Six shapes: `ok_or` / `ok_or_else` × pointer niche / scalar niche /
+    /// aggregate Option.
+    #[test]
+    fn option_ok_or_family_repr_switch() {
+        let kinds = [
+            (super::DiscCombinator::OptionOkOr, "ok_or"),
+            (super::DiscCombinator::OptionOkOrElse, "ok_or_else"),
+        ];
+        let reprs = [
+            OptionRecvRepr::PointerNiche,
+            OptionRecvRepr::ScalarNiche,
+            OptionRecvRepr::Aggregate,
+        ];
+        for (kind, method) in kinds {
+            for repr in reprs {
+                check_option_ok_or_family_repr(kind, method, repr);
+            }
+        }
     }
 
     #[test]

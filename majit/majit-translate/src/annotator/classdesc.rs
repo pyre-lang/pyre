@@ -458,6 +458,30 @@ pub(crate) fn dyn_fat_field_annotation() -> SomeValue {
     SomeValue::Tuple(SomeTuple::new(items))
 }
 
+/// Data-word item of [`dyn_fat_field_annotation`]: a two-item tuple of
+/// a classdef-less instance and an integer, in `fat_ptr_layout` order.
+/// `rclass.py` `ll_cast_to_object` / `cast_instance` take that instance;
+/// the vtable lives in class `typeptr`.
+pub(crate) fn dyn_fat_tuple_data_item(value: &SomeValue) -> Option<&SomeValue> {
+    let SomeValue::Tuple(tuple) = value else {
+        return None;
+    };
+    if tuple.items.len() != 2 {
+        return None;
+    }
+    let layout = crate::fat_ptr_layout::probe();
+    let data = &tuple.items[layout.word_index(false) as usize];
+    let meta = &tuple.items[layout.word_index(true) as usize];
+    match data {
+        SomeValue::Instance(inst) if inst.classdef.is_none() => {}
+        _ => return None,
+    }
+    if !matches!(meta, SomeValue::Integer(_)) {
+        return None;
+    }
+    Some(data)
+}
+
 /// Charon lays a fieldless-enum value out as `u8`/`u32` while every
 /// value site colours it `ValueType::Int` (`tyref_is_fieldless_enum_free`).
 /// `scalar_value_type` maps an unsigned integer to `Unsigned`, so the
@@ -3687,6 +3711,22 @@ mod tests {
             }
             other => panic!("expected Tuple FORCE for &dyn imp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dyn_fat_tuple_data_item_is_the_classdef_less_instance() {
+        let fat = dyn_fat_field_annotation();
+        let data = dyn_fat_tuple_data_item(&fat).expect("dyn-fat tuple has a data word");
+        match data {
+            SomeValue::Instance(inst) => assert!(inst.classdef.is_none()),
+            other => panic!("data word must be classdef-less Instance, got {other:?}"),
+        }
+        assert!(dyn_fat_tuple_data_item(&crate::annotator::model::s_int()).is_none());
+        let not_fat = SomeValue::Tuple(SomeTuple::new(vec![
+            crate::annotator::model::s_int(),
+            crate::annotator::model::s_int(),
+        ]));
+        assert!(dyn_fat_tuple_data_item(&not_fat).is_none());
     }
 
     #[test]

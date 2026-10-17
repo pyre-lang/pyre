@@ -15,6 +15,19 @@ pub struct FatPtrLayout {
     pub len_offset: usize,
 }
 
+impl FatPtrLayout {
+    /// Index of the metadata (`true`) or data (`false`) word in the
+    /// two-word fat value `two_word_fat_struct` / `dyn_fat_field_annotation`
+    /// spell as a tuple. `rtuple.py` `rtype_getitem` uses this index.
+    pub fn word_index(self, metadata: bool) -> i64 {
+        let len_first = self.len_offset < self.data_offset;
+        match (metadata, len_first) {
+            (true, true) | (false, false) => 0,
+            (true, false) | (false, true) => 1,
+        }
+    }
+}
+
 pub fn probe() -> FatPtrLayout {
     static CELL: OnceLock<FatPtrLayout> = OnceLock::new();
     *CELL.get_or_init(|| layout_for_word(crate::layout::target_word_size()))
@@ -231,5 +244,9 @@ mod tests {
             (0, 4),
             "a wasm32 target places the data pointer then the length"
         );
+        assert_eq!(wide.word_index(false), 0, "data word is item 0");
+        assert_eq!(wide.word_index(true), 1, "metadata word is item 1");
+        assert_eq!(wasm.word_index(false), 0);
+        assert_eq!(wasm.word_index(true), 1);
     }
 }

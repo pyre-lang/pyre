@@ -5437,12 +5437,7 @@ fn field_spelling_is_dyn_fat(
 /// Index of the metadata (`true`) or data (`false`) word in
 /// `two_word_fat_struct` / `dyn_fat_field_annotation`.
 fn fat_dyn_word_index(metadata: bool) -> i64 {
-    let layout = crate::fat_ptr_layout::probe();
-    let len_first = layout.len_offset < layout.data_offset;
-    match (metadata, len_first) {
-        (true, true) | (false, false) => 0,
-        (true, false) | (false, true) => 1,
-    }
+    crate::fat_ptr_layout::probe().word_index(metadata)
 }
 
 fn getattr_then_getitem(

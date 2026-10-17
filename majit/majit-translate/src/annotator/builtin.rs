@@ -1997,6 +1997,20 @@ fn cast_instance_intrinsic(
     // pointer is itself nullable.  Same rule as `operand_can_be_none` above,
     // spelled out here because this arm also has to classify the operand
     // variant it does not recognise.
+    //
+    // A residual fat `&dyn` / `Box<dyn>` is `dyn_fat_field_annotation`
+    // SomeTuple. `rclass.py` `ll_cast_to_object` / `cast_instance` take
+    // the instance; the vtable is class `typeptr`. Project the data
+    // word (`rtuple.py` `rtype_getitem`) for an instance dest. A tuple
+    // dest already passed through above.
+    let operand_storage;
+    let operand = match crate::annotator::classdesc::dyn_fat_tuple_data_item(operand) {
+        Some(data) => {
+            operand_storage = data.clone();
+            &operand_storage
+        }
+        None => operand,
+    };
     let can_be_none = match operand {
         SomeValue::Instance(_) | SomeValue::None_(_) => operand_can_be_none,
         SomeValue::Ptr(_) | SomeValue::Address(_) => false,
@@ -3881,6 +3895,52 @@ mod tests {
         )
         .expect("a SomeTuple operand passes through");
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_dyn_fat_tuple_operand_uses_data_word() {
+        // Residual `&dyn Trait` / `Box<dyn Trait>` is
+        // `dyn_fat_field_annotation` SomeTuple. The cast dest is a
+        // classdef instance (`rclass.py` `ll_cast_to_object` /
+        // `cast_instance`); the data word is that instance.
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let owner = "castdyn::Strategy";
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "Strategy".to_string(),
+            "castdyn".to_string(),
+        )]));
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            owner.to_string(),
+            vec![("tag".to_string(), "u8".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root(owner)
+            .expect("Strategy classdef");
+        let s_fat = crate::annotator::classdesc::dyn_fat_field_annotation();
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str(owner))
+            .expect("instance root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_fat), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("dyn-fat tuple operand must cast through the data word");
+        let SomeValue::Instance(inst) = out else {
+            panic!("instance root must project dest as SomeInstance, got {out:?}");
+        };
+        assert!(
+            inst.classdef
+                .as_ref()
+                .is_some_and(|got| Rc::ptr_eq(got, &classdef)),
+            "cast dest must be the family classdef"
+        );
     }
 
     #[test]

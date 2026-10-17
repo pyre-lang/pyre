@@ -5701,8 +5701,10 @@ pub fn type_name_of(w_obj: PyObjectRef) -> String {
 /// `space.type(value).name` only from `OperationError.get_w_value`. pyre
 /// cannot mint that class (`get_operrcls2` already admits this), so the
 /// same payload sits on `PyErrorObject` (`w_fmt_x0`, the format-string
-/// constant) next to `w_name_context` / `w_obj_context`. The look-inside
-/// ctor is [`make_pyerror_deferred_t`], split from [`make_pyerror`] the way
+/// constant) next to `w_name_context` / `w_obj_context`. That carrier holds
+/// one object operand; `_properror`'s `"property %R of '%s' object has no %s"`
+/// has no extra slots and stays on the eager walk. The look-inside ctor is
+/// [`make_pyerror_deferred_t`], split from [`make_pyerror`] the way
 /// `w_list_make_empty` is split from `w_list_new`. `%T` has no user-visible
 /// side effect, so a swallowed TypeError never loads the type name.
 ///
@@ -6464,6 +6466,37 @@ mod tests {
         );
         assert_eq!(err.kind, PyErrorKind::TypeError);
         drop(err);
+    }
+
+    #[test]
+    fn oefmt_property_r_and_s_format_is_eager() {
+        // `PyErrorObject.w_fmt_x0` is `OpErrFmt.x0` for a single `%T`.
+        // `_properror`'s `"property %R of '%s' object has no %s"` needs a
+        // carrier extension to defer; until then `_compute_value` runs here.
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+        let w_name = pyre_object::w_str_new_managed("foo");
+        let w_type = crate::builtins::lookup_exc_class("AttributeError").expect("AttributeError");
+        let err = super::oefmt(
+            w_type,
+            "property %R of '%s' object has no %s",
+            &[
+                super::FmtArg::Obj(w_name),
+                super::FmtArg::Text("C"),
+                super::FmtArg::Text("setter"),
+            ],
+        );
+        assert!(
+            !err.message.is_null(),
+            "mixed %R+%s cannot ride the single-%T deferred carrier"
+        );
+        assert_eq!(err.fmt_valuefmt_len, 0);
+        assert_eq!(
+            err.message_wtf8().as_str(),
+            Ok("property 'foo' of 'C' object has no setter")
+        );
+        assert_eq!(err.kind, PyErrorKind::AttributeError);
     }
 
     #[test]

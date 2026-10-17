@@ -14387,7 +14387,7 @@ pub(crate) unsafe fn get(
         }
         let fget = w_property_get_fget(descr);
         if fget.is_null() || is_none(fget) {
-            return Err(property_no_accessor(descr, obj, "getter")?);
+            return Err(property_no_accessor(descr, obj, "getter"));
         }
         // W_Property.get → `space.call_function(self.fget, w_obj)`: the
         // getter's exception propagates rather than being swallowed.  A null
@@ -14528,7 +14528,7 @@ unsafe fn set(
     if is_exact_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {
-            return Err(property_no_accessor(descr, obj, "setter")?);
+            return Err(property_no_accessor(descr, obj, "setter"));
         }
         // descriptor.py W_Property.set → `space.call_function(self.fset,
         // w_obj, w_value)`: the setter's exception propagates rather than
@@ -14619,7 +14619,7 @@ unsafe fn delete(mut descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::
     if is_exact_property(descr) {
         let fdel = w_property_get_fdel(descr);
         if fdel.is_null() || is_none(fdel) {
-            return Err(property_no_accessor(descr, obj, "deleter")?);
+            return Err(property_no_accessor(descr, obj, "deleter"));
         }
         crate::call::call_function_impl_result(fdel, &[obj])?;
         return Ok(());
@@ -22369,71 +22369,74 @@ unsafe fn property_copy(
 }
 
 /// `descriptor.py W_Property._properror` — AttributeError naming
-/// the missing accessor and, when known, the property's `__name__`.
-unsafe fn property_no_accessor(
-    prop: PyObjectRef,
-    obj: PyObjectRef,
-    kind: &str,
-) -> Result<crate::PyError, crate::PyError> {
-    // `W_Property._properror` reads `type(w_obj).__qualname__`, then `self`.
-    // The qualname lookup can run Python; reload both afterwards
-    // (`get_livevars_for_roots`).
-    let w_type_ptr =
-        crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |w_type| w_type.as_ptr());
+/// the missing accessor and, when known, the property's stored `w_name`.
+unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) -> crate::PyError {
+    // `W_Property._properror`:
+    //   qualname = space.type(w_obj).qualname
+    //   if self.w_name is not None:
+    //       raise oefmt(space.w_AttributeError,
+    //           "property %R of '%s' object has no %s",
+    //           self.w_name, qualname, kind)
+    //   else:
+    //       raise oefmt(space.w_AttributeError,
+    //           "property of '%s' object has no %s",
+    //           qualname, kind)
+    //
+    // `qualname` is `W_TypeObject.qualname` (`getqualname`), not an
+    // application `getattr` of `__qualname__`. The message is WTF-8
+    // (`PyErrorObject.message` is an rstr of those bytes); `%s` copies
+    // the field without `space.str`. `w_name` alone chooses the named
+    // format — `fget.__name__` is `property.__name__`'s getter, not this
+    // path. `%R` is eager: `OpErrFmt` on `PyErrorObject` stores one `%T`
+    // (`w_fmt_x0`); a mixed `%R`+`%s` payload has no extra slots, so
+    // `_compute_value` runs here, including `'<repr raised>'` +
+    // `write_unraisable` when `space.repr` fails.
+    let w_type = crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |w_type| w_type.as_ptr());
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[prop, w_type_ptr]);
-    let qualname = if w_type_ptr.is_null() {
-        unsafe { (*(*obj).ob_type).name.to_string() }
+    let base = pyre_object::gc_roots::pin_roots(&[prop, w_type, obj]);
+    let mut qualname = Wtf8Buf::new();
+    let w_type = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if w_type.is_null() {
+        let obj = pyre_object::gc_roots::shadow_stack_get(base + 2);
+        qualname.push_str((*(*obj).ob_type).name);
     } else {
-        match getattr_str(
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-            "__qualname__",
-        ) {
-            // `descriptor.py W_Property._properror` interpolates
-            // `space.type(w_obj).qualname` with oefmt `%s`; the value is
-            // already a str, so the raise path does not call `space.str`.
-            // A lone surrogate is ordinary Python, and this message is only
-            // ever displayed, so escape what has no `&str` form rather than
-            // aborting. The escape is visible where the raw surrogate would
-            // be shown — `PyError::message` is a `String`, so the exact
-            // spelling waits on that field becoming WTF-8.
-            Ok(q) if !q.is_null() && is_str(q) => crate::display::wtf8_display_string(
-                pyre_object::w_str_get_wtf8(q).to_wtf8_buf(),
-                "<unprintable>",
-            ),
-            _ => pyre_object::w_type_get_name(pyre_object::gc_roots::shadow_stack_get(base + 1))
-                .to_string(),
-        }
-    };
-    // An explicitly assigned/set_name value wins; otherwise fall back to
-    // `fget.__name__`. The name stays on the property object.
-    let prop = pyre_object::gc_roots::shadow_stack_get(base);
-    let mut w_name = pyre_object::descriptor::w_property_get_name(prop);
-    if w_name.is_null() {
-        let fget = w_property_get_fget(prop);
-        if !fget.is_null() && !is_none(fget) {
-            let w_name_slot = _roots.pin_roots(&[w_name]);
-            match getattr_str(fget, "__name__") {
-                Ok(name) => w_name = name,
-                Err(err) if err.kind == PyErrorKind::AttributeError => {
-                    w_name = _roots.get(w_name_slot);
-                }
-                Err(err) => return Err(err),
-            }
+        // `w_qualname` is the WTF-8 spelling of the same field: a lone
+        // surrogate assigned onto the type lives there, while the `&str`
+        // `qualname` slot cannot hold it. Read the object when present;
+        // otherwise the `qualname` field. Never `getattr_str`.
+        let w_qn = pyre_object::w_type_get_qualname_obj(w_type);
+        if !w_qn.is_null() && is_str(w_qn) {
+            qualname.push_wtf8(pyre_object::w_str_get_wtf8(w_qn));
+        } else {
+            qualname.push_str(pyre_object::w_type_get_qualname(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ));
         }
     }
-    let msg = if !w_name.is_null() {
-        let name_repr = crate::display::py_repr_wtf8(w_name)
-            .unwrap_or_else(|_| Wtf8Buf::from_string("<name>".to_string()));
-        crate::display::wtf8_format!(
-            "property ",
-            name_repr,
-            format!(" of '{qualname}' object has no {kind}")
+    let prop = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_name = pyre_object::descriptor::w_property_get_name(prop);
+    let w_attr =
+        crate::builtins::lookup_exc_class("AttributeError").unwrap_or(pyre_object::PY_NULL);
+    if !w_name.is_null() {
+        crate::error::oefmt(
+            w_attr,
+            "property %R of '%s' object has no %s",
+            &[
+                crate::error::FmtArg::Obj(w_name),
+                crate::error::FmtArg::Bytes(qualname.as_bytes()),
+                crate::error::FmtArg::Text(kind),
+            ],
         )
     } else {
-        Wtf8Buf::from_string(format!("property of '{qualname}' object has no {kind}"))
-    };
-    Ok(crate::PyError::attribute_error(msg))
+        crate::error::oefmt(
+            w_attr,
+            "property of '%s' object has no %s",
+            &[
+                crate::error::FmtArg::Bytes(qualname.as_bytes()),
+                crate::error::FmtArg::Text(kind),
+            ],
+        )
+    }
 }
 
 pub(crate) fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
@@ -22493,7 +22496,7 @@ pub(crate) fn property_descr_get_impl(args: &[PyObjectRef]) -> PyResult {
         }
         let fget = w_property_get_fget(prop);
         if fget.is_null() || is_none(fget) {
-            return Err(property_no_accessor(prop, obj, "getter")?);
+            return Err(property_no_accessor(prop, obj, "getter"));
         }
         crate::call::call_function_impl_result(fget, &[obj])
     }
@@ -22507,7 +22510,7 @@ pub(crate) fn property_descr_set_impl(args: &[PyObjectRef]) -> PyResult {
         let value = args[2];
         let fset = w_property_get_fset(prop);
         if fset.is_null() || is_none(fset) {
-            return Err(property_no_accessor(prop, obj, "setter")?);
+            return Err(property_no_accessor(prop, obj, "setter"));
         }
         crate::call::call_function_impl_result(fset, &[obj, value])?;
         Ok(pyre_object::w_none())
@@ -22523,7 +22526,7 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
         })?;
         let fdel = w_property_get_fdel(prop);
         if fdel.is_null() || is_none(fdel) {
-            return Err(property_no_accessor(prop, obj, "deleter")?);
+            return Err(property_no_accessor(prop, obj, "deleter"));
         }
         crate::call::call_function_impl_result(fdel, &[obj])?;
         Ok(pyre_object::w_none())
@@ -26666,6 +26669,91 @@ mod tests {
         assert_eq!(unsafe { pyre_object::w_list_len(stored) }, 1);
         let inner = unsafe { pyre_object::w_list_getitem(stored, 0) }.expect("returned list[0]");
         assert_eq!(unsafe { w_int_get_value(inner) }, 7);
+    }
+
+    /// `descriptor.py W_Property._properror`: named vs unnamed messages
+    /// follow `self.w_name` only, and the class name is the type object's
+    /// `qualname` field (WTF-8, not a display escape).
+    #[test]
+    fn property_no_accessor_follows_properror() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let ns = crate::builtins::new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = roots.pin_roots(&[ns]);
+
+        let obj = pyre_object::w_list_new(vec![]);
+        let obj_slot = roots.pin_roots(&[obj]);
+        let prop = pyre_object::w_property_new(
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        );
+        let prop_slot = roots.pin_roots(&[prop]);
+
+        let unnamed =
+            unsafe { property_no_accessor(roots.get(prop_slot), roots.get(obj_slot), "deleter") };
+        assert_eq!(
+            unnamed.message_wtf8().as_str(),
+            Ok("property of 'list' object has no deleter")
+        );
+
+        let fget = unsafe { pyre_object::w_dict_getitem_str(roots.get(ns_slot), "len") }
+            .expect("len builtin");
+        let fget_slot = roots.pin_roots(&[fget]);
+        let with_fget = pyre_object::w_property_new(
+            roots.get(fget_slot),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        );
+        let with_fget_slot = roots.pin_roots(&[with_fget]);
+        let still_unnamed = unsafe {
+            property_no_accessor(roots.get(with_fget_slot), roots.get(obj_slot), "deleter")
+        };
+        assert_eq!(
+            still_unnamed.message_wtf8().as_str(),
+            Ok("property of 'list' object has no deleter"),
+            "w_name is unset: fget.__name__ is not a _properror fallback"
+        );
+
+        let name = pyre_object::w_str_new_managed("foo");
+        let name_slot = roots.pin_roots(&[name]);
+        unsafe {
+            pyre_object::descriptor::w_property_set_name(
+                roots.get(prop_slot),
+                roots.get(name_slot),
+            );
+        }
+        let named =
+            unsafe { property_no_accessor(roots.get(prop_slot), roots.get(obj_slot), "setter") };
+        assert_eq!(
+            named.message_wtf8().as_str(),
+            Ok("property 'foo' of 'list' object has no setter")
+        );
+
+        let w_cls = pyre_object::w_type_new("SurProp", pyre_object::PY_NULL, std::ptr::null_mut());
+        let cls_slot = roots.pin_roots(&[w_cls]);
+        let mut qn = Wtf8Buf::new();
+        qn.push(rustpython_wtf8::CodePoint::from_char('Q'));
+        qn.push(rustpython_wtf8::CodePoint::from_u32(0xd800).unwrap());
+        qn.push(rustpython_wtf8::CodePoint::from_char('n'));
+        let w_qn = pyre_object::w_str_from_wtf8(qn);
+        let qn_slot = roots.pin_roots(&[w_qn]);
+        unsafe {
+            pyre_object::w_type_set_qualname(roots.get(cls_slot), roots.get(qn_slot));
+        }
+        let inst = pyre_object::w_instance_new(roots.get(cls_slot));
+        let inst_slot = roots.pin_roots(&[inst]);
+        let surrogate =
+            unsafe { property_no_accessor(roots.get(prop_slot), roots.get(inst_slot), "getter") };
+        let mut expected = Wtf8Buf::from_string("property 'foo' of '".to_string());
+        expected.push(rustpython_wtf8::CodePoint::from_char('Q'));
+        expected.push(rustpython_wtf8::CodePoint::from_u32(0xd800).unwrap());
+        expected.push(rustpython_wtf8::CodePoint::from_char('n'));
+        expected.push_str("' object has no getter");
+        assert_eq!(surrogate.message_wtf8(), expected);
     }
 }
 

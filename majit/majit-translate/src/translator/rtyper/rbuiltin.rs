@@ -4718,6 +4718,7 @@ pub fn rtype_cast_instance_intrinsic(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
+    use crate::translator::rtyper::rtuple::TupleRepr;
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let r_result =
@@ -4730,6 +4731,36 @@ pub fn rtype_cast_instance_intrinsic(
     // `args_v[0]` index, matching the other typers in this module.
     let r_arg0 = arg_repr(hop, 0)?;
     let v_ptr = hop.inputarg(&r_arg0, 0)?;
+    // Residual fat `&dyn` / `Box<dyn>`: the hop operand is the two-word
+    // tuple (`dyn_fat_field_annotation`). `rclass.py` `ll_cast_to_object`
+    // / `cast_instance` take the instance; `TupleRepr.getitem`
+    // (`rtuple.py`) projects that data word. The residual Call's fat
+    // argument stays whole (`front::dyn_fat`).
+    let s0 = hop.args_s.borrow().first().cloned();
+    let (r_arg0, v_ptr) = if s0
+        .as_ref()
+        .is_some_and(|s| crate::annotator::classdesc::dyn_fat_tuple_data_item(s).is_some())
+    {
+        let any_r: &dyn std::any::Any = r_arg0.as_ref();
+        let r_tup = any_r.downcast_ref::<TupleRepr>().ok_or_else(|| {
+            TyperError::message(
+                "rtype_cast_instance_intrinsic: dyn-fat tuple operand is not TupleRepr",
+            )
+        })?;
+        let index = crate::fat_ptr_layout::probe().word_index(false) as usize;
+        let r_item = r_tup.external_items_r.get(index).cloned().ok_or_else(|| {
+            TyperError::message(format!(
+                "rtype_cast_instance_intrinsic: dyn-fat data index {index} out of range"
+            ))
+        })?;
+        let v_data = {
+            let mut llops = hop.llops.borrow_mut();
+            r_tup.getitem(&mut llops, v_ptr, index)?
+        };
+        (r_item, v_data)
+    } else {
+        (r_arg0, v_ptr)
+    };
     hop.exception_cannot_occur()?;
     if r_arg0.lowleveltype() == &result_lltype {
         return Ok(Some(v_ptr));

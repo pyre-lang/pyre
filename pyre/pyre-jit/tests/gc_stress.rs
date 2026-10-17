@@ -3241,16 +3241,18 @@ assert p.__isabstractmethod__ is True
     );
 }
 
-/// `W_Property._properror` reads `type(w_obj).__qualname__`, then the
-/// property's name. The qualname lookup can collect.
+/// `W_Property._properror` raises through `oefmt` `%R` of `self.w_name`.
+/// `OpErrFmt._compute_value` runs `space.repr` for that `%R`, which can
+/// collect; a collection must not leave a stale property/type/name pointer
+/// (`MAJIT_GC_NURSERY_POISON`).
 #[test]
-fn property_no_accessor_reloads_after_qualname() {
+fn property_no_accessor_reloads_after_name_repr() {
     const CHILD: &str = "PYRE_PROPERTY_NO_ACCESSOR_GC_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "property_no_accessor_reloads_after_qualname",
+                "property_no_accessor_reloads_after_name_repr",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -3262,7 +3264,7 @@ fn property_no_accessor_reloads_after_qualname() {
             .expect("run isolated property-no-accessor regression");
         assert!(
             output.status.success(),
-            "missing-accessor error read a moved property:\n{}\n{}",
+            "missing-accessor error read a moved name after %R:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -3272,29 +3274,28 @@ fn property_no_accessor_reloads_after_qualname() {
         r#"
 import gc
 
-class Meta(type):
-    def __getattribute__(self, name):
-        if name == "__qualname__":
-            gc.collect()
-            junk = [object() for _ in range(40)]
-            return "QualC"
-        return type.__getattribute__(self, name)
+class NameObj:
+    def __repr__(self):
+        gc.collect()
+        junk = [object() for _ in range(40)]
+        return "BoomName"
 
-class C(metaclass=Meta):
+class C:
     pass
 
 p = property()
+p.__set_name__(C, NameObj())
 try:
     p.__get__(C())
 except AttributeError as e:
     msg = str(e)
-    assert "QualC" in msg, msg
+    assert msg == "property BoomName of 'C' object has no getter", msg
 else:
     raise AssertionError("expected AttributeError")
 "#,
-        "property_no_accessor.py",
-        "property no accessor",
-        "_properror must re-read the property after __qualname__",
+        "property_no_accessor_name_repr.py",
+        "property no accessor name repr",
+        "_properror must re-read the name after OpErrFmt._compute_value %R",
     );
 }
 
