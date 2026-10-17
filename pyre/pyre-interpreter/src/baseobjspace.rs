@@ -5755,7 +5755,7 @@ unsafe fn setitem_bytearray_slice(
     // `_check_exports` is skipped for an equal-length write, so `m[0:2] = b'ZZ'`
     // remains legal while a buffer is exported but `m[0:1] = b'ZZZ'` is not.
     if sequence2.len() as i64 != slicelength {
-        pyre_object::with_roots!(obj => crate::builtins::bytearray_check_exports(obj))?;
+        crate::builtins::bytearray_check_exports(obj)?;
     }
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     let old_size = vec.len();
@@ -25451,11 +25451,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             // `descr_delitem` refuses any deletion (single or slice — every
             // delete shrinks the buffer) while an export is outstanding.
-            // The check collects when an export is live, so the index moves
-            // with the bytearray.
-            pyre_object::with_roots!(obj, index => {
-                crate::builtins::bytearray_check_exports(obj)
-            })?;
+            crate::builtins::bytearray_check_exports(obj)?;
             if is_slice(index) {
                 let (rs, rp, st) = {
                     // Each slice component runs `__index__`; a nursery

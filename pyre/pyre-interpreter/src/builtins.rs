@@ -112,56 +112,17 @@ pub unsafe fn buffer_export_decref(obj: PyObjectRef) {
     }
 }
 
-/// `_check_exports` — reject a size-changing mutation of a bytearray while a
-/// buffer export (a live memoryview) is outstanding.
-///
-/// Returns the live bytearray. A minor moves a nursery object; callers that
-/// mutate after this check have to use the returned address.
-pub(crate) unsafe fn bytearray_check_exports(
-    obj: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
-    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } == 0 {
-        return Ok(obj);
-    }
-    // The collector reads `PyFrame.valuestackdepth` to exclude popped
-    // operand slots.  When this check is reached from assembler that
-    // virtualizable field is still register-resident, so materialize the
-    // current red frame first.  This is the explicit counterpart of
-    // RPython `rvirtualizable.py hook_access_field`: an opaque
-    // consumer which reads a redirected field receives
-    // `force_virtualizable_if_necessary` before the read.
-    crate::executioncontext::force_frame(crate::eval::current_frame());
-    let _roots = pyre_object::gc_roots::push_roots();
-    let slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    // `W_MemoryView` is nursery-born. A dead view's export is released by
-    // `W_MemoryView._finalize_`, which a collection only queues. A traced
-    // caller does not fill the nursery on the way here, so a dead young
-    // view is the common case and the minor runs before the old-gen sweep.
-    // The minor moves `obj`; `slot` is the reload.
-    pyre_object::gc_hook::try_gc_collect(0);
-    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
-    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
-        // A view that survived an earlier minor sits on
-        // `old_objects_with_destructors`. `do_collect_oldgen_nonmoving`
-        // runs those destructors and does not move `obj`.
-        pyre_object::gc_hook::try_gc_collect_oldgen();
-    }
-    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
-    if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
-        // A dead view releases its export in `W_MemoryView._finalize_`,
-        // which the collections above only queue. Drain the queue the way
-        // `gc.collect()` does after its collection.
-        crate::executioncontext::run_finalizers_now();
-    }
-    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+/// `bytearrayobject.py W_BytearrayObject._check_exports` — reject a
+/// size-changing mutation of a bytearray while a buffer export (a live
+/// memoryview) is outstanding.
+pub(crate) unsafe fn bytearray_check_exports(obj: PyObjectRef) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::BufferError,
             "Existing exports of data: object cannot be re-sized",
         ));
     }
-    Ok(obj)
+    Ok(())
 }
 
 /// Wrap native per-dimension extents (a `shape` or `strides`) into a fresh

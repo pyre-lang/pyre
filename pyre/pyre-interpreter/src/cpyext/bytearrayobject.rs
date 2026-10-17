@@ -136,9 +136,9 @@ pub unsafe extern "C" fn PyByteArray_Resize(object: *mut CPyObject, length: isiz
         ));
         return -1;
     }
-    let Some(value) = super::pyerrors::trap(crate::builtins::bytearray_check_exports(value)) else {
+    if super::pyerrors::trap(crate::builtins::bytearray_check_exports(value)).is_none() {
         return -1;
-    };
+    }
     unsafe {
         let old = pyre_object::bytearrayobject::w_bytearray_len(value);
         pyre_object::bytearrayobject::w_bytearray_vec_mut(value).resize(length as usize, 0);

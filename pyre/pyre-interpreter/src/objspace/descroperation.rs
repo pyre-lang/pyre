@@ -2804,11 +2804,9 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
     // Only an actual length change touches the buffer size; an exported buffer
     // blocks it.
-    let ba = if new_size != len {
-        crate::builtins::bytearray_check_exports(ba)?
-    } else {
-        ba
-    };
+    if new_size != len {
+        crate::builtins::bytearray_check_exports(ba)?;
+    }
     if count == 0 {
         pyre_object::bytearrayobject::w_bytearray_vec_mut(ba).clear();
         pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
