@@ -170,11 +170,22 @@ jobs:
     - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       with:
         cache-bin: false
-        shared-key: ${{ runner.arch }}
-        # Restore-only on PRs (they pull main's cache via restore-keys); save
-        # only on main so per-PR target caches don't multiply across refs past
-        # GitHub's 10 GB cache budget and trigger LRU eviction.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        # rust-cache saves the dependency builds alone: it drops the workspace
+        # crates from `target/` before saving. One key per platform used to
+        # serve every job, and whichever job finished first on main saved it.
+        # On Linux and Windows that was this job, whose builds go to the
+        # Charon target rather than `target/` (260 MB and 381 MB: the registry
+        # and git sources, little else), so `cargo test` and `pyre/check.py`
+        # found the key taken and rebuilt every dependency on every run.
+        #
+        # Now each key has one job that saves it. `pyre/check.py` saves the
+        # release dependencies on every platform, and Linux `cargo test` the
+        # debug ones; the 10 GB budget has no room for a debug entry on macOS
+        # and Windows. This job only needs the registry and git sources
+        # Charon compiles against, so it reads the `pyre/check.py` entry and
+        # saves nothing.
+        shared-key: ${{ runner.arch }}-check
+        save-if: false
     - name: Restore Charon binary
       id: charon-cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -390,8 +401,12 @@ jobs:
             echo "${crate//-/_}_rewrote=1" >> "$GITHUB_OUTPUT"
           fi
         done
+    # The five saves below run on main only, like rust-cache and the Charon
+    # target. A PR's entries are readable by that PR alone, and on 2026-10-17
+    # they held 2.2 GB of the 10 GB budget the dependency caches need. On a PR, a crate its commits changed is re-extracted on every
+    # run; every other crate still restores main's entry.
     - name: Save LLBC (majit-rlib)
-      if: steps.llbc-extract.outputs.majit_rlib_rewrote == '1'
+      if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.majit_rlib_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -401,7 +416,7 @@ jobs:
           build/llbc/majit-rlib.*.layouts.ullbc
         key: llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
     - name: Save LLBC (pyre-object)
-      if: steps.llbc-extract.outputs.pyre_object_rewrote == '1'
+      if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.pyre_object_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -411,7 +426,7 @@ jobs:
           build/llbc/pyre-object.*.layouts.ullbc
         key: llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
     - name: Save LLBC (pyre-interpreter)
-      if: steps.llbc-extract.outputs.pyre_interpreter_rewrote == '1'
+      if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.pyre_interpreter_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -421,7 +436,7 @@ jobs:
           build/llbc/pyre-interpreter.*.layouts.ullbc
         key: llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
     - name: Save LLBC (pyre-module)
-      if: steps.llbc-extract.outputs.pyre_module_rewrote == '1'
+      if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.pyre_module_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -431,7 +446,7 @@ jobs:
           build/llbc/pyre-module.*.layouts.ullbc
         key: llbc3-pyre-module-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_module }}
     - name: Save LLBC (pyre-jit)
-      if: steps.llbc-extract.outputs.pyre_jit_rewrote == '1'
+      if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.pyre_jit_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -597,11 +612,14 @@ jobs:
     - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       with:
         cache-bin: false
-        shared-key: ${{ runner.arch }}
+        # The debug dependency builds of this job, on Linux only; macOS and
+        # Windows read the `pyre/check.py` entry for its registry and git
+        # sources. See the prepare job.
+        shared-key: ${{ runner.os == 'Linux' && format('{0}-cargo-test', runner.arch) || format('{0}-check', runner.arch) }}
         # Restore-only on PRs (they pull main's cache via restore-keys); save
         # only on main so per-PR target caches don't multiply across refs past
         # GitHub's 10 GB cache budget and trigger LRU eviction.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        save-if: ${{ github.ref == 'refs/heads/main' && runner.os == 'Linux' }}
     - name: Download Charon artifact
       # Run-scoped handoff from prepare-charon-llbc. Cross-run reuse still
       # comes from the prepare job's cache; consumers avoid cache eviction
@@ -865,11 +883,10 @@ jobs:
     - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       with:
         cache-bin: false
-        shared-key: ${{ runner.arch }}
-        # Restore-only on PRs (they pull main's cache via restore-keys); save
-        # only on main so per-PR target caches don't multiply across refs past
-        # GitHub's 10 GB cache budget and trigger LRU eviction.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        # Reads the release dependency builds the `pyre/check.py` dynasm job
+        # saves, and saves none of its own; see the prepare job.
+        shared-key: ${{ runner.arch }}-check
+        save-if: false
     - name: Download Charon artifact
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
@@ -1011,11 +1028,10 @@ jobs:
       if: ${{ steps.environment.outputs.match != 'false' }}
       with:
         cache-bin: false
-        shared-key: ${{ runner.arch }}
-        # Restore-only on PRs (they pull main's cache via restore-keys); save
-        # only on main so per-PR target caches don't multiply across refs past
-        # GitHub's 10 GB cache budget and trigger LRU eviction.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        # Reads the release dependency builds the `pyre/check.py` dynasm job
+        # saves, and saves none of its own; see the prepare job.
+        shared-key: ${{ runner.arch }}-check
+        save-if: false
     - name: Download Charon artifact
       if: ${{ steps.environment.outputs.match != 'false' }}
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1144,11 +1160,16 @@ jobs:
     - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       with:
         cache-bin: false
-        shared-key: ${{ runner.arch }}
+        # The release dependency builds, see the prepare job. On Linux the
+        # dynasm leg saves them: it builds dynasm, the wasm guest and the wasm
+        # runner. The cranelift leg needs the same release crates plus the
+        # cranelift backend's, so it only reads them. macOS and Windows have
+        # one leg each, and it saves.
+        shared-key: ${{ runner.arch }}-check
         # Restore-only on PRs (they pull main's cache via restore-keys); save
         # only on main so per-PR target caches don't multiply across refs past
         # GitHub's 10 GB cache budget and trigger LRU eviction.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        save-if: ${{ github.ref == 'refs/heads/main' && matrix.backend != 'cranelift' }}
     - name: Download Charon artifact
       # Run-scoped handoff from prepare-charon-llbc. Cross-run reuse still
       # comes from the prepare job's cache; consumers avoid cache eviction
