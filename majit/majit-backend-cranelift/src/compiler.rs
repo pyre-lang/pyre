@@ -5678,8 +5678,10 @@ fn resolve_call_assembler_target(
     // A target reached via do_recursive_call(assembler_call=True) at an
     // inline-frame loop header (opimpl_jit_merge_point pyjitpl.py) is a
     // loop greenkey, not a function-entry trace: it exits via guard-deopt and
-    // exposes no FINISH descr. RPython/x86 never require a target-local finish
-    // exit — _call_assembler_check_descr (x86/assembler.py) compares the
+    // exposes no portal-return FINISH. A segmented loop's only FINISH is
+    // `exit_frame_with_exception_descr_ref` (`_create_segmented_trace_and_blackhole`).
+    // RPython/x86 never require a target-local finish exit —
+    // `_call_assembler_check_descr` (x86/assembler.py) compares the
     // returned jf_descr against the CPU-global done_with_this_frame descr, and
     // the helper path handles the deopt result. When the target DOES expose a
     // finish exit (function-entry traces), keep validating its result type.

@@ -308,21 +308,41 @@ fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize)
 /// callee coordinate instead of collapsing to the caller's CALL boundary.
 ///
 /// The multi-frame snapshot below fires only when the paused-caller chain
-/// covers the full inline depth — one parent per active inlined callee.  A
-/// shorter chain falls through to the single-frame collapse, whose resume
-/// re-executes the entire call, so a guard emitted under it re-runs every side
-/// effect the inline region sequenced before it.  A fold that must not be
-/// re-run consults this before emitting its guards.
+/// covers the full inline depth — one parent per active inlined callee.
+/// `capture_resumedata` (`pyjitpl.py` / `resume.py`) snapshots every
+/// `MIFrame` on `framestack`, so an admitted Python inline records its
+/// caller (`perform_call` / `newframe`) and the chain is complete by
+/// construction.  `walk_generator_resume` is the remaining helper-shaped
+/// path: its body is portal-shaped, and pushing that level as a Python
+/// `InlineFrame` either `compile_tmp_callback`s a second loop
+/// (`cut_inlined_loop_backedge` `CALL_ASSEMBLER`) or walks the eval-loop
+/// `goto`s through to a miscompiled `FOR_ITER` item.  Until that merge
+/// point is `should_unroll_one_iteration` (`interp_jit.py`), this path
+/// keeps the empty-parents collapse.  A shorter chain falls through to
+/// the single-frame collapse, whose resume re-executes the entire call.
 pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
+    if !ctx.fbw_mode.inline_subwalk {
+        return false;
+    }
     let session = ctx.session.borrow();
     let n_parents = session
         .framestack
         .iter()
         .filter(|frame| !frame.parents.is_empty())
         .count();
-    inline_snapshot_has_complete_parent_chain(n_parents, session.inline_depth())
+    let n_callees = session.inline_depth();
+    let complete = inline_snapshot_has_complete_parent_chain(n_parents, n_callees);
+    debug_assert!(
+        session
+            .last_inline()
+            .is_none_or(|frame| frame.parents.is_empty() || complete),
+        "inlined level has parents but the chain is incomplete \
+         (n_parents={n_parents} n_callees={n_callees}); every admitted \
+         inline records its caller (`pyjitpl.py` `capture_resumedata`)"
+    );
+    complete
 }
 
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
@@ -387,10 +407,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // #68 multi-frame inline guard: a guard emitted inside an inlined callee
     // sub-walk with paused caller frames on the walk framestack resumes
     // BOTH the callee (at its own pc) and the caller(s) (at the CALL return
-    // point), instead of collapsing to the caller boundary (re-execute).  Only
-    // the forward-branch inline path
-    // populates the chain; straight-line callees keep the empty chain + the
-    // single-frame collapse below.
+    // point), instead of collapsing to the caller boundary (re-execute).
+    // Every admitted Python inline records its caller (`perform_call` /
+    // `newframe`); an empty chain is the collapse fallback for a level that
+    // has no parent snapshot.
     if inline_subwalk {
         let parent_frames = {
             let session = ctx.session.borrow();

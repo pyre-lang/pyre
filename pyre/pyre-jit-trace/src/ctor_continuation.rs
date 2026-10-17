@@ -100,15 +100,17 @@ const PLACEHOLDER_CALLEE: u16 = 0;
 /// Returns nothing, matching the `'v'` result the calldescr declares —
 /// `bh_call_v_dispatch` (`majit-backend/src/call_stub.rs`) transmutes the
 /// address to a `()`-returning `extern "C"` fn, so any other Rust return type
-/// would be a signature mismatch.  The exception reaches the blackhole through
-/// `BH_LAST_EXC_VALUE`, which `handler_residual_call_r_v` zeroes before the
-/// call and tests after it.  The compiled-code channel (`store_jit_exception`)
-/// is deliberately not written: this jitcode is a resume coordinate, never a
-/// compilation unit.
+/// would be a signature mismatch.  A refusal publishes through
+/// `ResidualError::publish_residual` (`jit_publish_residual_error`):
+/// `BH_LAST_EXC_VALUE` for the blackhole handler and the compiled
+/// `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` cell.  The walker records this
+/// helper after a loop-callee `CALL_ASSEMBLER` so a non-None `__init__`
+/// result raises as `descr_call`'s outcome instead of aborting into an
+/// entry replay.
 pub extern "C" fn bh_check_init_returned_none(result: pyre_object::PyObjectRef) {
-    if let Err(mut err) = pyre_interpreter::call::check_init_returned_none(result) {
-        let exc_obj = err.to_exc_object();
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    if let Err(err) = pyre_interpreter::call::check_init_returned_none(result) {
+        use majit_ir::helper_fnaddr::ResidualError;
+        err.publish_residual();
     }
 }
 
