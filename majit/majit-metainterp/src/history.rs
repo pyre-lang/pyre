@@ -61,14 +61,22 @@ pub fn get_const_ptr_for_unicode(
 /// per loop (from retracing with different virtual states).
 /// `history.py TargetToken` attributes the optimizer writes after the token
 /// is minted (`virtual_state`, `short_preamble`) and pyre's LABEL/JUMP
-/// vable contract. Behind one lock because the token is shared through
-/// `JitCellToken.target_tokens` and mutated by `unroll.py` passes.
+/// vable contract (`label_source_positions`). Behind one lock because the
+/// token is shared through `JitCellToken.target_tokens` and mutated by
+/// `unroll.py` passes.
 #[derive(Debug, Default)]
 pub struct TargetTokenAttrs {
     pub virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     pub vable_label_arg_recipes: Vec<(majit_ir::OpCode, majit_ir::DescrRef)>,
     pub label_tail_unrebuildable: bool,
+    /// Compact LABEL source-position map for the cranelift host entry.
+    /// `history.py TargetToken._ll_loop_code` is the per-token backend sink;
+    /// `compile.py compile_loop` `jitcell_token.target_tokens = [start_descr]`
+    /// is the list compile-time selection scans; `warmstate.py
+    /// execute_assembler` consumes the selected token stored on the
+    /// compiled-loop record.
+    pub label_source_positions: Option<Vec<usize>>,
     minor_scan_pending: bool,
 }
 
@@ -82,7 +90,7 @@ struct LoopTargetDescrState {
     original_jitcell_token: Option<Weak<JitCellToken>>,
     /// Cached `JitCellToken.number` so `unroll.rs` can compare owners
     /// without upgrading the Weak.
-    original_jitcell_token_number: Option<u64>,
+    original_jitcell_token_number: Option<i64>,
 }
 
 /// `history.py TargetToken(AbstractDescr)`: one object that is both the
@@ -166,10 +174,12 @@ impl TargetToken {
     /// `compile.py compile_simple_loop` / `compile_loop` /
     /// `propagate_original_jitcell_token` —
     /// `target_token.original_jitcell_token = jitcell_token`.
-    /// Stores the token object (Weak) and caches `token.number` for the
-    /// dense `unroll.rs` compare.
+    /// Stores the token object (Weak) and caches `token.number()` for the
+    /// dense `unroll.rs` compare. The cache is a fallback; the live
+    /// number is re-read off the upgraded Weak so a snapshot taken
+    /// before `compile.py send_loop_to_backend` assigned it is not stale.
     pub fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
-        let number = token.number;
+        let number = token.number();
         let mut st = self.state.lock();
         st.original_jitcell_token_number = Some(number);
         st.original_jitcell_token = Some(Arc::downgrade(token));
@@ -178,7 +188,7 @@ impl TargetToken {
     /// Number-only backfill for descrs that do not carry a token object
     /// (`BasicLoopTargetDescr`). Production compile sites use
     /// [`Self::set_original_jitcell_token`].
-    pub fn set_original_jitcell_token_number(&self, num: u64) {
+    pub fn set_original_jitcell_token_number(&self, num: i64) {
         majit_ir::LoopTargetDescr::set_original_jitcell_token_number(self, num);
     }
 }
@@ -214,12 +224,10 @@ impl majit_ir::Descr for TargetToken {
         self.token_id as u32
     }
 
+    /// `history.py TargetToken.repr_of_descr`: `compute_unique_id(self)`,
+    /// the object's address, so simultaneously live targets print apart.
     fn repr(&self) -> String {
-        if self.is_preamble_target {
-            format!("TargetToken(start:{})", self.token_id)
-        } else {
-            format!("TargetToken({})", self.token_id)
-        }
+        format!("TargetToken({})", self as *const Self as usize)
     }
 
     fn as_loop_target_descr(&self) -> Option<&dyn majit_ir::LoopTargetDescr> {
@@ -289,11 +297,16 @@ impl majit_ir::LoopTargetDescr for TargetToken {
         self.state.lock().target_arglocs = arglocs;
     }
 
-    fn original_jitcell_token_number(&self) -> Option<u64> {
-        self.state.lock().original_jitcell_token_number
+    fn original_jitcell_token_number(&self) -> Option<i64> {
+        let st = self.state.lock();
+        if let Some(tok) = st.original_jitcell_token.as_ref().and_then(|w| w.upgrade()) {
+            Some(tok.number())
+        } else {
+            st.original_jitcell_token_number
+        }
     }
 
-    fn set_original_jitcell_token_number(&self, num: u64) {
+    fn set_original_jitcell_token_number(&self, num: i64) {
         self.state.lock().original_jitcell_token_number = Some(num);
     }
 
@@ -4887,7 +4900,7 @@ impl TraceCtx {
         // Arc identity. Production CALL_ASSEMBLER emission uses the Arc-typed
         // helpers above.
         let descr = crate::call_descr::make_call_assembler_descr_by_number(
-            target.number,
+            target.number(),
             arg_types,
             ret_type,
             target.virtualizable_arg_index(),
@@ -4901,7 +4914,7 @@ impl TraceCtx {
     #[cfg(test)]
     fn call_assembler_typed_by_number(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
         result_type: Type,
@@ -4941,7 +4954,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_void_by_number_typed(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) {
@@ -4951,7 +4964,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_int_by_number_typed(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -4961,7 +4974,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_ref_by_number_typed(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -4971,7 +4984,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_float_by_number_typed(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -5068,7 +5081,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_red_only_ref(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {

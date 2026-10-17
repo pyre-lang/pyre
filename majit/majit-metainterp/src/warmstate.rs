@@ -6,7 +6,7 @@
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseBaseJitCell
 use indexmap::IndexMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_backend::JitCellToken;
 use majit_ir::{GreenKey, RetainedGreens, Type};
@@ -64,15 +64,6 @@ pub struct BaseJitCell {
     pub abort_count: Cell<u32>,
     /// Hot counter value for this cell (local to this green key).
     pub counter: Cell<u32>,
-    /// The `number` of the last procedure token set on this cell.
-    ///
-    /// Upstream has no such field. It is a diagnostics mirror only: the
-    /// question "did this cell ever have a procedure token" is answered by the
-    /// weakref slot itself ([`Self::has_seen_a_procedure_token`],
-    /// warmstate.py), not from here — a number cannot stop being set
-    /// when the token it names dies, which is the state
-    /// `should_remove_jitcell` has to be able to see (warmstate.py).
-    pub token: Cell<Option<u64>>,
     /// Generation at which tracing was last started.
     /// Used to detect stale tracing sessions.
     pub tracing_generation: Cell<u64>,
@@ -208,7 +199,6 @@ impl BaseJitCell {
             flags: Cell::new(JcFlags::empty()),
             abort_count: Cell::new(0),
             counter: Cell::new(0),
-            token: Cell::new(None),
             tracing_generation: Cell::new(0),
             loop_token: RefCell::new(None),
             invalidated_flag: RefCell::new(None),
@@ -372,7 +362,6 @@ impl BaseJitCell {
         tmp: bool,
     ) -> Option<Arc<JitCellToken>> {
         let loop_token = loop_token.into();
-        self.token.set(Some(loop_token.number));
         // `warmstate.py:202` `self.wref_procedure_token =
         // self._makeref(token)`. The returned `old` is the strong handle the
         // displaced weakref still resolves to, if anything still owns it —
@@ -574,12 +563,9 @@ fn default_enable_opts() -> Vec<String> {
 /// not.
 pub const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
-/// rlib/jit.py:599 has `disable_unrolling = 200`, stored by
-/// `set_param_disable_unrolling` and read by nothing. This port reads it
-/// (`MetaInterp::compile_loop_body`), so the default never fires.
-const DEFAULT_DISABLE_UNROLLING: u32 = u32::MAX;
-
-static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
+/// rlib/jit.py `PARAMETERS['disable_unrolling']`, stored by
+/// `set_param_disable_unrolling` and read by nothing.
+const DEFAULT_DISABLE_UNROLLING: u32 = 200;
 
 /// warmspot.py `WarmRunnerDesc.__init__`: `self.jitcounter = JitCounter(...)`
 /// with the `rlib/jit.py PARAMETERS` decay default.
@@ -598,11 +584,6 @@ pub fn new_runner_memory_manager() -> crate::memmgr::MemoryManager {
     memory_manager.set_retrace_limit(DEFAULT_RETRACE_LIMIT);
     memory_manager.set_max_unroll_loops(DEFAULT_MAX_UNROLL_LOOPS);
     memory_manager
-}
-
-/// Allocate a new unique JitCellToken number.
-pub fn alloc_token_number() -> u64 {
-    NEXT_GLOBAL_TOKEN_NUMBER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// JIT statistics snapshot.
@@ -934,64 +915,8 @@ impl WarmEnterState {
         }
     }
 
-    /// Check and possibly transition the JIT state for a given green key.
-    ///
-    /// Called by the interpreter at loop back-edges and function entries.
-    /// Returns a `HotResult` telling the interpreter what to do next.
-    /// Mark a green key as DONT_TRACE_HERE permanently.
-    /// Clear the loop token for a cell, so is_compiled() returns false.
-    ///
-    /// Upstream never does this: `wref_procedure_token` is only ever
-    /// overwritten by `set_procedure_token`, and a token that should stop
-    /// being entered is retired by `token.invalidated` (warmstate.py) or
-    /// by `alive_loops` dropping it. Clearing the SLOT additionally erases
-    /// `has_seen_a_procedure_token` (warmstate.py), so a
-    /// `JC_DONT_TRACE_HERE` cell cleared this way reads as "never had a token"
-    /// and stops being removable. No production caller exists — every
-    /// occurrence in the tree is a fixture — so this is documented rather than
-    /// repaired; give it upstream's shape at the point a caller appears.
-    pub fn clear_loop_token(&mut self, cell_key: u64) {
-        if let Some(cell) = self.cell_by_key_mut(cell_key) {
-            *cell.loop_token.borrow_mut() = None;
-            *cell.invalidated_flag.borrow_mut() = None;
-        }
-    }
-
-    /// A table slot holds a chain head. Every sweep over the whole table
-    /// must walk `next` as well, or it silently skips chained cells. A chain
-    /// needs no hash collision: one green key reached
-    /// through a hash-only writer and then a typed one produces two cells in
-    /// one bucket, because a `comparekey: None` cell can never match a typed
-    /// lookup, so `ensure_cell_for_key` misses and chains past it. Proven by
-    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`,
-    /// which uses only public entry points on a single key.
-    pub fn clear_all_loop_tokens(&mut self) {
-        self.counter.for_each_cell(|cell| {
-            *cell.loop_token.borrow_mut() = None;
-            *cell.invalidated_flag.borrow_mut() = None;
-        });
-    }
-
     pub fn mark_dont_trace(&mut self, cell_key: u64) {
         self.disable_noninlinable_function(cell_key);
-    }
-
-    /// TODO: pyre-only cold fast path check. RPython
-    /// warmstate.py:467 just calls jitcounter.tick(hash, increment_threshold)
-    /// directly; this read-only peek exists to skip GreenKey allocation
-    /// in jitdriver.rs for cold keys.
-    #[inline]
-    pub fn counter_would_fire(&self, cell_key: u64) -> bool {
-        if let Some(cell) = self.cell_by_key(cell_key) {
-            if cell.is_compiled() || cell.is_tracing() {
-                return true;
-            }
-            if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
-                return false;
-            }
-        }
-        self.counter
-            .would_tick_fire(self.bucket_of(cell_key), self.increment_threshold)
     }
 
     /// warmstate.py:467: jitcounter.tick(hash, increment_threshold).
@@ -1061,28 +986,6 @@ impl WarmEnterState {
 
     fn bump_cell_generation(&mut self) {
         self.cell_generation = self.cell_generation.wrapping_add(1);
-    }
-
-    pub fn is_ceiling_latched(&self, cell_key: u64) -> bool {
-        let Some(cell) = self.cell_by_key(cell_key) else {
-            return false;
-        };
-        Self::cell_is_ceiling_latched(&cell)
-    }
-
-    pub fn is_ceiling_latched_for_key(&self, key: &GreenKey) -> bool {
-        let Some(cell) = self.lookup_chain_with_key(key) else {
-            return false;
-        };
-        Self::cell_is_ceiling_latched(&cell)
-    }
-
-    fn cell_is_ceiling_latched(cell: &BaseJitCell) -> bool {
-        if cell.is_compiled() || cell.is_tracing() {
-            return false;
-        }
-        let dead_token = cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
-        !dead_token && cell.abort_ceiling_latched()
     }
 
     /// The `dead_token` gate below is narrower than
@@ -1237,9 +1140,8 @@ impl WarmEnterState {
     ///
     /// Hash-only callers ([`Self::maybe_compile`]) still mutate the
     /// bucket head via the legacy entry point. The typed chain-walk
-    /// variants of `finish_tracing`, `abort_tracing`, `clear_loop_token`,
-    /// and `mark_dont_trace` ([`Self::finish_tracing_for_key`] etc.) keep
-    /// the typed path's full lifecycle self-consistent on its own buckets));
+    /// variant [`Self::finish_tracing_for_key`] keeps the typed path's
+    /// full lifecycle self-consistent on its own buckets;
     /// the production cutover from the hash entry points is the separate
     /// typed-greenkey threading work.
     pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
@@ -1366,43 +1268,6 @@ impl WarmEnterState {
             cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
             // State remains Tracing until attach_procedure_to_interp is called.
         }
-    }
-
-    /// Typed-key variant of [`Self::abort_tracing`]. Walks the bucket
-    /// chain by comparekey so a collided typed green mutates its own
-    /// cell's `JC_TRACING` / pyre-local abort-count / `DONT_TRACE_HERE` state.
-    pub fn abort_tracing_for_key(&mut self, key: &GreenKey, disable_noninlinable_function: bool) {
-        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
-            cell.abort_count.set(cell.abort_count.get() + 1);
-            let already_banned = cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE);
-            let ceiling_reached = cell.abort_ceiling_latched();
-            if disable_noninlinable_function || already_banned || ceiling_reached {
-                cell.flags
-                    .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
-            }
-            if ceiling_reached && !already_banned && !disable_noninlinable_function {
-                crate::mc_diag_bump(80);
-            }
-        }
-
-        if disable_noninlinable_function {
-            self.disable_noninlinable_function_for_key(key);
-        }
-    }
-
-    /// Typed-key variant of [`Self::clear_loop_token`]. Walks the bucket
-    /// chain by comparekey to clear the matching cell's loop token.
-    pub fn clear_loop_token_for_key(&mut self, key: &GreenKey) {
-        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            *cell.loop_token.borrow_mut() = None;
-            *cell.invalidated_flag.borrow_mut() = None;
-        }
-    }
-
-    /// Typed-key variant of [`Self::mark_dont_trace`].
-    pub fn mark_dont_trace_for_key(&mut self, key: &GreenKey) {
-        self.disable_noninlinable_function_for_key(key);
     }
 
     /// Typed-key variant of [`Self::disable_noninlinable_function`]:
@@ -1585,38 +1450,6 @@ impl WarmEnterState {
         previous
     }
 
-    /// warmstate.py `cell.set_procedure_token(procedure_token, tmp=True)`.
-    ///
-    /// Installs a temporary CALL_ASSEMBLER fallback token without
-    /// changing the tracing flags or compiled state.
-    ///
-    pub fn attach_tmp_callback_to_interp(
-        &mut self,
-        cell_key: u64,
-        token: impl Into<Arc<JitCellToken>>,
-    ) {
-        let token = token.into();
-        let cell = self.ensure_cell_by_key(cell_key);
-        let _old = cell.set_procedure_token(token, true);
-        self.bump_cell_generation();
-    }
-
-    /// Typed form of [`Self::attach_tmp_callback_to_interp`]: the cell is
-    /// `ensure_jit_cell_at_key(greenkey)`, so it carries its greens.
-    pub fn attach_tmp_callback_to_interp_for_key(
-        &mut self,
-        key: &GreenKey,
-        token: impl Into<Arc<JitCellToken>>,
-    ) {
-        let token = token.into();
-        self.ensure_cell_for_key(key);
-        let cell = self
-            .lookup_chain_with_key_mut(key)
-            .expect("ensure_cell_for_key just installed a cell matching this key");
-        let _old = cell.set_procedure_token(token, true);
-        self.bump_cell_generation();
-    }
-
     /// warmstate.py `finally: cell.flags &= ~JC_TRACING` parity —
     /// unconditional flag clear on the starting cell after tracing ends.
     /// Called from the synchronous tracing entry point
@@ -1628,52 +1461,6 @@ impl WarmEnterState {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags.set(cell.flags.get() & !JcFlags::JC_TRACING);
         }
-    }
-
-    /// Typed-key variant of [`Self::clear_tracing_flag`], and the missing half
-    /// of a live pair.
-    ///
-    /// `JC_TRACING` is *set* through [`Self::mark_as_being_traced_for_key`],
-    /// which installs through [`Self::ensure_cell_for_key`] and therefore
-    /// writes the cell that matches the key. The hash form above clears the
-    /// cell its CELL KEY names, which is the same cell whenever the caller's
-    /// u64 was resolved from these greens — but a caller holding a raw bucket
-    /// hash on a chained bucket names the bucket's first occupant instead.
-    /// Once a hash-only writer and a typed one have both written one key those
-    /// are two different cells
-    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`) with
-    /// two different keys, so the set can land on one and the clear on the
-    /// other, the flag is never cleared, and every gate that reads the
-    /// unresolved key — `counter_would_fire`, `counter_tick_checked`,
-    /// `maybe_compile`, `force_start_tracing`, `should_trace_function_entry` —
-    /// refuses that key from then on.
-    ///
-    /// Deliberately does NOT route through `ensure_cell_for_key` the way the
-    /// `_for_key` writers do: clearing a flag must not install a cell. A key
-    /// with no cell has no flag to clear, which is the hash form's behaviour
-    /// too.
-    ///
-    /// No caller yet. Unlike [`Self::attach_tmp_callback_to_interp`], which
-    /// got a stated reason instead of a twin because nothing calls it
-    /// anywhere, the hash form here has a live production caller in
-    /// `pyre-jit` (the `finally` clear after tracing ends) that still passes a
-    /// hash. Converting it is caller-side work in another crate and lands
-    /// separately.
-    pub fn clear_tracing_flag_for_key(&mut self, key: &GreenKey) {
-        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
-        }
-    }
-
-    /// No typed twin: this has no callers anywhere in the workspace — the only
-    /// occurrence in the tree is this definition. A twin here would be a
-    /// second uncalled entry point, so it gets a reason instead, the same call
-    /// [`Self::attach_tmp_callback_to_interp`] got. Give it a typed form at
-    /// the point a caller appears, not before.
-    pub fn take_procedure_token(&mut self, cell_key: u64) -> Option<Arc<JitCellToken>> {
-        self.cell_by_key_mut(cell_key)
-            .and_then(|cell| cell.loop_token.take())
-            .and_then(|wref| wref.upgrade())
     }
 
     /// Get a reference to the compiled loop token for a green key.
@@ -1771,8 +1558,9 @@ impl WarmEnterState {
     ///
     /// A chain needs no hash collision: one green key reached through a
     /// hash-only writer and then a typed one produces two cells for one hash
-    /// (see [`Self::clear_all_loop_tokens`]). A hash owning exactly one cell
-    /// leaves one candidate, so [`Self::sole_cell_key`] is exact and a caller
+    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`). A
+    /// hash owning exactly one cell leaves one candidate, so
+    /// [`Self::sole_cell_key`] is exact and a caller
     /// can skip building a `GreenKey` it would only use to confirm that — which
     /// is what keeps [`Self::resolve_cell_key`] allocation-free on the entry
     /// path.
@@ -1797,11 +1585,6 @@ impl WarmEnterState {
         self.cell_keys_at(green_key_hash).0 > 1
     }
 
-    /// Allocate a new unique JitCellToken number.
-    pub fn alloc_token_number(&mut self) -> u64 {
-        alloc_token_number()
-    }
-
     /// Get the current threshold.
     pub fn threshold(&self) -> u32 {
         self.threshold
@@ -1816,17 +1599,6 @@ impl WarmEnterState {
     /// Decay all counters (e.g., periodically to avoid stale counts).
     pub fn decay_counters(&mut self) {
         self.counter.decay_all_counters();
-    }
-
-    /// Reset the hot counter for a specific green key to zero.
-    pub fn reset_counter(&mut self, cell_key: u64) {
-        self.counter.reset(self.bucket_of(cell_key));
-    }
-
-    /// Check if a green key carries `JC_DONT_TRACE_HERE`.
-    pub fn is_dont_trace_here(&self, cell_key: u64) -> bool {
-        self.cell_by_key(cell_key)
-            .is_some_and(|c| c.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE))
     }
 
     /// Get a reference to the BaseJitCell for a green key, if it exists.
@@ -1857,45 +1629,6 @@ impl WarmEnterState {
     /// pick a cell out of one.
     pub fn get_cell_for_key(&self, key: &GreenKey) -> Option<Rc<BaseJitCell>> {
         self.lookup_chain_with_key(key)
-    }
-
-    /// TODO: walk the warmstate cells to find a
-    /// `JitCellToken` by number. Used by `MetaInterp::record_loop_or_bridge`
-    /// to widen the CALL_ASSEMBLER keepalive search to cover targets
-    /// that live only on a `BaseJitCell.loop_token` and are not yet — or
-    /// never — registered in `MetaInterp::compiled_loops`.
-    ///
-    /// This doc previously named tmp-callback installs at
-    /// `attach_tmp_callback_to_interp` as the most important such target.
-    /// That function has no callers anywhere in the workspace, so it
-    /// installs nothing and cannot be what this helper covers. The
-    /// surviving population is whatever `attach_procedure_to_interp` wrote
-    /// but `record_loop_or_bridge` has not registered; nobody has measured
-    /// it, so treat the need for this fallback as unquantified rather than
-    /// established.
-    ///
-    /// RPython equivalent does not exist because upstream descrs hold
-    /// the `JitCellToken` object directly (`compile.py:187 isinstance(descr,
-    /// JitCellToken)`). Production CALL_ASSEMBLER / JUMP descrs now
-    /// carry the token object, so `record_loop_or_bridge` no longer
-    /// calls this. Leftover `BC_CALL_ASSEMBLER_*` dispatch still
-    /// resolves by number through `with_trace_ctx_and_token_resolver`.
-    /// Walks each chain, not just its head — see `clear_all_loop_tokens`.
-    ///
-    /// Owned, for the reason [`Self::get_compiled`] gives: the cell's handle is
-    /// weak, so a token that no longer upgrades is simply not a match — it has
-    /// no compiled body left to resolve a guard against.
-    pub fn find_token_by_number(&self, token_number: u64) -> Option<Arc<JitCellToken>> {
-        let mut found = None;
-        self.counter.for_each_cell(|cell| {
-            if found.is_none()
-                && let Some(tok) = cell.loop_token.borrow().as_ref().and_then(|w| w.upgrade())
-                && tok.number == token_number
-            {
-                found = Some(tok);
-            }
-        });
-        found
     }
 
     /// `rpython/jit/metainterp/warmstate.py` `get_assembler_token`.
@@ -1939,14 +1672,13 @@ impl WarmEnterState {
     }
 
     /// `warmstate.py` `get_assembler_token` typed variant —
-    /// walks the chain at `key.get_uhash()` and dispatches off
-    /// `comparekey` instead of trusting the hash to be collision-free.
+    /// `JitCell.ensure_jit_cell_at_key(greenkey)` then the cell's identity.
     ///
-    /// Equivalent to `get_assembler_token` modulo lookup discipline:
-    /// upstream `JitCell.ensure_jit_cell_at_key(greenkey)` walks the
-    /// chain (`warmstate.py`) and inserts at head on miss.
-    /// Pyre's hash-only [`Self::get_assembler_token`] aliases distinct
-    /// typed keys that share a hash bucket; this variant disambiguates.
+    /// `compile_tmp_callback` (`make_token`) can collect, so the typed
+    /// greens are resolved to the cell key before that call and the
+    /// post-compile install uses [`Self::get_assembler_token`]. The cell's
+    /// own comparekey is forwarded by the GC walker; a raw `GreenKey` of
+    /// reference words is not.
     pub fn get_assembler_token_with_key<E, F>(
         &mut self,
         key: &GreenKey,
@@ -1956,29 +1688,8 @@ impl WarmEnterState {
         F: FnOnce(&mut crate::memmgr::MemoryManager) -> Result<Arc<JitCellToken>, E>,
     {
         self.ensure_cell_for_key(key);
-        if let Some(token) = self
-            .lookup_chain_with_key(key)
-            .and_then(|cell| cell.get_procedure_token())
-        {
-            return Ok(token.clone());
-        }
-        // See [`Self::get_assembler_token`] for why the manager is threaded
-        // through the closure rather than read by the caller.
-        let token = make_token(&mut self.memory_manager)?;
-        let hash = key.get_uhash();
-        // Walk the chain to find the typed match. `ensure_cell_for_key`
-        // guarantees one exists either as the head (miss path) or
-        // somewhere down the chain (existing-cell path).
-        let mut cell = self
-            .counter
-            .lookup_chain(hash)
-            .expect("ensure_cell_for_key installed a chain entry");
-        while cell.jitdriver_sd != self.jitdriver_sd || !cell.comparekey_matches(key) {
-            let next = cell.next.borrow().clone();
-            cell = next.expect("ensure_cell_for_key guarantees a typed match exists");
-        }
-        cell.set_procedure_token(token.clone(), true);
-        Ok(token)
+        let cell_key = self.cell_key_for(key).unwrap_or_else(|| key.get_uhash());
+        self.get_assembler_token(cell_key, make_token)
     }
 
     /// warmstate.py: trace_eagerness parameter (integer).
@@ -2152,19 +1863,6 @@ impl WarmEnterState {
             .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
     }
 
-    /// Mark a callee as currently being traced.
-    ///
-    /// This is the warm-state equivalent of PyPy's `mark_as_being_traced()`.
-    pub fn mark_as_being_traced(&mut self, callee_key: u64) {
-        let tracing_generation = self.tracing_generation;
-        let cell = self.ensure_cell_by_key(callee_key);
-        cell.flags.set(cell.flags.get() | (JcFlags::JC_TRACING));
-        if !cell.flags.get().contains(JcFlags::JC_TRACING_OCCURRED) {
-            cell.tracing_generation.set(tracing_generation);
-        }
-    }
-
-    /// Typed-key variant of [`Self::mark_as_being_traced`]:
     /// `warmstate.py mark_as_being_traced(*greenargs)`, which reaches
     /// its cell through `_ensure_jit_cell_at_key(*greenargs)` — i.e. by
     /// comparekey, never by hash alone.
@@ -2556,11 +2254,6 @@ impl WarmEnterState {
         self.counter.tick(bucket, self.increment_function_threshold)
     }
 
-    /// Check if inlining is allowed at the given depth.
-    pub fn can_inline_at_depth(&self, current_depth: usize) -> bool {
-        (current_depth as u32) < self.max_inline_depth
-    }
-
     // ── Quasi-immutable field invalidation ──
 
     /// Register that the compiled loop at `cell_key` depends on the
@@ -2625,7 +2318,7 @@ impl WarmEnterState {
     ///
     /// This is a brute-force invalidation used when the specific qmut_key
     /// is not known (e.g., bulk invalidation after a class hierarchy change).
-    /// Walks each chain, not just its head — see `clear_all_loop_tokens`.
+    /// Walks each chain, not just its head.
     /// This is the sweep where skipping a cell is a WRONG ANSWER rather than a
     /// leak: a cell whose token is not invalidated keeps running compiled code
     /// built under an assumption that has just been retracted.
@@ -3368,7 +3061,7 @@ impl WarmEnterState {
     /// This is the resolve half of [`Self::cell_key_for`], which is how the
     /// `u64` API surface reaches the same cell without holding the greens: the
     /// walk happens ONCE, at the hash producer, and the cell key it yields is
-    /// what `clear_loop_token`, `counter_tick`, `maybe_compile`,
+    /// what `counter_tick`, `maybe_compile`,
     /// `finish_tracing`, `abort_tracing`, `get_cell` and the rest are handed —
     /// along with `MetaInterp`'s `compiled_loops` / `cut_compiled_keys`, which
     /// are indexed by the same key and so describe the same cell. That is the
@@ -3490,7 +3183,7 @@ mod tests {
     fn a_token_the_memory_manager_evicted_reads_back_as_never_compiled() {
         let mut ws = WarmEnterState::new(1);
         let key = GreenKey::new(vec![0x11, 0x22]);
-        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         // `compile.py:566-567` order: register the strong owner, then attach.
         let token = attach_alive_for_key(&mut ws, &key, token);
         let cell_key = ws.cell_key_for(&key).expect("the key now owns a cell");
@@ -3561,10 +3254,9 @@ mod tests {
         let mut ws = WarmEnterState::new(1);
 
         let unregistered_key = GreenKey::new(vec![0x55, 0x66]);
-        let number = ws.alloc_token_number();
         let handed_back = ws
             .get_assembler_token_with_key::<(), _>(&unregistered_key, |_memmgr| {
-                Ok(Arc::new(JitCellToken::new(number)))
+                Ok(Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED)))
             })
             .expect("the maker succeeded");
         assert!(
@@ -3582,10 +3274,9 @@ mod tests {
         );
 
         let registered_key = GreenKey::new(vec![0x77, 0x88]);
-        let number = ws.alloc_token_number();
         let handed_back = ws
             .get_assembler_token_with_key::<(), _>(&registered_key, |memmgr| {
-                let token = Arc::new(JitCellToken::new(number));
+                let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
                 // `compile.py:1148-1149`.
                 memmgr.keep_loop_alive(&token);
                 Ok(token)
@@ -3611,7 +3302,7 @@ mod tests {
     fn a_token_the_memory_manager_still_owns_is_entered_every_time() {
         let mut ws = WarmEnterState::new(1);
         let key = GreenKey::new(vec![0x33, 0x44]);
-        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         let token = attach_alive_for_key(&mut ws, &key, token);
         let cell_key = ws.cell_key_for(&key).expect("the key now owns a cell");
         // The fixture's own handle is gone; `alive_loops` is the only owner,
@@ -3701,8 +3392,7 @@ mod tests {
     #[test]
     fn test_run_compiled() {
         let mut ws = WarmEnterState::new(1);
-        let token_num = ws.alloc_token_number();
-        let token = JitCellToken::new(token_num);
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 42, token);
 
         match ws.maybe_compile(42) {
@@ -3787,19 +3477,6 @@ mod tests {
     }
 
     #[test]
-    fn test_alloc_token_number() {
-        let mut ws = WarmEnterState::new(10);
-        let first = ws.alloc_token_number();
-        let second = ws.alloc_token_number();
-        let third = ws.alloc_token_number();
-        // The allocator is process-global. Other tests may allocate between
-        // these calls when the harness runs tests in parallel, so only the
-        // monotonic uniqueness contract is local to this test.
-        assert!(first < second);
-        assert!(second < third);
-    }
-
-    #[test]
     fn test_set_threshold() {
         let mut ws = WarmEnterState::new(100);
         assert_eq!(ws.threshold(), 100);
@@ -3817,7 +3494,7 @@ mod tests {
 
         let compiled = ws.get_compiled(42);
         assert!(compiled.is_some());
-        assert_eq!(compiled.unwrap().number, 0);
+        assert_eq!(compiled.unwrap().number(), 0);
     }
 
     #[test]
@@ -3837,8 +3514,7 @@ mod tests {
 
         // Phase 4: Finish tracing, install compiled code
         ws.finish_tracing(key);
-        let token_num = ws.alloc_token_number();
-        let token = JitCellToken::new(token_num);
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
         // Phase 5: Run compiled
@@ -3863,7 +3539,7 @@ mod tests {
     #[test]
     fn test_quasiimmut_register_and_invalidate() {
         let mut ws = WarmEnterState::new(1);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         let green_key = 42;
         let qmut_key = 0xABCD;
 
@@ -3893,7 +3569,7 @@ mod tests {
 
         // Install two loops depending on the same quasi-immutable field.
         for green_key in [10, 20] {
-            let token = JitCellToken::new(ws.alloc_token_number());
+            let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
             attach_alive(&mut ws, green_key, token);
             ws.register_quasiimmut_dependency(qmut_key, green_key);
         }
@@ -3911,7 +3587,7 @@ mod tests {
     fn test_quasiimmut_invalidate_all() {
         let mut ws = WarmEnterState::new(1);
         for green_key in [1, 2, 3] {
-            let token = JitCellToken::new(ws.alloc_token_number());
+            let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
             attach_alive(&mut ws, green_key, token);
         }
 
@@ -4033,7 +3709,7 @@ mod tests {
             HotResult::StartTracing => {
                 // Phase 4: this time the trace succeeds.
                 ws.finish_tracing(key);
-                let token = JitCellToken::new(ws.alloc_token_number());
+                let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
             _ => panic!("expected StartTracing on retry"),
@@ -4072,7 +3748,7 @@ mod tests {
         match ws.maybe_compile(key) {
             HotResult::StartTracing => {
                 ws.finish_tracing(key);
-                let token = JitCellToken::new(ws.alloc_token_number());
+                let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
             _ => panic!("expected StartTracing (attempt 3)"),
@@ -4110,7 +3786,7 @@ mod tests {
     fn test_quasiimmut_deps_cleared_after_invalidation() {
         let mut ws = WarmEnterState::new(1);
         let qmut_key = 0xABCD;
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 42, token);
         ws.register_quasiimmut_dependency(qmut_key, 42);
 
@@ -4128,7 +3804,7 @@ mod tests {
     // memmgr.py (the looptoken Python object is the dict key
     // upstream).
 
-    fn make_token(number: u64) -> Arc<JitCellToken> {
+    fn make_token(number: i64) -> Arc<JitCellToken> {
         Arc::new(JitCellToken::new(number))
     }
 
@@ -4333,7 +4009,7 @@ mod tests {
             _ => panic!("expected StartTracing"),
         }
         ws.finish_tracing(key);
-        let token = make_token(ws.alloc_token_number());
+        let token = make_token(JitCellToken::NUMBER_UNASSIGNED);
         ws.attach_procedure_to_interp(key, Arc::clone(&token));
         mgr.keep_loop_alive(&token);
 
@@ -4347,7 +4023,7 @@ mod tests {
         // Re-install: a fresh compile produces a fresh token; the
         // warmstate cell records the new procedure token, MemoryManager
         // tracks it under its own pointer identity.
-        let token2 = make_token(ws.alloc_token_number());
+        let token2 = make_token(JitCellToken::NUMBER_UNASSIGNED);
         ws.attach_procedure_to_interp(key, Arc::clone(&token2));
         mgr.keep_loop_alive(&token2);
 
@@ -4406,7 +4082,7 @@ mod tests {
         let mut tokens: Vec<Arc<JitCellToken>> = Vec::new();
 
         for i in 0..10u64 {
-            let t = make_token(i);
+            let t = make_token(i as i64);
             mgr.keep_loop_alive(&t);
             tokens.push(t);
             mgr.next_generation();
@@ -4428,24 +4104,6 @@ mod tests {
                 assert!(!is_alive, "odd token {} should be evicted", i);
             }
         }
-    }
-
-    // ── Trace limit + inline depth interaction ──
-
-    #[test]
-    fn test_trace_limit_with_inline_depth() {
-        // Inline depth limiting and trace limit are orthogonal:
-        // a function can be inlined (depth < max), but the trace
-        // can still be too long. The WarmEnterState correctly tracks both.
-        let mut ws = WarmEnterState::new(3);
-        ws.set_max_inline_depth(3);
-
-        // Depth 0: allowed
-        assert!(ws.can_inline_at_depth(0));
-        // Depth 2: allowed (< 3)
-        assert!(ws.can_inline_at_depth(2));
-        // Depth 3: not allowed (>= 3)
-        assert!(!ws.can_inline_at_depth(3));
     }
 
     #[test]
@@ -4476,7 +4134,7 @@ mod tests {
         match ws.maybe_compile(key) {
             HotResult::StartTracing => {
                 ws.finish_tracing(key);
-                let token = JitCellToken::new(ws.alloc_token_number());
+                let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
             _ => panic!("expected StartTracing with lower threshold"),
@@ -4530,7 +4188,7 @@ mod tests {
 
         // Finish tracing and install → Compiled
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
 
@@ -4541,8 +4199,7 @@ mod tests {
         // The loop_token's invalidated flag should be set
         let cell = ws.get_cell(key).unwrap();
         assert!(resolved_token(&cell).is_invalidated());
-        // token number is preserved as a historical record
-        assert!(cell.token.get().is_some());
+        assert!(cell.has_seen_a_procedure_token());
     }
 
     #[test]
@@ -4558,13 +4215,11 @@ mod tests {
             _ => panic!("expected StartTracing"),
         }
         ws.finish_tracing(key);
-        let token_num = ws.alloc_token_number();
-        let token = JitCellToken::new(token_num);
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
         // Cell owns the token
         let cell = ws.get_cell(key).unwrap();
-        assert_eq!(cell.token.get(), Some(token_num));
         assert!(cell.get_procedure_token().is_some());
         assert!(cell.has_seen_a_procedure_token());
 
@@ -4573,10 +4228,9 @@ mod tests {
         ws.register_quasiimmut_dependency(qmut_key, key);
         ws.invalidate_quasiimmut(qmut_key);
 
-        // Token ownership revoked (state is Invalidated, but token number
-        // is preserved as historical record)
+        // Token ownership revoked (state is Invalidated); the weak slot
+        // still records that a procedure token existed.
         let cell = ws.get_cell(key).unwrap();
-        assert_eq!(cell.token.get(), Some(token_num)); // historical record preserved
         assert_eq!(cell.derived_state(), BaseJitCellState::Invalidated);
         // get_procedure_token returns None because the token is invalidated
         assert!(cell.get_procedure_token().is_none());
@@ -4629,7 +4283,7 @@ mod tests {
 
         // Compile key 1
         ws.finish_tracing(1);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 1, token);
 
         let stats = ws.get_stats();
@@ -4667,7 +4321,13 @@ mod tests {
 
         // Abort with DONT_TRACE_HERE → the cell carries the flag
         ws.abort_tracing(key, true);
-        assert!(ws.is_dont_trace_here(key));
+        assert!(
+            ws.get_cell(key)
+                .unwrap()
+                .flags
+                .get()
+                .contains(JcFlags::JC_DONT_TRACE_HERE)
+        );
 
         // Future calls return NotHot
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
@@ -4722,11 +4382,7 @@ mod tests {
                     }
                 }
                 assert!(started, "the location never became hot");
-                if use_typed_key {
-                    ws.abort_tracing_for_key(&green, false);
-                } else {
-                    ws.abort_tracing(key, false);
-                }
+                ws.abort_tracing(key, false);
             }
 
             for _ in 0..64 {
@@ -4796,19 +4452,22 @@ mod tests {
     #[test]
     fn a_pretrace_decline_does_not_charge_the_abort_ceiling() {
         let mut ws = WarmEnterState::new(2);
-        let key = 0xDEC11E;
+        let key = GreenKey::new(vec![0xDEC11E]);
+        let hash = key.get_uhash();
 
         for _ in 0..=MAX_TRACE_ABORT_COUNT {
-            ws.mark_as_being_traced(key);
-            ws.decline_tracing(key);
+            ws.mark_as_being_traced_for_key(&key);
+            ws.decline_tracing(hash);
         }
 
-        let cell = ws.get_cell(key).expect("decline keeps the warm-state cell");
+        let cell = ws
+            .get_cell_for_key(&key)
+            .expect("decline keeps the warm-state cell");
         assert_eq!(cell.abort_count.get(), 0);
         assert_eq!(cell.derived_state(), BaseJitCellState::NotHot);
         assert!(!cell.flags.get().contains(JcFlags::JC_TRACING));
         assert!(!cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
-        assert!(ws.can_inline_callable(key));
+        assert!(ws.can_inline_callable_for_key(&key));
     }
 
     #[test]
@@ -4849,10 +4508,13 @@ mod tests {
     #[test]
     fn stale_tracing_generation_is_counted_apart_from_a_live_trace() {
         let mut ws = WarmEnterState::new(2);
+        let key_a = GreenKey::new(vec![0xA]);
 
         // Cell A is marked as being traced under the current generation.
-        ws.mark_as_being_traced(0xA);
-        let cell = ws.get_cell(0xA).expect("mark_as_being_traced installs it");
+        ws.mark_as_being_traced_for_key(&key_a);
+        let cell = ws
+            .get_cell_for_key(&key_a)
+            .expect("mark_as_being_traced_for_key installs it");
         assert!(cell.is_tracing(), "fixture: A carries JC_TRACING");
         assert_eq!(
             cell.tracing_generation.get(),
@@ -4864,7 +4526,7 @@ mod tests {
         // case: 65 moves, 66 must not.
         let live_65 = crate::mc_diag(65);
         let live_66 = crate::mc_diag(66);
-        assert!(!ws.should_trace_function_entry(0xA));
+        assert!(!ws.should_trace_function_entry_for_key(&key_a));
         assert!(
             crate::mc_diag(65) >= live_65 + 1,
             "a decline on the tracing term bumps 65"
@@ -4879,7 +4541,7 @@ mod tests {
         // clearing A's flag: only start_tracing_cell increments the generation.
         assert!(matches!(ws.maybe_compile(0xB), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(0xB), HotResult::StartTracing));
-        let cell = ws.get_cell(0xA).expect("A is still installed");
+        let cell = ws.get_cell_for_key(&key_a).expect("A is still installed");
         assert!(cell.is_tracing(), "fixture: A's flag was never cleared");
         assert!(
             cell.tracing_generation.get() < ws.tracing_generation(),
@@ -4887,7 +4549,7 @@ mod tests {
         );
 
         let stale_66 = crate::mc_diag(66);
-        assert!(!ws.should_trace_function_entry(0xA));
+        assert!(!ws.should_trace_function_entry_for_key(&key_a));
         assert!(
             crate::mc_diag(66) >= stale_66 + 1,
             "a stale JC_TRACING at this gate is what slot 66 reports"
@@ -4930,16 +4592,6 @@ mod tests {
                 .expect("the cell exists")
                 .is_tracing(),
             "clearing the hash key clears the one cell",
-        );
-
-        // The typed form reaches it.
-        ws.clear_tracing_flag_for_key(&key);
-        assert!(
-            !ws.lookup_chain_with_key(&key)
-                .expect("the typed cell exists")
-                .is_tracing(),
-            "the typed clear selects by comparekey, so it reaches the cell the \
-             typed mark wrote",
         );
     }
 
@@ -5006,7 +4658,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing));
         ws.finish_tracing(1);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 1, token);
 
         // Key 2: tracing (should NOT be removed)
@@ -5037,7 +4689,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
 
@@ -5047,7 +4699,7 @@ mod tests {
 
         // Reset to NotHot and recompile
         ws.transition_cell(key, BaseJitCellState::NotHot);
-        let token2 = JitCellToken::new(ws.alloc_token_number());
+        let token2 = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token2);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
@@ -5092,7 +4744,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
         // Register quasi-immutable dependency
@@ -5115,7 +4767,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, key);
 
@@ -5153,7 +4805,7 @@ mod tests {
         assert!(ws.counter_tick_checked(key));
         ws.force_start_tracing(key);
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, key);
 
@@ -5177,7 +4829,7 @@ mod tests {
         assert!(ws.should_trace_function_entry(key));
         ws.force_start_tracing(key);
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, key);
 
@@ -5208,7 +4860,7 @@ mod tests {
         assert!(ws.should_trace_function_entry(key));
         ws.force_start_tracing(key);
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, key);
 
@@ -5650,98 +5302,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn abort_tracing_for_key_marks_only_matching_cell() {
-        let target = GreenKey::new(vec![5, 6]);
-        let decoy = GreenKey::new(vec![7, 8]);
-        let mut ws = chain_decoy_then_target(&target, &decoy);
-        ws.abort_tracing_for_key(&target, true);
-        let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
-        assert!(
-            head.flags.get().contains(JcFlags::JC_TRACING),
-            "decoy head still TRACING"
-        );
-        assert!(
-            !head.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
-            "decoy not disabled"
-        );
-        let hit = head
-            .next
-            .borrow()
-            .clone()
-            .expect("target chained behind decoy");
-        assert!(
-            !hit.flags.get().contains(JcFlags::JC_TRACING),
-            "target TRACING cleared"
-        );
-        assert!(
-            hit.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
-            "target disabled by permanent abort"
-        );
-    }
-
-    #[test]
-    fn mark_dont_trace_for_key_sets_only_matching_cell() {
-        let target = GreenKey::new(vec![5, 6]);
-        let decoy = GreenKey::new(vec![7, 8]);
-        let mut ws = chain_decoy_then_target(&target, &decoy);
-        ws.mark_dont_trace_for_key(&target);
-        let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
-        assert!(
-            !head.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
-            "decoy head not disabled"
-        );
-        let hit = head
-            .next
-            .borrow()
-            .clone()
-            .expect("target chained behind decoy");
-        assert!(
-            hit.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
-            "target disabled"
-        );
-    }
-
-    #[test]
-    fn clear_loop_token_for_key_clears_only_matching_cell() {
-        let target = GreenKey::new(vec![5, 6]);
-        let decoy = GreenKey::new(vec![7, 8]);
-        let mut ws = WarmEnterState::new(100);
-        let bucket = target.get_uhash();
-        let token = std::sync::Arc::new(JitCellToken::new(0x00c0_ffee_u64));
-        // The cell's handle is weak (`warmstate.py:188`), so the token needs
-        // the strong owner production gives it — `alive_loops`
-        // (`memmgr.py:9-14`). Without it both slots below are born dead and
-        // this fixture would be testing nothing.
-        ws.memory_manager.keep_loop_alive(&token);
-        let mut decoy_cell = BaseJitCell::new();
-        decoy_cell
-            .flags
-            .set(decoy_cell.flags.get() | (JcFlags::JC_TRACING));
-        *decoy_cell.comparekey.borrow_mut() = Some(decoy.clone());
-        *decoy_cell.loop_token.borrow_mut() = Some(std::sync::Arc::downgrade(&token));
-        ws.install_new_cell(bucket, Some(decoy_cell));
-        let mut target_cell = BaseJitCell::new();
-        target_cell
-            .flags
-            .set(target_cell.flags.get() | (JcFlags::JC_TRACING));
-        *target_cell.comparekey.borrow_mut() = Some(target.clone());
-        *target_cell.loop_token.borrow_mut() = Some(std::sync::Arc::downgrade(&token));
-        ws.install_new_cell(bucket, Some(target_cell));
-        ws.clear_loop_token_for_key(&target);
-        let head = ws.lookup_chain(bucket).expect("bucket head");
-        assert!(head.loop_token.borrow().is_some(), "decoy loop_token kept");
-        let hit = head
-            .next
-            .borrow()
-            .clone()
-            .expect("target chained behind decoy");
-        assert!(
-            hit.loop_token.borrow().is_none(),
-            "target loop_token cleared"
-        );
-    }
-
     /// `warmstate.py` `get_assembler_token` — a fresh typed key
     /// installs a temporary procedure token (tmp=true → JC_TEMPORARY)
     /// and returns it; subsequent calls with the same key return the
@@ -5750,7 +5310,7 @@ mod tests {
     fn get_assembler_token_with_key_caches_token_per_typed_key() {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![10, 20]);
-        let token = std::sync::Arc::new(JitCellToken::new(0xa55e_b1ed_u64));
+        let token = std::sync::Arc::new(JitCellToken::new(0xa55e_b1ed_u64 as i64));
 
         let mut make_token_calls = 0;
         let token_clone_1 = {
@@ -5767,7 +5327,9 @@ mod tests {
         let token_clone_2 = ws
             .get_assembler_token_with_key::<(), _>(&key, |_memmgr| {
                 make_token_calls += 1;
-                Ok(std::sync::Arc::new(JitCellToken::new(0xdead_beef_u64)))
+                Ok(std::sync::Arc::new(JitCellToken::new(
+                    0xdead_beef_u64 as i64,
+                )))
             })
             .expect("re-fetch ok");
         assert_eq!(
@@ -6202,21 +5764,21 @@ mod tests {
         assert!(cell.is_tracing(), "JC_TRACING flag set on threshold tick");
     }
 
-    /// The three whole-table sweeps must walk each chain, not just its head.
+    /// The whole-table sweeps must walk each chain, not just its head.
     ///
     /// A table slot yields a chain HEAD, so a sweep that does not follow
     /// `next` silently skips every chained cell. "majit-metainterp: count
     /// chained cells in get_stats, not bucket heads" fixed exactly
-    /// this in `get_stats`; the fix was filed at one access path and three
-    /// siblings kept the defect.
+    /// this in `get_stats`; the fix was filed at one access path and the
+    /// remaining siblings kept the defect.
     ///
     /// `invalidate_all` is the one that costs a wrong answer rather than a
     /// leak: a chained cell whose token is never invalidated keeps running
     /// compiled code built under a retracted assumption.
     ///
     /// The token lives on the CHAINED cell and the head is left tokenless, so
-    /// a head-only sweep reaches nothing at all — the assertions below fail on
-    /// every one of the three before the fix.
+    /// a head-only sweep reaches nothing at all — the assertions below fail
+    /// before the fix.
     #[test]
     fn whole_table_sweeps_reach_chained_cells_not_only_heads() {
         let mut ws = WarmEnterState::new(100);
@@ -6232,7 +5794,7 @@ mod tests {
         *head.comparekey.borrow_mut() = Some(key_head.clone());
         ws.install_new_cell(bucket, Some(head));
 
-        const CHAINED_TOKEN: u64 = 0x5EED_0003;
+        const CHAINED_TOKEN: i64 = 0x5EED_0003;
         let chained_token = make_token(CHAINED_TOKEN);
         // `alive_loops` is the token's only strong owner once the cell's
         // handle is weak (`warmstate.py:188`, `memmgr.py:9-14`).
@@ -6258,9 +5820,14 @@ mod tests {
             "fixture requires the token on the CHAINED cell"
         );
 
-        // 1. find_token_by_number
+        // 1. the chained cell's weak handle upgrades to the planted token.
         assert!(
-            ws.find_token_by_number(CHAINED_TOKEN).is_some(),
+            chain_head
+                .next
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.loop_token.borrow().as_ref().and_then(|w| w.upgrade()))
+                .is_some_and(|tok| Arc::ptr_eq(&tok, &chained_token)),
             "a token on a chained cell must be findable"
         );
 
@@ -6279,17 +5846,6 @@ mod tests {
                 .is_some_and(|t| t.is_invalidated()),
             "invalidate_all must invalidate a CHAINED cell's token — skipping \
              it leaves compiled code live under a retracted assumption"
-        );
-
-        // 3. clear_all_loop_tokens
-        ws.clear_all_loop_tokens();
-        let chained = ws
-            .lookup_chain(bucket)
-            .and_then(|h| h.next.borrow().clone())
-            .expect("chain survives clear_all_loop_tokens");
-        assert!(
-            chained.loop_token.borrow().is_none(),
-            "clear_all_loop_tokens must clear a CHAINED cell's token"
         );
     }
 
@@ -6331,7 +5887,7 @@ mod tests {
         let mut cell_b = BaseJitCell::new();
         *cell_b.comparekey.borrow_mut() = Some(key_b.clone());
         // A live token keeps B out of the tokenless `cleanup_chain` arm.
-        let token_b = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token_b = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.memory_manager.keep_loop_alive(&token_b);
         cell_b.set_procedure_token(Arc::clone(&token_b), true);
         ws.install_new_cell(bucket, Some(cell_b));
@@ -6502,7 +6058,7 @@ mod tests {
         ws.disable_noninlinable_function_for_key(&key);
         assert!(ws.lookup_chain_with_key(&key).is_some());
 
-        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
 
         let cell = ws
@@ -6532,7 +6088,7 @@ mod tests {
         let key = GreenKey::new(vec![1100, 1200]);
 
         ws.disable_noninlinable_function_for_key(&key);
-        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
 
         assert!(!ws.bucket_is_chained(key.get_uhash()));
@@ -6597,7 +6153,7 @@ mod tests {
     /// `self.compiled.get().is_some()` — so its type only has to satisfy the
     /// `Any + Send` bound.
     fn token_with_compiled_code(ws: &mut WarmEnterState) -> Arc<JitCellToken> {
-        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         token.set_compiled(Box::new(()));
         assert!(token.has_compiled_code());
         token
@@ -6758,8 +6314,8 @@ mod tests {
             "the entry decided `chained_key` has compiled code and then ran a \
              DIFFERENT key's artifact: decided token #{}, executed token #{}. \
              The two must resolve through the same cell.",
-            decided.number,
-            executed.number,
+            decided.number(),
+            executed.number(),
         );
 
         let by_bucket_hash = ws
@@ -6849,7 +6405,7 @@ mod tests {
         // A procedure token keeps the first cell non-removable, so the second
         // install chains it rather than pruning it (counter.py install_new_cell's
         // `should_remove_jitcell` gate — a cold, tokenless cell is dropped).
-        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         attach_alive_for_key(&mut ws, &first, token);
         let first_key = ws
             .cell_key_for(&first)
@@ -6905,7 +6461,7 @@ mod tests {
         // `a_chained_bucket_reached_without_greens_answers_the_first_occupant`
         // builds, because a single-candidate bucket takes the `(1, _)` arm and
         // never reaches the branch under test.
-        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         attach_alive_for_key(&mut ws, &first, token);
         let first_key = ws
             .cell_key_for(&first)
@@ -7330,14 +6886,14 @@ mod tests {
         // `compile.rs`'s `compile_tmp_callback`
         // (`jitcell_token.green_key.set(green_key)`) writes and
         // what `try_to_free_some_loops` reads back.
-        let token_a = Arc::new(JitCellToken::new(ws.alloc_token_number()));
-        let token_b = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token_a = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
+        let token_b = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         token_a.green_key.set(cell_a);
         token_b.green_key.set(cell_b);
 
-        let mut compiled_loops: indexmap::IndexMap<u64, u64> = indexmap::IndexMap::new();
-        compiled_loops.insert(token_a.green_key(), token_a.number);
-        compiled_loops.insert(token_b.green_key(), token_b.number);
+        let mut compiled_loops: indexmap::IndexMap<u64, i64> = indexmap::IndexMap::new();
+        compiled_loops.insert(token_a.green_key(), token_a.number());
+        compiled_loops.insert(token_b.green_key(), token_b.number());
         assert_eq!(
             compiled_loops.len(),
             2,
@@ -7348,12 +6904,13 @@ mod tests {
         // Eviction of B reaches B's entry and leaves A's alone.
         assert_eq!(
             compiled_loops.swap_remove(&token_b.green_key()),
-            Some(token_b.number),
+            Some(token_b.number()),
             "the evicted token's own key must name its own entry",
         );
+        let token_a_number = token_a.number();
         assert_eq!(
             compiled_loops.get(&token_a.green_key()),
-            Some(&token_a.number),
+            Some(&token_a_number),
             "and the colliding sibling's artifact must survive it",
         );
     }
@@ -7366,7 +6923,7 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![1300, 1400]);
 
-        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
 
         assert!(
@@ -7518,15 +7075,14 @@ mod tests {
     #[test]
     fn a_latched_cell_whose_token_died_is_still_removed_from_the_chain() {
         let mut ws = WarmEnterState::new(2);
-        let token_num = ws.alloc_token_number();
         // Seen once, held no longer. `set_procedure_token` stores only a
         // weak handle (`_makeref`) and takes no ownership, and this fixture
         // registers the token with no owner, so the weakref is already dead
         // when `attach_procedure_to_interp` returns while the SLOT stays
         // `Some` — which is the state `has_seen_a_procedure_token` reads.
-        // Nulling the slot with `clear_loop_token` would instead erase the
-        // record and make the cell read as "never had a token".
-        ws.attach_procedure_to_interp(42, JitCellToken::new(token_num));
+        // Nulling the slot would erase the record and make the cell read as
+        // "never had a token".
+        ws.attach_procedure_to_interp(42, JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             ws.abort_tracing(42, false);
         }
@@ -7556,10 +7112,12 @@ mod tests {
     fn a_latched_typed_cell_whose_token_died_is_still_removed_from_the_chain() {
         let mut ws = WarmEnterState::new(2);
         let key = GreenKey::new(vec![7, 11]);
-        let token_num = ws.alloc_token_number();
-        ws.attach_procedure_to_interp_for_key(&key, JitCellToken::new(token_num));
+        ws.attach_procedure_to_interp_for_key(
+            &key,
+            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+        );
         for _ in 0..MAX_TRACE_ABORT_COUNT {
-            ws.abort_tracing_for_key(&key, false);
+            ws.abort_tracing(key.get_uhash(), false);
         }
         let cell = ws
             .get_cell_for_key(&key)
@@ -7587,14 +7145,14 @@ mod tests {
         let cell_key = 42u64;
         ws.ensure_cell_by_key(cell_key);
         assert!(
-            !ws.is_ceiling_latched(cell_key),
+            ws.get_cell(cell_key).unwrap().abort_count.get() < MAX_TRACE_ABORT_COUNT,
             "a fresh cell is not latched",
         );
 
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             ws.abort_tracing(cell_key, false);
         }
-        assert!(ws.is_ceiling_latched(cell_key));
+        assert!(ws.get_cell(cell_key).unwrap().abort_count.get() >= MAX_TRACE_ABORT_COUNT);
 
         let generation = ws.cell_generation();
         assert!(matches!(
@@ -7602,35 +7160,10 @@ mod tests {
             HotResult::NotHot
         ));
         assert_eq!(ws.cell_generation(), generation);
-        assert!(
-            ws.is_ceiling_latched(cell_key),
+        assert_eq!(
+            ws.get_cell(cell_key).unwrap().abort_count.get(),
+            MAX_TRACE_ABORT_COUNT,
             "the refusal did not consume the latch",
-        );
-    }
-
-    #[test]
-    fn a_dead_token_is_not_a_ceiling_latch_because_the_decision_cleans_it_up() {
-        let mut ws = WarmEnterState::new(2);
-        let key = GreenKey::new(vec![7, 11]);
-        let token_num = ws.alloc_token_number();
-        ws.attach_procedure_to_interp_for_key(&key, JitCellToken::new(token_num));
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            ws.abort_tracing_for_key(&key, false);
-        }
-        let cell = ws
-            .get_cell_for_key(&key)
-            .expect("fixture: the cell is still there");
-        assert!(
-            cell.abort_count.get() >= MAX_TRACE_ABORT_COUNT,
-            "fixture: the ceiling must be latched",
-        );
-        let cell_key = cell
-            .cell_key
-            .get()
-            .expect("fixture: the cell carries its key");
-        assert!(
-            !ws.is_ceiling_latched(cell_key),
-            "a dead token takes the cleanup path, so the decision does not refuse at the ceiling",
         );
     }
 
@@ -7640,8 +7173,7 @@ mod tests {
         let cell_key = 7u64;
         ws.ensure_cell_by_key(cell_key);
         let generation = ws.cell_generation();
-        let token_num = ws.alloc_token_number();
-        ws.attach_procedure_to_interp(cell_key, JitCellToken::new(token_num));
+        ws.attach_procedure_to_interp(cell_key, JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         assert_ne!(
             ws.cell_generation(),
             generation,
@@ -7708,12 +7240,12 @@ mod tests {
         }
     }
     #[test]
-    fn disable_unrolling_defaults_to_never_and_is_settable() {
+    fn disable_unrolling_defaults_to_parameters_and_is_settable() {
         let mut ws = WarmEnterState::new(3);
-        assert_eq!(ws.disable_unrolling_threshold(), u32::MAX);
+        assert_eq!(ws.disable_unrolling_threshold(), 200);
         ws.set_param("disable_unrolling", 6000);
         assert_eq!(ws.disable_unrolling_threshold(), 6000);
         ws.set_default_params();
-        assert_eq!(ws.disable_unrolling_threshold(), u32::MAX);
+        assert_eq!(ws.disable_unrolling_threshold(), 200);
     }
 }

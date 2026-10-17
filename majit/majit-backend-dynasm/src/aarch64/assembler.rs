@@ -5464,7 +5464,7 @@ impl<'a> AssemblerARM64<'a> {
         unsafe { Self::write_redirect_branch(old_addr as usize, new_addr as usize, false) };
         // `aarch64/assembler.py redirect_call_assembler`:
         // `jl.redirect_assembler(..., newlooptoken.number)`.
-        majit_backend::redirect_assembler(old, new, new.number);
+        majit_backend::redirect_assembler(old, new, new.number() as u64);
     }
 
     // genop_* — integer arithmetic
@@ -8350,7 +8350,7 @@ mod tests {
     ) -> (DynasmBackend, JitCellToken) {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let token = JitCellToken::new(trace_id);
+        let token = JitCellToken::new(trace_id as i64);
 
         let (word, armed, guard) = eval_breaker_poll_ops(word_addr, 0);
 
@@ -8620,7 +8620,7 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
-        let token = JitCellToken::new(trace_id);
+        let token = JitCellToken::new(trace_id as i64);
         backend
             .compile_loop(&inputargs, &[OpRc::new(barrier), OpRc::new(finish)], &token)
             .expect("compile COND_CALL_GC_WB_ARRAY trace");

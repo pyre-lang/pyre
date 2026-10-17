@@ -2665,6 +2665,10 @@ fn inlined_bridge_without_owner_loop_label_declines() {
     assert!(error.to_string().contains("no local loop LABEL"));
 }
 
+fn test_ca_token() -> std::sync::Arc<majit_backend::JitCellToken> {
+    std::sync::Arc::new(majit_backend::JitCellToken::new(0x5a5a))
+}
+
 /// A CALL_ASSEMBLER descr carrying a callee token, which the stock
 /// `SimpleCallDescr` cannot: its `call_target_token` answers `None`, and a
 /// merge declines on the missing token before it ever consults `ca.targets`.
@@ -2672,7 +2676,7 @@ fn inlined_bridge_without_owner_loop_label_declines() {
 struct TargetTokenCallDescr {
     arg_types: Vec<Type>,
     result_type: Type,
-    target_token: u64,
+    token: std::sync::Arc<majit_backend::JitCellToken>,
 }
 
 impl majit_ir::Descr for TargetTokenCallDescr {
@@ -2690,8 +2694,12 @@ impl majit_ir::Descr for TargetTokenCallDescr {
 }
 
 impl majit_ir::LoopTokenDescr for TargetTokenCallDescr {
-    fn loop_token_number(&self) -> u64 {
-        self.target_token
+    fn loop_token_number(&self) -> i64 {
+        self.token.number()
+    }
+
+    fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
+        Some(&self.token)
     }
 }
 
@@ -2708,8 +2716,8 @@ impl majit_ir::descr::CallDescr for TargetTokenCallDescr {
         8
     }
 
-    fn call_target_token(&self) -> Option<u64> {
-        Some(self.target_token)
+    fn call_target_token(&self) -> Option<i64> {
+        Some(self.token.number())
     }
 
     fn get_extra_info(&self) -> &EffectInfo {
@@ -2817,17 +2825,21 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
     /// `token` gives the op a callee the owner could in principle have an arm
     /// for; without it the merge declines on the missing token and never
     /// consults `ca.targets` at all.
-    fn region_ops(opcode: OpCode, result: OpRef, token: Option<u64>) -> Vec<Op> {
+    fn region_ops(
+        opcode: OpCode,
+        result: OpRef,
+        token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
+    ) -> Vec<Op> {
         let call = make_op(
             opcode,
             &[OpRef::input_arg_int(40), OpRef::input_arg_int(41)],
             result,
         );
-        if let Some(target_token) = token {
+        if let Some(token) = token {
             call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
                 arg_types: vec![Type::Int],
                 result_type: opcode.result_type(),
-                target_token,
+                token,
             }));
         }
         vec![
@@ -2854,12 +2866,16 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
     ] {
         for (case, token, ca) in [
             // No CA arm at all, so no table to consult.
-            ("no arm", Some(0x5a5a_u64), codegen::CaParams::default()),
+            (
+                "no arm",
+                Some(test_ca_token()),
+                codegen::CaParams::default(),
+            ),
             // The arm is emitted, but this callee is not one the owner
             // compiled against, so its geometry is absent from `ca.targets`.
             (
                 "arm without this callee",
-                Some(0x5a5a_u64),
+                Some(test_ca_token()),
                 codegen::CaParams {
                     emit_ca: true,
                     ..codegen::CaParams::default()
@@ -2885,13 +2901,13 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
 #[test]
 fn call_assembler_accepts_float_and_void_result_locals() {
     fn build(opcode: OpCode, result: OpRef, input_type: Type) -> Vec<u8> {
-        let token = 0x5a5a_u64;
+        let token = test_ca_token();
         let inputargs = vec![InputArg::from_type_rc(input_type, 0)];
         let call = make_op(opcode, &[OpRef::input_arg_typed(0, input_type)], result);
         call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
             arg_types: vec![input_type],
             result_type: opcode.result_type(),
-            target_token: token,
+            token: std::sync::Arc::clone(&token),
         }));
         let finish_args = (result != OpRef::NONE).then(|| rb(result));
         let ops = vec![
@@ -2929,7 +2945,7 @@ fn call_assembler_accepts_float_and_void_result_locals() {
             ca: codegen::CaParams {
                 emit_ca: true,
                 targets: HashMap::from([(
-                    token,
+                    token.identity_key(),
                     codegen::CaTarget {
                         dispatch_entry: 1024,
                     },
@@ -2963,7 +2979,7 @@ fn call_assembler_accepts_float_and_void_result_locals() {
 
 #[test]
 fn call_assembler_inlines_malloc_cond_varsize_frame() {
-    let token = 0x5a5a_u64;
+    let token = test_ca_token();
     let nursery_free = 0x1000_u32;
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let frame_ref = OpRef::int_op(2);
@@ -2976,7 +2992,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
         arg_types: vec![Type::Int],
         result_type: Type::Int,
-        target_token: token,
+        token: std::sync::Arc::clone(&token),
     }));
     let ops = vec![
         malloc,
@@ -3019,7 +3035,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         ca: codegen::CaParams {
             emit_ca: true,
             targets: HashMap::from([(
-                token,
+                token.identity_key(),
                 codegen::CaTarget {
                     dispatch_entry: 1024,
                 },
@@ -3145,7 +3161,7 @@ fn entry_prologue_does_not_null_unmarked_home_padding() {
 #[test]
 fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
     fn build(with_caller_gnf2: bool) -> Vec<u8> {
-        let token = 0x5a5a_u64;
+        let token = test_ca_token();
         let ca_pop_fn_ptr = 0x77_i64;
         let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
         let call = make_op(
@@ -3156,7 +3172,7 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
         call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
             arg_types: vec![Type::Int],
             result_type: Type::Int,
-            target_token: token,
+            token: std::sync::Arc::clone(&token),
         }));
         let mut ops = vec![call];
         if with_caller_gnf2 {
@@ -3195,7 +3211,7 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
             ca: codegen::CaParams {
                 emit_ca: true,
                 targets: HashMap::from([(
-                    token,
+                    token.identity_key(),
                     codegen::CaTarget {
                         dispatch_entry: 1024,
                     },

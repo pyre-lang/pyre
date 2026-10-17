@@ -11,7 +11,7 @@ fn signext(value: i64, numbytes: i64) -> i64 {
 }
 
 fn compiled_signext(backend: &mut DynasmBackend, token_id: u64, numbytes: i64, value: i64) -> i64 {
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let i0 = inputargs[0].opref();
     let sign = Op::new(

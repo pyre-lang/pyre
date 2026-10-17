@@ -13,7 +13,7 @@ use indexmap::{IndexMap, IndexSet};
 ///
 /// Reference: rpython/jit/backend/llsupport/rewrite.py GcRewriterAssembler.
 use majit_ir::Type;
-use majit_ir::descr::{DescrRef, FieldDescr, SizeDescr};
+use majit_ir::descr::{DescrRef, FieldDescr, LoopTokenDescr, SizeDescr};
 use majit_ir::forwarding::{Forwarded, ForwardingHost};
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
@@ -395,10 +395,11 @@ pub struct GcRewriterImpl {
     /// JitFrame info for call_assembler rewriting.
     /// rewrite.py — handle_call_assembler needs frame layout info.
     pub jitframe_info: Option<JitFrameDescrs>,
-    /// rewrite.py:673 — lookup compiled_loop_token._ll_initial_locs
-    /// by target token number. Provided by the backend.
+    /// rewrite.py `handle_call_assembler` — `loop_token.compiled_loop_token._ll_initial_locs`.
+    /// Upstream `op.getdescr()` IS the `JitCellToken`; the backend recovers
+    /// that object from `LoopTokenDescr::token_handle_any` and reads the CLT.
     pub call_assembler_callee_locs:
-        Option<Box<dyn Fn(u64) -> Option<CallAssemblerCalleeLocs> + Send>>,
+        Option<Box<dyn Fn(&dyn LoopTokenDescr) -> Option<CallAssemblerCalleeLocs> + Send>>,
     /// llmodel.py `load_supported_factors = (1,)` — the default for
     /// CPUs whose addressing mode only scales by one. x86 overrides this
     /// at `rpython/jit/backend/x86/runner.py:31` with `(1, 2, 4, 8)`.
@@ -3276,19 +3277,18 @@ impl GcRewriterImpl {
         let loop_token_descr = descr_arc
             .as_loop_token_descr()
             .expect("CallAssembler op must carry a loop-token descriptor");
-        let token = loop_token_descr.loop_token_number();
 
         // rewrite.py:673 — index_list = loop_token.compiled_loop_token._ll_initial_locs
         // RPython: compiled_loop_token is pre-allocated with the token;
         // frame_info pointer is stable. Recursive calls emit against either a
         // compiled token or a `compile_tmp_callback` token, so metadata must
         // already exist before the rewriter sees CALL_ASSEMBLER.
-        let callee_locs = lookup(token)
+        let callee_locs = lookup(loop_token_descr)
             .expect("CALL_ASSEMBLER target metadata must be registered before rewriter runs");
         if crate::majit_log_enabled() {
             eprintln!(
                 "[gc-rewrite][call-assembler] token={} frame_info_ptr=0x{:x} ll_initial_locs={:?} frame_depth={} index_of_virtualizable={}",
-                token,
+                loop_token_descr.loop_token_number(),
                 callee_locs.frame_info_ptr,
                 callee_locs._ll_initial_locs,
                 callee_locs.frame_depth,
@@ -5174,8 +5174,8 @@ mod tests {
             }
         }
         impl majit_ir::LoopTokenDescr for TestLoopToken {
-            fn loop_token_number(&self) -> u64 {
-                self.0
+            fn loop_token_number(&self) -> i64 {
+                self.0 as i64
             }
         }
 
@@ -5196,8 +5196,8 @@ mod tests {
             sign_size: 8,
             jf_frame_itemsize: 8,
         });
-        rw.call_assembler_callee_locs = Some(Box::new(|token| {
-            (token == 9).then_some(CallAssemblerCalleeLocs {
+        rw.call_assembler_callee_locs = Some(Box::new(|ltd| {
+            (ltd.loop_token_number() == 9).then_some(CallAssemblerCalleeLocs {
                 _ll_initial_locs: Vec::new(),
                 frame_depth: 4,
                 frame_info_ptr: 0x1000,
@@ -5278,8 +5278,8 @@ mod tests {
             }
         }
         impl majit_ir::LoopTokenDescr for TestLoopToken {
-            fn loop_token_number(&self) -> u64 {
-                self.0
+            fn loop_token_number(&self) -> i64 {
+                self.0 as i64
             }
         }
 
@@ -5299,8 +5299,8 @@ mod tests {
             sign_size: 4,
             jf_frame_itemsize: 8,
         });
-        rw.call_assembler_callee_locs = Some(Box::new(|token| {
-            (token == 9).then_some(CallAssemblerCalleeLocs {
+        rw.call_assembler_callee_locs = Some(Box::new(|ltd| {
+            (ltd.loop_token_number() == 9).then_some(CallAssemblerCalleeLocs {
                 _ll_initial_locs: vec![8, 16, 24],
                 frame_depth: 4,
                 frame_info_ptr: 0x1000,

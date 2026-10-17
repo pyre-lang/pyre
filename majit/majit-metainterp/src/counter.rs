@@ -227,8 +227,8 @@ impl JitCounterInner {
         }
     }
 
-    /// TODO: no RPython counterpart. Read-only peek
-    /// used by warmstate's cold fast path to avoid GreenKey allocation.
+    /// Test-only read of what `tick` would answer, without counting.
+    #[cfg(test)]
     pub fn would_tick_fire(&self, hash: u64, increment: f64) -> bool {
         let elapsed = DECAY_GENERATION
             .load(Ordering::Relaxed)
@@ -269,9 +269,8 @@ impl JitCounterInner {
         //
         // Each JitCounter keeps its own last-seen generation because JIT_DRIVER
         // is thread-local, giving each mutator thread its own counter.
-        // Every elapsed interval is applied before every mutating table access;
-        // would_tick_fire decay-adjusts its read. A value written after a
-        // collection is therefore not retro-decayed.
+        // Every elapsed interval is applied before every mutating table access.
+        // A value written after a collection is therefore not retro-decayed.
         self.apply_pending_decay();
 
         let index = self._get_index(hash);
@@ -604,8 +603,8 @@ impl JitCounter {
         JitCounterInner::_swap(entry, n)
     }
 
-    /// TODO: no RPython counterpart. Read-only peek
-    /// used by warmstate's cold fast path to avoid GreenKey allocation.
+    /// Test-only read of what `tick` would answer, without counting.
+    #[cfg(test)]
     pub fn would_tick_fire(&self, hash: u64, increment: f64) -> bool {
         self.inner.borrow().would_tick_fire(hash, increment)
     }

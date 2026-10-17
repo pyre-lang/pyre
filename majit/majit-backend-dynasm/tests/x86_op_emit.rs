@@ -34,7 +34,7 @@ use majit_ir::{
 fn compile_and_run_int(opcode: OpCode, extra: Option<i64>, input: i64, token_id: u64) -> i64 {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let i0 = inputargs[0].opref();
     let mut args = vec![rb(i0)];
@@ -59,7 +59,7 @@ fn compile_and_run_int(opcode: OpCode, extra: Option<i64>, input: i64, token_id:
 fn compile_float(opcode: OpCode, token_id: u64) -> (DynasmBackend, JitCellToken) {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
     let i0 = inputargs[0].opref();
     let body = Op::new(opcode, &[rb(i0)]);
@@ -111,7 +111,7 @@ fn gc_world(token_id: u64) -> (GcWorld, JitCellToken) {
     let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
     majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
     backend.set_gc_allocator(Box::new(gc));
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     (
         GcWorld {
             backend,
@@ -298,9 +298,9 @@ fn guard_subclass_typeid_range() {
     );
 }
 
-fn next_token_id() -> u64 {
+fn next_token_id() -> i64 {
     static NEXT: AtomicU64 = AtomicU64::new(0x00D4_0001);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    NEXT.fetch_add(1, Ordering::Relaxed) as i64
 }
 
 fn fresh_backend() -> DynasmBackend {
@@ -1904,8 +1904,8 @@ impl Descr for AssemblerLoopDescr {
 }
 
 impl LoopTokenDescr for AssemblerLoopDescr {
-    fn loop_token_number(&self) -> u64 {
-        self.token.number
+    fn loop_token_number(&self) -> i64 {
+        self.token.number()
     }
 
     fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
@@ -4299,7 +4299,7 @@ fn flush_cc_materializes_every_condition() {
         (OpCode::UintGe, 1, -1, 0),
     ];
     for (op, input, rhs, expected) in cases {
-        let got = compile_and_run_int(op, Some(rhs), input, next_token_id());
+        let got = compile_and_run_int(op, Some(rhs), input, next_token_id() as u64);
         assert_eq!(got, expected, "{op:?}({input}, {rhs})");
     }
 }
@@ -4411,7 +4411,7 @@ fn finish_returns_ref_and_float() {
 #[test]
 fn jump_to_another_loop_target_token() {
     let mut backend = fresh_backend();
-    let unresolved = make_loop_target_descr(next_token_id(), false);
+    let unresolved = make_loop_target_descr(next_token_id() as u64, false);
     let jump = Op::new(OpCode::Jump, &[]);
     jump.pos().set(OpRef::void_op(1));
     jump.setdescr(unresolved);
@@ -4425,7 +4425,7 @@ fn jump_to_another_loop_target_token() {
         "{err}"
     );
 
-    let descr = make_loop_target_descr(next_token_id(), false);
+    let descr = make_loop_target_descr(next_token_id() as u64, false);
     let target = JitCellToken::new(next_token_id());
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let i0 = inputargs[0].opref();

@@ -381,7 +381,7 @@ fn build_magic_div_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
 
     let mut backend = CraneliftBackend::new();
 
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     backend
         .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
@@ -415,7 +415,7 @@ fn build_magic_mod_trace(m: i64, token_id: u64) -> (CraneliftBackend, JitCellTok
 
     let mut backend = CraneliftBackend::new();
 
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     backend
         .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");
@@ -449,7 +449,7 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
 
     let mut backend = CraneliftBackend::new();
 
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     backend
         .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("compilation should succeed");

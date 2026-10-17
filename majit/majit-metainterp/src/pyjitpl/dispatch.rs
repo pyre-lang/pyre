@@ -2341,13 +2341,16 @@ where
             mp_opcode_pc,
             /* after_residual_call */ false,
         );
-        // pyjitpl.py:1633-1636 `exception_box = ConstInt(ptr2int(
-        // llexception.typeptr))` — the AssertionError type pointer the
-        // unreachable FINISH escapes with.  The op sits behind a guard that
-        // always fails, so pyre records the placeholder `ConstInt(0)`
-        // instead of resolving a type pointer for a value nothing reads.
-        // Both arms below take this same box, as upstream does.
-        let exception_box = ctx.const_int(0);
+        // pyjitpl.py `_create_segmented_trace_and_blackhole`:
+        // `exception_box = ConstInt(ptr2int(llexception.typeptr))` from
+        // `jitexc.get_llexception` / `jitexc._get_standard_error`.
+        // Unset host hook keeps ConstInt(0).
+        let typeptr = ctx
+            .metainterp_sd()
+            .host
+            .assertion_error_typeptr
+            .map_or(0, |f| f());
+        let exception_box = ctx.const_int(typeptr);
         // pyjitpl.py:1639-1640 `if (metainterp.current_merge_points and
         // isinstance(metainterp.resumekey, compile.ResumeFromInterpDescr)):`
         // — a trace that owns a merge point and entered from the
@@ -7398,7 +7401,10 @@ mod tests {
 
     /// `BC_CALL_ASSEMBLER_VOID` with `num_args == 0` and descr 0 naming
     /// `concrete_ptr`. One ref register holds the virtualizable.
-    fn call_assembler_void_jitcode(concrete_ptr: *const ()) -> JitCode {
+    fn call_assembler_void_jitcode(
+        token: Option<&std::sync::Arc<majit_backend::JitCellToken>>,
+        concrete_ptr: *const (),
+    ) -> JitCode {
         let mut startpoints = indexmap::IndexSet::new();
         startpoints.insert(0usize);
         let mut jitcode = JitCode::new("call_assembler_void");
@@ -7414,9 +7420,11 @@ mod tests {
             startpoints: Some(startpoints),
             ..Default::default()
         });
-        jitcode.exec.descrs = vec![crate::jitcode::RuntimeBhDescr::AssemblerToken(
-            crate::jitcode::JitCallAssemblerTarget::new(7, concrete_ptr),
-        )];
+        let target = match token {
+            Some(tok) => crate::jitcode::JitCallAssemblerTarget::new(tok, concrete_ptr),
+            None => crate::jitcode::JitCallAssemblerTarget::unresolved(concrete_ptr),
+        };
+        jitcode.exec.descrs = vec![crate::jitcode::RuntimeBhDescr::AssemblerToken(target)];
         jitcode
     }
 
@@ -7432,6 +7440,7 @@ mod tests {
     fn trace_call_assembler_void<R: JitCodeRuntime>(
         concrete_ptr: *const (),
         runtime: &R,
+        token: Option<&std::sync::Arc<majit_backend::JitCellToken>>,
     ) -> (TraceAction, crate::virtualizable::VableToken, Vec<OpCode>) {
         #[repr(C)]
         struct VableObj {
@@ -7442,7 +7451,7 @@ mod tests {
         let info = VirtualizableInfo::new(0).finalize_arc(majit_ir::descr::make_size_descr(
             std::mem::size_of::<VableObj>(),
         ));
-        let jitcode = call_assembler_void_jitcode(concrete_ptr);
+        let jitcode = call_assembler_void_jitcode(token, concrete_ptr);
         let asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut ctx = context_with_liveness(&[Type::Ref], &asm);
         ctx.install_virtualizable_info(info.clone());
@@ -7485,7 +7494,7 @@ mod tests {
     #[test]
     fn call_assembler_void_null_target_aborts_without_vable_token() {
         let (action, token, opcodes) =
-            trace_call_assembler_void(std::ptr::null(), &LabelOnlyRuntime);
+            trace_call_assembler_void(std::ptr::null(), &LabelOnlyRuntime, None);
         assert!(
             matches!(action, TraceAction::Abort),
             "null CALL_ASSEMBLER target must abort, got {action:?}"
@@ -7515,13 +7524,6 @@ mod tests {
         fn label_at(&self, _pc: usize) -> usize {
             0
         }
-
-        fn jitcell_token_arc_for_number(
-            &self,
-            token_number: u64,
-        ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-            (token_number == self.token.number).then(|| self.token.clone())
-        }
     }
 
     /// A host walk-abort is latched during the call, after the stamp.
@@ -7533,8 +7535,11 @@ mod tests {
         let runtime = AssemblerTokenRuntime {
             token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
         };
-        let (action, token, opcodes) =
-            trace_call_assembler_void(call_assembler_void_host_abort as *const (), &runtime);
+        let (action, token, opcodes) = trace_call_assembler_void(
+            call_assembler_void_host_abort as *const (),
+            &runtime,
+            Some(&runtime.token),
+        );
         assert!(
             CALL_ASSEMBLER_VOID_HOST_ABORT_RAN.with(|ran| ran.get()),
             "the concrete void target must run before the host abort"

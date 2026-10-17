@@ -4073,20 +4073,16 @@ pub trait LoopTargetDescr: Descr {
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
 
     /// `history.py self.original_jitcell_token = original_jitcell_token`.
-    /// The owning JitCellToken's `number` for this TargetToken — set by
-    /// `compile.py:237` / `compile.py:289` once the freshly-made JitCellToken
-    /// is bound to the loop. Returns `None` for a TargetToken constructed
-    /// before the owner exists (the preamble sentinel at
-    /// `unroll.rs`'s `TargetToken::new_preamble(0)`); `record_loop_or_bridge`
-    /// (`compile.py:197-199`) must then leave this JUMP branch unhandled.
-    ///
-    /// Production `history.rs` `LoopTargetDescr` also stores the token
-    /// object (as a Weak; see `original_jitcell_token_handle`). The number
-    /// remains the dense identity `unroll.rs` compares without upgrading.
-    fn original_jitcell_token_number(&self) -> Option<u64> {
+    /// The owning JitCellToken's log-only `number` for this TargetToken —
+    /// set by `compile.py compile_simple_loop` / `compile.py compile_loop`
+    /// once the freshly-made JitCellToken is bound to the loop. Returns
+    /// `None` for a TargetToken constructed before the owner exists (the
+    /// preamble sentinel at `unroll.rs`'s `TargetToken::new_preamble(0)`).
+    /// Production identity is [`Self::original_jitcell_token_handle`].
+    fn original_jitcell_token_number(&self) -> Option<i64> {
         None
     }
-    fn set_original_jitcell_token_number(&self, _num: u64) {}
+    fn set_original_jitcell_token_number(&self, _num: i64) {}
 
     /// `history.py TargetToken.original_jitcell_token`.
     ///
@@ -4128,7 +4124,7 @@ struct BasicLoopTargetDescrState {
     target_arglocs: Vec<TargetArgLoc>,
     /// `history.py:493 self.original_jitcell_token`. Backfilled at
     /// compile-time once the owning JitCellToken is created.
-    original_jitcell_token_number: Option<u64>,
+    original_jitcell_token_number: Option<i64>,
     /// The owner object itself, weak for the reason given on
     /// `LoopTargetDescr::original_jitcell_token_handle`.
     original_jitcell_token: Option<std::sync::Weak<dyn std::any::Any + Send + Sync>>,
@@ -4253,11 +4249,11 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
         self.state.lock().target_arglocs = arglocs;
     }
 
-    fn original_jitcell_token_number(&self) -> Option<u64> {
+    fn original_jitcell_token_number(&self) -> Option<i64> {
         self.state.lock().original_jitcell_token_number
     }
 
-    fn set_original_jitcell_token_number(&self, num: u64) {
+    fn set_original_jitcell_token_number(&self, num: i64) {
         self.state.lock().original_jitcell_token_number = Some(num);
     }
 
@@ -5207,31 +5203,6 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Pyre-only per-emission failure counter.  PyPy carries the
-    /// equivalent jitcounter hash in the per-descr `status` slot
-    /// (`compile.py` `AbstractResumeGuardDescr._attrs_ =
-    /// ('status',)`) — both `ResumeGuardDescr` and
-    /// `ResumeGuardCopiedDescr` get their own status by inheritance
-    /// from `AbstractResumeGuardDescr`.  Pyre's counter follows the
-    /// same per-emission classification.  Default returns 0 for
-    /// descrs that never compile bridges.
-    fn fail_count(&self) -> u32 {
-        0
-    }
-
-    /// Pyre-only per-emission failure-count increment.  Returns the
-    /// post-increment value.  Default panics — only Resume-family
-    /// guards carry the counter (`compile.py:683`
-    /// `AbstractResumeGuardDescr._attrs_ = ('status',)`).  Callers
-    /// must gate by `is_resume_guard() || is_resume_guard_copied()`.
-    fn increment_fail_count(&self) -> u32 {
-        panic!(
-            "increment_fail_count invoked on a FailDescr that does not \
-             carry a fail_count slot (compile.py:683 `_attrs_` only on \
-             AbstractResumeGuardDescr / ResumeGuardCopiedDescr)"
-        );
-    }
-
     /// Pyre-only per-emission `CompiledTraceInfo` slot.  Returned as
     /// `Arc<dyn Any + Send + Sync>` so the trait can live in
     /// `majit-ir` without depending on `majit-backend`'s
@@ -6177,9 +6148,9 @@ pub trait CallDescr: Descr {
         true
     }
 
-    /// Target compiled loop token for `CALL_ASSEMBLER_*`, if this call
-    /// descriptor represents a nested JIT-to-JIT call.
-    fn call_target_token(&self) -> Option<u64> {
+    /// Log-only `JitCellToken.number` for `CALL_ASSEMBLER_*`. Production
+    /// identity is `LoopTokenDescr::token_handle_any`.
+    fn call_target_token(&self) -> Option<i64> {
         None
     }
 
@@ -6270,8 +6241,9 @@ pub trait SwitchDescr: Descr {
 /// (`rewrite.py assert isinstance(loop_token, JitCellToken)`), so the
 /// token-specific queries live outside generic `CallDescr`.
 pub trait LoopTokenDescr: Descr {
-    /// history.py `JitCellToken.number`.
-    fn loop_token_number(&self) -> u64;
+    /// history.py `JitCellToken.number` — log-only. Production identity is
+    /// [`Self::token_handle_any`].
+    fn loop_token_number(&self) -> i64;
 
     /// rewrite.py:685-689 `jd.index_of_virtualizable`.
     fn call_virtualizable_index(&self) -> Option<usize> {

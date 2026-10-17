@@ -10,7 +10,7 @@
 //! * [`GenEntrySym`] — the merge-point banks of the portal: `gen`, `w_arg`.
 //! * [`GenEntryJitState`] — `Meta = PyreMeta`, `Sym = GenEntrySym`, `Env = PyreEnv`.
 
-use majit_ir::{GcRef, OpRef, Type, Value};
+use majit_ir::{GcRef, GreenKey, GreenType, OpRef, Type, Value};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 
 use crate::state::{PyreEnv, PyreMeta};
@@ -64,11 +64,19 @@ pub struct GenEntryJitState {
 /// is a different `JitCell` (`warmstate.py`).
 pub const GENERATORENTRY_JD_INDEX: i64 = 2;
 
+/// jd2 greens `(pycode, driver index)` as a `GreenKey`.
+pub fn genentry_green_key(pycode: PyObjectRef) -> GreenKey {
+    GreenKey::with_types(
+        vec![pycode as i64, GENERATORENTRY_JD_INDEX],
+        vec![GreenType::Ref, GreenType::Int],
+    )
+}
+
 /// Hash of the jd2 greens `(pycode, driver index)`.
 pub fn genentry_green_hash(pycode: PyObjectRef) -> u64 {
     majit_metainterp::green_key_hash_typed(
         &[pycode as i64, GENERATORENTRY_JD_INDEX],
-        &[majit_ir::GreenType::Ref, majit_ir::GreenType::Int],
+        &[GreenType::Ref, GreenType::Int],
     )
 }
 
@@ -79,12 +87,7 @@ pub fn genentry_resolved_cell_key(
     pycode: PyObjectRef,
 ) -> u64 {
     let hash = genentry_green_hash(pycode);
-    warm.resolve_cell_key(hash, || {
-        majit_ir::GreenKey::with_types(
-            vec![pycode as i64, GENERATORENTRY_JD_INDEX],
-            vec![majit_ir::GreenType::Ref, majit_ir::GreenType::Int],
-        )
-    })
+    warm.resolve_cell_key(hash, || genentry_green_key(pycode))
 }
 
 /// Reds in merge-point bank order (red R: `gen`, `w_arg`).
@@ -164,7 +167,6 @@ impl JitState for GenEntryJitState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::{GreenKey, GreenType};
     use majit_metainterp::warmstate::WarmEnterState;
 
     #[test]
@@ -178,10 +180,7 @@ mod tests {
         let pycode = 0x51ED as PyObjectRef;
         let hash = genentry_green_hash(pycode);
         jd2.disable_noninlinable_function(hash);
-        let typed = GreenKey::with_types(
-            vec![pycode as i64, GENERATORENTRY_JD_INDEX],
-            vec![GreenType::Ref, GreenType::Int],
-        );
+        let typed = genentry_green_key(pycode);
         let minted = jd2.ensure_cell_key(&typed);
         assert_ne!(
             minted, hash,

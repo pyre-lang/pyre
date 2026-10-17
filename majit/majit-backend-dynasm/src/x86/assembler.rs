@@ -197,7 +197,7 @@ mod tests {
     ) -> (DynasmBackend, JitCellToken) {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut token = JitCellToken::new(trace_id);
+        let mut token = JitCellToken::new(trace_id as i64);
 
         let word = OpRc::new(Op::with_descr(
             OpCode::RawLoadI,
@@ -554,7 +554,7 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
-        let token = JitCellToken::new(trace_id);
+        let token = JitCellToken::new(trace_id as i64);
         backend
             .compile_loop(&inputargs, &[OpRc::new(barrier), OpRc::new(finish)], &token)
             .expect("compile COND_CALL_GC_WB_ARRAY trace");
@@ -7597,7 +7597,11 @@ impl<'a> Assembler386<'a> {
         // `x86/assembler.py redirect_call_assembler`:
         // `asm_adr = newlooptoken._ll_raw_start`.
         let raw = new.ll_raw_start();
-        let asm_adr = if raw != 0 { raw as u64 } else { new.number };
+        let asm_adr = if raw != 0 {
+            raw as u64
+        } else {
+            new.number() as u64
+        };
         majit_backend::redirect_assembler(old, new, asm_adr);
     }
 

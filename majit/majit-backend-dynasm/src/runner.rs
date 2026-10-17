@@ -42,9 +42,8 @@ use crate::x86::cpu_ext::X86CpuExt as ArchCpuExt;
 /// RPython stores `descr._ll_function_addr` on the target token
 /// (x86/assembler.py:599) so `CALL_ASSEMBLER` can resolve the callee
 /// address directly from the descriptor. pyre identifies callee tokens
-/// by `u64 token_number` inside `MetaCallAssemblerDescr` (pyre PRE-
-/// EXISTING-ADAPTATION — serializable descriptors), so a process-wide
-/// `token_number -> DynasmCaTarget` index is required.
+/// by `JitCellToken` object identity (`identity_key`), so a per-thread
+/// `identity_key -> DynasmCaTarget` index is required.
 ///
 /// Each entry retains a `Weak` to the callee's `CompiledLoopToken` so
 /// `handle_call_assembler` (rewrite.py) can sample
@@ -76,13 +75,13 @@ thread_local! {
     /// at compile time (the resolved address is baked into the code), so
     /// thread-local scope never narrows what production (single-threaded) can
     /// reach.
-    static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<u64, DynasmCaTarget, rustc_hash::FxBuildHasher>> =
+    static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<usize, DynasmCaTarget, rustc_hash::FxBuildHasher>> =
         const { RefCell::new(IndexMap::with_hasher(rustc_hash::FxBuildHasher)) };
 }
 
-fn unregister_dynasm_ca_target(number: u64) {
+fn unregister_dynasm_ca_target(token_key: usize) {
     let _ = CALL_ASSEMBLER_TARGETS.try_with(|cell| {
-        cell.borrow_mut().swap_remove(&number);
+        cell.borrow_mut().swap_remove(&token_key);
     });
 }
 
@@ -90,11 +89,11 @@ fn unregister_dynasm_ca_target(number: u64) {
 /// lookup, sourced from the registered `DynasmCaTarget`'s CLT Arc.
 /// Mirrors `majit-backend-cranelift::compiler.rs`.
 pub(crate) fn lookup_call_assembler_callee_locs(
-    token_number: u64,
+    token_key: usize,
 ) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
     CALL_ASSEMBLER_TARGETS.with(|cell| {
         let guard = cell.borrow();
-        let target = guard.get(&token_number)?;
+        let target = guard.get(&token_key)?;
         let clt = target.compiled_loop_token.upgrade()?;
         // `JitFrameInfo` is `#[repr(C)]` and the Arc keeps the allocation
         // pinned, matching cranelift's `compiler.rs` pattern.
@@ -2480,8 +2479,10 @@ impl DynasmBackend {
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs +
             // ptr2int(compiled_loop_token.frame_info), both sourced from the
             // CLT Arc on the registered DynasmCaTarget (model.py:292-338).
-            call_assembler_callee_locs: Some(Box::new(|token_number| {
-                lookup_call_assembler_callee_locs(token_number)
+            call_assembler_callee_locs: Some(Box::new(|ltd| {
+                ltd.token_handle_any()
+                    .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
+                    .and_then(|token| lookup_call_assembler_callee_locs(token.identity_key()))
             })),
             // x86/runner.py:31 `load_supported_factors = (1, 2, 4, 8)`
             // vs llmodel.py:39 default `(1,)` used by the aarch64
@@ -2774,30 +2775,26 @@ impl DynasmBackend {
     /// `_ll_function_addr` after the loop is fully assembled and retain the
     /// compiled-loop metadata for GC rewrite callbacks.
     fn register_call_assembler_target(token: &JitCellToken, code_addr: usize) {
-        let token_number = token.number;
+        let token_key = token.identity_key();
         let index_of_virtualizable = token.virtualizable_arg_index().map_or(-1_i32, |i| i as i32);
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm][ca-target] register token={} addr=0x{:x}",
-                token_number, code_addr
+                token.number(),
+                code_addr
             );
         }
         CALL_ASSEMBLER_TARGETS.with(|cell| {
             let mut guard = cell.borrow_mut();
-            match guard.get_mut(&token_number) {
+            match guard.get_mut(&token_key) {
                 Some(existing) => {
                     existing.code_addr = code_addr;
-                    // Re-register keeps the token's own CLT; a Weak
-                    // here must not resurrect a dropped token.
-                    if let Some(clt) = existing.compiled_loop_token.upgrade() {
-                        token.set_compiled_loop_token(Some(clt));
-                    }
                 }
                 None => {
                     let clt = token.compiled_loop_token_expect();
-                    clt.set_ca_unregister(unregister_dynasm_ca_target);
+                    clt.set_ca_unregister(token_key, unregister_dynasm_ca_target);
                     guard.insert(
-                        token_number,
+                        token_key,
                         DynasmCaTarget {
                             code_addr,
                             compiled_loop_token: Arc::downgrade(&clt),
@@ -2809,15 +2806,15 @@ impl DynasmBackend {
         });
     }
 
-    fn redirect_call_assembler_target(old_number: u64, new_addr: usize) {
+    fn redirect_call_assembler_target(old_key: usize, new_addr: usize) {
         if crate::majit_log_enabled() {
             eprintln!(
-                "[dynasm][ca-target] redirect token={} addr=0x{:x}",
-                old_number, new_addr
+                "[dynasm][ca-target] redirect token_key={} addr=0x{:x}",
+                old_key, new_addr
             );
         }
         CALL_ASSEMBLER_TARGETS.with(|cell| {
-            if let Some(existing) = cell.borrow_mut().get_mut(&old_number) {
+            if let Some(existing) = cell.borrow_mut().get_mut(&old_key) {
                 existing.code_addr = new_addr;
             }
         });
@@ -4238,7 +4235,7 @@ impl Backend for DynasmBackend {
     /// fail-descr cells it pins — would live for the entire process
     /// lifetime.  Drop the entry so the Arc chain unwinds.
     fn free_loop(&mut self, token: &JitCellToken) {
-        unregister_dynasm_ca_target(token.number);
+        unregister_dynasm_ca_target(token.identity_key());
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
@@ -4336,7 +4333,7 @@ impl Backend for DynasmBackend {
         let old_addr = old_compiled.entry_ptr();
         let new_addr = new_compiled.entry_ptr();
         Asm::redirect_call_assembler(old, new, old_addr, new_addr);
-        Self::redirect_call_assembler_target(old.number, new_addr as usize);
+        Self::redirect_call_assembler_target(old.identity_key(), new_addr as usize);
         Ok(())
     }
 

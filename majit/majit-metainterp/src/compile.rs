@@ -49,11 +49,12 @@ use crate::trace_ctx::{MergePoint, TraceCtx};
 ///     return jitcell_token
 /// ```
 ///
-/// Pyre takes `number` separately because `JitCellToken::new(number)`
-/// requires a unique number allocated up-front (RPython relies on
-/// `__init__` increment of `_GLOBAL_NUMBER_OF_TOKENS`; pyre uses
-/// `WarmEnterState::alloc_token_number` for the same purpose).  The
-/// `outermost_jitdriver_index: Option<usize>` is the pyre analog of
+/// The token is created unnumbered (`history.py JitCellToken.number = -1`).
+/// `compile.py send_loop_to_backend` assigns
+/// `metainterp_sd.jitlog.trace_id` immediately before `cpu.compile_loop`.
+/// `compile_tmp_callback` leaves the number unassigned.
+///
+/// The `outermost_jitdriver_index: Option<usize>` is the pyre analog of
 /// RPython's `outermost_jitdriver_sd` attribute (pyre stores a slot
 /// index into `metainterp_sd.jitdrivers_sd` instead of a direct
 /// reference, since the descriptor lives in another crate).
@@ -62,9 +63,9 @@ use crate::trace_ctx::{MergePoint, TraceCtx};
 /// mutate the token before it is cloned with `Arc::get_mut`, then pass
 /// the same Arc through `compile_loop` (`compile.py`) →
 /// `attach_procedure_to_interp` (`compile.py`) →
-/// `MemoryManager.keep_loop_alive` (`compile.py:567`/`:1149`).
-pub fn make_jitcell_token(number: u64, jd_index: Option<usize>) -> Arc<JitCellToken> {
-    let mut token = JitCellToken::new(number);
+/// `MemoryManager.keep_loop_alive`.
+pub fn make_jitcell_token(jd_index: Option<usize>) -> Arc<JitCellToken> {
+    let mut token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
     token.outermost_jitdriver_index = jd_index;
     Arc::new(token)
 }
@@ -1756,11 +1757,11 @@ pub(crate) fn normalize_closing_jump_args(
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     num_inputs: usize,
 ) -> Vec<majit_ir::OpRc> {
-    let Some((label_args, label_descr_index)) = ops
+    let Some((label_args, label_descr)) = ops
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label)
-        .map(|op| (op.getarglist(), op.getdescr().map(|descr| descr.index())))
+        .map(|op| (op.getarglist(), op.getdescr()))
     else {
         return ops;
     };
@@ -1785,7 +1786,9 @@ pub(crate) fn normalize_closing_jump_args(
     // exactly this reason). Slot `idx` then names a different live value in
     // each list, and rewriting it lands the trailing label's value in an
     // unrelated target slot.
-    if jump.getdescr().map(|descr| descr.index()) != label_descr_index {
+    if jump.getdescr().as_ref().map(majit_ir::descr_identity)
+        != label_descr.as_ref().map(majit_ir::descr_identity)
+    {
         return ops;
     }
 
@@ -2355,7 +2358,6 @@ pub fn make_and_attach_done_descrs(targets: &mut [&mut dyn DescrContainer]) {
 pub fn compile_tmp_callback(
     backend: &mut dyn Backend,
     jitdriver_sd: &crate::jitdriver::JitDriverStaticData,
-    token_number: u64,
     green_key: u64,
     greenboxes: &[Value],
     red_arg_types: &[Type],
@@ -2399,11 +2401,13 @@ pub fn compile_tmp_callback(
     //
     // `compile.py` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
     // is set inside `make_jitcell_token`.
-    let jitcell_token = make_jitcell_token(token_number, jitdriver_sd.index);
+    //
+    // `compile.py compile_tmp_callback` leaves `JitCellToken.number == -1`.
+    let jitcell_token = make_jitcell_token(jitdriver_sd.index);
     // compile.py: `jl.tmp_callback(jitcell_token)` after make_jitcell_token.
     crate::rjitlog::tmp_callback(
         std::sync::Arc::as_ptr(&jitcell_token) as *const () as u64,
-        token_number,
+        jitcell_token.number() as u64,
     );
     // `green_key` / `virtualizable_arg_index` are interior-mutable (`Cell`),
     // so they are written through the shared `Arc` directly.
@@ -2603,7 +2607,7 @@ mod tests {
         use majit_ir::OpRc;
 
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        let build = |label_descr_index: u64, jump_descr_index: u64| {
+        let build = |label_descr: majit_ir::DescrRef, jump_descr: majit_ir::DescrRef| {
             let mut label = Op::new(
                 OpCode::Label,
                 &[
@@ -2612,7 +2616,7 @@ mod tests {
                     rooted_resop_operand(Type::Ref, 22),
                 ],
             );
-            label.setdescr(majit_ir::make_loop_target_descr(label_descr_index, false));
+            label.setdescr(label_descr);
             let mut jump = Op::new(
                 OpCode::Jump,
                 &[
@@ -2621,7 +2625,7 @@ mod tests {
                     rooted_resop_operand(Type::Ref, 52),
                 ],
             );
-            jump.setdescr(majit_ir::make_loop_target_descr(jump_descr_index, false));
+            jump.setdescr(jump_descr);
             vec![OpRc::new(label), OpRc::new(jump)]
         };
         let jump_args = |ops: &[OpRc]| -> Vec<OpRef> {
@@ -2631,18 +2635,39 @@ mod tests {
                 .unwrap()
         };
 
-        // Same token: the JUMP feeds this LABEL slot for slot, so an arg with
-        // no definition in the trace is repaired from it.
-        let same = normalize_closing_jump_args(build(2, 2), &constants, 8);
+        // Same token object: the JUMP feeds this LABEL slot for slot, so an
+        // arg with no definition in the trace is repaired from it.
+        let same_token = majit_ir::make_loop_target_descr(2, false);
+        let same = normalize_closing_jump_args(
+            build(same_token.clone(), same_token.clone()),
+            &constants,
+            8,
+        );
         assert_eq!(
             jump_args(&same),
             vec![OpRef::ref_op(20), OpRef::ref_op(21), OpRef::ref_op(22)]
         );
 
         // Foreign token: the JUMP already carries that token's argument order.
-        let foreign = normalize_closing_jump_args(build(2, 1), &constants, 8);
+        let local = majit_ir::make_loop_target_descr(2, false);
+        let foreign = normalize_closing_jump_args(
+            build(local.clone(), majit_ir::make_loop_target_descr(1, false)),
+            &constants,
+            8,
+        );
         assert_eq!(
             jump_args(&foreign),
+            vec![OpRef::ref_op(50), OpRef::ref_op(51), OpRef::ref_op(52)]
+        );
+
+        // Same `Descr::index`, distinct objects: still a foreign JUMP.
+        let same_index_distinct = normalize_closing_jump_args(
+            build(local, majit_ir::make_loop_target_descr(2, false)),
+            &constants,
+            8,
+        );
+        assert_eq!(
+            jump_args(&same_index_distinct),
             vec![OpRef::ref_op(50), OpRef::ref_op(51), OpRef::ref_op(52)]
         );
     }
@@ -3413,7 +3438,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         bridge_declined_terminally: AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
@@ -3497,7 +3521,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         bridge_declined_terminally: AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
@@ -3783,12 +3806,6 @@ impl FailDescr for ResumeAtPositionDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn fail_count(&self) -> u32 {
-        FailDescr::fail_count(&self.inner)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        FailDescr::increment_fail_count(&self.inner)
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         FailDescr::trace_info_any(&self.inner)
     }
@@ -3839,7 +3856,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
@@ -4054,16 +4070,6 @@ impl ResumeGuardForcedDescr {
         let _cc = crate::CriticalCodeGuard::enter();
         body();
     }
-
-    /// compile.py `ResumeGuardForcedDescr.handle_fail`.
-    ///
-    /// `hidden_all_virtuals = cpu.get_savedata_ref(deadframe)` then
-    /// `AllVirtuals.show`. An empty cache is the miss arm that still
-    /// blackholes (`VirtualCache([], [])`).
-    #[allow(dead_code)] // compile.py ResumeGuardForcedDescr.handle_fail
-    pub fn handle_fail_savedata(savedata: Option<majit_ir::GcRef>) -> Option<(Vec<i64>, Vec<i64>)> {
-        AllVirtuals::show(savedata?)
-    }
 }
 
 impl FailDescr for ResumeGuardForcedDescr {
@@ -4213,12 +4219,6 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn fail_count(&self) -> u32 {
-        FailDescr::fail_count(&self.inner)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        FailDescr::increment_fail_count(&self.inner)
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         FailDescr::trace_info_any(&self.inner)
     }
@@ -4269,7 +4269,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
@@ -4477,12 +4476,6 @@ impl FailDescr for ResumeGuardExcDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn fail_count(&self) -> u32 {
-        FailDescr::fail_count(&self.inner)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        FailDescr::increment_fail_count(&self.inner)
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         FailDescr::trace_info_any(&self.inner)
     }
@@ -4533,7 +4526,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
@@ -4625,13 +4617,6 @@ pub struct ResumeGuardCopiedDescr {
     /// copy guards the same back edge as its donor, so the optimizer stamps
     /// each copy as it emits it.
     back_edge_poll: std::sync::atomic::AtomicBool,
-    /// Pyre-only per-emission failure counter for bridge compilation
-    /// thresholds.  PyPy carries the equivalent jitcounter hash in
-    /// `compile.py AbstractResumeGuardDescr._attrs_ ('status',)`
-    /// — each copied descr has its own status, retracing
-    /// independently of the donor.  Owned per copied descr so each
-    /// copy's failures accrue separately.
-    fail_count: AtomicU32,
     /// Pyre-only per-emission `CompiledTraceInfo` cell.  Same shape
     /// and atomic-swap discipline as
     /// `ResumeGuardDescr::trace_info`.  Per-emission because
@@ -4736,7 +4721,6 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
@@ -4971,16 +4955,6 @@ impl FailDescr for ResumeGuardCopiedDescr {
         self.back_edge_poll
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    /// Per-emission `fail_count` (see field comment).  Owned per
-    /// copied descr — PyPy parity with per-descr `status` jitcounter
-    /// hash so each copied guard's bridge threshold accrues
-    /// independently of the donor.
-    fn fail_count(&self) -> u32 {
-        self.fail_count.load(Ordering::Relaxed)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
-    }
     /// Per-emission `trace_info` (see field comment).  Same
     /// atomic-swap discipline as `ResumeGuardDescr::set_trace_info` —
     /// owning Arc reclaimed by `Drop`.
@@ -5102,7 +5076,6 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                fail_count: AtomicU32::new(0),
                 trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge: std::sync::OnceLock::new(),
                 external_jump_target: std::sync::OnceLock::new(),
@@ -5241,12 +5214,6 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_back_edge_poll(&self) {
         self.inner.set_back_edge_poll();
     }
-    fn fail_count(&self) -> u32 {
-        self.inner.fail_count()
-    }
-    fn increment_fail_count(&self) -> u32 {
-        self.inner.increment_fail_count()
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         self.inner.trace_info_any()
     }
@@ -5318,7 +5285,6 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        fail_count: AtomicU32::new(0),
         trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         bridge: std::sync::OnceLock::new(),
         external_jump_target: std::sync::OnceLock::new(),
@@ -5355,7 +5321,6 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
@@ -5498,7 +5463,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
 /// Modeled as a newtype wrapping `ResumeGuardDescr` so the subclass
 /// inherits the full `_attrs_` slot set (adr_jump_offset, rd_locs,
 /// status, rd_loop_token, plus the pyre-side per-emission cells:
-/// source_op_index, trace_info, fail_count,
+/// source_op_index, trace_info,
 /// external_jump_target, bridge_*) the cranelift codegen path reads
 /// off every guard descr at `collect_guards` / dispatch emission.
 /// Same shape as `ResumeAtPositionDescr` (compile.py).
@@ -5553,7 +5518,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 bridge_declined_terminally: AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                fail_count: AtomicU32::new(0),
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
@@ -5720,12 +5684,6 @@ impl FailDescr for CompileLoopVersionDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn fail_count(&self) -> u32 {
-        FailDescr::fail_count(&self.inner)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        FailDescr::increment_fail_count(&self.inner)
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         FailDescr::trace_info_any(&self.inner)
     }
@@ -5774,7 +5732,6 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
@@ -6136,12 +6093,6 @@ impl TraceCtx {
         self.header_pc
     }
 
-    /// Hash-only [`Self::find_merge_point_same_greenkey`]. `header_pc` does
-    /// not filter: see [`Self::has_merge_point_at`].
-    pub fn get_merge_point_at(&self, key: u64, _header_pc: usize) -> Option<&MergePoint> {
-        self.find_merge_point_same_greenkey(key, None)
-    }
-
     /// `compile.py compile_retrace(..., start)` — the merge point the
     /// `same_greenkey` scan already selected. Look up by that `start`
     /// position, not by `(green_key, header_pc)`: `header_pc` is the
@@ -6249,10 +6200,6 @@ mod fail_descr_tests {
     fn all_virtuals_hide_show_round_trips_the_cache() {
         let hidden = AllVirtuals::hide((vec![1, 2], vec![3]));
         assert_eq!(AllVirtuals::show(hidden), Some((vec![1, 2], vec![3])));
-        assert_eq!(
-            ResumeGuardForcedDescr::handle_fail_savedata(Some(hidden)),
-            Some((vec![1, 2], vec![3]))
-        );
         assert_eq!(AllVirtuals::show(majit_ir::GcRef(0)), None);
     }
 
@@ -6418,7 +6365,6 @@ mod fail_descr_tests {
                 bridge_declined_terminally: AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                fail_count: AtomicU32::new(0),
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),

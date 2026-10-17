@@ -831,7 +831,7 @@ fn stamp_and_publish_label_targets(
     inputargs: &[InputArgRc],
     ops: &[Op],
     bridge_entry_arity: Option<usize>,
-    owner_token: u64,
+    owner_token: usize,
 ) -> (Vec<usize>, Vec<majit_ir::DescrRef>) {
     // Stamp each LABEL's loop-target descr with its ordinal (0, 1, 2, …) so a
     // loop-closing bridge can recover which label its terminal JUMP targets:
@@ -2345,40 +2345,23 @@ fn force_tail_fields(frame: codegen::FrameGeometry) -> (u32, u32, u32) {
     )
 }
 
-fn lookup_call_assembler_callee_locs(
-    token_number: u64,
-    tokens: &std::collections::HashMap<u64, std::sync::Arc<JitCellToken>>,
-) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
-    ca_locs_from_token(tokens.get(&token_number)?)
-}
-
-fn ca_tokens_in(ops: &[Op]) -> std::collections::HashMap<u64, std::sync::Arc<JitCellToken>> {
-    let mut tokens = std::collections::HashMap::new();
-    for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
-        let Some(descr) = op.getdescr() else {
-            continue;
-        };
-        let Some(token) = descr
-            .as_loop_token_descr()
-            .and_then(|ltd| ltd.token_handle_any())
-            .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
-        else {
-            continue;
-        };
-        tokens.insert(token.number, std::sync::Arc::clone(token));
-    }
-    tokens
+fn call_assembler_token_from_descr(
+    descr: &majit_ir::DescrRef,
+) -> Option<&std::sync::Arc<JitCellToken>> {
+    descr
+        .as_loop_token_descr()?
+        .token_handle_any()?
+        .downcast_ref::<std::sync::Arc<JitCellToken>>()
 }
 
 /// A `CALL_ASSEMBLER` whose callee has not published locs cannot be rewritten.
 /// The message matches `wasm_unsupported_trace_reason` so the decline tally
 /// stays on the same string.
 fn missing_call_assembler_locs(ops: &[Op]) -> Option<String> {
-    let tokens = ca_tokens_in(ops);
     for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
         let ready = op.getdescr().is_some_and(|d| {
-            d.as_loop_token_descr()
-                .and_then(|lt| lookup_call_assembler_callee_locs(lt.loop_token_number(), &tokens))
+            call_assembler_token_from_descr(&d)
+                .and_then(|tok| ca_locs_from_token(tok))
                 .is_some()
         });
         if !ready {
@@ -2418,10 +2401,7 @@ pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
         max_nursery_size,
         wb_descr,
         jitframe_info: Some(wasm_jitframe_descrs()),
-        call_assembler_callee_locs: Some(Box::new(|token_number| {
-            let _ = token_number;
-            None
-        })),
+        call_assembler_callee_locs: Some(Box::new(|_ltd| None)),
         load_supported_factors: &[1],
         supports_load_effective_address: true,
         malloc_zero_filled: is_boehm,
@@ -2468,9 +2448,10 @@ pub fn rewrite_ops_for_gc(
     Option<Arc<majit_gc::GcTable>>,
 ) {
     let mut rewriter = gc_rewriter();
-    let tokens = ca_tokens_in(&ops);
-    rewriter.call_assembler_callee_locs = Some(Box::new(move |token_number| {
-        lookup_call_assembler_callee_locs(token_number, &tokens)
+    rewriter.call_assembler_callee_locs = Some(Box::new(|ltd| {
+        ltd.token_handle_any()
+            .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
+            .and_then(|tok| ca_locs_from_token(tok))
     }));
     rewrite_ops_for_gc_with(&rewriter, ops, constants)
 }
@@ -4684,7 +4665,7 @@ impl WasmBackend {
             &inputs.inputargs,
             &inputs.ops,
             inputs.bridge_entry_arity,
-            token.number,
+            token.identity_key(),
         );
         release::push_resources(token, asm_resources);
         if let Some(mut target) = target_from_token(token) {
@@ -4847,7 +4828,7 @@ fn resolve_cross_loop_jump_target(
 /// trace.  PyPy's `compile_tmp_callback` always supplies a real compiled token
 /// while the final loop is pending, so every target here must likewise be an
 /// installed `CompiledWasmLoop`; there is no bodyless self-placeholder case.
-fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
+fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(usize, CallAssemblerTarget)>> {
     let mut resolved = Vec::new();
     let mut saw_ca = false;
     for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
@@ -4883,7 +4864,7 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
             diag_bump(58);
             return None;
         };
-        let target_token = owned.number;
+        let target_token = owned.identity_key();
         let Some(mut registered) = target_from_token(owned) else {
             diag_bump(60);
             return None;
@@ -4953,13 +4934,13 @@ fn module_has_guard_not_forced_2(ops: &[Op], inlined_bridges: &[codegen::Inlined
             .any(|bridge| bridge.ops.iter().any(is_gnf2))) as u32
 }
 
-fn bridge_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
+fn bridge_call_assembler_target(ops: &[Op]) -> Option<Vec<(usize, CallAssemblerTarget)>> {
     general_call_assembler_target(ops)
 }
 
 fn ca_codegen_targets(
-    targets: &[(u64, CallAssemblerTarget)],
-) -> std::collections::HashMap<u64, codegen::CaTarget> {
+    targets: &[(usize, CallAssemblerTarget)],
+) -> std::collections::HashMap<usize, codegen::CaTarget> {
     targets
         .iter()
         .map(|(token, target)| {
@@ -4973,7 +4954,7 @@ fn ca_codegen_targets(
         .collect()
 }
 
-fn ca_max_frame_bytes(targets: &[(u64, CallAssemblerTarget)]) -> u32 {
+fn ca_max_frame_bytes(targets: &[(usize, CallAssemblerTarget)]) -> u32 {
     targets
         .iter()
         .map(|(_, target)| target.callee_frame_bytes)
@@ -5015,7 +4996,7 @@ fn mark_call_assembler_target_active(
             // this a bounded window, exactly like a real terminal bridge
             // decline.
             let selector = FORCE_CA_TERMINAL_DECLINE.load(Ordering::Relaxed);
-            if selector != 0 && (selector == 1 || selector == target.token_number) {
+            if selector != 0 && (selector == 1 || selector as i64 == target.token_number) {
                 // One forced target per guest run. A real terminal decline
                 // also transitions its target just once.
                 FORCE_CA_TERMINAL_DECLINE.store(0, Ordering::Relaxed);
@@ -5801,7 +5782,7 @@ impl majit_backend::Backend for WasmBackend {
             inputargs,
             ops,
             None,
-            token.number,
+            token.identity_key(),
         );
         if func_handle != 0 {
             asm_resources.table_slots.push(func_handle);
@@ -5826,7 +5807,7 @@ impl majit_backend::Backend for WasmBackend {
         // scoped to one `execute_token` call.
 
         let compiled = CompiledWasmLoop {
-            token_number: token.number,
+            token_number: token.identity_key(),
             trace_id,
             input_types: inputargs.iter().map(|ia| ia.tp.get()).collect(),
             func_handle: std::cell::Cell::new(func_handle),
@@ -5897,7 +5878,7 @@ impl majit_backend::Backend for WasmBackend {
             .and_then(|targets| {
                 targets
                     .iter()
-                    .find(|(target_token, _)| *target_token == token.number)
+                    .find(|(target_token, _)| *target_token == token.identity_key())
                     .map(|(_, target)| target.callee_gcmap_ptr)
             })
             .unwrap_or(home_gcmap_ptr as i64);
@@ -5909,7 +5890,7 @@ impl majit_backend::Backend for WasmBackend {
         publish_token_target(
             token,
             &CallAssemblerTarget {
-                token_number: token.number,
+                token_number: token.number(),
                 dispatch_entry: 0,
                 func_handle: compiled.eager_func_handle(),
                 input_types: compiled.input_types.clone(),
@@ -6891,7 +6872,7 @@ impl majit_backend::Backend for WasmBackend {
             inputargs,
             ops,
             bridge_entry_arity,
-            original_token.number,
+            original_token.identity_key(),
         );
         if bridge_slot != 0 {
             asm_resources.table_slots.push(bridge_slot);
@@ -7526,7 +7507,7 @@ impl majit_backend::Backend for WasmBackend {
                 transfer_call_assembler_target_activity(old_target, &new_target);
             }
         }
-        majit_backend::redirect_assembler(old, new, new.number);
+        majit_backend::redirect_assembler(old, new, new.number() as u64);
         Ok(())
     }
 
@@ -7670,7 +7651,7 @@ mod tests {
     /// a LABEL argument, so the resume loader reads a capture slot.
     fn compile_peeled_label(token_number: u64, capture: bool) -> (WasmBackend, JitCellToken) {
         let mut backend = WasmBackend::new();
-        let token = JitCellToken::new(token_number);
+        let token = JitCellToken::new(token_number as i64);
         let label = majit_ir::make_loop_target_descr(token_number, false);
         let inputargs = vec![InputArg::new_int_rc(0)];
         let kept = OpRc::new(majit_ir::Op::new(
@@ -7729,7 +7710,7 @@ mod tests {
     #[test]
     fn a_freed_pending_slot_is_not_dereferenced_on_drain() {
         let token = std::sync::Arc::new(JitCellToken::new(9_910_077));
-        let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(token.number));
+        let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(token.number()));
         clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
         token.set_compiled_loop_token(Some(clt));
 

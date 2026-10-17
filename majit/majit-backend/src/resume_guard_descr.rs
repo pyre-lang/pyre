@@ -197,14 +197,6 @@ pub struct ResumeGuardDescr {
     /// statistics counter to keep scheduled exits out of the guard-failure
     /// total.  See `descr.rs FailDescr::is_back_edge_poll`.
     pub back_edge_poll: AtomicBool,
-    /// `AbstractResumeGuardDescr.handle_fail` (`compile.py`)
-    /// drives `must_compile` via `jitcounter.tick(status_hash)` in
-    /// RPython.  Pyre keeps a raw per-descr counter:
-    /// the cranelift dispatch hot path calls `increment_fail_count()`
-    /// once per guard failure to drive the same threshold logic.
-    /// Migrated here from `CraneliftFailDescr::fail_count` so the
-    /// meta Arc is the single source of truth.
-    pub fail_count: AtomicU32,
     /// Per-descr `CompiledTraceInfo` cell.  PyPy
     /// recovers the same state on demand from `cpu.asmmemmgr_blocks` +
     /// `compiled_loop_token`; cranelift parks the per-trace metadata
@@ -394,7 +386,6 @@ impl Descr for ResumeGuardDescr {
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: OnceLock::new(),
@@ -564,12 +555,6 @@ impl FailDescr for ResumeGuardDescr {
     fn set_back_edge_poll(&self) {
         self.back_edge_poll.store(true, Ordering::Relaxed);
     }
-    fn fail_count(&self) -> u32 {
-        self.fail_count.load(Ordering::Relaxed)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         let ptr = self.trace_info.load(Ordering::Acquire);
         if ptr.is_null() {
@@ -671,7 +656,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         bridge_declined_terminally: AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: AtomicBool::new(false),
-        fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: OnceLock::new(),
@@ -693,19 +677,6 @@ impl ResumeGuardDescr {
     pub fn set_source_op_index(&self, source_op_index: usize) {
         // Safety: single-threaded JIT.
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
-    }
-
-    /// Increment the per-descr `fail_count`.  Returns
-    /// the post-increment value.  Mirrors PyPy's `jitcounter.tick`
-    /// semantics: one increment per observed guard failure, drives
-    /// `must_compile` threshold in `compile.py`.
-    pub fn increment_fail_count(&self) -> u32 {
-        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    /// Read the per-descr `fail_count`.
-    pub fn get_fail_count(&self) -> u32 {
-        self.fail_count.load(Ordering::Relaxed)
     }
 
     /// Publish the per-trace `CompiledTraceInfo` into the descr-local

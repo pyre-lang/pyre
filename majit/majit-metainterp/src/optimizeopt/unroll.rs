@@ -324,11 +324,13 @@ pub struct UnrollOptimizer {
     /// `target_tokens` stays inside one code buffer.
     ///
     /// `None` for a fresh `compile_loop`, which mints its own token afterwards.
-    /// `compile.py:287-289` expresses the same thing by *resetting*
+    /// `compile.py compile_loop` expresses the same thing by *resetting*
     /// `jitcell_token.target_tokens` to `[start_descr]`, leaving nothing for
     /// `_jump_to_existing_trace` to match; pyre seeds the previous
     /// compilation's tokens instead, so the distinction has to be carried here.
-    pub attach_jitcell_token_number: Option<u64>,
+    /// Identity is the `JitCellToken` object (`history.py
+    /// TargetToken.original_jitcell_token is`).
+    pub attach_jitcell_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
     /// history.py: JitCellToken.retraced_count — number of times this loop
     /// has been retraced. Compared against retrace_limit to prevent infinite
     /// retracing.
@@ -611,7 +613,7 @@ impl UnrollOptimizer {
             supports_efficient_uint_mul_high: true,
             short_preamble: None,
             target_tokens: Vec::new(),
-            attach_jitcell_token_number: None,
+            attach_jitcell_token: None,
             retraced_count: 0,
             // unroll.py:215/265 reads
             // `warmrunnerdescr.memory_manager.{retrace_limit,max_retrace_guards}`.
@@ -2066,24 +2068,28 @@ impl UnrollOptimizer {
                 // be re-checked here.
                 let current_body_descr =
                     self.target_tokens.last().map(|t| t.as_jump_target_descr());
-                let current_body_descr_idx = current_body_descr.as_ref().map(|d| d.index());
                 let redirected_jump_descr = redirected_tail_ops
                     .iter()
                     .rfind(|o| o.opcode == OpCode::Jump)
                     .and_then(|o| o.getdescr());
-                let redirected_jump_descr_idx = redirected_jump_descr.as_ref().map(|d| d.index());
-                let redirected_jump_owner_num = redirected_jump_descr
+                let redirected_jump_owner = redirected_jump_descr
                     .as_ref()
                     .and_then(|d| d.as_loop_target_descr())
-                    .and_then(|d| d.original_jitcell_token_number());
-                let closes_onto_own_body = redirected_jump_descr_idx == current_body_descr_idx;
+                    .and_then(|d| d.original_jitcell_token_handle())
+                    .and_then(|any| any.downcast::<majit_backend::JitCellToken>().ok());
+                let closes_onto_own_body = match (&current_body_descr, &redirected_jump_descr) {
+                    (Some(body), Some(jump)) => {
+                        majit_ir::descr_identity(body) == majit_ir::descr_identity(jump)
+                    }
+                    _ => false,
+                };
                 let closes_within_attached_artifact =
-                    match (self.attach_jitcell_token_number, redirected_jump_owner_num) {
-                        (Some(attach_num), Some(target_num)) => attach_num == target_num,
+                    match (&self.attach_jitcell_token, &redirected_jump_owner) {
+                        (Some(attach), Some(target)) => std::sync::Arc::ptr_eq(attach, target),
                         // No artifact to attach to yet: compile_loop mints its token
                         // after optimizing, so every seeded candidate still names the
-                        // *previous* compilation. compile.py:288-289 keeps that case
-                        // from arising at all by resetting the list.
+                        // *previous* compilation. compile.py compile_loop keeps that
+                        // case from arising at all by resetting the list.
                         _ => false,
                     };
                 if !closes_onto_own_body && !closes_within_attached_artifact {
@@ -2092,10 +2098,10 @@ impl UnrollOptimizer {
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] jump_to_existing_trace: target {:?} (owner {:?}) is neither this body {:?} nor inside the attached artifact {:?}, falling back to preamble",
-                            redirected_jump_descr_idx,
-                            redirected_jump_owner_num,
-                            current_body_descr_idx,
-                            self.attach_jitcell_token_number,
+                            redirected_jump_descr.as_ref().map(majit_ir::descr_identity),
+                            redirected_jump_owner.as_ref().map(|t| t.identity_key()),
+                            current_body_descr.as_ref().map(majit_ir::descr_identity),
+                            self.attach_jitcell_token.as_ref().map(|t| t.identity_key()),
                         );
                     }
                     redirected_tail_ops.clear();
@@ -6096,17 +6102,18 @@ fn assemble_peeled_trace_with_jump_args(
                         .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
                 })
                 .unwrap_or_else(|| full_label_args.clone());
-            let jump_target_descr_idx = new_op.getdescr().map(|descr| descr.index());
-            let local_label_descr_idx = match current_inner_label_index {
+            let jump_target_id = new_op.getdescr().as_ref().map(majit_ir::descr_identity);
+            let local_label_id = match current_inner_label_index {
                 Some(label_idx) => result
                     .get(label_idx)
                     .and_then(|op| op.getdescr())
-                    .map(|descr| descr.index()),
-                None => loop_label_descr.as_ref().map(|descr| descr.index()),
+                    .as_ref()
+                    .map(majit_ir::descr_identity),
+                None => loop_label_descr.as_ref().map(majit_ir::descr_identity),
             };
             let jump_targets_local_label = matches!(
-                (jump_target_descr_idx, local_label_descr_idx),
-                (Some(jump_idx), Some(label_idx)) if jump_idx == label_idx
+                (jump_target_id, local_label_id),
+                (Some(jump_id), Some(label_id)) if jump_id == label_id
             );
             let target_base_len = if current_inner_label_index.is_some() {
                 op.num_args()
@@ -6119,8 +6126,8 @@ fn assemble_peeled_trace_with_jump_args(
                     current_inner_label_index,
                     jump_was_redirected,
                     jump_targets_local_label,
-                    jump_target_descr_idx,
-                    local_label_descr_idx,
+                    jump_target_id,
+                    local_label_id,
                     original_args,
                     mapped_base_args,
                     label_args,
@@ -6892,8 +6899,10 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)]
         );
         assert_eq!(
-            result[1].getdescr().map(|descr| descr.repr()),
-            Some("TargetToken(start:7)".to_string())
+            result[1].getdescr().as_ref().map(majit_ir::descr_identity),
+            Some(majit_ir::descr_identity(
+                &preamble_target.as_jump_target_descr()
+            ))
         );
     }
 
@@ -6921,8 +6930,10 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)]
         );
         assert_eq!(
-            result[0].getdescr().map(|descr| descr.repr()),
-            Some("TargetToken(start:7)".to_string())
+            result[0].getdescr().as_ref().map(majit_ir::descr_identity),
+            Some(majit_ir::descr_identity(
+                &preamble_target.as_jump_target_descr()
+            ))
         );
     }
 
@@ -6966,7 +6977,8 @@ mod tests {
             op
         }];
         let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
-        jump.setdescr(TargetToken::new_preamble(7).as_jump_target_descr());
+        let preamble_descr = TargetToken::new_preamble(7).as_jump_target_descr();
+        jump.setdescr(preamble_descr.clone());
 
         let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
         let result = replace_terminal_jump(&body_ops, jump);
@@ -6983,8 +6995,8 @@ mod tests {
             &[OpRef::int_op(2)]
         );
         assert_eq!(
-            result[1].getdescr().map(|descr| descr.repr()),
-            Some("TargetToken(start:7)".to_string())
+            result[1].getdescr().as_ref().map(majit_ir::descr_identity),
+            Some(majit_ir::descr_identity(&preamble_descr))
         );
     }
 
@@ -9730,7 +9742,7 @@ mod tests {
             &[],
             &majit_ir::ConstMap::default(),
             Some(start_descr),
-            Some(loop_descr),
+            Some(loop_descr.clone()),
         );
 
         let jump = combined.last().expect("assembled jump");
@@ -9786,14 +9798,15 @@ mod tests {
             &[],
             &constants,
             Some(start_descr),
-            Some(loop_descr),
+            Some(loop_descr.clone()),
         );
 
         let body_label = combined
             .iter()
             .find(|op| {
                 op.opcode == OpCode::Label
-                    && op.getdescr().map(|descr| descr.repr()) == Some("TargetToken(1)".to_string())
+                    && op.getdescr().as_ref().map(majit_ir::descr_identity)
+                        == Some(majit_ir::descr_identity(&loop_descr))
             })
             .expect("body label");
         assert_eq!(

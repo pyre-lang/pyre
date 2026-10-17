@@ -162,7 +162,7 @@ fn guard_one_int() -> Case {
     let token = JitCellToken::new(2);
 
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]);
     label_op.pos().set(OpRef::void_op(100));
@@ -226,7 +226,7 @@ fn guard_float_and_int() -> Case {
         InputArg::from_type_rc(Type::Float, 0),
         InputArg::from_type_rc(Type::Int, 1),
     ];
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let label_op = Op::new(
         OpCode::Label,
@@ -302,7 +302,7 @@ fn guard_with_hole() -> Case {
     let token = JitCellToken::new(4);
 
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]);
     label_op.pos().set(OpRef::void_op(100));

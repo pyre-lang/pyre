@@ -4343,6 +4343,14 @@ pub fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
     }
 }
 
+fn call_assembler_token_key(descr: &majit_ir::DescrRef) -> Option<usize> {
+    descr
+        .as_loop_token_descr()?
+        .token_handle_any()?
+        .downcast_ref::<std::sync::Arc<majit_backend::JitCellToken>>()
+        .map(|t| t.identity_key())
+}
+
 /// Parameters for the guest→guest `CALL_ASSEMBLER` `call_indirect` arm.
 /// `emit_ca == false` (the default) keeps every emitted module byte-identical
 /// to the pre-feature backend.
@@ -4352,7 +4360,7 @@ pub struct CaParams {
     pub emit_ca: bool,
     /// Geometry and entry metadata, keyed by the CALL_ASSEMBLER callee token.
     /// Every entry describes exactly the JitFrame allocated for that target.
-    pub targets: HashMap<u64, CaTarget>,
+    pub targets: HashMap<usize, CaTarget>,
     /// `__indirect_function_table` slot of `wasm_ca_resume_deopt`
     /// (`lib.rs::ca_deopt_helper_slot`). When a callee `call_indirect` returns a
     /// non-finish `fail_index` (a guard deopt), the CA arm `call_indirect`s this
@@ -5268,9 +5276,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
             if !op.opcode.is_call_assembler() {
                 continue;
             }
-            let target = op
-                .getdescr()
-                .and_then(|descr| descr.as_call_descr().and_then(|d| d.call_target_token()));
+            let target = op.getdescr().as_ref().and_then(call_assembler_token_key);
             if !ca.emit_ca || target.is_none_or(|token| !ca.targets.contains_key(&token)) {
                 return Err(BackendError::Unsupported(format!(
                     "wasm backend: inlined bridge carries {:?}, which the owner \
@@ -10024,9 +10030,7 @@ fn build_function(
                 let descr = op
                     .getdescr()
                     .expect("CALL_ASSEMBLER op must carry a descriptor");
-                let op_token = descr
-                    .as_call_descr()
-                    .and_then(|descr| descr.call_target_token())
+                let op_token = call_assembler_token_key(&descr)
                     .expect("CALL_ASSEMBLER op must carry a callee token");
                 let tgt = ca
                     .targets

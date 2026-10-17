@@ -151,8 +151,8 @@ impl CallDescr for MetaCallAssemblerDescr {
     fn result_size(&self) -> usize {
         8
     }
-    fn call_target_token(&self) -> Option<u64> {
-        Some(self.target_token.number)
+    fn call_target_token(&self) -> Option<i64> {
+        Some(self.target_token.number())
     }
     fn call_virtualizable_index(&self) -> Option<usize> {
         self.target_token.virtualizable_arg_index()
@@ -164,8 +164,8 @@ impl CallDescr for MetaCallAssemblerDescr {
 }
 
 impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
-    fn loop_token_number(&self) -> u64 {
-        self.target_token.number
+    fn loop_token_number(&self) -> i64 {
+        self.target_token.number()
     }
 
     fn call_virtualizable_index(&self) -> Option<usize> {
@@ -1023,8 +1023,8 @@ impl majit_ir::Descr for JitCellTokenDescr {
 }
 
 impl majit_ir::descr::LoopTokenDescr for JitCellTokenDescr {
-    fn loop_token_number(&self) -> u64 {
-        self.token.number
+    fn loop_token_number(&self) -> i64 {
+        self.token.number()
     }
 
     fn call_virtualizable_index(&self) -> Option<usize> {
@@ -1070,7 +1070,7 @@ pub fn make_call_assembler_descr(
 /// `make_call_assembler_descr`.
 #[cfg(test)]
 pub fn make_call_assembler_descr_by_number(
-    target_number: u64,
+    target_number: i64,
     arg_types: &[Type],
     result_type: Type,
     virtualizable_arg_index: Option<usize>,

@@ -401,8 +401,8 @@ use pyre_interpreter::objspace::descroperation::{
 majit_math1_gateway!(sin, _float_sin, |x| x.is_finite());
 majit_math1_gateway!(cos, _float_cos, |x| x.is_finite());
 majit_math1_gateway!(tan, _float_tan, |x| x.is_finite());
-majit_math1_gateway!(asin, _float_asin, |x| (-1.0..=1.0).contains(&x));
-majit_math1_gateway!(acos, _float_acos, |x| (-1.0..=1.0).contains(&x));
+majit_math1_gateway!(asin, _float_asin, |x| x >= -1.0 && x <= 1.0);
+majit_math1_gateway!(acos, _float_acos, |x| x >= -1.0 && x <= 1.0);
 majit_math1_gateway!(atan, _float_atan, |x| x.is_finite());
 majit_math1_gateway!(tanh, _float_tanh, |x| x.is_finite());
 majit_math1_gateway!(asinh, _float_asinh, |x| x.is_finite());

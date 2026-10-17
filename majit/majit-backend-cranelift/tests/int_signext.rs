@@ -29,7 +29,7 @@ fn compiled_signext(
     let result = rec.record_op(OpCode::IntSignext, &[i0, OpRef::const_int(numbytes)]);
     rec.finish(&[result], make_descr(0));
     let trace = rec.get_trace();
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     backend
         .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .unwrap_or_else(|err| panic!("compile int_signext({numbytes}): {err:?}"));

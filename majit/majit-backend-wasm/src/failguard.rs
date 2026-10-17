@@ -603,8 +603,8 @@ pub struct LabelTarget {
     /// a frame when its offsets agree exactly, not merely when its allocation
     /// is large enough.
     pub frame: crate::codegen::FrameGeometry,
-    /// `JitCellToken.number` that published this row.
-    pub owner_token: u64,
+    /// `JitCellToken::identity_key` that published this row.
+    pub owner_token: usize,
 }
 
 /// Frozen metadata for entering a compiled loop from a `CALL_ASSEMBLER` arm.
@@ -612,9 +612,9 @@ pub struct LabelTarget {
 /// installed, so a caller can decline before baking an unresolved target.
 #[derive(Clone, Debug)]
 pub struct CallAssemblerTarget {
-    /// Owning `JitCellToken` number. Used only by the dormant wasm regression
-    /// hook to select one target deterministically.
-    pub token_number: u64,
+    /// Log-only `JitCellToken.number`. Used only by the dormant wasm
+    /// regression hook to select one target deterministically.
+    pub token_number: i64,
     /// Address of this token's `WasmCaDispatchEntry` (`_ll_function_addr`).
     pub dispatch_entry: u32,
     pub func_handle: u32,
@@ -1245,7 +1245,7 @@ pub fn target_from_token(token: &majit_backend::JitCellToken) -> Option<CallAsse
     };
     let live_flag = entry.has_guard_not_forced_2.load(Ordering::Acquire);
     Some(CallAssemblerTarget {
-        token_number: token.number,
+        token_number: token.number(),
         dispatch_entry: token.ll_function_addr() as u32,
         func_handle: snap.func_handle,
         input_types,
@@ -1418,9 +1418,9 @@ impl ResumeEntry {
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
 pub struct CompiledWasmLoop {
-    /// Owning `JitCellToken` number, used to retract this loop's
-    /// CALL_ASSEMBLER target metadata on drop.
-    pub token_number: u64,
+    /// Owning `JitCellToken::identity_key`, used to match `LabelTarget`
+    /// rows published by this loop.
+    pub token_number: usize,
     pub trace_id: u64,
     pub input_types: Vec<Type>,
     /// Shared-table slot of the materialized wasm function.  Straight-line

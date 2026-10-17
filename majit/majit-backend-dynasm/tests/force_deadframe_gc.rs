@@ -353,7 +353,7 @@ impl Fixture {
             .into_iter()
             .map(OpRc::new)
             .collect();
-        let token = JitCellToken::new(token_number);
+        let token = JitCellToken::new(token_number as i64);
         backend
             .compile_loop(&inputargs, &ops, &token)
             .expect("compile_loop");

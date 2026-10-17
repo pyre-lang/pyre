@@ -195,23 +195,6 @@ fn as_fd(d: &DescrRef) -> &dyn FailDescr {
         .expect("fail_descrs entries always implement FailDescr")
 }
 
-/// Increment per-emission `fail_count` when `fd` owns the slot
-/// (Resume-family only — `compile.py:683`
-/// `AbstractResumeGuardDescr._attrs_ = ('status',)`).  Singleton
-/// FINISH / synthetic descrs (PropagateExceptionDescr,
-/// DoneWithThisFrameDescr*, ExitFrameWithExceptionDescrRef) bypass
-/// the jitcounter/bridge-retrace machinery and have no counter slot
-/// — the trait default panics on them, so this gate keeps the
-/// guard-failure dispatcher honest for non-Resume descrs reaching
-/// it via the identity-preservation path.
-fn maybe_increment_fail_count(fd: &dyn FailDescr) -> u32 {
-    if fd.is_resume_guard() || fd.is_resume_guard_copied() {
-        fd.increment_fail_count()
-    } else {
-        0
-    }
-}
-
 fn attached_descr_ptrs_with_fallbacks(
     attached: majit_backend::AttachedDescrPtrs,
 ) -> majit_backend::AttachedDescrPtrs {
@@ -575,16 +558,16 @@ impl majit_ir::ArrayDescr for BuiltinArrayDescr {
 pub struct CallAssemblerDescr {
     arg_types: Vec<Type>,
     result_type: Type,
-    target_token: u64,
+    token: Arc<JitCellToken>,
     extra_info: EffectInfo,
 }
 
 impl CallAssemblerDescr {
-    pub fn new(target_token: u64, arg_types: Vec<Type>, result_type: Type) -> Self {
+    pub fn new(token: Arc<JitCellToken>, arg_types: Vec<Type>, result_type: Type) -> Self {
         CallAssemblerDescr {
             arg_types,
             result_type,
-            target_token,
+            token,
             extra_info: EffectInfo {
                 extraeffect: majit_ir::ExtraEffect::CanRaise,
                 oopspecindex: OopSpecIndex::None,
@@ -605,8 +588,12 @@ impl majit_ir::Descr for CallAssemblerDescr {
 }
 
 impl majit_ir::LoopTokenDescr for CallAssemblerDescr {
-    fn loop_token_number(&self) -> u64 {
-        self.target_token
+    fn loop_token_number(&self) -> i64 {
+        self.token.number()
+    }
+
+    fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
+        Some(&self.token)
     }
 }
 
@@ -623,8 +610,8 @@ impl majit_ir::CallDescr for CallAssemblerDescr {
         8
     }
 
-    fn call_target_token(&self) -> Option<u64> {
-        Some(self.target_token)
+    fn call_target_token(&self) -> Option<i64> {
+        Some(self.token.number())
     }
 
     fn get_extra_info(&self) -> &EffectInfo {
@@ -2168,17 +2155,16 @@ thread_local! {
     /// `JitCellToken` reference, so `handle_call_assembler`
     /// (rewrite.py:665-695) reads metadata via
     /// `loop_token.compiled_loop_token` with no indirection. pyre's
-    /// backends emit u64-keyed trampolines, so a `token_number ->
-    /// RegisteredLoopTarget` map is a TODO required
-    /// for the u64 dispatch. Storing the map thread-locally (matching
+    /// backends look up CALL_ASSEMBLER metadata by `JitCellToken`
+    /// object identity (`identity_key`). Storing the map thread-locally (matching
     /// `CALL_ASSEMBLER_DEADFRAMES` below) keeps cranelift's per-thread
     /// CA state separated and avoids a process-global registry
     /// (keeps cranelift's per-thread CA state separated).
-    static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<u64, RegisteredLoopTarget>> =
+    static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<usize, RegisteredLoopTarget>> =
         RefCell::new(IndexMap::new());
     /// Per-thread caller->callee result-kind expectations. Same
-    /// TODO rationale as `CALL_ASSEMBLER_TARGETS`.
-    static CALL_ASSEMBLER_EXPECTATIONS: RefCell<IndexMap<u64, IndexMap<CallAssemblerCallerId, u64>>> =
+    /// identity-key as `CALL_ASSEMBLER_TARGETS`.
+    static CALL_ASSEMBLER_EXPECTATIONS: RefCell<IndexMap<usize, IndexMap<CallAssemblerCallerId, u64>>> =
         RefCell::new(IndexMap::new());
     /// Thread-local deadframe storage for call_assembler results.
     /// Each test thread gets its own isolated registry, preventing
@@ -2394,16 +2380,16 @@ thread_local! {
     /// site holds a raw `*const CaDispatchEntry` obtained via
     /// `ca_dispatch_slot`. Thread-local is safe because the JIT code and
     /// the entries live on the same thread; teardown is concurrent.
-    static CA_DISPATCH_TABLE: RefCell<IndexMap<u64, Box<CaDispatchEntry>>> =
+    static CA_DISPATCH_TABLE: RefCell<IndexMap<usize, Box<CaDispatchEntry>>> =
         RefCell::new(IndexMap::new());
 }
 
 /// Get or create the stable dispatch entry for a token.
 /// Returns the address of the entry (stable for this thread's lifetime).
-fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatchEntry {
+fn ca_dispatch_slot(token_key: usize, code_ptr: *const u8) -> *const CaDispatchEntry {
     CA_DISPATCH_TABLE.with(|c| {
         let mut table = c.borrow_mut();
-        let entry = table.entry_or_insert_with(token_number, || {
+        let entry = table.entry_or_insert_with(token_key, || {
             Box::new(CaDispatchEntry {
                 code_ptr: AtomicPtr::new(code_ptr as *mut u8),
                 finish_descr_ptr: AtomicU64::new(CA_FINISH_INDEX_UNKNOWN),
@@ -2418,9 +2404,9 @@ fn ca_dispatch_slot(token_number: u64, code_ptr: *const u8) -> *const CaDispatch
 
 /// Update the finish_descr_ptr for a token's dispatch entry.
 /// Stores the FailDescr pointer (not index) for direct finish comparison.
-fn ca_dispatch_set_finish_descr_ptr(token_number: u64, finish_descr_ptr: i64) {
+fn ca_dispatch_set_finish_descr_ptr(token_key: usize, finish_descr_ptr: i64) {
     CA_DISPATCH_TABLE.with(|c| {
-        if let Some(entry) = c.borrow().get(&token_number) {
+        if let Some(entry) = c.borrow().get(&token_key) {
             entry
                 .finish_descr_ptr
                 .store(finish_descr_ptr as u64, Ordering::Release);
@@ -2429,7 +2415,7 @@ fn ca_dispatch_set_finish_descr_ptr(token_number: u64, finish_descr_ptr: i64) {
 }
 
 /// Update dispatch slot for redirect — updates both code_ptr and finish_descr_ptr.
-fn ca_dispatch_redirect(old_token: u64, new_code_ptr: *const u8, new_finish_descr_ptr: i64) {
+fn ca_dispatch_redirect(old_token: usize, new_code_ptr: *const u8, new_finish_descr_ptr: i64) {
     CA_DISPATCH_TABLE.with(|c| {
         if let Some(entry) = c.borrow().get(&old_token) {
             entry
@@ -2442,23 +2428,24 @@ fn ca_dispatch_redirect(old_token: u64, new_code_ptr: *const u8, new_finish_desc
     });
 }
 
-fn ca_dispatch_remove(token_number: u64) {
-    // `try_with`: `CraneliftBackend::drop` calls `unregister_call_assembler_target`
-    // which reaches here during thread TLS teardown. Silently no-op if TLS
+fn ca_dispatch_remove(token_key: usize) {
+    // `try_with`: `CompiledLoopToken::free_loop_and_bridges` /
+    // `Backend::free_loop` call `unregister_call_assembler_target`, which
+    // reaches here during thread TLS teardown. Silently no-op if TLS
     // has already been torn down.
-    let _ = CA_DISPATCH_TABLE.try_with(|c| c.borrow_mut().swap_remove(&token_number));
+    let _ = CA_DISPATCH_TABLE.try_with(|c| c.borrow_mut().swap_remove(&token_key));
 }
 
 thread_local! {
     /// Thread-local cache for call_assembler target lookups.
     /// The IndexMap holds Arc ownership; CA_FAST_PTR caches a raw pointer
     /// for the hot path to avoid atomic refcount ops on every call.
-    static CA_TARGET_CACHE: RefCell<IndexMap<u64, Arc<RegisteredLoopTarget>>> =
+    static CA_TARGET_CACHE: RefCell<IndexMap<usize, Arc<RegisteredLoopTarget>>> =
         RefCell::new(IndexMap::new());
 
-    /// Single-entry raw pointer cache: (token_number, ptr_as_usize).
+    /// Single-entry raw pointer cache: (identity_key, ptr_as_usize).
     /// Valid because the Arc in CA_TARGET_CACHE keeps the data alive.
-    static CA_FAST_PTR: Cell<(u64, usize)> = const { Cell::new((0, 0)) };
+    static CA_FAST_PTR: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 /// Look up a call_assembler target without atomic refcount operations.
@@ -2467,10 +2454,10 @@ thread_local! {
 /// The returned pointer is valid for the duration of the current call
 /// (the Arc in CA_TARGET_CACHE keeps the data alive, and invalidation
 /// clears CA_FAST_PTR before removing from CA_TARGET_CACHE).
-unsafe fn fast_lookup_ca_target(token_number: u64) -> *const RegisteredLoopTarget {
+unsafe fn fast_lookup_ca_target(token_key: usize) -> *const RegisteredLoopTarget {
     // Hot path: single Cell read, no borrow, no atomic ops
     if let Ok((t, p)) = CA_FAST_PTR.try_with(|c| c.get())
-        && t == token_number
+        && t == token_key
         && p != 0
     {
         return p as *const RegisteredLoopTarget;
@@ -2478,31 +2465,31 @@ unsafe fn fast_lookup_ca_target(token_number: u64) -> *const RegisteredLoopTarge
     // Warm path: IndexMap lookup, extract pointer without Arc clone
     if let Ok(Some(ptr)) = CA_TARGET_CACHE.try_with(|c| {
         c.borrow()
-            .get(&token_number)
+            .get(&token_key)
             .map(|arc| Arc::as_ptr(arc) as usize)
     }) {
-        let _ = CA_FAST_PTR.try_with(|c| c.set((token_number, ptr)));
+        let _ = CA_FAST_PTR.try_with(|c| c.set((token_key, ptr)));
         return ptr as *const RegisteredLoopTarget;
     }
     // Cold path: thread-local registry, then cache
-    let target = with_call_assembler_registry(|m| m.get(&token_number).cloned())
+    let target = with_call_assembler_registry(|m| m.get(&token_key).cloned())
         .map(Arc::new)
-        .unwrap_or_else(|| panic!("missing call_assembler target token {token_number}"));
+        .unwrap_or_else(|| panic!("missing call_assembler target token {token_key}"));
     let ptr = Arc::as_ptr(&target) as usize;
-    let _ = CA_TARGET_CACHE.try_with(|c| c.borrow_mut().insert(token_number, target));
-    let _ = CA_FAST_PTR.try_with(|c| c.set((token_number, ptr)));
+    let _ = CA_TARGET_CACHE.try_with(|c| c.borrow_mut().insert(token_key, target));
+    let _ = CA_FAST_PTR.try_with(|c| c.set((token_key, ptr)));
     ptr as *const RegisteredLoopTarget
 }
 
-fn invalidate_ca_thread_cache(token_number: u64) {
+fn invalidate_ca_thread_cache(token_key: usize) {
     // Clear fast pointer cache first (before removing Arc ownership)
     let _ = CA_FAST_PTR.try_with(|c| {
         let (t, _) = c.get();
-        if t == token_number {
+        if t == token_key {
             c.set((0, 0));
         }
     });
-    let _ = CA_TARGET_CACHE.try_with(|c| c.borrow_mut().swap_remove(&token_number));
+    let _ = CA_TARGET_CACHE.try_with(|c| c.borrow_mut().swap_remove(&token_key));
 }
 
 /// Register a force callback for call_assembler guard failures.
@@ -2579,12 +2566,12 @@ const CALL_ASSEMBLER_RESULT_REF: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum CallAssemblerCallerId {
-    RootLoop(u64),
+    RootLoop(usize),
     BridgeTrace(u64),
 }
 
 fn with_call_assembler_registry<R>(
-    f: impl FnOnce(&mut IndexMap<u64, RegisteredLoopTarget>) -> R,
+    f: impl FnOnce(&mut IndexMap<usize, RegisteredLoopTarget>) -> R,
 ) -> R {
     // `try_with` + `expect`: normal call paths run long before the thread's
     // TLS destructor fires. The `Drop for CraneliftBackend` path uses
@@ -2596,7 +2583,7 @@ fn with_call_assembler_registry<R>(
 }
 
 fn with_call_assembler_expectations<R>(
-    f: impl FnOnce(&mut IndexMap<u64, IndexMap<CallAssemblerCallerId, u64>>) -> R,
+    f: impl FnOnce(&mut IndexMap<usize, IndexMap<CallAssemblerCallerId, u64>>) -> R,
 ) -> R {
     CALL_ASSEMBLER_EXPECTATIONS
         .try_with(|r| f(&mut r.borrow_mut()))
@@ -2607,12 +2594,12 @@ fn with_call_assembler_expectations<R>(
 /// and may reach these helpers after Rust has destroyed the `RefCell`
 /// thread_local (see `std::thread::LocalKey::try_with`). Since the drop
 /// path is discarding state anyway, silently no-op when TLS is gone.
-fn try_call_assembler_registry_drop(f: impl FnOnce(&mut IndexMap<u64, RegisteredLoopTarget>)) {
+fn try_call_assembler_registry_drop(f: impl FnOnce(&mut IndexMap<usize, RegisteredLoopTarget>)) {
     let _ = CALL_ASSEMBLER_TARGETS.try_with(|r| f(&mut r.borrow_mut()));
 }
 
 fn try_call_assembler_expectations_drop(
-    f: impl FnOnce(&mut IndexMap<u64, IndexMap<CallAssemblerCallerId, u64>>),
+    f: impl FnOnce(&mut IndexMap<usize, IndexMap<CallAssemblerCallerId, u64>>),
 ) {
     let _ = CALL_ASSEMBLER_EXPECTATIONS.try_with(|r| f(&mut r.borrow_mut()));
 }
@@ -2643,7 +2630,7 @@ fn actual_call_assembler_target_result_kind(
 }
 
 fn validate_call_assembler_target_result_kind(
-    target_token: u64,
+    target_token: usize,
     expected_result_kind: u64,
     actual_result_kind: u64,
     context: &str,
@@ -2659,7 +2646,7 @@ fn validate_call_assembler_target_result_kind(
 }
 
 fn validate_registered_target_against_call_assembler_expectations(
-    target_token: u64,
+    target_token: usize,
     target: &RegisteredLoopTarget,
 ) -> Result<(), BackendError> {
     let expected_result_kinds: Vec<u64> = with_call_assembler_expectations(|m| {
@@ -2687,7 +2674,7 @@ fn validate_registered_target_against_call_assembler_expectations(
 }
 
 fn remove_call_assembler_expectations_locked(
-    expectations: &mut IndexMap<u64, IndexMap<CallAssemblerCallerId, u64>>,
+    expectations: &mut IndexMap<usize, IndexMap<CallAssemblerCallerId, u64>>,
     caller_id: CallAssemblerCallerId,
 ) {
     expectations.retain(|_, callers| {
@@ -2697,9 +2684,9 @@ fn remove_call_assembler_expectations_locked(
 }
 
 fn unregister_call_assembler_expectations(caller_id: CallAssemblerCallerId) {
-    // `try_*_drop`: this helper is called from `CraneliftBackend::drop`,
-    // which may run during thread TLS teardown. See the drop-path comment
-    // on `try_call_assembler_expectations_drop`.
+    // `try_*_drop`: the token's `free_loop_and_bridges` path may run
+    // during thread TLS teardown. See the drop-path comment on
+    // `try_call_assembler_expectations_drop`.
     try_call_assembler_expectations_drop(|m| {
         remove_call_assembler_expectations_locked(m, caller_id)
     });
@@ -2722,7 +2709,7 @@ fn unregister_call_assembler_bridge_tree(fail_descrs: &[DescrRef]) {
     }
 }
 
-fn collect_call_assembler_expectations(ops: &[OpRc]) -> Result<IndexMap<u64, u64>, BackendError> {
+fn collect_call_assembler_expectations(ops: &[OpRc]) -> Result<IndexMap<usize, u64>, BackendError> {
     let mut expectations = IndexMap::new();
     for op in ops {
         let opcode = op.opcode;
@@ -2741,12 +2728,14 @@ fn collect_call_assembler_expectations(ops: &[OpRc]) -> Result<IndexMap<u64, u64
         let call_descr = descr.as_call_descr().ok_or_else(|| {
             unsupported_semantics(opcode, "call-assembler descriptor must be a CallDescr")
         })?;
-        let target_token = call_descr.call_target_token().ok_or_else(|| {
-            unsupported_semantics(
-                opcode,
-                "call-assembler descriptor must provide a compiled target token",
-            )
-        })?;
+        let target_token = call_assembler_jitcell_token(&descr)
+            .map(|token| token.identity_key())
+            .ok_or_else(|| {
+                unsupported_semantics(
+                    opcode,
+                    "call-assembler descriptor must provide a compiled target token",
+                )
+            })?;
         let expected_result_kind = expected_call_assembler_result_kind(call_descr)?;
         if let Some(&previous) = expectations.get(&target_token) {
             validate_call_assembler_target_result_kind(
@@ -2821,7 +2810,7 @@ fn register_call_assembler_target(
     compiled: &CompiledLoop,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
-    invalidate_ca_thread_cache(token.number);
+    invalidate_ca_thread_cache(token.identity_key());
     let entry_code = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
     let entry_body = compiled.entry_body_ptr.load(Ordering::Acquire) as *const u8;
     // assembler.py: `looptoken._ll_function_addr = rawstart + functionpos`
@@ -2830,18 +2819,8 @@ fn register_call_assembler_target(
     token.set_ll_function_addr(entry_body as usize);
     let depth = compiled.frame_depth as i64;
     let base_ofs = JF_FRAME_ITEM0_OFS as i64;
-    // Preserve an existing registered CLT Arc when this token number is
-    // re-registered, so metadata pointers already baked into callers remain
-    // stable. `CompiledLoopToken::new` zero-initialises the fields we're about
-    // to populate, so reusing the token's current CLT is safe.
-    if let Some(existing_clt) = with_call_assembler_registry(|m| {
-        m.get(&token.number)
-            .and_then(|t| t.compiled_loop_token.upgrade())
-    }) {
-        token.set_compiled_loop_token(Some(existing_clt));
-    }
     let clt = token.compiled_loop_token_expect();
-    clt.set_ca_unregister(unregister_call_assembler_target);
+    clt.set_ca_unregister(token.identity_key(), unregister_call_assembler_target);
     // `regalloc.py` `_set_initial_bindings`: contiguous layout
     // → `locs[i] = i * SIZEOFSIGNED`.
     *clt._ll_initial_locs.lock() = (0..compiled.num_inputs).map(|i| (i as i32) * 8).collect();
@@ -2872,11 +2851,11 @@ fn register_call_assembler_target(
         compiled_loop_token: Arc::downgrade(&clt),
         cpu_attachments: Arc::clone(&compiled.cpu_attachments),
     };
-    validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
+    validate_registered_target_against_call_assembler_expectations(token.identity_key(), &target)?;
     // Invalidate thread-local cache in case a pending placeholder was cached.
-    invalidate_ca_thread_cache(token.number);
+    invalidate_ca_thread_cache(token.identity_key());
     // Create/update dispatch slot for direct call
-    ca_dispatch_slot(token.number, entry_code);
+    ca_dispatch_slot(token.identity_key(), entry_code);
     // `compile.py:665-674` parity: the direct CA call path embeds the
     // finish descr pointer as a compile-time constant in the caller,
     // and the callee writes the same pointer into `jf_descr` at FINISH
@@ -2896,42 +2875,42 @@ fn register_call_assembler_target(
             .copied()
             .unwrap_or(Type::Void);
         let ptr = attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64;
-        ca_dispatch_set_finish_descr_ptr(token.number, ptr);
+        ca_dispatch_set_finish_descr_ptr(token.identity_key(), ptr);
     }
-    with_call_assembler_registry(|m| m.insert(token.number, target));
+    with_call_assembler_registry(|m| m.insert(token.identity_key(), target));
     Ok(())
 }
 
-fn unregister_call_assembler_target(token_number: u64) {
-    invalidate_ca_thread_cache(token_number);
-    unregister_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token_number));
-    ca_dispatch_remove(token_number);
-    // `try_*_drop`: called from `CraneliftBackend::drop` during thread
-    // shutdown — use TLS teardown-safe variant.
+fn unregister_call_assembler_target(token_key: usize) {
+    invalidate_ca_thread_cache(token_key);
+    unregister_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token_key));
+    ca_dispatch_remove(token_key);
+    // `try_*_drop`: `CompiledLoopToken::__del__` /
+    // `free_loop_and_bridges` may run during thread TLS teardown.
     let mut removed = None;
-    try_call_assembler_registry_drop(|m| removed = m.swap_remove(&token_number));
+    try_call_assembler_registry_drop(|m| removed = m.swap_remove(&token_key));
     if let Some(target) = removed {
         unregister_call_assembler_bridge_tree(&target.fail_descrs);
     }
 }
 
-fn lookup_call_assembler_target(token_number: u64) -> Option<RegisteredLoopTarget> {
-    with_call_assembler_registry(|m| m.get(&token_number).cloned())
+fn lookup_call_assembler_target(token_key: usize) -> Option<RegisteredLoopTarget> {
+    with_call_assembler_registry(|m| m.get(&token_key).cloned())
 }
 
-fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<(), BackendError> {
-    invalidate_ca_thread_cache(old_number);
-    let Some(new_target) = lookup_call_assembler_target(new_number) else {
+fn redirect_call_assembler_target(old_key: usize, new_key: usize) -> Result<(), BackendError> {
+    invalidate_ca_thread_cache(old_key);
+    let Some(new_target) = lookup_call_assembler_target(new_key) else {
         return Ok(());
     };
-    if let Some(old_target) = lookup_call_assembler_target(old_number)
+    if let Some(old_target) = lookup_call_assembler_target(old_key)
         && old_target.inputarg_types != new_target.inputarg_types
     {
         return Err(BackendError::Unsupported(format!(
-            "call-assembler redirect from token {old_number} to {new_number} changed input types"
+            "call-assembler redirect from token {old_key} to {new_key} changed input types"
         )));
     }
-    validate_registered_target_against_call_assembler_expectations(old_number, &new_target)?;
+    validate_registered_target_against_call_assembler_expectations(old_key, &new_target)?;
     // Update dispatch slot so existing compiled code sees the new target.
     // Must update both code_ptr AND finish_descr_ptr (the new target has
     // different FailDescr pointers for its finish exit).
@@ -2952,8 +2931,8 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
             attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
         })
         .unwrap_or(CA_FINISH_INDEX_UNKNOWN as i64);
-    ca_dispatch_redirect(old_number, new_target.code_ptr, new_finish_descr_ptr);
-    with_call_assembler_registry(|m| m.insert(old_number, new_target));
+    ca_dispatch_redirect(old_key, new_target.code_ptr, new_finish_descr_ptr);
+    with_call_assembler_registry(|m| m.insert(old_key, new_target));
     Ok(())
 }
 
@@ -3289,8 +3268,7 @@ fn handle_compiled_exit(
     // ask the descr what this word has already said. The arm is a
     // SUPERSET of `is_finish()` — a `PropagateExceptionDescr` answers
     // `u32::MAX` too and is not final — and it is right only because
-    // the fall-through return is byte-identical and
-    // `maybe_increment_fail_count` is inert on both. Anything added
+    // the fall-through return is byte-identical. Anything added
     // between the two returns below has to be re-checked here.
     debug_assert!(
         fail_index != u32::MAX || {
@@ -3337,7 +3315,6 @@ fn handle_compiled_exit(
         ));
     }
 
-    maybe_increment_fail_count(fail_descr_fd);
     // llgraph/runner.py fail_guard → ExecutionFinished (LLDeadFrame).
     // Attached bridges dispatch in-code (`patch_jump_for_descr`);
     // reaching here means the descr has no bridge.
@@ -3487,7 +3464,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let fail_descr = direct_descr
             .unwrap_or_else(|| ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone()));
         let fail_descr_fd = fail_descr.as_fail_descr();
-        maybe_increment_fail_count(fail_descr_fd);
         if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             // Extracted here rather than beside `fail_index`: the exits that
             // reach the two returns below never read a slot vector, and the
@@ -3589,7 +3565,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         }
 
         // Bridge compilation is decided by MetaInterp.must_compile()
-        // (compile.py:783-784 jitcounter.tick), not by backend fail_count.
+        // (`AbstractResumeGuardDescr.must_compile` jitcounter.tick).
 
         // jf_savedata already correct in jf_frame memory.
         // jf_guard_exc already written by emit_guard_exit
@@ -4078,7 +4054,7 @@ extern "C" fn call_assembler_guard_failure(
     // same `PYRE_STACKTOOBIG.stack_end` the rest of the runtime uses.
     call_assembler_guard_failure_inner(
         cpu_handle,
-        token_number,
+        token_number as usize,
         fail_descr_ptr,
         frame_ptr,
         outputs_ptr,
@@ -4088,7 +4064,7 @@ extern "C" fn call_assembler_guard_failure(
 
 fn call_assembler_guard_failure_inner(
     cpu_handle: *const majit_backend::CpuDescrCell,
-    token_number: u64,
+    token_number: usize,
     fail_descr_ptr: i64,
     frame_ptr: i64,
     outputs_ptr: *const i64,
@@ -4204,8 +4180,7 @@ fn call_assembler_guard_failure_inner(
     let outputs_ptr = call_assembler_frame_outputs(frame_ptr, outputs_ptr);
 
     // Fast path: read the attached bridge directly from the fail_descr
-    // (which IS jf_descr from the callee's guard exit). Skip
-    // fail_count increment when bridge is available, as patched PyPy
+    // (which IS jf_descr from the callee's guard exit). Patched PyPy
     // code jumps to the bridge instead of re-entering the guard helper.
     if let Some(bridge) = fail_descr_bridge_ref(fail_descr_ref) {
         let raw_num = fail_descr_ref.fail_arg_types().len();
@@ -4237,7 +4212,7 @@ fn call_assembler_guard_failure_inner(
         return 0;
     }
 
-    // Slow path: target lookup + fail_count increment.
+    // Slow path: target lookup.
     //
     // RPython handle_fail is a method on the failed descriptor object.
     // Do not re-index through the root CALL_ASSEMBLER target here: when a
@@ -4259,7 +4234,6 @@ fn call_assembler_guard_failure_inner(
     // `compile_bridge`'s `debug_assert_eq!(source_jct.green_key, green_key)`
     // (pyjitpl.rs).
     let owning_jct = majit_backend::descr_owning_jct(fail_descr);
-    maybe_increment_fail_count(fail_descr);
     frame_ptr = reread_rooted_call_assembler_frame(frame_ptr, &frame_root);
 
     // compile.py handle_fail → must_compile → bridge tracing.
@@ -4361,7 +4335,7 @@ fn call_assembler_shim_inner(
     // the check the callee is about to perform on the same stack.
     let outcome = outcome_ptr as usize as *mut i64;
 
-    let target = unsafe { &*fast_lookup_ca_target(target_token) };
+    let target = unsafe { &*fast_lookup_ca_target(target_token as usize) };
 
     let input_slice =
         unsafe { std::slice::from_raw_parts(args_ptr as usize as *const i64, target.num_inputs) };
@@ -5823,8 +5797,7 @@ fn resolve_call_assembler_target(
     descr_token: Option<&JitCellToken>,
 ) -> Result<Option<RegisteredLoopTarget>, BackendError> {
     let target_token = descr_token
-        .map(|token| token.number)
-        .or_else(|| call_descr.call_target_token())
+        .map(|token| token.identity_key())
         .ok_or_else(|| {
             unsupported_semantics(
                 opcode,
@@ -6006,19 +5979,21 @@ fn build_type_overrides(
     // the LABEL arg's type changes to the JUMP arg's type. RPython's
     // Box objects carry their own types; in our flat OpRef namespace we
     // must propagate types through the JUMP→LABEL edge explicitly.
-    // Collect LABEL→descr and JUMP→descr, then match by descr index.
-    let mut label_by_descr: IndexMap<u32, usize> = IndexMap::new();
-    let mut jumps_by_descr: Vec<(u32, usize)> = Vec::new();
+    // Key by `descr_identity` (`x86/regalloc.py consider_jump`,
+    // `x86/assembler.py closing_jump` / `fixup_target_tokens`):
+    // `Descr::index` is not unique across distinct TargetToken objects.
+    let mut label_by_descr: IndexMap<usize, usize> = IndexMap::new();
+    let mut jumps_by_descr: Vec<(usize, usize)> = Vec::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label {
             let __descr_arc_d = op.getdescr();
             if let Some(d) = __descr_arc_d.as_ref() {
-                label_by_descr.insert(d.index(), op_idx);
+                label_by_descr.insert(majit_ir::descr_identity(d), op_idx);
             }
         } else if op.opcode == OpCode::Jump {
             let __descr_arc_d = op.getdescr();
             if let Some(d) = __descr_arc_d.as_ref() {
-                jumps_by_descr.push((d.index(), op_idx));
+                jumps_by_descr.push((majit_ir::descr_identity(d), op_idx));
             }
         }
     }
@@ -11575,8 +11550,6 @@ pub struct CraneliftBackend {
     /// `Backend::set_next_frame_value_count_fn` — the compiling driver's
     /// `-live-` decoder for the `rd_numb` reads below.
     next_frame_value_count_fn: Option<fn(i32, i32) -> usize>,
-    registered_call_assembler_tokens: IndexSet<u64>,
-    registered_call_assembler_bridge_traces: IndexSet<u64>,
     /// llmodel.py: self.vtable_offset — byte offset for vtable in objects.
     /// pyre PyObject layout: ob_type at offset 0.
     vtable_offset: Option<usize>,
@@ -11801,8 +11774,6 @@ impl CraneliftBackend {
             next_trace_id: None,
             next_header_pc: None,
             next_frame_value_count_fn: None,
-            registered_call_assembler_tokens: IndexSet::new(),
-            registered_call_assembler_bridge_traces: IndexSet::new(),
             // llmodel.py:64-69: vtable_offset is None when gcremovetypeptr is
             // enabled; otherwise it comes from
             //   symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...).
@@ -12036,30 +12007,33 @@ impl CraneliftBackend {
             // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info),
             // both sourced directly from the CLT Arc on the target
             // (model.py:292-338).
-            call_assembler_callee_locs: Some(Box::new(|token_number| {
-                lookup_call_assembler_target(token_number).and_then(|t| {
-                    let clt = t.compiled_loop_token.upgrade()?;
-                    // JitFrameInfo is #[repr(C)] so `&JitFrameInfo as *const _`
-                    // points at [jfi_frame_depth, jfi_frame_size] (Signed
-                    // words); the generated CALL_ASSEMBLER code loads those
-                    // without taking the Mutex. Keeping the Arc alive via
-                    // `RegisteredLoopTarget.compiled_loop_token` pins the
-                    // allocation, matching RPython where the lltype-malloced
-                    // JITFRAMEINFO outlives the loop.
-                    let frame_info_ptr = {
-                        let guard = clt.frame_info.lock();
-                        &*guard as *const majit_backend::JitFrameInfo as usize
-                    };
-                    let ll_initial_locs = clt._ll_initial_locs.lock().clone();
-                    Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
-                        _ll_initial_locs: ll_initial_locs,
-                        frame_depth: t.max_output_slots + t.num_ref_roots,
-                        frame_info_ptr,
-                        // pyjitpl.py direct_call_may_force — outermost_jitdriver_sd.index_of_virtualizable,
-                        // propagated from JitCellToken at registration time.
-                        index_of_virtualizable: t.index_of_virtualizable,
+            call_assembler_callee_locs: Some(Box::new(|ltd| {
+                ltd.token_handle_any()
+                    .and_then(|any| any.downcast_ref::<Arc<JitCellToken>>())
+                    .and_then(|token| lookup_call_assembler_target(token.identity_key()))
+                    .and_then(|t| {
+                        let clt = t.compiled_loop_token.upgrade()?;
+                        // JitFrameInfo is #[repr(C)] so `&JitFrameInfo as *const _`
+                        // points at [jfi_frame_depth, jfi_frame_size] (Signed
+                        // words); the generated CALL_ASSEMBLER code loads those
+                        // without taking the Mutex. Keeping the Arc alive via
+                        // `RegisteredLoopTarget.compiled_loop_token` pins the
+                        // allocation, matching RPython where the lltype-malloced
+                        // JITFRAMEINFO outlives the loop.
+                        let frame_info_ptr = {
+                            let guard = clt.frame_info.lock();
+                            &*guard as *const majit_backend::JitFrameInfo as usize
+                        };
+                        let ll_initial_locs = clt._ll_initial_locs.lock().clone();
+                        Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
+                            _ll_initial_locs: ll_initial_locs,
+                            frame_depth: t.max_output_slots + t.num_ref_roots,
+                            frame_info_ptr,
+                            // pyjitpl.py direct_call_may_force — outermost_jitdriver_sd.index_of_virtualizable,
+                            // propagated from JitCellToken at registration time.
+                            index_of_virtualizable: t.index_of_virtualizable,
+                        })
                     })
-                })
             })),
         }
     }
@@ -12295,8 +12269,6 @@ impl CraneliftBackend {
             // jf_guard_exc already written by emit_guard_exit.
             return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         }
-
-        maybe_increment_fail_count(fail_descr_fd);
 
         if let Some(next_bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             // Extracted on the one arm that feeds it forward; the FINISH and
@@ -16255,15 +16227,14 @@ impl CraneliftBackend {
                     let args_data_ptr = builder
                         .ins()
                         .iadd_imm_s(args_ptr, JF_FRAME_ITEM0_OFS as i64);
-                    let token_val = descr_token
-                        .map(|token| token.number)
-                        .or_else(|| call_descr.call_target_token())
-                        .ok_or_else(|| {
+                    let token_val = descr_token.map(|token| token.identity_key()).ok_or_else(
+                        || {
                             unsupported_semantics(
                                 op.opcode,
                                 "call-assembler descriptor must provide a compiled target token",
                             )
-                        })?;
+                        },
+                    )?;
                     let target_token = builder.ins().iconst(cl_types::I64, token_val as i64);
                     let args_ptr_i64 = ptr_arg_as_i64(&mut builder, args_data_ptr, ptr_type);
                     let outcome_slot = builder.create_sized_stack_slot(StackSlotData::new(
@@ -20724,12 +20695,14 @@ impl CraneliftBackend {
 
 impl Drop for CraneliftBackend {
     fn drop(&mut self) {
-        for token_number in std::mem::take(&mut self.registered_call_assembler_tokens) {
-            unregister_call_assembler_target(token_number);
-        }
-        for trace_id in std::mem::take(&mut self.registered_call_assembler_bridge_traces) {
-            unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(trace_id));
-        }
+        // `model.py CompiledLoopToken.__del__` calls
+        // `cpu.free_loop_and_bridges(self)` for that token. There is no
+        // backend-wide sweep of identity keys: `JitCellToken::identity_key`
+        // is a heap cell that a later token can reuse, and unregistering a
+        // remembered key here would retract the new token's CALL_ASSEMBLER
+        // registry (`unregister_call_assembler_target` on the token's own
+        // `ca_unregister` / `Backend::free_loop` is the only retract).
+        //
         // The active allocator and the call-assembler deadframe map belong to
         // this execution thread, not to this transient backend value.
         // Several JitDrivers can coexist on one thread; clearing either slot
@@ -21954,9 +21927,9 @@ impl CraneliftBackend {
             repointed.push(descr.clone());
         }
         token.set_ll_function_addr(body_ptr);
-        ca_dispatch_slot(token.number, code_ptr as *const u8);
+        ca_dispatch_slot(token.identity_key(), code_ptr as *const u8);
         with_call_assembler_registry(|registry| {
-            if let Some(target) = registry.get_mut(&token.number) {
+            if let Some(target) = registry.get_mut(&token.identity_key()) {
                 target.code_ptr = code_ptr as *const u8;
                 target.body_ptr = body_ptr as *const u8;
             }
@@ -22319,13 +22292,13 @@ impl majit_backend::Backend for CraneliftBackend {
             code_size: compiled.code_size,
         };
         register_call_assembler_target(token, &compiled, self.attached_descr_ptrs())?;
-        if let Err(err) =
-            install_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token.number), ops)
-        {
-            unregister_call_assembler_target(token.number);
+        if let Err(err) = install_call_assembler_expectations(
+            CallAssemblerCallerId::RootLoop(token.identity_key()),
+            ops,
+        ) {
+            unregister_call_assembler_target(token.identity_key());
             return Err(err);
         }
-        self.registered_call_assembler_tokens.insert(token.number);
         self.register_fail_descrs(token, &compiled.fail_descrs);
         if let Some(table) = compiled.gc_table.clone() {
             self.register_gc_table(token, table);
@@ -22551,8 +22524,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     .map(|block| Box::new(block) as Box<dyn std::any::Any + Send>),
             );
         }
-        self.registered_call_assembler_bridge_traces
-            .insert(compiled.trace_id);
         // `compile.py record_loop_or_bridge`: bridge descrs
         // are scoped to the original loop's CLT, so the tracer batch
         // lands on `original_token`'s `asmmemmgr_gcreftracers`.
@@ -23028,8 +22999,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 };
             }
 
-            maybe_increment_fail_count(fail_descr_fd);
-
             // X1-delete proved the host-loop bridge fallback is dead for
             // `execute_with_inputs`: every attached bridge is dispatched
             // inside the generated code via `patch_jump_for_descr`
@@ -23349,17 +23318,15 @@ impl majit_backend::Backend for CraneliftBackend {
             let old_weak = Arc::downgrade(&old_clt);
             new_clt.update_frame_info(&old_clt, old_weak, baseofs);
         }
-        redirect_call_assembler_target(old.number, new.number)?;
+        redirect_call_assembler_target(old.identity_key(), new.identity_key())?;
         // Non-x86 assemblers log `newlooptoken.number`
         // (`aarch64/assembler.py redirect_call_assembler`).
-        majit_backend::redirect_assembler(old, new, new.number);
+        majit_backend::redirect_assembler(old, new, new.number() as u64);
         Ok(())
     }
 
     fn free_loop(&mut self, token: &JitCellToken) {
-        unregister_call_assembler_target(token.number);
-        self.registered_call_assembler_tokens
-            .swap_remove(&token.number);
+        unregister_call_assembler_target(token.identity_key());
         // `llmodel.py free_loop_and_bridges` parity.  Strong
         // refs to baked `FailDescrCell` Arcs live on
         // `clt.asmmemmgr_gcreftracers` (`model.py:294`); dropping the
@@ -24015,7 +23982,7 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
         let ops = [word, armed, OpRc::new(guard), OpRc::new(finish)];
-        let token = JitCellToken::new(trace_id);
+        let token = JitCellToken::new(trace_id as i64);
         backend
             .compile_loop(&[], &ops, &token)
             .expect("compile eval-breaker poll IR");
@@ -24136,7 +24103,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let callee_token = JitCellToken::new(1_500_540);
+        let callee_token = Arc::new(JitCellToken::new(1_500_540));
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .expect("int-finishing callee registers as call-assembler target");
@@ -24160,9 +24127,10 @@ mod tests {
         let fd = descr.as_fail_descr().expect("resume guard is a FailDescr");
         assert_eq!(fd.adr_jump_offset(), 0);
 
-        let mismatch_token = JitCellToken::new(1_500_540);
+        // Recompiling the callee token itself with a void FINISH clashes with
+        // the caller's int expectation registered under that token.
         let err = backend
-            .compile_loop(&[], &guard_void_finish_ops(descr.clone()), &mismatch_token)
+            .compile_loop(&[], &guard_void_finish_ops(descr.clone()), &callee_token)
             .expect_err("void finish must fail call-assembler registration");
         assert!(
             format!("{err:?}").contains("incompatible"),
@@ -24212,12 +24180,12 @@ mod tests {
     }
 
     fn make_call_assembler_descr(
-        target: &JitCellToken,
+        target: &Arc<JitCellToken>,
         arg_types: Vec<Type>,
         result_type: Type,
     ) -> majit_ir::DescrRef {
         Arc::new(CallAssemblerDescr::new(
-            target.number,
+            Arc::clone(target),
             arg_types,
             result_type,
         ))
@@ -24777,7 +24745,7 @@ mod tests {
         expected_detail: &str,
     ) {
         let mut backend = CraneliftBackend::new();
-        let token = JitCellToken::new(token_number);
+        let token = JitCellToken::new(token_number as i64);
         let err = backend.compile_loop(&inputargs, &ops, &token).unwrap_err();
         match err {
             BackendError::Unsupported(msg) => {
@@ -25467,7 +25435,7 @@ mod tests {
             InputArg::new_ref_rc(1),
             InputArg::new_float_rc(2),
         ];
-        let token = JitCellToken::new(token_id);
+        let token = JitCellToken::new(token_id as i64);
         backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
         let failed = backend.execute_token(
             &token,
@@ -25585,7 +25553,7 @@ mod tests {
             InputArg::new_ref_rc(4),
             InputArg::new_int_rc(5),
         ];
-        let token = JitCellToken::new(token_id);
+        let token = JitCellToken::new(token_id as i64);
         backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
         let values = [
             Value::Int(10),
@@ -27280,6 +27248,80 @@ mod tests {
 
         // B adds 100 once and jumps into A, which adds 1 and finishes. Looping
         // back to B's own LABEL would instead add 100 until the guard fails.
+        let frame = backend.execute_token(&token_b, &[Value::Int(0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 101);
+        let _keep_a = token_a;
+    }
+
+    /// Simple-loop TargetTokens all carry `Descr::index` 0. Type-propagation
+    /// and block lookup must still treat a JUMP to a *different* index-0
+    /// object as an external edge (`x86/regalloc.py consider_jump`,
+    /// `x86/assembler.py closing_jump` / `fixup_target_tokens`).
+    #[test]
+    fn jump_to_distinct_index_0_target_is_not_local_back_edge() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let label_a = make_label_descr(0);
+        let ops_a = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label_a.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        let token_a = JitCellToken::new(9106);
+        token_a.record_target_token(label_a.clone());
+        backend.compile_loop(&inputargs, &ops_a, &token_a).unwrap();
+
+        let label_b = make_label_descr(0);
+        assert_eq!(label_a.index(), 0);
+        assert_eq!(label_b.index(), 0);
+        assert_ne!(
+            majit_ir::descr_identity(&label_a),
+            majit_ir::descr_identity(&label_b)
+        );
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
+        let ops_b = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label_b.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(100)],
+                1,
+            ),
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(1000)],
+                2,
+            ),
+            guard,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label_a,
+            ),
+        ];
+        let token_b = JitCellToken::new(9107);
+        token_b.record_target_token(label_b);
+        backend.compile_loop(&inputargs, &ops_b, &token_b).unwrap();
+
+        // B adds 100 once and jumps into A. Matching on `Descr::index` 0
+        // would treat that JUMP as B's own back-edge and add 100 until the
+        // guard fails.
         let frame = backend.execute_token(&token_b, &[Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 101);
@@ -30846,7 +30888,7 @@ mod tests {
                 ),
             ];
 
-            let token = JitCellToken::new(token_id);
+            let token = JitCellToken::new(token_id as i64);
             backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
             let frame = backend.execute_token(&token, &[Value::Int(input)]);
@@ -32420,55 +32462,6 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_failure_counting() {
-        // Verify that guard failures are counted.
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int_rc(0)];
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::GuardTrue,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        let token = JitCellToken::new(201);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        // Execute with x = 0 (guard fails) multiple times
-        for i in 1..=5 {
-            backend.execute_token(&token, &[Value::Int(0)]);
-            let compiled = token
-                .compiled
-                .get()
-                .unwrap()
-                .downcast_ref::<CompiledLoop>()
-                .unwrap();
-            let descr = &compiled.fail_descrs[0];
-            assert_eq!(as_fd(descr).fail_count(), i);
-        }
-
-        // Execute with x = 1 (guard passes, reaches finish)
-        backend.execute_token(&token, &[Value::Int(1)]);
-        let compiled = token
-            .compiled
-            .get()
-            .unwrap()
-            .downcast_ref::<CompiledLoop>()
-            .unwrap();
-        // Guard descr count unchanged (guard didn't fail this time)
-        let guard_descr = &compiled.fail_descrs[0];
-        assert_eq!(as_fd(guard_descr).fail_count(), 5);
-    }
-
-    #[test]
     fn test_bridge_with_explicit_fail_args() {
         // Test that when a guard has explicit fail_args, the bridge receives
         // those values as inputs.
@@ -33255,9 +33248,9 @@ mod tests {
         callee_constants.insert(100, 2);
         backend.set_constants(callee_constants);
 
-        let callee_token = JitCellToken::new(1_500_200);
+        let callee_token = Arc::new(JitCellToken::new(1_500_200));
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
+            .compile_loop(&callee_inputargs, &callee_ops, callee_token.as_ref())
             .unwrap();
 
         let caller_inputargs = vec![InputArg::new_int_rc(0)];
@@ -33285,7 +33278,7 @@ mod tests {
     #[test]
     fn test_call_assembler_requires_gc_runtime_for_rewrite_parity() {
         let mut backend = CraneliftBackend::new();
-        let callee_token = JitCellToken::new(1_500_352);
+        let callee_token = Arc::new(JitCellToken::new(1_500_352));
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -33299,7 +33292,7 @@ mod tests {
         ];
 
         let err = backend
-            .compile_loop(&inputargs, &ops, &callee_token)
+            .compile_loop(&inputargs, &ops, callee_token.as_ref())
             .unwrap_err();
         assert!(
             err.to_string().contains("requires a configured GC runtime"),

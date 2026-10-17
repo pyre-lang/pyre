@@ -11,7 +11,9 @@ use majit_ir::{ConstMap, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 fn token() -> Arc<JitCellToken> {
     static NEXT: AtomicU64 = AtomicU64::new(1_000_000);
-    Arc::new(JitCellToken::new(NEXT.fetch_add(1, Ordering::Relaxed)))
+    Arc::new(JitCellToken::new(
+        NEXT.fetch_add(1, Ordering::Relaxed) as i64
+    ))
 }
 
 fn backend() -> Box<dyn Backend> {

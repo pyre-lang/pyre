@@ -4154,9 +4154,10 @@ where
         // with is the ROOT frame's i0, so an inlined callee's own pc
         // would name a position in the wrong code.
         if ctx.inline_depth() == 0
-            && let Some(u) = mp_green_pc.and_then(|v| usize::try_from(v).ok()) {
-                ctx.last_mp_green_pc = Some(u);
-            }
+            && let Some(u) = mp_green_pc.and_then(|v| usize::try_from(v).ok())
+        {
+            ctx.last_mp_green_pc = Some(u);
+        }
         if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
             // The loop-vs-bridge split lives inside
             // `create_segmented_trace`, where upstream keeps it
@@ -6859,11 +6860,14 @@ where
                 }
             }
         }
-        let (token_number, concrete_ptr) = self
-            .frames
-            .current_mut()
-            .jitcode
-            .call_assembler_target(fn_ptr_idx);
+        let (concrete_ptr, token_weak) = {
+            let target = self
+                .frames
+                .current_mut()
+                .jitcode
+                .call_assembler_target(fn_ptr_idx);
+            (target.concrete_ptr, target.token.clone())
+        };
         // 1. `clear_exception`.
         self.clear_exception();
         // Refusals with no `do_residual_call` counterpart, before
@@ -6892,7 +6896,7 @@ where
         // `direct_assembler_call` reads the token before it records. A
         // missing token aborts here, before the stamp and the concrete
         // call, so a replay of this opcode does not run the call twice.
-        let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
+        let Some(arc) = token_weak.upgrade() else {
             return TraceAction::Abort;
         };
         // 2. `vable_and_vrefs_before_residual_call`: vrefs first, then
@@ -7876,11 +7880,14 @@ where
                 }
             }
         }
-        let (token_number, concrete_ptr) = self
-            .frames
-            .current_mut()
-            .jitcode
-            .call_assembler_target(fn_ptr_idx);
+        let (concrete_ptr, token_weak) = {
+            let target = self
+                .frames
+                .current_mut()
+                .jitcode
+                .call_assembler_target(fn_ptr_idx);
+            (target.concrete_ptr, target.token.clone())
+        };
         self.clear_exception();
         if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
             return report_symbolic_residual_call_target(
@@ -7902,7 +7909,7 @@ where
         ) {
             return action;
         }
-        let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
+        let Some(arc) = token_weak.upgrade() else {
             return TraceAction::Abort;
         };
         ctx.vrefs_before_residual_call();
@@ -8018,11 +8025,14 @@ where
                 }
             }
         }
-        let (token_number, concrete_ptr) = self
-            .frames
-            .current_mut()
-            .jitcode
-            .call_assembler_target(fn_ptr_idx);
+        let (concrete_ptr, token_weak) = {
+            let target = self
+                .frames
+                .current_mut()
+                .jitcode
+                .call_assembler_target(fn_ptr_idx);
+            (target.concrete_ptr, target.token.clone())
+        };
         self.clear_exception();
         if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
             return report_symbolic_residual_call_target(
@@ -8044,7 +8054,7 @@ where
         ) {
             return action;
         }
-        let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
+        let Some(arc) = token_weak.upgrade() else {
             return TraceAction::Abort;
         };
         ctx.vrefs_before_residual_call();
@@ -8161,11 +8171,14 @@ where
                 }
             }
         }
-        let (token_number, concrete_ptr) = self
-            .frames
-            .current_mut()
-            .jitcode
-            .call_assembler_target(fn_ptr_idx);
+        let (concrete_ptr, token_weak) = {
+            let target = self
+                .frames
+                .current_mut()
+                .jitcode
+                .call_assembler_target(fn_ptr_idx);
+            (target.concrete_ptr, target.token.clone())
+        };
         self.clear_exception();
         if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
             return report_symbolic_residual_call_target(
@@ -8187,7 +8200,7 @@ where
         ) {
             return action;
         }
-        let Some(arc) = _runtime.jitcell_token_arc_for_number(token_number) else {
+        let Some(arc) = token_weak.upgrade() else {
             return TraceAction::Abort;
         };
         ctx.vrefs_before_residual_call();

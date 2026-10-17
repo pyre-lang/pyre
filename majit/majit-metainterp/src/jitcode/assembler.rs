@@ -6367,12 +6367,12 @@ impl JitCodeBuilder {
         self.add_call_target_with_save_err(trace_ptr, concrete_ptr, slot, save_err)
     }
 
-    pub fn add_call_assembler_target_number(
+    pub fn add_call_assembler_target(
         &mut self,
-        token_number: u64,
+        target: &std::sync::Arc<JitCellToken>,
         concrete_ptr: *const (),
     ) -> u16 {
-        let target = JitCallAssemblerTarget::new(token_number, concrete_ptr);
+        let target = JitCallAssemblerTarget::new(target, concrete_ptr);
         for (idx, entry) in self.descrs.iter().enumerate() {
             if let RuntimeBhDescr::AssemblerToken(existing) = entry
                 && *existing == target
@@ -6381,14 +6381,6 @@ impl JitCodeBuilder {
             }
         }
         self.push_descr_entry(RuntimeBhDescr::AssemblerToken(target))
-    }
-
-    pub fn add_call_assembler_target(
-        &mut self,
-        target: &JitCellToken,
-        concrete_ptr: *const (),
-    ) -> u16 {
-        self.add_call_assembler_target_number(target.number, concrete_ptr)
     }
 
     fn add_vable_field_descr(&mut self, field_idx: u16) -> u16 {

@@ -7,7 +7,7 @@ use majit_ir::forwarding::bound_operand_from_opref as rb;
 use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 fn float_to_singlefloat_bits(backend: &mut DynasmBackend, token_id: u64, input: f64) -> i64 {
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
     let f0 = inputargs[0].opref();
     let cast = Op::new(OpCode::CastFloatToSinglefloat, &[rb(f0)]);
@@ -26,7 +26,7 @@ fn float_to_singlefloat_bits(backend: &mut DynasmBackend, token_id: u64, input: 
 }
 
 fn singlefloat_bits_to_float(backend: &mut DynasmBackend, token_id: u64, bits: i64) -> f64 {
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let i0 = inputargs[0].opref();
     let cast = Op::new(OpCode::CastSinglefloatToFloat, &[rb(i0)]);
@@ -45,7 +45,7 @@ fn singlefloat_bits_to_float(backend: &mut DynasmBackend, token_id: u64, bits: i
 }
 
 fn chained_cast(backend: &mut DynasmBackend, token_id: u64, input: f64) -> f64 {
-    let token = JitCellToken::new(token_id);
+    let token = JitCellToken::new(token_id as i64);
     let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
     let f0 = inputargs[0].opref();
     let to_sf = Op::new(OpCode::CastFloatToSinglefloat, &[rb(f0)]);

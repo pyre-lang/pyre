@@ -788,39 +788,6 @@ impl BlackholeInterpreter {
         );
     }
 
-    /// RPython `blackhole.py:313-337` register-file setup against the
-    /// canonical codewriter `JitCode`.
-    ///
-    /// This intentionally stops short of installing `self.jitcode` for
-    /// dispatch: pyre's execution path still expects the runtime adapter
-    /// `crate::jitcode::JitCode` for `exec.*` pools. The extracted helper
-    /// keeps the upstream-common part of `setposition` usable without a
-    /// build→runtime conversion layer.
-    #[cfg(test)]
-    pub(crate) fn prepare_registers_for_canonical_jitcode(
-        &mut self,
-        jitcode: &majit_jitcode::jitcode::JitCode,
-        position: usize,
-    ) {
-        let body = jitcode.body();
-        Self::init_register_file_from_i64s(
-            &mut self.registers_i,
-            body.c_num_regs_i as usize,
-            &body.constants_i,
-        );
-        Self::init_register_file_from_const_slots_r(
-            &mut self.registers_r,
-            body.c_num_regs_r as usize,
-            &body.constants_r,
-        );
-        Self::init_register_file_from_i64s(
-            &mut self.registers_f,
-            body.c_num_regs_f as usize,
-            &body.constants_f,
-        );
-        self.reset_position_state(position);
-    }
-
     /// Restore an inline callee frame so [`Self::inline_callee_scratch`] can
     /// hand it to the next `BC_INLINE_CALL`.
     ///
@@ -3011,66 +2978,6 @@ impl BlackholeInterpBuilder {
                 panic!("bad opcode {opcode} at position {}", position - 1);
             }
             position = match self.dispatch_table[opcode](bh, code, position) {
-                Ok(next) => next,
-                Err(err) => {
-                    sync_raise_position(bh, &err);
-                    return Err(err);
-                }
-            };
-        }
-    }
-
-    /// `dispatch_loop` with a per-opcode probe hook (Phase D-2 shadow
-    /// execution scaffolding).
-    ///
-    /// TODO: RPython's `BlackholeInterpBuilder.dispatch_loop`
-    /// has no probe parameter because upstream runs a single dispatch
-    /// path (jitcode). Pyre is mid-migration: trait-based
-    /// `MIFrame::execute_opcode_step` (trace_opcode.rs) and this
-    /// codewriter-orthodox jitcode path coexist while Phase D
-    /// validates the latter against the former. The probe lets a
-    /// shadow-execute caller capture the jitcode op sequence so it
-    /// can compare against the trace-side IR emitted by
-    /// `execute_opcode_step`.
-    ///
-    /// Convergence path: removed in Phase E (eval-loop automation
-    /// plan) when trait dispatch is deleted and `dispatch_loop`
-    /// becomes the single production path. Until then this method
-    /// stays alongside `dispatch_loop` without disturbing it — the
-    /// non-probe loop is verbatim RPython parity, the probe variant
-    /// is the opt-in transitional surface.
-    ///
-    /// `probe(bh_view, pc, opcode_byte, opname_key)` fires once per
-    /// dispatched opcode, BEFORE the handler runs.
-    ///
-    /// * `bh_view` — shared reborrow of the interpreter. The probe
-    ///   can read `registers_i/r/f`, `tmpreg_*`, `descrs`, etc. to
-    ///   capture the input data flow consumed by the upcoming
-    ///   handler. The reborrow expires at the end of the probe call,
-    ///   so the handler runs against the same `&mut BlackholeInterpreter`
-    ///   the loop holds.
-    /// * `pc` — position of the opcode byte (not the position after
-    ///   operand decode). `code[pc] == opcode_byte`.
-    /// * `opname_key` — the `_insns[opcode]` entry (e.g.
-    ///   `"int_add/ii>i"`).
-    pub fn dispatch_loop_with_probe(
-        &self,
-        bh: &mut BlackholeInterpreter,
-        code: &[u8],
-        mut position: usize,
-        mut probe: impl FnMut(&BlackholeInterpreter, usize, u8, &str),
-    ) -> Result<(), DispatchError> {
-        loop {
-            let pc = position;
-            let opcode = code[position];
-            let opcode_idx = opcode as usize;
-            if opcode_idx >= self.dispatch_table.len() {
-                panic!("bad opcode {opcode_idx} at position {pc}");
-            }
-            let opname = self._insns[opcode_idx].as_str();
-            probe(&*bh, pc, opcode, opname);
-            position += 1;
-            position = match self.dispatch_table[opcode_idx](bh, code, position) {
                 Ok(next) => next,
                 Err(err) => {
                     sync_raise_position(bh, &err);
@@ -5325,17 +5232,15 @@ mod tests {
         }
 
         #[test]
-        fn reraise_of_a_null_exception_aborts_the_frame() {
+        #[should_panic(expected = "bhimpl_reraise")]
+        fn reraise_of_a_null_exception_asserts() {
             let mut builder = super::build_inline_call_only_bh_builder(&[(
                 "recursive_call_v/iIRFIRF",
                 majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
             )]);
             let mut bh = builder.acquire_interp();
             bh.exception_last_value = 0;
-            let err = super::handler_reraise(&mut bh, &[], 0)
-                .expect_err("a null exception must leave the frame");
-            assert!(matches!(err, super::DispatchError::LeaveFrame));
-            assert!(bh.aborted);
+            let _ = super::handler_reraise(&mut bh, &[], 0);
         }
 
         #[test]
@@ -7920,11 +7825,6 @@ impl StateFieldLayout {
         );
         Some(self.ref_scalar_base - 1)
     }
-
-    /// Former int-bank identity slot. Always `None`: the identity is a Ref.
-    pub fn vable_identity_slot(&self) -> Option<usize> {
-        None
-    }
 }
 
 // pyre-only: `state_field` family. RPython has no opcode counterpart — the
@@ -8431,13 +8331,17 @@ fn handler_ref_return(
     Err(DispatchError::LeaveFrame)
 }
 
-/// Handler for `void_return/` — RPython blackhole.py:859-862.
+/// Handler for `void_return/` — RPython `bhimpl_void_return`.
 fn handler_void_return(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
-    _position: usize,
+    position: usize,
 ) -> Result<usize, DispatchError> {
     bh.return_type = BhReturnType::Void;
+    // `_get_method` stores the post-decode position before re-raising
+    // `LeaveFrame`. `void_return/` has no operands, so that coordinate
+    // is `position` (the int/ref/float siblings add one for their operand).
+    bh.position = position;
     Err(DispatchError::LeaveFrame)
 }
 
@@ -12441,17 +12345,14 @@ fn handler_raise(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let exc = bh.registers_r[code[p] as usize];
-    // RPython blackhole.py `bhimpl_raise(self, excvalue)`
-    // `e = cast_opaque_ptr(...); assert e; reraise(e)`.
-    // Grain never installs MiniMark, so a helper `NEW` of the exception
-    // is NULL. Abort the frame rather than panic or publish a void return.
-    if exc == 0 {
-        bh.aborted = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+    // `bhimpl_raise(self, excvalue)`:
+    //   e = cast_opaque_ptr(OBJECTPTR, excvalue)
+    //   assert e
+    //   reraise(e)
+    let e = bh.registers_r[code[p] as usize];
+    assert!(e != 0, "bhimpl_raise: exception value must be non-null");
     Err(DispatchError::RaiseException {
-        exc,
+        exc: e,
         resume_position: p + 1,
     })
 }
@@ -12462,14 +12363,17 @@ fn handler_reraise(
 ) -> Result<usize, DispatchError> {
     // `reraise/` decodes no operands, so `p` is already the end of the
     // instruction.
-    // Grain: no MiniMark means no exception object. Abort rather than
-    // panic or publish a void return.
-    if bh.exception_last_value == 0 {
-        bh.aborted = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+    // `bhimpl_reraise(self)`:
+    //   e = self.exception_last_value
+    //   assert e
+    //   reraise(e)
+    let e = bh.exception_last_value;
+    assert!(
+        e != 0,
+        "bhimpl_reraise: exception_last_value must be non-null"
+    );
     Err(DispatchError::RaiseException {
-        exc: bh.exception_last_value,
+        exc: e,
         resume_position: p,
     })
 }

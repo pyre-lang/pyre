@@ -228,7 +228,7 @@ fn a_label_immediately_after_the_guard_is_at_least_five_bytes_later() {
     let token = JitCellToken::new(5);
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let i0 = inputargs[0].opref();
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let guard_descr = make_resume_guard_descr_typed(vec![Type::Int]);
     let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);

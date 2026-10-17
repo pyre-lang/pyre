@@ -2843,12 +2843,17 @@ fn create_segmented_trace<Sym: WalkSym>(
             cause,
         });
     }
-    // pyjitpl.py:1633-1636 `exception_box = ConstInt(ptr2int(
-    // llexception.typeptr))` — the AssertionError type pointer the unreachable
-    // FINISH escapes with. The op sits behind a guard that always fails, so the
-    // placeholder `ConstInt(0)` stands in for a value nothing reads. Both arms
-    // below take this same box, as upstream does.
-    let exception_box = ctx.trace_ctx.const_int(0);
+    // pyjitpl.py `_create_segmented_trace_and_blackhole`:
+    // `exception_box = ConstInt(ptr2int(llexception.typeptr))` from
+    // `jitexc.get_llexception` / `jitexc._get_standard_error`.
+    // Unset host hook keeps ConstInt(0).
+    let typeptr = ctx
+        .trace_ctx
+        .metainterp_sd()
+        .host
+        .assertion_error_typeptr
+        .map_or(0, |f| f());
+    let exception_box = ctx.trace_ctx.const_int(typeptr);
     // pyjitpl.py:1639-1640 `if (metainterp.current_merge_points and
     // isinstance(metainterp.resumekey, compile.ResumeFromInterpDescr)):` — a
     // trace that owns a merge point and entered from the interpreter becomes a
@@ -2968,9 +2973,14 @@ impl PartialEq for DispatchOutcome {
                     target_pc: b_pc,
                 },
             ) => {
-                a_token.as_ref().map(|token| token.number)
-                    == b_token.as_ref().map(|token| token.number)
-                    && a_pc == b_pc
+                // Pending loop tokens share `JitCellToken::NUMBER_UNASSIGNED`
+                // until `compile.py send_loop_to_backend`; identity is the
+                // `Arc`, not the number.
+                match (a_token.as_ref(), b_token.as_ref()) {
+                    (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b) && a_pc == b_pc,
+                    (None, None) => a_pc == b_pc,
+                    _ => false,
+                }
             }
             _ => false,
         }
@@ -4377,6 +4387,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         .get_or_make_jitdriver_assembler_token_arc(
             jd_index,
             green_key.get_uhash(),
+            Some(&green_key),
             &greenboxes,
             &red_types,
         )

@@ -98,15 +98,6 @@ pub struct ExitFrameWithException {
     pub exc_value: GcRef,
 }
 
-/// Request to continue running in the interpreter (leave JIT).
-///
-/// Mirrors ContinueRunningNormally in jitexc.py.
-#[derive(Debug, Clone)]
-pub struct ContinueRunningNormally {
-    pub green_values: Vec<i64>,
-    pub red_values: Vec<i64>,
-}
-
 impl ContinueRunningNormallyArgs {
     /// Green banks a merge point or header snapshot already grouped by kind.
     ///
@@ -126,35 +117,6 @@ impl ContinueRunningNormallyArgs {
             red_ref: Vec::new(),
             red_float: Vec::new(),
         }
-    }
-
-    /// Inverse of a declared-green `GreenKey` (`can_enter_jit` cell key).
-    ///
-    /// `warmspot.py portalfunc_ARGS` asserts `kind != 'void'`. A short
-    /// bank or a void green is a decode fault.
-    pub fn from_declared_green_key(key: &GreenKey) -> Self {
-        assert_eq!(
-            key.types.len(),
-            key.values.len(),
-            "declared green key type/value lengths must match"
-        );
-        let mut green_int = Vec::new();
-        let mut green_ref = Vec::new();
-        let mut green_float = Vec::new();
-        for (&tp, &value) in key.types.iter().zip(key.values.iter()) {
-            match tp {
-                GreenType::Int => green_int.push(value),
-                GreenType::Void => {
-                    panic!(
-                        "void green cannot land in green_int \
-                         (warmspot.py portalfunc_ARGS asserts kind != 'void')"
-                    )
-                }
-                GreenType::Ref | GreenType::Str | GreenType::Unicode => green_ref.push(value),
-                GreenType::Float => green_float.push(value),
-            }
-        }
-        Self::from_green_banks(green_int, green_ref, green_float)
     }
 
     /// Portal pc: `green_int[0]`, the dispatch-entry i0 convention.

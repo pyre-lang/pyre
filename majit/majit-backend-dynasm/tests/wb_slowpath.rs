@@ -107,7 +107,7 @@ fn cond_call_gc_wb_slowpath_reaches_the_gc_and_keeps_live_registers() {
             finish,
         ];
         let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
-        let token = JitCellToken::new(trace_id);
+        let token = JitCellToken::new(trace_id as i64);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
         let frame = backend.execute_token(
             &token,

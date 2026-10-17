@@ -347,7 +347,7 @@ fn test_guard_and_loop() {
     let token = JitCellToken::new(1);
 
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]);
     label_op.pos().set(OpRef::void_op(100));
@@ -408,7 +408,7 @@ fn a_jump_that_carries_a_label_invariant_slot_compiles() {
     ];
     let counter = inputargs[0].opref();
     let invariant = inputargs[1].opref();
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(counter), rb(invariant)]);
     label_op.pos().set(OpRef::void_op(100));
@@ -465,7 +465,7 @@ fn a_jump_shorter_than_its_label_is_rejected() {
     ];
     let counter = inputargs[0].opref();
     let invariant = inputargs[1].opref();
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(counter), rb(invariant)]);
     label_op.pos().set(OpRef::void_op(100));
@@ -492,7 +492,7 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
 
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let value = inputargs[0].opref();
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let label_op = Op::new(OpCode::Label, &[rb(value)]);
     label_op.pos().set(OpRef::void_op(0));
@@ -552,7 +552,7 @@ fn test_float_loop_carried_across_jump() {
         InputArg::from_type_rc(Type::Float, 0),
         InputArg::from_type_rc(Type::Int, 1),
     ];
-    let loop_descr = make_loop_target_descr(token.number, false);
+    let loop_descr = make_loop_target_descr(token.number() as u64, false);
 
     let label_op = Op::new(
         OpCode::Label,

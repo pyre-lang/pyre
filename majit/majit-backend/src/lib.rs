@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Type, Value};
@@ -972,7 +972,14 @@ impl std::fmt::Debug for LoopVersionInfo {
 /// under concurrent execution) — RPython mutates through the GIL instead.
 pub struct CompiledLoopToken {
     /// `model.py` `self.number = number`.
-    pub number: u64,
+    ///
+    /// Log-only (`history.py JitCellToken.number`). pyre creates the CLT
+    /// eagerly in [`JitCellToken::new`] while `compile.py send_loop_to_backend`
+    /// assigns `JitCellToken.number` later; [`JitCellToken::set_number`]
+    /// keeps this copy in sync so the `jit-mem-looptoken-alloc` log sees
+    /// the assigned id. Tokens are told apart by object identity, never
+    /// by this field.
+    number: AtomicI64,
     /// `compile.py:180-181` `wref = weakref.ref(original_jitcell_token);
     /// clt.loop_token_wref = wref` parity. Weak back-reference to the
     /// owning `JitCellToken`. Set immediately after `make_jitcell_token`
@@ -1046,9 +1053,10 @@ pub struct CompiledLoopToken {
     /// Set by [`record_compiled_loop_token`] at assemble time.
     cpu_tracker: parking_lot::Mutex<Option<Arc<CpuTotalTracker>>>,
     /// Backend CALL_ASSEMBLER map retract. `__del__` /
-    /// `free_loop_and_bridges` unregisters the token number so a
+    /// `free_loop_and_bridges` unregisters by token identity so a
     /// side table cannot keep this CLT alive.
-    ca_unregister: parking_lot::Mutex<Option<fn(u64)>>,
+    /// The `usize` is [`JitCellToken::identity_key`] stamped at register.
+    ca_unregister: parking_lot::Mutex<Option<(usize, fn(usize))>>,
 }
 
 /// PyPy `model.py:296-307` `CompiledLoopToken.__init__` opens the
@@ -1078,7 +1086,7 @@ pub fn record_compiled_loop_token(tracker: &Arc<CpuTotalTracker>, clt: &Compiled
     tracker.total_compiled_loops.fetch_add(1, Ordering::Relaxed);
     majit_ir::debug::log_one(
         "jit-mem-looptoken-alloc",
-        &format!("allocating Loop # {}", clt.number),
+        &format!("allocating Loop # {}", clt.number()),
     );
 }
 
@@ -1092,9 +1100,9 @@ impl CompiledLoopToken {
     /// to [`record_compiled_loop_token`] called at the
     /// [`Backend::compile_loop`] entry — see that helper's doc for the
     /// eager-CLT rationale.
-    pub fn new(number: u64) -> Self {
+    pub fn new(number: i64) -> Self {
         CompiledLoopToken {
-            number,
+            number: AtomicI64::new(number),
             loop_token_wref: parking_lot::Mutex::new(std::sync::Weak::new()),
             owning_green_key: AtomicU64::new(0),
             owning_green_key_set: AtomicBool::new(false),
@@ -1109,6 +1117,19 @@ impl CompiledLoopToken {
             cpu_tracker: parking_lot::Mutex::new(None),
             ca_unregister: parking_lot::Mutex::new(None),
         }
+    }
+
+    #[inline]
+    pub fn number(&self) -> i64 {
+        self.number.load(Ordering::Relaxed)
+    }
+
+    /// Keep this copy in sync with [`JitCellToken::set_number`].
+    /// `model.py CompiledLoopToken.__init__` receives the number after
+    /// `compile.py send_loop_to_backend` assigned it.
+    #[inline]
+    pub fn set_number(&self, number: i64) {
+        self.number.store(number, Ordering::Relaxed);
     }
 
     /// `compile.py` `clt.loop_token_wref = wref` setter. Called
@@ -1157,7 +1178,8 @@ impl CompiledLoopToken {
             "jit-mem-looptoken-alloc",
             &format!(
                 "allocating Bridge # {} of Loop # {}",
-                bridges_count, self.number
+                bridges_count,
+                self.number(),
             ),
         );
     }
@@ -1211,8 +1233,10 @@ impl CompiledLoopToken {
 
     /// Install the backend's CALL_ASSEMBLER retract. `Drop` calls it
     /// so a side table cannot keep this CLT after `LoopToken.__del__`.
-    pub fn set_ca_unregister(&self, unregister: fn(u64)) {
-        *self.ca_unregister.lock() = Some(unregister);
+    /// `token_key` is [`JitCellToken::identity_key`] (`redirect_call_assembler`
+    /// identity), not `number`.
+    pub fn set_ca_unregister(&self, token_key: usize, unregister: fn(usize)) {
+        *self.ca_unregister.lock() = Some((token_key, unregister));
     }
 
     /// `llmodel.py` `AbstractCPU.free_loop_and_bridges`.
@@ -1225,8 +1249,8 @@ impl CompiledLoopToken {
     /// owner (`JitCellToken::drop`) must break it first or `Drop` never
     /// runs. Idempotent: a second call finds empty lists.
     pub fn free_loop_and_bridges(&self) {
-        if let Some(unregister) = self.ca_unregister.lock().take() {
-            unregister(self.number);
+        if let Some((token_key, unregister)) = self.ca_unregister.lock().take() {
+            unregister(token_key);
         }
         self.asmmemmgr_gcreftracers.lock().clear();
         self.asmmemmgr_blocks.lock().clear();
@@ -1310,8 +1334,29 @@ pub fn descr_owning_green_key(descr: &dyn FailDescr) -> Option<u64> {
 /// RPython history.py JitCellToken parity — green_key carried on token
 /// so the backend can identify the parent loop for bridge compilation.
 pub struct JitCellToken {
-    /// Unique number for this token.
-    pub number: u64,
+    /// Log-only integer for this token.
+    ///
+    /// `history.py JitCellToken.number = -1` until
+    /// `compile.py send_loop_to_backend` assigns
+    /// `metainterp_sd.jitlog.trace_id`. `compile_tmp_callback` leaves
+    /// it at [`Self::NUMBER_UNASSIGNED`]. Tokens are told apart by
+    /// object identity (`Arc::ptr_eq`, `wref_procedure_token`), never
+    /// by this field.
+    ///
+    /// `Cell<i64>` because `send_loop_to_backend` writes it through
+    /// `&JitCellToken` after self-recursive CALL_ASSEMBLER ops already
+    /// hold `Arc` clones of the pending token (`green_key` /
+    /// `generation` use the same shape).
+    number: Cell<i64>,
+    /// Heap cell whose address is this token object's identity.
+    ///
+    /// `history.py JitCellToken` and `llsupport/rewrite.py handle_call_assembler`
+    /// identify the token object itself. A `JitCellToken` value can move
+    /// (into an `Arc`, returned from a stack compile, etc.), so
+    /// `self as *const _` is not stable. Allocated in [`Self::new`] and
+    /// never replaced; [`Self::identity_key`] and the drop-time CALL_ASSEMBLER
+    /// unregister share this key.
+    identity: Box<u8>,
     /// Green key hash identifying the loop entry point.
     /// Set by MetaInterp before compile_loop. Used by the backend's
     /// bridge threshold callback to find the compiled loop metadata.
@@ -1567,6 +1612,9 @@ impl JitCellToken {
     /// next bridge from this loop should `force_finish_trace`.
     pub const FORCE_BRIDGE_SEGMENTING: u32 = 1;
 
+    /// `history.py JitCellToken.number = -1`. See [`Self::number`].
+    pub const NUMBER_UNASSIGNED: i64 = -1;
+
     /// The raw field, which is what `unroll.py optimize_bridge` reads: it
     /// compares `cell_token.retraced_count` against `retrace_limit` and
     /// increments it, never going through `history.py`'s
@@ -1589,14 +1637,15 @@ impl JitCellToken {
     pub fn set_retraced_count(&self, value: u32) {
         self.retraced_count.set(value);
     }
-    pub fn new(number: u64) -> Self {
+    pub fn new(number: i64) -> Self {
         let invalidated = Arc::new(AtomicBool::new(false));
         let bridge_invalidation_flags = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let invalidate_sites = Arc::new(parking_lot::Mutex::new(InvalidateSites::default()));
         let clt = Arc::new(CompiledLoopToken::new(number));
         let clt_ptr = Arc::as_ptr(&clt) as *mut CompiledLoopToken;
         JitCellToken {
-            number,
+            number: Cell::new(number),
+            identity: Box::new(0),
             green_key: Cell::new(0),
             inputarg_types: OnceLock::new(),
             virtualizable_arg_index: Cell::new(None),
@@ -1748,19 +1797,20 @@ impl JitCellToken {
     ///
     /// Pyre stores the target's `Arc<JitCellToken>`, the direct Rust
     /// analog of PyPy's Python-object dict-key keepalive.  The
-    /// `target.number == self.number` short-circuit matches PyPy's
+    /// pointer-identity short-circuit matches PyPy's
     /// `if target_token is self: return` (implicit because the dict
     /// would just no-op); the explicit guard avoids the Mutex lock for
-    /// the self-jump case.
+    /// the self-jump case. Numbers are unassigned until
+    /// `compile.py send_loop_to_backend`, so they cannot stand in for
+    /// identity here.
     pub fn record_jump_to(&self, target: Arc<JitCellToken>) {
-        if target.number == self.number {
+        if std::ptr::eq(self, target.as_ref()) {
             return;
         }
-        let target_number = target.number;
         let mut guard = self.keepalive_tokens.lock();
         if !guard
             .iter()
-            .any(|existing| existing.number == target_number)
+            .any(|existing| std::ptr::eq(existing.as_ref(), target.as_ref()))
         {
             guard.push(target);
         }
@@ -1831,9 +1881,37 @@ impl JitCellToken {
         let _ = self.compiled.set(compiled);
     }
 
+    /// Live `JitCellToken.number`. Unassigned (`-1`) until
+    /// `compile.py send_loop_to_backend`. Log-only: not an identity key.
+    #[inline]
+    pub fn number(&self) -> i64 {
+        self.number.get()
+    }
+
+    /// `compile.py send_loop_to_backend`
+    /// `original_jitcell_token.number = n = metainterp_sd.jitlog.trace_id`.
+    #[inline]
+    pub fn set_number(&self, n: i64) {
+        self.number.set(n);
+        if let Some(clt) = self.compiled_loop_token() {
+            clt.set_number(n);
+        }
+    }
+
     /// model.py: get_number()
-    pub fn get_number(&self) -> u64 {
-        self.number
+    pub fn get_number(&self) -> i64 {
+        self.number()
+    }
+
+    /// Object identity used where upstream compares `JitCellToken` objects
+    /// (`wref_procedure_token`, `TargetToken.original_jitcell_token`,
+    /// `redirect_call_assembler(oldlooptoken, newlooptoken)`).
+    ///
+    /// The key is the heap cell allocated in [`Self::new`], not `self`'s
+    /// address, so it stays the same after the token value moves.
+    #[inline]
+    pub fn identity_key(&self) -> usize {
+        std::ptr::from_ref(&*self.identity) as usize
     }
 
     /// The input-arg types recorded at `compile_loop`.  Empty until the
@@ -1986,7 +2064,7 @@ impl JitCellToken {
 impl std::fmt::Debug for JitCellToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JitCellToken")
-            .field("number", &self.number)
+            .field("number", &self.number())
             .finish()
     }
 }
@@ -5262,6 +5340,19 @@ mod tests {
     }
 
     #[test]
+    fn identity_key_is_stable_across_moves() {
+        let token = JitCellToken::new(1);
+        let key = token.identity_key();
+        assert_ne!(key, std::ptr::from_ref(&token) as usize);
+        let moved = token;
+        assert_eq!(moved.identity_key(), key);
+        let arc = Arc::new(moved);
+        assert_eq!(arc.identity_key(), key);
+        let other = JitCellToken::new(1);
+        assert_ne!(other.identity_key(), key);
+    }
+
+    #[test]
     fn jit_cell_token_keepalive_holds_jit_cell_token() {
         let token = JitCellToken::new(1);
         let target = Arc::new(JitCellToken::new(2));
@@ -5271,7 +5362,7 @@ mod tests {
 
         let guard = token.keepalive_tokens.lock();
         assert_eq!(guard.len(), 1);
-        assert_eq!(guard[0].number, 2);
+        assert_eq!(guard[0].number(), 2);
         assert!(Arc::ptr_eq(&guard[0], &target));
     }
 

@@ -2902,7 +2902,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             }
         };
     if p2_diag_enabled() {
-        eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
+        eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number());
     }
 
     // emission
@@ -15757,6 +15757,7 @@ fn descend_generatorentry<Sym: WalkSym>(
     // Same cell key `genentry_merge_point_jit` resolves (`warmstate.py
     // JitCell`): `(pycode, jd index)` on `jitdrivers_sd[2].warmstate`,
     // not jd0's `make_green_key(pycode, 0, false)`.
+    let typed_key = crate::genentry_state::genentry_green_key(pycode);
     let green_key = {
         let (driver, _) = crate::driver::driver_pair();
         crate::genentry_state::genentry_resolved_cell_key(
@@ -15770,7 +15771,13 @@ fn descend_generatorentry<Sym: WalkSym>(
     // `jitdrivers_sd[2]` is `generatorentry` (registered immediately after jd1).
     let Some(token) = driver
         .meta_interp_mut()
-        .get_or_make_jitdriver_assembler_token_arc(2, green_key, &greenboxes, &red_types)
+        .get_or_make_jitdriver_assembler_token_arc(
+            2,
+            green_key,
+            Some(&typed_key),
+            &greenboxes,
+            &red_types,
+        )
     else {
         gen_resume_decline("several_yields_no_token");
         return Ok(None);

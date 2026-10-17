@@ -413,12 +413,6 @@ impl Snapshot {
                 .collect(),
         }
     }
-
-    /// Estimated encoded size for NumberingState capacity hint.
-    pub fn estimated_size(&self) -> usize {
-        let frame_size: usize = self.framestack.iter().map(|f| f.boxes.len() + 2).sum();
-        self.vable_array.len() + self.vref_array.len() + frame_size + 4
-    }
 }
 
 /// Re-export BoxEnv from majit-ir.
@@ -1256,10 +1250,6 @@ impl ResumeLayoutSummary {
         }
     }
 
-    pub fn to_exit_recovery_layout(&self) -> ExitRecoveryLayout {
-        self.to_exit_recovery_layout_with_caller_prefix(None)
-    }
-
     pub fn to_exit_recovery_layout_with_caller_prefix(
         &self,
         caller_prefix: Option<&ExitRecoveryLayout>,
@@ -1356,29 +1346,6 @@ impl ResumeLayoutSummary {
         self.reconstruct_state(fail_values).frames
     }
 
-    pub fn reconstruct_frame(
-        &self,
-        frame_index: usize,
-        fail_values: &[i64],
-    ) -> Option<ReconstructedFrame> {
-        let frame = self.frame_layouts.get(frame_index)?;
-        Some(ReconstructedFrame {
-            trace_id: frame.trace_id,
-            header_pc: frame.header_pc,
-            source_guard: frame.source_guard,
-            pc: frame.pc,
-            jitcode_index: frame.jitcode_index,
-            slot_types: frame.slot_types.clone(),
-            values: frame
-                .slot_layouts
-                .iter()
-                .map(|slot| {
-                    ResumeData::resolve_frame_slot_source(&slot.to_resume_source(), fail_values)
-                })
-                .collect(),
-        })
-    }
-
     pub fn materialize_virtuals(&self, fail_values: &[i64]) -> Vec<MaterializedVirtual> {
         self.to_resume_data().materialize_virtuals(fail_values)
     }
@@ -1464,65 +1431,6 @@ pub use majit_backend::VirtualInfo;
 // VirtualFieldSource type alias re-exported from majit-backend
 // (Phase C-1 cascade), same as FrameSlotSource.
 pub use majit_backend::VirtualFieldSource;
-
-/// Convert a tagged fieldnum (i16, resume.py encoding) to a VirtualFieldSource.
-///
-/// resume.py decode_int/decode_ref: tagged values encode where
-/// each field value comes from at resume time.
-///
-/// `consts` is the rd_consts array. `count` is the number of fail_args
-/// (used for negative TAGBOX indices). `num_virtuals` is the length of
-/// rd_virtuals (used for negative TAGVIRTUAL indices — nested virtuals
-/// are numbered negatively by `assign_number_to_virtual`,
-/// resume.py, and resolved via Python negative list indexing).
-/// All come from the containing ResumeGuardDescr / EncodedResumeData.
-pub fn tagged_to_source(
-    tagged: i16,
-    consts: &[majit_ir::Const],
-    count: i32,
-    num_virtuals: usize,
-) -> VirtualFieldSource {
-    if tagged_eq(tagged, UNASSIGNED) {
-        return ResumeValueSource::Unavailable;
-    }
-    if tagged_eq(tagged, UNINITIALIZED_TAG) {
-        return ResumeValueSource::Uninitialized;
-    }
-    if tagged_eq(tagged, NULLREF) {
-        // history.py CONST_NULL = ConstPtr(null). resume.py:1589 parity.
-        return ResumeValueSource::Constant(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
-    }
-    let (num, tag_bits) = untag(tagged);
-    match tag_bits {
-        TAGCONST => {
-            let idx = (num - TAG_CONST_OFFSET) as usize;
-            if idx < consts.len() {
-                // resume.py self.consts[num - TAG_CONST_OFFSET] — the
-                // Const object carries its type (ConstInt/ConstFloat/ConstPtr).
-                ResumeValueSource::Constant(consts[idx])
-            } else {
-                ResumeValueSource::Constant(majit_ir::Const::Int(0))
-            }
-        }
-        // resume.py ConstInt(num) — always Int type for TAGINT.
-        TAGINT => ResumeValueSource::Constant(majit_ir::Const::Int(num as i64)),
-        TAGBOX => {
-            let mut idx = num;
-            if idx < 0 {
-                idx += count;
-            }
-            ResumeValueSource::FailArg(idx as usize)
-        }
-        TAGVIRTUAL => {
-            let mut idx = num;
-            if idx < 0 {
-                idx += num_virtuals as i32;
-            }
-            ResumeValueSource::Virtual(idx as usize)
-        }
-        _ => ResumeValueSource::Unavailable,
-    }
-}
 
 /// Convert an `RdVirtualInfo` (IR-level, from compile.rs/pyjitpl.rs)
 /// to a `VirtualInfo` (resume-level, used by ResumeDataDirectReader).
@@ -2855,10 +2763,6 @@ impl ResumeDataVirtualAdder {
         }
     }
 
-    pub fn set_vable_array(&mut self, values: Vec<ResumeValueSource>) {
-        self.vable_array = values;
-    }
-
     /// Push a new frame onto the stack.
     /// resume.py `ResumeDataLoopMemo.number`: jitcode_index, pc per frame.
     pub fn push_frame(&mut self, jitcode_index: i32, pc: u64) {
@@ -2896,11 +2800,6 @@ impl ResumeDataVirtualAdder {
     /// Mark a frame slot as present but uninitialized.
     pub fn set_slot_uninitialized(&mut self, slot_idx: usize) {
         self.set_slot_source(slot_idx, FrameSlotSource::Uninitialized);
-    }
-
-    /// Mark a frame slot as dead/unavailable.
-    pub fn set_slot_unavailable(&mut self, slot_idx: usize) {
-        self.set_slot_source(slot_idx, FrameSlotSource::Unavailable);
     }
 
     /// Add a virtual object description. Returns the index in the virtuals array.
@@ -2948,53 +2847,6 @@ impl ResumeDataVirtualAdder {
         })
     }
 
-    /// Convenience: add a virtual array (NEW_ARRAY).
-    pub fn add_virtual_array(
-        &mut self,
-        arraydescr: Option<majit_ir::DescrRef>,
-        clear: bool,
-        items: Vec<VirtualFieldSource>,
-    ) -> usize {
-        self.add_virtual(VirtualInfo::VArray {
-            arraydescr,
-            clear,
-            items,
-        })
-    }
-
-    /// resume.py: visit_varraystruct(arraydescr, size, fielddescrs)
-    ///                 → VArrayStructInfo(arraydescr, size, fielddescrs)
-    pub fn add_virtual_array_struct(
-        &mut self,
-        arraydescr: Option<majit_ir::DescrRef>,
-        fielddescrs: Vec<majit_ir::DescrRef>,
-        element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
-    ) -> usize {
-        self.add_virtual(VirtualInfo::VArrayStruct {
-            arraydescr,
-            fielddescrs,
-            element_fields,
-        })
-    }
-
-    /// Convenience: add a virtual raw buffer.
-    pub fn add_virtual_raw_buffer(
-        &mut self,
-        func: i64,
-        size: usize,
-        offsets: Vec<i64>,
-        descrs: Vec<majit_ir::ArrayDescrInfo>,
-        values: Vec<VirtualFieldSource>,
-    ) -> usize {
-        self.add_virtual(VirtualInfo::VRawBuffer {
-            func,
-            size,
-            offsets,
-            descrs,
-            values,
-        })
-    }
-
     /// Add a deferred field write to replay on resume.
     ///
     /// `resume.py PENDINGFIELDSTRUCT.lldescr` — RPython always
@@ -3027,11 +2879,6 @@ impl ResumeDataVirtualAdder {
             value,
             item_index: Some(item_index),
         });
-    }
-
-    /// resume.py: visit_vrawslice(offset) — add virtual raw slice.
-    pub fn add_virtual_raw_slice(&mut self, offset: i64, parent: VirtualFieldSource) -> usize {
-        self.add_virtual(VirtualInfo::VRawSlice { offset, parent })
     }
 
     /// Build the final ResumeData.
@@ -4574,90 +4421,11 @@ impl ResumeDataLoopMemo {
             frame_sizes,
         }
     }
-
-    /// Number of entries in the shared constant pool.
-    pub fn num_shared_consts(&self) -> usize {
-        self.consts.len()
-    }
 }
 
 impl Default for ResumeDataLoopMemo {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// resume.py: AbstractResumeDataReader — reads resume data to
-/// reconstruct interpreter state after a guard failure.
-///
-/// Two concrete implementations in RPython:
-/// - ResumeDataBoxReader: creates boxes (for blackhole interpreter)
-/// - ResumeDataDirectReader: reads values directly (for fast path)
-pub struct ResumeDataReader<'a> {
-    /// The resume data to read from.
-    resume_data: &'a ResumeData,
-    /// Fail argument values from the guard failure.
-    fail_values: &'a [i64],
-    /// Materialized virtuals (lazily populated).
-    virtuals: Vec<Option<i64>>,
-}
-
-impl<'a> ResumeDataReader<'a> {
-    /// resume.py: AbstractResumeDataReader.__init__
-    pub fn new(resume_data: &'a ResumeData, fail_values: &'a [i64]) -> Self {
-        let num_virtuals = resume_data.virtuals.len();
-        ResumeDataReader {
-            resume_data,
-            fail_values,
-            virtuals: vec![None; num_virtuals],
-        }
-    }
-
-    /// resume.py: _decode_box — decode a tagged value reference.
-    pub fn decode_frame_slot(&self, source: &FrameSlotSource) -> i64 {
-        self.decode_value(source)
-    }
-
-    /// Decode a ResumeValueSource to a concrete value.
-    pub fn decode_value(&self, source: &ResumeValueSource) -> i64 {
-        match source {
-            ResumeValueSource::FailArg(idx) => self.fail_values.get(*idx).copied().unwrap_or(0),
-            ResumeValueSource::Constant(c) => c.as_raw_i64(),
-            ResumeValueSource::Virtual(vidx) => {
-                self.virtuals.get(*vidx).copied().flatten().unwrap_or(0)
-            }
-            ResumeValueSource::Tagged(_) => {
-                panic!("runtime tagged source requires ResumeDataDirectReader")
-            }
-            ResumeValueSource::Uninitialized | ResumeValueSource::Unavailable => 0,
-        }
-    }
-
-    /// resume.py: consume_boxes — read all frame slots for one frame.
-    pub fn read_frame_slots(&self, frame_idx: usize) -> Vec<i64> {
-        if frame_idx >= self.resume_data.frames.len() {
-            return vec![];
-        }
-        let frame = &self.resume_data.frames[frame_idx];
-        frame
-            .slot_map
-            .iter()
-            .map(|source| self.decode_frame_slot(source))
-            .collect()
-    }
-
-    /// Number of frames in the resume data.
-    pub fn num_frames(&self) -> usize {
-        self.resume_data.frames.len()
-    }
-
-    /// PC for a given frame.
-    pub fn frame_pc(&self, frame_idx: usize) -> u64 {
-        self.resume_data
-            .frames
-            .get(frame_idx)
-            .map(|f| f.pc)
-            .unwrap_or(0)
     }
 }
 
@@ -4864,24 +4632,36 @@ mod tests {
     }
 
     #[test]
-    fn resume_register_box_pairs_failargs_and_consts_and_skips_holes() {
+    fn resume_register_box_pairs_failargs_and_consts() {
         let fail_values = [11i64, 22];
         let (op, bits) =
-            super::resume_register_box(&RebuiltValue::Box(1, majit_ir::Type::Int), &fail_values)
-                .expect("failarg");
+            super::resume_register_box(&RebuiltValue::Box(1, majit_ir::Type::Int), &fail_values);
         assert_eq!(op, majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int));
         assert_eq!(bits, 22);
-        assert!(
-            super::resume_register_box(&RebuiltValue::Box(4, majit_ir::Type::Int), &fail_values)
-                .is_none()
-        );
         let (op, bits) =
-            super::resume_register_box(&RebuiltValue::Const(majit_ir::Const::Int(7)), &fail_values)
-                .expect("const");
+            super::resume_register_box(&RebuiltValue::Const(majit_ir::Const::Int(7)), &fail_values);
         assert_eq!(op, majit_ir::OpRef::const_int(7));
         assert_eq!(bits, 7);
-        assert!(super::resume_register_box(&RebuiltValue::Unassigned, &fail_values).is_none());
-        assert!(super::resume_register_box(&RebuiltValue::Virtual(0), &fail_values).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "liveboxes[4] is past the deadframe")]
+    fn resume_register_box_box_past_deadframe_panics() {
+        let fail_values = [11i64, 22];
+        let _ =
+            super::resume_register_box(&RebuiltValue::Box(4, majit_ir::Type::Int), &fail_values);
+    }
+
+    #[test]
+    #[should_panic(expected = "UNINITIALIZED is not a live-register box")]
+    fn resume_register_box_unassigned_panics() {
+        let _ = super::resume_register_box(&RebuiltValue::Unassigned, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "TAGVIRTUAL is getvirtual_ptr")]
+    fn resume_register_box_leftover_virtual_panics() {
+        let _ = super::resume_register_box(&RebuiltValue::Virtual(0), &[]);
     }
 
     #[test]
@@ -9156,31 +8936,46 @@ pub fn read_frame_liveness_reg_indices(
     FrameLivenessRegIndices { int, ref_, float }
 }
 
-/// One `resume.py` `ResumeDataBoxReader` callback result: the box to store
-/// in the live register, and the concrete bits `_copy_data_from_miframe`
-/// reads back. `Virtual` has no box yet: `consume_boxes` allocates it
-/// through `getvirtual_ptr` (`materialize_bridge_virtual`) and stores
-/// that box before any later `get_list_of_active_boxes`. `Unassigned`
-/// stays empty (`box is None`).
+/// One `resume.py` `ResumeDataBoxReader.decode_box` result: the box to
+/// store in the live register, and the concrete bits
+/// `_copy_data_from_miframe` reads back.
+///
+/// `decode_box` always returns a box and `assert box.type == kind`.
+/// `ResumeDataLoopMemo._number_boxes` numbers a live slot as TAGBOX,
+/// TAGCONST/TAGINT, or TAGVIRTUAL; `UNINITIALIZED` is `_gettagged` for a
+/// missing virtual field, not a live register. `TAGVIRTUAL` is
+/// `getvirtual_ptr` (`materialize_bridge_virtual`) before this helper
+/// runs. A leftover `Virtual`, `Unassigned`, or a TAGBOX past the
+/// deadframe is malformed resume data.
 pub fn resume_register_box(
     value: &majit_ir::resumedata::RebuiltValue,
     fail_values: &[i64],
-) -> Option<(majit_ir::OpRef, i64)> {
+) -> (majit_ir::OpRef, i64) {
     use majit_ir::resumedata::RebuiltValue;
     match value {
         RebuiltValue::Box(n, kind) => {
-            let bits = *fail_values.get(*n)?;
-            Some((majit_ir::OpRef::input_arg_typed(*n as u32, *kind), bits))
+            let bits = *fail_values.get(*n).unwrap_or_else(|| {
+                panic!(
+                    "resume.py decode_box: liveboxes[{n}] is past the deadframe (len {})",
+                    fail_values.len()
+                )
+            });
+            (majit_ir::OpRef::input_arg_typed(*n as u32, *kind), bits)
         }
-        RebuiltValue::Const(majit_ir::Const::Int(v)) => Some((majit_ir::OpRef::const_int(*v), *v)),
+        RebuiltValue::Const(majit_ir::Const::Int(v)) => (majit_ir::OpRef::const_int(*v), *v),
         RebuiltValue::Const(majit_ir::Const::Ref(index)) => {
             let g = majit_ir::const_ptr_table::resolve(*index);
-            Some((majit_ir::OpRef::ConstPtr(*index), g.0 as i64))
+            (majit_ir::OpRef::ConstPtr(*index), g.0 as i64)
         }
         RebuiltValue::Const(majit_ir::Const::Float(f)) => {
-            Some((majit_ir::OpRef::const_float(*f), f.to_bits() as i64))
+            (majit_ir::OpRef::const_float(*f), f.to_bits() as i64)
         }
-        RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => None,
+        RebuiltValue::Virtual(_) => {
+            panic!("resume.py decode_box: TAGVIRTUAL is getvirtual_ptr, not a skipped slot")
+        }
+        RebuiltValue::Unassigned => {
+            panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
+        }
     }
 }
 
@@ -9286,49 +9081,6 @@ pub fn prepare_resume_heap_with_roots<'a>(
         resumereader.prepare_guard_pendingfields(guard_pf);
     }
     resume_roots
-}
-
-/// Prepare resume heap side effects without entering a blackhole.
-///
-/// This is the bridge / legacy-deopt counterpart to the heap-prepare block in
-/// `blackhole_from_resumedata`: it sizes `rd_virtuals`, roots the virtual cache,
-/// materializes virtual pending-field targets/values on demand, and applies
-/// `rd_pendingfields`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
-)]
-pub fn prepare_resume_heap<'a>(
-    rd_numb: &'a [u8],
-    rd_consts: &'a [majit_ir::Const],
-    all_liveness: &'a [u8],
-    deadframe: &'a [i64],
-    deadframe_types: Option<&'a [majit_ir::Type]>,
-    rd_virtuals: Option<&'a [VirtualInfo]>,
-    rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
-    allocator: &'a dyn BlackholeAllocator,
-    numb_root: Option<&'a majit_ir::NumberingRef>,
-) {
-    let Some(guard_pf) = rd_guard_pendingfields else {
-        return;
-    };
-    if guard_pf.is_empty() {
-        return;
-    }
-    let mut resumereader = ResumeDataDirectReader::new(
-        rd_numb,
-        rd_consts,
-        all_liveness,
-        deadframe.into(),
-        deadframe_types,
-        None,
-        allocator,
-    );
-    if let Some(numb) = numb_root {
-        resumereader.resumecodereader.bind_numbering(numb);
-    }
-    let _resume_roots =
-        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, Some(guard_pf));
 }
 
 #[expect(
