@@ -30993,10 +30993,13 @@ mod tests {
         let live = Box::leak(Box::new(VableFrame { arr: live_array }));
         let dead_addr = GcRef(dead as *mut VableFrame as usize);
         let live_addr = GcRef(live as *mut VableFrame as usize);
-        // Private sentinel. The frames themselves are not intern keys:
-        // `intern` hashes the address, and a later `set_slot` is what a
-        // minor writes into the existing index.
-        let (const_ref, index, _restore) = intern_const_ptr(GcRef(0x96E2_4000));
+        // Unique intern identity. `const_ptr_table::intern` is the
+        // process-lifetime `history.py` ConstPtr table; a sibling intern
+        // of the same word `stamp_reuse`s this slot. The frames themselves
+        // are not intern keys: `intern` hashes the address, and a later
+        // `set_slot` is what a minor writes into the existing index.
+        let intern_key = GcRef(Box::leak(Box::new(0u8)) as *mut u8 as usize);
+        let (const_ref, index, _restore) = intern_const_ptr(intern_key);
         majit_ir::const_ptr_table::set_slot(index, dead_addr);
         let captured = majit_ir::const_ptr_table::resolve(index).0 as *const u8;
         majit_ir::const_ptr_table::set_slot(index, live_addr);
@@ -31027,8 +31030,9 @@ mod tests {
     /// the published index, and dropping the compile guard releases it.
     #[test]
     fn compile_vable_anchor_index_moves_only_on_snapshot_walk() {
-        let dead = GcRef(0x96E2_5000);
-        let live = GcRef(0x96E2_6000);
+        // Distinct from `recorder` 0x96E2_5/6000 intern keys.
+        let dead = GcRef(0x96E3_5100);
+        let live = GcRef(0x96E3_6100);
         let (const_ref, index, _restore) = intern_const_ptr(dead);
         let mut meta = MetaInterp::<()>::new(0);
         let mut ctx = TraceCtx::for_test(1);
@@ -31076,8 +31080,9 @@ mod tests {
     /// forward the slot; dropping the guard releases it.
     #[test]
     fn compile_live_op_vec_forwards_on_snapshot_walk() {
-        let dead = GcRef(0x96E2_9000);
-        let live = GcRef(0x96E2_A000);
+        // Distinct from `pyjitpl::frame` 0x96E4_A100 intern keys.
+        let dead = GcRef(0x96E3_9100);
+        let live = GcRef(0x96E3_A100);
         let (const_ref, index, _restore) = intern_const_ptr(dead);
         let op = majit_ir::OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::GuardTrue,
@@ -31117,8 +31122,8 @@ mod tests {
     /// That word lives in `compile_vable_root` so the same walker can move it.
     #[test]
     fn compile_vable_anchor_cut_addr_moves_on_snapshot_walk() {
-        let dead = GcRef(0x96E2_7000);
-        let live = GcRef(0x96E2_8000);
+        let dead = GcRef(0x96E3_7100);
+        let live = GcRef(0x96E3_8100);
         let mut meta = MetaInterp::<()>::new(0);
         let ctx = TraceCtx::for_test(1);
         let cut = crate::trace_ctx::MergePoint {
@@ -31386,6 +31391,7 @@ mod tests {
     fn compiled_graph_root_walk_consumes_its_aggregate_minor_barrier() {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
+        let _serial = majit_ir::const_ptr_table::lock_test_serial();
         let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
         descr
             .as_fail_descr()
@@ -31570,6 +31576,7 @@ mod tests {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
         use majit_ir::const_ptr_table::resolve;
 
+        let _serial = majit_ir::const_ptr_table::lock_test_serial();
         let dead = GcRef(0x90_0000_D001);
         let live = GcRef(0x90_0000_D002);
         let (_const_ref, index, _restore) = intern_const_ptr(dead);
@@ -31652,6 +31659,7 @@ mod tests {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
         use majit_ir::const_ptr_table::resolve;
 
+        let _serial = majit_ir::const_ptr_table::lock_test_serial();
         let dead = GcRef(0x91_0000_C001);
         let live = GcRef(0x91_0000_C002);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![]);

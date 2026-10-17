@@ -2559,6 +2559,7 @@ mod tests {
     /// intern once in `_refs_dict`, and a moving collection re-keys it.
     #[test]
     fn const_ptr_operands_share_the_trace_ref_pool_and_rekey_after_gc() {
+        let _serial = majit_ir::const_ptr_table::lock_test_serial();
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Ref);
         let (old, _restore) = intern_const_ptr(GcRef(0x98_0000_1000));
@@ -2589,6 +2590,7 @@ mod tests {
 
     #[test]
     fn ref_pool_gc_visits_each_box_once_and_rekeys_overlapping_addresses() {
+        let _serial = majit_ir::const_ptr_table::lock_test_serial();
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Ref);
         let base = 0x99_0000_0000usize;
@@ -3113,6 +3115,8 @@ mod tests {
             }
         }
 
+        // recorder-owned 0x96E2_4/5/6000 intern keys. A sibling intern of
+        // the same word `stamp_reuse`s the process-lifetime slot.
         let original_a = GcRef(0x96E2_4000);
         let original_b = GcRef(0x96E2_5000);
         let forwarded_b = GcRef(0x96E2_6000);
@@ -3164,6 +3168,7 @@ mod tests {
 
     #[test]
     fn byte_mode_walk_forwards_trb_refs() {
+        let _serial = majit_ir::const_ptr_table::lock_test_serial();
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Ref);
         rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));

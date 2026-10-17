@@ -96,6 +96,17 @@ impl Table {
     }
 }
 
+/// Tests that [`Wave::enter`] or [`walk`] this table. MiniMark is STW;
+/// cargo test starts many mutators against one process-lifetime ConstPtr
+/// table (`history.py`). `walk` claims every non-null slot for the current
+/// [`Wave`], so a parallel `walk` inside another test's wave marks that
+/// test's slot, `trace_index` returns without the visitor, and `resolve`
+/// still returns the interned address.
+pub fn lock_test_serial() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
+}
+
 static TABLE: Mutex<Table> = Mutex::new(Table {
     slots: Vec::new(),
     hashes: Vec::new(),
@@ -823,20 +834,11 @@ fn find(table: &Table, hash: u64, addr: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use parking_lot::Mutex;
-
     use super::*;
-
-    /// `walk` claims every non-null slot for the current [`Wave`]
-    /// (`claim_wave`). These tests share that process-global table, so a
-    /// parallel `walk` inside another test's wave marks its slot,
-    /// `trace_index` returns without the visitor, and `resolve` still
-    /// returns the interned address.
-    static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn intern_is_stable_and_null_is_zero() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         assert_eq!(intern(GcRef::NULL), 0);
         assert!(resolve(0).is_null());
         let a = GcRef(0x1111_0000);
@@ -849,7 +851,7 @@ mod tests {
 
     #[test]
     fn visitor_may_call_index_of_current_without_deadlocking() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let addr = GcRef(0x6E6A_DEAD_0100);
         let idx = intern(addr);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -877,7 +879,7 @@ mod tests {
 
     #[test]
     fn intern_reuses_the_slot_when_the_referent_moved() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         struct ResetHook;
         impl Drop for ResetHook {
             fn drop(&mut self) {
@@ -900,7 +902,7 @@ mod tests {
 
     #[test]
     fn intern_of_a_from_space_address_does_not_overwrite_dest() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         struct ResetHook;
         impl Drop for ResetHook {
             fn drop(&mut self) {
@@ -933,7 +935,7 @@ mod tests {
 
     #[test]
     fn intern_reuses_the_slot_when_the_identity_hash_is_the_address() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         // Default hook: identity is the address. A nursery intern then
         // an intern of the forwarded word must be one ConstPtr.
         let from = GcRef(0x5555_1000);
@@ -947,7 +949,7 @@ mod tests {
 
     #[test]
     fn intern_reuses_the_slot_after_walk_when_hashes_differ() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let from = GcRef(0x5555_3000);
         let to = GcRef(0x5555_3080);
         let idx = intern(from);
@@ -962,7 +964,7 @@ mod tests {
 
     #[test]
     fn drop_slots_if_frees_matching_slots_and_leaves_the_rest() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let keep = intern(GcRef(0x6E6D_0000));
         let drop_me = intern(GcRef(0x6E6D_1000));
         drop_slots_if(&mut |g| g.0 == 0x6E6D_1000);
@@ -974,7 +976,7 @@ mod tests {
 
     #[test]
     fn walk_forwards_the_slot_the_index_names() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let addr = GcRef(0x3333_0000);
         let idx = intern(addr);
         walk(&mut |slot| {
@@ -987,7 +989,7 @@ mod tests {
 
     #[test]
     fn a_later_wave_forwards_a_slot_the_previous_wave_traced() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let first = GcRef(0x6E6A_ED90_0100);
         let idx = intern(first);
         {
@@ -1011,7 +1013,7 @@ mod tests {
 
     #[test]
     fn wrapped_wave_id_does_not_skip_a_slot_marked_with_that_generation() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let addr = GcRef(0x6E6A_ED90_0A01);
         let idx = intern(addr);
         {
@@ -1060,7 +1062,7 @@ mod tests {
 
     #[test]
     fn intern_grows_past_the_old_chunk_directory_cap() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         const N: usize = SLOT_CHUNK * 1024 + 1;
         let base = 0x6E6B_C100usize;
         let last_word = base + (N - 1) * 16;
@@ -1079,7 +1081,7 @@ mod tests {
 
     #[test]
     fn intern_reuses_slots_across_major_sweeps_past_the_old_cap() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         const BATCH: usize = 80_000;
         const ROUNDS: usize = 4;
         let base = 0x6E6B_D000usize;
@@ -1107,7 +1109,7 @@ mod tests {
 
     #[test]
     fn a_held_slot_survives_a_major_and_keeps_its_index() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let addr = GcRef(0x6E6B_F010);
         reclaim_unheld(addr.0, addr.0);
         let idx = intern(addr);
@@ -1121,7 +1123,7 @@ mod tests {
 
     #[test]
     fn intern_find_hit_does_not_keep_a_slot_without_trace_index() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let addr = GcRef(0x6E6B_F110);
         reclaim_unheld(addr.0, addr.0);
         let idx = intern(addr);
@@ -1137,7 +1139,7 @@ mod tests {
 
     #[test]
     fn intern_find_hit_survives_when_the_young_list_is_walked() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let addr = GcRef(0x6E6B_F118);
         reclaim_unheld(addr.0, addr.0);
         let idx = intern(addr);
@@ -1158,7 +1160,7 @@ mod tests {
     /// MiniMark that allocated it.
     #[test]
     fn collect_young_leaves_slots_the_collector_does_not_own() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         reclaim_unheld(0x6E6C_0010, 0x6E6C_0020);
         let mine = intern(GcRef(0x6E6C_0010));
         let other = intern(GcRef(0x6E6C_0020));
@@ -1185,7 +1187,7 @@ mod tests {
     /// the extra-root walk that stamps `ResumeGuardDescr.rd_consts`.
     #[test]
     fn a_copied_index_without_trace_index_is_freed_at_major() {
-        let _serial = TEST_SERIAL.lock();
+        let _serial = lock_test_serial();
         let addr = GcRef(0x6E6B_F210);
         reclaim_unheld(addr.0, addr.0);
         let holder = intern(addr);
