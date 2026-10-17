@@ -24,7 +24,7 @@ const DEFAULT_IMM_SIZE: i64 = 4096;
 /// the int is inlined on `ConstInt` (history.py `ConstInt.value`);
 /// pyre's inline-Const variant `OpRef::ConstInt` carries the i64
 /// on the OpRef itself (`arg.getint()` never fails).
-fn check_imm_box(arg: OpRef) -> bool {
+pub(crate) fn check_imm_box(arg: OpRef) -> bool {
     match arg {
         OpRef::ConstInt(v) => (0..DEFAULT_IMM_SIZE).contains(&v),
         _ => false,

@@ -547,7 +547,7 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
 /// that exits through `GUARD_TRUE(i < 5)`. Returns `(exited_at_counter, i)`:
 /// a counter exit means every `GUARD_VALUE` passed, `i == 0` from the first
 /// `GUARD_VALUE` means it failed on entry.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn run_float_guard_value_loop(rhs: OpRef, f0: f64, f1: f64) -> (bool, i64) {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
@@ -613,9 +613,10 @@ fn run_float_guard_value_loop(rhs: OpRef, f0: f64, f1: f64) -> (bool, i64) {
     (exited_at_counter, backend.get_int_value(&frame, 1))
 }
 
-/// `genop_guard_guard_value` compares a FLOAT operand with `UCOMISD`; here
-/// against a `ConstFloat`.
-#[cfg(target_arch = "x86_64")]
+/// FLOAT `GUARD_VALUE` against a `ConstFloat`.
+/// x86 `genop_guard_guard_value` compares with `UCOMISD`;
+/// aarch64 `emit_op_guard_value` compares with `FCMP_dd`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn guard_value_on_a_float_against_a_const_float() {
     let k = OpRef::const_float(2.5);
@@ -623,13 +624,85 @@ fn guard_value_on_a_float_against_a_const_float() {
     assert_eq!(run_float_guard_value_loop(k, 1.0, 0.0), (false, 0));
 }
 
-/// `genop_guard_guard_value` with both FLOAT operands in xmm registers.
-#[cfg(target_arch = "x86_64")]
+/// FLOAT `GUARD_VALUE` with both operands in xmm / vfp registers
+/// (`UCOMISD` / `FCMP_dd`).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn guard_value_on_a_float_against_a_float_box() {
     let b = OpRef::input_arg_float(1);
     assert_eq!(run_float_guard_value_loop(b, -3.75, -3.75), (true, 5));
     assert_eq!(run_float_guard_value_loop(b, -3.75, 3.75), (false, 0));
+}
+
+/// `CVTTSD2SI_rx` / `CVTSD2SS_xx` of a `ConstFloat` operand.
+/// `execute_cast_const` does not fold non-finite or out-of-range values,
+/// so the constant reaches `consider_cast_float_to_int`.
+/// `genop_finish` stores only its first argument, so the four results
+/// come back as failargs of `GUARD_ALWAYS_FAILS`.
+/// `genop_cast_float_to_singlefloat` does `CVTSD2SS` into the low 32 bits
+/// of the xmm temp, then `MOVD32` into the int.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn cast_const_float_uses_cvttsd2si_and_cvtsd2ss() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(48);
+
+    let inf = Op::new(
+        OpCode::CastFloatToInt,
+        &[rb(OpRef::const_float(f64::INFINITY))],
+    );
+    inf.pos().set(OpRef::int_op(1));
+    let nan = Op::new(OpCode::CastFloatToInt, &[rb(OpRef::const_float(f64::NAN))]);
+    nan.pos().set(OpRef::int_op(2));
+    let finite = Op::new(OpCode::CastFloatToInt, &[rb(OpRef::const_float(3.75))]);
+    finite.pos().set(OpRef::int_op(3));
+    let single = Op::new(
+        OpCode::CastFloatToSinglefloat,
+        &[rb(OpRef::const_float(1.5))],
+    );
+    single.pos().set(OpRef::int_op(4));
+
+    let fail_descr = make_resume_guard_descr_typed(vec![Type::Int; 4]);
+    let guard = Op::new(OpCode::GuardAlwaysFails, &[]);
+    guard.pos().set(OpRef::void_op(5));
+    guard.set_fail_arg_types(vec![Type::Int; 4]);
+    guard.setfailargs(
+        vec![
+            rb(OpRef::int_op(1)),
+            rb(OpRef::int_op(2)),
+            rb(OpRef::int_op(3)),
+            rb(OpRef::int_op(4)),
+        ]
+        .into(),
+    );
+    guard.setdescr(fail_descr);
+
+    let finish = Op::new(OpCode::Finish, &[]);
+    finish.pos().set(OpRef::void_op(6));
+    finish.set_fail_arg_types(vec![]);
+    finish.setfailargs(vec![].into());
+
+    let ops_rc: Vec<OpRc> = vec![inf, nan, finite, single, guard, finish]
+        .into_iter()
+        .map(OpRc::new)
+        .collect();
+    let inputargs: Vec<InputArgRc> = vec![];
+    backend
+        .compile_loop(&inputargs, &ops_rc, &token)
+        .expect("compile casts of ConstFloat");
+    let frame = backend.execute_token(&token, &[]);
+    assert!(
+        !backend.get_latest_descr(&frame).is_finish(),
+        "GUARD_ALWAYS_FAILS should side-exit with the cast results"
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), i64::MIN);
+    assert_eq!(backend.get_int_value(&frame, 1), i64::MIN);
+    assert_eq!(backend.get_int_value(&frame, 2), 3);
+    assert_eq!(
+        backend.get_int_value(&frame, 3),
+        i64::from(1.5f32.to_bits())
+    );
 }
 
 /// More float loop arguments than xmm registers, rotated by one at every
