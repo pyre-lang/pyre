@@ -840,6 +840,27 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
     dynasm!(asm ; .arch x64 ; ret);
 }
 
+/// `LocationCodeBuilder._addr_as_reg_offset` over a bare `Assembler`, with
+/// the `_scratch_register_value` cache held by the caller (`-1` is unknown).
+/// Reuses r11 when `addr` is within a signed disp32 of the cached value;
+/// otherwise `MOV_ri` loads `addr` and records it.
+fn addr_as_reg_offset_raw(
+    mc: &mut Assembler,
+    scratch_register_value: &mut i64,
+    addr: i64,
+) -> (u8, i32) {
+    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+    if *scratch_register_value != -1 {
+        let offset = addr.wrapping_sub(*scratch_register_value);
+        if rx86::fits_in_32bits(offset) {
+            return (scratch, offset as i32);
+        }
+    }
+    *scratch_register_value = addr;
+    rx86::mov_ri(mc, scratch, addr);
+    (scratch, 0)
+}
+
 /// `_build_failure_recovery(exc, withfloats)`.
 ///
 /// Entered by `jmp`, not `call`, with the two words `generate_quick_failure`
@@ -854,14 +875,17 @@ fn emit_failure_recovery(mc: &mut Assembler, exc: bool, withfloats: bool) {
     if exc {
         let exc_value_addr = crate::jit_exc_value_addr() as i64;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        // `MOV(ebx, heap(pos_exc_value))`. The cell does not fit a disp32,
-        // so the address goes through `r11` (`_addr_as_reg_offset`).
-        rx86::mov_ri(mc, rx86::R11, exc_value_addr);
-        rx86::mov_rm(mc, rx86::EBX, (rx86::R11, 0));
-        rx86::mov_ri(mc, rx86::R11, exc_type_addr);
-        rx86::mov_mi(mc, (rx86::R11, 0), 0);
-        rx86::mov_ri(mc, rx86::R11, exc_value_addr);
-        rx86::mov_mi(mc, (rx86::R11, 0), 0);
+        // `MOV(ebx, heap(pos_exc_value))`, then the two `MOV(heap(..),
+        // imm0)`. The cells do not fit a disp32, so each address goes
+        // through `_addr_as_reg_offset`; the stub starts from a fresh
+        // `MachineCodeBlockWrapper`, so r11 is unknown on entry.
+        let mut scratch_value = -1;
+        let mem = addr_as_reg_offset_raw(mc, &mut scratch_value, exc_value_addr);
+        rx86::mov_rm(mc, rx86::EBX, mem);
+        let mem = addr_as_reg_offset_raw(mc, &mut scratch_value, exc_type_addr);
+        rx86::mov_mi(mc, mem, 0);
+        let mem = addr_as_reg_offset_raw(mc, &mut scratch_value, exc_value_addr);
+        rx86::mov_mi(mc, mem, 0);
         rx86::mov_br(mc, JF_GUARD_EXC_OFS, rx86::EBX);
     }
     // Top of stack is the gcmap, then the descr (`generate_quick_failure`).
@@ -970,27 +994,28 @@ pub(crate) fn build_propagate_exception_path(
 /// free-fn variant for the helper builders: move `pos_exc_value` and
 /// `pos_exception` into the two registers and clear both.
 fn store_and_reset_exception_raw(asm: &mut Assembler, excvalloc: u8, exctploc: u8) {
-    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
     let exc_value_addr = crate::jit_exc_value_addr() as i64;
     let exc_type_addr = crate::jit_exc_type_addr() as i64;
-    rx86::mov_ri(asm, scratch, exc_value_addr);
-    rx86::mov_rm(asm, excvalloc, (scratch, 0));
-    rx86::mov_ri(asm, scratch, exc_type_addr);
-    rx86::mov_rm(asm, exctploc, (scratch, 0));
-    rx86::mov_mi(asm, (scratch, 0), 0);
-    rx86::mov_ri(asm, scratch, exc_value_addr);
-    rx86::mov_mi(asm, (scratch, 0), 0);
+    let mut scratch_value = -1;
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_value_addr);
+    rx86::mov_rm(asm, excvalloc, mem);
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_type_addr);
+    rx86::mov_rm(asm, exctploc, mem);
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_type_addr);
+    rx86::mov_mi(asm, mem, 0);
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_value_addr);
+    rx86::mov_mi(asm, mem, 0);
 }
 
 /// `assembler.py _restore_exception(mc, excvalloc, exctploc)` — free-fn
 /// variant: write the two registers back to `pos_exc_value` and
 /// `pos_exception`.
 fn restore_exception_raw(asm: &mut Assembler, excvalloc: u8, exctploc: u8) {
-    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-    rx86::mov_ri(asm, scratch, crate::jit_exc_value_addr() as i64);
-    rx86::mov_mr(asm, (scratch, 0), excvalloc);
-    rx86::mov_ri(asm, scratch, crate::jit_exc_type_addr() as i64);
-    rx86::mov_mr(asm, (scratch, 0), exctploc);
+    let mut scratch_value = -1;
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, crate::jit_exc_value_addr() as i64);
+    rx86::mov_mr(asm, mem, excvalloc);
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, crate::jit_exc_type_addr() as i64);
+    rx86::mov_mr(asm, mem, exctploc);
 }
 
 /// `_store_and_reset_exception(mc, None, ebx, tmpreg)`: the value goes
@@ -998,30 +1023,31 @@ fn restore_exception_raw(asm: &mut Assembler, excvalloc: u8, exctploc: u8) {
 /// both cells are cleared. `ARG0` / `ARG1` are already set and must
 /// survive (`tmpreg` is `ecx` on SysV and `r12` on Win64).
 fn store_and_reset_exception_frame(asm: &mut Assembler, tmpreg: u8) {
-    let scratch = rx86::R11;
     let exc_value_addr = crate::jit_exc_value_addr() as i64;
     let exc_type_addr = crate::jit_exc_type_addr() as i64;
-    rx86::mov_ri(asm, scratch, exc_value_addr);
-    rx86::mov_rm(asm, tmpreg, (scratch, 0));
+    let mut scratch_value = -1;
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_value_addr);
+    rx86::mov_rm(asm, tmpreg, mem);
     rx86::mov_br(asm, JF_GUARD_EXC_OFS, tmpreg);
-    rx86::mov_ri(asm, scratch, exc_type_addr);
-    rx86::mov_rm(asm, rx86::EBX, (scratch, 0));
-    rx86::mov_mi(asm, (scratch, 0), 0);
-    rx86::mov_ri(asm, scratch, exc_value_addr);
-    rx86::mov_mi(asm, (scratch, 0), 0);
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_type_addr);
+    rx86::mov_rm(asm, rx86::EBX, mem);
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_type_addr);
+    rx86::mov_mi(asm, mem, 0);
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_value_addr);
+    rx86::mov_mi(asm, mem, 0);
 }
 
 /// `_restore_exception(mc, None, ebx, ecx)`. `ecx` even on Win64, where
 /// the store used `r12`: load `jf_guard_exc`, clear the slot, write
 /// `pos_exc_value`, then `pos_exception` from `ebx`.
 fn restore_exception_frame(asm: &mut Assembler) {
-    let scratch = rx86::R11;
     rx86::mov_rb(asm, rx86::ECX, JF_GUARD_EXC_OFS);
     rx86::mov_bi(asm, JF_GUARD_EXC_OFS, 0);
-    rx86::mov_ri(asm, scratch, crate::jit_exc_value_addr() as i64);
-    rx86::mov_mr(asm, (scratch, 0), rx86::ECX);
-    rx86::mov_ri(asm, scratch, crate::jit_exc_type_addr() as i64);
-    rx86::mov_mr(asm, (scratch, 0), rx86::EBX);
+    let mut scratch_value = -1;
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, crate::jit_exc_value_addr() as i64);
+    rx86::mov_mr(asm, mem, rx86::ECX);
+    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, crate::jit_exc_type_addr() as i64);
+    rx86::mov_mr(asm, mem, rx86::EBX);
 }
 
 /// `build_frame_realloc_slowpath`. The caller has executed
@@ -2429,16 +2455,7 @@ impl<'a> Assembler386<'a> {
     /// `(X86_64_SCRATCH_REG, disp32)`. Reuse the value already in r11 when
     /// the difference fits a signed disp32; otherwise `MOV_ri` reloads it.
     fn addr_as_reg_offset(&mut self, addr: i64) -> (u8, i32) {
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        if self.scratch_register_value != -1 {
-            let offset = addr.wrapping_sub(self.scratch_register_value);
-            if rx86::fits_in_32bits(offset) {
-                return (scratch, offset as i32);
-            }
-        }
-        self.scratch_register_value = addr;
-        rx86::mov_ri(&mut self.mc, scratch, addr);
-        (scratch, 0)
+        addr_as_reg_offset_raw(&mut self.mc, &mut self.scratch_register_value, addr)
     }
 
     /// `LocationCodeBuilder._load_scratch`: put `value` in
@@ -6408,11 +6425,13 @@ impl<'a> Assembler386<'a> {
         let Loc::Reg(tmp) = tmp_loc else {
             return;
         };
+        // `MOV(loc1, heap(pos_exception))`: the address goes through
+        // `_addr_as_reg_offset`, so r11 stays known for the
+        // `_store_and_reset_exception` that follows the guard.
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        let mem = self.addr_as_reg_offset(exc_type_addr);
         self.forget_if_scratch_written(tmp.value);
-        rx86::mov_ri(&mut self.mc, tmp.value, exc_type_addr);
-        self.forget_if_scratch_written(tmp.value);
-        rx86::mov_rm(&mut self.mc, tmp.value, (tmp.value, 0));
+        rx86::mov_rm(&mut self.mc, tmp.value, mem);
         self.emit_cmp_reg_loc_i64(tmp.value, expected_loc);
     }
 
@@ -6470,9 +6489,9 @@ impl<'a> Assembler386<'a> {
                 ),
             }
         }
-        let (sr, so) = self.addr_as_reg_offset(exc_value_addr);
-        rx86::mov_mi(&mut self.mc, (sr, so), 0);
         let (sr, so) = self.addr_as_reg_offset(exc_type_addr);
+        rx86::mov_mi(&mut self.mc, (sr, so), 0);
+        let (sr, so) = self.addr_as_reg_offset(exc_value_addr);
         rx86::mov_mi(&mut self.mc, (sr, so), 0);
     }
 
@@ -10583,54 +10602,46 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// assembler.py:1845-1850 `_restore_exception`:
-    /// `MOV [pos_exc_value], excvalloc; MOV [pos_exception], exctploc`.
-    /// arglocs = [class, value]; the regalloc brings both into registers
-    /// (`consider_restore_exception`), so only the Reg arm is hot — the
-    /// non-Reg fallback round-trips through rax with a push/pop save.
+    /// `genop_discard_restore_exception` → `_restore_exception(mc,
+    /// arglocs[1], arglocs[0])`: `MOV(heap(pos_exc_value), excvalloc)`,
+    /// then `MOV(heap(pos_exception), exctploc)`. arglocs = [class, value];
+    /// `consider_restore_exception` puts a box in a register and a Const in
+    /// an `ImmedLoc` (`return_constant`).
     fn genop_restore_exception(&mut self, arglocs: &[Loc]) {
         if arglocs.len() < 2 {
             return;
         }
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        let mut store_loc_to = |this: &mut Self, cell_addr: i64, loc: &Loc| {
-            this.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut this.mc, scratch, cell_addr);
-            match loc {
-                Loc::Reg(src) => {
-                    rx86::mov_mr(&mut this.mc, (scratch, 0), src.value);
-                }
-                Loc::Frame(frame) => {
-                    let ofs = frame.ebp_loc.value;
-                    dynasm!(this.mc ; .arch x64
-                    ; push rax
-                    );
-                    rx86::mov_rb(&mut this.mc, rx86::EAX, ofs);
-                    rx86::mov_mr(&mut this.mc, (scratch, 0), rx86::EAX);
-                    dynasm!(this.mc ; .arch x64
-                                            ; pop rax
+        self.mov_heap_loc(crate::jit_exc_value_addr() as i64, &arglocs[1]);
+        self.mov_heap_loc(crate::jit_exc_type_addr() as i64, &arglocs[0]);
+    }
 
-                    );
-                }
-                Loc::Immed(imm) | Loc::ImmedFloat(imm) => {
-                    dynasm!(this.mc ; .arch x64
-                    ; push rax
-                    );
-                    rx86::mov_ri(&mut this.mc, rx86::EAX, imm.value);
-                    rx86::mov_mr(&mut this.mc, (scratch, 0), rx86::EAX);
-                    dynasm!(this.mc ; .arch x64
-                                            ; pop rax
-
-                    );
-                }
-                other => panic!(
-                    "genop_restore_exception: unhandled operand {other:?} — the store is \
-                skipped and the exception cell keeps its previous contents"
-                ),
+    /// `MOV(heap(addr), loc)` for a cell that does not fit a disp32:
+    /// `_addr_as_reg_offset` turns `'j'` into `'m'`. An immediate that fits
+    /// is `MOV_mi`; a wider one is `insn_with_64_bit_immediate`, which
+    /// `PUSH`es `find_unused_reg()` (eax), loads it, stores it and `POP`s.
+    fn mov_heap_loc(&mut self, addr: i64, loc: &Loc) {
+        match loc {
+            Loc::Reg(src) => {
+                let mem = self.addr_as_reg_offset(addr);
+                rx86::mov_mr(&mut self.mc, mem, src.value);
             }
-        };
-        store_loc_to(self, crate::jit_exc_value_addr() as i64, &arglocs[1]);
-        store_loc_to(self, crate::jit_exc_type_addr() as i64, &arglocs[0]);
+            Loc::Immed(imm) | Loc::ImmedFloat(imm) => {
+                if rx86::fits_in_32bits(imm.value) {
+                    let mem = self.addr_as_reg_offset(addr);
+                    rx86::mov_mi(&mut self.mc, mem, imm.value as i32);
+                } else {
+                    rx86::push_r(&mut self.mc, rx86::EAX);
+                    rx86::mov_ri(&mut self.mc, rx86::EAX, imm.value);
+                    let mem = self.addr_as_reg_offset(addr);
+                    rx86::mov_mr(&mut self.mc, mem, rx86::EAX);
+                    dynasm!(self.mc ; .arch x64 ; pop rax);
+                }
+            }
+            other => panic!(
+                "MOV(heap, {other:?}): consider_restore_exception keeps the \
+                 operands in registers or immediates"
+            ),
+        }
     }
 
     // genop_* — extended integer arithmetic

@@ -12,7 +12,8 @@ use std::sync::LazyLock;
 
 use majit_backend::{Backend, JitCellToken, STATUS_TYPE_MASK, make_resume_guard_descr_typed};
 use majit_ir::{
-    GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr, make_loop_target_descr,
+    GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr,
+    make_loop_target_descr,
 };
 
 use majit_backend_dynasm::runner::DynasmBackend;
@@ -1007,6 +1008,110 @@ fn test_exception_guards_use_dynasm_emit() {
     assert!(!majit_backend_dynasm::jit_exc_is_pending());
 
     majit_backend_dynasm::jit_exc_clear();
+}
+
+/// A mismatching `GUARD_EXCEPTION` leaves through the `exc=True`
+/// `_build_failure_recovery` stub, which moves `pos_exc_value` into
+/// `jf_guard_exc` and clears both cells.
+#[test]
+fn guard_exception_mismatch_saves_the_value_in_jf_guard_exc() {
+    let _guard = EXCEPTION_TEST_LOCK.lock();
+    majit_backend_dynasm::jit_exc_clear();
+
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(45);
+
+    let guard_exception = Op::new(OpCode::GuardException, &[rb(OpRef::const_int(0x5151_0000))]);
+    guard_exception.pos().set(OpRef::ref_op(0));
+    guard_exception.set_fail_arg_types(vec![]);
+    guard_exception.setfailargs(vec![].into());
+
+    let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::ref_op(0))]);
+    finish_op.pos().set(OpRef::void_op(1));
+    finish_op.set_fail_arg_types(vec![Type::Ref]);
+    finish_op.setfailargs(vec![rb(OpRef::ref_op(0))].into());
+
+    let ops_rc: Vec<OpRc> = vec![OpRc::new(guard_exception), OpRc::new(finish_op)];
+    backend
+        .compile_loop(&[], &ops_rc, &token)
+        .expect("compile loop with GUARD_EXCEPTION");
+
+    let mut exc_obj = vec![0x6262_0000_usize, 0usize];
+    let exc_ref = GcRef(exc_obj.as_mut_ptr() as usize);
+    majit_backend_dynasm::jit_exc_raise(exc_ref.0 as i64);
+
+    let frame = backend.execute_token(&token, &[]);
+    assert!(
+        !backend.get_latest_descr(&frame).is_finish(),
+        "a different class must fail GUARD_EXCEPTION"
+    );
+    assert_eq!(backend.grab_exc_value(&frame), exc_ref);
+    assert!(!majit_backend_dynasm::jit_exc_is_pending());
+    assert_eq!(majit_backend_dynasm::jit_exc_class_raw(), 0);
+
+    majit_backend_dynasm::jit_exc_clear();
+}
+
+/// `_restore_exception` writes `pos_exc_value`, then `pos_exception`, from
+/// registers, from immediates that fit 32 bits, and from wider immediates.
+#[test]
+fn restore_exception_writes_both_cells() {
+    let _guard = EXCEPTION_TEST_LOCK.lock();
+
+    let run = |class: OpRef, value: OpRef, inputargs: &[InputArgRc], args: &[Value]| {
+        majit_backend_dynasm::jit_exc_clear();
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let token = JitCellToken::new(46);
+
+        let restore = Op::new(OpCode::RestoreException, &[rb(class), rb(value)]);
+        restore.pos().set(OpRef::void_op(10));
+        let finish_op = Op::new(OpCode::Finish, &[]);
+        finish_op.pos().set(OpRef::void_op(11));
+        finish_op.set_fail_arg_types(vec![]);
+        finish_op.setfailargs(vec![].into());
+
+        let ops_rc: Vec<OpRc> = vec![OpRc::new(restore), OpRc::new(finish_op)];
+        backend
+            .compile_loop(inputargs, &ops_rc, &token)
+            .expect("compile loop with RESTORE_EXCEPTION");
+        let frame = backend.execute_token(&token, args);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let got = (
+            majit_backend_dynasm::jit_exc_class_raw(),
+            majit_backend_dynasm::jit_exc_value_peek(),
+        );
+        majit_backend_dynasm::jit_exc_clear();
+        got
+    };
+
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+    ];
+    let mut exc_obj = vec![0x7171_0000_usize, 0usize];
+    let exc_ref = GcRef(exc_obj.as_mut_ptr() as usize);
+    assert_eq!(
+        run(
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_ref(1),
+            &inputargs,
+            &[Value::Int(0x7171_0000), Value::Ref(exc_ref)],
+        ),
+        (0x7171_0000, exc_ref.0 as i64)
+    );
+
+    let wide = 0x1234_5678_9abc_i64;
+    assert_eq!(
+        run(
+            OpRef::const_int(0x7272_0000),
+            OpRef::const_int(wide),
+            &[],
+            &[]
+        ),
+        (0x7272_0000, wide)
+    );
 }
 
 #[test]
