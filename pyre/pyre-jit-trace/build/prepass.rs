@@ -1216,6 +1216,21 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // `call_kw` reaches the binder through `call_plain_user_kw`,
+                // which is `dont_look_inside`, so the portal BFS never enters
+                // it. The CALL_KW walker descends this body by path. Its
+                // traced arm is `match_signature_indexed`
+                // (`argument.py _match_signature`, `@jit.unroll_safe`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "call",
+                    "bind_plain_user_kw_scope",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "argument",
+                    "match_signature_indexed",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.

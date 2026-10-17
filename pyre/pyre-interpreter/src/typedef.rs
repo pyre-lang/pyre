@@ -10857,8 +10857,13 @@ fn init_frame_type(ns: PyObjectRef) {
                     if f.is_null() {
                         return Ok(pyre_object::w_str_new_managed("<frame (null)>"));
                     }
+                    // `descr_repr` reads `last_instr`. The getset wrappers
+                    // force that virtualizable; this interp2app is the same
+                    // residual reader.
+                    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+                    crate::executioncontext::jit_force_virtualizable(anchor.live());
                     Ok(pyre_object::w_str_from_wtf8_managed(
-                        unsafe { &*f }.descr_repr(),
+                        unsafe { &*anchor.live() }.descr_repr(),
                     ))
                 },
                 1,

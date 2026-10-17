@@ -634,10 +634,12 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
 /// materialized for a `new_array` / `new_array_clear` recorded in this
 /// trace, write the concrete element into it so a later BUILD_LIST /
 /// BUILD_TUPLE residual reads a complete block during the walk. If the
-/// element value (not a ref) or the index has no known concrete, the
-/// block cannot be completed, so revert the array to the no-concrete
-/// sentinel (`Ref(usize::MAX)`): the residual then declines and the void
-/// store aborts, exactly as without materialization.
+/// element value has no known concrete, or the value's bank disagrees
+/// with the block, the block cannot be completed, so revert the array
+/// to the no-concrete sentinel (`Ref(usize::MAX)`): the residual then
+/// declines and the void store aborts, exactly as without materialization.
+/// A `GcArray(Signed)` block stores the `i64` (`setarrayitem_gc_i`).
+/// Scalar items are not GC pointers, so that store is not a write barrier.
 ///
 /// A real heap array store — whose `array` operand is a `GetfieldGcR`
 /// load of a pre-existing container's items block — is left untouched,
@@ -731,6 +733,28 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     if idx >= cap {
         ctx.trace_ctx
             .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+        return;
+    }
+    // `GcArray(Signed)` (`try_alloc_typed_items_block`) shares the
+    // capacity word with `ItemsBlock` but its slots are `i64`, not
+    // pointers. Writing a ref into it would publish an integer as a
+    // traced pointer; writing an int into an `ItemsBlock` would do the
+    // reverse. The header tid is the one `gc_int_array_gc_type_id`
+    // published at GC init.
+    let int_tid = pyre_object::gc_int_array_gc_type_id();
+    let payload_tid = unsafe { (*majit_gc::header::header_of(block as usize)).type_id() };
+    if int_tid != 0 && payload_tid == int_tid {
+        let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(value) else {
+            ctx.trace_ctx
+                .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+            return;
+        };
+        unsafe {
+            let base = pyre_object::typed_items_block_items_base(
+                block as *mut pyre_object::TypedItemsBlock,
+            );
+            *(base as *mut i64).add(idx) = n;
+        }
         return;
     }
     let elem = match ctx.trace_ctx.box_value(value) {

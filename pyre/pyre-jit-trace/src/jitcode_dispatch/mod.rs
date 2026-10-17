@@ -8023,7 +8023,17 @@ struct InlineParentFrame {
     jitcode_index: u32,
     /// The caller CALL opcode's JitCode pc. A nested inline-capture abort
     /// carries this native coordinate to the interpreter-flush boundary.
+    /// `Some` arms `WalkEndResume::Rewind` and re-executes that call. A
+    /// bridge root leaves this unset; the call position is `call_pc`.
     call_jitcode_pc: Option<usize>,
+    /// Jitcode pc of the CALL this frame is paused in. The handler records
+    /// that position, then sets `MIFrame.pc` to the first byte after the
+    /// opcode before the callee runs. Not the Rewind coordinate above.
+    call_pc: Option<usize>,
+    /// Post-call resume pc. `MIFrame.pc` while the callee runs, and the pc
+    /// half of `AbstractResumeDataReader.read_jitcode_pos_pc` restored by
+    /// `MIFrame.setup_resume_at_op`. Includes a trailing `-live-`.
+    resume_pc: Option<usize>,
     /// Concrete operand-stack slots at the caller CALL, keyed by absolute
     /// `locals_cells_stack_w` index. Used only by the abort-point flush.
     call_stack_overrides: Vec<(usize, pyre_object::PyObjectRef)>,
@@ -8036,8 +8046,8 @@ struct InlineParentFrame {
     /// Python-native consumers resolve this at their boundary.
     resume_coord: ParentResumeCoord,
     /// Codewrite-time jitcode-keyed marker for the CALL fallthrough resume
-    /// point, queried at the CALL site.  Bridge-root frames have no CALL
-    /// offset in hand and carry `None`.
+    /// point, queried at the CALL site. Same word as `resume_pc` when the
+    /// paused frame has a valid jitcode offset.
     resume_marker_jit_pc: Option<usize>,
     /// The caller's `in_a_call` active boxes at its resolved resume pc — the liveness
     /// at the return point with the not-yet-produced call-result slot nulled
@@ -8046,8 +8056,9 @@ struct InlineParentFrame {
     /// Live `MIFrame.registers_{r,i,f}` of the paused caller, plus the
     /// walker extras on `WalkFrameState`. `MetaInterp.replace_box` writes
     /// these in place (`pyjitpl.py replace_box` → `replace_active_box_in_frame`).
-    /// `None` on a reconstructed resume image that has no live walk
-    /// (bridge reconstruct, ctor continuation).
+    /// `consume_boxes` (`resume.py`) fills these on a bridge root, null refs
+    /// included. `None` when that bank was not captured (ctor continuation,
+    /// empty list).
     registers_r: Option<RegisterBank>,
     registers_i: Option<RegisterBank>,
     registers_f: Option<RegisterBank>,
@@ -8198,6 +8209,19 @@ struct InlineParentBlackhole {
     float_values: Vec<(usize, OpRef)>,
 }
 
+/// The instruction whose next byte is `resume_pc`.
+///
+/// The handler sets `MIFrame.pc` to the first byte after the opcode before
+/// the callee runs. `AbstractResumeDataReader.read_jitcode_pos_pc` restores
+/// that word through `MIFrame.setup_resume_at_op`. The CALL's jitcode pc is
+/// the opcode that ends at that word; the opcode name is not consulted.
+fn jitcode_op_ending_at(
+    code: &[u8],
+    resume_pc: usize,
+) -> Option<crate::jitcode_runtime::DecodedOp> {
+    crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
+}
+
 /// The derivation flavor of a paused caller frame's Python resume pc.
 #[derive(Clone, Copy)]
 enum ParentResumeCoord {
@@ -8228,6 +8252,8 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
         // The tail has no Python code object and so no Python pc. `Backxlat`
@@ -8270,6 +8296,8 @@ pub(crate) fn operator_continuation_parent_frame(
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: Some(resume_pc),
         call_stack_overrides: Vec::new(),
         blackhole: None,
         // The tail has no Python code object and so no Python pc. `Backxlat`
@@ -8318,6 +8346,27 @@ impl<'a> WalkSessionRoots<'a> {
             _area: area,
             _session: session,
         }
+    }
+}
+
+fn walk_paused_register_bank(
+    bank: &Option<RegisterBank>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let Some(bank) = bank else {
+        return;
+    };
+    if bank.is_empty() {
+        return;
+    }
+    // `ConstPtr` stores its `GcRef` by value. Walk a copy, then write the
+    // forwarded word back into the shared bank (`OpRef::walk_const_ptr_refs_mut`).
+    let mut values = bank.to_vec();
+    for value in &mut values {
+        value.walk_const_ptr_refs_mut(visitor);
+    }
+    for (index, value) in values.into_iter().enumerate() {
+        bank.set(index, value);
     }
 }
 
@@ -8370,6 +8419,11 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
             for (_, value) in &mut parent.call_stack_overrides {
                 walk_ptr(value, visitor);
             }
+            // `MIFrame.registers_*` on a bridge root hold ConstPtr boxes,
+            // including nulls. Forward those slots in place.
+            walk_paused_register_bank(&parent.registers_r, visitor);
+            walk_paused_register_bank(&parent.registers_i, visitor);
+            walk_paused_register_bank(&parent.registers_f, visitor);
             if let Some(blackhole) = parent.blackhole.as_mut() {
                 for (_, value) in &mut blackhole.ref_values {
                     walk_ptr(value, visitor);
@@ -9864,6 +9918,12 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     {
         return create_segmented_trace(ctx, jit_pc, py_pc as usize, true);
     }
+    // `opimpl_loop_header` (`pyjitpl.py`) only stamps
+    // `seen_loop_header_for_jdindex`. The close is `opimpl_jit_merge_point`
+    // on the `jit_merge_point` emitted at the loop-header block
+    // (`handle_jit_marker__jit_merge_point`, `jtransform.py`). This
+    // synthesized boundary records `DEBUG_MERGE_POINT` and the segmenting
+    // check above.
     Ok(None)
 }
 

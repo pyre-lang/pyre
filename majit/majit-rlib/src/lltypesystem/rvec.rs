@@ -17,10 +17,16 @@
 //! * `ll_vec_append_*` and `ll_vec_resize_ge_*` are looked inside;
 //!   `ll_vec_resize_hint_really_*` and `ll_vec_reverse_*` are looked inside
 //!   only under their upstream `look_inside_iff` predicates.
-//! * Only the buffer allocation itself is opaque: [`vec_buf_alloc`],
-//!   [`vec_buf_realloc`] and [`vec_buf_free`] use the same `Layout` as the
-//!   standard library's `RawVec`, so a buffer grown here can be freed by host
-//!   code and the reverse.
+//! * Item buffers have one allocator. [`vec_buf_alloc`], [`vec_buf_realloc`]
+//!   and [`vec_buf_free`] use `RawVec`'s `Layout` (`vec_buf_layout`: `nbytes`
+//!   at the item alignment, the dangling `align` address for zero bytes).
+//!   Jitcode calls the same allocator as a one-argument `(nbytes) -> addr`
+//!   leaf ([`vec_item_malloc_word`] / [`vec_item_malloc_f64`], and the
+//!   zero-filling twins) so `do_RAW_MALLOC_VARSIZE_CHAR` can virtualize it
+//!   and resume passes the byte size alone. [`vec_buf_free`] is `raw_free`
+//!   (`OS_RAW_FREE`, items pointer first) for both paths. `VecItemKind::size_align`
+//!   is `(word, word)` for `Int` and `Ref`, and `(8, 8)` for `Float`, so the
+//!   float leaf bakes `f64`'s alignment rather than the word.
 //!
 //! The item buffer stays raw memory for every kind, managed references
 //! included: the interpreter treats `Vec` contents as untraced and roots them
@@ -242,34 +248,84 @@ fn item_bytes(count: usize, itemsize: usize) -> Option<usize> {
     count.checked_mul(itemsize)
 }
 
-/// A buffer for `allocated` items. An empty buffer is the dangling address
-/// `align`, as `RawVec` spells it.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub fn vec_buf_alloc(allocated: usize, itemsize: usize, align: usize) -> usize {
-    if allocated == 0 || itemsize == 0 {
+/// `nbytes` bytes at `align`, or the dangling `align` address when `nbytes`
+/// is zero. Same `Layout` as [`vec_buf_layout`] / `RawVec`: a native `Vec<T>`
+/// can grow or free the block, and this allocator can grow or free a block
+/// `RawVec` allocated.
+fn alloc_item_bytes(nbytes: usize, align: usize, zero: bool) -> usize {
+    if nbytes == 0 {
         return align;
     }
-    let layout = vec_buf_layout(allocated, itemsize, align);
-    let items = unsafe { alloc(layout) };
+    let layout =
+        Layout::from_size_align(nbytes, align).unwrap_or_else(|_| panic!("Vec capacity overflow"));
+    let items = unsafe {
+        if zero {
+            alloc_zeroed(layout)
+        } else {
+            alloc(layout)
+        }
+    };
     if items.is_null() {
         handle_alloc_error(layout);
     }
     items as usize
 }
 
+/// Jitcode item buffer for a word item (`usize` / `*mut u8`).
+///
+/// `(nbytes) -> addr`, tagged `OS_RAW_MALLOC_VARSIZE_CHAR`
+/// (`_rewrite_raw_malloc`). Alignment is the word: `VecItemKind::size_align`
+/// gives `(word, word)` for `Int` and `Ref`, and `align_of::<usize>()` equals
+/// `align_of::<*mut u8>()`. A zero-byte request is the dangling alignment,
+/// as `RawVec` spells an empty buffer.
+#[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn vec_item_malloc_word(nbytes: usize) -> usize {
+    alloc_item_bytes(nbytes, std::mem::align_of::<usize>(), false)
+}
+
+/// Zero-filled twin of [`vec_item_malloc_word`] (`newlist_clear`).
+#[majit_macros::oopspec("raw_malloc_varsize_zero(size)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn vec_item_malloc_word_zero(nbytes: usize) -> usize {
+    alloc_item_bytes(nbytes, std::mem::align_of::<usize>(), true)
+}
+
+/// Jitcode item buffer for an `f64` item.
+///
+/// `VecItemKind::size_align` is `(8, 8)` for `Float`, not `(word, word)`.
+/// On a 32-bit target the word is 4 and `Vec<f64>` still aligns to 8, so
+/// this leaf does not share [`vec_item_malloc_word`].
+#[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn vec_item_malloc_f64(nbytes: usize) -> usize {
+    alloc_item_bytes(nbytes, std::mem::align_of::<f64>(), false)
+}
+
+/// Zero-filled twin of [`vec_item_malloc_f64`] (`newlist_clear`).
+#[majit_macros::oopspec("raw_malloc_varsize_zero(size)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn vec_item_malloc_f64_zero(nbytes: usize) -> usize {
+    alloc_item_bytes(nbytes, std::mem::align_of::<f64>(), true)
+}
+
+const _: () = assert!(std::mem::align_of::<usize>() == std::mem::align_of::<*mut u8>());
+const _: () = assert!(std::mem::size_of::<f64>() == 8 && std::mem::align_of::<f64>() == 8);
+
+/// A buffer for `allocated` items. An empty buffer is the dangling address
+/// `align`, as `RawVec` spells it.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn vec_buf_alloc(allocated: usize, itemsize: usize, align: usize) -> usize {
+    let nbytes = item_bytes(allocated, itemsize).unwrap_or_else(|| panic!("Vec capacity overflow"));
+    alloc_item_bytes(nbytes, align, false)
+}
+
 /// A zero-filled buffer for `allocated` items (`raw_malloc(..., zero=True)`).
 /// An empty buffer is the dangling address `align`, as [`vec_buf_alloc`].
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn vec_buf_alloc_clear(allocated: usize, itemsize: usize, align: usize) -> usize {
-    if allocated == 0 || itemsize == 0 {
-        return align;
-    }
-    let layout = vec_buf_layout(allocated, itemsize, align);
-    let items = unsafe { alloc_zeroed(layout) };
-    if items.is_null() {
-        handle_alloc_error(layout);
-    }
-    items as usize
+    let nbytes = item_bytes(allocated, itemsize).unwrap_or_else(|| panic!("Vec capacity overflow"));
+    alloc_item_bytes(nbytes, align, true)
 }
 
 /// Move `items` (holding `allocated` slots) to a buffer of `new_allocated`
@@ -299,12 +355,31 @@ pub fn vec_buf_realloc(
 }
 
 /// Free a buffer of `allocated` slots.
+///
+/// `raw_free` (`OS_RAW_FREE`): the items pointer is the first argument, so
+/// `do_RAW_FREE` drops the free while the buffer is virtual. A zero-slot
+/// buffer is the dangling `align` address and is not a heap block. Native
+/// `Vec` drop and jitcode free both call this, on the same `Layout`.
+#[majit_macros::oopspec("raw_free(items, allocated, itemsize, align)")]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn vec_buf_free(items: usize, allocated: usize, itemsize: usize, align: usize) {
     if allocated == 0 || itemsize == 0 {
         return;
     }
     unsafe { dealloc(items as *mut u8, vec_buf_layout(allocated, itemsize, align)) }
+}
+
+/// Free a lowered header and its item buffer.
+///
+/// The header came from [`raw_malloc_varsize_char`]. The items came from the
+/// same allocator as a native `Vec` (`vec_buf_layout`), whether jitcode
+/// called [`vec_item_malloc_word`] / [`vec_item_malloc_f64`] or native code
+/// called [`vec_buf_alloc`].
+fn ll_vec_free_buffer(header: usize, itemsize: usize, align: usize) {
+    let items = vec_header_word(header, VEC_PTR_WORD);
+    let allocated = vec_header_word(header, VEC_CAP_WORD);
+    vec_buf_free(items, allocated, itemsize, align);
+    raw_free(header);
 }
 
 // ── `_i`: `usize` items ─────────────────────────────────────────────────
@@ -350,7 +425,13 @@ fn ll_vec_arrayclear_i(l: &mut Vec<usize>, count: usize) {
 }
 
 /// `rlist.py _ll_alloc_and_clear`.
-/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
+///
+/// The oopspec replaces this call in `ll_vec_alloc_and_set_jit_i`'s jitcode
+/// (`_ll_alloc_and_set_jit`). A `Vec` result takes
+/// `_handle_raw_resizable_list_call`, which allocates with the zero-filling
+/// item leaf ([`vec_item_malloc_word_zero`] / [`vec_item_malloc_f64_zero`]),
+/// so the tracer never enters [`ll_vec_arrayclear_i`].
+#[majit_macros::oopspec("newlist_clear(count)")]
 pub fn ll_vec_alloc_and_clear_i(count: usize) -> Vec<usize> {
     let mut l = ll_vec_newlist_i(count);
     ll_vec_arrayclear_i(&mut l, count);
@@ -497,11 +578,7 @@ pub fn ll_vec_reverse_i(l: &mut Vec<usize>) {
 
 /// `lltype.free(l, flavor='raw')` of a lowered `Vec` header and its buffer.
 pub fn ll_vec_free_i(l: &mut Vec<usize>) {
-    let header = vec_header_i(l);
-    let items = vec_header_word(header, VEC_PTR_WORD);
-    let allocated = vec_header_word(header, VEC_CAP_WORD);
-    vec_buf_free(items, allocated, ITEM_SIZE_I, ITEM_ALIGN_I);
-    raw_free(header);
+    ll_vec_free_buffer(vec_header_i(l), ITEM_SIZE_I, ITEM_ALIGN_I);
 }
 
 /// `ll_items`: the header's item pointer.
@@ -696,8 +773,8 @@ fn ll_vec_arrayclear_r(l: &mut Vec<*mut u8>, count: usize) {
     }
 }
 
-/// `rlist.py _ll_alloc_and_clear`.
-/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
+/// `rlist.py _ll_alloc_and_clear`. See [`ll_vec_alloc_and_clear_i`].
+#[majit_macros::oopspec("newlist_clear(count)")]
 pub fn ll_vec_alloc_and_clear_r(count: usize) -> Vec<*mut u8> {
     let mut l = ll_vec_newlist_r(count);
     ll_vec_arrayclear_r(&mut l, count);
@@ -785,7 +862,7 @@ pub fn ll_vec_append_r(l: &mut Vec<*mut u8>, newitem: *mut u8) {
     ll_vec_setitem_fast_r(l, length, newitem);
 }
 
-/// `_ll_list_resize_ge`.
+/// `_ll_list_resize_ge`. See [`ll_vec_resize_ge_i`].
 pub fn ll_vec_resize_ge_r(l: &mut Vec<*mut u8>, newsize: usize) {
     let allocated = vec_header_word(vec_header_r(l), VEC_CAP_WORD);
     let cond = allocated < newsize;
@@ -852,11 +929,7 @@ pub fn ll_vec_reverse_r(l: &mut Vec<*mut u8>) {
 
 /// `lltype.free(l, flavor='raw')` of a lowered `Vec` header and its buffer.
 pub fn ll_vec_free_r(l: &mut Vec<*mut u8>) {
-    let header = vec_header_r(l);
-    let items = vec_header_word(header, VEC_PTR_WORD);
-    let allocated = vec_header_word(header, VEC_CAP_WORD);
-    vec_buf_free(items, allocated, ITEM_SIZE_R, ITEM_ALIGN_R);
-    raw_free(header);
+    ll_vec_free_buffer(vec_header_r(l), ITEM_SIZE_R, ITEM_ALIGN_R);
 }
 
 /// `ll_items`: the header's item pointer.
@@ -1087,8 +1160,8 @@ fn ll_vec_arrayclear_f(l: &mut Vec<f64>, count: usize) {
     }
 }
 
-/// `rlist.py _ll_alloc_and_clear`.
-/// No `newlist_clear` oopspec: this is a raw `Vec`, not a GC list header.
+/// `rlist.py _ll_alloc_and_clear`. See [`ll_vec_alloc_and_clear_i`].
+#[majit_macros::oopspec("newlist_clear(count)")]
 pub fn ll_vec_alloc_and_clear_f(count: usize) -> Vec<f64> {
     let mut l = ll_vec_newlist_f(count);
     ll_vec_arrayclear_f(&mut l, count);
@@ -1173,7 +1246,7 @@ pub fn ll_vec_append_f(l: &mut Vec<f64>, newitem: f64) {
     ll_vec_setitem_fast_f(l, length, newitem);
 }
 
-/// `_ll_list_resize_ge`.
+/// `_ll_list_resize_ge`. See [`ll_vec_resize_ge_i`].
 pub fn ll_vec_resize_ge_f(l: &mut Vec<f64>, newsize: usize) {
     let allocated = vec_header_word(vec_header_f(l), VEC_CAP_WORD);
     let cond = allocated < newsize;
@@ -1236,11 +1309,7 @@ pub fn ll_vec_reverse_f(l: &mut Vec<f64>) {
 
 /// `lltype.free(l, flavor='raw')` of a lowered `Vec` header and its buffer.
 pub fn ll_vec_free_f(l: &mut Vec<f64>) {
-    let header = vec_header_f(l);
-    let items = vec_header_word(header, VEC_PTR_WORD);
-    let allocated = vec_header_word(header, VEC_CAP_WORD);
-    vec_buf_free(items, allocated, ITEM_SIZE_F, ITEM_ALIGN_F);
-    raw_free(header);
+    ll_vec_free_buffer(vec_header_f(l), ITEM_SIZE_F, ITEM_ALIGN_F);
 }
 
 /// `ll_items`: the header's item pointer.
@@ -1439,6 +1508,22 @@ mod tests {
             majit_ir::rvec::VEC_HEADER_MALLOC,
             format!("{rffi}::raw_malloc_varsize_char")
         );
+        assert_eq!(
+            majit_ir::rvec::vec_item_malloc_path(majit_ir::rvec::VecItemKind::Int, false),
+            format!("{module}::vec_item_malloc_word")
+        );
+        assert_eq!(
+            majit_ir::rvec::vec_item_malloc_path(majit_ir::rvec::VecItemKind::Ref, true),
+            format!("{module}::vec_item_malloc_word_zero")
+        );
+        assert_eq!(
+            majit_ir::rvec::vec_item_malloc_path(majit_ir::rvec::VecItemKind::Float, false),
+            format!("{module}::vec_item_malloc_f64")
+        );
+        assert_eq!(
+            majit_ir::rvec::vec_item_malloc_path(majit_ir::rvec::VecItemKind::Float, true),
+            format!("{module}::vec_item_malloc_f64_zero")
+        );
     }
     use majit_ir::rvec::{
         SliceOp, VEC_HEADER_WORDS, VecItemKind, VecOp, slice_helper_path, vec_helper_path,
@@ -1630,6 +1715,87 @@ mod tests {
         assert_eq!(v.capacity(), 0);
     }
 
+    /// A jitcode item leaf and `vec_buf_alloc` produce the same `RawVec`
+    /// `Layout`, so either side can grow or free the other's block.
+    #[test]
+    fn item_leaf_and_vec_buf_grow_and_free_each_other() {
+        let align = std::mem::align_of::<usize>();
+        let itemsize = std::mem::size_of::<usize>();
+
+        let items = vec_item_malloc_word(itemsize);
+        unsafe { (items as *mut usize).write(0x11) };
+        let grown = vec_buf_realloc(items, 1, 3, itemsize, align);
+        assert_eq!(unsafe { (grown as *const usize).read() }, 0x11);
+        unsafe { (grown as *mut usize).add(2).write(0x22) };
+        vec_buf_free(grown, 3, itemsize, align);
+
+        let native = vec_buf_alloc(1, itemsize, align);
+        unsafe { (native as *mut usize).write(0x33) };
+        let grown = vec_buf_realloc(native, 1, 4, itemsize, align);
+        assert_eq!(unsafe { (grown as *const usize).read() }, 0x33);
+        vec_buf_free(grown, 4, itemsize, align);
+
+        let direct = vec_item_malloc_word(itemsize * 2);
+        vec_buf_free(direct, 2, itemsize, align);
+        let native = vec_buf_alloc(2, itemsize, align);
+        vec_buf_free(native, 2, itemsize, align);
+
+        let zeroed = vec_item_malloc_word_zero(itemsize * 2);
+        assert_eq!(unsafe { (zeroed as *const usize).read() }, 0);
+        assert_eq!(unsafe { (zeroed as *const usize).add(1).read() }, 0);
+        let grown = vec_buf_realloc(zeroed, 2, 4, itemsize, align);
+        assert_eq!(unsafe { (grown as *const usize).read() }, 0);
+        vec_buf_free(grown, 4, itemsize, align);
+
+        assert_eq!(vec_item_malloc_word(0), align);
+        assert_eq!(vec_buf_alloc(0, itemsize, align), align);
+        let mut empty: Vec<usize> = Vec::new();
+        assert_eq!(empty.as_mut_ptr() as usize, align);
+        vec_buf_free(align, 0, itemsize, align);
+
+        let leaf = vec_item_malloc_word(itemsize * 2);
+        unsafe {
+            (leaf as *mut usize).write(7);
+            (leaf as *mut usize).add(1).write(8);
+            let mut v = Vec::from_raw_parts(leaf as *mut usize, 2, 2);
+            v.push(9);
+            assert_eq!(v, vec![7, 8, 9]);
+        }
+
+        let mut host = Vec::with_capacity(2);
+        host.push(4usize);
+        host.push(5);
+        let cap = host.capacity();
+        let ptr = host.as_mut_ptr();
+        std::mem::forget(host);
+        let grown = vec_buf_realloc(ptr as usize, cap, cap + 2, itemsize, align);
+        assert_eq!(unsafe { (grown as *const usize).read() }, 4);
+        assert_eq!(unsafe { (grown as *const usize).add(1).read() }, 5);
+        vec_buf_free(grown, cap + 2, itemsize, align);
+
+        let falign = std::mem::align_of::<f64>();
+        let fsize = std::mem::size_of::<f64>();
+        let fitems = vec_item_malloc_f64(fsize);
+        unsafe { (fitems as *mut f64).write(1.5) };
+        let fgrown = vec_buf_realloc(fitems, 1, 2, fsize, falign);
+        assert_eq!(unsafe { (fgrown as *const f64).read() }, 1.5);
+        vec_buf_free(fgrown, 2, fsize, falign);
+
+        let fnative = vec_buf_alloc(1, fsize, falign);
+        unsafe { (fnative as *mut f64).write(2.5) };
+        let fgrown = vec_buf_realloc(fnative, 1, 3, fsize, falign);
+        assert_eq!(unsafe { (fgrown as *const f64).read() }, 2.5);
+        vec_buf_free(fgrown, 3, fsize, falign);
+
+        assert_eq!(vec_item_malloc_f64(0), falign);
+        let zeroed = vec_item_malloc_f64_zero(fsize);
+        assert_eq!(unsafe { (zeroed as *const f64).read() }, 0.0);
+        let mut floats = unsafe { Vec::from_raw_parts(zeroed as *mut f64, 1, 1) };
+        floats.push(3.5);
+        assert_eq!(floats[0], 0.0);
+        assert_eq!(floats[1], 3.5);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn residual_entries_are_published() {
@@ -1641,6 +1807,10 @@ mod tests {
             "vec_buf_alloc_clear",
             "vec_buf_realloc",
             "vec_buf_free",
+            "vec_item_malloc_word",
+            "vec_item_malloc_word_zero",
+            "vec_item_malloc_f64",
+            "vec_item_malloc_f64_zero",
             "ll_vec_resize_hint_really_i",
             "ll_vec_resize_hint_really_r",
             "ll_vec_resize_hint_really_f",

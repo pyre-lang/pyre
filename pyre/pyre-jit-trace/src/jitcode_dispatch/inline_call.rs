@@ -3751,32 +3751,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     }))
 }
 
-/// Fold a keyword call's `kwnames`->parameter permutation at trace time so a
-/// `call_kw` reuses the positional inline path.  The constant `kwnames` tuple
-/// and the callee's static parameter names are both known at record time, so
-/// the reorder is a pure trace-time permutation of the argument boxes into
-/// parameter order — `_match_signature` (`@jit.unroll_safe`) unrolled and
-/// folded.  Once reordered the seeding is identical to a positional call.
-///
-/// `r_args` layout is `[callable, self_or_null, kwnames, arg0..argN-1]`; the
-/// trailing `nkw` args are the keyword values, `kwnames[j]` naming
-/// `arg[n_pos + j]` where `n_pos = nargs - nkw`.  `receiver`, when present,
-/// is the implicit leading argument inserted by `call_kw` for method-form
-/// calls (`Arguments.prepend` / `funcrun_obj` upstream).
-///
-/// A keyword that names no parameter is returned separately for a `**kwargs`
-/// callee, which collects it into its mapping (`_match_signature`).
-///
-/// Returns `None` (declining to the residual call, no behavior change) for any
-/// shape the seeding cannot serve: a non-constant / non-tuple `kwnames`, a
-/// callee with `*args` / keyword-only parameters, more positional arguments
-/// than the callee takes, a keyword naming an unknown parameter of a callee
-/// without `**kwargs`, or a keyword colliding with a positionally-filled
-/// parameter ("multiple values").
-///
-/// # Safety
-/// `w_code` must be the live code object pointer for the resolved callable.
-/// Whether every local of `w_code` that a call must bind lives in
+/// Whether every local of `w_code` that a positional call binds lives in
 /// `registers_r[0..co_argcount]`, which is all the inline seeding fills.
 ///
 /// `*args` and `**kwargs` own locals the seeding never packs, and a
@@ -3793,22 +3768,6 @@ fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
     let flags = unsafe { (*raw).flags };
     !flags.contains(pyre_interpreter::CodeFlags::VARARGS)
         && !flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
-        && unsafe { (*raw).kwonlyarg_count } == 0
-}
-
-/// Whether the only local of `w_code` outside `registers_r[0..co_argcount]`
-/// is the `**kwargs` mapping.
-fn fbw_callee_scope_is_varkw_only(w_code: *const ()) -> bool {
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    if raw.is_null() {
-        return false;
-    }
-    let flags = unsafe { (*raw).flags };
-    !flags.contains(pyre_interpreter::CodeFlags::VARARGS)
-        && flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
         && unsafe { (*raw).kwonlyarg_count } == 0
 }
 
@@ -3874,117 +3833,16 @@ struct VarkwExtra {
     concrete: ConcreteValue,
 }
 
-unsafe fn fbw_reorder_call_kw_args(
-    r_args: &[OpRef],
-    arg_concretes: &[ConcreteValue],
-    w_code: *const (),
-    nparams: usize,
-    receiver: Option<(OpRef, ConcreteValue)>,
-) -> Option<(Vec<OpRef>, Vec<ConcreteValue>, Vec<VarkwExtra>)> {
-    if r_args.len() < 3 || arg_concretes.len() < 3 {
-        return None;
-    }
-    let ConcreteValue::Ref(kwnames) = arg_concretes[2] else {
-        return None;
-    };
-    if kwnames.is_null() || !unsafe { pyre_object::is_tuple(kwnames) } {
-        return None;
-    }
-    let args = &r_args[3..];
-    let arg_conc = &arg_concretes[3..];
-    let nargs = args.len();
-    if arg_conc.len() != nargs {
-        return None;
-    }
-    let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
-    // A `**kwargs` callee takes every keyword that names no parameter into its
-    // mapping (`_match_signature`), so only the positional arguments have to
-    // fit its parameters.
-    let has_varkw = fbw_callee_varkw_slot(w_code).is_some();
-    // No positional parameter may be filled more than once, and the call may
-    // not pass more than the callee takes — `*args` / keyword-only slots are
-    // ruled out separately by `fbw_callee_scope_is_positional_only`.  A
-    // parameter left unbound is allowed through as a hole; the caller fills it
-    // from `defs_w` or declines when it has no default.
-    let receiver_count = usize::from(receiver.is_some());
-    if nkw > nargs {
-        return None;
-    }
-    if has_varkw {
-        if nargs - nkw + receiver_count > nparams {
-            return None;
-        }
-    } else if nparams == 0 || nargs + receiver_count > nparams {
-        return None;
-    }
+/// `signature.has_kwarg()` — the callee owns a `**kwargs` local.
+fn fbw_callee_has_varkeywords(w_code: *const ()) -> bool {
     let raw = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
     if raw.is_null() {
-        return None;
+        return false;
     }
-    if !fbw_callee_scope_is_positional_only(w_code) && !fbw_callee_scope_is_varkw_only(w_code) {
-        return None;
-    }
-    let varnames = unsafe { &(*raw).varnames };
-    if varnames.len() < nparams {
-        return None;
-    }
-    let n_pos = nargs - nkw;
-    let extras = Vec::new();
-    let mut slot_args: Vec<Option<OpRef>> = vec![None; nparams];
-    let mut slot_conc: Vec<Option<ConcreteValue>> = vec![None; nparams];
-    if let Some((receiver_arg, receiver_concrete)) = receiver {
-        slot_args[0] = Some(receiver_arg);
-        slot_conc[0] = Some(receiver_concrete);
-    }
-    for k in 0..n_pos {
-        let pi = receiver_count + k;
-        slot_args[pi] = Some(args[k]);
-        slot_conc[pi] = Some(arg_conc[k]);
-    }
-    for j in 0..nkw {
-        let name_obj = unsafe { pyre_object::w_tuple_getitem(kwnames, j as i64) }?;
-        if !unsafe { pyre_object::is_str(name_obj) } {
-            return None;
-        }
-        let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) }
-            .as_str()
-            .ok()?;
-        let posonly = unsafe { (*raw).posonlyarg_count } as usize;
-        // A keyword naming no parameter — or, under PEP 570, naming a
-        // positional-only one — goes to the `**kwargs` mapping when the callee
-        // has one (`_match_signature`); without it the call is a TypeError the
-        // interpreter reports.
-        let pi = varnames[..nparams]
-            .iter()
-            .position(|v| v.as_str() == name)
-            .filter(|&pi| pi >= posonly);
-        let Some(pi) = pi else {
-            // A name that binds no parameter belongs in the callee's
-            // `**kwargs` mapping (`_match_signature`). Building that dict
-            // here would trace the binding by hand. Leave the call residual.
-            return None;
-        };
-        // A keyword may only bind a parameter past the positional fill, and each
-        // parameter at most once (else Python raises "multiple values for
-        // argument").  A name in the positional-only range is not bindable by
-        // keyword at all — `def f(x, /)` called as `f(x=1)` is a TypeError, so
-        // binding slot 0 here would inline a call the interpreter rejects.
-        if pi < receiver_count + n_pos || slot_args[pi].is_some() {
-            return None;
-        }
-        slot_args[pi] = Some(args[n_pos + j]);
-        slot_conc[pi] = Some(arg_conc[n_pos + j]);
-    }
-    let mut out_args = Vec::with_capacity(nparams);
-    let mut out_conc = Vec::with_capacity(nparams);
-    for k in 0..nparams {
-        out_args.push(slot_args[k].unwrap_or(OpRef::NONE));
-        out_conc.push(slot_conc[k].unwrap_or(ConcreteValue::Null));
-    }
-    Some((out_args, out_conc, extras))
+    unsafe { (*raw).flags }.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
 }
 
 /// Permute a builtin CALL_KW into the gateway Signature's parameter
@@ -4750,6 +4608,350 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
     )
 }
 
+const CALL_KW_BIND_DESCENT: super::specialize::HelperDescent = super::specialize::HelperDescent {
+    path: "pyre_interpreter::call::bind_plain_user_kw_scope",
+    commit_label: "call_kw_bind_commit",
+    call_site_label: "bind_plain_user_kw_scope_call_site",
+    decline_tag: "CALL-KW-BIND-SUBWALK",
+};
+
+fn call_kw_restore_trace<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    saved_pos: majit_metainterp::recorder::TracePosition,
+    saved_heap: majit_metainterp::heapcache::HeapCache,
+) {
+    ctx.trace_ctx.cut_trace_with_snapshots(saved_pos);
+    *ctx.trace_ctx.heap_cache_mut() = saved_heap;
+}
+
+fn call_kw_positional_object<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    arg_concretes: &[ConcreteValue],
+    item: OpRef,
+    slot: usize,
+) -> Option<pyre_object::PyObjectRef> {
+    if let Some(ConcreteValue::Ref(obj)) = arg_concretes.get(slot)
+        && !obj.is_null()
+    {
+        return Some(*obj);
+    }
+    match ctx.trace_ctx.box_value(item) {
+        Some(majit_ir::Value::Ref(gcref))
+            if gcref != majit_ir::GcRef::NO_CONCRETE && gcref.as_usize() != 0 =>
+        {
+            Some(gcref.as_usize() as pyre_object::PyObjectRef)
+        }
+        _ => None,
+    }
+}
+
+fn call_kw_classify_box<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    item: OpRef,
+) -> Option<ConcreteValue> {
+    match ctx.trace_ctx.box_value(item)? {
+        majit_ir::Value::Ref(gcref)
+            if gcref != majit_ir::GcRef::NO_CONCRETE && gcref.as_usize() != 0 =>
+        {
+            Some(ConcreteValue::Ref(
+                gcref.as_usize() as pyre_object::PyObjectRef
+            ))
+        }
+        majit_ir::Value::Int(n) => Some(ConcreteValue::Int(n)),
+        _ => None,
+    }
+}
+
+fn call_kw_recover_scope<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    scope_array: OpRef,
+    scope_block: *mut pyre_object::object_array::ItemsBlock,
+    seeded: usize,
+    array_descr: &majit_ir::descr::DescrRef,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    let mut descrs = [array_descr.index(), 0];
+    let mut descr_count = 1usize;
+    if let Some(vinfo) = ctx.trace_ctx.virtualizable_info()
+        && !vinfo.array_descrs.is_empty()
+    {
+        descrs[1] = vinfo.array_item_descr(0).index();
+        descr_count = 2;
+    }
+    let live_block = match ctx.trace_ctx.box_value(scope_array) {
+        Some(majit_ir::Value::Ref(gcref))
+            if gcref != majit_ir::GcRef::NO_CONCRETE && gcref.as_usize() != 0 =>
+        {
+            gcref.as_usize() as *mut pyre_object::object_array::ItemsBlock
+        }
+        _ => scope_block,
+    };
+    let mut ops = Vec::with_capacity(seeded);
+    let mut concretes = Vec::with_capacity(seeded);
+    for index in 0..seeded {
+        let index_op = ctx.trace_ctx.const_int(index as i64);
+        let mut recovered = None;
+        for descr_index in descrs.iter().take(descr_count).copied() {
+            if let Some(item) =
+                ctx.trace_ctx
+                    .heapcache_getarrayitem(scope_array, index_op, descr_index)
+                && let Some(concrete) = call_kw_classify_box(ctx, item)
+            {
+                recovered = Some((item, concrete));
+                break;
+            }
+        }
+        if recovered.is_none() {
+            let loaded = ctx.trace_ctx.record_op_with_descr(
+                OpCode::GetarrayitemGcR,
+                &[scope_array, index_op],
+                array_descr.clone(),
+            );
+            ctx.trace_ctx.heapcache_getarrayitem_now_known(
+                scope_array,
+                index_op,
+                array_descr.index(),
+                loaded,
+            );
+            if let Some(value) = ctx.trace_ctx.array_sanity_load(
+                live_block as usize as i64,
+                index as i64,
+                array_descr,
+                Type::Ref,
+            ) {
+                match value {
+                    majit_ir::Value::Ref(gcref)
+                        if gcref != majit_ir::GcRef::NO_CONCRETE && gcref.as_usize() != 0 =>
+                    {
+                        ctx.trace_ctx
+                            .try_set_opref_concrete(loaded, majit_ir::Value::Ref(gcref));
+                        recovered = Some((
+                            loaded,
+                            ConcreteValue::Ref(gcref.as_usize() as pyre_object::PyObjectRef),
+                        ));
+                    }
+                    majit_ir::Value::Int(n) => {
+                        ctx.trace_ctx
+                            .try_set_opref_concrete(loaded, majit_ir::Value::Int(n));
+                        recovered = Some((loaded, ConcreteValue::Int(n)));
+                    }
+                    _ => {}
+                }
+            }
+            if recovered.is_none()
+                && let Some(concrete) = call_kw_classify_box(ctx, loaded)
+            {
+                recovered = Some((loaded, concrete));
+            }
+        }
+        let Some((item, concrete)) = recovered else {
+            return None;
+        };
+        ops.push(item);
+        concretes.push(concrete);
+    }
+    Some((ops, concretes))
+}
+
+/// Walk `bind_plain_user_kw_scope` and seed the callee from the scope it
+/// wrote. The binder is `argument.py _match_signature` (`@jit.unroll_safe`):
+/// the callee signature is constant, so the keyword permutation unrolls.
+/// A decline leaves the residual `bh_call_kw`.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_descend_plain_call_kw<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    resolved_callable: pyre_object::PyObjectRef,
+    w_code: *const (),
+    nparams: usize,
+    has_closure: bool,
+    mut arg_concretes: Vec<ConcreteValue>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if ctx.session.borrow().is_being_profiled {
+        return Ok(None);
+    }
+    if r_args.len() < 3 || arg_concretes.len() != r_args.len() {
+        return Ok(None);
+    }
+    if matches!(arg_concretes[2], ConcreteValue::Null)
+        && let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[2])
+        && r != majit_ir::GcRef::NO_CONCRETE
+        && r.as_usize() != 0
+    {
+        arg_concretes[2] = ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef);
+    }
+    let ConcreteValue::Ref(kwnames) = arg_concretes[2] else {
+        return Ok(None);
+    };
+    if kwnames.is_null() || unsafe { !pyre_object::is_tuple(kwnames) } {
+        return Ok(None);
+    }
+    let Some(kwonly_count) = fbw_callee_kwonly_count(w_code) else {
+        return Ok(None);
+    };
+    let has_vararg = fbw_callee_vararg_slot(w_code).is_some();
+    let has_varkeywords = fbw_callee_has_varkeywords(w_code);
+    let seeded = nparams + kwonly_count + usize::from(has_vararg) + usize::from(has_varkeywords);
+    let sig = unsafe { pyre_interpreter::w_code_signature(w_code as pyre_object::PyObjectRef) };
+    if sig.is_null() || unsafe { (*sig).scope_length() } != seeded {
+        return Ok(None);
+    }
+    let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
+    let nargs = r_args.len() - 3;
+    let limit = pyre_interpreter::argument::PLAIN_USER_KW_UNROLL_LIMIT;
+    if seeded > limit || nkw > limit || nkw > nargs {
+        return Ok(None);
+    }
+    let Some(pos_block) =
+        (unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(nargs) })
+    else {
+        return Ok(None);
+    };
+    let Some(scope_block) =
+        (unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(seeded) })
+    else {
+        return Ok(None);
+    };
+    let Some(prep) = super::specialize::prepare_orthodox_descent(ctx, op.pc, &CALL_KW_BIND_DESCENT)
+    else {
+        return Ok(None);
+    };
+
+    let saved_heap = ctx.trace_ctx.heap_cache().clone();
+    let saved_pos = ctx.trace_ctx.get_trace_position();
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let pos_len = ctx.trace_ctx.const_int(nargs as i64);
+    let pos_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[pos_len], array_descr.clone());
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(pos_array, pos_len, true);
+    ctx.trace_ctx.try_set_opref_concrete(
+        pos_array,
+        majit_ir::Value::Ref(majit_ir::GcRef(pos_block as usize)),
+    );
+    for i in 0..nargs {
+        let item = r_args[3 + i];
+        let index = ctx.trace_ctx.const_int(i as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[pos_array, index, item],
+            array_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setarrayitem(pos_array, index, array_descr.index(), item);
+        if let Some(obj) = call_kw_positional_object(ctx, &arg_concretes, item, 3 + i) {
+            unsafe { pyre_object::object_array::items_block_set_ref(pos_block, i, obj) };
+        }
+    }
+    let scope_len_op = ctx.trace_ctx.const_int(seeded as i64);
+    let scope_array = ctx.trace_ctx.record_op_with_descr(
+        OpCode::NewArrayClear,
+        &[scope_len_op],
+        array_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(scope_array, scope_len_op, true);
+    ctx.trace_ctx.try_set_opref_concrete(
+        scope_array,
+        majit_ir::Value::Ref(majit_ir::GcRef(scope_block as usize)),
+    );
+    let first_op = ctx.trace_ctx.const_ref(0);
+    let ref_args = [r_args[0], first_op, pos_array, r_args[2], scope_array];
+    let ref_concretes = [
+        ConcreteValue::Ref(resolved_callable),
+        ConcreteValue::Ref(pyre_object::PY_NULL),
+        ConcreteValue::Ref(pos_block as pyre_object::PyObjectRef),
+        ConcreteValue::Ref(kwnames),
+        ConcreteValue::Ref(scope_block as pyre_object::PyObjectRef),
+    ];
+    // SAFETY: `prepare_orthodox_descent` rejected a null sym.
+    let sym = unsafe { &*prep.sym_ptr };
+    let walk = super::specialize::run_orthodox_helper_subwalk(
+        ctx,
+        op.pc,
+        sym,
+        &prep.body,
+        prep.nested,
+        CALL_KW_BIND_DESCENT.commit_label,
+        CALL_KW_BIND_DESCENT.call_site_label,
+        &[],
+        &[],
+        &ref_args,
+        &ref_concretes,
+        &[],
+    );
+    match walk {
+        Ok((DispatchOutcome::SubReturn { .. }, _)) => {}
+        Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, _)) => {
+            if let Some(target) = try_catch_exception_at(code, op.pc) {
+                ctx.set_last_exc_value(exc, exc_concrete);
+                return Ok(Some((DispatchOutcome::Continue, target)));
+            }
+            return Ok(Some((
+                DispatchOutcome::SubRaise { exc, exc_concrete },
+                op.next_pc,
+            )));
+        }
+        Ok(_) => {
+            call_kw_restore_trace(ctx, saved_pos, saved_heap);
+            return Ok(None);
+        }
+        Err(
+            DispatchError::InlineCallArityMismatch { .. }
+            | DispatchError::InlineCallIntArityMismatch { .. }
+            | DispatchError::InlineCallFloatArityMismatch { .. }
+            | DispatchError::OrthodoxSubWalkTraceUnsupported { .. },
+        ) => {
+            call_kw_restore_trace(ctx, saved_pos, saved_heap);
+            return Ok(None);
+        }
+        // A seeded helper abort latches in `walk` and converts in place.
+        // Cutting here drops the ops that latch still has to read.
+        Err(error) => return Err(error),
+    }
+    let Some((callee_args, callee_arg_concretes)) =
+        call_kw_recover_scope(ctx, scope_array, scope_block, seeded, &array_descr)
+    else {
+        call_kw_restore_trace(ctx, saved_pos, saved_heap);
+        return Ok(None);
+    };
+    match try_walker_inline_resolved_user_call_bound_scope(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        resolved_callable,
+        w_code,
+        nparams,
+        has_closure,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+    ) {
+        Ok(Some(outcome)) => Ok(Some(outcome)),
+        Ok(None) => {
+            call_kw_restore_trace(ctx, saved_pos, saved_heap);
+            Ok(None)
+        }
+        // `try_walker_inline_format` propagates this `Err` with `?`.
+        // `walk` latches the live framestack and converts in place;
+        // rewinding first is the replay the in-place conversion replaced.
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -4917,33 +5119,31 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     }
     let mut star_args = None;
     let mut star_kwargs = None;
-    let mut varkw_extra = Vec::new();
-    let (callee_args, callee_arg_concretes) = if is_call_kw {
-        // A keyword call folds its `kwnames`->parameter permutation at trace
-        // time (`fbw_reorder_call_kw_args`) so the reordered param-order args
-        // seed the callee exactly like a positional call.  Method form
-        // prepends its receiver before that permutation, matching
-        // `call_kw`'s `Arguments.prepend` / `funcrun_obj` path.
-        let receiver = if let Some(bound) = bound_method {
-            // Placeholder until the resolved half reads Method.w_self live.
-            Some((bound.method_op, ConcreteValue::Ref(bound.receiver)))
-        } else if instance_call_pin.is_some() {
-            // `get_and_call_args(w_descr, w_obj, args)` binds the object the
-            // lookup ran on, and that object is the CALL's own callable operand.
-            Some((r_args[0], ConcreteValue::Ref(callable)))
-        } else if method_form {
-            Some((r_args[1], arg_concretes[1]))
-        } else {
-            None
-        };
-        let Some((args, concretes, extras)) = (unsafe {
-            fbw_reorder_call_kw_args(r_args, &arg_concretes, w_code, nparams, receiver)
-        }) else {
+    let varkw_extra = Vec::new();
+    if is_call_kw {
+        // Method form, a bound method, and an instance `__call__` stay on
+        // `call_kw_in_ctx_impl`. The traced binder is the plain user path
+        // (`bind_plain_user_kw_scope` → `match_signature_indexed`).
+        if method_form || bound_method.is_some() || instance_call_pin.is_some() {
             return Ok(None);
-        };
-        varkw_extra = extras;
-        (args, concretes)
-    } else if is_call_function_ex {
+        }
+        return try_walker_descend_plain_call_kw(
+            ctx,
+            op,
+            code,
+            funcptr,
+            r_args,
+            call_descr,
+            dst_bank,
+            dst,
+            resolved_callable,
+            w_code,
+            nparams,
+            has_closure,
+            arg_concretes,
+        );
+    }
+    let (callee_args, callee_arg_concretes) = if is_call_function_ex {
         // `f(*args)` unpacks the star tuple into positional arguments, which is
         // a trace-time reorder whenever the tuple is the one this trace just
         // built: its element boxes are still in the heap cache, so the callee
@@ -5041,6 +5241,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         star_args,
         varkw_extra,
         star_kwargs,
+        false,
     )
 }
 
@@ -7632,6 +7833,66 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
+    )
+}
+
+/// Seed a callee whose fast locals `bind_plain_user_kw_scope` already wrote.
+/// The scope vector is the whole frame prefix — positionals, keyword-only,
+/// vararg, and the `**kwargs` dict — so the seeder must not refill defaults
+/// or allocate another kwargs dict.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_resolved_user_call_bound_scope<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    callable: pyre_object::PyObjectRef,
+    w_code: *const (),
+    nparams: usize,
+    has_closure: bool,
+    arg_concretes: Vec<ConcreteValue>,
+    callee_args: Vec<OpRef>,
+    callee_arg_concretes: Vec<ConcreteValue>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        callable,
+        r_args[0],
+        callable,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        false,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+        None,
+        false,
+        false,
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        true,
     )
 }
 
@@ -7699,6 +7960,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // A `f(**mapping)` dict the named parameters are read from; its
     // placeholders in `callee_args` are replaced after the eligibility checks.
     star_kwargs: Option<StarKwargsInline>,
+    // The scope vector is already the frame `bind_plain_user_kw_scope` wrote.
+    // Defaults, the vararg pack, and the kwargs dict stay as those slots.
+    scope_already_bound: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // Callers read these copies before guards of their own, which append to
     // `opencoder.py Trace._ops` and can minor-collect.  A box that carries its
@@ -7810,9 +8074,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let positional_only = fbw_callee_scope_is_positional_only(w_code);
     let vararg_slot = fbw_callee_vararg_slot(w_code);
     let varkw_slot = fbw_callee_varkw_slot(w_code);
+    let has_varkeywords = fbw_callee_has_varkeywords(w_code);
     let Some(kwonly_count) = fbw_callee_kwonly_count(w_code) else {
         return resolved_inline_decline(op.pc, line!());
     };
+    if scope_already_bound {
+        let sig = unsafe { pyre_interpreter::w_code_signature(w_code as pyre_object::PyObjectRef) };
+        if sig.is_null() {
+            return resolved_inline_decline(op.pc, line!());
+        }
+        let expect = nparams
+            + kwonly_count
+            + usize::from(vararg_slot.is_some())
+            + usize::from(has_varkeywords);
+        if unsafe { (*sig).scope_length() } != expect
+            || callee_args.len() != expect
+            || callee_arg_concretes.len() != expect
+        {
+            return resolved_inline_decline(op.pc, line!());
+        }
+        if callee_args.iter().any(|arg| *arg == OpRef::NONE) {
+            return resolved_inline_decline(op.pc, line!());
+        }
+    }
     if !positional_only && vararg_slot.is_none() && kwonly_count == 0 && varkw_slot.is_none() {
         return resolved_inline_decline(op.pc, line!());
     }
@@ -7877,7 +8161,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let missing: Vec<usize> = (0..nparams)
         .filter(|&i| callee_args.get(i).is_none_or(|arg| *arg == OpRef::NONE))
         .collect();
-    let positional_defaults = if missing.is_empty() {
+    let positional_defaults = if scope_already_bound || missing.is_empty() {
         None
     } else {
         // The defaults are read live off `callable_guard_op` below, while the
@@ -7920,7 +8204,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // (`_match_signature`) before it writes the vararg slot.  Resolved here
     // so a missing default still declines without having recorded anything;
     // the live reads are emitted alongside the positional defaults below.
-    let kwonly_defaults = if kwonly_count == 0 {
+    let kwonly_defaults = if scope_already_bound || kwonly_count == 0 {
         None
     } else {
         // The dict is read off `callable_guard_op` while the resolve below
@@ -7986,7 +8270,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .collect()
         })
         .unwrap_or_default();
-    let vararg_surplus = if vararg_slot.is_some() {
+    let vararg_surplus = if !scope_already_bound && vararg_slot.is_some() {
         // `_match_signature` (`argument.py:194-201`) prepends a receiver to
         // `args_w` — and so to the vararg tuple — when the callee has no
         // positional parameter to hold it.  A bound method reaches here with
@@ -8070,7 +8354,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         );
     }
     // The `**kwargs` mapping is built at the emit, which fills both halves.
-    if varkw_slot.is_some() {
+    // `scope_w[co_argcount + co_kwonlyargcount + has_vararg] = w_kwds`
+    // (`_match_signature`). A scope `bind_plain_user_kw_scope` already wrote
+    // keeps that slot.
+    if varkw_slot.is_some() && !scope_already_bound {
         callee_args.push(OpRef::NONE);
         callee_arg_concretes.push(ConcreteValue::Null);
         arg_root_slots.push(None);
@@ -9338,11 +9625,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         callee_args[vararg_index] = tuple_op;
     }
-
     // `w_kwds = space.newdict(kwargs=True)` and one `space.setitem(w_kwds,
     // ...)` per keyword that named no parameter (`_match_signature`),
-    // replacing the placeholder pushed above.
-    if varkw_slot.is_some() {
+    // replacing the placeholder pushed above. A scope the binder already
+    // wrote keeps its mapping.
+    if varkw_slot.is_some() && !scope_already_bound {
         // `newdict` / `setitem` allocate. The vararg tuple and the keyword
         // values are already live objects; pin them before that, then read
         // the slots the collector rewrites. A raw copy in
@@ -13304,6 +13591,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             None,
             Vec::new(),
             None,
+            false,
         )?;
         if inlined.is_none() {
             cut_declined_subwalk(ctx, pre_fold_pos);
@@ -13552,6 +13840,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -13680,6 +13969,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     )?;
     let Some((outcome, next_pc)) = got else {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -13748,6 +14038,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     )?;
     if called.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -14102,6 +14393,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -14353,6 +14645,7 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     )?;
     // A refused result — `__len__` answering a non-int or a negative — declines
     // from inside the call above after the body has been walked.  Cut that
@@ -14599,6 +14892,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -14742,6 +15036,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     );
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
@@ -14908,6 +15203,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     );
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
@@ -15729,8 +16025,27 @@ fn static_descr_table(refs: &'static [DescrRef]) -> &'static dyn DescrRefTable {
 /// `redirect_call_assembler` to patch, so the call would stay on that
 /// function after the real trace compiled.
 ///
+/// Concrete `next` for `CALL_ASSEMBLER` into `generatorentry`.
+///
+/// `jit_next` returns null on `StopIteration` and does not publish it, so a
+/// normal `FOR_ITER` residual ends on `GuardNonnull`. The portal runner
+/// (`ll_generatorentry_portal_runner_shim`) publishes that error
+/// (`publish_residual_call_exception`) and returns null. `handle_possible_exception`
+/// then records `GUARD_EXCEPTION`, and `pyopcode.py` `FOR_ITER`'s
+/// `e.match(space, space.w_StopIteration)` (`jit_exception_match`) consumes
+/// it. Publishing every `Err` here is that runner: there is no separate
+/// `StopIteration` test, and the object is the one `baseobjspace::next` raised.
+extern "C" fn generatorentry_concrete_next(
+    iter: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    match pyre_interpreter::baseobjspace::next(iter) {
+        Ok(value) => value,
+        Err(err) => pyre_interpreter::jit_publish_residual_error_ref(err),
+    }
+}
+
 /// Op order matches `emit_walker_loop_callee_call_assembler`: vable/vref
-/// bookkeeping, concrete `jit_next`, `CALL_ASSEMBLER` + `KEEPALIVE`,
+/// bookkeeping, concrete portal `next`, `CALL_ASSEMBLER` + `KEEPALIVE`,
 /// result stamp, dst writeback, `GUARD_NOT_FORCED`, then
 /// `handle_possible_exception`. The green key is
 /// `genentry_resolved_cell_key`, the same key `genentry_merge_point_jit`
@@ -15738,7 +16053,6 @@ fn static_descr_table(refs: &'static [DescrRef]) -> &'static dyn DescrRefTable {
 fn descend_generatorentry<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
-    funcptr: OpRef,
     iter_op: OpRef,
     iter_obj: pyre_object::PyObjectRef,
     call_descr: &dyn majit_ir::descr::CallDescr,
@@ -15830,17 +16144,23 @@ fn descend_generatorentry<Sym: WalkSym>(
     // `pyjitpl.py` `vable_and_vrefs_before_residual_call`, before the call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // `direct_assembler_call` executes the call, then rewrites the recorded
-    // op to `CALL_ASSEMBLER`. `jit_next` is that execution for `next(gen)`,
-    // run through the residual executor so the walk's virtualizable heap
-    // pointer is saved and restored around the callee's own portal
-    // activation and `tracing_after_residual_call` runs after it (the same
-    // route `emit_walker_loop_callee_call_assembler` takes). A raw call
-    // left the callee's frame seeded as this walk's vable, and the next
-    // snapshot wrote that frame's slot count into the caller's array.
+    // op to `CALL_ASSEMBLER`. `generatorentry_concrete_next` is that
+    // execution for `next(gen)`: same ABI as this residual's `jit_next`
+    // descr, but a `StopIteration` is published the way
+    // `ll_generatorentry_portal_runner_shim` publishes it. Run through the
+    // residual executor so the walk's virtualizable heap pointer is saved
+    // and restored around the callee's own portal activation and
+    // `tracing_after_residual_call` runs after it (the same route
+    // `emit_walker_loop_callee_call_assembler` takes). A raw call left the
+    // callee's frame seeded as this walk's vable, and the next snapshot
+    // wrote that frame's slot count into the caller's array.
+    let exec_fn = ctx
+        .trace_ctx
+        .const_int(generatorentry_concrete_next as *const () as i64);
     let exec = try_execute_residual_call_via_executor(
         ctx,
         OpCode::CallMayForceR,
-        &[funcptr, iter_op],
+        &[exec_fn, iter_op],
         call_descr,
         OpRef::NONE,
         op.pc,
@@ -15882,7 +16202,7 @@ fn descend_generatorentry<Sym: WalkSym>(
     ctx.trace_ctx.heapcache_invalidate_caches_varargs(
         OpCode::CallMayForceR,
         Some(call_descr.get_extra_info()),
-        &[funcptr, iter_op],
+        &[exec_fn, iter_op],
     );
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', ca_result)?;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
@@ -15942,7 +16262,7 @@ fn walk_generator_resume<Sym: WalkSym>(
     // `CO_GENERATOR` body; `should_not_inline` is the 2+ yield case that
     // upstream sends to `generatorentry_driver` instead.
     if pyre_interpreter::baseobjspace::should_not_inline(code) {
-        return descend_generatorentry(ctx, op, funcptr, iter_op, iter_obj, call_descr, dst);
+        return descend_generatorentry(ctx, op, iter_op, iter_obj, call_descr, dst);
     }
     if !code.cellvars.is_empty() || !code.freevars.is_empty() {
         gen_resume_decline("cells_or_freevars");
@@ -17330,6 +17650,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        false,
     )?;
     // A refused result — `__format__` answering a non-str — declines from
     // inside the call above after the body has been walked. Cut that

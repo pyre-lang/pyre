@@ -369,16 +369,39 @@ impl SliceOp {
 pub const RVEC_MODULE: &str = "majit_rlib::lltypesystem::rvec";
 
 /// The raw allocator of a `Vec` header the lowering creates
-/// (`OS_RAW_MALLOC_VARSIZE_CHAR`, so an unescaped header is a virtual raw
-/// buffer).
+/// (`_rewrite_raw_malloc`, `OS_RAW_MALLOC_VARSIZE_CHAR`). An unescaped block
+/// is a virtual raw buffer. Item buffers use [`vec_item_malloc_path`]: the
+/// same `Layout` as `RawVec`, not this size-word allocator.
 pub const VEC_HEADER_MALLOC: &str = "majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char";
 
-/// The opaque item-buffer allocator: `(allocated, itemsize, align)` → buffer
-/// address.
+/// Jitcode item-buffer leaf: `(nbytes) -> addr`, tagged
+/// `OS_RAW_MALLOC_VARSIZE_CHAR` (the zero twin via `raw_malloc_varsize_zero`).
+///
+/// `Int` and `Ref` share the word leaf (`VecItemKind::size_align` is
+/// `(word, word)` and `align_of::<usize>()` equals `align_of::<*mut u8>()`).
+/// `Float` is `(8, 8)`, so it has its own leaf. `zero` is `newlist_clear`.
+/// A zero-byte request is the dangling alignment, as `RawVec` spells an
+/// empty buffer. Resume passes the byte size alone.
+pub fn vec_item_malloc_path(kind: VecItemKind, zero: bool) -> &'static str {
+    match (kind, zero) {
+        (VecItemKind::Int | VecItemKind::Ref, false) => {
+            "majit_rlib::lltypesystem::rvec::vec_item_malloc_word"
+        }
+        (VecItemKind::Int | VecItemKind::Ref, true) => {
+            "majit_rlib::lltypesystem::rvec::vec_item_malloc_word_zero"
+        }
+        (VecItemKind::Float, false) => "majit_rlib::lltypesystem::rvec::vec_item_malloc_f64",
+        (VecItemKind::Float, true) => "majit_rlib::lltypesystem::rvec::vec_item_malloc_f64_zero",
+    }
+}
+
+/// Item-buffer allocator: `(allocated, itemsize, align)` → buffer address.
+/// Same `Layout` as [`vec_item_malloc_path`]. Jitcode constructors call the
+/// one-argument leaf so `do_RAW_MALLOC_VARSIZE_CHAR` can virtualize the block.
 pub const VEC_BUF_ALLOC: &str = "majit_rlib::lltypesystem::rvec::vec_buf_alloc";
 
-/// The zero-filling item-buffer allocator (`raw_malloc(..., zero=True)`):
-/// `(allocated, itemsize, align)` → buffer address.
+/// Zero-filling item-buffer allocator. Same `Layout` as [`VEC_BUF_ALLOC`];
+/// the jitcode leaf is [`vec_item_malloc_path`] with `zero` set.
 pub const VEC_BUF_ALLOC_CLEAR: &str = "majit_rlib::lltypesystem::rvec::vec_buf_alloc_clear";
 
 /// `(operation, item kind)` → helper path, rows in [`VecOp::ALL`] order and

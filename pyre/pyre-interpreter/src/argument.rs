@@ -17,13 +17,24 @@
 use pyre_object::PyObjectRef;
 use rustpython_wtf8::Wtf8Buf;
 
-/// The `%T` conversion `oefmt` applies, for the `*args` / `**kwargs` parity
-/// messages below ("argument after * must be an iterable, not %T", "argument
-/// after ** must be a mapping, not %T", "keywords must be strings, not '%T'")
-/// — which are `oefmt(..., "%T", w_obj)` upstream.
-use crate::error::type_name_of;
+/// `%T` text for `text_w`'s non-string TypeError
+/// (`expected str, got %T object`).
+use crate::error::{FmtArg, type_name_of};
 
-/// pypy/interpreter/argument.py `raise_type_error`.
+/// `raise_type_error!(w_function, "msg", args)`.
+///
+/// `@specialize.arg(2)` makes `msg` a per-call-site constant, so
+/// `"%s " + msg` folds per specialization. Both format strings are
+/// `&'static str` known at the call site: `valuefmt` and
+/// `concat!("%s ", valuefmt)`.
+#[macro_export]
+macro_rules! raise_type_error {
+    ($w_function:expr, $valuefmt:literal, $args:expr $(,)?) => {
+        $crate::argument::raise_type_error($w_function, $valuefmt, concat!("%s ", $valuefmt), $args)
+    };
+}
+
+/// `argument.py` `raise_type_error`.
 ///
 /// ```python
 /// @specialize.arg(2)
@@ -34,42 +45,74 @@ use crate::error::type_name_of;
 ///     raise oefmt(space.w_TypeError, msg, space.object_functionstr(w_function), *args)
 /// ```
 ///
-/// Returns a `PyError` of kind `TypeError` rather than raising via
-/// `oefmt(space.w_TypeError, ...)`.  When `w_function` is `PY_NULL`
-/// (PyPy's `None` sentinel) the message lands without prefix; otherwise
-/// `object_functionstr` resolves a leading `"<qualname>() "` prefix.
+/// A null `w_function` builds `oefmt(TypeError, valuefmt, args)`.
+/// Otherwise the prefixed format is the per-call-site constant
+/// (`@specialize.arg(2)`), and the first argument is
+/// `object_functionstr(w_function)`. An error from that lookup is the
+/// raised error.
 ///
-/// Caller sites in `argument.py` (`_combine_starargs_wrapped`:99,
-/// `_check_not_duplicate_kwargs`:415, `_do_combine_starstarargs_wrapped`:434
-/// + 443) all use this helper to format diagnostic context.
-///
-/// PyPy's `oefmt(space.w_TypeError, "%s ..." , space.object_functionstr(...))`
-/// instantiates the `%s` substitution at raise time; if
-/// `object_functionstr` itself raises an async OperationError
-/// (SystemExit / KeyboardInterrupt via `findattr`'s
-/// `baseobjspace.py` re-raise), the async error preempts the
-/// TypeError and propagates as the actual exception PyPy raises.
-/// Pyre mirrors this by returning the async `PyError` verbatim
-/// instead of building the TypeError prefix.
+/// `#[majit_macros::dont_look_inside]`: `argument.py raise_type_error` calls
+/// `oefmt`, and `error.py get_operrcls2` returns an `OpErrFmt` that formats
+/// only in `OpErrFmt._compute_value`. The raise trace therefore never runs
+/// the `%S`/`%T` conversions or app-level `str`. `crate::error::oefmt`
+/// formats eagerly (see the doc comment on `crate::error::oefmt`), so the
+/// body that runs those conversions stays out of the trace.
+#[majit_macros::dont_look_inside]
 pub fn raise_type_error(
     w_function: PyObjectRef,
-    msg: impl Into<rustpython_wtf8::Wtf8Buf>,
+    valuefmt: &'static str,
+    prefixed_valuefmt: &'static str,
+    args: &[FmtArg<'_>],
 ) -> crate::PyError {
-    let msg = msg.into();
     if w_function.is_null() {
-        return crate::PyError::type_error(msg);
+        return type_error_oefmt(valuefmt, args);
     }
-    match crate::baseobjspace::object_functionstr(w_function) {
-        Ok(mut prefix) => {
-            prefix.push_str(" ");
-            prefix.push_wtf8(&msg);
-            crate::PyError::type_error(prefix)
+    // `object_functionstr` runs Python and can collect. The callable and
+    // every `%R`/`%S`/`%T`/`%N` operand are caller-owned words; pin them
+    // and hand `oefmt` the slots' words.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_function);
+    let mut objs = Vec::new();
+    for arg in args {
+        if let FmtArg::Obj(obj) = arg {
+            objs.push(*obj);
         }
-        // Async findattr propagates as the actual raise (matches
-        // PyPy `oefmt`'s argument-evaluation order: side effects of
-        // `%s` formatting fire before the TypeError is constructed).
-        Err(async_err) => async_err,
     }
+    let objs_base = pyre_object::gc_roots::pin_roots(&objs);
+    match crate::baseobjspace::object_functionstr(pyre_object::gc_roots::shadow_stack_get(fn_slot))
+    {
+        Ok(prefix) => {
+            let mut fmt_args = Vec::with_capacity(1 + args.len());
+            fmt_args.push(FmtArg::Bytes(prefix.as_bytes()));
+            let mut obj_i = 0;
+            for arg in args {
+                match *arg {
+                    FmtArg::Obj(_) => {
+                        fmt_args.push(FmtArg::Obj(pyre_object::gc_roots::shadow_stack_get(
+                            objs_base + obj_i,
+                        )));
+                        obj_i += 1;
+                    }
+                    other => fmt_args.push(other),
+                }
+            }
+            type_error_oefmt(prefixed_valuefmt, &fmt_args)
+        }
+        Err(err) => err,
+    }
+}
+
+/// `oefmt` of the TypeError class. Before `init_typeobjects` the class is
+/// null and `oefmt` reports `RuntimeError`; the carrier stays `TypeError`.
+fn type_error_oefmt(valuefmt: &'static str, args: &[FmtArg<'_>]) -> crate::PyError {
+    let w_type =
+        crate::typedef::gettypeobject(&pyre_object::interp_exceptions::EXC_TYPE_ERROR_TYPE);
+    let mut err = crate::error::oefmt(w_type, valuefmt, args);
+    if w_type.is_null() {
+        err.set_kind(crate::PyErrorKind::TypeError);
+    }
+    err
 }
 
 /// pypy/interpreter/argument.py `contains_w_names`.
@@ -141,39 +184,32 @@ pub fn contains_w_names(w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
 /// `keywords_w` is the parallel value list, kept in the signature for
 /// upstream parity but unused in the duplicate check (only the names
 /// matter).
+///
+/// `@jit.look_inside_iff(lambda ...:
+///     jit.isconstant(len(keyword_names_w) and
+///     jit.isconstant(existingkeywords_w)))`.
+fn check_not_duplicate_kwargs_iff(
+    existingkeywords_w: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    _keywords_w: &[PyObjectRef],
+    _w_function: PyObjectRef,
+) -> bool {
+    let names_and_existing =
+        keyword_names_w.len() != 0 && majit_rlib::jit::isconstant(existingkeywords_w);
+    majit_rlib::jit::isconstant(&names_and_existing)
+}
+
+#[majit_macros::look_inside_iff(check_not_duplicate_kwargs_iff)]
 pub fn check_not_duplicate_kwargs(
     existingkeywords_w: &[PyObjectRef],
     keyword_names_w: &[PyObjectRef],
     _keywords_w: &[PyObjectRef],
     w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    let Some((mut w_key, mut w_function)) =
-        find_duplicate_kwarg(existingkeywords_w, keyword_names_w, w_function)
-    else {
-        return Ok(());
-    };
-    let key_repr = unsafe {
-        if pyre_object::is_str(w_key) {
-            pyre_object::w_str_get_wtf8(w_key).to_owned()
-        } else {
-            pyre_object::with_roots!(w_key, w_function => crate::display::py_str_wtf8(w_key))?
-        }
-    };
-    Err(raise_type_error(
-        w_function,
-        crate::display::wtf8_format!("got multiple values for keyword argument '", key_repr, "'"),
-    ))
-}
-
-/// The loop of `_check_not_duplicate_kwargs`: the first of `keyword_names_w`
-/// that `existingkeywords_w` already holds, returned with `w_function`.
-/// `contains_w_names` can collect, so both lists and the callable are read
-/// from their slots.
-fn find_duplicate_kwarg(
-    existingkeywords_w: &[PyObjectRef],
-    keyword_names_w: &[PyObjectRef],
-    w_function: PyObjectRef,
-) -> Option<(PyObjectRef, PyObjectRef)> {
+    // argument.py `_check_not_duplicate_kwargs`: the `for w_key in
+    // keyword_names_w` / `contains_w_names` loop lives on the
+    // `unroll_safe` original (`look_inside_iff`). `contains_w_names` can
+    // collect, so both lists and the callable are read from their slots.
     let existing_len = existingkeywords_w.len();
     let names_len = keyword_names_w.len();
     let roots = pyre_object::gc_roots::push_roots();
@@ -184,10 +220,19 @@ fn find_duplicate_kwarg(
     for i in 0..names_len {
         pyre_object::gc_roots::shadow_stack_copy_range(existing_base, &mut existing_now);
         if contains_w_names(roots.get(names_base + i), &existing_now) {
-            return Some((roots.get(names_base + i), roots.get(function_slot)));
+            // `_check_not_duplicate_kwargs` calls `raise_type_error` in the
+            // loop (`'%S'` of `w_key`). `contains_w_names` can collect, so
+            // both words are read back from the slots this bracket published.
+            let w_key = roots.get(names_base + i);
+            let w_function = roots.get(function_slot);
+            return Err(raise_type_error!(
+                w_function,
+                "got multiple values for keyword argument '%S'",
+                &[FmtArg::Obj(w_key)],
+            ));
         }
     }
-    None
+    Ok(())
 }
 
 /// pypy/interpreter/argument.py `_do_combine_starstarargs_wrapped`.
@@ -277,15 +322,13 @@ pub fn do_combine_starstarargs_wrapped(
         // without the callable's qualname or the offending key's type, where
         // argument.py formats `"keywords must be strings, not '%T'"`
         // through `raise_type_error`.
-        let key = unsafe {
-            if !pyre_object::is_str(w_key) {
-                return Err(crate::PyError::type_error("keywords must be strings"));
-            }
-            // `space.text_w` preserves lone surrogates as WTF-8 bytes; keep the
-            // key in WTF-8 so a surrogate keyword name survives the seen-set and
-            // the dict value read.
-            pyre_object::w_str_get_wtf8(w_key).to_owned()
-        };
+        if unsafe { !pyre_object::is_str(w_key) } {
+            return Err(crate::PyError::type_error("keywords must be strings"));
+        }
+        // `space.text_w` preserves lone surrogates as WTF-8 bytes; keep the
+        // key in WTF-8 so a surrogate keyword name survives the seen-set and
+        // the dict value read.
+        let key = unsafe { pyre_object::w_str_get_wtf8(w_key).to_owned() };
         // argument.py:439-445 — duplicate check against existing kwargs +
         // already-seen names in this iteration.
         let already_in_existing = existing_len != 0 && {
@@ -293,9 +336,12 @@ pub fn do_combine_starstarargs_wrapped(
             contains_w_names(w_key, &existing_now)
         };
         if already_in_existing || seen.contains_key(&key) {
-            return Err(raise_type_error(
+            // `contains_w_names` can collect; `%S` needs the key object.
+            let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+            return Err(raise_type_error!(
                 w_function(),
-                format!("got multiple values for keyword argument '{key}'"),
+                "got multiple values for keyword argument '%S'",
+                &[FmtArg::Obj(w_key)],
             ));
         }
         // `contains_w_names` can collect; the key is read back from its slot.
@@ -396,10 +442,10 @@ pub fn combine_starargs_wrapped(
             if e.kind == crate::PyErrorKind::TypeError
                 && !crate::baseobjspace::is_iterable(w_stararg())
             {
-                let tp = type_name_of(w_stararg());
-                Err(raise_type_error(
+                Err(raise_type_error!(
                     w_function(),
-                    format!("argument after * must be an iterable, not {tp}"),
+                    "argument after * must be an iterable, not %T",
+                    &[FmtArg::Obj(w_stararg())],
                 ))
             } else {
                 Err(e)
@@ -575,10 +621,10 @@ pub fn combine_starstarargs_wrapped(
         let w_keys_meth = match crate::baseobjspace::getattr_str(w_starstararg(), "keys") {
             Ok(m) => m,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-                let tp = type_name_of(w_starstararg());
-                return Err(raise_type_error(
+                return Err(raise_type_error!(
                     w_function(),
-                    format!("argument after ** must be a mapping, not {tp}"),
+                    "argument after ** must be a mapping, not %T",
+                    &[FmtArg::Obj(w_starstararg())],
                 ));
             }
             Err(e) => return Err(e),
@@ -586,10 +632,10 @@ pub fn combine_starstarargs_wrapped(
         let w_keys = match crate::call::call_function_impl_result(w_keys_meth, &[]) {
             Ok(w) => w,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-                let tp = type_name_of(w_starstararg());
-                return Err(raise_type_error(
+                return Err(raise_type_error!(
                     w_function(),
-                    format!("argument after ** must be a mapping, not {tp}"),
+                    "argument after ** must be a mapping, not %T",
+                    &[FmtArg::Obj(w_starstararg())],
                 ));
             }
             Err(e) => return Err(e),
@@ -1156,40 +1202,45 @@ impl Arguments {
             input_argcount += take;
         }
 
-        // `w_kw_defs`, the `**kwargs` dict, the keyword values, the leftover
-        // positionals that become `*args`, the positional defaults and the
-        // words already copied into `scope_w` are all read after the
-        // allocations below — the vararg tuple, the dict itself, the keyword
-        // collection, the kwonly-default lookups — and a `list` or `dict`
-        // among them moves under any of those.  A by-value parameter copy is
-        // no more a slot the collector updates than the caller's scope buffer
-        // or `Arguments`' own vectors are, so each word is pinned here, ahead
-        // of the first allocation, and read back where it is used.
+        // `_match_signature` assigns `scope_w[i]` in place across
+        // `_match_keywords`, `_collect_keyword_args` and `finditem`.
+        // The live set and `scope_w` are published as one contiguous run.
+        // `normalize_roots` runs once
+        // (`ShadowStackFrameworkGCTransformer.push_roots`).
         let _roots = pyre_object::gc_roots::push_roots();
         let keywords_w = self.keywords_w.as_deref().unwrap_or(&[]);
         let names_w = self.keyword_names_w.as_deref().unwrap_or(&[]);
-        let mut live = Vec::with_capacity(1 + keywords_w.len() + names_w.len() + args_w.len());
+        let defaults_slice = defaults_w.unwrap_or_default();
+        let mut live = Vec::with_capacity(
+            1 + keywords_w.len() + names_w.len() + args_w.len() + defaults_slice.len(),
+        );
         live.push(w_kw_defs);
         live.extend_from_slice(keywords_w);
         live.extend_from_slice(names_w);
         live.extend_from_slice(args_w);
-        let kw_defs_slot = pyre_object::gc_roots::pin_roots(&live);
+        live.extend_from_slice(defaults_slice);
+        let kw_defs_slot = pyre_object::gc_roots::publish_roots(&live);
+        // `scope_w` stores go through its shadow slots, and
+        // `shadow_stack_copy_range` writes them back.
+        let scope_base = pyre_object::gc_roots::publish_roots(scope_w);
+        // The `**kwargs` dict does not exist yet. The slot is published now
+        // so `space.newdict(kwargs=True)` lands in the same run.
+        if signature.has_kwarg() {
+            pyre_object::gc_roots::publish_roots(&[pyre_object::PY_NULL]);
+        }
+        pyre_object::gc_roots::normalize_roots(
+            kw_defs_slot,
+            live.len() + scope_w.len() + usize::from(signature.has_kwarg()),
+        );
         let w_kw_defs = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot);
         let keywords_base = kw_defs_slot + 1;
         let names_base = keywords_base + keywords_w.len();
         let args_base = names_base + names_w.len();
-        // The defaults arrive as a caller-owned slice — `Function`'s `defs_w`
-        // reaches here through a borrow, and a gateway builds its own array —
-        // so the collector rewrites neither, while the run is read out one
-        // entry at a time in the defaults loop far below.
-        let defaults_base = pyre_object::gc_roots::pin_roots(defaults_w.unwrap_or_default());
-        // The scope buffer keeps its own run of slots: `w_firstarg` and the
-        // positional copy above are in it already, and every later store goes
-        // through `store` so the refresh before `Ok(())` reads the whole scope
-        // back at its current addresses.
-        let scope_base = pyre_object::gc_roots::pin_roots(scope_w);
-        let store = |scope_w: &mut [PyObjectRef], index: usize, w_value: PyObjectRef| {
-            scope_w[index] = w_value;
+        let defaults_base = args_base + args_w.len();
+        let kwds_slot = scope_base + scope_w.len();
+        // `_match_signature` assigns `scope_w[i]`. The shadow slot is that
+        // local until `shadow_stack_copy_range` restores the slice.
+        let store = |index: usize, w_value: PyObjectRef| {
             pyre_object::gc_roots::shadow_stack_set(scope_base + index, w_value);
         };
 
@@ -1208,13 +1259,12 @@ impl Arguments {
             };
             let loc = co_argcount + co_kwonlyargcount;
             let w_stararg = pyre_object::w_tuple_new(starargs_w);
-            store(scope_w, loc, w_stararg);
+            store(loc, w_stararg);
         } else if avail > co_argcount {
             too_many_args = true;
         }
 
         // argument.py:238-242 — **kwargs dict allocation.
-        let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
         let kwarg_loc = co_argcount + co_kwonlyargcount + (signature.has_vararg() as usize);
         let mut w_kwds: PyObjectRef = pyre_object::PY_NULL;
         if signature.has_kwarg() {
@@ -1223,10 +1273,12 @@ impl Arguments {
             // KwargsDictStrategy; a str subclass is not an exact str, so
             // `switch_to_correct_strategy` promotes to the object strategy
             // and `_collect_keyword_args` `setitem`s that same key.
-            let _ =
-                pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new_kwargs());
+            pyre_object::gc_roots::shadow_stack_set(
+                kwds_slot,
+                pyre_object::dictmultiobject::w_dict_new_kwargs(),
+            );
             w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
-            store(scope_w, kwarg_loc, w_kwds);
+            store(kwarg_loc, w_kwds);
         }
 
         // argument.py:244-271 — keyword arg matching.
@@ -1248,6 +1300,7 @@ impl Arguments {
                 input_argcount,
                 &names_w,
                 &mut mapping,
+                self.jit_few_keywords,
             )?;
             if num_remainingkwds > 0 {
                 if !w_kwds.is_null() {
@@ -1263,6 +1316,7 @@ impl Arguments {
                         &values_w,
                         pyre_object::gc_roots::shadow_stack_get(kwds_slot),
                         &mapping,
+                        self.jit_few_keywords,
                     )?;
                 } else {
                     // argument.py:270-271 — ArgErrUnknownKwds.  PyPy's
@@ -1323,7 +1377,7 @@ impl Arguments {
                         let w_value = pyre_object::gc_roots::shadow_stack_get(
                             keywords_base + kwds_index as usize,
                         );
-                        store(scope_w, i, w_value);
+                        store(i, w_value);
                     }
                 }
             }
@@ -1368,7 +1422,7 @@ impl Arguments {
                 if defnum >= 0 {
                     let w_default =
                         pyre_object::gc_roots::shadow_stack_get(defaults_base + defnum as usize);
-                    store(scope_w, i, w_default);
+                    store(i, w_default);
                 } else if let Some(list) = missing_positional.as_mut() {
                     list.push(signature.argnames[i].to_string());
                 } else {
@@ -1398,7 +1452,7 @@ impl Arguments {
                     pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
                     name,
                 )? {
-                    Some(w_def) => store(scope_w, i, w_def),
+                    Some(w_def) => store(i, w_def),
                     None => {
                         if let Some(list) = missing_kwonly.as_mut() {
                             list.push(name.to_string());
@@ -1423,11 +1477,9 @@ impl Arguments {
             }
         }
 
-        // The collection points above have all run by now, so the buffer takes
-        // the scope's current addresses instead of keeping the ones it was
-        // filled with.  The early `return Err(...)` paths skip this refresh and
-        // leave pre-move words in the buffer; that is sound only because every
-        // caller drops `scope_w` unread on an error.
+        // `pop_roots` restores `scope_w` (`shadow_stack_copy_range`). The
+        // early `return Err(...)` paths skip this refresh; every caller drops
+        // `scope_w` unread on an error.
         pyre_object::gc_roots::shadow_stack_copy_range(scope_base, scope_w);
         Ok(())
     }
@@ -1659,6 +1711,21 @@ impl From<crate::PyError> for MatchSignatureError {
 /// pypy/interpreter/argument.py `_match_keywords`.
 ///
 /// ```python
+/// `argument.py` `_match_keywords` is
+/// `@jit.look_inside_iff(lambda ... jiton: jiton)`. The flag is
+/// `Arguments._jit_few_keywords`.
+fn match_keywords_jiton(
+    _signature: &crate::gateway::Signature,
+    _blindargs: usize,
+    _co_posonlyargcount: usize,
+    _input_argcount: usize,
+    _keyword_names_w: &[PyObjectRef],
+    _kwds_mapping: &mut [isize],
+    jiton: bool,
+) -> bool {
+    jiton
+}
+
 /// def _match_keywords(space, signature, blindargs, co_posonlyargcount,
 ///                     input_argcount, keyword_names_w, kwds_mapping, _):
 ///     num_kwds = num_remainingkwds = len(keyword_names_w)
@@ -1685,6 +1752,7 @@ impl From<crate::PyError> for MatchSignatureError {
 ///         raise ArgErrPosonlyAsKwds(wrong_posonly)
 ///     return num_remainingkwds
 /// ```
+#[majit_macros::look_inside_iff(match_keywords_jiton)]
 pub fn match_keywords(
     signature: &crate::gateway::Signature,
     blindargs: usize,
@@ -1692,6 +1760,7 @@ pub fn match_keywords(
     input_argcount: usize,
     keyword_names_w: &[PyObjectRef],
     kwds_mapping: &mut [isize],
+    _jiton: bool,
 ) -> Result<usize, MatchSignatureError> {
     let num_kwds = keyword_names_w.len();
     let mut num_remainingkwds = num_kwds;
@@ -1751,27 +1820,35 @@ pub fn match_keywords(
 
 /// pypy/interpreter/argument.py `_collect_keyword_args`.
 ///
-/// ```python
-/// def _collect_keyword_args(space, keyword_names_w, keywords_w, w_kwds,
-///                           kwds_mapping, _):
-///     for i in range(len(keyword_names_w)):
-///         for j in kwds_mapping:
-///             if i == j:
-///                 break
-///         else:
-///             w_key = keyword_names_w[i]
-///             space.setitem(w_kwds, w_key, keywords_w[i])
-/// ```
+/// `argument.py` `_collect_keyword_args` is
+/// `@jit.look_inside_iff(lambda ... jiton: jiton)`.
+fn collect_keyword_args_jiton(
+    _keyword_names_w: &[PyObjectRef],
+    _keywords_w: &[PyObjectRef],
+    _w_kwds: PyObjectRef,
+    _kwds_mapping: &[isize],
+    jiton: bool,
+) -> bool {
+    jiton
+}
+
+/// `argument.py` `_collect_keyword_args(space, keyword_names_w, keywords_w, w_kwds, kwds_mapping, _)`
+/// walks each index `i` of `keyword_names_w`. For each `i` it scans `kwds_mapping`;
+/// if some slot `j` equals `i` the name is already bound and the scan stops.
+/// Otherwise (`for`/`else`) it forwards the pair with
+/// `space.setitem(w_kwds, keyword_names_w[i], keywords_w[i])`.
 ///
 /// `kwds_mapping[k] == i` means slot `k` matched a real argname; this
 /// helper walks the kwarg names and forwards every name that did NOT
 /// match (i.e. did not appear in `kwds_mapping`) into the `**kwargs`
 /// dict via `setitem`.
+#[majit_macros::look_inside_iff(collect_keyword_args_jiton)]
 pub fn collect_keyword_args(
     keyword_names_w: &[PyObjectRef],
     keywords_w: &[PyObjectRef],
     w_kwds: PyObjectRef,
     kwds_mapping: &[isize],
+    _jiton: bool,
 ) -> Result<(), crate::PyError> {
     // Every `setitem` is a collection point, so the dictionary and the pairs it
     // forwards are published before the first one and read back at each turn.
@@ -1804,6 +1881,391 @@ pub fn collect_keyword_args(
         )?;
     }
     Ok(())
+}
+
+/// Keyword names the traced `CALL_KW` binder unrolls. A wider call falls
+/// through to [`bind_plain_user_kw_scope_native`], which runs
+/// `Arguments::parse_into_scope`.
+pub const PLAIN_USER_KW_UNROLL_LIMIT: usize = 32;
+
+/// `argument.py parse_into_scope` for a plain user `CALL_KW` when the
+/// tracer is off. Builds an `Arguments` and calls the existing matcher.
+/// The scope buffer is cleared first: a traced attempt may have written
+/// slots before giving up.
+#[majit_macros::dont_look_inside]
+pub fn bind_plain_user_kw_scope_native(
+    func: PyObjectRef,
+    w_firstarg: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+    scope_w: &mut [PyObjectRef],
+) -> Result<usize, crate::PyError> {
+    for slot in scope_w.iter_mut() {
+        *slot = pyre_object::PY_NULL;
+    }
+    let nargs = positional.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let func_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(func);
+    let first_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_firstarg);
+    let kw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwarg_names);
+    let pos_base = pyre_object::gc_roots::pin_roots(positional);
+
+    let code = unsafe { crate::getcode(pyre_object::gc_roots::shadow_stack_get(func_slot)) };
+    if code.is_null() || unsafe { crate::gateway::is_builtin_code(code) } {
+        return Err(crate::PyError::type_error(
+            "plain keyword call requires a Python function",
+        ));
+    }
+    let sig_ptr = unsafe { crate::w_code_signature(code) };
+    if sig_ptr.is_null() {
+        return Err(crate::PyError::type_error("code object has no signature"));
+    }
+    let signature = unsafe { &*sig_ptr };
+
+    let kwnames = pyre_object::gc_roots::shadow_stack_get(kw_slot);
+    let nkw = if !kwnames.is_null() && unsafe { pyre_object::is_tuple(kwnames) } {
+        unsafe { pyre_object::w_tuple_len(kwnames) }
+    } else {
+        0
+    };
+    if nkw > nargs {
+        return Err(crate::PyError::type_error(
+            "keyword argument count exceeds supplied arguments",
+        ));
+    }
+    let n_pos = nargs - nkw;
+
+    let kw_values_base = pyre_object::gc_roots::shadow_stack_len();
+    for i in 0..nkw {
+        let value = pyre_object::gc_roots::shadow_stack_get(pos_base + n_pos + i);
+        let _ = pyre_object::gc_roots::pin_root(value);
+    }
+    let names_base = pyre_object::gc_roots::shadow_stack_len();
+    for i in 0..nkw {
+        let kwnames = pyre_object::gc_roots::shadow_stack_get(kw_slot);
+        let name = unsafe { pyre_object::w_tuple_getitem(kwnames, i as i64) }.ok_or_else(|| {
+            crate::PyError::type_error("keyword name tuple is shorter than the keyword tail")
+        })?;
+        let _ = pyre_object::gc_roots::pin_root(name);
+    }
+
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let defs_obj = unsafe { crate::function_get_defaults(func_now) };
+    let defs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(defs_obj);
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let kw_defs_obj = unsafe { crate::function_get_kwdefaults(func_now) };
+    let kw_defs_obj = if kw_defs_obj.is_null() || unsafe { pyre_object::is_none(kw_defs_obj) } {
+        pyre_object::PY_NULL
+    } else {
+        kw_defs_obj
+    };
+    let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kw_defs_obj);
+
+    let defs_obj = pyre_object::gc_roots::shadow_stack_get(defs_slot);
+    let ndef = if defs_obj.is_null()
+        || unsafe { pyre_object::is_none(defs_obj) }
+        || unsafe { !pyre_object::is_tuple(defs_obj) }
+    {
+        0
+    } else {
+        unsafe { pyre_object::w_tuple_len(defs_obj) }
+    };
+    let defaults_base = pyre_object::gc_roots::shadow_stack_len();
+    for i in 0..ndef {
+        let defs_obj = pyre_object::gc_roots::shadow_stack_get(defs_slot);
+        let item = unsafe { pyre_object::w_tuple_getitem(defs_obj, i as i64) }
+            .unwrap_or(pyre_object::PY_NULL);
+        let _ = pyre_object::gc_roots::pin_root(item);
+    }
+
+    let mut arguments_w = Vec::with_capacity(n_pos);
+    let mut keyword_names_w = Vec::with_capacity(nkw);
+    let mut keywords_w = Vec::with_capacity(nkw);
+    let mut defaults_w = Vec::with_capacity(ndef);
+    for i in 0..n_pos {
+        arguments_w.push(pyre_object::gc_roots::shadow_stack_get(pos_base + i));
+    }
+    for i in 0..nkw {
+        keyword_names_w.push(pyre_object::gc_roots::shadow_stack_get(names_base + i));
+        keywords_w.push(pyre_object::gc_roots::shadow_stack_get(kw_values_base + i));
+    }
+    for i in 0..ndef {
+        defaults_w.push(pyre_object::gc_roots::shadow_stack_get(defaults_base + i));
+    }
+    let fnname =
+        unsafe { crate::function_get_name(pyre_object::gc_roots::shadow_stack_get(func_slot)) };
+    let args = Arguments {
+        arguments_w,
+        keyword_names_w: if nkw == 0 {
+            None
+        } else {
+            Some(keyword_names_w)
+        },
+        keywords_w: if nkw == 0 { None } else { Some(keywords_w) },
+        jit_few_keywords: majit_rlib::jit::isconstant(&nkw),
+        methodcall: false,
+    };
+    args.parse_into_scope(
+        pyre_object::gc_roots::shadow_stack_get(first_slot),
+        scope_w,
+        fnname,
+        signature,
+        if ndef == 0 { None } else { Some(&defaults_w) },
+        pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
+    )
+}
+
+/// Item of a keyword-name or defaults tuple.
+///
+/// `w_tuple_getitem` records `w_tuple_getitem_known`, and that arm's
+/// `unreachable` is `panic_fmt`, which is not a registered call. A binder
+/// that calls it never becomes jitcode. `jit_tuple_getitem` is elidable
+/// (`tupleobject.py getitem` at a known index): the trace folds it when
+/// the tuple and the index are constant, which is the `CALL_KW` kwnames
+/// tuple. A miss returns null and the caller recomputes through
+/// `parse_into_scope`.
+unsafe fn plain_user_kw_tuple_item(obj: PyObjectRef, index: i64) -> PyObjectRef {
+    if obj.is_null() || index < 0 || unsafe { !pyre_object::is_tuple(obj) } {
+        return pyre_object::PY_NULL;
+    }
+    let len = unsafe { pyre_object::w_tuple_len(obj) } as i64;
+    if index >= len {
+        return pyre_object::PY_NULL;
+    }
+    pyre_object::jit_tuple_getitem(obj, index)
+}
+
+/// Traced `argument.py _match_signature` for a plain user keyword call.
+///
+/// Indexes `positional` directly: values `[0..n_pos)` are positional and
+/// `[n_pos..)` are the keyword tail named by `kwarg_names`. The callee
+/// signature comes from `pycode.py make_signature` on `getcode(func)`.
+/// Shapes that pack `*args`, overflow [`PLAIN_USER_KW_UNROLL_LIMIT`], or
+/// need an error message return [`bind_plain_user_kw_scope_native`], which
+/// recomputes the whole scope. `we_are_jitted` is folded true in jitcode,
+/// so this body is the one a trace records.
+#[majit_macros::unroll_safe]
+pub fn match_signature_indexed(
+    func: PyObjectRef,
+    w_firstarg: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+    scope_w: &mut [PyObjectRef],
+) -> Result<usize, crate::PyError> {
+    let code = unsafe { crate::getcode(func) };
+    if code.is_null() || unsafe { crate::gateway::is_builtin_code(code) } {
+        return bind_plain_user_kw_scope_native(func, w_firstarg, positional, kwarg_names, scope_w);
+    }
+    let sig_ptr = unsafe { crate::w_code_signature(code) };
+    if sig_ptr.is_null() {
+        return bind_plain_user_kw_scope_native(func, w_firstarg, positional, kwarg_names, scope_w);
+    }
+    let signature = unsafe { &*sig_ptr };
+    let co_posonlyargcount = signature.posonlyargcount;
+    let co_argcount = signature.num_argnames();
+    let co_kwonlyargcount = signature.num_kwonlyargnames();
+    let scope_len = signature.scope_length();
+    if scope_w.len() < scope_len {
+        return Err(crate::PyError::type_error(
+            "scope buffer is shorter than the signature",
+        ));
+    }
+
+    let nkw = if !kwarg_names.is_null() && unsafe { pyre_object::is_tuple(kwarg_names) } {
+        unsafe { pyre_object::w_tuple_len(kwarg_names) }
+    } else {
+        0
+    };
+    if nkw > positional.len()
+        || nkw > PLAIN_USER_KW_UNROLL_LIMIT
+        || scope_len > PLAIN_USER_KW_UNROLL_LIMIT
+    {
+        return bind_plain_user_kw_scope_native(func, w_firstarg, positional, kwarg_names, scope_w);
+    }
+    if !w_firstarg.is_null() && co_argcount == 0 {
+        return bind_plain_user_kw_scope_native(func, w_firstarg, positional, kwarg_names, scope_w);
+    }
+    if signature.has_vararg() {
+        return bind_plain_user_kw_scope_native(func, w_firstarg, positional, kwarg_names, scope_w);
+    }
+
+    let mut upfront = 0usize;
+    if !w_firstarg.is_null() {
+        scope_w[0] = w_firstarg;
+        upfront = 1;
+    }
+    let n_pos = positional.len() - nkw;
+    let avail = n_pos + upfront;
+    if avail > co_argcount {
+        return bind_plain_user_kw_scope_native(func, w_firstarg, positional, kwarg_names, scope_w);
+    }
+
+    let mut input_argcount = upfront;
+    if input_argcount < co_argcount {
+        let take = n_pos.min(co_argcount - upfront);
+        let mut i = 0usize;
+        while i < take {
+            scope_w[i + input_argcount] = positional[i];
+            i += 1;
+        }
+        input_argcount += take;
+    }
+
+    let mapping_len = co_argcount + co_kwonlyargcount - input_argcount;
+    if mapping_len > PLAIN_USER_KW_UNROLL_LIMIT {
+        return bind_plain_user_kw_scope_native(func, w_firstarg, positional, kwarg_names, scope_w);
+    }
+    // `argument.py` `_match_signature` builds `kwds_mapping` as
+    // `[0] * (co_argcount + co_kwonlyargcount - input_argcount)` and
+    // writes `-1` into every slot by hand. Each slot is an RPython
+    // `int` (`Signed`), the machine word. `_match_keywords` writes
+    // each keyword's index into a live slot.
+    let mut mapping: Vec<isize> = vec![0; mapping_len];
+    let mut map_init = 0usize;
+    let unset: isize = -1;
+    while map_init < mapping_len {
+        mapping[map_init] = unset;
+        map_init += 1;
+    }
+    let mut num_remainingkwds = nkw;
+    let mut i = 0usize;
+    while i < nkw {
+        let w_name = unsafe { plain_user_kw_tuple_item(kwarg_names, i as i64) };
+        if w_name.is_null() {
+            return bind_plain_user_kw_scope_native(
+                func,
+                w_firstarg,
+                positional,
+                kwarg_names,
+                scope_w,
+            );
+        }
+        let mut j = signature.find_w_argname(w_name);
+        if j >= 0 && (j as usize) < co_posonlyargcount {
+            if signature.has_kwarg() {
+                j = -1;
+            } else {
+                return bind_plain_user_kw_scope_native(
+                    func,
+                    w_firstarg,
+                    positional,
+                    kwarg_names,
+                    scope_w,
+                );
+            }
+        }
+        if j < input_argcount as isize {
+            if j >= 0 {
+                return bind_plain_user_kw_scope_native(
+                    func,
+                    w_firstarg,
+                    positional,
+                    kwarg_names,
+                    scope_w,
+                );
+            }
+        } else {
+            let slot = (j as usize) - input_argcount;
+            if slot >= mapping_len {
+                return bind_plain_user_kw_scope_native(
+                    func,
+                    w_firstarg,
+                    positional,
+                    kwarg_names,
+                    scope_w,
+                );
+            }
+            mapping[slot] = i as isize;
+            num_remainingkwds -= 1;
+        }
+        i += 1;
+    }
+
+    let mut filled = input_argcount;
+    let mut map_index = 0usize;
+    let fill_limit = co_argcount + co_kwonlyargcount;
+    while filled < fill_limit {
+        if map_index < mapping_len {
+            let kwds_index = mapping[map_index];
+            if kwds_index >= 0 {
+                let src = n_pos + (kwds_index as usize);
+                if src < positional.len() {
+                    scope_w[filled] = positional[src];
+                }
+            }
+        }
+        map_index += 1;
+        filled += 1;
+    }
+
+    let mut slot = input_argcount;
+    while slot < co_argcount {
+        if scope_w[slot].is_null() {
+            let defaults = unsafe { crate::function_get_defaults(func) };
+            let ndef = if defaults.is_null()
+                || unsafe { pyre_object::is_none(defaults) }
+                || unsafe { !pyre_object::is_tuple(defaults) }
+            {
+                0
+            } else {
+                unsafe { pyre_object::w_tuple_len(defaults) }
+            };
+            let def_first = co_argcount as isize - ndef as isize;
+            let defnum = slot as isize - def_first;
+            if defnum < 0 {
+                return bind_plain_user_kw_scope_native(
+                    func,
+                    w_firstarg,
+                    positional,
+                    kwarg_names,
+                    scope_w,
+                );
+            }
+            let w_default = unsafe { plain_user_kw_tuple_item(defaults, defnum as i64) };
+            if w_default.is_null() {
+                return bind_plain_user_kw_scope_native(
+                    func,
+                    w_firstarg,
+                    positional,
+                    kwarg_names,
+                    scope_w,
+                );
+            }
+            scope_w[slot] = w_default;
+        }
+        slot += 1;
+    }
+    // A missing keyword-only slot is filled from `w_kw_defs` by name
+    // (`argument.py _match_signature`). `Signature.argnames` is
+    // `Vec<&str>`, two words per element, so indexing it is not the
+    // one-word list getitem the tracer records. Recompute through the
+    // native binder, which clears the scope and runs `parse_into_scope`.
+    while slot < co_argcount + co_kwonlyargcount {
+        if scope_w[slot].is_null() {
+            return bind_plain_user_kw_scope_native(
+                func,
+                w_firstarg,
+                positional,
+                kwarg_names,
+                scope_w,
+            );
+        }
+        slot += 1;
+    }
+
+    // `argument.py _collect_keyword_args` stores the surplus into the
+    // `**kwargs` dict. `dict.setitem` does not lower, so this traced arm
+    // recomputes the whole scope through `parse_into_scope`. A call with
+    // no `**kwargs` and no surplus name never takes it.
+    if signature.has_kwarg() || num_remainingkwds > 0 {
+        return bind_plain_user_kw_scope_native(func, w_firstarg, positional, kwarg_names, scope_w);
+    }
+    Ok(scope_len)
 }
 
 #[inline]
@@ -1999,7 +2461,7 @@ mod tests {
     /// pypy/interpreter/argument.py — `w_function is None` arm.
     #[test]
     fn raise_type_error_no_function() {
-        let err = raise_type_error(pyre_object::PY_NULL, "boom".to_string());
+        let err = raise_type_error!(pyre_object::PY_NULL, "boom", &[]);
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         assert_eq!(err.message_text(), "boom");
     }
@@ -2014,7 +2476,7 @@ mod tests {
     fn raise_type_error_with_function() {
         crate::typedef::init_typeobjects();
         let func = pyre_object::w_int_new(7);
-        let err = raise_type_error(func, "needs an iterable".to_string());
+        let err = raise_type_error!(func, "needs an iterable", &[]);
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         // object_functionstr scalar fallback returns the str() of the
         // value, here "7"; raise_type_error joins it with the message.
@@ -2445,7 +2907,7 @@ mod tests {
         let sig = crate::gateway::Signature::new(vec!["a", "b"], None, None, 0, 0);
         let names = [pyre_object::w_str_new("b")];
         let mut mapping = vec![-1isize; 2];
-        let remaining = match_keywords(&sig, 0, 0, 0, &names, &mut mapping)
+        let remaining = match_keywords(&sig, 0, 0, 0, &names, &mut mapping, true)
             .expect("kwarg name match should succeed");
         assert_eq!(remaining, 0);
         assert_eq!(mapping, vec![-1, 0]); // 'b' is signature index 1, slot 1 (= 1 - input_argcount=0)
@@ -2458,7 +2920,7 @@ mod tests {
         let sig = crate::gateway::Signature::new(vec!["a", "b"], None, None, 0, 1);
         let names = [pyre_object::w_str_new("a")];
         let mut mapping = vec![-1isize; 2];
-        let err = match_keywords(&sig, 0, 1, 0, &names, &mut mapping)
+        let err = match_keywords(&sig, 0, 1, 0, &names, &mut mapping, true)
             .expect_err("posonly kwarg should raise");
         match err {
             MatchSignatureError::Shape(ArgErr::PosonlyAsKwds { posonly_kwds }) => {

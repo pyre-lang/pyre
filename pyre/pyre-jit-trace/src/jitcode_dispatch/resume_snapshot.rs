@@ -2632,6 +2632,8 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
+        call_pc: Some(call_jit_pc),
+        resume_pc: resume_marker_jit_pc,
         call_stack_overrides,
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
         resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
@@ -2867,6 +2869,8 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
+        call_pc: Some(call_jit_pc),
+        resume_pc: resume_marker_jit_pc,
         call_stack_overrides: Vec::new(),
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
         resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
@@ -3053,6 +3057,8 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
+        call_pc: Some(call_jit_pc),
+        resume_pc: Some(resume_marker_jit_pc),
         call_stack_overrides: Vec::new(),
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
         resume_coord: ParentResumeCoord::Backxlat(resume_marker_jit_pc),

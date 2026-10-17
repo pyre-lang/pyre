@@ -451,6 +451,36 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // is harvested ⊆ reviewed.
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
     ("match_signature", "argument.py _match_signature"),
+    // `argument.py` `_match_signature` is `@jit.unroll_safe`.
+    // `match_signature_indexed` is the plain-user `CALL_KW` binder of that
+    // loop: the permutation is bounded by the callee signature
+    // (`PLAIN_USER_KW_UNROLL_LIMIT`), not by the call's arguments.
+    //
+    // Evidence: `MAJIT_STATS=1 target/release/pyre-dynasm` on
+    // `call_kw_hot_loop.py`, `call_kw_residual_kwargs_callee.py`, and
+    // `call_star_forms_inlined_callee.py`. `fbw_rolled_back_with_effects`
+    // was 0 on all three (a rise would be a correctness verdict). The
+    // recorded dynasm counters held with it: hot and residual
+    // `loops_compiled=1`, `loops_aborted=0`, `bridges_compiled=0`,
+    // `guard_failures=1`; star `loops_compiled=3`, `loops_aborted=0`,
+    // `bridges_compiled=0`, `guard_failures=2`.
+    ("match_signature_indexed", "argument.py _match_signature"),
+    // `bind_plain_user_kw_scope` is the plain-user `CALL_KW` gate in front
+    // of that loop. Jitted, it calls `match_signature_indexed`; the
+    // permutation is still bounded by the callee signature
+    // (`PLAIN_USER_KW_UNROLL_LIMIT`). `call_plain_user_kw` stays
+    // `dont_look_inside`, so the trace records the binder rather than the
+    // frame setup.
+    //
+    // Evidence: the same `MAJIT_STATS=1 target/release/pyre-dynasm` runs.
+    // `call_kw_hot_loop.py` names this function.
+    // `fbw_rolled_back_with_effects` was 0 on `call_kw_hot_loop.py`,
+    // `call_kw_residual_kwargs_callee.py`, and
+    // `call_star_forms_inlined_callee.py`. The recorded dynasm counters
+    // held: hot and residual `loops_compiled=1`, `loops_aborted=0`,
+    // `bridges_compiled=0`, `guard_failures=1`; star `loops_compiled=3`,
+    // `loops_aborted=0`, `bridges_compiled=0`, `guard_failures=2`.
+    ("bind_plain_user_kw_scope", "argument.py _match_signature"),
     // `argument.py unpack` is `@jit.look_inside_iff(lambda self:
     // self._jit_few_keywords)`. `look_inside_iff.inner` does
     // `func = unroll_safe(func)`, so the harvested name is `_orig_unpack`.
@@ -463,6 +493,30 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `dont_look_inside`, so the walk still residualizes at allocation
     // rather than expanding a new fold row.
     ("_orig_unpack", "argument.py unpack"),
+    // `argument.py` `_match_keywords` / `_collect_keyword_args` are
+    // `@jit.look_inside_iff(lambda ... jiton: jiton)`. `look_inside_iff.inner`
+    // does `func = unroll_safe(func)`, so the harvested names are the
+    // originals.
+    (
+        "_orig_match_keywords",
+        "argument.py look_inside_iff unroll_safe(_match_keywords)",
+    ),
+    (
+        "_orig_collect_keyword_args",
+        "argument.py look_inside_iff unroll_safe(_collect_keyword_args)",
+    ),
+    (
+        "_orig_check_not_duplicate_kwargs",
+        "argument.py look_inside_iff unroll_safe(_check_not_duplicate_kwargs)",
+    ),
+    (
+        "_orig_setitem_correct_indirection",
+        "kwargsdict.py look_inside_iff unroll_safe(_setitem_correct_indirection)",
+    ),
+    (
+        "_orig_getitem_correct_indirection",
+        "kwargsdict.py look_inside_iff unroll_safe(_getitem_correct_indirection)",
+    ),
     (
         "_orig__dict_merge_loop",
         "pyopcode.py look_inside_iff unroll_safe(_dict_merge_loop)",
