@@ -94,16 +94,6 @@ pub trait Optimization {
     /// Called once before optimization starts.
     fn setup(&mut self) {}
 
-    /// Drop state that `setup` keeps for an intra-compile phase-1 → phase-2
-    /// handoff (`OptPure.extra_call_pure` / `preamble_pure_ops`) so a recycled
-    /// optimizer cannot leak it into the next `compile_bridge`.
-    ///
-    /// RPython `BridgeCompileData.optimize` constructs a new
-    /// `UnrollOptimizer` per compile; nursery allocation is cheap there.
-    fn reset_between_compiles(&mut self) {
-        self.setup();
-    }
-
     /// Called after all operations have been processed.
     fn flush(&mut self, _ctx: &mut OptContext) {}
 
@@ -453,11 +443,6 @@ pub struct Optimizer {
     pub terminal_op: Option<Op>,
     /// Preserved final context after optimization, for jump_to_existing_trace.
     pub final_ctx: Option<OptContext>,
-    /// Recycled `OptContext` maps from the previous compile. Taken at the
-    /// start of the next `optimize_with_constants_and_inputs_at` so
-    /// `resop_refs` / `new_operations` / `emitted_operations` keep their
-    /// capacity (`optimizer.py Optimizer.__init__` builds those maps once).
-    recycled_ctx: Option<Box<OptContext>>,
     /// RPython Box identity: generation epoch for Phase 2 ops.
     /// Phase 1 JUMP arg OpRef indices to pre-tag as gen=0.
     /// bridgeopt.py deserialize_optimizer_knowledge: pending bridge resume data for deserialization
@@ -995,7 +980,25 @@ impl Optimizer {
                 let virtual_head_box = ctx
                     .get_box_replacement_operand_opt(raw)
                     .unwrap_or(Operand::None);
-                walk_visited.insert(top_key, virtual_head_box);
+                walk_visited.insert(top_key, virtual_head_box.clone());
+                // unroll.py `setinfo_from_preamble`: `if op.get_forwarded() is not None: return`.
+                // `import_state` already reinstalled the exported virtual PtrInfo
+                // (`op.set_forwarded(preamble_info)`) and the field infos via
+                // `setinfo_from_preamble_list(preamble_info.all_items(), ...)`.
+                // Rebuilding a fresh Virtual here replaces that shared cell with
+                // Phase-2 label-arg field boxes and drops the exported IntBounds.
+                if !virtual_head_box.is_none() && ctx.has_forwarding(&virtual_head_box) {
+                    for (_descr, field_info) in &iv.fields {
+                        let _ = Self::import_virtual_state_from_label_args(
+                            field_info,
+                            imported_label_args,
+                            &mut label_slot,
+                            ctx,
+                            &mut walk_visited,
+                        );
+                    }
+                    continue;
+                }
                 let mut fields = Vec::new();
                 for (descr, field_info) in &iv.fields {
                     let field_box = Self::import_virtual_state_from_label_args(
@@ -1449,7 +1452,6 @@ impl Optimizer {
             skip_flush: false,
             terminal_op: None,
             final_ctx: None,
-            recycled_ctx: None,
             pending_bridge_rd: None,
             building_bridge: false,
             simple_compile: false,
@@ -1480,62 +1482,6 @@ impl Optimizer {
         }
     }
 
-    /// Keep the pass boxes and `ResumeDataLoopMemo` scratch, drop the
-    /// per-compile graph. RPython `BridgeCompileData.optimize` constructs a
-    /// new `UnrollOptimizer` per compile; nursery allocation is cheap there.
-    pub fn recycle_for_next_compile(&mut self) {
-        self.final_num_inputs = 0;
-        self.call_pure_results = crate::optimizeopt::util::ArgsDict::default();
-        self.last_guard_op_idx = None;
-        self.replaces_guard.clear();
-        self.pendingfields.clear();
-        self.can_replace_guards = true;
-        self.quasi_immutable_deps.clear();
-        self.imported_virtuals.clear();
-        self.trace_inputargs.clear();
-        self.runtime_boxes.clear();
-        self.exported_loop_state = None;
-        self.imported_loop_state = None;
-        self.imported_short_aliases.clear();
-        self.imported_short_preamble = None;
-        self.imported_short_preamble_builder = None;
-        self.short_preamble_producer = None;
-        self.published_short_preamble_producer_slot = None;
-        self.compile_live_op_roots_slot = None;
-        self.imported_label_args = None;
-        self.patchguardop = None;
-        self.skip_flush = false;
-        self.terminal_op = None;
-        if let Some(ctx) = self.final_ctx.take() {
-            self.stash_recycled_ctx(ctx);
-        }
-        self.pending_bridge_rd = None;
-        self.building_bridge = false;
-        self.simple_compile = false;
-        self.all_descrs = Arc::new(Vec::new());
-        self.snapshot_boxes = Vec::new();
-        self.snapshot_frame_sizes.clear();
-        self.snapshot_vable_boxes = Vec::new();
-        self.snapshot_vref_boxes = Vec::new();
-        self.snapshot_frame_pcs.clear();
-        self.byte_bridge_resume = None;
-        self.phase1_emit_ops.clear();
-        self.opt_ops_emitted = 0;
-        self.opt_guards_emitted = 0;
-        self.opt_guards_shared_emitted = 0;
-        self.explicit_input_ops_seed = None;
-        self.trace_inputarg_boxes.clear();
-        self.resumedata_memo.borrow_mut().recycle_for_next_compile();
-        for pass in &mut self.passes {
-            pass.reset_between_compiles();
-        }
-    }
-
-    fn stash_recycled_ctx(&mut self, mut ctx: OptContext) {
-        ctx.reset_keep_capacity(0, 0, 0, 0);
-        self.recycled_ctx = Some(Box::new(ctx));
-    }
-
     fn take_opt_context(
         &mut self,
         estimated_ops: usize,
@@ -1543,10 +1489,6 @@ impl Optimizer {
         inputarg_base: u32,
         start_next_pos: u32,
     ) -> OptContext {
-        if let Some(mut ctx) = self.recycled_ctx.take() {
-            ctx.reset_keep_capacity(estimated_ops, num_inputs, inputarg_base, start_next_pos);
-            return *ctx;
-        }
         OptContext::with_num_inputs_and_start_pos(
             estimated_ops,
             num_inputs,
@@ -1816,7 +1758,18 @@ impl Optimizer {
                     && !resolved.is_constant()
                     && ctx.get_box_replacement_operand_opt(resolved).is_none()
                 {
-                    ctx.materialize_operand_at(resolved);
+                    // Producer-less resop: mint at this write of the export
+                    // key (`mint_box_at`), matching `ResOperation(...)` at
+                    // allocation. InputArg slots still bind through
+                    // `materialize_operand_at`'s InputArg arm.
+                    match resolved {
+                        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                            ctx.materialize_operand_at(resolved);
+                        }
+                        _ => {
+                            ctx.mint_box_at(resolved);
+                        }
+                    }
                 }
                 resolved
             })
@@ -1829,7 +1782,12 @@ impl Optimizer {
             .iter()
             .map(|&arg| {
                 ctx.get_box_replacement_operand_opt(arg)
-                    .unwrap_or_else(|| ctx.materialize_operand_at(arg))
+                    .unwrap_or_else(|| match arg {
+                        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                            ctx.materialize_operand_at(arg)
+                        }
+                        _ => ctx.mint_box_at(arg),
+                    })
             })
             .collect();
         let preview_virtual_state =
@@ -2045,7 +2003,7 @@ impl Optimizer {
                         if arg.is_none() {
                             continue;
                         }
-                        *arg = ctx.get_box_replacement_operand(arg.to_opref());
+                        *arg = arg.get_box_replacement(false);
                     }
                     preamble_op.setfailargs(fail_args);
                 }
@@ -3569,32 +3527,37 @@ impl Optimizer {
         // `optimize_peeled_loop` (compile.py) chain walk reaches it
         // via `partial_trace.operations`.
         //
-        // pyre's per-iter `TraceIterator::next()` (`opencoder.rs`)
-        // pushes a fresh resop operand slot for every visited op
-        // BEFORE the optimizer pipeline decides whether to emit. Two
-        // categories of slot escape the `new_operations` carry above
-        // and need explicit handling so retrace sees the same
-        // `Forwarded::Op(_)` chain targets Phase 1 installed:
-        //
-        //   - Unbound orphan: the pipeline folded/dropped the op so
-        //     `ctx.emit` never ran. Synthesize a `SameAs` stand-in
-        //     and bind the slot.
-        //   - Synthetic-bound: a forward reference reached `materialize_operand_at`
-        //     first; `materialize_operand_at` minted a `SameAs` stand-in into
-        //     `ctx.resop_refs[idx]` and `bind_op`'ed it. When `emit`
-        //     never arrived to upgrade the binding to a real producer,
-        //     the stand-in itself is the chain target carrier.
-        //
-        // In both cases the stand-in OpRc must travel into
-        // `phase1_emit_ops` (and from there into
-        // `ExportedState.partial_trace_operations`) so retrace reads it as
-        // part of the partial trace.
-        // `live_synthetics` is the incrementally-maintained set of synthetic
-        // stand-ins (mint_synthetic_resop / bind_input_resops) whose position
-        // was never superseded by an `emit` — the box-bound-to-synthetic
-        // producers that must travel into `phase1_emit_ops`. Positions that
-        // were never synthesized carry no producer, so nothing else needs
-        // draining here.
+        // Never-emitted recorder ops come from the iterator's op list
+        // (`opencoder.py TraceIterator._cache`), not a side map. Skip
+        // positions already in `new_operations` and recorder ops that
+        // `install_canonical_producer` / `mint_synthetic_resop` replaced
+        // as the `resop_refs` host — those replacements live in
+        // `live_synthetics` below.
+        for op in ops {
+            let pos = op.pos().get();
+            if pos.is_none() || pos.is_constant() {
+                continue;
+            }
+            if matches!(
+                pos,
+                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+            ) {
+                continue;
+            }
+            if ctx.new_operations_index.contains_key(&pos) {
+                continue;
+            }
+            if !ctx
+                .resop_refs
+                .get(&pos)
+                .is_some_and(|canonical| OpRc::ptr_eq(canonical, op))
+            {
+                continue;
+            }
+            self.phase1_emit_ops.push(op.clone());
+        }
+        // Remaining `mint_synthetic_resop` / extra-producer stand-ins
+        // that were never superseded by an emit.
         self.phase1_emit_ops
             .extend(ctx.live_synthetics.iter().cloned());
         // Transfer exported virtual state from context to optimizer
@@ -3725,7 +3688,10 @@ impl Optimizer {
                             "propagate_from_pass_range SameAs: source OpRef missing Box.type",
                         );
                         let same_as = OpCode::same_as_for_type(arg_type);
-                        let fresh = ctx.alloc_op_position_typed(arg_type);
+                        // history.py `record_same_as` mints the SameAs box at
+                        // allocation (`ResOperation(...)`); a later `_forwarded`
+                        // write (PtrInfo copy below) lands on that box.
+                        let (fresh, b_fresh) = ctx.reserve_virtual_box(arg_type);
                         let arg0 = ctx.materialize_operand_at(orig);
                         let mut op = Op::new(same_as, std::slice::from_ref(&arg0));
                         op.pos().set(fresh);
@@ -3768,9 +3734,7 @@ impl Optimizer {
                                 }
                                 other => other,
                             };
-                            if let Some(b) = ctx.get_box_replacement_operand_opt(fresh) {
-                                ctx.set_ptr_info(&b, fresh_info);
-                            }
+                            ctx.set_ptr_info(&b_fresh, fresh_info);
                         }
                         *arg = fresh;
                         // After allocating a fresh alias for an inputarg position,
@@ -4955,11 +4919,24 @@ impl Optimizer {
     /// optimizer.py `_clean_optimization_info(lst)` — drop `_forwarded`
     /// on each exported op so the next optimizer (the retrace body) does
     /// not inherit preamble forwarding.
-    fn clean_optimization_info(ops: &[majit_ir::OpRc]) {
+    pub(crate) fn clean_optimization_info(ops: &[majit_ir::OpRc]) {
         use majit_ir::forwarding::ForwardingHost;
         for op in ops {
             if !matches!(op.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
                 op.clear_forwarded();
+            }
+        }
+    }
+
+    /// `optimizer.py Optimizer._clean_optimization_info` over an operand
+    /// list. `unroll.py UnrollOptimizer.export_state` calls this on
+    /// `end_args` after expanding infos, so the next iteration's
+    /// `setinfo_from_preamble` does not early-return on leftover PtrInfo
+    /// (`unroll.py setinfo_from_preamble`: `if op.get_forwarded() is not None: return`).
+    pub(crate) fn clean_optimization_info_boxes(boxes: &[majit_ir::operand::Operand]) {
+        for box_ in boxes {
+            if !matches!(box_.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
+                box_.clear_forwarded();
             }
         }
     }
@@ -5183,9 +5160,8 @@ impl Optimizer {
             current_op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
-            let new = current_op.arg(0).to_opref();
             let b_old = Operand::from_bound_op(op_rc);
-            let b_new = ctx.get_box_replacement_operand(new);
+            let b_new = current_op.arg(0).get_box_replacement(false);
             ctx.make_equal_to(&b_old, &b_new);
             return Ok(());
         }

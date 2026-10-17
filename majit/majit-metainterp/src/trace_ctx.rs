@@ -209,10 +209,9 @@ impl GreenBox {
         recorder
             .inputargs()
             .iter()
-            .enumerate()
-            .map(|(i, arg)| {
+            .map(|arg| {
                 let tp = arg.tp.get();
-                Self::new(OpRef::input_arg_typed(i as u32, tp), tp)
+                Self::new(arg.opref(), tp)
             })
             .collect()
     }
@@ -721,6 +720,11 @@ pub struct TraceCtx {
     /// undo what the discarded operations wrote.  `None` for a tracer with no
     /// such undo log.
     pub(crate) cut_observer: Option<fn(&crate::recorder::TracePosition)>,
+    /// `pyjitpl.py MetaInterp.cpu` analog for `execute_and_record` /
+    /// `executor.execute` (`model.py AbstractCPU`). Production traces
+    /// install this from `MetaInterp.cpu` at the same setup sites that
+    /// call [`Self::set_cpu`]. Constructors default to `default_cpu()`.
+    pub(crate) metainterp_cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     // `opref_concrete: HashMap<u32, Value>` retired — the concrete
     // value now lives intrinsically on each frontend object's
     // `value: Cell<Option<Value>>` field (`Op` / `InputArg`), matching
@@ -1139,6 +1143,13 @@ impl TraceCtx {
                 >(raw)
             }
         });
+    }
+
+    /// Install the `model.py AbstractCPU` used by `execute_and_record`.
+    /// Production: `MetaInterp.cpu` at the same setup sites as
+    /// [`Self::set_cpu`]. Tests keep the constructor default.
+    pub fn set_metainterp_cpu(&mut self, cpu: std::sync::Arc<dyn crate::cpu::Cpu>) {
+        self.metainterp_cpu = cpu;
     }
 
     /// Borrow the exact MetaInterp CPU installed by [`Self::set_cpu`].
@@ -2260,6 +2271,17 @@ impl TraceCtx {
         )
     }
 
+    /// Like [`Self::for_test_types`] with a sparse failarg layout:
+    /// reserved prefix `input_types.len()`, live boxes only where
+    /// `live_inputs` is true (`Trace::with_input_layout`).
+    pub fn for_test_input_layout(input_types: &[majit_ir::Type], live_inputs: &[bool]) -> Self {
+        Self::new(
+            Trace::with_input_layout(input_types, live_inputs),
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        )
+    }
+
     /// Like [`Self::for_test_types`] but seeds the trace green key (and thus
     /// `root_green_key`).  A unit test that drives a loop-closing
     /// `jit_merge_point` uses this to model the trace as having STARTED at
@@ -2375,6 +2397,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             cut_observer: None,
+            metainterp_cpu: crate::cpu::default_cpu(),
             bridge_exception_resume_prepared: false,
             bridge_exception_source_pc: None,
             bridge_exception_source_jitcode: None,
@@ -2473,6 +2496,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             cut_observer: None,
+            metainterp_cpu: crate::cpu::default_cpu(),
             bridge_exception_resume_prepared: false,
             bridge_exception_source_pc: None,
             bridge_exception_source_jitcode: None,
@@ -2775,6 +2799,12 @@ impl TraceCtx {
         }
     }
 
+    /// `resume.py ResumeDataBoxReader.load_box_from_cpu`: the bridge
+    /// InputArg is born with `cpu.get_int_value(deadframe, num)`.
+    pub fn load_box_from_cpu(&mut self, num: u32, kind: Type, value: Value) -> OpRef {
+        self.recorder.load_box_from_cpu(num, kind, value)
+    }
+
     /// Like [`Self::set_opref_concrete`] but returns `false` instead of
     /// panicking when no frontend op/inputarg is recorded at `opref`'s
     /// position.  The full-body walker's speculative residual-call
@@ -3017,7 +3047,7 @@ impl TraceCtx {
     /// `initial_inputarg_consts`; the inputarg Box identity itself is still the
     /// ordinary `OpRef(index)`, matching RPython's `original_boxes` list.
     pub fn initial_inputarg_argbox(&self, index: usize) -> Option<(JitArgKind, OpRef, i64)> {
-        let tp = self.recorder.inputarg_types().get(index).copied()?;
+        let tp = self.recorder.inputarg_type_at(index as u32)?;
         let const_ref = self.initial_inputarg_consts.get(index)?;
         // history.py/268/314 — Const{Int,Float,Ptr}.value lives inline
         // on the Box; read it and resolve the raw bits (Int→value,
@@ -3130,12 +3160,31 @@ impl TraceCtx {
             .is_some_and(|op| op.result_type() == Type::Void)
     }
 
-    /// Input argument types in loop-header order.
+    /// Types of the live inputargs, in `History.set_inputargs` order.
+    /// Dead failarg holes are absent; do not index this list by
+    /// `get_position()`. Use [`Self::inputarg_type_at`] or `opref.ty()`.
     pub fn inputarg_types(&self) -> Vec<Type> {
         self.recorder.inputarg_types()
     }
 
-    /// Number of traced operations recorded so far.
+    /// Type of the live InputArg whose `get_position()` is `position`.
+    /// `None` when that coordinate is a dead failarg hole.
+    ///
+    /// `resume.py ResumeDataBoxReader.load_box_from_cpu` yields a typed
+    /// box; the type is on the box, not a compact-list index.
+    pub fn inputarg_type_at(&self, position: u32) -> Option<Type> {
+        self.recorder.inputarg_type_at(position)
+    }
+
+    /// One GreenBox per live recorder inputarg, each keeping its
+    /// original `get_position()`.
+    pub fn inputarg_greenboxes(&self) -> Vec<GreenBox> {
+        GreenBox::from_recorder_inputargs(&self.recorder)
+    }
+
+    /// `History.length`: `trace._count - len(trace.inputargs)`.
+    /// Trace-length limit; dead failarg holes count. The recorded-op
+    /// index bound for [`Self::opcode_at`] is [`Self::opcode_at_len`].
     pub fn num_ops(&self) -> usize {
         self.recorder.num_ops()
     }
@@ -5964,17 +6013,24 @@ impl TraceCtx {
             0,
         );
         //     condbox = mi.execute_and_record(rop.PTR_NE, None, tokenbox, CONST_NULL)
+        // `MetaInterp.execute_and_record` runs `executor.execute` on the
+        // metainterp CPU, then records. PTR_NE is `blackhole.py bhimpl_ptr_ne`
+        // over `tokenbox.getref_base()` and CONST_NULL; the walker traces
+        // the same compare through `execute_and_record` after that eval.
         let null_ref = self.const_null();
-        let cond_live = token_live.map(|v| {
-            Value::Int(match v {
-                Value::Ref(r) if !r.is_null() => 1,
-                _ => 0,
-            })
+        let cond_live = self.box_value(tokenbox).and_then(|tv| {
+            crate::executor::execute_ptr_compare_values(
+                OpCode::PtrNe,
+                tv,
+                Value::Ref(majit_ir::GcRef::NULL),
+            )
+            .map(Value::Int)
         });
-        // PTR_NE is always-pure; a Some resvalue needs a cpu. The comparison
-        // reads no memory, so the default one stands in (same as PTR_EQ in
-        // `_nonstandard_virtualizable`).
-        let cpu = crate::cpu::default_cpu();
+        // PTR_NE is always-pure; execute_and_record's fold gate needs a
+        // model.py Cpu. Upstream `MetaInterp.execute_and_record` uses
+        // `self.cpu`. The COND_CALL below still runs through
+        // `blackhole_cpu` (`executor.py do_cond_call` → `cpu.bh_call_v`).
+        let cpu = self.metainterp_cpu.clone();
         let condbox = self.execute_and_record(
             Some(cpu.as_ref()),
             OpCode::PtrNe,
@@ -5986,12 +6042,44 @@ impl TraceCtx {
         let funcbox = self.const_int(clear_ptr as i64);
         //     self.execute_varargs(rop.COND_CALL, [condbox, funcbox, box],
         //                          calldescr, False, False)
-        // `execute_varargs`, not `execute_and_record`: `COND_CALL_N` is inside
-        // the can-raise range, which the funnel refuses.
+        // `execute_and_record_varargs`: `executor.execute_varargs` then
+        // record. `COND_CALL_N` is inside the can-raise range, which the
+        // non-varargs funnel refuses. `executor.py do_cond_call`: when
+        // `condbox.getint()` is true, call `clear_vable_ptr` so later
+        // trace-time reads see the forced virtualizable.
+        let cond_value = match self.box_value(condbox) {
+            Some(Value::Int(n)) => n,
+            _ => 0,
+        };
+        // `executor.py do_cond_call` → `do_call_n` reads
+        // `argboxes[n].getref_base()`. The branch records ops with their
+        // values (`*FrontendOp(pos, value)`), so the vable box always has
+        // one.
+        let vable_bits = self
+            .box_bits(vable_opref)
+            .expect("emit_force_virtualizable: vable box has no recorded value");
+        let effectinfo = {
+            let calldescr = clear_descr
+                .as_call_descr()
+                .expect("emit_force_virtualizable: clear_vable_descr is a CallDescr");
+            crate::executor::do_cond_call(
+                self.blackhole_cpu(),
+                cond_value,
+                clear_ptr as i64,
+                &[vable_bits],
+                calldescr,
+            );
+            calldescr.get_extra_info().clone()
+        };
         self.profiler()
             .count_ops(OpCode::CondCallN, crate::counters::OPS);
         self.profiler()
             .count_ops(OpCode::CondCallN, crate::counters::RECORDED_OPS);
+        self.heapcache_invalidate_caches_varargs(
+            OpCode::CondCallN,
+            Some(&effectinfo),
+            &[condbox, funcbox, vable_opref],
+        );
         Self::do_record_op_with_descr(
             &mut self.recorder,
             OpCode::CondCallN,
@@ -6131,10 +6219,10 @@ impl TraceCtx {
                 // arriving here are *different* constants and cannot be equal at
                 // runtime either — the fold to `ConstInt(0)` is sound, and
                 // `implement_guard_value` then short-circuits it into no
-                // GUARD_VALUE. `PTR_EQ` reads no memory, so the fold does not
-                // depend on which backend answers; `TraceCtx` holds no `Cpu`,
-                // so the default one stands in.
-                let cpu = crate::cpu::default_cpu();
+                // GUARD_VALUE. `PTR_EQ` reads no memory. The CPU is
+                // `MetaInterp.cpu`, the same one `execute_and_record` uses
+                // upstream.
+                let cpu = self.metainterp_cpu.clone();
                 let eqbox = self.execute_and_record(
                     Some(cpu.as_ref()),
                     OpCode::PtrEq,
@@ -9045,14 +9133,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initial_inputarg_argbox_reads_type_from_sparse_live_box() {
+        // [Int, dead, Float]: compact inputarg_types() is [Int, Float].
+        // Indexing it with position 2 is OOB; the box at get_position() 2
+        // is the live Float (ResumeDataBoxReader.load_box_from_cpu).
+        let rec =
+            Trace::with_input_layout(&[Type::Int, Type::Ref, Type::Float], &[true, false, true]);
+        let mut ctx = TraceCtx::new(
+            rec,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.initial_inputarg_consts = vec![
+            OpRef::const_int(1),
+            OpRef::const_int(0),
+            OpRef::const_float(1.5),
+        ];
+        assert_eq!(ctx.inputarg_types(), vec![Type::Int, Type::Float]);
+        assert_eq!(ctx.inputarg_type_at(2), Some(Type::Float));
+        let (kind, opref, bits) = ctx
+            .initial_inputarg_argbox(2)
+            .expect("live Float at position 2");
+        assert_eq!(kind, crate::jitcode::JitArgKind::Float);
+        assert_eq!(opref, OpRef::input_arg_float(2));
+        assert_eq!(opref.ty(), Some(Type::Float));
+        assert_eq!(bits, 1.5f64.to_bits() as i64);
+        let boxes = ctx.inputarg_greenboxes();
+        assert_eq!(
+            boxes.iter().map(|b| (b.opref, b.ty)).collect::<Vec<_>>(),
+            vec![
+                (OpRef::input_arg_int(0), Type::Int),
+                (OpRef::input_arg_float(2), Type::Float)
+            ]
+        );
+    }
+
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {
         let mut recorder = ctx.recorder;
-        let inputarg_types = recorder.inputarg_types();
-        let jump_args: Vec<OpRef> = inputarg_types
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
-            .collect();
+        let jump_args: Vec<OpRef> = recorder.inputargs().iter().map(|arg| arg.opref()).collect();
         recorder.close_loop(&jump_args);
         let trace = recorder.get_trace();
         // Return only non-JUMP ops
@@ -9405,6 +9524,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.virtualizable_info = Some(std::sync::Arc::new(info));
+        ctx.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(1)));
 
         let nonstandard = decide_nonstandard(&mut ctx, vable, &fd8);
         let _result = ctx.vable_getfield_int_checked(
@@ -9475,6 +9595,105 @@ mod tests {
         let condbox = OpRef::int_op(2);
         assert_eq!(ctx.opcode_of(condbox), Some(OpCode::PtrNe));
         assert_eq!(ctx.box_value(condbox), Some(Value::Int(1)));
+    }
+
+    /// `executor.py do_cond_call`: when the token GETFIELD is non-null,
+    /// the COND_CALL target (`clear_vable_ptr`) runs at trace time.
+    #[test]
+    fn emit_force_virtualizable_executes_cond_call_when_token_is_nonzero() {
+        extern "C" fn clear_vable_probe(vable: i64) {
+            // `make_clear_vable_descr` is `[Ref] -> Void`; mark the pc word.
+            unsafe {
+                *(vable as *mut usize).add(1) = 0xF0CED;
+            }
+        }
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.set_clear_vable(
+            clear_vable_probe as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let fd = info.static_field_descr(0);
+
+        let mut storage = [0usize; 8];
+        let token = 0x1234_0000usize;
+        let cpu = SanityTestCpu {
+            int_value: 0,
+            ref_value: majit_ir::GcRef(token),
+            float_value: 0.0,
+        };
+
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.install_virtualizable_info(info);
+        ctx.set_cpu(Some(&cpu));
+        ctx.set_opref_concrete(
+            vable,
+            Value::Ref(majit_ir::GcRef(storage.as_ptr() as usize)),
+        );
+        ctx.emit_force_virtualizable(&fd, vable);
+
+        assert_eq!(
+            storage[1], 0xF0CED,
+            "do_cond_call must invoke clear_vable_ptr when the token is non-null",
+        );
+        let condbox = OpRef::int_op(2);
+        assert_eq!(ctx.opcode_of(condbox), Some(OpCode::PtrNe));
+        assert_eq!(ctx.box_value(condbox), Some(Value::Int(1)));
+    }
+
+    /// `executor.py do_cond_call`: a null token skips the helper.
+    #[test]
+    fn emit_force_virtualizable_skips_cond_call_when_token_is_null() {
+        extern "C" fn clear_vable_probe(vable: i64) {
+            unsafe {
+                *(vable as *mut usize).add(1) = 0xF0CED;
+            }
+        }
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.set_clear_vable(
+            clear_vable_probe as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let fd = info.static_field_descr(0);
+
+        let mut storage = [0usize; 8];
+        let cpu = SanityTestCpu {
+            int_value: 0,
+            ref_value: majit_ir::GcRef::NULL,
+            float_value: 0.0,
+        };
+
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.install_virtualizable_info(info);
+        ctx.set_cpu(Some(&cpu));
+        ctx.set_opref_concrete(
+            vable,
+            Value::Ref(majit_ir::GcRef(storage.as_ptr() as usize)),
+        );
+        ctx.emit_force_virtualizable(&fd, vable);
+
+        assert_eq!(
+            storage[1], 0,
+            "do_cond_call must not invoke clear_vable_ptr when the token is null",
+        );
+        let condbox = OpRef::int_op(2);
+        assert_eq!(ctx.opcode_of(condbox), Some(OpCode::PtrNe));
+        assert_eq!(ctx.box_value(condbox), Some(Value::Int(0)));
     }
 
     #[test]

@@ -329,11 +329,10 @@ fn walk_live_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;
-/// this adapter copies OpRefs into a side table. A six-box list is one
-/// 96 B `Layout::array` (`SnapshotBox` is one `OpRef`); twelve boxes
-/// mint from the chunked slab instead. `create_numbering_arc` mints a
-/// `NumberingRef` slab cell (`resumecode.create_numbering` /
-/// `lltype.malloc(NUMBERING)`).
+/// this adapter stores `SnapshotBox` (OpRef plus the iterator-cache
+/// Operand) in a side table. Twelve boxes mint from the chunked slab.
+/// `create_numbering_arc` mints a `NumberingRef` slab cell
+/// (`resumecode.create_numbering` / `lltype.malloc(NUMBERING)`).
 const SNAP_LIST_SLAB: usize = 12;
 const SNAP_LIST_SLAB_BYTES: usize = SNAP_LIST_SLAB * std::mem::size_of::<SnapshotBox>();
 const SNAP_LIST_SLAB_BIT: u32 = 1 << 31;
@@ -504,7 +503,7 @@ impl Clone for SnapshotBoxList {
     fn clone(&self) -> Self {
         let mut out = Self::with_capacity(self.len as usize);
         for item in self.as_slice() {
-            out.push(*item);
+            out.push(item.clone());
         }
         out
     }
@@ -756,6 +755,28 @@ pub(crate) fn snapshot_get<T>(store: &[Option<T>], pos: i32) -> Option<&T> {
 
 pub(crate) fn snapshot_contains<T>(store: &[Option<T>], pos: i32) -> bool {
     snapshot_get(store, pos).is_some()
+}
+
+/// Bind each snapshot slot's iterator-cache box (`TraceIterator._cache`).
+/// Call while the OpRef is still in the cache's key space, before a
+/// later remap rewrites it.
+pub(crate) fn attach_snapshot_map_iter_cache(map: &mut SnapshotBoxes, cache: &[Option<Operand>]) {
+    for list in map.iter_mut().flatten() {
+        for boxref in list.iter_mut() {
+            boxref.attach_iter_cache(cache);
+        }
+    }
+}
+
+pub(crate) fn attach_resume_snapshot_caches(
+    boxes: &mut SnapshotBoxes,
+    vable: &mut SnapshotBoxes,
+    vref: &mut SnapshotBoxes,
+    cache: &[Option<Operand>],
+) {
+    attach_snapshot_map_iter_cache(boxes, cache);
+    attach_snapshot_map_iter_cache(vable, cache);
+    attach_snapshot_map_iter_cache(vref, cache);
 }
 
 pub(crate) fn snapshot_insert<T>(store: &mut Vec<Option<T>>, pos: i32, value: T) {
@@ -1591,28 +1612,16 @@ pub struct OptContext {
     // counterpart (upstream keys producers on `box._forwarded`, not a
     // positional map).
     pub(crate) resop_refs: OpRefFxIndexMap<majit_ir::resoperation::OpRc>,
-    /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
-    /// products) that have NOT been superseded by an `emit` at their
-    /// position. The end-of-Phase-1 orphan-binding pass drains this into
-    /// `phase1_emit_ops` so retrace sees them in `partial_trace_operations`; an
-    /// `emit` that rebinds a position's box off its synthetic removes the
-    /// synthetic here (it stays strongly held by `resop_refs` for lookup,
-    /// but is no longer an orphan needing carry). Tracking liveness
-    /// incrementally by `OpRc` identity sidesteps the flat-OpRef raw/type
-    /// collision that makes the final `new_operations` state ambiguous
-    /// about which type-tagged value won a shared raw slot.
+    /// Live `mint_synthetic_resop` / `install_canonical_producer` stand-ins
+    /// that have NOT been superseded by an `emit` at their position. Recorder
+    /// ops from `bind_input_resops` are the iterator box itself
+    /// (`opencoder.py TraceIterator.next` `_cache`); they stay in `resop_refs`
+    /// and are not listed here. The Phase-1 drain walks remaining entries
+    /// into `phase1_emit_ops` so retrace sees them in
+    /// `partial_trace_operations`. At most one live entry per position
+    /// (emit invariant). A Vec scan is enough: this set is only synthetics
+    /// and extra producers, not the whole trace.
     pub(crate) live_synthetics: Vec<majit_ir::resoperation::OpRc>,
-    /// `pos -> index into live_synthetics`, kept in lockstep with the vector so
-    /// the three supersession sites (`install_canonical_producer`, `emit`'s
-    /// reuse path, `bind_input_resops`) resolve a position's live stand-in in
-    /// O(1) instead of an `iter().position()` scan. At most one live entry
-    /// exists per position (the emit invariant asserted throughout this file),
-    /// so the map is unambiguous. Maintained via `live_synthetics_push` /
-    /// `live_synthetics_swap_remove_pos`; without it the scan is O(n^2) over a
-    /// vector that grows to the whole trace length (tens of thousands of ops
-    /// on a whole-program loop),
-    /// the same producer-resolution cost `phase1_emit_ops_index` removes.
-    pub(crate) live_synthetics_index: FxHashMap<OpRef, usize>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
     ///
     /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
@@ -2545,11 +2554,7 @@ impl OptContext {
                 estimated_ops,
                 Default::default(),
             ),
-            live_synthetics: Vec::with_capacity(estimated_ops),
-            live_synthetics_index: FxHashMap::with_capacity_and_hasher(
-                estimated_ops,
-                Default::default(),
-            ),
+            live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::with_capacity(estimated_ops),
@@ -2785,29 +2790,20 @@ impl OptContext {
         }
     }
 
-    /// Append `op` to `live_synthetics`, keeping `live_synthetics_index`
-    /// (pos -> vector index) in lockstep. At most one live entry per position
-    /// (emit invariant), so a plain insert replaces any stale mapping.
+    /// Append `op` to `live_synthetics`. Recorder ops are not stored here
+    /// (`bind_input_resops` keeps them in `resop_refs` only); this set is
+    /// `mint_synthetic_resop` / extra-producer stand-ins.
     pub(crate) fn live_synthetics_push(&mut self, op: majit_ir::OpRc) {
-        let pos = op.pos().get();
-        let idx = self.live_synthetics.len();
         self.live_synthetics.push(op);
-        self.live_synthetics_index.insert(pos, idx);
     }
 
-    /// Remove the live entry at position `pos` (if any) via `swap_remove`,
-    /// keeping `live_synthetics_index` in lockstep. Returns the removed `OpRc`.
-    /// `swap_remove` moves the last element into the freed slot, so that
-    /// element's index mapping is repointed here.
+    /// Remove the live synthetic/extra at position `pos` (if any).
     pub(crate) fn live_synthetics_swap_remove_pos(&mut self, pos: OpRef) -> Option<majit_ir::OpRc> {
-        let i = self.live_synthetics_index.remove(&pos)?;
-        let removed = self.live_synthetics.swap_remove(i);
-        if i < self.live_synthetics.len() {
-            // The element formerly at the tail now lives at `i`.
-            let moved_pos = self.live_synthetics[i].pos().get();
-            self.live_synthetics_index.insert(moved_pos, i);
-        }
-        Some(removed)
+        let i = self
+            .live_synthetics
+            .iter()
+            .position(|op| op.pos().get() == pos)?;
+        Some(self.live_synthetics.swap_remove(i))
     }
 
     /// Mint a `SameAsI/F/R` (or `Jump` for `Void`) synthetic
@@ -2887,11 +2883,14 @@ impl OptContext {
         }
         // Drop the superseded stand-in at this position and carry its
         // accumulated `_forwarded` onto `op` (replace_op_with's `opinfo`
-        // hand-off). At most one live stand-in exists per position
-        // (mod.rs::emit invariant), so a single removal is sufficient. The
-        // `ptr_eq` guard skips the self-clone — and its `RefCell` double-borrow
-        // — when `op` is already the registered stand-in.
-        if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos)
+        // hand-off). The current box is a live synthetic if one was minted,
+        // otherwise the recorder `OpRc` in `resop_refs` (`optimizer.py`
+        // `replace_op_with` / `op.set_forwarded(newop)`). The `ptr_eq`
+        // guard skips the self-clone — and its `RefCell` double-borrow —
+        // when `op` is already the registered stand-in.
+        if let Some(superseded) = self
+            .live_synthetics_swap_remove_pos(pos)
+            .or_else(|| self.resop_refs.get(&pos).cloned())
             && !OpRc::ptr_eq(&superseded, op)
         {
             let carried = superseded.forwarded().borrow().clone();
@@ -2975,12 +2974,13 @@ impl OptContext {
             }
             return minted;
         }
-        if let Some(op) = self.find_producer_op(opref) {
-            return Some(Operand::from_bound_op(&op));
-        }
-        let idx = opref.raw() as usize;
+        // `resoperation.py AbstractInputArg` is not an `AbstractResOp`;
+        // `inputarg_refs` is the owner. Classify before `find_producer_op`
+        // so InputArg positions never pay the producer-map lookup
+        // (`optimizer.py Optimizer.get_box_replacement` walks the box).
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                let idx = opref.raw() as usize;
                 // An unbound position reports "no binding" rather than a
                 // box, which makes `get_replacement_opref` return the
                 // position itself — `resoperation.py:57-68
@@ -2993,8 +2993,12 @@ impl OptContext {
                 {
                     return Some(Operand::from_bound_inputarg(ia));
                 }
+                return None;
             }
             _ => {}
+        }
+        if let Some(op) = self.find_producer_op(opref) {
+            return Some(Operand::from_bound_op(&op));
         }
         None
     }
@@ -3049,10 +3053,9 @@ impl OptContext {
     /// unbound terminal and a subsequent `set_forwarded_info` write
     /// trips `write_forwarded`'s bound-precondition assert.
     ///
-    /// The producer `OpRc` is stashed in `resop_refs[pos]` so `emit()`'s
-    /// `bound_is_synthetic` check (`mod.rs::emit` rebind path) later
-    /// upgrades the binding to the emitted post-pass producer `OpRc`
-    /// via `bind_op`'s carry-over (forwarded state preserved).
+    /// The producer `OpRc` is stashed in `resop_refs[pos]` so `emit()`
+    /// reuses that same box (`optimizer.py Optimizer._emit_operation`
+    /// appends `op`).
     ///
     /// InputArg slots are skipped (handled by `ensure_inputarg_bindings`);
     /// only resop positions land here. Each phase's input `ops` carry that
@@ -3061,9 +3064,9 @@ impl OptContext {
     /// the `resop_refs[opref]` dedup covers intra-`ops` repeats.
     pub(crate) fn bind_input_resops(&mut self, ops: &[majit_ir::OpRc]) {
         // The loop over the caller-threaded `ops` self-guards (no-op on an
-        // empty slice) and records each resop producer into `resop_refs` /
-        // `live_synthetics` — the collision-safe stores `find_producer_op`
-        // consults.
+        // empty slice) and records each resop producer into `resop_refs` —
+        // the iterator object is the box (`opencoder.py TraceIterator.next`
+        // `_cache`; `optimizer.py Optimizer._emit_operation` appends it).
         for op in ops {
             // Bridge / Phase-2 reminted InputArgs live on the op
             // (`inputarg_from_tp`). `inputarg_base != 0` is that reminted
@@ -3101,12 +3104,11 @@ impl OptContext {
             if self.resop_refs.contains_key(&pos) {
                 continue;
             }
-            // Record the caller-threaded `OpRc` so the iterated input op,
-            // `resop_refs`, and `live_synthetics` share one `Op` identity
-            // (no second private copy).
-            let op_rc = op.clone();
-            self.resop_refs.insert(pos, op_rc.clone());
-            self.live_synthetics_push(op_rc);
+            // Record the caller-threaded `OpRc` so the iterated input op
+            // and `resop_refs` share one `Op` identity (no second private
+            // copy). Not pushed to `live_synthetics`: that set is only
+            // synthetics / extra producers.
+            self.resop_refs.insert(pos, op.clone());
         }
     }
 
@@ -3229,11 +3231,7 @@ impl OptContext {
                 estimated_ops,
                 Default::default(),
             ),
-            live_synthetics: Vec::with_capacity(estimated_ops),
-            live_synthetics_index: FxHashMap::with_capacity_and_hasher(
-                estimated_ops,
-                Default::default(),
-            ),
+            live_synthetics: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_emit_ops_index: FxHashMap::default(),
             input_ops: Vec::with_capacity(estimated_ops),
@@ -3246,94 +3244,6 @@ impl OptContext {
             pending_invalid_loop: std::cell::Cell::new(None),
             const_operands: std::cell::RefCell::new(crate::FxIndexMap::default()),
         }
-    }
-
-    /// Drop the per-compile graph, keep map/vec capacities.
-    /// `optimizer.py Optimizer.__init__` builds those maps once per
-    /// optimizer; RPython `BridgeCompileData.optimize` then constructs a
-    /// new `UnrollOptimizer` per compile (nursery allocation). Recycle
-    /// the same maps across `compile_bridge` instead of dropping them.
-    pub(crate) fn reset_keep_capacity(
-        &mut self,
-        estimated_ops: usize,
-        num_inputs: usize,
-        inputarg_base: u32,
-        start_next_pos: u32,
-    ) {
-        self.supports_efficient_uint_mul_high = true;
-        self.new_operations.clear();
-        self.new_operations.reserve(estimated_ops);
-        self.new_operations_drained = false;
-        self.new_operations_index.clear();
-        self.new_operations_index.reserve(estimated_ops);
-        self.emitted_operations.clear();
-        if estimated_ops > self.emitted_operations.capacity() {
-            self.emitted_operations.reserve(estimated_ops);
-        }
-        self.num_inputs = num_inputs as u32;
-        self.inputarg_base = inputarg_base;
-        self.next_pos = start_next_pos;
-        self.extra_operations_after.clear();
-        self.extra_pending.clear();
-        self.pending_guard_class_postprocess = None;
-        self.pending_mark_last_guard = None;
-        self.pending_finish_guard_postprocess = None;
-        self.imported_short_pure_ops.clear();
-        self.imported_virtual_args = None;
-        self.imported_loop_invariant_results.clear();
-        self.imported_short_preamble_builder = None;
-        self.const_infos.clear();
-        self.potential_extra_ops.clear();
-        self.active_short_preamble_producer = None;
-        self.preview_short_state = None;
-        self.exported_const_short_boxes.clear();
-        self.imported_virtuals.clear();
-        self.imported_label_args = None;
-        self.can_replace_guards = true;
-        self.patchguardop = None;
-        self.preamble_end_args = None;
-        self.skip_flush_mode = false;
-        self.building_bridge = false;
-        self.current_pass_idx = 0;
-        self.optearlyforce_idx = 0;
-        self.in_final_emission = false;
-        self.callinfocollection = None;
-        self.pending_for_guard.clear();
-        self.pending_pure_from_args.clear();
-        self.pending_pure_from_args2.clear();
-        self.pure_ops = None;
-        self.constant_fold_alloc = None;
-        self.string_length_resolver = None;
-        self.string_content_resolver = None;
-        self.string_constant_alloc = None;
-        self.quasi_immutable_deps.clear();
-        self.snapshot_boxes.clear();
-        self.snapshot_frame_sizes.clear();
-        self.snapshot_vable_boxes.clear();
-        self.minimum_virtualizable_size = -1;
-        self.snapshot_vref_boxes.clear();
-        self.snapshot_frame_pcs.clear();
-        self.byte_bridge_resume = None;
-        self.inputargs.clear();
-        self.inputarg_refs.clear();
-        self.resop_refs.clear();
-        if estimated_ops > self.resop_refs.capacity() {
-            self.resop_refs.reserve(estimated_ops);
-        }
-        self.live_synthetics.clear();
-        self.live_synthetics.reserve(estimated_ops);
-        self.live_synthetics_index.clear();
-        self.live_synthetics_index.reserve(estimated_ops);
-        self.phase1_emit_ops.clear();
-        self.phase1_emit_ops_index.clear();
-        self.input_ops.clear();
-        self.input_ops.reserve(estimated_ops);
-        self.last_guard_idx = None;
-        self.guard_chain_broken = false;
-        self.last_seen_snapshot_pos = None;
-        self.last_op_removed = false;
-        self.pending_invalid_loop.set(None);
-        self.const_operands.get_mut().clear();
     }
 
     pub fn num_inputs(&self) -> usize {
@@ -3356,23 +3266,20 @@ impl OptContext {
     /// This is the explicit creation primitive for producer-less
     /// synthetics: importers that allocate a position purely to carry a
     /// forwarded write (PtrInfo / IntBound / Const for an imported virtual
-    /// state leaf) get a bound write target in one step, instead of
-    /// `alloc_op_position_typed` followed by a lazy `materialize_operand_at(opref)`
-    /// re-materialization. The minted synthetic is identical to the one
-    /// `materialize_operand_at`'s producer-less arm mints (`mint_synthetic_resop`), so
+    /// state leaf) get a bound write target in one step. The minted
+    /// synthetic is the `ResOperation(...)` analog (`mint_synthetic_resop`);
     /// a later `emit()` for the same position supersedes it through the
     /// same `live_synthetics` catch-up. Reserve a bare position via
-    /// `alloc_op_position_typed` instead when no forwarded write follows
-    /// (e.g. an `Unknown` leaf), to avoid an eager synthetic for a
+    /// `alloc_op_position_typed` instead when no forwarded write or read
+    /// follows (e.g. an `Unknown` leaf), to avoid an eager synthetic for a
     /// position that is never written.
-    /// Explicit "create" half of the find-or-create `materialize_operand_at`:
-    /// mint a `SameAs*` synthetic at `opref` and return an operand bound to it,
-    /// so a subsequent `set_forwarded_*` lands on the canonical `Op._forwarded`
-    /// host. `opref` must be a non-const, non-sentinel resop position whose
-    /// producer is not yet emitted (a virgin alias). Callers reach this only on
-    /// the `None` arm of `get_box_replacement_operand_opt`; an already-minted or
-    /// producer-backed opref resolves there. Mirrors `materialize_operand_at`'s resop
-    /// lazy-alloc arm (`mint_synthetic_resop` + bind).
+    /// Explicit create: mint a `SameAs*` synthetic at `opref` and return an
+    /// operand bound to it, so a subsequent `set_forwarded_*` lands on the
+    /// canonical `Op._forwarded` host. `opref` must be a non-const,
+    /// non-sentinel resop position whose producer is not yet emitted (a
+    /// virgin alias). Callers reach this only on the `None` arm of
+    /// `get_box_replacement_operand_opt`; an already-minted or
+    /// producer-backed opref resolves there.
     pub(crate) fn mint_box_at(&mut self, opref: OpRef) -> Operand {
         let tp = opref.ty().unwrap_or(majit_ir::Type::Void);
         let synthetic = self.mint_synthetic_resop(opref, tp);
@@ -3597,18 +3504,12 @@ impl OptContext {
     /// so typed positions never grow `value_types`.
     pub(crate) fn reserve_pos_typed(&mut self, tp: majit_ir::Type) -> OpRef {
         let raw = self.allocate_next_pos_raw();
-        // The position's canonical host is materialized lazily on first
-        // *write* access (`materialize_operand_at` mints a `SameAs*` synthetic
-        // into `resop_refs[raw]` keyed by the full OpRef; `resolve_to_operand`
-        // is `&self` and returns `None` until then). No eager pre-mint here:
-        // an eager synthetic for a position that is reserved but never
-        // emitted (label / jump positions on an empty trace) would leak into
-        // `phase1_emit_ops` via `live_synthetics`; the emitted op, when it
-        // arrives, supersedes the lazily-minted synthetic the same way.
-        // Callers whose position is *read* before any write (imported
-        // virtual-state leaves and heads) must use `reserve_virtual_box`
-        // instead — a bare position read mints a fresh position-only box per
-        // resolution (bind-at-alloc).
+        // Bare position: no producer is minted. Callers that later write
+        // `_forwarded` or read the box must use `reserve_virtual_box` /
+        // `mint_box_at` so the `ResOperation(...)` analog exists from
+        // allocation (`resoperation.py`). An eager synthetic for a position
+        // that is reserved but never emitted (label / jump on an empty
+        // trace) would leak into `phase1_emit_ops` via `live_synthetics`.
         // PyPy/RPython has no Box for positions that no `ResOperation()` /
         // `InputArg()` call produced (`resoperation.py`).
         OpRef::op_typed(raw, tp)
@@ -3719,8 +3620,13 @@ impl OptContext {
     ///
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
     /// so the backend's variable numbering stays consistent.
+    ///
+    /// `optimizer.py Optimizer._emit_operation` appends the same `op`
+    /// object it was handed. A recorder / extra / synthetic `OpRc` already
+    /// registered at this position is reused; a genuinely new
+    /// `ResOperation` (`emit_extra`, `copy_and_change`) is cloned.
     pub fn emit(&mut self, op: Op) -> OpRef {
-        self.emit_impl(op, false)
+        self.emit_impl(op)
     }
 
     /// Append an already-allocated `OpRc` without a second `ResOperation()`.
@@ -3766,7 +3672,17 @@ impl OptContext {
     /// one-node cycle.
     fn adopt_live_synthetic(&mut self, op_rc: &majit_ir::OpRc) {
         let op_pos = op_rc.pos().get();
-        let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) else {
+        // A live SameAs/extra stand-in, else the recorder box in
+        // `resop_refs`. `optimizer.py replace_op_with` forwards the old
+        // box (`op.set_forwarded(newop)`) when emit clones a new
+        // ResOperation (`copy_and_change`). `ptr_eq` with the recorder
+        // itself is a no-op carry.
+        let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos).or_else(|| {
+            self.resop_refs
+                .get(&op_pos)
+                .cloned()
+                .filter(|old| !OpRc::ptr_eq(old, op_rc))
+        }) else {
             return;
         };
         let carried = synth.forwarded().borrow().clone();
@@ -3802,20 +3718,13 @@ impl OptContext {
         dst.pos().set(src.pos().get());
     }
 
-    /// `emit` variant that REUSES the recorder input op (the `live_synthetics`
-    /// entry at this position) as the emitted producer instead of cloning into
-    /// a fresh `Rc<Op>`. The input op is the object later ops' operands already
-    /// wrap; making it the producer collapses the two-Op-per-position
-    /// duplication that the `live_synthetics` catch-up otherwise bridges by
-    /// copying `_forwarded` and linking input -> clone. One box per value, the
-    /// op IS the box (resoperation.py AbstractResOpOrInputArg). Falls back to the clone path when
-    /// no structurally-matching input op is live at this position.
+    /// Same as [`emit`]: recorder ops reuse the registered `OpRc`.
     #[allow(dead_code)] // resoperation.py AbstractResOp emit reuse
     pub(crate) fn emit_reusing(&mut self, op: Op) -> OpRef {
-        self.emit_impl(op, true)
+        self.emit_impl(op)
     }
 
-    fn emit_impl(&mut self, mut op: Op, reuse: bool) -> OpRef {
+    fn emit_impl(&mut self, mut op: Op) -> OpRef {
         if op.pos().get().is_none() || op.pos().get().is_constant() {
             // Tag the freshly allocated position with the producer op's
             // result type so the variant-tag readers
@@ -3935,65 +3844,25 @@ impl OptContext {
         // `debug_assert_box_type_invariant` below.
         Self::debug_assert_box_type_invariant(&op);
         let op_pos = op.pos().get();
-        // Reuse path: when an unchanged op flows through to final emission, reuse
-        // the recorder input op (the `live_synthetics` entry at this position) as
-        // the emitted producer rather than cloning. The input op is what later
-        // ops' operands already wrap, and the passes already wrote its
-        // `_forwarded` host via `find_producer_op`, so overwriting its args with
-        // the resolved operands and copying the descr makes it the single box per
-        // value (resoperation.py AbstractResOpOrInputArg the op IS the box). This is the structural
-        // collapse the clone path's catch-up only approximates by copying
-        // `_forwarded` onto a fresh clone and redirecting input -> clone.
-        // Guards used to be excluded because emit_guard_operation mutates
-        // the owned `op` (failargs / descr / rd_resume_position) before
-        // we get here. Stamp that same state onto the live recorder op
-        // instead of `Rc::new` — the opcode/num_args match still rejects
-        // a stand-in that is no longer the same guard.
-        if reuse {
-            // At most one live entry per position (emit invariant), so the
-            // O(1) index resolves the reuse candidate; the opcode/num_args
-            // predicate then guards against reusing a non-matching stand-in
-            // (fall through to the clone path on mismatch).
-            let reuse_match = self
-                .live_synthetics_index
-                .get(&op_pos)
-                .copied()
-                .is_some_and(|i| {
-                    let s = &self.live_synthetics[i];
-                    s.opcode == op.opcode && s.num_args() == op.num_args()
-                });
-            if reuse_match {
-                let reused = self
-                    .live_synthetics_swap_remove_pos(op_pos)
-                    .expect("index pointed at a live entry");
-                for k in 0..op.num_args() {
-                    reused.setarg(k, op.arg(k));
-                }
-                match op.getdescr() {
-                    Some(d) => reused.setdescr(d),
-                    None => reused.cleardescr(),
-                }
-                if op.opcode.is_guard() {
-                    if let Some(fa) = op.guard_fail_args() {
-                        reused.setfailargs(fa.iter().cloned().collect());
-                    } else {
-                        reused.clearfailargs();
-                    }
-                    match op.get_fail_arg_types() {
-                        Some(ts) => reused.set_fail_arg_types(ts),
-                        None => reused.clear_fail_arg_types(),
-                    }
-                    reused.set_rd_resume_position(op.rd_resume_position());
-                }
-                // optimizer.py `self._emittedoperations[op] = None`. The
-                // clone path below records this too; `get_producing_op` only
-                // admits producers present here, so the reused op must be
-                // marked emitted or it stays invisible to producer matching.
-                self.emitted_operations
-                    .insert(majit_ir::operand::Operand::from_bound_op(&reused));
-                self.push_new_operation(reused);
-                return op_pos;
-            }
+        // optimizer.py Optimizer._emit_operation appends the same `op`
+        // object (`TraceIterator.next` `_cache`). Reuse the registered
+        // `OpRc` when opcode and arity still match — the recorder box, an
+        // extra producer, or a SameAs synthetic being emitted as itself.
+        // Guard emit mutates failargs/descr on the owned `op` first
+        // (`emit_guard_operation`); stamp that state onto the registered
+        // box. Opcode/arity mismatch is `copy_and_change`: clone, and
+        // `adopt_live_synthetic` / `link_replaced_producer` forward the
+        // old box.
+        if let Some(reused) = self.resop_refs.get(&op_pos).cloned()
+            && reused.opcode == op.opcode
+            && reused.num_args() == op.num_args()
+        {
+            Self::stamp_emitted_op(&op, &reused);
+            self.adopt_live_synthetic(&reused);
+            self.emitted_operations
+                .insert(majit_ir::operand::Operand::from_bound_op(&reused));
+            self.push_new_operation(reused);
+            return op_pos;
         }
         let op_rc = OpRc::new(op);
         // Catch up any operand placeholder that `materialize_operand_at` created for
@@ -4002,8 +3871,8 @@ impl OptContext {
         // object; late binding establishes that connection so
         // subsequent `box.set_forwarded` reaches `op.forwarded`.
         //
-        // The synthetic stand-in registered for `op_pos` by `materialize_operand_at` /
-        // `bind_input_resops` is the `live_synthetics` entry at this position.
+        // The synthetic stand-in registered for `op_pos` by `materialize_operand_at`
+        // is the `live_synthetics` entry at this position.
         // `adopt_live_synthetic` migrates its `_forwarded` onto the real producer
         // and drops it from `live_synthetics` so the superseded stand-in is not
         // drained into `phase1_emit_ops`. Each `op_pos` has at most one live
@@ -4220,6 +4089,17 @@ impl OptContext {
             PreambleOpKind, ProducedShortOp, ShortPreambleBuilder,
         };
 
+        // shortpreamble.py `preamble_op.set_forwarded(info)` writes the
+        // ResOperation object `add_op_to_short` created. Phase 2's
+        // OptContext does not inherit Phase 1 `resop_refs`, so bind those
+        // boxes here (`bind_input_resops` / TraceIterator `_cache`) before
+        // `set_preamble_forwarded_info` resolves them by position.
+        let preamble_ops: Vec<majit_ir::OpRc> = short_boxes
+            .iter()
+            .map(|(_, produced_op)| produced_op.preamble_op.clone())
+            .collect();
+        self.bind_input_resops(&preamble_ops);
+
         // shortpreamble.py ShortPreambleBuilder.__init__ parity:
         //
         //   for produced_op in short_boxes:
@@ -4271,7 +4151,7 @@ impl OptContext {
                 // shortpreamble.py `preamble_op.set_forwarded(info)` — the
                 // info lives on the replay op, so `make_guards(preamble_op)`
                 // names that result rather than the export-time box.
-                self.set_preamble_forwarded_info(produced_op.preamble_op.pos().get(), info);
+                self.set_preamble_forwarded_info(&produced_op.preamble_op, info);
             }
         }
 
@@ -4806,29 +4686,29 @@ impl OptContext {
     /// shortpreamble.py `preamble_op.set_forwarded(info)` for imported
     /// short preamble ops. Store the same family of info values that RPython
     /// stores in `_forwarded`, without transforming them through
-    /// `setinfo_from_preamble` yet.
-    fn set_preamble_forwarded_info(
+    /// `setinfo_from_preamble` yet. The `preamble_op` object is the box
+    /// (`resoperation.py AbstractResOp`); register it so a later position
+    /// reader shares that host.
+    pub(crate) fn set_preamble_forwarded_info(
         &mut self,
-        source: OpRef,
+        preamble_op: &majit_ir::OpRc,
         info: &crate::optimizeopt::info::OpInfo,
     ) {
         use crate::optimizeopt::info::OpInfo;
-        if source.is_constant() {
+        let source = preamble_op.pos().get();
+        if source.is_constant() || source.is_none() {
             return;
         }
-        if let Some(b) = self.get_box_replacement_operand_opt(source)
-            && self.has_forwarding(&b)
-        {
+        if !matches!(
+            source,
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+        ) {
+            self.bind_input_resops(std::slice::from_ref(preamble_op));
+        }
+        let b = Operand::from_bound_op(preamble_op);
+        if self.has_forwarding(&b) {
             return;
         }
-        // shortpreamble.py `preamble_op.set_forwarded(info)`. The replay
-        // OpRef is a short-preamble op whose producer may not be registered
-        // yet (the Pure / Heap / LoopInvariant replay slot is seeded here,
-        // before the short-preamble body that builds the producing op).
-        // `materialize_operand_at` returns the canonical host, minting a `SameAs*`
-        // synthetic into `resop_refs` when absent; `emit()` later re-binds it
-        // to the real producer, carrying the forwarded state across.
-        let b = self.materialize_operand_at(source);
         match info {
             OpInfo::Unknown => b.clear_forwarded(),
             OpInfo::EmptyInfo(_) => b.set_forwarded_info(info.clone()),
@@ -5065,7 +4945,6 @@ impl OptContext {
                 new_info.lenbound = Some(crate::optimizeopt::intutils::IntBound::nonnegative());
             }
             self.set_ptr_info(&op_box, PtrInfo::Str(new_info));
-            return;
         }
 
         // unroll.py:91-92: is_nonnull → make_nonnull
@@ -5719,13 +5598,10 @@ impl OptContext {
     /// `resoperation.py get_box_replacement` (returns the last
     /// `AbstractResOpOrInputArg` before `None` / Info / a rejected Const).
     /// A position that resolves to neither a producer `Op`, an
-    /// `inputarg_refs` slot, nor a Const falls back to
-    /// [`Operand::bound_from_opref`], which mints a synthetic producer carrying
-    /// the same `pos` (`to_opref` byte-identical) rather than panicking. Every
-    /// value-bearing op-arg position has a findable producer, so the fallback
-    /// is unreachable for arg-resolution callers; `s9_probe_fire` records any
-    /// fire as an early warning (a fire signals an unbound operand fed as an op
-    /// arg, and would split the `Rc::ptr_eq` ExportCache rather than abort).
+    /// `inputarg_refs` slot, nor a Const is a bind-at-alloc gap: production
+    /// write-sites mint via `reserve_virtual_box` / `mint_box_at`. The
+    /// `bound_from_opref` arm is a debug-asserted release fallback (two
+    /// calls for the same unbound OpRef are not `ptr_eq`).
     pub(crate) fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
         if opref.is_none() {
             return Operand::None;
@@ -5733,6 +5609,11 @@ impl OptContext {
         if let Some(start) = self.resolve_to_operand(opref) {
             return start.get_box_replacement(false);
         }
+        debug_assert!(
+            cfg!(test),
+            "get_box_replacement_operand S9 bound_from_opref fallback: {opref:?} \
+             has no producer; mint at allocation (mint_box_at / reserve_virtual_box)"
+        );
         self.s9_probe_fire(opref);
         Operand::bound_from_opref(opref)
     }
@@ -5769,18 +5650,17 @@ impl OptContext {
         o
     }
 
-    /// "Box always exists" materializer (`resoperation.py:233-248
-    /// AbstractResOpOrInputArg._forwarded`). Returns the canonical bound
-    /// `_forwarded` host for `opref` as an [`Operand`] (`Op` / `InputArg`),
-    /// minting a `SameAs*` synthetic into `resop_refs` when no producer is
-    /// registered yet (the lazy-alloc arm). For a const-namespace OpRef
+    /// "Box always exists" materializer (`resoperation.py AbstractResOpOrInputArg._forwarded`).
+    /// Returns the canonical bound `_forwarded` host for `opref` as an
+    /// [`Operand`] (`Op` / `InputArg`). For a const-namespace OpRef
     /// returns a fresh `Operand::Const` (`history.py` no-dedup; Const
     /// boxes have no `_forwarded`, so any write the caller attempts is a
-    /// no-op). Unlike `resolve_to_operand` it never returns `None` for a
-    /// value-bearing OpRef — the explicit-mint endpoint (#47) at
-    /// find-or-create write sites whose receiver may be unbound (test
-    /// fixtures, short-preamble replay slots). The sentinel `OpRef::none()`
-    /// has no operand (debug-asserted); resolve it with
+    /// no-op). The InputArg arm binds a missing `inputarg_refs` slot.
+    /// A producer-less resop is a bind-at-alloc gap: production write-sites
+    /// mint via `reserve_virtual_box` / `mint_box_at`. The resop mint arm
+    /// is a debug-asserted release fallback. Unlike `resolve_to_operand`
+    /// this never returns `None` for a value-bearing OpRef. The sentinel
+    /// `OpRef::none()` has no operand (debug-asserted); resolve it with
     /// `resolve_to_operand` / `get_box_replacement_operand` instead.
     pub(crate) fn materialize_operand_at(&mut self, opref: OpRef) -> Operand {
         debug_assert!(
@@ -5833,22 +5713,16 @@ impl OptContext {
                 Operand::from_bound_inputarg(&self.inputarg_refs[&idx])
             }
             _ => {
-                // A resop reaching here has no producer in any
-                // `find_producer_op` store (else it returned above) —
-                // synthesise a `SameAsI/F/R` (or `Jump` for Void) stand-in
-                // with the correct result type into `resop_refs[opref]` so
-                // chain steps targeting this operand route through
-                // `Forwarded::Op(_)` (`optimizer.py:394
-                // op.set_forwarded(newop)` where `newop` is an
-                // `AbstractResOp`). `emit()` re-binds to the real producer
-                // when it arrives. A subsequent `materialize_operand_at` /
-                // `find_producer_op` for the same OpRef re-resolves to that
-                // synthetic (`resop_refs[opref].pos == opref`), so the
-                // synthetic is the stable `_forwarded` host across calls;
-                // no memoization side-table is needed.
-                let placeholder_type = opref.ty().unwrap_or(majit_ir::Type::Void);
-                let synthetic = self.mint_synthetic_resop(opref, placeholder_type);
-                Operand::from_bound_op(&synthetic)
+                // Producer-less resop: production write-sites mint at
+                // allocation (`reserve_virtual_box` / `mint_box_at`). This
+                // arm is a bind-at-alloc gap (`resoperation.py
+                // ResOperation(...)` creates the box immediately).
+                debug_assert!(
+                    cfg!(test),
+                    "materialize_operand_at resop arm: {opref:?} has no producer; \
+                     mint at allocation (mint_box_at / reserve_virtual_box)"
+                );
+                self.mint_box_at(opref)
             }
         }
     }
@@ -6537,7 +6411,7 @@ impl OptContext {
     ///     `unbounded` cell when the slot was `Forwarded::None` —
     ///     mirroring RPython's lazy `op.set_forwarded(IntBound())`
     ///     side-effect at line 111.
-    pub fn getintbound_handle(&mut self, op: &Operand) -> IntBoundHandle {
+    pub fn getintbound_handle(&self, op: &Operand) -> IntBoundHandle {
         use crate::optimizeopt::info::OpInfo;
         // optimizer.py:100 `assert op.type == 'i'`. Void admitted as the
         // pyre placeholder-box tolerance shared with `setintbound`.
@@ -7273,11 +7147,7 @@ impl OptContext {
                         // regalloc.py:1206: Const objects skip forcing.
                         // Constant OpRefs may collide with virtual positions;
                         // forcing would corrupt the virtual's PtrInfo.
-                        if self
-                            .get_box_replacement_operand_opt(farg.to_opref())
-                            .and_then(|cb| cb.const_value())
-                            .is_none()
-                        {
+                        if farg.get_box_replacement(false).const_value().is_none() {
                             self.force_box_inline(farg);
                         }
                     }
@@ -8732,6 +8602,73 @@ impl OptContext {
                  (forwarding.rs get_box_replacement walker invariant)",
                 )
             }
+        }
+    }
+
+    /// optimizer.py `Optimizer.getinfo`.
+    ///
+    /// ```python
+    /// def getinfo(self, op):
+    ///     if op.type == 'r':
+    ///         return getptrinfo(op)
+    ///     elif op.type == 'i':
+    ///         if self.is_raw_ptr(op):
+    ///             return getptrinfo(op)
+    ///         return self.getintbound(op)
+    ///     elif op.type == 'f':
+    ///         if get_box_replacement(op).is_constant():
+    ///             return info.FloatConstInfo(get_box_replacement(op))
+    /// ```
+    ///
+    /// Reads `_forwarded` off `op` itself (after `get_box_replacement`), never
+    /// by re-resolving `op.to_opref()` through the producer registry. A bound
+    /// box that the OpRef map does not know still exports its PtrInfo /
+    /// IntBound — the same object `unroll.py _expand_info` stores in
+    /// `exported_infos`.
+    pub fn getinfo(&self, op: &Operand) -> Option<crate::optimizeopt::info::OpInfo> {
+        use crate::optimizeopt::info::{FloatConstInfo, OpInfo};
+        match op.type_() {
+            majit_ir::Type::Ref => self.getinfo_ptr(op),
+            majit_ir::Type::Int => {
+                if self.is_raw_ptr(op) {
+                    self.getinfo_ptr(op)
+                } else {
+                    Some(self.getinfo_intbound(op))
+                }
+            }
+            majit_ir::Type::Float => {
+                let replaced = op.get_box_replacement(false);
+                if replaced.is_constant() {
+                    match replaced.const_value() {
+                        Some(Value::Float(f)) => {
+                            Some(OpInfo::FloatConstInfo(FloatConstInfo::new(f)))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            majit_ir::Type::Void => None,
+        }
+    }
+
+    fn getinfo_ptr(&self, op: &Operand) -> Option<crate::optimizeopt::info::OpInfo> {
+        use crate::optimizeopt::info::OpInfo;
+        match self.getptrinfo_handle(op) {
+            Some(PtrInfoHandle::Live(rc)) => Some(OpInfo::Ptr(rc)),
+            Some(PtrInfoHandle::Const(pi)) => Some(OpInfo::ptr(pi)),
+            None => None,
+        }
+    }
+
+    /// optimizer.py `getintbound(op)` as the `getinfo` int arm: always
+    /// returns an IntBound, lazily installing unbounded on a live box
+    /// (`op.set_forwarded(intbound)`).
+    fn getinfo_intbound(&self, op: &Operand) -> crate::optimizeopt::info::OpInfo {
+        use crate::optimizeopt::info::OpInfo;
+        match self.getintbound_handle(op) {
+            IntBoundHandle::Live(rc) | IntBoundHandle::Const(rc) => OpInfo::IntBound(rc),
         }
     }
 
@@ -10344,7 +10281,7 @@ mod boxref_forwarding_tests {
         ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
 
         // pos 2 = an INT_LT result not yet emitted; mint the stand-in the
-        // recorder / `bind_input_resops` seeds into resop_refs + live_synthetics.
+        // recorder / `bind_input_resops` seeds into resop_refs.
         let pos2 = OpRef::int_op(2);
         let _standin = ctx.mint_synthetic_resop(pos2, Type::Int);
 
@@ -13079,14 +13016,20 @@ mod opt_box_env_tests {
 
     #[test]
     fn materialize_operand_at_lazy_materialises_resop_for_empty_resop_slot() {
-        // Companion to the InputArg case — `OpRef::int_op(_)` must bind
-        // to a (synthetic) producing `Op`, not an InputArg host.
+        // Companion to the InputArg case — a producer-less `OpRef::int_op(_)`
+        // is minted at allocation (`mint_box_at`, the `ResOperation(...)`
+        // analog) and then found by `materialize_operand_at`.
         let mut ctx = OptContext::with_num_inputs(8, 0);
         let result = OpRef::int_op(3);
-        let materialised = ctx.materialize_operand_at(result);
-        let op = materialised
+        let minted = ctx.mint_box_at(result);
+        let op = minted
             .bound_op()
-            .expect("empty ResOp slot lazy-materialised the wrong host kind");
+            .expect("empty ResOp slot mint_box_at bound the wrong host kind");
         assert_eq!(op.pos().get(), result);
+        let second = ctx.materialize_operand_at(result);
+        assert!(
+            majit_ir::OpRc::ptr_eq(&op, &second.bound_op().expect("second bound to ResOp"),),
+            "materialize_operand_at must resolve to the mint_box_at host",
+        );
     }
 }

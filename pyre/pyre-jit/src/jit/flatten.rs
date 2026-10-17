@@ -1137,6 +1137,23 @@ impl Operand {
 /// `opname` field of `Insn::Op`, matching the tuple-shape exactly.
 pub const OPNAME_LIVE: &str = "-live-";
 
+/// Graph op the portal codewriter records for `dispatch_bytecode`'s
+/// `if self.debugdata: ec.bytecode_only_trace(self)`.  Flatten lowers
+/// each copy to `goto L_shared` and emits one out-of-line residual
+/// block per jitcode, matching the single copy in the dispatch loop.
+/// A per-instruction inlined skip overflowed the u16 `code_len`
+/// ceiling on `exception_metadata_jitstress.run` (76364 vs 62584).
+pub const OPNAME_COND_RESIDUAL_CALL_R_V: &str = "cond_residual_call_r_v";
+
+pub(super) const SHARED_WAJ_LABEL_PREFIX: &str = "waj";
+const SHARED_WAJ_LABEL: &str = "waj_shared";
+const SHARED_WAJ_DISPATCH_LABEL: &str = "waj_dispatch";
+/// `interp_jit.py PyFrame._virtualizable_`: last_instr, pycode,
+/// valuestackdepth, debugdata.  The shared block reads debugdata and
+/// last_instr; the switch key is `next_instr = r_uint(self.last_instr)`.
+const SHARED_WAJ_LAST_INSTR_FIELD_IDX: u16 = 0;
+const SHARED_WAJ_DEBUGDATA_FIELD_IDX: u16 = 3;
+
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
 /// The three RPython tuple shapes enumerated above: `Label`, `---`
@@ -1284,6 +1301,14 @@ pub struct GraphFlattener<'a> {
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
     next_label_id: usize,
+    /// Residual `bytecode_only_trace` args for the one out-of-line block
+    /// (`dispatch_bytecode` holds a single copy).
+    cond_residual_shared: Option<SpaceOperation>,
+    /// Portal frame the shared block reads `debugdata` / `last_instr` from.
+    cond_residual_frame: Option<FlowValue>,
+    /// `(last_instr, body_label)` so the shared block can switch back to
+    /// the opcode after `bytecode_only_trace`.
+    cond_residual_bodies: Vec<(i64, String)>,
     /// When `Some`, `flatten_space_operation` routes pre-rtype HLOp
     /// opnames from the four retired families (BINARY_OP / COMPARE_OP
     /// / BOOL / SETITEM) through
@@ -1326,6 +1351,9 @@ impl<'a> GraphFlattener<'a> {
             block_names: Vec::new(),
             link_names: Vec::new(),
             next_label_id: 0,
+            cond_residual_shared: None,
+            cond_residual_frame: None,
+            cond_residual_bodies: Vec::new(),
             lowering_ctx: None,
         }
     }
@@ -1422,6 +1450,10 @@ impl<'a> GraphFlattener<'a> {
                 self.ssarepr.pc_run_insn_pos.push((pos, py_pc));
             }
         }
+        if op.opname == OPNAME_COND_RESIDUAL_CALL_R_V {
+            self.serialize_cond_residual_call(op);
+            return;
+        }
         let insn = self.flatten_space_operation(op);
         // `jtransform.py:467-482` appends a `-live-` AFTER a call op so the
         // metainterp can snapshot the post-call resume state for
@@ -1445,6 +1477,117 @@ impl<'a> GraphFlattener<'a> {
 
     fn emitline(&mut self, insn: Insn) {
         self.ssarepr.insns.push(insn);
+    }
+
+    /// Fresh color past every graph-allocated one.  The assembler freezes
+    /// `num_regs_*` from `num_colors`, so the bump has to happen before
+    /// `try_assemble` (`assembler.py` `Assembler.emit_reg`).
+    fn alloc_scratch_reg(&mut self, kind: Kind) -> Register {
+        let alloc = &mut self.regallocs[kind.index()];
+        let color = alloc.num_colors;
+        alloc.num_colors += 1;
+        Register::new(kind, color)
+    }
+
+    /// `pyopcode.py dispatch_bytecode` holds one `if self.debugdata`
+    /// in the loop.  Each unrolled instruction jumps to that copy, then
+    /// the shared block switches on `last_instr` back to the opcode.
+    fn serialize_cond_residual_call(&mut self, op: &SpaceOperation) {
+        if self.cond_residual_shared.is_none() {
+            let residual =
+                SpaceOperation::new("residual_call_r_v", op.args.clone(), None, op.offset);
+            let frame = match op.args.get(1) {
+                Some(SpaceOperationArg::ListOfKind(list)) => list.content.get(1).cloned(),
+                other => panic!(
+                    "{OPNAME_COND_RESIDUAL_CALL_R_V} missing frame ListOfKind, got {other:?}"
+                ),
+            };
+            self.cond_residual_shared = Some(residual);
+            self.cond_residual_frame = Some(frame.unwrap_or_else(|| {
+                panic!("{OPNAME_COND_RESIDUAL_CALL_R_V} ListOfKind missing frame")
+            }));
+        }
+        let body_name = format!("waj{}", self.next_label_id);
+        self.next_label_id += 1;
+        self.cond_residual_bodies
+            .push((op.offset, body_name.clone()));
+        self.emitline(Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(SHARED_WAJ_LABEL))],
+        ));
+        self.emitline(Insn::Label(Label::new(body_name)));
+    }
+
+    fn emit_shared_cond_residual(&mut self) {
+        let Some(residual) = self.cond_residual_shared.take() else {
+            return;
+        };
+        let Some(frame) = self.cond_residual_frame.take() else {
+            return;
+        };
+        let bodies = std::mem::take(&mut self.cond_residual_bodies);
+        if bodies.is_empty() {
+            return;
+        }
+        let frame_op = self.getcolor(&frame);
+        // These dests are not graph Variables, so regalloc never colored
+        // them.  `assembler.py emit_reg` requires `reg < count_regs[kind]`
+        // once `num_regs` is frozen from `num_colors`; bump here so the
+        // extra color is part of that window.  Armed and last_instr share
+        // the Int scratch: `goto_if_not` kills armed before dispatch.
+        let debugdata_dst = self.alloc_scratch_reg(Kind::Ref);
+        let int_scratch = self.alloc_scratch_reg(Kind::Int);
+        self.emitline(Insn::Label(Label::new(SHARED_WAJ_LABEL)));
+        self.emitline(Insn::op_with_result(
+            "getfield_vable_r",
+            vec![
+                frame_op.clone(),
+                Operand::descr_vable_static_field(SHARED_WAJ_DEBUGDATA_FIELD_IDX),
+            ],
+            debugdata_dst,
+        ));
+        self.emitline(Insn::op_with_result(
+            "ptr_nonzero",
+            vec![Operand::Register(debugdata_dst)],
+            int_scratch,
+        ));
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op(
+            "goto_if_not",
+            vec![
+                Operand::Register(int_scratch),
+                Operand::TLabel(TLabel::new(SHARED_WAJ_DISPATCH_LABEL)),
+            ],
+        ));
+        let insn = self.flatten_space_operation(&residual);
+        let trailing_live = insn_needs_trailing_live(&insn);
+        self.emitline(insn);
+        if trailing_live {
+            self.emitline(Insn::live(Vec::new()));
+        }
+        self.emitline(Insn::Label(Label::new(SHARED_WAJ_DISPATCH_LABEL)));
+        self.emitline(Insn::op_with_result(
+            "getfield_vable_i",
+            vec![
+                frame_op,
+                Operand::descr_vable_static_field(SHARED_WAJ_LAST_INSTR_FIELD_IDX),
+            ],
+            int_scratch,
+        ));
+        let mut switchdict = SwitchDictDescr::new();
+        for (pc, body) in &bodies {
+            switchdict.labels.push((*pc, TLabel::new(body.clone())));
+        }
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op(
+            "switch",
+            vec![
+                Operand::Register(int_scratch),
+                Operand::descr(DescrOperand::SwitchDict(switchdict)),
+            ],
+        ));
+        self.emitline(Insn::op("unreachable", Vec::new()));
+        self.emitline(Insn::Unreachable);
     }
 
     /// `flatten.py popline`: pop the most recently emitted
@@ -2251,6 +2394,7 @@ impl<'a> GraphFlattener<'a> {
     pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
         self.make_bytecode_block(self.graph.startblock.clone(), false);
+        self.emit_shared_cond_residual();
     }
 
     fn make_bytecode_block(&mut self, block: BlockRef, handling_ovf: bool) {

@@ -559,6 +559,66 @@ fn abort_too_long_action() -> TraceAction {
     })
 }
 
+/// True when this recorded history already contains `CALL_ASSEMBLER`.
+/// `_opimpl_recursive_call` (`pyjitpl.py`) records that op once
+/// `dont_trace_here` has flipped `assembler_call=True`.
+fn trace_recorded_call_assembler(ctx: &TraceCtx) -> bool {
+    (0..ctx.opcode_at_len()).any(|i| {
+        matches!(
+            ctx.opcode_at(i),
+            Some(
+                majit_ir::OpCode::CallAssemblerI
+                    | majit_ir::OpCode::CallAssemblerR
+                    | majit_ir::OpCode::CallAssemblerF
+                    | majit_ir::OpCode::CallAssemblerN
+            )
+        )
+    })
+}
+
+/// `pyjitpl.py blackhole_if_trace_too_long` + `find_biggest_function`:
+/// the inlined frame that owns the most recorded ops is this portal itself.
+///
+/// A recursive Python unroll in FBW finishes (`Terminate`) well under
+/// `trace_limit` — `fib(20)` records ~955 ops here vs PyPy's ~8449 on the
+/// generic eval loop, which does trip `ABORT_TOO_LONG`. Without that abort
+/// the next attempt inlines the same portal again, reconstruction of the
+/// unrolled tree's multi-frame guards fails (`P2Drain::NoRecipes`), and
+/// `abort_ceiling` bans the cell. Naming the same portal here runs the
+/// upstream disable (`disable_noninlinable_function` + `trace_next_iteration`)
+/// so `_opimpl_recursive_call` records `CALL_ASSEMBLER` on the retrace.
+/// A history that already has that op is that retrace; a bridge Terminate is
+/// a specialization of the compiled token and must compile.
+fn recursive_portal_was_inlined(w_code: *const ()) -> bool {
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return false;
+    };
+    let Some((_, huge_key)) = driver.meta_interp().find_biggest_function() else {
+        return false;
+    };
+    match huge_key.1.as_ref() {
+        Some(typed) => typed.values.get(2).copied() == Some(w_code as i64),
+        None => false,
+    }
+}
+
+fn recursive_portal_terminate_without_call_assembler(
+    w_code: *const (),
+    ctx: &TraceCtx,
+) -> Option<TraceAction> {
+    if ctx.is_bridge_trace || trace_recorded_call_assembler(ctx) {
+        return None;
+    }
+    if !recursive_portal_was_inlined(w_code) {
+        return None;
+    }
+    crate::state::note_root_trace_too_long(
+        ctx.current_merge_points_first_green_key_pair(),
+        ctx.resumekey_original_loop_token().cloned(),
+    );
+    Some(abort_too_long_action())
+}
+
 pub(crate) fn range_foriter_demoted(key: u64) -> bool {
     RANGE_FORITER_DEMOTED.with(|s| s.borrow().contains(&key))
 }
@@ -4414,6 +4474,90 @@ fn blackhole_terminal_error(error: &crate::jitcode_dispatch::DispatchError) -> b
     ) || error.can_convert_seeded_inline()
 }
 
+/// Whether `marker` is the portal dispatch-top merge sandwich at `header_pc`.
+///
+/// `jtransform.py Transformer.handle_jit_marker__jit_merge_point` emits
+/// `[op3=-live-, jit_merge_point, op2=-live-]`. Guard resume lands on op2,
+/// so `loop_header_marker_jit_pc` is op2, not `merge_entry_for` (op3).
+/// `containing_py_pc_for_jitcode_pc(op2)` can name `header_pc + 1` when the
+/// next instruction's floor or block-head starts at op2; that is still the
+/// header merge (`interp_jit.py PyFrame.dispatch`), not a marker inside a
+/// super-instruction. Check the sandwich before attributing the marker to a
+/// later Python PC.
+fn portal_dispatch_merge_sandwich_contains(
+    pjc: &crate::pyjitcode::PyJitCode,
+    header_pc: usize,
+    marker: usize,
+) -> bool {
+    let code = pjc.jitcode.code.as_slice();
+    if live_follows_portal_merge(code, marker) {
+        return true;
+    }
+    let Some(entry) = pjc.merge_entry_for(header_pc) else {
+        return false;
+    };
+    if marker == entry {
+        return true;
+    }
+    if pjc.resume_marker_for_jitcode_pc(entry) == Some(marker) {
+        return true;
+    }
+    let Some(op3) = crate::jitcode_runtime::decode_op_at(code, entry) else {
+        return false;
+    };
+    if op3.opname != "live" {
+        return false;
+    }
+    let mut pc = op3.next_pc;
+    loop {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.opname == "live" {
+            return false;
+        }
+        if op.opname == "jit_merge_point" {
+            let hi = crate::jitcode_runtime::decode_op_at(code, op.next_pc)
+                .filter(|op2| op2.opname == "live")
+                .map(|op2| op2.pc)
+                .unwrap_or(op.pc);
+            let lo = entry.min(hi);
+            let hi = entry.max(hi);
+            return marker >= lo && marker <= hi;
+        }
+        if op.next_pc <= pc {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+}
+
+/// Guard-resume op2 sits immediately after `jit_merge_point`. Body merges
+/// are not in `merge_entry_by_green`, so the header-table path cannot name
+/// them; the byte stream still has the sandwich.
+fn live_follows_portal_merge(code: &[u8], marker: usize) -> bool {
+    let Some(at) = crate::jitcode_runtime::decode_op_at(code, marker) else {
+        return false;
+    };
+    if at.opname != "live" {
+        return false;
+    }
+    let mut pc = 0;
+    while pc < marker {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.next_pc == marker {
+            return op.opname == "jit_merge_point";
+        }
+        if op.next_pc <= pc || op.next_pc > marker {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+    false
+}
+
 fn run_perfn_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     flush_committed: &std::cell::Cell<bool>,
@@ -5091,15 +5235,25 @@ fn run_perfn_walk<Sym: WalkSym>(
                 },
                 _end_pc,
             )) => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
-                let marker_py =
-                    crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, marker)
-                        as usize;
-                if marker_py == *loop_header_pc
-                    && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
-                {
-                    *loop_header_pc + 1
+                // Sandwich first: op2 of the dispatch-top merge belongs to
+                // this header even when `containing_py_pc` names header+1.
+                if portal_dispatch_merge_sandwich_contains(&pjc, *loop_header_pc, marker) {
+                    *loop_header_pc
                 } else {
-                    marker_py
+                    let marker_py =
+                        crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, marker)
+                            as usize;
+                    if marker_py != *loop_header_pc {
+                        marker_py
+                    } else if pjc.merge_entry_for(*loop_header_pc).is_some() {
+                        // Marker inside a loop-header super-instruction.
+                        *loop_header_pc + 1
+                    } else {
+                        // Body merge: not a static loop header, so +1 would
+                        // skip the opcode the merge belongs to and flush a
+                        // NULL operand into the next instruction.
+                        *loop_header_pc
+                    }
                 }
             })),
             _ => None,
@@ -5408,11 +5562,26 @@ fn run_perfn_walk<Sym: WalkSym>(
             if commit_walk_end(flush_committed, WalkEndCommitLeg::VableEscape, resume) {
                 crate::jitcode_dispatch::discard_escape_flush_undo();
                 // The force-time escape flush wrote the resume state into the
-                // LIVE frame (the frame the callee inspected).  The portal
-                // epilogue propagates `executed_frame` → live on a committed
-                // flush, so mirror the live frame's resume state into the walk
-                // snapshot to make that copy the identity.
+                // LIVE frame (the frame the callee inspected).  A residual
+                // that is still running then puts the executing opcode back
+                // so `f_lasti` readers see it; an Exact interpreter resume
+                // needs `last_instr = resume_py_pc - 1` again.
                 let live = sym.live_vable_frame_addr();
+                if matches!(
+                    escape_kind,
+                    crate::jitcode_dispatch::EscapeResumeKind::Exact
+                ) {
+                    let frame = if live != 0 { live } else { cf_addr };
+                    if frame != 0 {
+                        unsafe {
+                            (*(frame as *mut pyre_interpreter::PyFrame)).last_instr =
+                                resume_py_pc as isize - 1;
+                        }
+                    }
+                }
+                // The portal epilogue propagates `executed_frame` → live on a
+                // committed flush, so mirror the live frame's resume state
+                // into the walk snapshot to make that copy the identity.
                 if live != 0 && cf_addr != 0 && live != cf_addr {
                     unsafe {
                         (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
@@ -6905,14 +7074,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // which only a MAIN trace should do.  So skip it for bridges.
     if !ctx.is_bridge_trace {
         let start_key = crate::driver::make_green_key(w_code, start_pc, is_being_profiled);
-        let input_types = ctx.inputarg_types();
-        let input_args: Vec<majit_metainterp::GreenBox> = input_types
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| {
-                majit_metainterp::GreenBox::new(majit_ir::OpRef::input_arg_typed(i as u32, tp), tp)
-            })
-            .collect();
+        let input_args: Vec<majit_metainterp::GreenBox> = ctx.inputarg_greenboxes();
         ctx.add_merge_point_with_key(
             start_key,
             Some(crate::driver::make_green_key_typed(
@@ -6991,6 +7153,10 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 finish_arg,
                 finish_arg_type,
             } => {
+                if let Some(action) = recursive_portal_terminate_without_call_assembler(w_code, ctx)
+                {
+                    return action;
+                }
                 // A loop-free portal exit: the top-level `*_return` reached
                 // `done_with_this_frame` with no back-edge.  The return arm
                 // routed through `fbw_terminate_with_finish`, which re-boxed the

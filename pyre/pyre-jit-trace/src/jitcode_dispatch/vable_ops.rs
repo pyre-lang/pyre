@@ -755,8 +755,19 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     // with, or the trace and the optimizer could disagree about the constant;
     // `trace.rs` installs this same `shared()` handle via `set_cpu`.
     let cpu = crate::pyre_cpu::shared();
+    // `_opimpl_getfield_vable` returns `virtualizable_boxes[index]` when
+    // `standard_box is box`.  The jitcode `VableField` descr may lack a
+    // vinfo backref, so `walker_nonstandard_virtualizable` would take
+    // `finish_known_nonstandard` and mark the portal frame nonstandard —
+    // the shared we_are_jitted `getfield debugdata` then poisons the
+    // subsequent `getfield last_instr` into a heap load of the snapshot
+    // ConstInt, and `switch` replays one opcode until TraceTooLong.
     let (result, shadow_value) = with_replace_frames(ctx, |ctx| {
-        let nonstandard = walker_nonstandard_virtualizable(ctx, pc, obj, &descr)?;
+        let nonstandard = if vable_is_standard_virtualizable(ctx, obj) {
+            false
+        } else {
+            walker_nonstandard_virtualizable(ctx, pc, obj, &descr)?
+        };
         Ok(match dst_bank {
             'i' => ctx.trace_ctx.vable_getfield_int_checked(
                 nonstandard,
@@ -930,23 +941,42 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
             _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
         };
         let descr = read_descr(code, op, 2, ctx)?;
-        if let (Some(Value::Int(value)), Some(field_index), Some(shadow)) = (
-            vable_value_concrete(code, op, 1, ctx, value_bank, value),
-            ctx.trace_ctx
-                .virtualizable_info()
-                .and_then(|info| info.static_field_by_descr(&descr)),
-            ctx.frame_state.borrow().callee_shadow.as_ref(),
-        ) {
-            if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
+        let field_index = ctx
+            .trace_ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_by_descr(&descr));
+        let concrete = vable_value_concrete(code, op, 1, ctx, value_bank, value);
+        let shadow_frame = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .map(|shadow| shadow.concrete_frame);
+        if let (Some(Value::Int(int_val)), Some(field_index), Some(frame)) =
+            (concrete, field_index, shadow_frame)
+        {
+            if let Some(frame) = durable_resume_frame(ctx, frame) {
                 fbw_arm_durable_frame_undo(frame);
             }
-            crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, value);
+            crate::state::store_live_frame_static_int(frame, field_index, int_val);
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setarrayitem_vable`: only the standard virtualizable
         // folds the write away. `_opimpl_setfield_vable` records `SETFIELD_GC`
         // for any other box.
         if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+            // `_opimpl_setfield_vable` always writes
+            // `virtualizable_boxes[index] = valuebox` (`pyjitpl.py`).  The
+            // live-frame store is the heap half; without this box write a
+            // later `getfield_vable` (the shared `dispatch_bytecode`
+            // `last_instr` / `debugdata` block) reads a stale slot.
+            if let (Some(field_index), Some(concrete)) = (field_index, concrete)
+                && ctx.trace_ctx.virtualizable_box_at(field_index).is_some()
+            {
+                ctx.trace_ctx
+                    .set_virtualizable_entry_at(field_index, value, concrete);
+                ctx.trace_ctx.synchronize_virtualizable_at(field_index);
+            }
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
@@ -996,7 +1026,160 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `setfield_vable_i_imm/rddd`: `_opimpl_setfield_vable` with a u32 immediate
+fn skip_lives(code: &[u8], mut pc: usize) -> usize {
+    while let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
+        if op.key != "live/" {
+            break;
+        }
+        pc = op.next_pc;
+    }
+    pc
+}
+
+/// Flatten's shared we_are_jitted block: `getfield debugdata` /
+/// `ptr_nonzero` / `goto_if_not` / residual / `switch last_instr`.
+fn is_shared_waj_block(code: &[u8], target: usize) -> bool {
+    let Some(getfield) = crate::jitcode_runtime::decode_op_at(code, target) else {
+        return false;
+    };
+    if getfield.key != "getfield_vable_r/rd>r" {
+        return false;
+    }
+    let Some(ptr_nz) =
+        crate::jitcode_runtime::decode_op_at(code, skip_lives(code, getfield.next_pc))
+    else {
+        return false;
+    };
+    if ptr_nz.key != "ptr_nonzero/r>i" {
+        return false;
+    }
+    let Some(gin) = crate::jitcode_runtime::decode_op_at(code, skip_lives(code, ptr_nz.next_pc))
+    else {
+        return false;
+    };
+    gin.key == "goto_if_not/iL"
+}
+
+/// Walker-inline the factored `dispatch_bytecode` we_are_jitted copy.
+///
+/// Upstream holds one `if self.debugdata: ec.bytecode_only_trace(self);
+/// next_instr = r_uint(self.last_instr)` in the dispatch loop.  Pyre
+/// unrolls the loop, so flatten emits `goto L_shared` per instruction
+/// and one out-of-line residual.  The unarmed arm does not reread
+/// `last_instr` (`pyopcode.py dispatch_bytecode`); resume at the opcode
+/// body that follows the `goto`.  The armed arm falls through to the
+/// residual and the `switch` (`next_instr = r_uint(self.last_instr)`).
+pub(crate) fn try_inline_shared_waj_goto<Sym: WalkSym>(
+    code: &[u8],
+    goto_op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    target: usize,
+) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
+    if !is_shared_waj_block(code, target) {
+        return None;
+    }
+    let getfield = crate::jitcode_runtime::decode_op_at(code, target)?;
+    let (_, mut pc) = match getfield_vable_via_metainterp(code, &getfield, ctx, 'r') {
+        Ok(pair) => pair,
+        Err(err) => return Some(Err(err)),
+    };
+    pc = skip_lives(code, pc);
+    let ptr_nz = crate::jitcode_runtime::decode_op_at(code, pc)?;
+    if ptr_nz.key != "ptr_nonzero/r>i" {
+        return None;
+    }
+    let (_, pc) = match super::arith::ptr_nullity_record(code, &ptr_nz, ctx, true) {
+        Ok(pair) => pair,
+        Err(err) => return Some(Err(err)),
+    };
+    let gin = crate::jitcode_runtime::decode_op_at(code, skip_lives(code, pc))?;
+    if gin.key != "goto_if_not/iL" {
+        return None;
+    }
+    let valuebox = match read_int_reg(code, &gin, 0, ctx) {
+        Ok(value) => value,
+        Err(err) => return Some(Err(err)),
+    };
+    let switchcase = match ctx.trace_ctx.concrete_of_opref(valuebox) {
+        Some(Value::Int(v)) => v,
+        _ => {
+            return Some(Err(DispatchError::GotoIfNotValueNotConcrete {
+                pc: gin.pc,
+                value: valuebox,
+            }));
+        }
+    };
+    // Unarmed (`switchcase == 0`): jump to the opcode body after `goto
+    // L_shared`.  Resume the armed arm at this `goto` so blackhole
+    // re-enters the one `dispatch_bytecode` copy with this opcode's
+    // live — the shared residual's `-live-` is the union of every body.
+    if switchcase == 0 {
+        return Some(super::goto_if_not_branch_on_with_other(
+            code,
+            &gin,
+            ctx,
+            valuebox,
+            switchcase,
+            goto_op.next_pc,
+            goto_op.pc,
+        ));
+    }
+    // Armed: walk the one residual then the opcode body.  Snapshot,
+    // GuardNotForced, and ABORT_ESCAPE resume at this `goto` so
+    // `last_instr` / fail_args / blackhole stay on this opcode's live
+    // (`dispatch_bytecode`'s in-loop copy).  Walking the shared
+    // `switch last_instr` instead stuck on the merge-point ConstInt
+    // (TraceTooLong).  Capturing at the residual published RETURN's
+    // `last_instr` (acc 576201 on the armed-before-entry fixture).
+    match super::goto_if_not_branch_on(code, &gin, ctx, valuebox, switchcase, goto_op.next_pc) {
+        Ok((DispatchOutcome::Continue, _)) => {}
+        other => return Some(other),
+    }
+    let residual_pc = skip_lives(code, gin.next_pc);
+    let residual = crate::jitcode_runtime::decode_op_at(code, residual_pc)?;
+    if !residual.key.starts_with("residual_call_r_v") {
+        return None;
+    }
+    match super::residual_call::dispatch_residual_call_iRd_kind_at(
+        code,
+        &residual,
+        ctx,
+        'v',
+        goto_op.pc,
+        goto_op.next_pc,
+    ) {
+        Ok((DispatchOutcome::Continue, _)) => {
+            Some(Ok((DispatchOutcome::Continue, goto_op.next_pc)))
+        }
+        other => Some(other),
+    }
+}
+
+/// Whether `vable` is the standard virtualizable identity, by Box or by
+/// the concrete frame pointer `virtualizable_boxes[-1]` carries.
+///
+/// `_nonstandard_virtualizable` compares Box identity first
+/// (`pyjitpl.py`); a portal frame register that is a copy of that
+/// identity still names the same object, and the shared
+/// `dispatch_bytecode` `last_instr` reread (`next_instr =
+/// r_uint(self.last_instr)`) has to see the store.
+fn vable_is_standard_virtualizable<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    vable: OpRef,
+) -> bool {
+    if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+        return true;
+    }
+    let Some(std_ptr) = ctx.trace_ctx.standard_virtualizable_ptr() else {
+        return false;
+    };
+    matches!(
+        ctx.trace_ctx.lookup_opref_concrete(vable),
+        Some(Value::Ref(ptr)) if ptr.as_usize() == std_ptr
+    )
+}
+
+/// `setfield_vable_i_imm/rdd`: `_opimpl_setfield_vable` with a u16 immediate
 /// instead of an int register. Same standard-vable box update, no recorded
 /// op (`pyjitpl.py` `_opimpl_setfield_vable`).
 pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
@@ -1004,35 +1187,88 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let lo = code[op.pc + 2] as u32 | ((code[op.pc + 3] as u32) << 8);
-    let hi = code[op.pc + 4] as u32 | ((code[op.pc + 5] as u32) << 8);
-    let imm = (lo | (hi << 16)) as i64;
+    let imm = (code[op.pc + 2] as u16 | ((code[op.pc + 3] as u16) << 8)) as i64;
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
-        let descr = read_descr(code, op, 5, ctx)?;
-        if let (Some(field_index), Some(shadow)) = (
-            ctx.trace_ctx
-                .virtualizable_info()
-                .and_then(|info| info.static_field_by_descr(&descr)),
-            ctx.frame_state.borrow().callee_shadow.as_ref(),
-        ) {
-            if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
-                fbw_arm_durable_frame_undo(frame);
+        let descr = read_descr(code, op, 3, ctx)?;
+        let field_index = ctx
+            .trace_ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_by_descr(&descr));
+        let shadow_frame = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .map(|shadow| shadow.concrete_frame);
+        if let (Some(field_index), Some(frame)) = (field_index, shadow_frame) {
+            if frame != 0 {
+                if let Some(frame) = durable_resume_frame(ctx, frame) {
+                    fbw_arm_durable_frame_undo(frame);
+                }
+                crate::state::store_live_frame_static_int(frame, field_index, imm);
             }
-            crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, imm);
         }
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        let obj = read_ref_reg_raw(code, op, 0, ctx)?;
+        let is_std = vable_is_standard_virtualizable(ctx, obj);
+        let has_box =
+            field_index.is_some_and(|index| ctx.trace_ctx.virtualizable_box_at(index).is_some());
+        // Same split as `setfield_vable_via_metainterp`: only the
+        // standard virtualizable folds the write away.
+        // `_opimpl_setfield_vable` always writes
+        // `virtualizable_boxes[index] = valuebox`.
+        if is_std {
+            if let Some(field_index) = field_index
+                && has_box
+            {
+                let imm_box = ctx.trace_ctx.const_int(imm);
+                ctx.trace_ctx
+                    .set_virtualizable_entry_at(field_index, imm_box, Value::Int(imm));
+                ctx.trace_ctx.synchronize_virtualizable_at(field_index);
+            }
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // Identity mismatch: fall through to `vable_setfield_checked`
+        // (records SETFIELD_GC for a nonstandard box).
     }
     let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     if obj.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let descr = read_descr(code, op, 5, ctx)?;
+    let descr = read_descr(code, op, 3, ctx)?;
     let concrete = Some(Value::Int(imm));
     let inline_field_index = ctx
         .trace_ctx
         .virtualizable_info()
         .and_then(|info| info.static_field_by_descr(&descr));
+    let is_std = vable_is_standard_virtualizable(ctx, obj);
+    let has_box =
+        inline_field_index.is_some_and(|index| ctx.trace_ctx.virtualizable_box_at(index).is_some());
+    // Root portal walks have `fold_frame_reg == MAX` (no callee_shadow).
+    // `_opimpl_setfield_vable` still writes `virtualizable_boxes[index]
+    // = valuebox` for the standard virtualizable, including when the
+    // frame register is a copy of `virtualizable_boxes[-1]`.
+    if is_std {
+        if let Some(field_index) = inline_field_index
+            && has_box
+        {
+            let imm_box = ctx.trace_ctx.const_int(imm);
+            ctx.trace_ctx
+                .set_virtualizable_entry_at(field_index, imm_box, Value::Int(imm));
+            ctx.trace_ctx.synchronize_virtualizable_at(field_index);
+        }
+        if let (Some(frame), Some(field_index)) = (
+            current_inline_vable_target(ctx, obj)
+                .or_else(|| ctx.trace_ctx.standard_virtualizable_ptr()),
+            inline_field_index,
+        ) {
+            if let Some(frame) = durable_resume_frame(ctx, frame) {
+                fbw_arm_durable_frame_undo(frame);
+            }
+            crate::state::store_live_frame_static_int(frame, field_index, imm);
+        }
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     let write = with_replace_frames(ctx, |ctx| {
         let nonstandard = walker_nonstandard_virtualizable(ctx, op.pc, obj, &descr)?;
         Ok(ctx.trace_ctx.vable_setfield_checked(

@@ -194,15 +194,6 @@ pub struct JitCodeBuilder {
     /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs`) panics on
     /// the `get_parent_descr()` of a virtualized struct field.
     struct_size_specs: rustc_hash::FxHashMap<u64, BhSizeSpec>,
-    /// Pyre-only bridge for canonical `residual_call_*_v`: the bytecode
-    /// itself keeps the RPython shape (`i` funcptr operand + `d`
-    /// calldescr operand), while the runtime trace path still needs the
-    /// separate `{trace_ptr, concrete_ptr}` pair. Keying by the `d`
-    /// operand keeps the bridge per callsite and avoids collapsing
-    /// different trace wrappers that share a concrete function pointer.
-    /// Drained into `JitCodeExecState.call_descr_to_call_target` at
-    /// `finish()`.
-    call_descr_to_call_target: indexmap::IndexMap<u16, JitCallTarget>,
     /// RPython `jitcode.py JitCode.setup self._resulttypes = resulttypes` —
     /// per-instruction result-kind char keyed by end-of-instruction
     /// position (`assembler.py:217-219`).  Consumed by
@@ -510,6 +501,17 @@ impl JitCodeBuilder {
             self.write_insn("int_copy/c>i");
             self.push_u8(short as u8);
             self.push_reg_u8(dst, "int_copy/c>i dst");
+            return;
+        }
+        // Bytecode offsets past 127 (`emit_const` short range) still fit
+        // the u16 jump-target space (`assembler.py` `fix_labels`). Encoding
+        // them inline keeps `verify_green_args`' ConstInt without a
+        // `constants_i` slot per unique PC.
+        if let Ok(imm) = u16::try_from(value) {
+            self.touch_reg(dst);
+            self.write_insn("int_copy/d>i");
+            self.push_u16(imm);
+            self.push_reg_u8(dst, "int_copy/d>i dst");
             return;
         }
         let const_idx = self.add_const_i(value);
@@ -1562,18 +1564,27 @@ impl JitCodeBuilder {
         // constant value would take a `constants_i` slot. One slot per
         // Python instruction (`dispatch_bytecode` `last_instr`) overflows
         // `check_result`'s 256-wide int index space. The immediate form
-        // writes the u32 inline and shares the `VableField` descr with
+        // writes a u16 inline and shares the `VableField` descr with
         // `setfield_vable_i/rid`. Blackhole `handler_setfield_vable_i_imm`
-        // and the walker's `setfield_vable_i_imm/rddd` arm execute it as
-        // `_opimpl_setfield_vable`.
-        let imm = u32::try_from(value)
-            .unwrap_or_else(|_| panic!("setfield_vable_i immediate {value} does not fit in u32"));
+        // and the walker's `setfield_vable_i_imm/rdd` arm execute it as
+        // `_opimpl_setfield_vable`. Values that do not fit u16 (a negative
+        // abort coordinate) fall back to a pooled `setfield_vable_i/rid`.
         self.touch_ref_reg(vable_reg);
         let field_descr = self.add_vable_field_descr(field_idx);
-        self.write_insn("setfield_vable_i_imm/rddd");
+        if let Ok(imm) = u16::try_from(value) {
+            self.write_insn("setfield_vable_i_imm/rdd");
+            self.push_reg_u8(vable_reg, "setfield_vable_i base");
+            self.push_u16(imm);
+            self.push_u16(field_descr);
+            return;
+        }
+        let const_idx = self.add_const_i(value);
+        self.write_insn("setfield_vable_i/rid");
         self.push_reg_u8(vable_reg, "setfield_vable_i base");
-        self.push_u16(imm as u16);
-        self.push_u16((imm >> 16) as u16);
+        let src_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((src_offset, ConstKind::Int, const_idx));
         self.push_u16(field_descr);
     }
 
@@ -4612,10 +4623,8 @@ impl JitCodeBuilder {
     /// adapter — bridges `fn_ptr_idx`-using emit sites to the
     /// canonical `residual_call_*_v` byte layout. Looks up the
     /// `JitCallTarget` at `descrs[fn_ptr_idx]`, materializes
-    /// `concrete_ptr` in the int constants pool, derives a `BhCallDescr`
-    /// from `arg_regs` kinds (result `Void`, default `EffectInfo`), and
-    /// records the pyre-only `(calldescr_idx → JitCallTarget)` bridge for
-    /// trace-time pointer selection.
+    /// `concrete_ptr` in the int constants pool, and derives a `BhCallDescr`
+    /// from `arg_regs` kinds (result `Void`, default `EffectInfo`).
     ///
     /// The 7 production emit sites referenced in
     /// ()
@@ -4728,6 +4737,14 @@ impl JitCodeBuilder {
         );
     }
 
+    /// Callee address baked as the `i` operand. Upstream
+    /// `Assembler.emit_const` encodes the function `Constant`;
+    /// `MIFrame.do_residual_call` reads it as the funcbox.
+    fn baked_call_funcptr(target: JitCallTarget) -> i64 {
+        assert_eq!(target.trace_ptr, target.concrete_ptr);
+        target.concrete_ptr as i64
+    }
+
     /// Emit the canonical `residual_call_{r,ir,irf}_v` opname/argcodes byte
     /// layout.
     ///
@@ -4740,7 +4757,7 @@ impl JitCodeBuilder {
         args: &[JitCallArg],
         calldescr: majit_jitcode::codewriter::jitcode::BhCallDescr,
     ) {
-        let calldescr_idx = self.emit_canonical_call_void(
+        self.emit_canonical_call_void(
             (
                 jitcode::insns::BC_RESIDUAL_CALL_R_V,
                 jitcode::insns::BC_RESIDUAL_CALL_IR_V,
@@ -4750,8 +4767,6 @@ impl JitCodeBuilder {
             args,
             calldescr,
         );
-        self.call_descr_to_call_target
-            .insert(calldescr_idx, JitCallTarget::from_fnaddr(funcptr));
     }
 
     /// Generic canonical `*_v` emission body shared by `residual_call`,
@@ -4913,10 +4928,8 @@ impl JitCodeBuilder {
 
     /// Generic via_target body shared by Slices 1 and 2: resolves the
     /// `JitCallTarget` at `descrs[fn_ptr_idx]`, materializes
-    /// `concrete_ptr` in the int constants pool, derives a void
-    /// `BhCallDescr` from arg kinds and effect policy, and records the
-    /// pyre trace/concrete pointer bridge against the emitted `d`
-    /// operand.
+    /// `concrete_ptr` in the int constants pool, and derives a void
+    /// `BhCallDescr` from arg kinds and effect policy.
     fn emit_canonical_call_void_via_target(
         &mut self,
         opcodes: (u8, u8, u8),
@@ -4951,7 +4964,7 @@ impl JitCodeBuilder {
                  RuntimeBhDescr::Call, got {other:?}"
             ),
         };
-        let concrete_ptr = target.concrete_ptr as i64;
+        let concrete_ptr = Self::baked_call_funcptr(target);
 
         let arg_classes: String = arg_regs
             .iter()
@@ -4971,9 +4984,7 @@ impl JitCodeBuilder {
         } else {
             calldescr
         };
-        let calldescr_idx =
-            self.emit_canonical_call_void(opcodes, concrete_ptr, arg_regs, calldescr);
-        self.call_descr_to_call_target.insert(calldescr_idx, target);
+        self.emit_canonical_call_void(opcodes, concrete_ptr, arg_regs, calldescr);
     }
 
     /// Sibling of `emit_canonical_call_void` for the non-void result
@@ -5022,10 +5033,8 @@ impl JitCodeBuilder {
     /// [`Self::emit_canonical_call_void_via_target`] threading `dst` /
     /// `dst_kind` for the trailing result-bank byte.  Resolves the
     /// `JitCallTarget` at `descrs[fn_ptr_idx]`, materialises
-    /// `concrete_ptr` in the int constants pool, derives a typed
-    /// `BhCallDescr` from arg kinds + `result_type` + `effect_info`,
-    /// and records the pyre trace/concrete pointer bridge against the
-    /// emitted `d` operand.
+    /// `concrete_ptr` in the int constants pool, and derives a typed
+    /// `BhCallDescr` from arg kinds + `result_type` + `effect_info`.
     #[allow(dead_code)]
     #[expect(
         clippy::too_many_arguments,
@@ -5049,7 +5058,7 @@ impl JitCodeBuilder {
                  RuntimeBhDescr::Call, got {other:?}"
             ),
         };
-        let concrete_ptr = target.concrete_ptr as i64;
+        let concrete_ptr = Self::baked_call_funcptr(target);
         let arg_classes: String = arg_regs
             .iter()
             .map(|a| match a.kind {
@@ -5063,15 +5072,7 @@ impl JitCodeBuilder {
             result_type,
             effect_info,
         );
-        let calldescr_idx = self.emit_canonical_call_typed(
-            opcodes,
-            concrete_ptr,
-            arg_regs,
-            calldescr,
-            dst,
-            dst_kind,
-        );
-        self.call_descr_to_call_target.insert(calldescr_idx, target);
+        self.emit_canonical_call_typed(opcodes, concrete_ptr, arg_regs, calldescr, dst, dst_kind);
     }
 
     /// Int-result sibling of
@@ -5272,16 +5273,10 @@ impl JitCodeBuilder {
         // give an `-> i64` signature carrying `f64::to_bits`
         // (`emit_helper_call_target_fn`, `majit-macros/src/lib.rs`).
         // Only the `*_float_wrapped` call policies mint that divergence, and
-        // no crate declares one; assert the invariant here so the first declaration
-        // trips a build rather than silently stamping a float read out of the
-        // integer return register.
-        debug_assert_eq!(
-            target.trace_ptr, target.concrete_ptr,
-            "float residual call bakes concrete_ptr as its funcbox; a distinct \
-             concrete target is the i64-packing `_concrete` wrapper and would be \
-             read from the wrong return register"
-        );
-        let concrete_ptr = target.concrete_ptr as i64;
+        // no crate declares one; `baked_call_funcptr` asserts the invariant so
+        // the first declaration trips a build rather than silently stamping a
+        // float read out of the integer return register.
+        let concrete_ptr = Self::baked_call_funcptr(target);
         let arg_classes: String = arg_regs
             .iter()
             .map(|a| match a.kind {
@@ -5295,9 +5290,7 @@ impl JitCodeBuilder {
             majit_ir::value::Type::Float,
             effect_info,
         );
-        let calldescr_idx =
-            self.emit_canonical_call_typed_irf_f(concrete_ptr, arg_regs, calldescr, dst);
-        self.call_descr_to_call_target.insert(calldescr_idx, target);
+        self.emit_canonical_call_typed_irf_f(concrete_ptr, arg_regs, calldescr, dst);
     }
 
     // ── typed policy variants (dormant) ──
@@ -5432,8 +5425,7 @@ impl JitCodeBuilder {
 
     /// low-level int-result direct entry — sibling of
     /// [`Self::residual_call_void_canonical_typed_args`].  Skips the
-    /// `JitCallTarget` resolution and registers a self-bridging
-    /// `(funcptr, funcptr)` pair (mirrors void at line 1645).
+    /// `JitCallTarget` resolution and bakes `funcptr` as the `i` operand.
     #[allow(dead_code)]
     pub fn residual_call_int_canonical_typed_args(
         &mut self,
@@ -5442,7 +5434,7 @@ impl JitCodeBuilder {
         calldescr: majit_jitcode::codewriter::jitcode::BhCallDescr,
         dst: u16,
     ) {
-        let calldescr_idx = self.emit_canonical_call_typed(
+        self.emit_canonical_call_typed(
             (
                 jitcode::insns::BC_RESIDUAL_CALL_R_I,
                 jitcode::insns::BC_RESIDUAL_CALL_IR_I,
@@ -5454,8 +5446,6 @@ impl JitCodeBuilder {
             dst,
             JitArgKind::Int,
         );
-        self.call_descr_to_call_target
-            .insert(calldescr_idx, JitCallTarget::from_fnaddr(funcptr));
     }
 
     #[allow(dead_code)]
@@ -5466,7 +5456,7 @@ impl JitCodeBuilder {
         calldescr: majit_jitcode::codewriter::jitcode::BhCallDescr,
         dst: u16,
     ) {
-        let calldescr_idx = self.emit_canonical_call_typed(
+        self.emit_canonical_call_typed(
             (
                 jitcode::insns::BC_RESIDUAL_CALL_R_R,
                 jitcode::insns::BC_RESIDUAL_CALL_IR_R,
@@ -5478,8 +5468,6 @@ impl JitCodeBuilder {
             dst,
             JitArgKind::Ref,
         );
-        self.call_descr_to_call_target
-            .insert(calldescr_idx, JitCallTarget::from_fnaddr(funcptr));
     }
 
     #[allow(dead_code)]
@@ -5490,9 +5478,7 @@ impl JitCodeBuilder {
         calldescr: majit_jitcode::codewriter::jitcode::BhCallDescr,
         dst: u16,
     ) {
-        let calldescr_idx = self.emit_canonical_call_typed_irf_f(funcptr, args, calldescr, dst);
-        self.call_descr_to_call_target
-            .insert(calldescr_idx, JitCallTarget::from_fnaddr(funcptr));
+        self.emit_canonical_call_typed_irf_f(funcptr, args, calldescr, dst);
     }
 
     // `CALL_ASSEMBLER` is a trace IR op (`history.rs`, pyjitpl
@@ -5721,7 +5707,7 @@ impl JitCodeBuilder {
             result_type,
             effect_info,
         );
-        let funcptr_const_idx = self.add_const_i(target.concrete_ptr as i64);
+        let funcptr_const_idx = self.add_const_i(Self::baked_call_funcptr(target));
         let calldescr_idx = self.add_call_descr(calldescr);
 
         self.write_insn(key);
@@ -5756,7 +5742,6 @@ impl JitCodeBuilder {
             self.push_reg_u8(dst, "cond/record result");
             self.record_resulttype(kind);
         }
-        self.call_descr_to_call_target.insert(calldescr_idx, target);
     }
 
     /// RPython `blackhole.py` `bhimpl_int_copy(a) returns=i`.
@@ -6439,19 +6424,12 @@ impl JitCodeBuilder {
     /// Append a `CanonicalBhDescr::Call { calldescr }` entry to the descrs
     /// pool and return its index. Used by canonical `residual_call_*` /
     /// `call_*` emit paths that need a `d` argcode descriptor (RPython
-    /// `assembler.py:197-207` `_encode_descr(calldescr)`).
+    /// `assembler.py Assembler.write_insn` `AbstractDescr` arm).
     ///
-    /// TODO: dedup is intentionally NOT done for the
-    /// `Call` variant. RPython's `descr.py:660-668 _key_for_caching`
-    /// dedups calldescrs on `(arg_classes, RESULT_ERASED, ffi_flags,
-    /// extrainfo)` because the funcptr lives in `op.args[0]` separately
-    /// from the descr. Pyre's adapter records a sidetable
-    /// `JitCodeExecState.call_descr_to_call_target` keyed by the descr
-    /// slot, so dedup'ing two distinct callees that share a signature
-    /// would cause the second emit's `(trace_ptr, concrete_ptr)` pair to
-    /// silently overwrite the first's. The convergence path is to lift
-    /// the sidetable onto the funcptr int-const slot once trace_ptr and
-    /// concrete_ptr unify; until then each emit gets a fresh descr slot.
+    /// Call descrs are not deduplicated: each emit gets a fresh descr
+    /// slot. Upstream `descr.py _key_for_caching` memos on
+    /// `(arg_classes, RESULT_ERASED, ffi_flags, extrainfo)` because the
+    /// funcptr lives in `op.args[0]`. Enabling that memo is a later task.
     pub fn add_call_descr(
         &mut self,
         calldescr: majit_jitcode::codewriter::jitcode::BhCallDescr,
@@ -6654,7 +6632,6 @@ impl JitCodeBuilder {
         jc.set_body(body);
         jc.exec = super::JitCodeExecState {
             descrs: self.descrs,
-            call_descr_to_call_target: self.call_descr_to_call_target,
             // Propagate the captured `BC_JIT_MERGE_POINT(_C)` opcode
             // offset so `register_dispatch_jitcode` validates the payload
             // by direct seek instead of byte-stream scan
@@ -7374,13 +7351,8 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 && lhs_interior_fields == rhs_interior_fields
                 && lhs_is_gc_managed == rhs_is_gc_managed
         }
-        // TODO: `Call` variant intentionally falls
-        // through `_ => false`. See `add_call_descr`'s docstring — pyre's
-        // per-callsite `JitCodeExecState.call_descr_to_call_target`
-        // sidetable is keyed by descr slot, so dedup'ing two distinct
-        // callees that share a signature would clobber the sidetable
-        // entry. The convergence path requires lifting the sidetable
-        // onto the funcptr int-const slot first.
+        // `Call` falls through `_ => false`: call descrs are not
+        // deduplicated. See `add_call_descr`.
         _ => false,
     }
 }
@@ -8013,6 +7985,7 @@ mod tests {
         // `load_const_i_value` emits the `USE_C_FORM` short encoding for
         // byte-sized constants, so wire both `int_copy` variants.
         entries.insert("int_copy/c>i".to_string(), jitcode::insns::BC_MOVE_I_C);
+        entries.insert("int_copy/d>i".to_string(), jitcode::insns::BC_MOVE_I_D);
         entries.insert("int_return/i".to_string(), jitcode::insns::BC_INT_RETURN);
         let mut builder = BlackholeInterpBuilder::new();
         builder.setup_insns(&entries);
@@ -8363,7 +8336,7 @@ mod tests {
     fn residual_call_void_via_target_keeps_source_arg_classes() {
         let mut builder = JitCodeBuilder::new();
         let trace_ptr = 0x1111usize as *const ();
-        let concrete_ptr = 0x2222usize as *const ();
+        let concrete_ptr = 0x1111usize as *const ();
         let fn_idx = builder.add_call_target(trace_ptr, concrete_ptr);
         let start = builder.current_pos();
         builder.residual_call_void_canonical_via_target(
@@ -8384,18 +8357,19 @@ mod tests {
             entry.as_bh_descr().unwrap().as_calldescr().arg_classes,
             "ri"
         );
+        let funcptr_reg = bytes[1] as usize;
         assert_eq!(
-            jitcode.exec.call_descr_to_call_target.get(&descr_idx),
-            Some(&JitCallTarget::new(trace_ptr, concrete_ptr))
+            jitcode.constants_i[funcptr_reg - jitcode.num_regs_i()],
+            concrete_ptr as i64
         );
     }
 
     #[test]
     fn residual_call_target_bridge_is_keyed_per_calldescr() {
         let mut builder = JitCodeBuilder::new();
-        let concrete_ptr = 0x3333usize as *const ();
-        let first_idx = builder.add_call_target(0x4444usize as *const (), concrete_ptr);
-        let second_idx = builder.add_call_target(0x5555usize as *const (), concrete_ptr);
+        let first_idx = builder.add_call_target(0x4444usize as *const (), 0x4444usize as *const ());
+        let second_idx =
+            builder.add_call_target(0x5555usize as *const (), 0x5555usize as *const ());
         let first_start = builder.current_pos();
         builder.residual_call_void_canonical_via_target(first_idx, &[]);
         let second_start = builder.current_pos();
@@ -8407,24 +8381,29 @@ mod tests {
         let second_descr = (jitcode.code[second_start + 3] as u16)
             | ((jitcode.code[second_start + 4] as u16) << 8);
         assert_ne!(first_descr, second_descr);
+        let num_regs_i = jitcode.num_regs_i();
+        let first_funcptr_reg = jitcode.code[first_start + 1] as usize;
+        let second_funcptr_reg = jitcode.code[second_start + 1] as usize;
         assert_eq!(
-            jitcode
-                .exec
-                .call_descr_to_call_target
-                .get(&first_descr)
-                .unwrap()
-                .trace_ptr,
-            0x4444usize as *const ()
+            jitcode.constants_i[first_funcptr_reg - num_regs_i],
+            0x4444usize as *const () as i64
         );
         assert_eq!(
-            jitcode
-                .exec
-                .call_descr_to_call_target
-                .get(&second_descr)
-                .unwrap()
-                .trace_ptr,
-            0x5555usize as *const ()
+            jitcode.constants_i[second_funcptr_reg - num_regs_i],
+            0x5555usize as *const () as i64
         );
+        assert_ne!(
+            jitcode.constants_i[first_funcptr_reg - num_regs_i],
+            jitcode.constants_i[second_funcptr_reg - num_regs_i]
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn residual_call_void_via_target_rejects_unequal_trace_concrete_ptr() {
+        let mut builder = JitCodeBuilder::new();
+        let fn_idx = builder.add_call_target(0x1111usize as *const (), 0x2222usize as *const ());
+        builder.residual_call_void_canonical_via_target(fn_idx, &[]);
     }
 
     #[test]
@@ -8841,18 +8820,39 @@ mod tests {
         );
     }
 
-    /// A value that does not fit a signed byte still goes through the pool
-    /// as `int_copy/i>i`.
+    /// A bytecode offset past the signed-byte short form is a u16 immediate
+    /// (`int_copy/d>i`), not a `constants_i` slot.
     #[test]
-    fn load_const_i_value_pools_values_wider_than_a_byte() {
+    fn load_const_i_value_uses_u16_immediate_for_wide_pcs() {
         let mut builder = JitCodeBuilder::new();
         builder.ensure_i_regs(1);
         builder.load_const_i_value(0, 1000);
+        let jitcode = builder.try_finish().expect("u16 immediate must assemble");
+        assert!(jitcode.constants_i.is_empty());
+        assert_eq!(
+            jitcode.code,
+            vec![
+                majit_jitcode::codewriter::insns::insn_byte("int_copy/d>i"),
+                (1000u16 & 0xff) as u8,
+                (1000u16 >> 8) as u8,
+                0
+            ]
+        );
+    }
+
+    /// A value that does not fit u16 still goes through the pool
+    /// as `int_copy/i>i`.
+    #[test]
+    fn load_const_i_value_pools_values_wider_than_u16() {
+        let mut builder = JitCodeBuilder::new();
+        builder.ensure_i_regs(1);
+        builder.load_const_i_value(0, 70_000);
         let jitcode = builder.try_finish().expect("pooled form must assemble");
         assert_eq!(
             jitcode.code[0],
             majit_jitcode::codewriter::insns::insn_byte("int_copy/i>i")
         );
+        assert_eq!(jitcode.constants_i, vec![70_000]);
     }
 
     /// A `Constant` operand is the register-space index of its constants

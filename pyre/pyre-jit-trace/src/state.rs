@@ -7264,19 +7264,18 @@ impl PyreSym {
                 vec![OpRef::NONE; nlocals]
             },
         );
-        // RPython resume.py rebuild_from_resumedata parity: bridge traces enter with the
-        // failing guard's saved boxes, NOT with the loop's full
-        // virtualizable inputarg layout. Each `bridge_local_oprefs[i]`
-        // points at the bridge inputarg slot the rebuilt frame placed in
-        // local i, so the type for local i must come from
-        // `inputarg_types[bridge_local_oprefs[i].0]` instead of the
-        // loop's `vable_array_base + i` indexing (which only applies to
-        // loops where every local sits in a fixed virtualizable slot).
+        // resume.py rebuild_from_resumedata / ResumeDataBoxReader.consume_boxes:
+        // bridge traces enter with the failing guard's saved boxes, NOT
+        // with the loop's full virtualizable inputarg layout. Each
+        // `bridge_local_oprefs[i]` is the box the rebuilt frame placed in
+        // local i; `load_box_from_cpu` yields a typed box, so the type is
+        // on that box (`opref.ty()`, or the InputArg at that
+        // `get_position()`). `inputarg_types()` is the compact live list
+        // and is not indexed by position.
         //
         // Loop / function-entry traces still use vable_array_base because
         // their inputarg list is the full vable layout.
         let inputarg_slot_types = if let Some(ref overrides) = self.bridge_local_oprefs.as_ref() {
-            let inputarg_types = ctx.inputarg_types();
             let locals: Vec<Type> = (0..nlocals)
                 .map(|i| {
                     overrides
@@ -7285,7 +7284,7 @@ impl PyreSym {
                             if opref.is_none() || opref.is_constant() {
                                 None
                             } else {
-                                inputarg_types.get(opref.raw() as usize).copied()
+                                opref.ty().or_else(|| ctx.inputarg_type_at(opref.raw()))
                             }
                         })
                         .unwrap_or(Type::Ref)
@@ -7301,20 +7300,12 @@ impl PyreSym {
             Some((locals, vec![Type::Ref; stack_only_depth]))
         } else {
             self.vable_array_base.map(|base| {
-                let inputarg_types = ctx.inputarg_types();
                 let locals: Vec<Type> = (0..nlocals)
-                    .map(|i| {
-                        inputarg_types
-                            .get(base as usize + i)
-                            .copied()
-                            .unwrap_or(Type::Ref)
-                    })
+                    .map(|i| ctx.inputarg_type_at(base + i as u32).unwrap_or(Type::Ref))
                     .collect();
                 let stack: Vec<Type> = (0..stack_only_depth)
                     .map(|i| {
-                        inputarg_types
-                            .get(base as usize + nlocals + i)
-                            .copied()
+                        ctx.inputarg_type_at(base + nlocals as u32 + i as u32)
                             .unwrap_or(Type::Ref)
                     })
                     .collect();

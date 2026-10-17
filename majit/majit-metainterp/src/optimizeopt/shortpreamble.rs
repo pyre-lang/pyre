@@ -551,16 +551,17 @@ impl PotentialShortOp {
                             panic!(
                                 "compound short-preamble alias source {:?} has no \
                                  variant tag; same_as_for_type requires Int/Ref/Float \
-                                 (shortpreamble.py:326-330)",
+                                 (shortpreamble.py ShortBoxes.add_op_to_short)",
                                 compound.res
                             )
                         });
-                        let alias = ctx.alloc_op_position_typed(tp);
+                        // shortpreamble.py ShortBoxes.add_op_to_short: `new_name = ResOperation(
+                        // same_as_for_type(shortop.res.type), [shortop.res])`
+                        // then `lst[i].short_op.res = new_name` — the alias
+                        // box exists from the moment it is created.
+                        let (alias, alias_box) = ctx.reserve_virtual_box(tp);
                         alt.preamble_op.pos().set(alias);
-                        // shortpreamble.py:329 `lst[i].short_op.res =
-                        // new_name` — the alias entry's res becomes the
-                        // freshly invented name.
-                        alt.res = ctx.materialize_operand_at(alias);
+                        alt.res = alias_box;
                         alt.invented_name = true;
                         // shortpreamble.py `lst[i].short_op.res = new_name`:
                         // the alias result is the freshly invented SameAs box,
