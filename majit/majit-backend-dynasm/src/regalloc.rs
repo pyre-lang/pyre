@@ -29,10 +29,11 @@ use smallvec::SmallVec;
 /// regalloc.py:909
 pub const UNDEF_POS: i32 = -42;
 
-/// regalloc.py:26-28
+/// llsupport/regalloc.py `SAVE_DEFAULT_REGS` / `SAVE_GCREF_REGS` /
+/// `SAVE_ALL_REGS`.
 pub const SAVE_DEFAULT_REGS: u8 = 0;
-pub const SAVE_GCREF_REGS: u8 = 1;
-pub const SAVE_ALL_REGS: u8 = 2;
+pub const SAVE_GCREF_REGS: u8 = 2;
+pub const SAVE_ALL_REGS: u8 = 1;
 
 /// `save_all_regs` for the CALL_MALLOC_NURSERY_VARSIZE spill. x86
 /// `consider_call_malloc_nursery_varsize` uses the default: the
@@ -2460,7 +2461,6 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py perform_guard
-    #[allow(dead_code)] // x86/regalloc.py perform_guard
     fn perform_guard(
         &mut self,
         op: &Op,
@@ -2479,6 +2479,10 @@ impl<'a> RegAlloc<'a> {
             faillocs_len,
             output,
         );
+        // self.possibly_free_vars(guard_op.getfailargs())
+        if let Some(fail_args) = op.guard_fail_args() {
+            self._possibly_free_j2_vars(fail_args.iter().map(|a| a.to_opref()));
+        }
     }
 
     fn push_perform_guard(
@@ -2549,7 +2553,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py perform_discard
-    fn perform_discard(
+    pub(crate) fn perform_discard(
         &mut self,
         op_index: usize,
         arglocs: Vec<Loc>,
@@ -2795,11 +2799,9 @@ impl<'a> RegAlloc<'a> {
                 self._possibly_free_j2_vars(std::iter::once(*arg));
                 (Some(*dst), Type::Int)
             }
+            // `perform_guard` already freed `getfailargs()`.
             LirOp::Guard { args, .. } => {
                 self._possibly_free_j2_vars(args.iter().copied());
-                if let Some(fa) = raw_op.guard_fail_args() {
-                    self._possibly_free_j2_vars(fa.iter().map(|a| a.to_opref()));
-                }
                 (None, raw_op.opcode.result_type())
             }
             LirOp::Load {
@@ -4592,7 +4594,7 @@ impl<'a> RegAlloc<'a> {
         let arg0 = op.arg(0).to_opref();
         let tp = self.tp(arg0);
         let loc = self.make_sure_var_in_reg(arg0, tp, &[], None, false);
-        self.perform(i, [loc], None, output);
+        self.perform_discard(i, vec![loc], output);
     }
 
     fn consider_check_memory_error_j2(
@@ -4601,12 +4603,10 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let Some(&arg) = args.first() else {
-            return self.perform(i, [], None, output);
-        };
-        let tp = self.tp(arg);
-        let loc = self.make_sure_var_in_reg(arg, tp, &[], None, false);
-        self.perform(i, [loc], None, output);
+        let x = args[0];
+        let tp = self.tp(x);
+        let loc = self.make_sure_var_in_reg(x, tp, &[], None, false);
+        self.perform_discard(i, vec![loc], output);
     }
 
     /// x86/regalloc.py consider_finish
@@ -4787,12 +4787,11 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let args = [src];
         let loc = self.xrm.force_result_in_reg(
             dst,
             src,
             Type::Float,
-            &args,
+            &[],
             &mut self.longevity,
             &mut self.fm,
             &self.constants,
@@ -4825,12 +4824,11 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let args = [arg];
         let loc = self.xrm.force_result_in_reg(
             dst,
             arg,
             Type::Float,
-            &args,
+            &[],
             &mut self.longevity,
             &mut self.fm,
             &self.constants,
@@ -5914,23 +5912,20 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        assert!(matches!(args.len(), 1 | 2));
-        if args.len() == 2 {
+        // llsupport/regalloc.py `locs_for_call_assembler`.
+        let arglocs = if args.len() == 2 {
             let vable = args[1];
             let tp = self.tp(vable);
-            if tp == Type::Float {
-                self.xrm
-                    ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
-            } else {
-                self.rm
-                    ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
-            }
-        }
-
-        let mut arglocs = Vec::with_capacity(args.len());
-        for &arg in args {
-            arglocs.push(self.loc(arg, self.tp(arg)));
-        }
+            self.rm
+                ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
+            vec![
+                self.loc(args[0], self.tp(args[0])),
+                Loc::Frame(self.fm.loc(vable, tp, false, &mut self.longevity)),
+            ]
+        } else {
+            assert!(args.len() == 1);
+            vec![self.loc(args[0], self.tp(args[0]))]
+        };
 
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
@@ -6606,10 +6601,27 @@ impl<'a> RegAlloc<'a> {
             }
         }
 
+        // x86/regalloc.py `consider_label`: we need to make sure that no
+        // variable is stored in ebp
+        #[cfg(target_arch = "x86_64")]
+        {
+            let ebp = self.rm.frame_reg;
+            for &arg in args {
+                let tp = self.tp(arg);
+                if matches!(self.loc(arg, tp), Loc::Reg(r) if r == ebp) {
+                    let loc2 = self.fm.loc(arg, tp, false, &mut self.longevity);
+                    self.rm.spill_moves.push((Loc::Reg(ebp), Loc::Frame(loc2)));
+                }
+            }
+            self.rm.box_currently_in_frame_reg = None;
+        }
+
         let mut locs = Vec::new();
         for &arg in args {
             let tp = self.tp(arg);
             let loc = self.loc(arg, tp);
+            #[cfg(target_arch = "x86_64")]
+            debug_assert!(!matches!(loc, Loc::Reg(r) if r == self.rm.frame_reg));
             if let Loc::Reg(_) = loc {
                 self.fm.mark_as_free(arg, tp, &mut self.longevity)
             }
@@ -6791,7 +6803,7 @@ impl<'a> RegAlloc<'a> {
         }
     }
 
-    fn preserve_for_zero_array_memset(&mut self) {
+    pub(crate) fn preserve_for_zero_array_memset(&mut self) {
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,
@@ -6829,6 +6841,7 @@ impl<'a> RegAlloc<'a> {
         self.perform_discard(i, locs, output);
     }
 
+    #[cfg(not(target_arch = "x86_64"))]
     fn consider_zero_array_j2(
         &mut self,
         args: &[OpRef],
@@ -7873,6 +7886,172 @@ mod tests {
             has_move_from(&ra_ops, &expected_argloc),
             "generic j2 opcode dispatch should materialize the LIR arg, not the raw Op arg: {:?}",
             ra_ops
+        );
+    }
+
+    /// x86/regalloc.py `perform_guard` frees `getfailargs()` before
+    /// `walk_operations` reaches `possibly_free_vars_for_op(op)`, so a
+    /// failarg's register goes back to `free_regs` ahead of the guard
+    /// argument's, and the argument's register is picked first afterwards.
+    #[test]
+    fn guard_frees_failargs_before_args() {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let i2 = OpRef::int_op(0);
+        let i3 = OpRef::int_op(1);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(3));
+        let ops = rcs(vec![
+            make_op(OpCode::IntAdd, 0, &[i0, OpRef::const_int(1)]),
+            make_op(OpCode::IntAdd, 1, &[i1, OpRef::const_int(1)]),
+            make_guard(OpCode::GuardTrue, 2, &[i2], &[i3]),
+            finish,
+        ]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let output = ra.walk_operations().expect("walk_operations");
+        let (arg_loc, fail_loc) = output
+            .iter()
+            .find_map(|op| match op {
+                RegAllocOp::PerformGuard1 {
+                    loc,
+                    faillocs_start,
+                    faillocs_len,
+                    ..
+                } => Some((*loc, ra.faillocs(*faillocs_start, *faillocs_len)[0])),
+                _ => None,
+            })
+            .expect("GUARD_TRUE must be a PerformGuard1");
+        let (Loc::Reg(arg_reg), Some(Loc::Reg(fail_reg))) = (arg_loc, fail_loc) else {
+            panic!("both guard operands must be in registers: {arg_loc:?} {fail_loc:?}");
+        };
+        let pos = |r: RegLoc| ra.rm.free_regs.iter().position(|&f| f == r).unwrap();
+        assert!(
+            pos(fail_reg) < pos(arg_reg),
+            "failarg {fail_reg:?} must be freed before arg {arg_reg:?}: {:?}",
+            ra.rm.free_regs
+        );
+    }
+
+    /// x86/regalloc.py `consider_label`: a LABEL argument located in ebp
+    /// (a bridge input bound by `_update_bindings`) is stored to its frame
+    /// slot, `box_currently_in_frame_reg` is reset, and the label's
+    /// location is that slot.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn label_moves_ebp_argument_to_its_frame_slot() {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::int_op(1);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let label = Op::new(OpCode::Label, &[rb(i0)]);
+        label.pos().set(OpRef::void_op(0));
+        let ops = rcs(vec![
+            label,
+            make_op(OpCode::IntAdd, 1, &[i0, OpRef::const_int(1)]),
+            make_op(OpCode::Finish, 2, &[i1]),
+        ]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_bridge(&[Loc::Reg(EBP)]);
+        assert_eq!(ra.rm.box_currently_in_frame_reg, Some(i0));
+        let output = ra.walk_operations().expect("walk_operations");
+        let label_pos = output
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    RegAllocOp::Perform { op_index: 0, .. }
+                        | RegAllocOp::Perform1 { op_index: 0, .. }
+                )
+            })
+            .expect("LABEL perform");
+        let label_loc = match &output[label_pos] {
+            RegAllocOp::Perform1 { loc, .. } => *loc,
+            RegAllocOp::Perform {
+                arglocs_start,
+                arglocs_len,
+                ..
+            } => ra.arglocs(*arglocs_start, *arglocs_len)[0],
+            _ => unreachable!(),
+        };
+        let Loc::Frame(slot) = label_loc else {
+            panic!("LABEL argument must be its frame slot, got {label_loc:?}");
+        };
+        assert!(
+            output[..label_pos].iter().any(|op| matches!(
+                op,
+                RegAllocOp::Move { src: Loc::Reg(r), dst: Loc::Frame(f) }
+                    if *r == EBP && f.position == slot.position
+            )),
+            "missing MOV [frame slot], ebp: {output:?}"
+        );
+        assert_eq!(ra.rm.box_currently_in_frame_reg, None);
+    }
+
+    /// llsupport/regalloc.py `locs_for_call_assembler`: the virtualizable
+    /// argument is synced to the stack and passed as `self.fm.loc(arg1)`,
+    /// even while it is still in a register.
+    #[test]
+    fn call_assembler_vable_loc_is_its_frame_slot() {
+        let p0 = OpRef::input_arg_ref(0);
+        let p1 = OpRef::input_arg_ref(1);
+        let p2 = OpRef::ref_op(0);
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
+        let same = Op::new(OpCode::SameAsR, &[rb(p1)]);
+        same.pos().set(p2);
+        let call = Op::new(OpCode::CallAssemblerN, &[rb(p0), rb(p2)]);
+        call.pos().set(OpRef::void_op(1));
+        let finish = Op::new(OpCode::Finish, &[rb(p2)]);
+        finish.pos().set(OpRef::void_op(2));
+        let ops = rcs(vec![same, call, finish]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let output = ra.walk_operations().expect("walk_operations");
+        let arglocs = output
+            .iter()
+            .find_map(|op| match op {
+                RegAllocOp::Perform {
+                    op_index: 1,
+                    arglocs_start,
+                    arglocs_len,
+                    ..
+                } => Some(ra.arglocs(*arglocs_start, *arglocs_len).to_vec()),
+                _ => None,
+            })
+            .expect("CALL_ASSEMBLER perform");
+        assert!(
+            matches!(arglocs[1], Loc::Frame(_)),
+            "vable must be passed as its frame slot: {arglocs:?}"
+        );
+    }
+
+    /// `consider_check_memory_error` is `perform_discard(op, [x])` with
+    /// `x` in a register.
+    #[test]
+    fn check_memory_error_is_a_discard() {
+        let p0 = OpRef::input_arg_ref(0);
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let check = Op::new(OpCode::CheckMemoryError, &[rb(p0)]);
+        check.pos().set(OpRef::void_op(0));
+        let finish = Op::new(OpCode::Finish, &[rb(p0)]);
+        finish.pos().set(OpRef::void_op(1));
+        let ops = rcs(vec![check, finish]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let output = ra.walk_operations().expect("walk_operations");
+        let arglocs = output
+            .iter()
+            .find_map(|op| match op {
+                RegAllocOp::PerformDiscard {
+                    op_index: 0,
+                    arglocs,
+                } => Some(arglocs.clone()),
+                _ => None,
+            })
+            .expect("CHECK_MEMORY_ERROR perform_discard");
+        assert!(
+            matches!(arglocs[..], [Loc::Reg(r)] if !r.is_xmm),
+            "one GPR argloc: {arglocs:?}"
         );
     }
 

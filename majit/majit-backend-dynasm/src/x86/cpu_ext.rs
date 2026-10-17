@@ -45,17 +45,15 @@ pub(crate) struct X86CpuExt {
     malloc_slowpath_varsize: Option<usize>,
     _malloc_slowpath_varsize_buffer: Option<ArenaExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.
-    /// Standalone trampoline that the malloc slowpath JMPs to on OOM.
-    /// The stack-check helper does not: its overflow footer runs before
-    /// `gen_shadowstack_header` and must not pop a shadow entry.
+    /// Standalone trampoline that the malloc slowpath JMPs to on OOM and
+    /// the stack-check helper JMPs to on overflow.
     propagate_exception_path: Option<usize>,
     _propagate_exception_path_buffer: Option<ArenaExecutableBuffer>,
     /// `build_frame_realloc_slowpath`: once per CPU. The per-bridge
     /// `IncreaseStackSlowPath` calls this address.
     frame_realloc_slowpath: Option<usize>,
     _frame_realloc_slowpath_buffer: Option<ArenaExecutableBuffer>,
-    /// `_build_stack_check_slowpath` plus the no-pop overflow footer.
-    /// `None` until `stack_check_addresses` is registered and
+    /// `_build_stack_check_slowpath`. `None` until `stack_check_addresses` is registered and
     /// `propagate_exception_descr` is installed; a failed attempt is not
     /// cached, so the next `ensure_stack_check_slowpath` retries.
     stack_check_slowpath: Option<usize>,
@@ -132,13 +130,13 @@ impl X86CpuExt {
         if addrs.slowpath_addr == 0 {
             return 0;
         }
-        let propagate_descr = cpu_handle.read().descr_ptrs().propagate_exception_descr;
-        if propagate_descr == 0 {
+        if cpu_handle.read().descr_ptrs().propagate_exception_descr == 0 {
             return 0;
         }
+        let propagate_exception_path = self.ensure_propagate_exception_path(cpu_handle);
         let (buffer, addr) = super::assembler::build_stack_check_slowpath(
             addrs.slowpath_addr,
-            propagate_descr,
+            propagate_exception_path,
             &self.asm_memory_manager,
         );
         debug_assert!(

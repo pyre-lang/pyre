@@ -876,6 +876,16 @@ pub fn sub_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     alu_mi(mc, 5, mem, immed);
 }
 
+/// `SUB_ji8` — `sub qword [abs32], imm8`. `encode_abs` with `/5`.
+pub fn sub_ji8(mc: &mut Assembler, abs_addr: i32, immed: i32) {
+    DynasmApi::push(mc, 0x48);
+    DynasmApi::push(mc, 0x83);
+    DynasmApi::push(mc, 0x2C);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
+    writeimm8(mc, immed);
+}
+
 /// `TEST8_mi` — `test byte [base + ofs], imm8`.
 pub fn test8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     encode_rex_opt(mc, rex_mem_reg_plus_const(mem));

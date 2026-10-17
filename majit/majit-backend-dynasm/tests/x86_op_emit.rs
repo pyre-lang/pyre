@@ -562,6 +562,65 @@ fn float_cmp_reads_const_operand_and_nan() {
     }
 }
 
+/// `_if_parity_clear_zero_and_carry`: `emit_forward_jump('NP')` is a
+/// two-byte `JNP rel8` over `CMP_ri(ebp, 0)`, whose immediate is imm8.
+#[test]
+fn float_cmp_parity_jump_is_rel8() {
+    let (_backend, token) = compile_float_cmp(OpCode::FloatEq, false, 1.0);
+    assert_has(
+        compiled_bytes(&token),
+        &[0x7B, 0x04, 0x48, 0x83, 0xFD, 0x00],
+        "jnp rel8; cmp rbp, 0",
+    );
+}
+
+/// `genop_guard_guard_nonnull_class`: `CMP obj, 1` then a `JB rel8`
+/// (`emit_forward_jump('B')`) over `_cmp_guard_class` to the guard's `JNE`.
+#[test]
+fn guard_nonnull_class_forward_jump_is_rel8() {
+    #[repr(C)]
+    struct Obj {
+        typeptr: usize,
+    }
+    let class_a = 0x5A5A_0000usize;
+    let class_b = 0x5B5B_0000usize;
+    let mut obj_a = Obj { typeptr: class_a };
+    let mut obj_b = Obj { typeptr: class_b };
+    let mut backend = fresh_backend();
+    backend.set_vtable_offset(Some(0));
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let p0 = inputargs[0].opref();
+    let guard = Op::new(
+        OpCode::GuardNonnullClass,
+        &[rb(p0), rb(OpRef::const_int(class_a as i64))],
+    );
+    guard.pos().set(OpRef::void_op(1));
+    guard.setdescr(make_resume_guard_descr_typed(vec![]));
+    guard.setfailargs(vec![].into());
+    let finish = Op::new(OpCode::Finish, &[]);
+    finish.pos().set(OpRef::void_op(2));
+    finish.set_fail_arg_types(vec![]);
+    finish.setfailargs(vec![].into());
+    let ops = vec![OpRc::new(guard), OpRc::new(finish)];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile GUARD_NONNULL_CLASS: {err:?}"));
+    let code = compiled_bytes(&token);
+    assert!(
+        code.windows(4)
+            .any(|w| w[0] == 0x83 && w[1] & 0xF8 == 0xF8 && w[2] == 0x01 && w[3] == 0x72),
+        "cmp obj, 1; jb rel8"
+    );
+    let run = |backend: &mut DynasmBackend, ptr: usize| {
+        let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
+        backend.get_latest_descr(&frame).is_finish()
+    };
+    assert!(run(&mut backend, &mut obj_a as *mut Obj as usize));
+    assert!(!run(&mut backend, &mut obj_b as *mut Obj as usize));
+    assert!(!run(&mut backend, 0));
+}
+
 // Test-only bridge into a `CALL_MAY_FORCE` helper. The helper is `extern "C"`
 // and has no Rust argument for the backend that owns the force token.
 thread_local! {
@@ -1619,26 +1678,44 @@ fn loop_code(token: &JitCellToken, code_size: usize) -> &[u8] {
     unsafe { std::slice::from_raw_parts(token.ll_raw_start() as *const u8, code_size) }
 }
 
-/// `generate_cond_call_slowpath` loads the helper with `mov r11, imm64`
-/// and `call r11`. `push_gcmap` forgets the scratch cache first, so
-/// `load_scratch` is that `movabs`, not an `lea`.
+/// `generate_cond_call_slowpath` loads the helper with `_load_scratch` and
+/// `call r11`. Its `push_gcmap`, before the func immediate, has loaded the
+/// gcmap into r11 the same way, so the helper is either a `mov r11, imm64`
+/// or an `lea r11, [r11+d]` off that gcmap. Track r11 from the gcmap load.
 fn cond_call_slowpath_index(code: &[u8], func: u64) -> usize {
     let needle = func.to_le_bytes();
     let at = code
         .windows(8)
         .position(|window| window == needle)
         .unwrap_or_else(|| panic!("cond_call func immediate is missing"));
-    let tail = &code[at..];
+    let gcmap_load = code[..at]
+        .windows(2)
+        .rposition(|window| window == [0x49, 0xBB])
+        .unwrap_or_else(|| panic!("cond_call gcmap load is missing"));
+    let tail = &code[gcmap_load..];
+    let mut r11: Option<u64> = None;
     let mut i = 0;
-    while i + 13 <= tail.len() {
-        if tail[i] == 0x49
-            && tail[i + 1] == 0xBB
-            && tail[i + 10] == 0x41
-            && tail[i + 11] == 0xFF
-            && tail[i + 12] == 0xD3
-        {
-            let helper = u64::from_le_bytes(tail[i + 2..i + 10].try_into().unwrap());
-            return classify_cond_call_helper(helper);
+    while i + 3 <= tail.len() {
+        if tail[i..].starts_with(&[0x49, 0xBB]) && i + 10 <= tail.len() {
+            r11 = Some(u64::from_le_bytes(tail[i + 2..i + 10].try_into().unwrap()));
+            i += 10;
+            continue;
+        }
+        if let Some(value) = r11 {
+            if tail[i..].starts_with(&[0x4D, 0x8D, 0x5B]) && i + 4 <= tail.len() {
+                r11 = Some(value.wrapping_add(tail[i + 3] as i8 as i64 as u64));
+                i += 4;
+                continue;
+            }
+            if tail[i..].starts_with(&[0x4D, 0x8D, 0x9B]) && i + 7 <= tail.len() {
+                let d = i32::from_le_bytes(tail[i + 3..i + 7].try_into().unwrap());
+                r11 = Some(value.wrapping_add(d as i64 as u64));
+                i += 7;
+                continue;
+            }
+            if tail[i..].starts_with(&[0x41, 0xFF, 0xD3]) {
+                return classify_cond_call_helper(value);
+            }
         }
         i += 1;
     }
@@ -2296,6 +2373,53 @@ fn call_release_gil_saves_last_error() {
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 1123);
     assert_eq!(majit_rlib::rwin32::GetLastError_saved(), 123);
+}
+
+#[cfg(target_os = "windows")]
+extern "C" fn set_last_error_and_return_float(code: i64) -> f64 {
+    unsafe { majit_rlib::rwin32::_SetLastError(code as u32) };
+    code as f64 + 0.25
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn call_release_gil_saves_last_error_float_result() {
+    // `CallBuilder64.save_result_value` for a FLOAT result is one
+    // `MOVSD [rsp], xmm0` (and `restore_result_value` the reverse) around
+    // `GetLastError`; rax is not saved.
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let call = Op::new(
+        OpCode::CallReleaseGilF,
+        &[
+            rb(OpRef::const_int(majit_jitcode::rffi::RFFI_SAVE_LASTERROR)),
+            rb(OpRef::const_int(
+                set_last_error_and_return_float as usize as i64,
+            )),
+            rb(OpRef::const_int(77)),
+        ],
+    );
+    call.pos().set(OpRef::float_op(1));
+    call.setdescr(call_descr(vec![Type::Int], Type::Float, false, 8));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::float_op(1), Type::Float, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile CALL_RELEASE_GIL_F: {err:?}"));
+    let code = compiled_bytes(&token);
+    assert_has(code, &[0xF2, 0x0F, 0x11, 0x04, 0x24], "movsd [rsp], xmm0");
+    assert_has(code, &[0xF2, 0x0F, 0x10, 0x04, 0x24], "movsd xmm0, [rsp]");
+    assert!(
+        !code.windows(4).any(|w| w == [0x48, 0x89, 0x04, 0x24]),
+        "a float result must not save rax"
+    );
+    majit_rlib::rwin32::SetLastError_saved(0);
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_float_value(&frame, 0), 77.25);
+    assert_eq!(majit_rlib::rwin32::GetLastError_saved(), 77);
 }
 
 fn op_at(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
@@ -3372,6 +3496,35 @@ fn compile_input_finish(backend: &mut DynasmBackend) -> JitCellToken {
     token
 }
 
+/// `_call_header_shadowstack` pushes through `ebx`; `_call_footer` does
+/// `MOV eax, ebp` and then `_call_footer_shadowstack`, which is
+/// `SUB_ji8(rst, 16)` or `MOV ebx, rst; SUB [ebx], 16`.
+#[test]
+fn shadowstack_header_and_footer_go_through_ebx() {
+    let mut backend = fresh_backend();
+    let token = compile_input_finish(&mut backend);
+    let code = compiled_bytes(&token);
+    let header = [
+        &[0x48, 0xC7, 0x03, 0x01, 0x00, 0x00, 0x00][..],
+        &[0x48, 0x89, 0x6B, 0x08],
+        &[0x48, 0x83, 0xC3, 0x10],
+    ]
+    .concat();
+    assert_has(code, &header, "MOV [ebx], 1; MOV [ebx+8], ebp; ADD ebx, 16");
+    let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+    let mut footer = vec![0x48, 0x89, 0xE8];
+    if i32::try_from(rst).is_ok() {
+        footer.extend_from_slice(&[0x48, 0x83, 0x2C, 0x25]);
+        footer.extend_from_slice(&(rst as i32).to_le_bytes());
+        footer.push(0x10);
+    } else {
+        footer.extend_from_slice(&[0x48, 0xBB]);
+        footer.extend_from_slice(&rst.to_le_bytes());
+        footer.extend_from_slice(&[0x48, 0x83, 0x2B, 0x10]);
+    }
+    assert_has(code, &footer, "MOV eax, ebp; then SUB [rootstacktop], 16");
+}
+
 fn count_bytes(code: &[u8], needle: &[u8]) -> usize {
     code.windows(needle.len())
         .filter(|window| *window == needle)
@@ -3392,14 +3545,6 @@ fn assert_stack_probe(code: &[u8]) {
         .windows(2)
         .find(|bytes| bytes[0] == 0x0F && (bytes[1] == 0x86 || bytes[1] == 0x87));
     assert_eq!(jcc, Some(&[0x0F, 0x87][..]), "not-taken ja, not jbe");
-}
-
-fn shadow_words() -> (usize, usize, usize) {
-    let top = shadow_top();
-    if top == 0 {
-        return (0, 0, 0);
-    }
-    unsafe { (top, *(top as *const usize), *((top + 8) as *const usize)) }
 }
 
 /// `_call_header_with_stack_check`. `STACK_CHECK_ADDRS` is a process-wide
@@ -3436,6 +3581,12 @@ fn stack_check_slowpath_once_per_process() {
     // compile must retry `ensure_stack_check_slowpath`.
     let token = compile_input_finish(&mut backend);
     assert_stack_probe(compiled_bytes(&token));
+    // `_call_header_shadowstack` (`mov [rbx+8], rbp`) precedes the probe.
+    assert!(
+        unique_bytes(compiled_bytes(&token), &[0x48, 0x89, 0x6B, 0x08])
+            < unique_bytes(compiled_bytes(&token), &[0x48, 0x29, 0xE0]),
+        "the stack check follows the shadow-stack push"
+    );
 
     let _lock = lock_exception_cells();
     let _clear = ClearExc;
@@ -3443,17 +3594,17 @@ fn stack_check_slowpath_once_per_process() {
     STACK_LENGTH.store(0, Ordering::Release);
     STACK_MODE.with(|mode| mode.set(2));
     STACK_CALLS.with(|calls| calls.set(0));
-    let before = shadow_words();
+    let before = shadow_top();
     let frame = backend.execute_token(&token, &[Value::Int(7)]);
     assert_propagate(&backend, &frame);
     assert!(
         !majit_backend_dynasm::jit_exc_is_pending(),
-        "the overflow footer clears both exception cells"
+        "propagate_exception_path clears both exception cells"
     );
     assert_eq!(
-        shadow_words(),
+        shadow_top(),
         before,
-        "overflow runs before gen_shadowstack_header and must not pop"
+        "the probe runs after the shadow-stack push, and          propagate_exception_path's _call_footer pops it"
     );
     assert!(
         STACK_CALLS.with(|calls| calls.get()) >= 1,
@@ -4073,6 +4224,94 @@ fn zero_array_displacement_crosses_i32() {
     let bias = i64::from(i32::MAX) - 8 - ZERO_ARRAY_BASEOFS as i64;
     run_zero_array_at(32, 0, false, false, bias);
     run_zero_array_at(ZERO_ARRAY_UNROLL_LIMIT + 16, 0, false, false, bias);
+}
+
+/// `consider_zero_array`'s memset() path with a variable length:
+/// `LEA` of the destination, `LEA` of the byte length when the length
+/// scale is 8, and `simple_call_no_collect`. A value computed before the
+/// call and the length itself must survive it.
+fn run_zero_array_variable_length(
+    items: i64,
+    start: i64,
+    len_itemsize: i64,
+    use_length_after: bool,
+) {
+    const BASEOFS: usize = 16;
+    let total = BASEOFS + ((start + items) as usize + 2) * 8;
+    let mut buf = vec![0xAAu8; total];
+    let ptr = buf.as_mut_ptr() as usize;
+    let descr: DescrRef = Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        BASEOFS,
+        8,
+        1,
+        Type::Int,
+    ));
+    let length = if len_itemsize == 1 { items * 8 } else { items };
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+    ];
+    let x = OpRef::int_op(3);
+    let add = Op::new(
+        OpCode::IntAdd,
+        &[rb(OpRef::input_arg_int(1)), rb(OpRef::const_int(1000))],
+    );
+    add.pos().set(x);
+    let zero = Op::new(
+        OpCode::ZeroArray,
+        &[
+            rb(OpRef::input_arg_ref(0)),
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_int(2)),
+            rb(OpRef::const_int(8)),
+            rb(OpRef::const_int(len_itemsize)),
+        ],
+    );
+    zero.pos().set(OpRef::void_op(4));
+    zero.setdescr(descr);
+    let mut ops = vec![OpRc::new(add), OpRc::new(zero)];
+    let result = if use_length_after {
+        let y = OpRef::int_op(5);
+        let sum = Op::new(OpCode::IntAdd, &[rb(x), rb(OpRef::input_arg_int(2))]);
+        sum.pos().set(y);
+        ops.push(OpRc::new(sum));
+        y
+    } else {
+        x
+    };
+    ops.push(OpRc::new(finish_of(result, Type::Int, 6)));
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile variable ZERO_ARRAY: {err:?}"));
+    let frame = backend.execute_token(
+        &token,
+        &[
+            Value::Ref(GcRef(ptr)),
+            Value::Int(start),
+            Value::Int(length),
+        ],
+    );
+    let expected = start + 1000 + if use_length_after { length } else { 0 };
+    assert_eq!(backend.get_int_value(&frame, 0), expected);
+    let lo = BASEOFS + start as usize * 8;
+    let hi = lo + items as usize * 8;
+    assert!(buf[..lo].iter().all(|&b| b == 0xAA), "{:02x?}", &buf[..lo]);
+    assert!(buf[lo..hi].iter().all(|&b| b == 0), "{:02x?}", &buf[lo..hi]);
+    assert!(buf[hi..].iter().all(|&b| b == 0xAA), "{:02x?}", &buf[hi..]);
+}
+
+#[test]
+fn zero_array_memset_variable_length() {
+    for len_itemsize in [1, 8] {
+        for use_length_after in [false, true] {
+            run_zero_array_variable_length(40, 3, len_itemsize, use_length_after);
+            run_zero_array_variable_length(0, 2, len_itemsize, use_length_after);
+        }
+    }
 }
 
 static CALL_ENTRY_RSP: AtomicUsize = AtomicUsize::new(0);
