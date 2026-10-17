@@ -1714,3 +1714,76 @@ fn sre_flag_names_folds_to_a_str_list() {
         "sre_pattern_flag_tail must bake FLAG_NAMES, got {tables:?}"
     );
 }
+
+fn leftover_ok_or_else(graph: &majit_translate::model::FunctionGraph) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "ok_or_else"
+            )
+        })
+        .count()
+}
+
+fn assert_no_ok_or_else(graph: &majit_translate::model::FunctionGraph, name: &str) {
+    assert_eq!(
+        leftover_ok_or_else(graph),
+        0,
+        "{name} left a foreign Option::ok_or_else call"
+    );
+}
+
+/// Tail-return `opt.ok_or_else(|| E)`: the residual Method is gone.
+#[test]
+fn lookup_dunder_import_ok_or_else_is_lowered() {
+    let graph =
+        lower_function(interp(), "lookup_dunder_import").expect("lookup_dunder_import lowers");
+    assert_no_ok_or_else(&graph, "lookup_dunder_import");
+}
+
+/// Tail-return `opt.ok_or_else(named_fn)`: the function-item callable is a
+/// direct `Call(FunctionPath)`, not a residual Method.
+#[test]
+fn try_new_buffer_ok_or_else_is_lowered() {
+    let graph = lower_function(interp(), "try_new_buffer").expect("try_new_buffer lowers");
+    assert_no_ok_or_else(&graph, "try_new_buffer");
+}
+
+/// `args.first().copied().ok_or_else(...)?` gateway: the foreign combinator
+/// is gone even when the `?` diamond is not the private from_residual shape
+/// the fused try-site requires.
+#[test]
+fn iobase_writelines_ok_or_else_is_lowered() {
+    let graph = lower_function(interp(), "iobase_writelines").expect("iobase_writelines lowers");
+    assert_no_ok_or_else(&graph, "iobase_writelines");
+}
+
+/// Tail-return niche `Option<&mut W_MMap>::ok_or_else`.
+#[test]
+fn mmap_this_ok_or_else_is_lowered() {
+    let graph = lower_function(optional_module(), "mmap_this").expect("mmap_this lowers");
+    assert_no_ok_or_else(&graph, "mmap_this");
+}
+
+/// Tail-return `queue_pop_front(...).ok_or_else(empty_error)`.
+#[test]
+fn simplequeue_get_ok_or_else_is_lowered() {
+    let graph =
+        lower_function(optional_module(), "simplequeue_get").expect("simplequeue_get lowers");
+    assert_no_ok_or_else(&graph, "simplequeue_get");
+}
+
+/// `opt.ok_or_else(|| E).and_then(...)` — the Result is a combinator
+/// consumer, not a `?` diamond.
+#[test]
+fn create_new_dict_ok_or_else_is_lowered() {
+    let graph = lower_function(interp(), "create_new_dict").expect("create_new_dict lowers");
+    assert_no_ok_or_else(&graph, "create_new_dict");
+}

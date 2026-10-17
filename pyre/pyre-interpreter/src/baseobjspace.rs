@@ -22389,12 +22389,18 @@ unsafe fn property_no_accessor(
             pyre_object::gc_roots::shadow_stack_get(base + 1),
             "__qualname__",
         ) {
-            // A `__qualname__` holding a lone surrogate is ordinary Python, and
-            // this message is only ever displayed, so escape what has no `&str`
-            // form rather than aborting. The escape is visible where the raw
-            // surrogate would be shown — `PyError::message` is a `String`, so
-            // the exact spelling waits on that field becoming WTF-8.
-            Ok(q) if !q.is_null() && is_str(q) => unsafe { crate::display::py_str_display(q) },
+            // `descriptor.py W_Property._properror` interpolates
+            // `space.type(w_obj).qualname` with oefmt `%s`; the value is
+            // already a str, so the raise path does not call `space.str`.
+            // A lone surrogate is ordinary Python, and this message is only
+            // ever displayed, so escape what has no `&str` form rather than
+            // aborting. The escape is visible where the raw surrogate would
+            // be shown — `PyError::message` is a `String`, so the exact
+            // spelling waits on that field becoming WTF-8.
+            Ok(q) if !q.is_null() && is_str(q) => crate::display::wtf8_display_string(
+                pyre_object::w_str_get_wtf8(q).to_wtf8_buf(),
+                "<unprintable>",
+            ),
             _ => pyre_object::w_type_get_name(pyre_object::gc_roots::shadow_stack_get(base + 1))
                 .to_string(),
         }

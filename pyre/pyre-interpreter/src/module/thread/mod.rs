@@ -1578,7 +1578,8 @@ mod local_class {
     }
 
     impl W_Local {
-        /// `os_local.py create_new_dict`.
+        /// `os_local.py create_new_dict` (`@jit.dont_look_inside`).
+        #[majit_macros::dont_look_inside]
         fn create_new_dict(&self, ident: i64) -> Result<PyObjectRef, crate::PyError> {
             let this = self as *const Self as *mut Self;
             let obj = this as PyObjectRef;

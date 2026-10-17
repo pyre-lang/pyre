@@ -5901,12 +5901,34 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
         }
         let closure_select_rewritten = closure_select_outcome.rewritten;
+        let option_ok_or_else_disc = disc_combinator_sites
+            .iter()
+            .any(|site| site.kind == DiscCombinator::OptionOkOrElse);
         if !disc_combinator_sites.is_empty() {
             rewire_disc_combinator_sites(
                 &mut lo.graph,
                 &disc_combinator_sites,
                 static_addrs.error_carrier,
             );
+        }
+        // `OptionOkOrElse` rebuilds `Result::Ok` / `Result::Err` after the
+        // callee rule above.  A scoped graph whose return was that
+        // `ok_or_else` pair therefore had nothing for the callee rule to
+        // rewrite when it ran.  Lower the fold's fresh shells, the same
+        // follow-up `rewire_checked_arith_ok_or_else` uses.
+        //
+        // `tail_forwarded_returns` is non-zero because this is a follow-up:
+        // the callee is already transformed.  Zero new shells means the
+        // combinator's Result was consumed in-graph (`?` / `and_then`), not
+        // that the callee has no returns.
+        if result_exc_callee && option_ok_or_else_disc {
+            crate::front::result_exc::lower_result_exc_returns(
+                &mut lo.graph,
+                1,
+                static_addrs.error_carrier,
+            )
+            .map_err(LowerError::Unsupported)?;
+            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
         }
         // The `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold
         // (`front::range_contains`) splices the residual `contains` call
@@ -30114,6 +30136,23 @@ impl<'a> Lowering<'a> {
         } else {
             false
         };
+        // `Option::ok_or_else` is a combinator (`DiscCombinator::OptionOkOrElse`),
+        // not a transformed `Result<T, PyError>` callee.  Capturing it as a
+        // scoped call remints the residual Method as a payload and leaves the
+        // foreign `ok_or_else` in the graph.
+        let option_ok_or_else_method = matches!(
+            &op_kind,
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                args,
+                ..
+            } if name == "ok_or_else" && args.len() == 2
+        ) && first_arg_ty.as_ref().is_some_and(|ty| {
+            crate::front::result_exc::tyref_is_option(ty, self.llbc)
+                || self.peel_to_option_or_result(ty).is_some_and(|peeled| {
+                    crate::front::result_exc::tyref_is_option(&peeled, self.llbc)
+                })
+        });
         // Capture scoped `Result<T, PyError>` call results for the
         // `?`-diamond rewiring pass (`front::result_exc`) that runs
         // after the body lowering completes.
@@ -30134,6 +30173,7 @@ impl<'a> Lowering<'a> {
         if (matches!(&op_kind, OpKind::Call { .. }) && callee_name_path.is_some()
             || indirect_family_call)
             && !captured_option_ok_or_else_try
+            && !option_ok_or_else_method
             && crate::front::result_exc::tyref_is_result_of_carrier(
                 &call.dest.ty,
                 self.llbc,
@@ -38184,7 +38224,11 @@ impl<'a> Lowering<'a> {
         let is_option = crate::front::result_exc::tyref_is_option(&recv_ty, self.llbc);
         let is_result = crate::front::result_exc::tyref_is_result(&recv_ty, self.llbc);
         match kind {
-            DiscCombinator::OptionFilter | DiscCombinator::OptionOkOr if !is_option => {
+            DiscCombinator::OptionFilter
+            | DiscCombinator::OptionOkOr
+            | DiscCombinator::OptionOkOrElse
+                if !is_option =>
+            {
                 return None;
             }
             DiscCombinator::ResultMap
@@ -38314,24 +38358,32 @@ impl<'a> Lowering<'a> {
                 site.call_result_ty = ValueType::Bool;
                 site.args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
             }
-            DiscCombinator::OptionOkOr => {
+            DiscCombinator::OptionOkOr | DiscCombinator::OptionOkOrElse => {
                 let dest = self.peel_to_option_or_result(dest_ty)?;
-                let (owner, ok_owner, err_owner, ok_ty, err_ty, _err_class) =
+                let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
                     self.resolve_result_owners(&dest)?;
                 site.result_owner = owner;
                 site.result_tag0_owner = ok_owner;
                 site.result_tag1_owner = err_owner;
                 site.result_payload0_ty = ok_ty;
-                site.result_payload1_ty = err_ty;
+                site.result_payload1_ty = err_ty.clone();
                 site.result_payload0_class = site.payload1_class.clone();
-                site.result_payload1_class = env_ty
-                    .and_then(|ty| {
-                        self.tyref_peel_ref_to_pointee(ty)
-                            .or_else(|| Some(clone_tyref(ty)))
-                    })
-                    .and_then(|ty| {
-                        enum_payload_instance_class_root(&ty, self.llbc, self.tombstoned_leaves)
-                    });
+                if kind == DiscCombinator::OptionOkOrElse {
+                    // `F: FnOnce() -> E`.  The None arm calls `f` and wraps
+                    // `E` as `Err`.
+                    site.result_payload1_class = err_class.clone();
+                    site.call_result_ty = err_ty;
+                    site.call_result_class = err_class;
+                } else {
+                    site.result_payload1_class = env_ty
+                        .and_then(|ty| {
+                            self.tyref_peel_ref_to_pointee(ty)
+                                .or_else(|| Some(clone_tyref(ty)))
+                        })
+                        .and_then(|ty| {
+                            enum_payload_instance_class_root(&ty, self.llbc, self.tombstoned_leaves)
+                        });
+                }
             }
             DiscCombinator::ResultMap | DiscCombinator::ResultAndThen => {
                 let dest = self.peel_to_option_or_result(dest_ty)?;
@@ -69496,6 +69548,10 @@ fn is_core_result_method(path: &str, leaf: &str) -> bool {
 enum DiscCombinator {
     OptionFilter,
     OptionOkOr,
+    /// `Option::ok_or_else(opt, f)`: `Some` rebuilds `Ok(payload)`, `None`
+    /// calls the niladic `f` and rebuilds `Err(f())`.  A niche `Option` is
+    /// the `rnone.py` `rtype_is_None` null test (`push_niche_is_some`).
+    OptionOkOrElse,
     ResultMap,
     ResultAndThen,
     ResultUnwrapOrElse,
@@ -69519,6 +69575,9 @@ impl DiscCombinator {
         match (name, nargs) {
             ("filter", 2) if is_core_option_method(path, "filter") => Some(Self::OptionFilter),
             ("ok_or", 2) if is_core_option_method(path, "ok_or") => Some(Self::OptionOkOr),
+            ("ok_or_else", 2) if is_core_option_method(path, "ok_or_else") => {
+                Some(Self::OptionOkOrElse)
+            }
             ("map", 2) if is_core_result_method(path, "map") => Some(Self::ResultMap),
             ("and_then", 2) if is_core_result_method(path, "and_then") => Some(Self::ResultAndThen),
             ("unwrap_or_else", 2) if is_core_result_method(path, "unwrap_or_else") => {
@@ -69537,6 +69596,7 @@ impl DiscCombinator {
         matches!(
             self,
             Self::OptionFilter
+                | Self::OptionOkOrElse
                 | Self::ResultMap
                 | Self::ResultAndThen
                 | Self::ResultUnwrapOrElse
@@ -69548,6 +69608,7 @@ impl DiscCombinator {
         match self {
             Self::OptionFilter => "filter",
             Self::OptionOkOr => "ok_or",
+            Self::OptionOkOrElse => "ok_or_else",
             Self::ResultMap => "map",
             Self::ResultAndThen => "and_then",
             Self::ResultUnwrapOrElse => "unwrap_or_else",
@@ -70057,7 +70118,9 @@ fn rewire_disc_combinator_diamond(
     let (then_is_tag1, then_needs_recv, then_needs_extra, else_needs_recv, else_needs_extra) =
         match site.kind {
             DiscCombinator::OptionFilter => unreachable!("filter has its own diamond"),
-            DiscCombinator::OptionOkOr => (true, true, false, false, true),
+            DiscCombinator::OptionOkOr | DiscCombinator::OptionOkOrElse => {
+                (true, true, false, false, true)
+            }
             DiscCombinator::ResultMap | DiscCombinator::ResultAndThen => {
                 (false, true, true, true, false)
             }
@@ -70143,7 +70206,20 @@ fn rewire_disc_combinator_diamond(
     for _ in ci..=remove_upto {
         graph.blocks[a].operations.remove(ci);
     }
-    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    // Niche `Option` is a nullable pointer: `rnone.py` `rtype_is_None`
+    // (`FunctionGraph::push_niche_is_some`).  A `__discriminant` field
+    // read would load the object header.
+    let disc = if site.recv_niche && site.kind == DiscCombinator::OptionOkOrElse {
+        emit_niche_some_tag(
+            graph,
+            a_id,
+            recv,
+            site.int_null.as_ref(),
+            &site.niche_null_cast,
+        )
+    } else {
+        emit_enum_disc_read(graph, a_id, recv, &site.recv_owner)
+    };
     if then_is_tag1 {
         graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
     } else {
@@ -70413,16 +70489,22 @@ fn build_disc_arm(
 
     match (site.kind, is_then) {
         (DiscCombinator::OptionFilter, _) => unreachable!("filter has its own diamond"),
-        (DiscCombinator::OptionOkOr, true) => {
+        (DiscCombinator::OptionOkOr, true) | (DiscCombinator::OptionOkOrElse, true) => {
             let recv = map_source(sources, inputs, recv)
                 .ok_or_else(|| format!("{name}: ok_or receiver not threaded"))?;
-            let payload = emit_payload_read(
-                graph,
-                block,
-                recv,
-                &site.recv_tag1_owner,
-                site.payload1_ty.clone(),
-            );
+            // Niche `Some` stores the pointer in the option word. `__pos_0`
+            // would load a field of that object.
+            let payload = if site.recv_niche && site.kind == DiscCombinator::OptionOkOrElse {
+                recv
+            } else {
+                emit_payload_read(
+                    graph,
+                    block,
+                    recv,
+                    &site.recv_tag1_owner,
+                    site.payload1_ty.clone(),
+                )
+            };
             let payload = emit_narrow(graph, block, payload, &site.payload1_class);
             Ok(emit_sum_variant(
                 graph,
@@ -70442,6 +70524,33 @@ fn build_disc_arm(
             let err = map_source(sources, inputs, extra)
                 .ok_or_else(|| format!("{name}: ok_or err not threaded"))?;
             let err = emit_narrow(graph, block, err, &site.result_payload1_class);
+            Ok(emit_sum_variant(
+                graph,
+                block,
+                &site.result_owner,
+                "Err",
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    err,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::OptionOkOrElse, false) => {
+            let env = disc_callable_env(site, sources, inputs, extra, name)?;
+            let err = crate::front::option_closure_select::emit_callable(
+                graph,
+                block,
+                env,
+                &site.call_once_owner,
+                site.fn_item_segments.as_deref(),
+                site.fn_item_ctor.as_ref(),
+                None,
+                site.call_result_ty.clone(),
+                &site.args_tuple_suffix,
+            )?;
+            let err = emit_narrow(graph, block, err, &site.call_result_class);
             Ok(emit_sum_variant(
                 graph,
                 block,
@@ -105915,6 +106024,145 @@ mod tests {
         assert!(!saw_disc, "niche filter read __discriminant");
         assert!(!saw_pos0, "niche filter read __pos_0");
         assert!(saw_is, "niche filter did not null-test the pointer");
+    }
+
+    fn option_ok_or_else_site(result_var: Variable) -> super::DiscCombinatorSite {
+        let mut site = option_disc_site(super::DiscCombinator::OptionOkOrElse, result_var);
+        site.result_owner = "core::result::Result".into();
+        site.result_tag0_owner = "core::result::Result::Ok".into();
+        site.result_tag1_owner = "core::result::Result::Err".into();
+        site.result_payload0_ty = ValueType::Ref(None);
+        site.result_payload1_ty = ValueType::Ref(None);
+        site.call_result_ty = ValueType::Ref(None);
+        site
+    }
+
+    #[test]
+    fn option_ok_or_else_lowers_to_discriminant_switch() {
+        let (mut graph, result) = build_two_arg_combinator("ok_or_else");
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[option_ok_or_else_site(result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "ok_or_else"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+    }
+
+    /// Niche `Option<*mut T>::ok_or_else` is a null test. `Some` is that
+    /// pointer — not `__discriminant` / `__pos_0` of the object.
+    #[test]
+    fn niche_option_ok_or_else_is_a_null_test() {
+        let mut graph = FunctionGraph::new("test_niche_ok_or_else");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("ok_or_else", Some("Option".into())),
+                    args: crate::model::call_args(vec![recv, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let mut site = option_ok_or_else_site(result);
+        site.recv_niche = true;
+        site.niche_null_cast = Some(("pyobject::PyObject".into(), ValueType::Ref(None)));
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "ok_or_else"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+        let mut saw_disc = false;
+        let mut saw_pos0_on_option = false;
+        let mut saw_is = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                        saw_disc = true;
+                    }
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "__pos_0"
+                            && field.owner_root.as_deref()
+                                == Some("core::option::Option::Some") =>
+                    {
+                        saw_pos0_on_option = true;
+                    }
+                    OpKind::BinOp { op, .. } if op == "is_" => saw_is = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(!saw_disc, "niche ok_or_else read __discriminant");
+        assert!(
+            !saw_pos0_on_option,
+            "niche ok_or_else read Option Some.__pos_0"
+        );
+        assert!(saw_is, "niche ok_or_else did not null-test the pointer");
+    }
+
+    #[test]
+    fn option_ok_or_else_fn_item_calls_the_named_function() {
+        let mut graph = FunctionGraph::new("test_ok_or_else_fn_item");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let f = graph.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("ok_or_else", Some("Option".into())),
+                    args: crate::model::call_args(vec![recv, f]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let mut site = option_ok_or_else_site(result);
+        site.call_once_owner = String::new();
+        site.fn_item_segments = Some(
+            ["pyre_interpreter", "builtins", "reservation_failed"]
+                .map(str::to_string)
+                .to_vec(),
+        );
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "ok_or_else"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 0);
+        let fn_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("reservation_failed")
+                )
+            })
+            .count();
+        assert_eq!(fn_calls, 1);
     }
 
     #[test]

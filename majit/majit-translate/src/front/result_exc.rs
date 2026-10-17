@@ -3365,6 +3365,21 @@ fn rewire_one_option_ok_or_else_try_site(
         }
     };
 
+    // A tail-forwarded `Result` is not a `?` diamond.  Decline before
+    // `rewire_one_call_site` remints the Method as a payload, so
+    // `DiscCombinator::OptionOkOrElse` still sees the residual call.
+    let call_ends_block = graph.blocks[a]
+        .operations
+        .last()
+        .is_some_and(|op| op.result.as_ref() == Some(&site.result_var));
+    if forwards_to_returnblock(graph, a, &site.result_var).is_ok()
+        || (call_ends_block && root_scope_closes_to_returnblock(graph, a, &site.result_var).is_ok())
+    {
+        return Err(format!(
+            "{name}: ok_or_else result is not consumed by an immediate `?` diamond"
+        ));
+    }
+
     // One recorded result: a merged `ok_or_else` continue has to fail in
     // planning, before this splice mutates, and the matcher reads the list.
     let recorded = [(site.result_var.clone(), None, site.payload_ty.clone())];

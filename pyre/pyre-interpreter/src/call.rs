@@ -4669,9 +4669,12 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
     if pyre_debug_call_enabled() {
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = e.pin(&_roots);
-        let message = e.message_text();
+        // `error.py OperationError.errorstr` runs at display time, not at
+        // raise time. Format inside the residual sink so a descent scan of
+        // this look_inside caller does not follow `message_text` into
+        // `space.str` (`py_str_wtf8`).
+        log_call_error(&e);
         e.reload(&_roots, slot);
-        log_call_error(&message);
     }
     set_call_error(e);
     PY_NULL
@@ -4680,16 +4683,17 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
 /// Cold debug-diagnostic sink for `call_function_impl_raw`. Residualized so
 /// the `eprintln!` formatting machinery (`fmt::rt::Argument`) stays out of the
 /// traced graph — the whole body is a host-stderr write behind the env probe,
-/// which the tracer cannot model. No-op under `sandbox` (host access must go
-/// through the seam).
+/// which the tracer cannot model. `message_text` (`error.py
+/// OperationError.errorstr`) lives here with that write. No-op under
+/// `sandbox` (host access must go through the seam).
 #[majit_macros::dont_look_inside]
-fn log_call_error(message: &str) {
+fn log_call_error(err: &PyError) {
     #[cfg(not(feature = "sandbox"))]
     if pyre_debug_call_enabled() {
-        eprintln!("[call_function_impl] error: {message}");
+        eprintln!("[call_function_impl] error: {}", err.message_text());
     }
     #[cfg(feature = "sandbox")]
-    let _ = message;
+    let _ = err;
 }
 
 /// Cold `descroperation.py call` non-callable error materialisation.
