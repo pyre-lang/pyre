@@ -13786,7 +13786,7 @@ mod tests {
                 "bound_reached finally does not bump abort_count"
             );
             assert!(
-                !driver.meta.warm_state_for_driver(0).is_dont_trace_here(key),
+                !cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
                 "bound_reached finally does not set JC_DONT_TRACE_HERE"
             );
         }
