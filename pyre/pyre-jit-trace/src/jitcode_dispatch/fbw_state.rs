@@ -1682,9 +1682,9 @@ pub fn fbw_foriter_inflight_take_for_resume(
     }
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
-        let at = stack
-            .iter()
-            .position(|e| foriter_body_matches_frame(e.body, frame, body_pc))?;
+        let at = stack.iter().position(|e| {
+            e.owner.is_portal() && foriter_body_matches_frame(e.body, frame, body_pc)
+        })?;
         // R1 never-double guard (cross-checks #33): an irreversible body effect
         // committed since this consume means re-running the body on delivery
         // would double it — refuse delivery.  A body-COMPLETED entry (the walk
@@ -1724,10 +1724,9 @@ pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usiz
     }
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
-        let Some(at) = stack
-            .iter()
-            .position(|e| foriter_body_matches_frame(e.body, frame, body_pc))
-        else {
+        let Some(at) = stack.iter().position(|e| {
+            e.owner.is_portal() && foriter_body_matches_frame(e.body, frame, body_pc)
+        }) else {
             return false;
         };
         stack[at].body_completed
@@ -1808,17 +1807,15 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 /// Which stash entry a take removes, given the indices that matched the parked
 /// frame.  `None` only for an empty stash.
 ///
-/// `foriter_body_matches_frame` decides on the frame's CODE and body pc, not on
-/// the frame itself — a frame address cannot be the key, since a minor
-/// collection relocates the frame between the capture and the take.  Two
-/// activations of one code (a recursive call, or one function inlined at two
-/// levels under different JitCode identities) therefore answer that match
-/// identically, and reaching past the top for one of them would deliver another
-/// activation's item into this frame.  So the match decides only while it is
-/// UNAMBIGUOUS; a second candidate falls back to the legacy top entry, whose
-/// header check then refuses and drops exactly as it did before.  Wrong-frame
-/// delivery is a wrong VALUE and the drop is only a loss, so never trading one
-/// for the other is what makes reaching past the top safe at all.
+/// The candidates are the portal frame's own entries
+/// ([`InflightForiterOwner::is_portal`]): `foriter_body_matches_frame` decides
+/// on the frame's CODE and body pc, so an inlined activation of the same code
+/// answers it identically, and only the owner tells the two items apart.  A
+/// second candidate is still possible when one loop was captured under both a
+/// Python-pc and a JitCode coordinate; it falls back to the legacy top entry,
+/// whose header check then refuses and drops.  Wrong-frame delivery is a wrong
+/// VALUE and the drop is only a loss, so never trading one for the other is
+/// what makes reaching past the top safe at all.
 fn inflight_take_index(len: usize, mut matching: impl Iterator<Item = usize>) -> Option<usize> {
     match (matching.next(), matching.next()) {
         (Some(only), None) => Some(only),
@@ -1937,7 +1934,8 @@ pub fn fbw_foriter_inflight_take(
                 .iter()
                 .enumerate()
                 .filter(|(_, entry)| {
-                    foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1)
+                    entry.owner.is_portal()
+                        && foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1)
                 })
                 .map(|(at, _)| at),
         ) else {
@@ -2250,7 +2248,11 @@ mod foriter_delivery_tests {
         assert_eq!(FBW_FORITER_INFLIGHT.with(|c| c.borrow().len()), 2);
 
         fbw_foriter_inflight_popframe(callee);
+        assert_eq!(FBW_FORITER_INFLIGHT.with(|c| c.borrow().len()), 1);
 
+        // An abort inside the callee: its item is on top and names the same
+        // code and body pc, but the live frame is the portal's.
+        fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
         assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((caller_item, 6)));
         fbw_store_journal_reset();
     }

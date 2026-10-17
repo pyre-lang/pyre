@@ -8609,6 +8609,13 @@ impl InflightForiterOwner {
             call_id: session.borrow().python_frame_call_id(),
         }
     }
+
+    /// Whether the owner is `framestack[0]`, the portal frame the walk entered
+    /// from. Only that frame is the live `PyFrame` an abort delivery pushes
+    /// onto; an inlined callee's item belongs to another frame.
+    pub(crate) fn is_portal(&self) -> bool {
+        self.call_id == 0
+    }
 }
 
 #[derive(Clone, Copy)]
