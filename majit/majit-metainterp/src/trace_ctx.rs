@@ -2934,9 +2934,7 @@ impl TraceCtx {
                 .map(|p| p.get())
                 .unwrap_or(majit_ir::GcRef(addr)),
         );
-        if opref.const_ptr_index().is_some_and(|index| index != 0) {
-            let _ = self.recorder.box_for_operand(opref);
-        }
+        self.recorder.hold_live_const_ptr(opref);
         opref
     }
 

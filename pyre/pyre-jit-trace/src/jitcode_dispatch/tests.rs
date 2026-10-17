@@ -18109,14 +18109,28 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
         portal_exempted.is_empty(),
         "unexpected exempt leaves: {portal_exempted:?}"
     );
-    // And that leaf only — every other published address still refuses the
-    // slot, `dict_get_plain` included, which takes the same three words and
-    // dereferences all of them.
+    // `sort_list_in_place_obj(list, key, reverse)`: `list.sort()` without
+    // `key=` / `reverse=` passes `PY_NULL` in both, and the helper tests
+    // each with `is_null()`.
+    let (_, sort) = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .find(|&(path, _)| leaf_of(path) == "sort_list_in_place_obj")
+        .expect("sort_list_in_place_obj is a registered leaf");
+    for i in 0..3 {
+        assert_eq!(
+            is_sentinel(K::None, sort, i, 3),
+            i != 0,
+            "sort_list_in_place_obj arg {i} of 3"
+        );
+    }
+    // And those leaves only — every other published address still refuses
+    // the slot, `dict_get_plain` included, which takes the same three words
+    // and dereferences all of them.
     let exempted: Vec<&str> = pyre_interpreter::jit_trace_fnaddrs()
         .into_iter()
         .filter(|&(_, addr)| is_sentinel(K::None, addr, 2, 3))
         .map(|(path, _)| leaf_of(path))
-        .filter(|&leaf| leaf != "dict_get_plain_applies")
+        .filter(|&leaf| leaf != "dict_get_plain_applies" && leaf != "sort_list_in_place_obj")
         .collect();
     assert!(
         exempted.is_empty(),
