@@ -205,7 +205,8 @@ impl RegisterHints {
     fn consider_int_sub(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
         let y = op.arg(1).to_opref();
         if let Some(val) = self.get_const_int(y) {
-            if fits_in_32bits(-val) {
+            // `-y.value` of `i64::MIN` is 2**63, which does not fit.
+            if fits_in_32bits(val.wrapping_neg()) {
                 return;
             }
         }
@@ -426,5 +427,25 @@ mod tests {
         // The separate GPR/XMM counters are the SysV numbering.
         #[cfg(not(target_os = "windows"))]
         assert_eq!(fixed(i), Some(ARGUMENTS_GPR[0]));
+    }
+
+    /// `consider_int_sub` negates the constant. `i64::MIN` has no
+    /// negation; it falls through to `_consider_binop`.
+    #[test]
+    fn int_sub_hint_of_i64_min_constant() {
+        let x = OpRef::input_arg_int(0);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let c = OpRef::const_int(i64::MIN);
+        let sub = Op::new(OpCode::IntSub, &[rb(x), rb(c)]);
+        sub.pos().set(OpRef::int_op(0));
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(0))]);
+        finish.pos().set(OpRef::void_op(1));
+        let ops: Vec<OpRc> = vec![OpRc::new(sub), OpRc::new(finish)];
+        let mut longevity = compute_vars_longevity(&inputargs, &ops);
+        RegisterHints::new(vec![], vec![], vec![], vec![], IndexMap::new()).add_hints(
+            &mut longevity,
+            &inputargs,
+            &ops,
+        );
     }
 }
