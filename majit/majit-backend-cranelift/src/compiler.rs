@@ -2810,27 +2810,14 @@ fn register_call_assembler_target(
     compiled: &CompiledLoop,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
-    invalidate_ca_thread_cache(token.identity_key());
     let entry_code = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
     let entry_body = compiled.entry_body_ptr.load(Ordering::Acquire) as *const u8;
-    // assembler.py: `looptoken._ll_function_addr = rawstart + functionpos`
-    // — the assembler body. The host-ABI wrapper stays on `entry_code_ptr`
-    // for `execute_token`; in-code CALL_ASSEMBLER loads this slot.
-    token.set_ll_function_addr(entry_body as usize);
     let depth = compiled.frame_depth as i64;
     let base_ofs = JF_FRAME_ITEM0_OFS as i64;
     let clt = token.compiled_loop_token_expect();
-    clt.set_ca_unregister(token.identity_key(), unregister_call_assembler_target);
-    // `regalloc.py` `_set_initial_bindings`: contiguous layout
-    // → `locs[i] = i * SIZEOFSIGNED`.
-    *clt._ll_initial_locs.lock() = (0..compiled.num_inputs).map(|i| (i as i32) * 8).collect();
-    // `jitframe.py` `jitframeinfo_update_depth`. The base_ofs is
-    // shifted by `GcHeader::SIZE` because pyre's nursery allocator
-    // returns the JITFRAME pointer past an 8-byte GcHeader; the depth
-    // field counts payload slots after the header.
-    clt.frame_info
-        .lock()
-        .update_frame_depth(base_ofs + GcHeader::SIZE as i64, depth);
+    // Built before any publish: `RegisteredLoopTarget` reads compiled
+    // fields and the token's existing identity, not `_ll_function_addr`,
+    // `_ll_initial_locs`, `frame_info`, or the dispatch slot.
     let target = RegisteredLoopTarget {
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
@@ -2852,8 +2839,24 @@ fn register_call_assembler_target(
         cpu_attachments: Arc::clone(&compiled.cpu_attachments),
     };
     validate_registered_target_against_call_assembler_expectations(token.identity_key(), &target)?;
-    // Invalidate thread-local cache in case a pending placeholder was cached.
+    // `x86/assembler.py assemble_loop` publishes
+    // `looptoken._ll_function_addr = rawstart + functionpos` only after
+    // the loop is fully assembled. The host-ABI wrapper stays on
+    // `entry_code_ptr` for `execute_token`; in-code CALL_ASSEMBLER loads
+    // this slot.
     invalidate_ca_thread_cache(token.identity_key());
+    token.set_ll_function_addr(entry_body as usize);
+    clt.set_ca_unregister(token.identity_key(), unregister_call_assembler_target);
+    // `regalloc.py` `_set_initial_bindings`: contiguous layout
+    // → `locs[i] = i * SIZEOFSIGNED`.
+    *clt._ll_initial_locs.lock() = (0..compiled.num_inputs).map(|i| (i as i32) * 8).collect();
+    // `jitframe.py` `jitframeinfo_update_depth`. The base_ofs is
+    // shifted by `GcHeader::SIZE` because pyre's nursery allocator
+    // returns the JITFRAME pointer past an 8-byte GcHeader; the depth
+    // field counts payload slots after the header.
+    clt.frame_info
+        .lock()
+        .update_frame_depth(base_ofs + GcHeader::SIZE as i64, depth);
     // Create/update dispatch slot for direct call
     ca_dispatch_slot(token.identity_key(), entry_code);
     // `compile.py:665-674` parity: the direct CA call path embeds the
@@ -2898,10 +2901,16 @@ fn lookup_call_assembler_target(token_key: usize) -> Option<RegisteredLoopTarget
     with_call_assembler_registry(|m| m.get(&token_key).cloned())
 }
 
-fn redirect_call_assembler_target(old_key: usize, new_key: usize) -> Result<(), BackendError> {
-    invalidate_ca_thread_cache(old_key);
+/// `x86/assembler.py redirect_call_assembler` checks first
+/// (`assert old_nbargs == new_nbargs`) and only then copies frame info
+/// and patches. Returns the looked-up new target so the caller can
+/// mutate `old` and then [`publish_redirect_call_assembler_target`].
+fn validate_redirect_call_assembler_target(
+    old_key: usize,
+    new_key: usize,
+) -> Result<Option<RegisteredLoopTarget>, BackendError> {
     let Some(new_target) = lookup_call_assembler_target(new_key) else {
-        return Ok(());
+        return Ok(None);
     };
     if let Some(old_target) = lookup_call_assembler_target(old_key)
         && old_target.inputarg_types != new_target.inputarg_types
@@ -2911,6 +2920,11 @@ fn redirect_call_assembler_target(old_key: usize, new_key: usize) -> Result<(), 
         )));
     }
     validate_registered_target_against_call_assembler_expectations(old_key, &new_target)?;
+    Ok(Some(new_target))
+}
+
+fn publish_redirect_call_assembler_target(old_key: usize, new_target: RegisteredLoopTarget) {
+    invalidate_ca_thread_cache(old_key);
     // Update dispatch slot so existing compiled code sees the new target.
     // Must update both code_ptr AND finish_descr_ptr (the new target has
     // different FailDescr pointers for its finish exit).
@@ -2933,7 +2947,6 @@ fn redirect_call_assembler_target(old_key: usize, new_key: usize) -> Result<(), 
         .unwrap_or(CA_FINISH_INDEX_UNKNOWN as i64);
     ca_dispatch_redirect(old_key, new_target.code_ptr, new_finish_descr_ptr);
     with_call_assembler_registry(|m| m.insert(old_key, new_target));
-    Ok(())
 }
 
 fn store_call_assembler_deadframe(frame: DeadFrame) -> u64 {
@@ -23300,17 +23313,23 @@ impl majit_backend::Backend for CraneliftBackend {
         new: &JitCellToken,
     ) -> Result<(), BackendError> {
         let _writing = majit_backend::AssemblerWriting::enter();
+        // `x86/assembler.py redirect_call_assembler` checks first
+        // (`assert old_nbargs == new_nbargs`) and only then copies frame
+        // info and patches.
+        let new_target =
+            validate_redirect_call_assembler_target(old.identity_key(), new.identity_key())?;
         let new_addr = new.ll_function_addr();
         if new_addr != 0 {
             old.set_ll_function_addr(new_addr);
         }
-        // x86/assembler.py:1146-1151 update_frame_info parity: propagate the
-        // new loop's frame depth onto the old token and its redirect chain.
-        // Callers baked the OLD CompiledLoopToken's frame_info pointer at
-        // rewrite time and read jfi_frame_size at runtime (rewrite.py),
-        // so without this every redirected call allocates a frame sized for
-        // the old (tmp-callback) body and the new loop's prologue reallocs it
-        // on every call.
+        // `x86/assembler.py redirect_call_assembler` `update_frame_info`
+        // parity: propagate the new loop's frame depth onto the old token
+        // and its redirect chain. Callers baked the OLD
+        // CompiledLoopToken's frame_info pointer at rewrite time and read
+        // jfi_frame_size at runtime (`rewrite.py handle_call_assembler`),
+        // so without this every redirected call allocates a frame sized
+        // for the old (tmp-callback) body and the new loop's prologue
+        // reallocs it on every call.
         if let (Some(new_clt), Some(old_clt)) =
             (new.compiled_loop_token(), old.compiled_loop_token())
         {
@@ -23318,7 +23337,9 @@ impl majit_backend::Backend for CraneliftBackend {
             let old_weak = Arc::downgrade(&old_clt);
             new_clt.update_frame_info(&old_clt, old_weak, baseofs);
         }
-        redirect_call_assembler_target(old.identity_key(), new.identity_key())?;
+        if let Some(new_target) = new_target {
+            publish_redirect_call_assembler_target(old.identity_key(), new_target);
+        }
         // Non-x86 assemblers log `newlooptoken.number`
         // (`aarch64/assembler.py redirect_call_assembler`).
         majit_backend::redirect_assembler(old, new, new.number() as u64);

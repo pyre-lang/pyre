@@ -5177,8 +5177,13 @@ mod tests {
             fn loop_token_number(&self) -> i64 {
                 self.0 as i64
             }
+
+            fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
+                Some(self)
+            }
         }
 
+        let token = Arc::new(TestLoopToken(9));
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
         rw.jitframe_info = Some(JitFrameDescrs {
@@ -5196,21 +5201,23 @@ mod tests {
             sign_size: 8,
             jf_frame_itemsize: 8,
         });
-        rw.call_assembler_callee_locs = Some(Box::new(|ltd| {
-            (ltd.loop_token_number() == 9).then_some(CallAssemblerCalleeLocs {
-                _ll_initial_locs: Vec::new(),
-                frame_depth: 4,
-                frame_info_ptr: 0x1000,
-                index_of_virtualizable: -1,
+        rw.call_assembler_callee_locs = Some({
+            let expected = Arc::clone(&token);
+            Box::new(move |ltd| {
+                ltd.token_handle_any()
+                    .and_then(|any| any.downcast_ref::<TestLoopToken>())
+                    .filter(|got| std::ptr::eq(*got, Arc::as_ptr(&expected)))
+                    .map(|_| CallAssemblerCalleeLocs {
+                        _ll_initial_locs: Vec::new(),
+                        frame_depth: 4,
+                        frame_info_ptr: 0x1000,
+                        index_of_virtualizable: -1,
+                    })
             })
-        }));
+        });
         let gc_fields = vec![ref_field_descr_at(24)];
         let descr = size_descr_with_gc_fields(48, 42, gc_fields);
-        let call = Op::with_descr(
-            OpCode::CallAssemblerN,
-            &[],
-            std::sync::Arc::new(TestLoopToken(9)),
-        );
+        let call = Op::with_descr(OpCode::CallAssemblerN, &[], Arc::clone(&token) as DescrRef);
         let ops = vec![
             Op::with_descr(OpCode::New, &[], descr),
             call,
@@ -5281,8 +5288,13 @@ mod tests {
             fn loop_token_number(&self) -> i64 {
                 self.0 as i64
             }
+
+            fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
+                Some(self)
+            }
         }
 
+        let token = Arc::new(TestLoopToken(9));
         let mut rw = make_rewriter();
         rw.jitframe_info = Some(JitFrameDescrs {
             jitframe_tid: 7,
@@ -5299,14 +5311,20 @@ mod tests {
             sign_size: 4,
             jf_frame_itemsize: 8,
         });
-        rw.call_assembler_callee_locs = Some(Box::new(|ltd| {
-            (ltd.loop_token_number() == 9).then_some(CallAssemblerCalleeLocs {
-                _ll_initial_locs: vec![8, 16, 24],
-                frame_depth: 4,
-                frame_info_ptr: 0x1000,
-                index_of_virtualizable: -1,
+        rw.call_assembler_callee_locs = Some({
+            let expected = Arc::clone(&token);
+            Box::new(move |ltd| {
+                ltd.token_handle_any()
+                    .and_then(|any| any.downcast_ref::<TestLoopToken>())
+                    .filter(|got| std::ptr::eq(*got, Arc::as_ptr(&expected)))
+                    .map(|_| CallAssemblerCalleeLocs {
+                        _ll_initial_locs: vec![8, 16, 24],
+                        frame_depth: 4,
+                        frame_info_ptr: 0x1000,
+                        index_of_virtualizable: -1,
+                    })
             })
-        }));
+        });
         let call = Op::with_descr(
             OpCode::CallAssemblerR,
             &[
@@ -5314,7 +5332,7 @@ mod tests {
                 ro(OpRef::int_op(1)),
                 ro(OpRef::float_op(2)),
             ],
-            std::sync::Arc::new(TestLoopToken(9)),
+            Arc::clone(&token) as DescrRef,
         );
 
         let result = rw.rewrite_ops(&[call]);
