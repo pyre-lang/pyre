@@ -2298,6 +2298,53 @@ fn call_release_gil_saves_last_error() {
     assert_eq!(majit_rlib::rwin32::GetLastError_saved(), 123);
 }
 
+#[cfg(target_os = "windows")]
+extern "C" fn set_last_error_and_return_float(code: i64) -> f64 {
+    unsafe { majit_rlib::rwin32::_SetLastError(code as u32) };
+    code as f64 + 0.25
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn call_release_gil_saves_last_error_float_result() {
+    // `CallBuilder64.save_result_value` for a FLOAT result is one
+    // `MOVSD [rsp], xmm0` (and `restore_result_value` the reverse) around
+    // `GetLastError`; rax is not saved.
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let call = Op::new(
+        OpCode::CallReleaseGilF,
+        &[
+            rb(OpRef::const_int(majit_jitcode::rffi::RFFI_SAVE_LASTERROR)),
+            rb(OpRef::const_int(
+                set_last_error_and_return_float as usize as i64,
+            )),
+            rb(OpRef::const_int(77)),
+        ],
+    );
+    call.pos().set(OpRef::float_op(1));
+    call.setdescr(call_descr(vec![Type::Int], Type::Float, false, 8));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::float_op(1), Type::Float, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile CALL_RELEASE_GIL_F: {err:?}"));
+    let code = compiled_bytes(&token);
+    assert_has(code, &[0xF2, 0x0F, 0x11, 0x04, 0x24], "movsd [rsp], xmm0");
+    assert_has(code, &[0xF2, 0x0F, 0x10, 0x04, 0x24], "movsd xmm0, [rsp]");
+    assert!(
+        !code.windows(4).any(|w| w == [0x48, 0x89, 0x04, 0x24]),
+        "a float result must not save rax"
+    );
+    majit_rlib::rwin32::SetLastError_saved(0);
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(backend.get_float_value(&frame, 0), 77.25);
+    assert_eq!(majit_rlib::rwin32::GetLastError_saved(), 77);
+}
+
 fn op_at(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let operands: Vec<_> = args.iter().copied().map(rb).collect();
     let op = Op::new(opcode, &operands);

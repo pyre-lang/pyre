@@ -8816,8 +8816,17 @@ impl<'a> Assembler386<'a> {
     /// `CallBuilderX86.read_real_errno`, after the raw call and after the
     /// stack pointer is restored: save the real `errno` (and on Windows the
     /// last error) into the thread-local copy. rax/xmm0 hold the result.
-    fn read_real_errno(&mut self, save_err: i64, esp_ofs: i32, tlofs_loaded: &mut bool) {
+    fn read_real_errno(
+        &mut self,
+        save_err: i64,
+        esp_ofs: i32,
+        tlofs_loaded: &mut bool,
+        restype: Type,
+        singlefloat_result: bool,
+    ) {
         use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_SAVE_ERRNO};
+        #[cfg(not(target_os = "windows"))]
+        let _ = (restype, singlefloat_result);
         use majit_rlib::rthread::{
             TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
         };
@@ -8852,37 +8861,53 @@ impl<'a> Assembler386<'a> {
                 } else {
                     TLFIELD_RPY_LASTERROR_OFS
                 } as i32;
-                // `save_result_value`: keep rax/xmm0 above a fresh shadow
-                // area. rsp is the body rsp here (`restore_stack_pointer`
-                // ran), so 48 = 32-byte shadow + two save slots keeps it
-                // 16-byte aligned for the call. r12 already names the
-                // thread-local block (`get_tlofs_reg`), so the `sub rsp`
-                // does not change the address.
+                // `CallBuilder64.save_result_value` stores the result at
+                // [rsp+0]. That word is the callee's shadow space on
+                // Win64, so a fresh 32-byte shadow is reserved below it
+                // for the call, as `win64_save_register_args` does around
+                // `SetLastError`. rsp is the body rsp here
+                // (`restore_stack_pointer` ran) and stays 16-byte aligned.
+                // r12 already names the thread-local block
+                // (`get_tlofs_reg`), so the `SUB` does not change it.
                 self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
                 debug_assert_eq!(esp_ofs % 16, 0);
-                dynasm!(self.mc ; .arch x64
-                ; sub rsp, 48
-                );
-                dynasm!(self.mc ; .arch x64
-                ; mov [rsp + 32], rax
-                );
-                dynasm!(self.mc ; .arch x64
-                        ; movsd [rsp + 40], xmm0
-                );
-                // `CALL(imm(follow_jump(GetLastError_addr)))`. rax/xmm0
-                // stay saved across it; the result comes back in eax.
+                self.save_result_value(restype, singlefloat_result);
+                rx86::sub_ri(&mut self.mc, rx86::ESP, 4 * WORD as i32);
+                // `CALL(imm(follow_jump(GetLastError_addr)))`.
                 self.emit_immediate_call(get_last_error);
                 rx86::mov32_mr(&mut self.mc, (rx86::R12, lasterror), rx86::EAX);
-                dynasm!(self.mc ; .arch x64
-                ; mov rax, [rsp + 32]
-                );
-                dynasm!(self.mc ; .arch x64
-                ; movsd xmm0, [rsp + 40]
-                );
-                dynasm!(self.mc ; .arch x64
-                    ; add rsp, 48
-                );
+                rx86::add_ri(&mut self.mc, rx86::ESP, 4 * WORD as i32);
+                self.restore_result_value(restype, singlefloat_result);
             }
+        }
+    }
+
+    /// `CallBuilder64.save_result_value`: temporarily save the result
+    /// value into [ESP].
+    #[cfg(target_os = "windows")]
+    fn save_result_value(&mut self, restype: Type, singlefloat_result: bool) {
+        match restype {
+            // void return
+            Type::Void => {}
+            Type::Float => rx86::movsd_sx(&mut self.mc, 0, 0),
+            // singlefloat return: store the lower 32 bits of XMM0 into [ESP]
+            _ if singlefloat_result => {
+                dynasm!(self.mc ; .arch x64 ; movd DWORD [rsp], xmm0);
+            }
+            _ => rx86::mov_sr(&mut self.mc, 0, rx86::EAX),
+        }
+    }
+
+    /// `CallBuilder64.restore_result_value`: opposite of `save_result_value`.
+    #[cfg(target_os = "windows")]
+    fn restore_result_value(&mut self, restype: Type, singlefloat_result: bool) {
+        match restype {
+            Type::Void => {}
+            Type::Float => rx86::movsd_xs(&mut self.mc, 0, 0),
+            _ if singlefloat_result => {
+                dynasm!(self.mc ; .arch x64 ; movd xmm0, DWORD [rsp]);
+            }
+            _ => rx86::mov_rs(&mut self.mc, rx86::EAX, 0),
         }
     }
 
@@ -9072,7 +9097,14 @@ impl<'a> Assembler386<'a> {
         // `CallBuilderX86.load_result` reads the one return word in rax.
 
         self.restore_stack_pointer(call_area_adjust);
-        self.read_real_errno(save_err, 0, &mut tlofs_loaded);
+        let singlefloat_result = call_descr.is_some_and(|cd| cd.result_class() == 'S');
+        self.read_real_errno(
+            save_err,
+            0,
+            &mut tlofs_loaded,
+            op.opcode.result_type(),
+            singlefloat_result,
+        );
     }
 
     /// `CallBuilder64.prepare_arguments`: Win64's next integer slot is the
