@@ -1798,6 +1798,15 @@ pub struct EntryPoint {
     pub schema: Vec<GreenType>,
 }
 
+/// `warmstate.py make_entry_point` closure captures.
+struct PortalEntryCaptures {
+    /// `confirm_enter_jit`; a hook installed after `register_descriptor`
+    /// stays visible because this is another handle to the WarmEnterState cell.
+    confirm_enter_jit_ptr: std::rc::Rc<std::cell::Cell<Option<fn(&GreenKey) -> bool>>>,
+    /// `jitdriver_sd.index` — `isinstance(cell, JitCell)` operand.
+    jd_index: usize,
+}
+
 /// High-level JIT driver that automates the tracing lifecycle.
 ///
 /// Wraps [`MetaInterp`] and manages symbolic state, replacing ~80 lines
@@ -1921,6 +1930,8 @@ pub struct JitDriver<S: JitState> {
     /// `ll_portal_runner` prefix does not mint a second artifact for the same
     /// activation. Taken, not read: a skipped door must not stay skipped.
     function_entry_suppressed: bool,
+    /// `warmstate.py make_entry_point` closure captures.
+    portal_entry: PortalEntryCaptures,
     /// Reusable buffers for the compiled-entry argument walk.
     ///
     /// `warmstate.py execute_assembler` builds the entry arguments
@@ -2250,6 +2261,10 @@ impl<S: JitState> JitDriver<S> {
             portal_jd_index: None,
             state_field_fvc: None,
             function_entry_suppressed: false,
+            portal_entry: PortalEntryCaptures {
+                confirm_enter_jit_ptr: std::rc::Rc::new(std::cell::Cell::new(None)),
+                jd_index: 0,
+            },
             entry_scratch: Some(Box::default()),
             exit_raw_scratch: Some(Vec::new()),
             #[expect(
@@ -2815,6 +2830,15 @@ impl<S: JitState> JitDriver<S> {
         // warmspot.py `make_enter_functions`: the driver's `warmstate`
         // exists from registration on.
         self.meta.make_enter_function(idx);
+        // `make_entry_point` captures `confirm_enter_jit` off that state.
+        if let Some(confirm) = self
+            .meta
+            .warm_state_ref_for_driver(idx)
+            .map(|warm| warm.confirm_enter_jit_handle())
+        {
+            self.portal_entry.confirm_enter_jit_ptr = confirm;
+        }
+        self.portal_entry.jd_index = idx;
         idx
     }
 
@@ -10087,33 +10111,45 @@ impl<S: JitState> JitDriver<S> {
 
     /// Sole compiled cell for `hash`, when no confirm hook is installed.
     ///
-    /// `warmstate.py maybe_compile_and_run` walks `lookup_chain` once.
-    /// `:473` declines `JC_TRACING | JC_TEMPORARY`. `:483` reads
-    /// `get_procedure_token` once. A confirm hook stays on the occupied
-    /// door (`:501`).
-    #[inline]
+    /// `warmstate.py maybe_compile_and_run` is a closure over
+    /// `jitcounter = self.warmrunnerdesc.jitcounter` and
+    /// `confirm_enter_jit`; it does `cell = jitcounter.lookup_chain(hash)`
+    /// then `isinstance(cell, JitCell)` (`cell.jitdriver_sd` of this
+    /// driver). Tracing / temporary flags decline. A confirm hook stays
+    /// on the occupied door.
+    #[inline(always)]
     fn compiled_function_token(
         &self,
         hash: u64,
     ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
-        let jd_no = self.index().unwrap_or(0);
-        let Some(warm) = self.meta.warm_state_ref_for_driver(jd_no) else {
+        let entry = &self.portal_entry;
+        if entry.confirm_enter_jit_ptr.get().is_some() {
             return None;
+        }
+        // The table `Ref` lives only for the cell-field reads and
+        // `get_procedure_token` (`warmstate.py`); `has_compiled_code` is
+        // on the owned token.
+        let (cell_key, token) = {
+            // `maybe_compile_and_run` reads `warmrunnerdesc.jitcounter`
+            // (`MetaInterp.jitcounter`), not `jitdrivers_sd[jd_no].warmstate`.
+            let cell = self.meta.jitcounter.lookup_chain(hash)?;
+            let cell = std::cell::Ref::map(cell, std::rc::Rc::as_ref);
+            // `isinstance(cell, JitCell)` — one subclass per driver.
+            if cell.jitdriver_sd != entry.jd_index {
+                return None;
+            }
+            if cell.next.borrow().is_some() || cell.cell_bucket.get() != hash {
+                return None;
+            }
+            if cell.flags.get().contains(JcFlags::JC_TRACING)
+                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+            {
+                return None;
+            }
+            let cell_key = cell.cell_key.get()?;
+            let token = cell.get_procedure_token()?;
+            (cell_key, token)
         };
-        if warm.has_confirm_enter_jit() {
-            return None;
-        }
-        let cell = warm.lookup_chain(hash)?;
-        if cell.next.borrow().is_some() || cell.cell_bucket.get() != hash {
-            return None;
-        }
-        if cell.flags.get().contains(JcFlags::JC_TRACING)
-            || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
-        {
-            return None;
-        }
-        let cell_key = cell.cell_key.get()?;
-        let token = cell.get_procedure_token()?;
         if !token.has_compiled_code() {
             return None;
         }
@@ -12766,6 +12802,110 @@ mod tests {
                 .get_compiled(key)
                 .is_none(),
             "portal slot 0 does not hold jd1's compiled cell"
+        );
+
+        // `isinstance(cell, JitCell)`: a lone cell filed by jd0 is the
+        // table-slot head `lookup_chain` returns, and is not this driver's.
+        // `0x7e14` indexes slot 0 (`(hash as u32) >> shift`); a second
+        // cell in that slot would become `cell.next` and the miss would be
+        // the chain check, not `jitdriver_sd`. Slot 1 keeps the head lone.
+        let foreign = 1u64 << 21;
+        assert_ne!(
+            driver.meta.jitcounter._get_index(key),
+            driver.meta.jitcounter._get_index(foreign),
+            "jd0's cell must be the lone head of a different slot"
+        );
+        let foreign_token = std::sync::Arc::new(majit_backend::JitCellToken::new(75));
+        foreign_token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx0)
+            .memory_manager
+            .keep_loop_alive(&foreign_token);
+        driver
+            .meta
+            .warm_state_for_driver(idx0)
+            .attach_procedure_to_interp(foreign, std::sync::Arc::clone(&foreign_token));
+        {
+            let cell = driver
+                .meta
+                .jitcounter
+                .lookup_chain(foreign)
+                .expect("jd0 filed the slot head");
+            assert_eq!(cell.jitdriver_sd, idx0);
+            assert!(
+                cell.next.borrow().is_none(),
+                "the isinstance miss is a lone head, not a chain"
+            );
+            assert!(
+                cell.get_procedure_token()
+                    .is_some_and(|got| std::sync::Arc::ptr_eq(&got, &foreign_token)),
+                "the slot holds jd0's compiled procedure"
+            );
+        }
+        assert!(
+            driver.compiled_function_token(key).is_some(),
+            "jd1's own slot still answers after jd0 files a different slot"
+        );
+        assert!(
+            driver.compiled_function_token(foreign).is_none(),
+            "function-entry compiled lookup on jd1 skips jd0's cell at that slot"
+        );
+    }
+
+    #[test]
+    fn compiled_function_token_declines_a_confirm_hook_installed_after_register() {
+        // `set_confirm_enter_jit` after `register_descriptor` must still
+        // keep the compiled portal on the occupied door: the capture is
+        // another handle to the same cell, not a registration-time copy.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut jd = JitDriverStaticData::new(vec![], vec![]);
+        jd.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx = driver.register_descriptor(jd);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        fn refuse(_key: &GreenKey) -> bool {
+            false
+        }
+
+        let key = 0xC0F1_u64;
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(76));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+
+        assert!(
+            driver.compiled_function_token(key).is_some(),
+            "the procedure is attached before the confirm hook"
+        );
+
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .set_confirm_enter_jit(Some(refuse));
+
+        assert!(
+            driver.compiled_function_token(key).is_none(),
+            "a confirm hook installed after register_descriptor stays on the occupied door"
+        );
+
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .set_confirm_enter_jit(None);
+        assert!(
+            driver.compiled_function_token(key).is_some(),
+            "clearing the hook restores the compiled token"
         );
     }
 

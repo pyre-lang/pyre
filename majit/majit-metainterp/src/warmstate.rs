@@ -315,6 +315,10 @@ impl BaseJitCell {
     /// invalidated one, and returns an OWNED handle: a caller that got a token
     /// out of here keeps it alive for as long as it holds it, which is what
     /// upstream's Python reference does too.
+    ///
+    /// Outlined so `Weak::upgrade`'s `casa` stays in this body. Inlining it
+    /// into `enter_compiled_function_entry` residualizes `upgrade` as a call.
+    #[inline(never)]
     pub fn get_procedure_token(&self) -> Option<Arc<JitCellToken>> {
         // The three conditions above, in order: the slot is set, the weakref
         // still resolves, and the token it resolves to is not invalidated.
@@ -751,6 +755,11 @@ pub struct WarmEnterState {
     /// `return True` closure when it is absent, which is what `None` means
     /// here; [`Self::confirm_enter_jit`] is that substitution.
     ///
+    /// `warmstate.py make_entry_point` captures `confirm_enter_jit` as a
+    /// closure constant. The `Rc<Cell>` is that capture: `JitDriver` holds
+    /// another handle to the same cell so the compiled portal can read it
+    /// without borrowing this state.
+    ///
     /// `warmspot.py make_driverhook_graphs` builds this hook with
     /// `onlygreens=False`, so upstream passes every portal green and red.
     /// This layer now supplies the structured [`GreenKey`], not its
@@ -759,7 +768,7 @@ pub struct WarmEnterState {
     /// `WarmEnterState` owns only cells and counters. Exact argument parity
     /// therefore requires moving the hook boundary to the portal or threading
     /// an interpreter-defined red-argument carrier into every policy call.
-    confirm_enter_jit_ptr: Option<fn(&GreenKey) -> bool>,
+    confirm_enter_jit_ptr: Rc<Cell<Option<fn(&GreenKey) -> bool>>>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -911,7 +920,7 @@ impl WarmEnterState {
             memory_manager,
             cell_generation: 0,
             jitdriver_sd,
-            confirm_enter_jit_ptr: None,
+            confirm_enter_jit_ptr: Rc::new(Cell::new(None)),
         }
     }
 
@@ -2455,7 +2464,7 @@ impl WarmEnterState {
     /// before entering already-compiled machine code.
     #[inline]
     pub fn confirm_enter_jit(&self, green_key: &GreenKey) -> bool {
-        match self.confirm_enter_jit_ptr {
+        match self.confirm_enter_jit_ptr.get() {
             None => true,
             Some(hook) => hook(green_key),
         }
@@ -2476,7 +2485,7 @@ impl WarmEnterState {
     /// pc)` and take the typed path whenever a hook is installed).
     #[inline]
     fn confirm_enter_jit_if_available(&self, green_key: Option<&GreenKey>) -> bool {
-        match (self.confirm_enter_jit_ptr, green_key) {
+        match (self.confirm_enter_jit_ptr.get(), green_key) {
             (None, _) => true,
             (Some(hook), Some(key)) => hook(key),
             (Some(_), None) => {
@@ -2492,7 +2501,7 @@ impl WarmEnterState {
     /// admissible substitute.
     #[inline]
     pub(crate) fn confirm_compiled_entry_for_cell_key(&self, cell_key: u64) -> bool {
-        if self.confirm_enter_jit_ptr.is_none() {
+        if self.confirm_enter_jit_ptr.get().is_none() {
             return true;
         }
         let cell = self.cell_by_key(cell_key);
@@ -2507,7 +2516,7 @@ impl WarmEnterState {
     /// below the declaration can know what it said, so an interpreter installs
     /// its own here. `None` restores the no-hook default.
     pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(&GreenKey) -> bool>) {
-        self.confirm_enter_jit_ptr = hook;
+        self.confirm_enter_jit_ptr.set(hook);
     }
 
     /// Whether an interpreter installed the optional entry veto. Entry doors
@@ -2515,7 +2524,13 @@ impl WarmEnterState {
     /// always-allow case.
     #[inline]
     pub fn has_confirm_enter_jit(&self) -> bool {
-        self.confirm_enter_jit_ptr.is_some()
+        self.confirm_enter_jit_ptr.get().is_some()
+    }
+
+    /// The `make_entry_point` capture of `confirm_enter_jit`. `JitDriver`
+    /// holds another handle to this same cell.
+    pub(crate) fn confirm_enter_jit_handle(&self) -> Rc<Cell<Option<fn(&GreenKey) -> bool>>> {
+        Rc::clone(&self.confirm_enter_jit_ptr)
     }
 
     /// warmstate.py: get_location(greenkey)
@@ -3029,7 +3044,7 @@ impl WarmEnterState {
     /// `comparekey`; this one hands back the slot as upstream does.
     #[inline]
     pub fn lookup_chain(&self, hash: u64) -> Option<Rc<BaseJitCell>> {
-        self.counter.lookup_chain(hash)
+        self.counter.lookup_chain(hash).map(|cell| Rc::clone(&cell))
     }
 
     /// `jitcounter.install_new_cell(hash, newcell)` (counter.py), reached
