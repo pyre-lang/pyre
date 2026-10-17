@@ -3907,33 +3907,25 @@ pub fn translate_op(
                             // `__pos_0` payloads union.
                             bk.intern_enum_variant_host(&owner_qual, name)
                         } else {
-                            // A closure env ctor.  Normal struct ctors keep the
-                            // dotted qualname (`_init_classdef`'s
-                            // `struct_force_key_from_dotted_qualname` reduces it
-                            // to the `module::Type` FORCE key), but a closure's
-                            // deep `<Impl>::fn::closure` path does not reduce to
-                            // a field-registry key, so the dotted class mints
-                            // fieldless.  When the full `::` `name_path` IS a
-                            // struct-root registry key, intern under it and
-                            // project the captured fields via
-                            // `getuniqueclassdef_for_struct_root`, matching the
-                            // fielded classdef the closure param-typing path
-                            // (`tyref_input_class_root`) derives.  RPython
-                            // forbids closures.
-                            let colon_qual = format!("{owner_qual}::{name}");
-                            let is_closure_root = majit_charon_reader::ullbc::is_closure_leaf(name)
-                                && bk
-                                    .struct_fields
-                                    .borrow()
-                                    .as_ref()
-                                    .is_some_and(|reg| reg.fields.contains_key(&colon_qual));
-                            if is_closure_root {
-                                let _ = bk.getuniqueclassdef_for_struct_root(&colon_qual);
-                                bk.intern_class_by_qualname(&colon_qual)
-                            } else {
-                                let qualname = format!("{}.{}", owner_path.join("."), name);
-                                bk.intern_class_by_qualname(&qualname)
+                            // Struct ctor: intern under the dotted
+                            // constructor qualname. `intern_class_by_qualname`
+                            // / `normalize_class_qualname` reduce it to the
+                            // crate-relative STRUCT path
+                            // `synthetic_transparent_ctor_owner` /
+                            // `rewrite_op_malloc` uses (`ClassDesc` /
+                            // `getuniqueclassdef` identity, `rclass.py`
+                            // `getinstancerepr`). A zero-capture closure
+                            // env keeps that unique path: the shared leaf
+                            // is not a ClassDesc. Project registered
+                            // fields onto the interned classdef
+                            // (`getuniqueclassdef_for_struct_root`); a
+                            // fieldless env stays empty.
+                            let qualname = format!("{}.{}", owner_path.join("."), name);
+                            let class_host = bk.intern_class_by_qualname(&qualname);
+                            if bk.is_known_struct_root(class_host.qualname()) {
+                                let _ = bk.getuniqueclassdef_for_struct_root(class_host.qualname());
                             }
+                            class_host
                         }
                     };
                     // Rust `T { fields }` allocates without running any

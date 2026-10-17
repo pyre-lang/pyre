@@ -263,23 +263,37 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
                 op.kind = OpKind::ConstRef(instance);
                 continue;
             }
-            // A fieldless named struct (`PyreEnv`, `KwargsDictStrategy`) is
-            // an instance of a class with no fields. Payloads of a struct
-            // ctor go through FieldWrites, so an empty-arg ctor with no
-            // field traffic is that empty class. Intern by the leaf so
-            // the constant's class matches `tyref_input_class_root` on
-            // the callee Input (`InstanceRepr.convert_const`,
-            // `get_reusable_prebuilt_instance`).
+            // A fieldless named struct (`PyreEnv`, `KwargsDictStrategy`, a
+            // zero-capture closure env) is an instance of a class with no
+            // fields. Payloads of a struct ctor go through FieldWrites, so
+            // an empty-arg ctor with no field traffic is that empty class.
+            // Intern under the crate-relative STRUCT path
+            // `synthetic_transparent_ctor_owner` / `rewrite_op_malloc`
+            // uses for this ctor (`ClassDesc` / `getuniqueclassdef`
+            // identity, `rclass.py` `getinstancerepr`). The ctor leaf
+            // alone is not that object: a shared `closure` / `closure#N`
+            // leaf is ambiguous across TypeDecls.
             if *is_struct {
                 let fieldless = op
                     .result
                     .as_ref()
                     .is_some_and(|result| !field_bases.iter().any(|base| base == result));
-                if fieldless
-                    && let Some(instance) = intern_unit_variant_prebuilt_instance(bk, name, None)
-                {
-                    op.kind = OpKind::ConstRef(instance);
-                    continue;
+                if fieldless {
+                    let name_path = if owner_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}::{name}", owner_path.join("::"))
+                    };
+                    let intern_key = crate::model::crate_relative_struct_owner(
+                        &name_path,
+                        graph.name.split("::").next(),
+                    );
+                    if let Some(instance) =
+                        intern_unit_variant_prebuilt_instance(bk, &intern_key, None)
+                    {
+                        op.kind = OpKind::ConstRef(instance);
+                        continue;
+                    }
                 }
             }
             let mut segments = owner_path.clone();
@@ -652,6 +666,71 @@ mod tests {
             "named empty class interned as prebuilt instance"
         );
         assert!(call_passes_zst, "the call must pass the instance");
+    }
+
+    /// Two zero-capture closures sharing the leaf intern as distinct
+    /// ClassDescs (`getuniqueclassdef` identity, `rclass.py`
+    /// `getinstancerepr`). The malloc owner is the crate-relative
+    /// STRUCT path, not the ambiguous `closure` leaf.
+    #[test]
+    fn fieldless_closures_intern_by_owner_path() {
+        use crate::model::{FunctionGraph, ValueType};
+
+        let mut graph = FunctionGraph::new("pyre_interpreter::mod::f");
+        let entry = graph.startblock;
+        let a = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["pyre_interpreter".into(), "mod".into(), "f".into()],
+                        "closure",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("pyre_interpreter::mod::f::closure".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let b = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["pyre_interpreter".into(), "other".into(), "g".into()],
+                        "closure",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("pyre_interpreter::other::g::closure".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_goto(entry, entry, Vec::new());
+
+        let bk = Rc::new(Bookkeeper::new());
+        fold_unit_variant_ctors(&mut graph, Some(&bk));
+        let class_of = |var: &crate::flowspace::model::Variable| -> String {
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    if let OpKind::ConstRef(instance) = &op.kind
+                        && op.result.as_ref() == Some(var)
+                    {
+                        return instance
+                            .instance_class()
+                            .expect("prebuilt instance has a class")
+                            .qualname()
+                            .to_string();
+                    }
+                }
+            }
+            panic!("expected ConstRef for {var:?}");
+        };
+        let qa = class_of(&a);
+        let qb = class_of(&b);
+        assert_eq!(qa, "mod::f::closure");
+        assert_eq!(qb, "other::g::closure");
+        assert_ne!(qa, qb);
     }
 
     /// Skip-arm `legacy_resolve` can leave a declared-Int residual actual
