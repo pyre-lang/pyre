@@ -22391,6 +22391,9 @@ unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) 
     // (`w_fmt_x0`); a mixed `%R`+`%s` payload has no extra slots, so
     // `_compute_value` runs here, including `'<repr raised>'` +
     // `write_unraisable` when `space.repr` fails.
+    // `W_Property._properror` (`descriptor.py`) builds the message via
+    // `oefmt`, whose `OpErrFmt` defers `%R`; 3.14 renders `%R` at the
+    // raise (`_PyErr_FormatV`), which pyre follows — see `oefmt`.
     let w_type = crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |w_type| w_type.as_ptr());
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[prop, w_type, obj]);

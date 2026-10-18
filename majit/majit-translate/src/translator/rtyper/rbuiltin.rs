@@ -4731,9 +4731,19 @@ pub fn rtype_cast_instance_intrinsic(
     // `args_v[0]` index, matching the other typers in this module.
     let r_arg0 = arg_repr(hop, 0)?;
     let v_ptr = hop.inputarg(&r_arg0, 0)?;
+    // `TupleRepr.convert_from_to` (`rtuple.py`) returns the value
+    // unchanged when the two tuple reprs have the same lowleveltype.
+    // Project the data word only when the destination is a different
+    // representation — an instance dest, matching the annotator.
+    if r_arg0.lowleveltype() == &result_lltype {
+        hop.exception_cannot_occur()?;
+        return Ok(Some(v_ptr));
+    }
     // Residual fat `&dyn` / `Box<dyn>`: the hop operand is the two-word
-    // tuple (`dyn_fat_field_annotation`). `rclass.py` `ll_cast_to_object`
-    // / `cast_instance` take the instance; `TupleRepr.getitem`
+    // tuple (`dyn_fat_field_annotation`). The identity check above is
+    // `TupleRepr.convert_from_to`; this projection therefore runs only
+    // for an instance destination. `rclass.py` `ll_cast_to_object` /
+    // `cast_instance` take the instance word; `TupleRepr.getitem`
     // (`rtuple.py`) projects that data word. The residual Call's fat
     // argument stays whole (`front::dyn_fat`).
     let s0 = hop.args_s.borrow().first().cloned();
@@ -7446,6 +7456,88 @@ mod tests {
             ops.iter().any(|op| op.opname == "direct_call"),
             "rtype_hlinvoke dispatch of a constant function emits direct_call, ops={:?}",
             ops.iter().map(|op| op.opname.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    fn hop_with_dyn_fat_tuple_operand() -> (HighLevelOp, Arc<dyn Repr>, Hlvalue) {
+        use crate::flowspace::model::{Hlvalue, Variable};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let s_fat = crate::annotator::classdesc::dyn_fat_field_annotation();
+        let r_fat = hop.rtyper.getrepr(&s_fat).expect("dyn-fat TupleRepr");
+        let v = Variable::named("fat");
+        v.set_concretetype(Some(r_fat.lowleveltype().clone()));
+        let v_h = Hlvalue::Variable(v);
+        hop.args_v.borrow_mut().push(v_h.clone());
+        hop.args_s.borrow_mut().push(s_fat);
+        hop.args_r.borrow_mut().push(Some(r_fat.clone()));
+        (hop, r_fat, v_h)
+    }
+
+    #[test]
+    fn rtype_cast_instance_intrinsic_dyn_fat_tuple_to_same_tuple_is_identity() {
+        // `TupleRepr.convert_from_to` (`rtuple.py`): same-lowleveltype
+        // tuple dest returns the operand unchanged. The annotator's
+        // `cast_instance_intrinsic` SomeTuple arm already passed the
+        // tuple through.
+        let (hop, r_fat, v_h) = hop_with_dyn_fat_tuple_operand();
+        *hop.r_result.borrow_mut() = Some(r_fat);
+
+        let out = rtype_cast_instance_intrinsic(&hop, &HashMap::new())
+            .expect("same-tuple dest")
+            .expect("identity result");
+        assert_eq!(out, v_h, "same-tuple dest must yield the operand");
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().all(|op| op.opname != "getfield"
+                && op.opname != "getitem"
+                && op.opname != "cast_pointer"),
+            "identity dest must not project or recast, ops={:?}",
+            ops.ops
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_cast_instance_intrinsic calls exception_cannot_occur"
+        );
+    }
+
+    #[test]
+    fn rtype_cast_instance_intrinsic_dyn_fat_tuple_to_instance_emits_getitem() {
+        // `rclass.py` `ll_cast_to_object` / `cast_instance` take the
+        // instance word; `TupleRepr.getitem` (`rtuple.py`) projects it.
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+
+        let (hop, _r_fat, v_h) = hop_with_dyn_fat_tuple_operand();
+        let r_inst = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("root InstanceRepr");
+        Repr::setup(r_inst.as_ref() as &dyn Repr).expect("setup object");
+        *hop.r_result.borrow_mut() = Some(r_inst as Arc<dyn Repr>);
+
+        let out = rtype_cast_instance_intrinsic(&hop, &HashMap::new())
+            .expect("instance dest")
+            .expect("projected data word");
+        let ops = hop.llops.borrow();
+        let getfield = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "getfield")
+            .expect("instance dest emits TupleRepr.getitem as getfield");
+        assert_eq!(getfield.args[0], v_h, "getitem reads the fat tuple");
+        let index = crate::fat_ptr_layout::probe().word_index(false);
+        let expected_field = format!("item{index}");
+        let Hlvalue::Constant(cname) = &getfield.args[1] else {
+            panic!("getfield name is a Void constant");
+        };
+        assert_eq!(cname.value, ConstValue::byte_str(&expected_field));
+        assert_eq!(out, getfield.result, "result is the projected data word");
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_cast_instance_intrinsic calls exception_cannot_occur"
         );
     }
 }

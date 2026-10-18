@@ -5719,11 +5719,11 @@ pub fn type_name_of(w_obj: PyObjectRef) -> String {
 /// string = PyUnicode_FromFormatV(format, vargs);
 /// ```
 ///
-/// — so `%R`'s `PyObject_Repr` runs at the raise, not at the read.  Measured on
-/// 3.14.2 with a `__repr__` that logs, against `types.GenericAlias(obj, ...)[int]`
-/// (`genericaliasobject.c` `"%R is not a generic class"`): one call at
-/// construction, none at `str(e)`.  Deferring those conversions would move
-/// that side effect and its unraisable to a different moment than 3.14 picks.
+/// — so `%R`'s `PyObject_Repr` runs at the raise, not at the read. Measured
+/// on 3.14.6 and 3.14.6t, with `hasattr` / `getattr(obj, name, default)` over
+/// a `property` whose `w_name` has a logging `__repr__`: the repr runs once
+/// per raise even when the error is swallowed. PyPy's
+/// `OpErrFmt._compute_value` defers it.
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &'static str, args: &[FmtArg<'_>]) -> OperationError {
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
     // the message verbatim, `%` sequences and all.  Nothing on the way to the

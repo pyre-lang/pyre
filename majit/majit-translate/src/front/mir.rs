@@ -10030,6 +10030,13 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    fn accumulator_of_identity_arg(&self, rt: usize) -> Option<usize> {
+        match self.accum.identity_accumulator.get(rt) {
+            Some(hit) => *hit,
+            None => identity_accumulator_of_arg_temp(self.body, self.llbc, rt),
+        }
+    }
+
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
         // Each MIR basic block is a FlowGraph block.  Locals live across
         // a successor edge are explicit `Link.args` into the target
@@ -18437,6 +18444,29 @@ impl<'a> Lowering<'a> {
         Ok(result)
     }
 
+    /// If `arg_locals[0]` is the sole identity argument of a builder-mode
+    /// accumulator (`as_bytes` / `deref` / `as_str` on that builder), emit
+    /// `ll_build` (`AbstractStringBuilderRepr.rtype_method_build`) and
+    /// return the finished `SomeString`.  The identity arm then aliases
+    /// dest to that string.  `None` keeps the existing identity alias.
+    fn builder_identity_string(
+        &mut self,
+        mir_bb: usize,
+        arg_locals: &[Option<usize>],
+    ) -> Result<Option<Variable>, LowerError> {
+        if self.builder_mode
+            && let Some(c) = arg_locals
+                .first()
+                .copied()
+                .flatten()
+                .and_then(|rt| self.accumulator_of_identity_arg(rt))
+            && self.accumulator_is_builder_mode(c)
+        {
+            return self.resolve_builder_build(mir_bb, c).map(Some);
+        }
+        Ok(None)
+    }
+
     /// The [`ValueType`] of a `Copy` / `Move` operand, read from the
     /// operand place's post-projection type.  Used by the `Cast`
     /// lowering to decide whether the cast crosses a register bank.
@@ -24826,7 +24856,16 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|t| tyref_is_string_family(t, self.llbc))
                     && tyref_is_string_family(&call.dest.ty, self.llbc)
                 {
-                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    // A builder-mode accumulator's Shared borrow feeding this
+                    // deref is `ll_build`
+                    // (`AbstractStringBuilderRepr.rtype_method_build`): the
+                    // builder is a STRINGBUILDERPTR, and identity assumes
+                    // SomeString.
+                    let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
+                        Some(built) => built,
+                        None => args[0].clone(),
+                    };
+                    self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -24917,7 +24956,11 @@ impl<'a> Lowering<'a> {
                 // `as_ref` method call the rtyper cannot route on the
                 // classdef-less string receiver.
                 if args.len() == 1 && self.is_std_borrow_identity(&reg) {
-                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
+                        Some(built) => built,
+                        None => args[0].clone(),
+                    };
+                    self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -24926,7 +24969,11 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && self.is_string_to_str_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
                 {
-                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
+                        Some(built) => built,
+                        None => args[0].clone(),
+                    };
+                    self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25074,7 +25121,14 @@ impl<'a> Lowering<'a> {
                 // UTF-8/WTF-8 storage exposed explicitly by `as_bytes`.
                 if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref())
                 {
-                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    // `buf.as_bytes()` on a builder-mode accumulator is
+                    // `ll_build` then the existing byte-view identity
+                    // (`AbstractStringBuilderRepr.rtype_method_build`).
+                    let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
+                        Some(built) => built,
+                        None => args[0].clone(),
+                    };
+                    self.alias_dest_to_arg0(dest_local, arg, true);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -43837,6 +43891,10 @@ struct ScanCache {
     /// `arg_of[local][accumulator as usize]` = [`append_arg_of_borrow`].
     arg_of: std::cell::RefCell<Vec<[Option<Option<usize>>; 2]>>,
     material: std::cell::RefCell<Vec<Option<usize>>>,
+    /// [`identity_view_of_borrow`]: a Shared borrow of the accumulator that
+    /// is the sole argument of a string-family identity (`as_bytes` /
+    /// `deref` / `as_str`), i.e. an `ll_build` read.
+    identity: std::cell::RefCell<Vec<Option<Option<usize>>>>,
 }
 
 impl ScanCache {
@@ -43850,6 +43908,7 @@ impl ScanCache {
             alias: std::cell::RefCell::new(vec![None; n]),
             arg_of: std::cell::RefCell::new(vec![[None, None]; n]),
             material: std::cell::RefCell::new(vec![None; n]),
+            identity: std::cell::RefCell::new(vec![None; n]),
         }
     }
 
@@ -43879,6 +43938,12 @@ struct AccumulatorFacts {
     builder_mode: Vec<bool>,
     append_accumulator: Vec<Option<usize>>,
     append_piece_accumulator: Vec<Option<usize>>,
+    /// Identity-call argument temp → owned builder-mode accumulator.
+    /// The temp is the sole argument of `as_bytes` / `deref` / `as_str`
+    /// (or a string-family alias of that argument) on a builder-mode
+    /// local; the identity arm emits `ll_build` then aliases the dest
+    /// (`AbstractStringBuilderRepr.rtype_method_build`).
+    identity_accumulator: Vec<Option<usize>>,
     has_builder: bool,
 }
 
@@ -43913,6 +43978,7 @@ impl AccumulatorFacts {
             }
         }
         let mut append_piece_accumulator = vec![None; n];
+        let mut identity_accumulator = vec![None; n];
         let forward_blocks = forward_reachable_mask(llbc, body);
         for c in owned_dests {
             if c >= n || !builder_mode[c] {
@@ -43930,12 +43996,21 @@ impl AccumulatorFacts {
                     };
                     if matches!(&source.kind, &PlaceKind::Local(i) if i as usize == c)
                         && let &PlaceKind::Local(direct_borrow) = &place.kind
-                        && let Some(piece) =
-                            append_piece_of_borrow(&cache, body, llbc, direct_borrow as usize)
-                        && let Some(slot) = append_piece_accumulator.get_mut(piece)
-                        && slot.is_none()
                     {
-                        *slot = Some(c);
+                        if let Some(piece) =
+                            append_piece_of_borrow(&cache, body, llbc, direct_borrow as usize)
+                            && let Some(slot) = append_piece_accumulator.get_mut(piece)
+                            && slot.is_none()
+                        {
+                            *slot = Some(c);
+                        }
+                        if let Some(id_arg) =
+                            identity_view_of_borrow(&cache, body, llbc, direct_borrow as usize)
+                            && let Some(slot) = identity_accumulator.get_mut(id_arg)
+                            && slot.is_none()
+                        {
+                            *slot = Some(c);
+                        }
                     }
                 }
             }
@@ -43945,6 +44020,7 @@ impl AccumulatorFacts {
             builder_mode,
             append_accumulator,
             append_piece_accumulator,
+            identity_accumulator,
             has_builder,
         }
     }
@@ -44037,14 +44113,18 @@ fn ref_temp_is_sole_append_arg(
 /// `c`, return its append-receiver temps if every use of `c` is append-safe,
 /// else `None`.  Append-safe uses: its single definition; a borrow `_r := &(mut) c`
 /// that reaches an append accumulator argument ([`append_receiver_of_borrow`],
-/// directly or through a single two-phase reborrow); or a bare `move c`
+/// directly or through a single two-phase reborrow); a Shared borrow that is
+/// the sole argument of a string-family identity (`as_bytes` / `deref` /
+/// `as_str`, [`identity_view_of_borrow`]) — a terminal `ll_build` read
+/// (`AbstractStringBuilderRepr.rtype_method_build`); or a bare `move c`
 /// (ownership transfer of the complete accumulated string).  Any other use — a
 /// `copy`, a projection read/write (`c.field` / `*c`), `&c.field`, `Len`/
-/// `Discriminant`, or `c` in an assert / switch — is an out-of-band access the
-/// functional model cannot track, so the whole local declines.  The returned
-/// temps are the call-argument locals the append arm resolves against
-/// ([`append_accumulator_of_arg_temp`]), which for a reborrowed `&mut` argument
-/// is the reborrow, not the direct borrow.
+/// `Discriminant`, an opaque `escape(&c)`, or `c` in an assert / switch — is an
+/// out-of-band access the functional model cannot track, so the whole local
+/// declines.  The returned temps are the call-argument locals the append arm
+/// resolves against ([`append_accumulator_of_arg_temp`]), which for a
+/// reborrowed `&mut` argument is the reborrow, not the direct borrow. Identity
+/// temps are accepted but not returned: they are not append receivers.
 fn clean_accumulator_ref_temps(
     cache: &ScanCache,
     body: &Unstructured,
@@ -44171,11 +44251,149 @@ fn clean_accumulator_ref_temps_scan(
     for &rt in &ref_temps {
         if let Some(receiver) = append_receiver_of_borrow(cache, body, llbc, rt) {
             receivers.push(receiver);
-        } else if append_piece_of_borrow(cache, body, llbc, rt).is_none() {
+        } else if append_piece_of_borrow(cache, body, llbc, rt).is_none()
+            && identity_view_of_borrow(cache, body, llbc, rt).is_none()
+        {
             return None;
         }
     }
     Some(receivers)
+}
+
+/// Whether `call` is a 1-arg string-family identity: `as_bytes` / `bytes`,
+/// `as_str` / `as_str_unchecked` / `as_ref` / `borrow`, or string-family
+/// `deref` / `deref_mut`.  Same leaves as the identity arms in call
+/// lowering; a Shared borrow of a builder that is the sole argument of
+/// one of these is an `ll_build` (`AbstractStringBuilderRepr.rtype_method_build`),
+/// not an escape.
+fn is_string_identity_call(llbc: &Llbc, call: &CallPayload) -> bool {
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    if call.args.len() != 1 {
+        return false;
+    }
+    let Some(first_ty) = operand_tyref(&call.args[0]) else {
+        return false;
+    };
+    if !tyref_is_string_family(first_ty, llbc) {
+        return false;
+    }
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    let Some(fd) = llbc.fn_by_id(*id) else {
+        return false;
+    };
+    let np = fd.item_meta.name_path();
+    match np.rsplit("::").next() {
+        Some("as_bytes") => true,
+        Some("bytes") if np.contains("str") => true,
+        Some("as_ref" | "as_str" | "as_str_unchecked" | "borrow") => {
+            tyref_strips_to_str(&call.dest.ty, llbc)
+        }
+        Some("deref" | "deref_mut") => tyref_is_string_family(&call.dest.ty, llbc),
+        _ => false,
+    }
+}
+
+/// Whether borrow temp `rt` is used exactly once as the sole argument of a
+/// string-family identity call ([`is_string_identity_call`]) and nowhere else.
+fn ref_temp_is_sole_identity_arg(
+    _cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+) -> bool {
+    let mut selected = 0usize;
+    let mut other = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for st in &bb.statements {
+            match st.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                let identity = is_string_identity_call(llbc, call);
+                for (i, arg) in call.args.iter().enumerate() {
+                    if operand_reads_local(arg, rt) {
+                        if identity && i == 0 {
+                            selected += 1;
+                        } else {
+                            other += 1;
+                        }
+                    }
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
+            }
+            _ => {}
+        }
+    }
+    selected == 1 && other == 0
+}
+
+/// Resolve a Shared/`&` borrow of an owned `Wtf8Buf` / `String` to the temp
+/// actually passed as the sole argument of a string-family identity
+/// (`as_bytes` / `deref` / `as_str`).  Walks the same reference/coercion
+/// shells [`append_piece_of_borrow`] walks (`&Wtf8Buf` → `Deref` → `&Wtf8`
+/// → `as_bytes`).  The identity is `ll_build`
+/// (`AbstractStringBuilderRepr.rtype_method_build`): the builder is one
+/// value, and this read materialises the finished string.
+fn identity_view_of_borrow(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+) -> Option<usize> {
+    if rt < cache.n()
+        && let Some(hit) = cache.identity.borrow()[rt]
+    {
+        return hit;
+    }
+    let result = (|| {
+        let mut current = rt;
+        for _ in 0..ALIAS_WALK_HOPS {
+            if ref_temp_is_sole_identity_arg(cache, body, llbc, current) {
+                return Some(current);
+            }
+            current = sole_string_alias_successor(cache, body, llbc, current)?;
+        }
+        None
+    })();
+    if rt < cache.n() {
+        cache.identity.borrow_mut()[rt] = Some(result);
+    }
+    result
 }
 
 /// Resolve a direct `&(mut) buf` borrow temp `rt` to the temp actually passed
@@ -44543,12 +44761,53 @@ fn append_piece_accumulator_of_arg_temp(
     None
 }
 
-/// Count the by-value consumptions (`move c`) of a fresh accumulator local
-/// `c`.  [`clean_accumulator_ref_temps`] already proves every other use of `c`
-/// is the ctor def or an append borrow, so each `move c` is a terminal
-/// materialisation of the finished string — the point where a real builder
-/// must run `ll_build`.  Counted so the builder lift only fires when the build
-/// point is unambiguous (see [`is_builder_mode_accumulator`]).
+/// Resolve a string-family identity argument temp to the builder-mode
+/// accumulator it borrows.  Membership is the MIR definition of `rt` as a
+/// whole-local borrow of that accumulator whose [`identity_view_of_borrow`]
+/// is `rt` itself (or a successor the identity arm actually consumes).
+///
+/// Call lowering reads the per-body [`AccumulatorFacts`] table. This scan
+/// remains for an index outside that table.
+fn identity_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    let cache = ScanCache::new(body.locals.locals.len());
+    cache.precompute_fresh(body, llbc);
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for candidate in owned_builder_dest_locals(body, llbc) {
+        if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
+            continue;
+        }
+        for (bb_idx, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
+                    stmt.stmt_kind_ref()
+                else {
+                    continue;
+                };
+                if matches!(source.kind, PlaceKind::Local(i) if i as usize == candidate)
+                    && let PlaceKind::Local(direct_borrow) = place.kind
+                    && identity_view_of_borrow(&cache, body, llbc, direct_borrow as usize)
+                        == Some(rt)
+                {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Count the terminal consumptions of a fresh accumulator local `c`.
+/// [`clean_accumulator_ref_temps`] already proves every other use of `c`
+/// is the ctor def, an append borrow, or a string-family identity view, so
+/// each `move c`, each inner-builder append piece, and each identity-view
+/// borrow (`as_bytes` / `deref` / `as_str`) is a terminal materialisation of
+/// the finished string — the point where a real builder must run `ll_build`
+/// (`AbstractStringBuilderRepr.rtype_method_build`).  Exclusive-branch
+/// identity views are several such points; sequential `build()` is valid
+/// on one `StringBuilder`.  See [`is_builder_mode_accumulator`].
 #[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
 fn accumulator_materialization_site_count(
     cache: &ScanCache,
@@ -44574,7 +44833,8 @@ fn accumulator_materialization_site_count(
                     && matches!(&source.kind, &PlaceKind::Local(i) if i as usize == c)
                     && let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
                     && let &PlaceKind::Local(rt) = &place.kind
-                    && append_piece_of_borrow(cache, body, llbc, rt as usize).is_some()
+                    && (append_piece_of_borrow(cache, body, llbc, rt as usize).is_some()
+                        || identity_view_of_borrow(cache, body, llbc, rt as usize).is_some())
                 {
                     moves += 1;
                 }
@@ -44657,14 +44917,18 @@ fn single_def_is_str_builder_ctor(body: &Unstructured, llbc: &Llbc, c: usize) ->
 ///   ([`single_def_is_str_builder_ctor`]) — a non-constructor definition is
 ///   an already-built string, and the ctor rewrite would replace that
 ///   producer with `__majit_stringbuilder_new`,
-/// * every borrow of `c` an append ([`clean_accumulator_ref_temps`]), and
-/// * exactly one terminal consumption
-///   ([`accumulator_materialization_site_count`]) — a by-value move or an
-///   inner-builder append piece, both spelling the single `ll_build` point.
+/// * every borrow of `c` an append or a string-family identity view
+///   ([`clean_accumulator_ref_temps`]), and
+/// * at least one terminal consumption
+///   ([`accumulator_materialization_site_count`]) — a by-value move, an
+///   inner-builder append piece, or an identity-view `as_bytes` / `deref` /
+///   `as_str` (`AbstractStringBuilderRepr.rtype_method_build`). Exclusive
+///   branches may each `ll_build`; sequential `build()` is valid on one
+///   `StringBuilder`.
 ///
-/// Zero or several terminal moves, or a non-constructor definition, keep
-/// the `ll_strconcat` fallback so the builder rewrite only fires where the
-/// ctor, the appends, and the one build point are all unambiguous.
+/// Zero terminal reads, or a non-constructor definition, keep the
+/// `ll_strconcat` fallback so the builder rewrite only fires where the
+/// ctor, the appends, and a build point are all unambiguous.
 /// Lowering records the answer for every local once per body; emit sites
 /// read that table.
 #[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
@@ -44682,7 +44946,7 @@ fn is_builder_mode_accumulator(
     let result = is_fresh_str_builder(cache, body, llbc, c)
         && single_def_is_str_builder_ctor(body, llbc, c)
         && clean_accumulator_ref_temps(cache, body, llbc, c).is_some()
-        && accumulator_materialization_site_count(cache, body, llbc, c) == 1;
+        && accumulator_materialization_site_count(cache, body, llbc, c) >= 1;
     if c < cache.n() {
         cache.builder.borrow_mut()[c] = Some(result);
     }
@@ -105148,21 +105412,24 @@ mod tests {
         })
     }
 
-    fn push_str_decl() -> Value {
-        let impl_seg = json!({"Impl": {"Ty": {
+    fn wtf8buf_impl_seg() -> Value {
+        json!({"Impl": {"Ty": {
             "params": {
                 "regions": [], "types": [], "const_generics": [], "trait_clauses": [],
                 "regions_outlive": [], "types_outlive": [], "trait_type_constraints": []
             },
             "skip_binder": {"Value": [0, wtf8_adt()]},
             "kind": "InherentImplBlock"
-        }}});
+        }}})
+    }
+
+    fn push_str_decl() -> Value {
         json!({
             "def_id": 2,
             "item_meta": str_builder_meta(vec![
                 ident_seg("rustpython_wtf8"),
                 ident_seg("Wtf8Buf"),
-                impl_seg,
+                wtf8buf_impl_seg(),
                 ident_seg("push_str"),
             ], false),
             "signature": {
@@ -105172,6 +105439,77 @@ mod tests {
             },
             "body": "Opaque"
         })
+    }
+
+    fn wtf8buf_new_decl() -> Value {
+        json!({
+            "def_id": 1,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("rustpython_wtf8"),
+                ident_seg("Wtf8Buf"),
+                wtf8buf_impl_seg(),
+                ident_seg("new"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": wtf8_adt()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn as_bytes_decl() -> Value {
+        json!({
+            "def_id": 3,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("rustpython_wtf8"),
+                ident_seg("Wtf8Buf"),
+                wtf8buf_impl_seg(),
+                ident_seg("as_bytes"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_wtf8("Shared")],
+                "output": bytes_slice_ty()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn deref_decl() -> Value {
+        json!({
+            "def_id": 4,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("rustpython_wtf8"),
+                ident_seg("Wtf8Buf"),
+                wtf8buf_impl_seg(),
+                ident_seg("deref"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_wtf8("Shared")],
+                "output": ref_wtf8("Shared")
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn bytes_slice_ty() -> Value {
+        json!({"Ref": [{"Erased": null}, {"Adt": {
+            "id": 0,
+            "builtin": "Slice",
+            "generics": {
+                "regions": [],
+                "types": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }}, "Shared"]})
+    }
+
+    fn bool_ty() -> Value {
+        json!({"Scalar": "Bool"})
     }
 
     fn subject_decl(
@@ -105223,6 +105561,281 @@ mod tests {
                 ..
             } if segments.last().is_some_and(|segment| segment == leaf))
             })
+    }
+
+    fn assert_builder_identity_lowering(graph: &FunctionGraph, name: &str) {
+        assert!(
+            !has_path_leaf(graph, "push_str"),
+            "{name}: push_str must not stay residual: {graph:#?}"
+        );
+        assert!(
+            !has_str_add(graph),
+            "{name}: identity-view builder must use ll_build, not ll_strconcat: {graph:#?}"
+        );
+        for marker in [
+            "__majit_stringbuilder_new",
+            "__majit_stringbuilder_append",
+            "__majit_stringbuilder_build",
+        ] {
+            assert!(
+                has_path_leaf(graph, marker),
+                "{name}: missing builder marker {marker}: {graph:#?}"
+            );
+        }
+    }
+
+    /// `Wtf8Buf::new(); buf.push_str(s); buf.as_bytes()` — a Shared identity
+    /// view is `ll_build` (`AbstractStringBuilderRepr.rtype_method_build`),
+    /// not an escape that residualizes `push_str`.
+    #[test]
+    fn owned_ctor_push_str_as_bytes_lowers_to_stringbuilder() {
+        let wtf8 = wtf8_adt();
+        let word = word_ty();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let shared = ref_wtf8("Shared");
+        let bytes = bytes_slice_ty();
+        let graph = lower_owned_concat(
+            "ctor_push_as_bytes",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "ctor_push_as_bytes",
+                    1,
+                    vec![word.clone()],
+                    bytes.clone(),
+                    vec![
+                        local_of(0, &bytes),
+                        local_of(1, &word),
+                        local_of(2, &wtf8),
+                        local_of(3, &borrow),
+                        local_of(4, &unit),
+                        local_of(5, &shared),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &wtf8), 1, 4)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &borrow),
+                                ref_rvalue(place_of(2, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &word))],
+                                place_of(4, &unit),
+                                2,
+                                4,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(5, &shared),
+                                ref_rvalue(place_of(2, &wtf8), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(5, &shared))],
+                                place_of(0, &bytes),
+                                3,
+                                4,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                wtf8buf_new_decl(),
+                push_str_decl(),
+                as_bytes_decl(),
+            ],
+        );
+        assert_builder_identity_lowering(&graph, "ctor_push_as_bytes");
+    }
+
+    /// `Wtf8Buf::new(); buf.push_str(s); Deref::deref(&buf).as_bytes()` —
+    /// the Shared borrow is consumed by string-family deref, then as_bytes.
+    /// Both are identity; `ll_build` fires at the deref.
+    #[test]
+    fn owned_ctor_push_str_deref_as_bytes_lowers_to_stringbuilder() {
+        let wtf8 = wtf8_adt();
+        let word = word_ty();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let shared = ref_wtf8("Shared");
+        let bytes = bytes_slice_ty();
+        let graph = lower_owned_concat(
+            "ctor_push_deref_as_bytes",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "ctor_push_deref_as_bytes",
+                    1,
+                    vec![word.clone()],
+                    bytes.clone(),
+                    vec![
+                        local_of(0, &bytes),
+                        local_of(1, &word),
+                        local_of(2, &wtf8),
+                        local_of(3, &borrow),
+                        local_of(4, &unit),
+                        local_of(5, &shared),
+                        local_of(6, &shared),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &wtf8), 1, 5)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &borrow),
+                                ref_rvalue(place_of(2, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &word))],
+                                place_of(4, &unit),
+                                2,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(5, &shared),
+                                ref_rvalue(place_of(2, &wtf8), "Shared"),
+                            )],
+                            call_term(
+                                4,
+                                vec![move_op(place_of(5, &shared))],
+                                place_of(6, &shared),
+                                3,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(6, &shared))],
+                                place_of(0, &bytes),
+                                4,
+                                5,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                wtf8buf_new_decl(),
+                push_str_decl(),
+                as_bytes_decl(),
+                deref_decl(),
+            ],
+        );
+        assert_builder_identity_lowering(&graph, "ctor_push_deref_as_bytes");
+    }
+
+    /// Exclusive-branch `as_bytes` on one builder: two `ll_build` points
+    /// (`AbstractStringBuilderRepr.rtype_method_build` may run on each
+    /// terminal read). `push_str` must not stay residual.
+    #[test]
+    fn owned_ctor_branched_as_bytes_lowers_to_stringbuilder() {
+        let wtf8 = wtf8_adt();
+        let flag = bool_ty();
+        let word = word_ty();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let shared = ref_wtf8("Shared");
+        let bytes = bytes_slice_ty();
+        let graph = lower_owned_concat(
+            "ctor_branched_as_bytes",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "ctor_branched_as_bytes",
+                    2,
+                    vec![flag.clone(), word.clone()],
+                    bytes.clone(),
+                    vec![
+                        local_of(0, &bytes),
+                        local_of(1, &flag),
+                        local_of(2, &word),
+                        local_of(3, &wtf8),
+                        local_of(4, &borrow),
+                        local_of(5, &unit),
+                        local_of(6, &shared),
+                        local_of(7, &borrow),
+                        local_of(8, &unit),
+                        local_of(9, &shared),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(3, &wtf8), 1, 7)),
+                        bb(
+                            vec![],
+                            json!({"Switch": {
+                                "discr": copy_op(place_of(1, &flag)),
+                                "targets": {"If": [2, 4]}
+                            }}),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(4, &borrow),
+                                ref_rvalue(place_of(3, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(4, &borrow)), copy_op(place_of(2, &word))],
+                                place_of(5, &unit),
+                                3,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(6, &shared),
+                                ref_rvalue(place_of(3, &wtf8), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(6, &shared))],
+                                place_of(0, &bytes),
+                                6,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(7, &borrow),
+                                ref_rvalue(place_of(3, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(7, &borrow)), copy_op(place_of(2, &word))],
+                                place_of(8, &unit),
+                                5,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(9, &shared),
+                                ref_rvalue(place_of(3, &wtf8), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(9, &shared))],
+                                place_of(0, &bytes),
+                                6,
+                                7,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                wtf8buf_new_decl(),
+                push_str_decl(),
+                as_bytes_decl(),
+            ],
+        );
+        assert_builder_identity_lowering(&graph, "ctor_branched_as_bytes");
     }
 
     /// An owned `Wtf8Buf` defined by a non-constructor call, then `push_str`,
@@ -108147,6 +108760,304 @@ mod tests {
             for repr in reprs {
                 check_option_ok_or_family_repr(kind, method, repr);
             }
+        }
+    }
+
+    fn bool_exit_target(
+        graph: &FunctionGraph,
+        block: crate::model::BlockId,
+        taken: bool,
+    ) -> crate::model::BlockId {
+        graph.blocks[block.0]
+            .exits
+            .iter()
+            .find(|link| link.exitcase == Some(crate::model::ExitCase::Bool(taken)))
+            .unwrap_or_else(|| panic!("missing Bool({taken}) exit on {block:?}"))
+            .target
+    }
+
+    fn goto_result_var(graph: &FunctionGraph, block: crate::model::BlockId) -> Variable {
+        let exits = &graph.blocks[block.0].exits;
+        assert_eq!(exits.len(), 1, "arm {block:?} should goto the join");
+        exits[0]
+            .args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .cloned()
+            .expect("filter arm result is a Variable")
+    }
+
+    fn option_variant_ctor(kind: &OpKind) -> Option<&str> {
+        match kind {
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name == "Some" || name == "None" => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn is_null_mut_call(kind: &OpKind) -> bool {
+        match kind {
+            OpKind::Call { target, .. } => target.to_string() == "core::ptr::null_mut",
+            _ => false,
+        }
+    }
+
+    fn producer_of<'a>(
+        block: &'a crate::model::Block,
+        var: &Variable,
+    ) -> Option<&'a SpaceOperation> {
+        block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(var))
+    }
+
+    fn block_has_method(graph: &FunctionGraph, block: crate::model::BlockId, method: &str) -> bool {
+        graph.blocks[block.0].operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == method
+            )
+        })
+    }
+
+    /// Drop / receiver-None arm of `rewire_option_filter_diamond`:
+    /// `emit_option_result_none` by the result representation.
+    fn assert_filter_none_value(
+        graph: &FunctionGraph,
+        arm: crate::model::BlockId,
+        repr: OptionRecvRepr,
+        which: &str,
+    ) {
+        let result = goto_result_var(graph, arm);
+        let block = &graph.blocks[arm.0];
+        let producer = producer_of(block, &result)
+            .unwrap_or_else(|| panic!("filter {repr:?} {which} result is not produced in the arm"));
+        match repr {
+            OptionRecvRepr::PointerNiche => {
+                assert!(
+                    block.operations.iter().any(|op| is_null_mut_call(&op.kind)),
+                    "filter pointer {which} missing rnone.py null_mut"
+                );
+                assert!(
+                    is_null_mut_call(&producer.kind)
+                        || crate::model::cast_instance_root(&producer.kind).is_some(),
+                    "filter pointer {which} join is not the null (or its payload cast), got {:?}",
+                    producer.kind
+                );
+            }
+            OptionRecvRepr::ScalarNiche => {
+                assert!(
+                    matches!(producer.kind, OpKind::ConstUInt(0)),
+                    "filter scalar {which} must be rint.py IntegerRepr zero, got {:?}",
+                    producer.kind
+                );
+            }
+            OptionRecvRepr::Aggregate => {
+                assert_eq!(
+                    option_variant_ctor(&producer.kind),
+                    Some("None"),
+                    "filter aggregate {which} must be emit_option_result_none's None"
+                );
+                assert!(
+                    block.operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, base, .. }
+                            if field.name == "__discriminant" && *base == result
+                    )),
+                    "filter aggregate {which} missing None __discriminant write"
+                );
+                assert!(
+                    !block.operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, base, .. }
+                            if field.name == "__pos_0" && *base == result
+                    )),
+                    "filter aggregate {which} wrote Some.__pos_0 onto None"
+                );
+            }
+        }
+    }
+
+    /// Keep arm of `rewire_option_filter_diamond`. A niche result is the
+    /// receiver word (`result_niche` / `result_scalar_niche`). An aggregate
+    /// rebuilds `Some` from `option_recv_payload` via `emit_option_variant`.
+    fn assert_filter_keep_arm(
+        graph: &FunctionGraph,
+        keep: crate::model::BlockId,
+        repr: OptionRecvRepr,
+    ) {
+        let result = goto_result_var(graph, keep);
+        let block = &graph.blocks[keep.0];
+        match repr {
+            OptionRecvRepr::PointerNiche | OptionRecvRepr::ScalarNiche => {
+                assert!(
+                    block.operations.is_empty(),
+                    "filter {repr:?} keep re-wrapped the receiver word"
+                );
+                assert_eq!(
+                    Some(&result),
+                    block.inputargs.last(),
+                    "filter {repr:?} keep must pass the receiver word through to the join"
+                );
+            }
+            OptionRecvRepr::Aggregate => {
+                let producer = producer_of(block, &result)
+                    .expect("filter aggregate keep result produced in keep arm");
+                assert_eq!(
+                    option_variant_ctor(&producer.kind),
+                    Some("Some"),
+                    "filter aggregate keep rebuilds Some via emit_option_variant"
+                );
+                let payload = block
+                    .inputargs
+                    .last()
+                    .expect("filter keep threads the payload");
+                assert!(
+                    block.operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, value, .. }
+                            if field.name == "__pos_0"
+                                && value.as_variable() == Some(payload)
+                    )),
+                    "filter aggregate keep missing Some.__pos_0 write of the threaded payload"
+                );
+            }
+        }
+    }
+
+    fn check_option_filter_repr(repr: OptionRecvRepr) {
+        let method = "filter";
+        let (mut graph, result) = build_two_arg_combinator(method);
+        let mut site = option_disc_site(super::DiscCombinator::OptionFilter, result);
+        match repr {
+            OptionRecvRepr::PointerNiche => {
+                site.recv_niche = true;
+                site.result_niche = true;
+                site.niche_null_cast = Some(("pyobject::PyObject".into(), ValueType::Ref(None)));
+            }
+            OptionRecvRepr::ScalarNiche => {
+                site.scalar_niche = true;
+                site.result_scalar_niche = true;
+                site.recv_owner = "core::option::Option<NonZeroUsize>".into();
+                site.result_owner = "core::option::Option<NonZeroUsize>".into();
+                site.payload1_ty = ValueType::Unsigned;
+                site.result_payload1_ty = ValueType::Unsigned;
+            }
+            OptionRecvRepr::Aggregate => {}
+        }
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1, "{method} {repr:?} must rewrite");
+        assert_eq!(
+            count_method_calls(&graph, method),
+            0,
+            "{method} {repr:?} left a residual call"
+        );
+        assert_eq!(
+            count_method_calls(&graph, "call_once"),
+            1,
+            "{method} {repr:?} predicate must run once"
+        );
+        let start = graph.startblock;
+        assert_eq!(graph.blocks[start.0].exits.len(), 2);
+        assert_option_recv_repr(&graph, repr, method);
+
+        let recv = graph.blocks[start.0].operations[0]
+            .result
+            .clone()
+            .expect("filter fixture receiver");
+        match repr {
+            OptionRecvRepr::PointerNiche => {
+                assert!(
+                    graph.blocks[start.0].operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::BinOp { op, lhs, .. } if op == "is_" && *lhs == recv
+                    )),
+                    "filter pointer niche missing rnone.py rtype_is_None on the receiver"
+                );
+            }
+            OptionRecvRepr::ScalarNiche => {
+                let ne = graph.blocks[start.0]
+                    .operations
+                    .iter()
+                    .find_map(|op| match &op.kind {
+                        OpKind::BinOp { op, lhs, rhs, .. } if op == "ne" && *lhs == recv => {
+                            Some(rhs.clone())
+                        }
+                        _ => None,
+                    });
+                let rhs = ne.expect(
+                    "filter scalar niche missing rint.py IntegerRepr.rtype_bool ne on the receiver",
+                );
+                let zero = producer_of(&graph.blocks[start.0], &rhs)
+                    .expect("filter scalar niche tag zero is in the start block");
+                assert!(
+                    matches!(zero.kind, OpKind::ConstUInt(0)),
+                    "filter scalar niche must compare against unsigned 0, got {:?}",
+                    zero.kind
+                );
+            }
+            OptionRecvRepr::Aggregate => {
+                assert!(
+                    graph.blocks[start.0].operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, base, .. }
+                            if field.name == "__discriminant" && *base == recv
+                    )),
+                    "filter aggregate missing __discriminant read of the receiver"
+                );
+            }
+        }
+
+        let some = bool_exit_target(&graph, start, true);
+        let none = bool_exit_target(&graph, start, false);
+        assert_eq!(
+            graph.blocks[some.0].exits.len(),
+            2,
+            "filter {repr:?} Some arm switches on the predicate"
+        );
+        assert!(
+            block_has_method(&graph, some, "call_once"),
+            "filter {repr:?} predicate must run on the Some/keep path"
+        );
+        assert!(
+            !block_has_method(&graph, start, "call_once"),
+            "filter {repr:?} predicate ran before the tag test"
+        );
+        let keep = bool_exit_target(&graph, some, true);
+        let drop = bool_exit_target(&graph, some, false);
+        assert!(
+            !block_has_method(&graph, keep, "call_once"),
+            "filter {repr:?} predicate ran inside the keep arm"
+        );
+        let join = graph.blocks[keep.0].exits[0].target;
+        assert_eq!(graph.blocks[drop.0].exits[0].target, join);
+        assert_eq!(graph.blocks[none.0].exits[0].target, join);
+        assert_filter_none_value(&graph, none, repr, "receiver-None arm");
+        assert_filter_none_value(&graph, drop, repr, "drop arm");
+        assert_filter_keep_arm(&graph, keep, repr);
+    }
+
+    /// Three shapes: `filter` × pointer niche / scalar niche / aggregate
+    /// Option (`emit_option_recv_tag` / `option_recv_payload` /
+    /// `emit_option_result_none`).
+    #[test]
+    fn option_filter_repr_switch() {
+        for repr in [
+            OptionRecvRepr::PointerNiche,
+            OptionRecvRepr::ScalarNiche,
+            OptionRecvRepr::Aggregate,
+        ] {
+            check_option_filter_repr(repr);
         }
     }
 
