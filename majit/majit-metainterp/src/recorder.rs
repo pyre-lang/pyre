@@ -378,7 +378,7 @@ fn snapshot_box_from_tagged<'c>(
     unique_cache: &'c [Option<Operand>],
 ) -> (crate::resume::SnapshotBox, Option<&'c Operand>) {
     let decoded = untag_snapshot_pools(inputargs, value_slots, trb, tagged);
-    let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded, inputargs);
+    let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded);
     // opencoder.py `SnapshotIterator._untag` returns `_cache[i]`, the box
     // object itself. `_cache` is `_index`-keyed.
     let cached = crate::pyjitpl::trace_iter_cached_box(snap_box.opref(), unique_cache);
@@ -569,6 +569,11 @@ impl Trace {
 
     pub fn has_byte_buffer(&self) -> bool {
         self.trb.is_some()
+    }
+
+    /// `history.py History.trace_tag_overflow` — `opencoder.py Trace.tag_overflow`.
+    pub fn tag_overflow(&self) -> bool {
+        self.trb.as_ref().is_some_and(|trb| trb.tag_overflow)
     }
 
     /// opencoder.py `Trace.tracing_done` — `compile.py compile_trace`

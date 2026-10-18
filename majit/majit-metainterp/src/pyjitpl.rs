@@ -971,35 +971,14 @@ impl Drop for JitlogAbortGuard {
     }
 }
 
-/// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
-/// must number as TAGBOX. `make_constant_box` already refuses that fold
-/// in the optimizer; the tracer can still snapshot the interned
-/// `ConstPtr` as `SnapshotTagged::Const`. Resume then TAGCONSTs it and
-/// the next `Vm::new` has no failarg to rebind. Map the resolved
-/// address back to the InputArg that already carries those bits.
-fn snapshot_inputarg_for_stack_ptr(
-    inputargs: &[majit_ir::InputArgRc],
-    addr: usize,
-) -> Option<majit_ir::OpRef> {
-    if !crate::optimizeopt::OptContext::ref_addr_is_stack_resident(addr) {
-        return None;
-    }
-    inputargs.iter().find_map(|ia| {
-        (ia.tp.get() == majit_ir::Type::Ref
-            && matches!(ia.get_value(), Some(majit_ir::Value::Ref(g)) if g.0 == addr))
-        .then_some(majit_ir::OpRef::input_arg_typed(
-            ia.index,
-            majit_ir::Type::Ref,
-        ))
-    })
-}
-
-/// Recorder snapshot tag to a resume box. A stack-resident Const Ref
-/// remaps to the InputArg that already carries those bits.
-pub(crate) fn snapshot_tagged_to_box(
-    tagged: &crate::recorder::SnapshotTagged,
-    inputargs: &[majit_ir::InputArgRc],
-) -> SnapshotBox {
+/// Recorder snapshot tag to a resume box.
+///
+/// `resume.py` `ResumeDataLoopMemo._number_boxes` keys on box identity;
+/// `isinstance(box, Const)` goes through `getconst`. A Const whose
+/// bits happen to equal a live InputArg is still that Const — remapping
+/// it back to the InputArg by address numbers the wrong box when two
+/// reds share an address, or when a constant equals a live input.
+pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -> SnapshotBox {
     match tagged {
         crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
             let tp = opref.ty().unwrap_or(*fallback_tp);
@@ -1012,11 +991,6 @@ pub(crate) fn snapshot_tagged_to_box(
             } else {
                 *val
             };
-            if *tp == majit_ir::Type::Ref
-                && let Some(ia) = snapshot_inputarg_for_stack_ptr(inputargs, bits as usize)
-            {
-                return SnapshotBox::typed(ia, *tp);
-            }
             let value = heap_value_for(*tp, bits);
             let opref = majit_ir::OpRef::const_inline_from_value(&value);
             SnapshotBox::typed(opref, *tp)
@@ -1139,7 +1113,7 @@ fn snapshot_map_from_trace_snapshots(
     // Box's OpRef. SnapshotTagged carries no `Virtual` variant (see the
     // `SnapshotTagged` docstring in `recorder.rs`) so this match is
     // exhaustive over the two recorder-side cases.
-    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| snapshot_tagged_to_box(t, inputargs);
+    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| snapshot_tagged_to_box(t);
     for (i, snap) in trace_snapshots.iter().enumerate() {
         let boxes: crate::optimizeopt::SnapshotBoxList = snap
             .frames
@@ -1246,9 +1220,8 @@ fn snapshot_map_from_byte_recorder(
     let mut frame_pcs_map = SnapshotFramePcs::with_capacity(n, 0);
     frame_pcs_map.reserve_frames(recorder.captured_frame_count());
     let inputargs = recorder.inputargs();
-    let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
-        snapshot_tagged_to_box(&t, inputargs)
-    };
+    let tagged_to_box =
+        |t: crate::recorder::SnapshotTagged| -> SnapshotBox { snapshot_tagged_to_box(&t) };
     recorder.for_each_captured_snapshot_arrays(|offset, it| {
         let n_boxes: usize = it
             .framestack
@@ -8705,9 +8678,21 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         driver_descriptor: Option<&JitDriverStaticData>,
     ) -> Arc<JitCellToken> {
-        let token = make_jitcell_token(driver_descriptor.and_then(|d| d.index));
+        let token = make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor));
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor);
         token
+    }
+
+    /// `compile.py make_jitcell_token(jitdriver_sd)` always names the compiling
+    /// driver. Prefer the descriptor's registered slot; a descriptor-less
+    /// host entry uses `active_jitdriver_sd` set at trace start.
+    fn jitdriver_index_for_new_token(
+        &self,
+        driver_descriptor: Option<&JitDriverStaticData>,
+    ) -> Option<usize> {
+        driver_descriptor
+            .and_then(|d| d.index)
+            .or(self.active_jitdriver_sd)
     }
 
     /// Close the current trace, optimize, and compile.
@@ -9970,10 +9955,10 @@ impl<M: Clone> MetaInterp<M> {
             if pk == green_key {
                 token
             } else {
-                make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
+                make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
             }
         } else {
-            make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
         };
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
         // `compile.py:180-181` wref wiring — done inside
@@ -11658,7 +11643,8 @@ impl<M: Clone> MetaInterp<M> {
         // trace is installed under. The token `compile.py:355-356` resolves is
         // the optimization-time one — it carries the closing JUMP descr and
         // the retrace budget, not the installation identity.
-        let mut token = make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index));
+        let mut token =
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         self.configure_loop_token_for_driver(
             Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
             green_key,
@@ -12725,10 +12711,10 @@ impl<M: Clone> MetaInterp<M> {
             if pk == green_key {
                 token
             } else {
-                make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
+                make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
             }
         } else {
-            make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
         };
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
         // `compile.py:180-181` wref wiring — done inside
@@ -13225,7 +13211,8 @@ impl<M: Clone> MetaInterp<M> {
 
         // Allocate token and compile.
         // `compile.py jitcell_token = make_jitcell_token(jitdriver_sd)`.
-        let mut token = make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index));
+        let mut token =
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         self.configure_loop_token_for_driver(
             Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
             green_key,
@@ -15099,7 +15086,9 @@ impl<M: Clone> MetaInterp<M> {
             // evicted token's `outermost_jitdriver_index` rather than
             // leftover `active_jitdriver_sd`.
             let gk = token.green_key();
-            let jd_no = token.outermost_jitdriver_index.unwrap_or(0);
+            let jd_no = token
+                .outermost_jitdriver_index
+                .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd");
             let Some(entry) = self.compiled_loops.get_mut(&(jd_no, gk)) else {
                 continue;
             };
@@ -15196,22 +15185,30 @@ impl<M: Clone> MetaInterp<M> {
                 .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&attach_token)),
         };
         if let Some(old_token) = old_token {
-            // `warmstate.py:343-347` line-by-line: when an `old_token`
-            // is present, redirect + record_jump_to run unconditionally.
-            // Upstream guarantees both tokens own real compiled code at
-            // this point — the public attach paths (`compile_loop`,
-            // `compile_simple_loop_or_bridge`, bridge-finish) only call
-            // here after `backend.compile_loop` has stamped the new
-            // token, and the old token retained its compiled blob from
-            // the previous attach.
+            // `warmstate.py attach_procedure_to_interp`: when an
+            // `old_token` is present, redirect + record_jump_to run
+            // unconditionally. Upstream guarantees both tokens own real
+            // compiled code at this point — the public attach paths
+            // (`compile_loop`, `compile_simple_loop_or_bridge`,
+            // bridge-finish) only call here after `backend.compile_loop`
+            // has stamped the new token, and the old token retained its
+            // compiled blob from the previous attach.
             //
-            // `warmstate.py:344` `cpu.redirect_call_assembler(old, new)`.
-            // The assembler logs `jl.redirect_assembler` itself
-            // (`x86/assembler.py` / `aarch64/assembler.py`).
+            // `warmstate.py attach_procedure_to_interp`
+            // `cpu.redirect_call_assembler(old, new)`. A mismatch is an
+            // assert inside `redirect_call_assembler`
+            // (`assert old_nbargs == new_nbargs`).
             crate::rjitlog::install_backend_hooks();
-            let _ = self
+            if let Err(e) = self
                 .backend
-                .redirect_call_assembler(&old_token, &attach_token);
+                .redirect_call_assembler(&old_token, &attach_token)
+            {
+                panic!(
+                    "redirect_call_assembler old identity={} new identity={}: {e}",
+                    old_token.identity_key(),
+                    attach_token.identity_key(),
+                );
+            }
             // `warmstate.py` `old_token.record_jump_to(procedure_token)`.
             old_token.record_jump_to(attach_token);
         }
@@ -15366,18 +15363,6 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
             .filter(|(pk, _)| *pk == green_key)
             .map(|(_, token)| token)
-    }
-
-    /// Redirect existing call_assembler calls from one loop to another.
-    ///
-    /// `jl.redirect_assembler` is logged by the backend assembler.
-    pub fn redirect_call_assembler(&self, old_key: u64, new_key: u64) {
-        let old_token = self.get_procedure_token(old_key);
-        let new_token = self.get_procedure_token(new_key);
-        if let (Some(old), Some(new)) = (old_token, new_token) {
-            crate::rjitlog::install_backend_hooks();
-            let _ = self.backend.redirect_call_assembler(&old, &new);
-        }
     }
 
     /// Port of `rpython/jit/metainterp/compile.py record_loop_or_bridge
@@ -15942,28 +15927,27 @@ impl<M: Clone> MetaInterp<M> {
     /// the same answer and hands it in rather than paying the weakref upgrade
     /// a second time inside one event.
     /// `compile.py must_compile` ticks `rd_loop_token.outermost_jitdriver_sd`.
-    /// A token that never recorded an index is the portal driver, not leftover
-    /// `active_jitdriver_sd` from a later compile.
+    /// `compile.py make_jitcell_token` always sets that field; a missing token
+    /// ticks the portal driver.
     pub(crate) fn jitdriver_index_for_failed_token(
         &self,
         token: Option<&majit_backend::JitCellToken>,
     ) -> usize {
-        token
-            .and_then(|token| token.outermost_jitdriver_index)
-            .unwrap_or(0)
+        match token {
+            Some(token) => token
+                .outermost_jitdriver_index
+                .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd"),
+            None => 0,
+        }
     }
 
     /// Integer key `must_compile` mixes into the GUARD_VALUE jitcounter hash
     /// for a TY_REF fail value.
     ///
-    /// Root across the call: `minimark.find_shadow` may collect while it
-    /// reserves the old-gen shadow (`optimizeopt/util.rs` ArgsKey).
+    /// `compile.py AbstractResumeGuardDescr.must_compile` uses
+    /// `lltype.cast_ptr_to_int` of the live pointer.
     fn ty_ref_jitcounter_intval(intval: i64) -> i64 {
-        if intval == 0 {
-            return 0;
-        }
-        let root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(intval as usize));
-        majit_gc::gc_id_or_identityhash(root.get().0) as i64
+        intval
     }
 
     /// `compile.py` `must_compile`: decode `status` into the jitcounter
@@ -16683,7 +16667,8 @@ impl<M: Clone> MetaInterp<M> {
         self.backend
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
-        let token = make_jitcell_token(driver_descriptor.as_ref().and_then(|driver| driver.index));
+        let token =
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         // `green_key` is interior-mutable, so it is written through the
         // shared `Arc`.
         token.green_key.set(original_green_key);
@@ -28189,7 +28174,9 @@ mod metainterp_static_data_tests {
         assert_eq!(idx1, 1);
         meta.finish_setup_descrs_for_jitdrivers();
 
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(41));
+        let mut token = majit_backend::JitCellToken::new(41);
+        token.outermost_jitdriver_index = Some(idx1);
+        let token = std::sync::Arc::new(token);
         meta.active_jitdriver_sd = Some(idx1);
         meta.keep_compiled_token_alive(&token);
         meta.warm_state_for_driver(idx1)
@@ -30632,6 +30619,24 @@ mod tests {
         assert!(!default_issubclass(0x1000, 0x1100));
         assert!(!default_issubclass(0x2000, 0x1000));
         assert!(default_issubclass(0xdead, 0xdead));
+    }
+
+    /// `resume.py` `ResumeDataLoopMemo._number_boxes` keys on box identity;
+    /// constants go through `getconst`. A Const whose bits equal a live
+    /// InputArg must stay a Const — do not reverse-map by address.
+    #[test]
+    fn snapshot_tagged_const_ref_does_not_remap_to_inputarg_by_address() {
+        let probe = 0usize;
+        let stack_addr = std::ptr::addr_of!(probe) as usize;
+        let ia = majit_ir::InputArgRc::new(InputArg::new_ref(0));
+        ia.set_value(Value::Ref(majit_ir::GcRef(stack_addr)));
+        let tagged = crate::recorder::SnapshotTagged::const_ref(stack_addr);
+        let box_ = snapshot_tagged_to_box(&tagged);
+        assert!(
+            box_.opref().is_constant(),
+            "Const Ref matching an InputArg address must stay Const, got {:?}",
+            box_.opref()
+        );
     }
 
     #[test]
@@ -34765,23 +34770,9 @@ mod tests {
     }
 
     #[test]
-    fn ty_ref_guard_value_hashes_by_identity_not_moving_address() {
-        // Two nursery addresses of one type must share the jitcounter bucket
-        // once `id_or_identityhash` has assigned the old-gen shadow.
-        fn identity_of_moved_type(addr: usize) -> usize {
-            match addr {
-                0x100 | 0x200 => 0xABC,
-                other => other,
-            }
-        }
-        struct RestoreIdentityHash;
-        impl Drop for RestoreIdentityHash {
-            fn drop(&mut self) {
-                majit_gc::set_active_gc_id_or_identityhash(None);
-            }
-        }
-        majit_gc::set_active_gc_id_or_identityhash(Some(identity_of_moved_type));
-        let _restore = RestoreIdentityHash;
+    fn ty_ref_guard_value_hashes_by_live_pointer_bits() {
+        // `compile.py AbstractResumeGuardDescr.must_compile`:
+        // `intval = lltype.cast_ptr_to_int(refval)`.
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.set_trace_eagerness(2);
@@ -34791,8 +34782,12 @@ mod tests {
 
         assert!(!meta.must_compile_with_values(&descr, &[], Some(0x100), 1).0);
         assert!(
-            meta.must_compile_with_values(&descr, &[], Some(0x200), 1).0,
-            "young and moved addresses of one type share the jitcounter bucket"
+            !meta.must_compile_with_values(&descr, &[], Some(0x200), 1).0,
+            "distinct live addresses hash into distinct jitcounter buckets"
+        );
+        assert!(
+            meta.must_compile_with_values(&descr, &[], Some(0x100), 1).0,
+            "the same live address ticks the same bucket"
         );
     }
 
@@ -35137,13 +35132,6 @@ mod tests {
             "must_compile ticks the failed token's driver timetable"
         );
 
-        let unindexed = majit_backend::JitCellToken::new(92);
-        assert!(unindexed.outermost_jitdriver_index.is_none());
-        assert_eq!(
-            meta.jitdriver_index_for_failed_token(Some(&unindexed)),
-            0,
-            "a token without outermost_jitdriver_index ticks the portal, not leftover active"
-        );
         assert_eq!(
             meta.jitdriver_index_for_failed_token(None),
             0,

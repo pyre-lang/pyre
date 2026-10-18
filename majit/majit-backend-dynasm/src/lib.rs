@@ -614,11 +614,13 @@ fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> 
 /// compile.py `PropagateExceptionDescr.handle_fail`.
 ///
 /// Reads `jf_guard_exc` (set by Layer 3's emitted
-/// `_store_and_reset_exception` in `OpCode::CheckMemoryError`),
-/// clears it (`grab_exc_value`), and falls back to `memory_error`
-/// when empty (`cast_instance_to_gcref(memory_error)`).  The caller
-/// observes `is_exit_frame_with_exception=true` on the synthesized
-/// FailDescr and re-raises the value through `jit_exc_value`.
+/// `_store_and_reset_exception` in `OpCode::CheckMemoryError`) the
+/// way `llmodel.py grab_exc_value` does — a read, no write — and
+/// falls back to `memory_error` when empty
+/// (`cast_instance_to_gcref(memory_error)`). Clearing the slot is
+/// `_restore_exception` (x86/assembler.py). The caller observes
+/// `is_exit_frame_with_exception=true` on the synthesized FailDescr
+/// and re-raises the value through `jit_exc_value`.
 ///
 /// Republishes the value via `jit_exc_raise` for the same
 /// caller-side GUARD_NO_EXCEPTION reason as
@@ -626,12 +628,8 @@ fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> 
 /// the globals on transfer, so this is a fresh store of the resolved
 /// (possibly memory_error fallback) value.
 fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
-    let exc_val = unsafe {
-        let slot = &mut (*frame_ptr).jf_guard_exc;
-        let v = *slot;
-        *slot = 0;
-        v
-    };
+    // `llmodel.py grab_exc_value`: read `jf_guard_exc` off the deadframe.
+    let exc_val = unsafe { (*frame_ptr).jf_guard_exc };
     let value = if exc_val != 0 {
         exc_val as i64
     } else {

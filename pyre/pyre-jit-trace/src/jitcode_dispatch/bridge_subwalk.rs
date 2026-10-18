@@ -1673,7 +1673,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     // NEXT level's paused chain, the same position the forward inline records
     // it at.  `capture_resumedata` keeps that tail's frame on the framestack,
     // so a guard inside the resumed callee resumes through it.
-    let mut pending_tail: Option<InlineParentFrame> = None;
+    // `resume.py rebuild_from_resumedata` rebuilds one frame per header; keep
+    // every consecutive helper/operator tail in recipe order.
+    let mut pending_tails: Vec<InlineParentFrame> = Vec::new();
     for parent_recipe in paused_parent_recipes {
         if parent_recipe.len_tail {
             // The recipe's jitcode is the operator tail that was paused
@@ -1684,7 +1686,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 return None;
             }
             let resume_pc = parent_recipe.jitcode_pc as usize;
-            pending_tail = Some(InlineParentFrame {
+            pending_tails.push(InlineParentFrame {
                 jitcode_index: parent_recipe.jitcode_index as u32,
                 call_jitcode_pc: None,
                 call_stack_overrides: Vec::new(),
@@ -1712,7 +1714,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             else {
                 return None;
             };
-            pending_tail = Some(tail);
+            pending_tails.push(tail);
             continue;
         }
         // Preserve the wrapper identity for frame-local metadata, but not a
@@ -1724,10 +1726,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         if parent_w_code == 0 {
             return None;
         }
-        // Outermost-first within the level: the paused caller, then the tail
-        // that ran between it and this frame, if the chain carried one.
+        // Outermost-first within the level: the paused caller, then the tails
+        // that ran between it and this frame, if the chain carried any.
         let mut guard_parents = vec![parent_for_current.clone()];
-        guard_parents.extend(pending_tail.take());
+        guard_parents.extend(pending_tails.drain(..));
         parent_guards.push(InlineFrameGuard::enter(
             session,
             parent_w_code,
@@ -1866,7 +1868,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         };
         let _frame_state_root = crate::trace::InlineFrameStateGuard::enter(&sub_wc.frame_state);
         let mut callee_parents = vec![parent_for_current];
-        callee_parents.extend(pending_tail.take());
+        callee_parents.extend(pending_tails.drain(..));
         let _inline_frame = InlineFrameGuard::enter(session, callee_w_code, false, callee_parents);
         // No `InlineConcreteFrameGuard` here.  A forward-inline sub-walk owns
         // the callee frame it publishes, so retargeting `last_instr` /

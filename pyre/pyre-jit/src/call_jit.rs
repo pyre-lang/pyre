@@ -3761,11 +3761,12 @@ pub(crate) fn compiled_meta_for_bridge_source<M: Clone>(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     green_key: u64,
 ) -> Option<std::sync::Arc<M>> {
-    let jd_no = descr_arc
+    let token = descr_arc
         .as_fail_descr()
-        .and_then(majit_backend::descr_owning_jct)
-        .and_then(|token| token.outermost_jitdriver_index)
-        .unwrap_or(0);
+        .and_then(majit_backend::descr_owning_jct)?;
+    let jd_no = token
+        .outermost_jitdriver_index
+        .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd");
     meta_interp
         .get_compiled_meta_on_driver(jd_no, green_key)
         .cloned()
@@ -4096,8 +4097,9 @@ pub fn trace_and_compile_from_bridge(
     // `catch_exception` on the resumed framestack innermost-first and
     // jumps there; the walker's `find_catch_for_exc_resume` is that
     // lookup.  Route any catching frame — live or inlined — onto that
-    // handler.  An uncaught raise still blackholes this failure
-    // (`compile_exit_frame_with_exception` is the remaining close).
+    // handler.  An uncaught raise closes with
+    // `compile_exit_frame_with_exception` (`last_exc_box` from
+    // `handle_possible_exception`).
     /// The exception-table byte offset a `next_instr`-style resume coordinate
     /// maps to, mirroring the live-frame form `frame.last_instr * 2` (where
     /// `last_instr` is `next_instr - 1`).
@@ -4207,9 +4209,36 @@ pub fn trace_and_compile_from_bridge(
         driver.meta_interp().exception_resume_was_prepared()
     };
     if pending_exc && !route_exc_edge && !exception_resume_prepared {
-        // Uncaught: `finishframe_exception` would
-        // `compile_exit_frame_with_exception`.  That Finish(exc) close is
-        // not wired on this walk yet, so this failure blackholes.
+        // Uncaught: `finishframe_exception` calls
+        // `compile_exit_frame_with_exception(self.last_exc_box)`.
+        // Record `GUARD_EXCEPTION` as `handle_possible_exception` does
+        // (`execute_ll_raised` with `constant=False` so `last_exc_box` is
+        // the guard result, not `ConstPtr` of this instance) and close
+        // with that symbolic box.
+        let live_exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
+        let exc_box = if live_exc != 0 {
+            let (driver, _) = crate::eval::driver_pair();
+            let meta = driver.meta_interp_mut();
+            meta.execute_ll_raised(live_exc, false);
+            let _ = meta.handle_possible_exception();
+            meta.last_exc_box.filter(|b| *b != majit_ir::OpRef::NONE)
+        } else {
+            None
+        };
+        if let Some(exc_box) = exc_box {
+            let (driver, _) = crate::eval::driver_pair();
+            let _ = driver
+                .meta_interp_mut()
+                .compile_exit_frame_with_exception(Some(exc_box));
+            if driver.is_tracing() {
+                driver.meta_interp_mut().abort_trace(false);
+            }
+            let live_exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
+            return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+                live_exc as PyObjectRef,
+            ));
+        }
+        // No symbolic box (no live exception, or tracing already gone):
         // `AbstractResumeGuardDescr.done_compiling` clears `ST_BUSY_FLAG`;
         // `jitcounter.tick` already reset the counter, so the next failure
         // ticks again.

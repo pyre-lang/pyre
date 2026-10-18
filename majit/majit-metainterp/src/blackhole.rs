@@ -4608,6 +4608,28 @@ mod tests {
             assert_eq!(bh.registers_i[0], 0);
         }
 
+        /// `RefOp.getref_base` returns `_resref`, nullptr until `setref_base`.
+        /// A present live box with no stamped mirror must still write that
+        /// default: skipping the write leaves a pooled leftover.
+        #[test]
+        fn copy_data_from_miframe_writes_resref_default_for_unstamped_live_ref() {
+            use crate::pyjitpl::MIFrame;
+            use majit_ir::OpRef;
+
+            let mut b = JitCodeBuilder::default();
+            b.ref_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.ref_regs[0] = Some(OpRef::ref_op(5));
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.registers_r = vec![0x380000; 16];
+            bh.copy_data_from_miframe(&frame);
+
+            assert_eq!(bh.registers_r[0], 0);
+        }
+
         /// `BlackholeInterpreter._copy_data_from_miframe` reads each
         /// `registers_r[i].getref_base()`. For a ConstPtr that means the
         /// GC-forwarded value stored on the box, never pyre's execution mirror.
@@ -13623,92 +13645,6 @@ pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
 #[inline]
 pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
     fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
-}
-
-/// True when `position` is still a node-entry of this helper: no child
-/// `INLINE_CALL` and no `SETFIELD` have run, and the param slots (`r0`,
-/// `i0`, `i1`) have not been overwritten. Restarting `fnaddr` with those
-/// slots is then the same as interpreting the rest of this frame.
-///
-/// A mid-`shift` Sequence/Alternative PC (left child already stored)
-/// returns false — re-running the helper would reread `old_left` from
-/// the current-character marks.
-///
-/// `run_after_rooting` only asks this at pc 0. Mid-tree resumes (regex
-/// leaf pc 210) skip the probe; the first unsafe PC is cached for the
-/// leftover-opcode / Char-19/28 tests that still call this directly.
-pub fn native_entry_args_intact(jitcode: &JitCode, position: usize) -> bool {
-    if position == 0 {
-        return true;
-    }
-    if jitcode.startpoints.is_none() {
-        return false;
-    }
-    position <= cached_first_unsafe_native_entry_pc(jitcode)
-}
-
-fn opcode_clobbers_native_entry_args(code: &[u8], pc: usize) -> bool {
-    let Some(&op) = code.get(pc) else {
-        return false;
-    };
-    match op {
-        jitcode::insns::BC_INLINE_CALL
-        | jitcode::insns::BC_SETFIELD_GC_I
-        | jitcode::insns::BC_SETFIELD_GC_R
-        | jitcode::insns::BC_SETFIELD_GC_F => true,
-        jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_R => {
-            let dest = code.get(pc + 4).copied().unwrap_or(0xff);
-            dest == 0 || (op == jitcode::insns::BC_GETFIELD_GC_I && dest == 1)
-        }
-        jitcode::insns::BC_MOVE_I | jitcode::insns::BC_MOVE_I_C => {
-            let dest = code.get(pc + 2).copied().unwrap_or(0xff);
-            dest == 0 || dest == 1
-        }
-        jitcode::insns::BC_INT_EQ => {
-            let dest = code.get(pc + 3).copied().unwrap_or(0xff);
-            dest == 0 || dest == 1
-        }
-        _ => false,
-    }
-}
-
-/// Smallest startpoint whose opcode clobbers a native-entry param slot.
-/// `native_entry_args_intact(p)` is then `p == 0 || p <= this`.
-fn first_unsafe_native_entry_pc(jitcode: &JitCode) -> usize {
-    let Some(starts) = jitcode.startpoints.as_ref() else {
-        return 0;
-    };
-    let code = jitcode.code.as_slice();
-    let mut first = usize::MAX;
-    for &pc in starts {
-        if opcode_clobbers_native_entry_args(code, pc) {
-            first = first.min(pc);
-        }
-    }
-    first
-}
-
-thread_local! {
-    /// One-entry cache of [`first_unsafe_native_entry_pc`]. The regex
-    /// deopt chain reseats the same `shift` helper on every frame.
-    static NATIVE_ENTRY_UNSAFE_PC: std::cell::Cell<Option<(usize, usize, usize)>> =
-        const { std::cell::Cell::new(None) };
-}
-
-fn cached_first_unsafe_native_entry_pc(jitcode: &JitCode) -> usize {
-    let ptr = jitcode as *const JitCode as usize;
-    let nstarts = jitcode.startpoints.as_ref().map_or(0, |s| s.len());
-    NATIVE_ENTRY_UNSAFE_PC.with(|cell| {
-        if let Some((cached_ptr, cached_n, limit)) = cell.get()
-            && cached_ptr == ptr
-            && cached_n == nstarts
-        {
-            return limit;
-        }
-        let limit = first_unsafe_native_entry_pc(jitcode);
-        cell.set(Some((ptr, nstarts, limit)));
-        limit
-    })
 }
 
 /// `blackhole.py _setup_return_value_*` + `get_tmpreg_*`: copy the

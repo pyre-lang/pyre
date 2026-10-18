@@ -2847,13 +2847,14 @@ fn create_segmented_trace<Sym: WalkSym>(
     // pyjitpl.py `_create_segmented_trace_and_blackhole`:
     // `exception_box = ConstInt(ptr2int(llexception.typeptr))` from
     // `jitexc.get_llexception` / `jitexc._get_standard_error`.
-    // Unset host hook keeps ConstInt(0).
     let typeptr = ctx
         .trace_ctx
         .metainterp_sd()
         .host
         .assertion_error_typeptr
-        .map_or(0, |f| f());
+        .expect(
+            "pyjitpl.py _create_segmented_trace_and_blackhole always gets a real AssertionError typeptr",
+        )();
     let exception_box = ctx.trace_ctx.const_int(typeptr);
     // pyjitpl.py:1639-1640 `if (metainterp.current_merge_points and
     // isinstance(metainterp.resumekey, compile.ResumeFromInterpDescr)):` — a
@@ -2878,9 +2879,7 @@ fn create_segmented_trace<Sym: WalkSym>(
             .metainterp_sd()
             .exit_frame_with_exception_descr_ref
             .clone()
-            .unwrap_or_else(|| {
-                majit_metainterp::make_finish_fail_descr_typed(vec![Type::Int], true)
-            });
+            .expect("compile.py make_and_attach_done_descrs attaches exit_frame_with_exception_descr_ref");
         ctx.trace_ctx.finish(&[exception_box], token);
     }
     // pyjitpl.py:1671-1673: "we now need to blackhole back to the interpreter
