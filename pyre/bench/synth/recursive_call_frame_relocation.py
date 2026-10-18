@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=8
-# Readings 2.2x-4.0x local (dynasm 2.2x-2.3x, cranelift 3.6x-4.0x); wasm reads
-# ~2.2x dynasm on CI. The floor, a fourth of the ceiling, sits under the fastest.
+# pyre-check: max-pypy-ratio=4.8
+# Readings 1.2x-3.1x local (dynasm 1.2x-2.1x, cranelift 2.3x-3.1x). The floor, a
+# fourth of the ceiling, sits under the fastest.
 # Deep self-recursion whose caller frame is relocated by a minor collection
 # while the recursive callee runs.  The bytecode CALL fast path drops the
 # arguments, runs the callee, then pushes its result onto the caller's value

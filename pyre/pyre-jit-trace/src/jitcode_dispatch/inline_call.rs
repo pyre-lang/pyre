@@ -8498,29 +8498,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
     // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) pushes an MIFrame.
     // A seeded frame already exists here, and a walk abort converts through
-    // `convert_and_run_from_pyjitpl` (`blackhole.py`). The remaining terms
-    // are unported OTHER: `code_has_for_iter`, `code_is_self_recursive`,
-    // and the constant-callable screen. That screen pins `Function.code`
+    // `convert_and_run_from_pyjitpl` (`blackhole.py`). A callee's own
+    // FOR_ITER items are keyed by its frame (`InflightForiterOwner`), so a
+    // callee that loops, or re-enters the caller's code, keeps them apart
+    // from the caller's. The remaining term is unported OTHER: the
+    // constant-callable screen. That screen pins `Function.code`
     // (`guards_the_callee_function`) — the greenkey `can_inline_callable`
     // unwraps — not function identity, so a fresh lambda with one code
     // object is admitted the same way a closure is.
     if fbw_foriter_inflight_active() && !instance_next_route {
-        let seeded_callee_resume = (try_multiframe || strict_seed)
+        let foriter_seeded_admit = (try_multiframe || strict_seed)
             && (callable_guard_op.is_constant()
                 || receiver_pinned_by_class
                 || guards_the_callee_function);
-        let foriter_seeded_admit = seeded_callee_resume
-            && !pyre_interpreter::code_has_for_iter(callee_code)
-            && !pyre_interpreter::code_is_self_recursive(callee_code);
         if !foriter_seeded_admit && fbw_inline_diag_enabled() {
             eprintln!(
-                "[inline-foriter-gate] pc={} seeded_admit={foriter_seeded_admit} \
-                 const_callable={} mf={try_multiframe} strict={strict_inlinable} \
-                 for_iter={} selfrec={} guards_fn={guards_the_callee_function}",
+                "[inline-foriter-gate] pc={} const_callable={} mf={try_multiframe} \
+                 strict={strict_inlinable} guards_fn={guards_the_callee_function}",
                 op.pc,
                 callable_guard_op.is_constant(),
-                pyre_interpreter::code_has_for_iter(callee_code),
-                pyre_interpreter::code_is_self_recursive(callee_code),
             );
         }
         if !foriter_seeded_admit {
