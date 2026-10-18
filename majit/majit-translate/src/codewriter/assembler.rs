@@ -4130,6 +4130,18 @@ impl AssemblerEncode for Assembler {
         {
             return self.emit_const_r_bits(prebuilt_instance_const_sentinel(ordinal), state);
         }
+        // `TypeLayoutBuilder.consider_constant` assigns the prebuilt
+        // constant's TYPE its type id at translation. Intern the same
+        // Size descr `new` interns so kind-0 decode /
+        // `GcLLDescr_framework.init_size_descr` can stamp it.
+        let _ = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
+            size: spec.size,
+            type_id: spec.type_id,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: spec.is_gc_managed,
+        });
         let ordinal = state.prebuilt_instance_consts.len();
         let constants_r_index = state.constants_r.len();
         let reg = self.emit_const_r_bits(prebuilt_instance_const_sentinel(ordinal), state);
@@ -4287,6 +4299,7 @@ struct EmptyClassPrebuilt {
     size: usize,
     type_id: u64,
     has_vtable: bool,
+    is_gc_managed: bool,
 }
 
 /// Empty-class singleton (`reusable_prebuilt_instance` /
@@ -4332,6 +4345,7 @@ fn empty_class_prebuilt_instance(
         size: spec.size,
         type_id: spec.type_id,
         has_vtable: crate::codewriter::heaptracker::callcontrol_has_vtable(cc, owner),
+        is_gc_managed: spec.is_gc_managed,
     })
 }
 
@@ -8608,6 +8622,41 @@ mod tests {
         assert_eq!(body.constants_r[idx], prebuilt_instance_const_sentinel(0));
         assert!(body.empty_array_consts.is_empty());
         assert!(body.unit_variant_consts.is_empty());
+    }
+
+    #[test]
+    fn empty_class_prebuilt_instance_interns_new_size_descr() {
+        let owner = "c1i::PrebuiltSizeDescrOnly";
+        let (cc, _guard) = empty_class_layout_cc(owner);
+        let class = HostObject::new_class(owner, Vec::new());
+        let inst = class
+            .reusable_prebuilt_instance()
+            .expect("empty class instance");
+        let type_id = majit_ir::descr::StructId::from_canonical(owner).as_u64();
+        let mut flat = SSARepr {
+            name: "empty_class_prebuilt_size".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(inst)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        assert_eq!(body.prebuilt_instance_consts.len(), 1);
+        assert_eq!(body.prebuilt_instance_consts[0].type_id, type_id);
+        let descrs = asm.snapshot_descrs();
+        assert!(
+            descrs.iter().any(|d| matches!(
+                d,
+                crate::jitcode::BhDescr::Size {
+                    type_id: tid,
+                    vtable: 0,
+                    ..
+                } if *tid == type_id
+            )),
+            "prebuilt-only empty class interned the new Size descr, got {descrs:?}"
+        );
     }
 
     #[test]

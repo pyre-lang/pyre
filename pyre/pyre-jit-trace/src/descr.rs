@@ -13607,15 +13607,15 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // `SimpleSizeDescr` via the cyclic `make_simple_descr_group`
             // path so `Arc<SimpleFieldDescr>` parents back-reference
             // the same `SimpleSizeDescr` (`descr.py` parent slot).
-            // The transient short-lived `BhDescr::Size` constructed in
-            // `pyre-jit/src/eval.rs` (`bh_new` / `bh_new_with_vtable`
-            // dispatch) carries an empty list and falls through to the
-            // bare ctor, which is the existing test-helper shape.
+            // A Size with `type_id == 0` has no STRUCT identity and
+            // takes the bare ctor.
+            // An empty STRUCT with a cache key is the SizeDescr
+            // `descr.py get_size_descr` caches, vtable or not:
+            // `simple_descr_group_from_bh_size` publishes it so
+            // `GcLLDescr_framework.init_size_descr` /
+            // `TypeLayoutBuilder.get_type_id` can stamp the collector tid.
             let headerless = owner == HEADERLESS_SIZE_OWNER_MARKER;
-            if all_fielddescrs.is_empty() && !headerless {
-                // TODO: `make_size_descr_with_type_and_vtable`
-                // takes the u32 gc tid; `mint_type_id` is the u64 cache key.
-                // Truncate `as u32` until gc_cache routing.
+            if all_fielddescrs.is_empty() && !headerless && *type_id == 0 {
                 make_size_descr_with_type_and_vtable(*size, mint_type_id as u32, *vtable as usize)
             } else {
                 let spec = majit_jitcode::jitcode::BhSizeSpec {
