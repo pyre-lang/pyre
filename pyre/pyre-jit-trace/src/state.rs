@@ -9280,7 +9280,9 @@ pub(crate) fn reconstruct_inline_recipe(
     // dest's floor stays at the post-call depth and keeps every slot below it
     // demanded.
     let unreconstructable_operand_floor = if in_a_call {
-        // result_slots=1 only for a Ref dest; int/float uses 0 because `get_list_of_active_boxes` parks that dest in `registers_i`/`registers_f`, and the floor only exempts W_Root slots the mandatory-operand loop reads.
+        // result_slots=1 only for a Ref dest; int/float uses 0 because
+        // `get_list_of_active_boxes` parks that dest in `registers_i`/`registers_f`,
+        // and the floor only exempts W_Root slots the mandatory-operand loop reads.
         let result_slots = usize::from(matches!(pending_result, Some(('r', _))));
         liveness
             .stack_depth_at(py_pc + 1)
