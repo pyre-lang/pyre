@@ -154,7 +154,7 @@ fn kwargs_get_empty_storage_is_newtuple_of_empty_vecs() {
     );
     assert!(
         vec_news >= 2,
-        "each tuple element default is vec::Vec::new\n{}",
+        "each tuple element default is the RustVecRepr NewEmpty helper\n{}",
         graph.dump()
     );
 }
@@ -230,9 +230,15 @@ fn is_core_tuple_default_call(target: &CallTarget) -> bool {
     }
 }
 
+/// The `RustVecRepr` `NewEmpty` helper an ordinary `Vec::new()` of
+/// one-word items lowers to (`rust_vec_std_call`), not the `newlist`
+/// spelling `vec::Vec::new`.
 fn is_vec_new_call(target: &CallTarget) -> bool {
     match target {
-        CallTarget::FunctionPath { segments, .. } => segments.as_slice() == ["vec", "Vec", "new"],
+        CallTarget::FunctionPath { segments, .. } => matches!(
+            majit_ir::rvec::vec_helper_for_path(&segments.join("::")),
+            Some((majit_ir::rvec::VecOp::NewEmpty, _))
+        ),
         _ => false,
     }
 }

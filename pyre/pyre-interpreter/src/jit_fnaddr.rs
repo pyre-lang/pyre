@@ -2801,9 +2801,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     upa1!(
         &mut entries,
-        "pyre_object::dictmultiobject::w_dict_length_typed_strategy",
-        "pyre_object::w_dict_length_typed_strategy",
-        pyre_object::dictmultiobject::w_dict_length_typed_strategy,
+        "pyre_object::dictmultiobject::w_dict_length_object_strategy",
+        "pyre_object::w_dict_length_object_strategy",
+        pyre_object::dictmultiobject::w_dict_length_object_strategy,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_length_int_strategy",
+        "pyre_object::w_dict_length_int_strategy",
+        pyre_object::dictmultiobject::w_dict_length_int_strategy,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_length_bytes_strategy",
+        "pyre_object::w_dict_length_bytes_strategy",
+        pyre_object::dictmultiobject::w_dict_length_bytes_strategy,
     );
     upa1!(
         &mut entries,

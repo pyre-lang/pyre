@@ -35185,18 +35185,26 @@ impl<'a> Lowering<'a> {
         res
     }
 
-    /// Empty `Vec::new()` — the same `vec::Vec::new` retarget
+    /// Empty `Vec::new()`, with the constructor an ordinary call selects
+    /// (`rust_vec_std_call`): a `Vec` of one-word items is the
+    /// `RustVecRepr` raw header, built by its `ll_vec_*` `NewEmpty`
+    /// helper; any other `Vec` keeps `vec::Vec::new`, which
     /// `flowspace_adapter` rewrites to `newlist()` / `ll_newemptylist`.
     /// A raw `NewList` in a graph that still drops to the legacy walker
     /// has no blackhole handler (`newlist/r>r`).
     fn emit_vec_new(&mut self, bb_id: BlockId, dest_ty: &TyRef) -> Variable {
+        let vec_new: Vec<String> = ["vec", "Vec", "new"].map(str::to_string).into();
+        let segments = match rust_vec_std_call(&vec_new, 0, dest_ty, None, self.llbc) {
+            Some((op, kind)) => rust_vec_helper_segments(op, kind),
+            None => vec_new,
+        };
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::Call {
-                target: CallTarget::function_path(["vec", "Vec", "new"]),
+                target: CallTarget::function_path(segments),
                 args: crate::model::call_args(vec![]),
                 result_ty: tyref_to_value_type_with(
                     dest_ty,
