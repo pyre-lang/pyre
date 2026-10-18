@@ -1082,7 +1082,10 @@ impl ModuleDictStrategy {
         w_dict: PyObjectRef,
         key: &str,
     ) -> Option<PyObjectRef> {
-        self._getdictvalue_no_unwrapping_pure(self.version, w_dict, key)
+        // Promote `self` before reading `self.version`, so that the read is
+        // a no-op due to the quasi-immutable field.
+        let this = unsafe { &*majit_ir::jit::promote(self as *const Self) };
+        this._getdictvalue_no_unwrapping_pure(this.version, w_dict, key)
     }
 
     /// `celldict.py _getdictvalue_no_unwrapping_pure` — keep the module dict
