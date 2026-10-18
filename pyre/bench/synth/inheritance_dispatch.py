@@ -5,6 +5,8 @@
 # gated on — only pypy is.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
+import gc
+
 N = 24729800
 
 
@@ -25,6 +27,11 @@ class Right(Base):
 
 def main():
     objs = [Base(), Left(), Right()]
+    # `must_compile` keys a failing ref GUARD_VALUE by the object's address
+    # (compile.py `lltype.cast_ptr_to_int`). Promote the receivers before the
+    # loop warms up, so a minor collection does not move them mid-warm-up and
+    # restart their counters at a point set by the startup allocation volume.
+    gc.collect()
     i = 0
     acc = 0
     while i < N:
