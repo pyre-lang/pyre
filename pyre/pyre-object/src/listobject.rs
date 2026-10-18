@@ -5950,8 +5950,8 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
         ListStrategy::Empty | ListStrategy::Size => 0,
         ListStrategy::SimpleRange | ListStrategy::Range => range_list_length(list),
         ListStrategy::Integer => ll_list_int_length(list),
-        ListStrategy::IntOrFloat => list.int_items.len(),
-        ListStrategy::Float => list.float_items.len(),
+        ListStrategy::IntOrFloat => ll_list_int_length(list),
+        ListStrategy::Float => ll_list_float_length(list),
         ListStrategy::Object => list.length_relaxed(),
         ListStrategy::Bytes => ll_list_bytes_length(list),
         ListStrategy::Ascii => ll_list_ascii_length(list),
@@ -5979,14 +5979,33 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
             w_int_new(item)
         }
         ListStrategy::IntOrFloat => {
-            let item = list.int_items.pop();
+            let item = {
+                let length = ll_list_int_length(list);
+                assert!(length > 0, "pop from empty list");
+                let index = length - 1;
+                let item = ll_list_int_getitem_fast(list, index);
+                ll_list_int_set_len(list, index);
+                item
+            };
             if int_or_float_is_int(item) {
                 w_int_new(int_or_float_decode_int(item))
             } else {
                 w_float_new(f64::from_bits(item as u64))
             }
         }
-        ListStrategy::Float => w_float_new(list.float_items.pop()),
+        // Same `ll_pop_default` decomposition as Integer: fused
+        // `float_items.pop()` / `int_items.pop()` do not lower, and a
+        // helper-innermost resume blackhole-interprets this body
+        // (`pickle_bridge_call_assembler_resumes_caller` `load_stop`).
+        ListStrategy::Float => {
+            let length = ll_list_float_length(list);
+            // rpython/rtyper/rlist.py ll_pop_default's internal precondition.
+            assert!(length > 0, "pop from empty list");
+            let index = length - 1;
+            let item = ll_list_float_getitem_fast(list, index);
+            ll_list_float_set_len(list, index);
+            w_float_new(item)
+        }
         // `AbstractUnwrappedStrategy.pop_end` (listobject.py) under an identity
         // `wrap`, rtyped as `ll_pop_default` (rlist.py): read, null the vacated
         // GC slot, shrink. Decomposed through the `ll_list_obj_*` leaves, like
