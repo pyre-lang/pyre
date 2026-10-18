@@ -20640,14 +20640,30 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     if w_code_ptr == 0 {
         return Ok(false);
     }
-    let w_globals = ns_ptr as pyre_object::PyObjectRef;
+    let mut w_globals = ns_ptr as pyre_object::PyObjectRef;
     // The namespace operand is the fold's authority: both legs end at
     // `guard_current_frame_globals_identity`, which bakes it as the expected
-    // `ConstPtr` and declines outright on a null one.  An inlined callee whose
-    // namespace register is unseeded presents it as a null `Ref`, so decline
-    // here instead of walking the builtins leg, which reads `__builtins__`
-    // straight out of it.  The residual re-resolves the globals from the frame
-    // it runs on, so declining stays correct.
+    // `ConstPtr` and declines outright on a null one.  The codewriter emits a
+    // NULL `ConstRef` placeholder for every `LOAD_GLOBAL`
+    // (`pyopcode.py _load_global` / `pyframe.py get_w_globals`); the walker
+    // replaces it from this MIFrame.  An inlined callee whose namespace
+    // register is still unseeded (`frame_ptr == 0`, or a GetfieldGcR with no
+    // concrete) would otherwise decline here and leave a residual
+    // `ForceToken` / `GuardNoException` per global.  Recover from THIS
+    // level's live frame — never the portal's — so the cell fold still
+    // produces a constant the inliner can use.
+    if w_globals.is_null() {
+        // Prefer THIS level's recorded `__globals__` so the identity check
+        // in `guard_current_frame_globals_identity` matches.  The live
+        // frame is the fallback when that word is still unseeded.
+        if ctx.inline_callee_consts.is_some() {
+            w_globals = ctx.inline_w_globals() as pyre_object::PyObjectRef;
+        }
+        if w_globals.is_null() && frame_ptr != 0 {
+            let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::PyFrame) };
+            w_globals = frame.get_w_globals();
+        }
+    }
     if w_globals.is_null() {
         return Ok(false);
     }

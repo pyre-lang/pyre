@@ -6856,6 +6856,9 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
             }
             return;
         };
+        // `pyframe.py get_w_globals` on a debugdata-less frame is
+        // `jit.promote(self.pycode).w_globals`: GETFIELD_GC_R of this
+        // callee red, not a ConstRef of the dict word.
         let w_globals = crate::state::frame_get_globals_obj(ctx.trace_ctx, frame);
         // Recording-time residual execution needs the same concrete shadow;
         // the compiled value remains the GETFIELD_GC_R result above and is
