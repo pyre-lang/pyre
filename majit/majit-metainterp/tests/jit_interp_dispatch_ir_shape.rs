@@ -678,7 +678,7 @@ fn a_trace_entry_takes_the_state_field_store_back_from_a_second_driver() {
     let program = [OP_INC_A, OP_END];
     let mut state = DispatchTestState { a: 0 };
     first.meta_interp_mut().finish_setup_descrs_for_jitdrivers();
-    first.force_start_tracing(0, 0, &mut state, &program[..]);
+    first.force_start_tracing(0, None, 0, &mut state, &program[..]);
     assert_eq!(
         majit_metainterp::current_state_field_fvc_epoch(),
         first.state_field_fvc_epoch(),

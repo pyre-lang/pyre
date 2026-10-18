@@ -8398,10 +8398,13 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// Bypasses the WarmEnterState hot counter (the caller already did its own
     /// counting). Used for function-entry JIT where the threshold is
-    /// controlled externally.
+    /// controlled externally. `greenargs` is `*greenargs` already in hand
+    /// (`warmstate.py bound_reached` `JitCell(*greenargs)`); the owned
+    /// `GreenKey` is built only at the cell-install site.
     pub fn force_start_tracing(
         &mut self,
         green_key: u64,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -8451,6 +8454,7 @@ impl<S: JitState> JitDriver<S> {
         if let BackEdgeAction::StartedTracing = self.meta.force_start_tracing(
             green_key,
             (state.code_ptr(), target_pc),
+            greenargs,
             descriptor.map(|d| (*d).clone()),
             &live_values,
         ) {
@@ -10628,7 +10632,13 @@ impl<S: JitState> JitDriver<S> {
                 if majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full() {
                     return None;
                 }
-                self.force_start_tracing(cell_key, target_pc, state, env);
+                self.force_start_tracing(
+                    cell_key,
+                    Some((green_values, green_types)),
+                    target_pc,
+                    state,
+                    env,
+                );
                 None
             }
             FunctionEntryStep::NotHot => None,
@@ -12772,6 +12782,73 @@ mod tests {
     }
 
     #[test]
+    fn function_entry_force_start_installs_comparekey_from_portal_greens() {
+        // warmstate.py bound_reached: `cell = JitCell(*greenargs)`.
+        // CountingDoorState::code_ptr is 0, so `with_typed_decision_key`
+        // declines; the portal greens are what must `set_comparekey`.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_function_threshold(2);
+        let values = [0i64, 0xabc0];
+        let types = [GreenType::Int, GreenType::Ref];
+        let hash = GreenKey::from_greenargs(&values, &types).get_uhash();
+        let mut state = CountingDoorState {
+            build_meta_calls: std::cell::Cell::new(0),
+            extract_live_values_calls: std::cell::Cell::new(0),
+            code_ptr: 0,
+        };
+        assert!(
+            driver
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            driver
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "the function-entry door must start tracing"
+        );
+        {
+            let cell = driver
+                .meta
+                .warm_state_for_driver(0)
+                .lookup_chain(hash)
+                .expect("function-entry force-start installs a cell");
+            assert!(
+                cell.comparekey(&values, &types),
+                "JitCell(*greenargs) stores comparekey"
+            );
+            assert!(cell.next.borrow().is_none(), "these greens own one cell");
+        }
+
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(101));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .attach_procedure_to_interp(hash, std::sync::Arc::clone(&token));
+        let (_cell_key, found) = driver
+            .meta
+            .warm_state_for_driver(0)
+            .resolved_cell_procedure_token(hash, Some((&values, &types)));
+        assert!(
+            found.is_some_and(|got| std::sync::Arc::ptr_eq(&got, &token)),
+            "resolved_cell_procedure_token(hash, Some(greens)) names the function-entry cell"
+        );
+    }
+
+    #[test]
     fn compiled_function_token_reads_the_entry_driver() {
         // warmstate.py maybe_compile_and_run with increment_function_threshold
         // is bound on that driver's WarmEnterState.
@@ -14046,7 +14123,7 @@ mod tests {
             .set_param("max_unroll_loops", 1);
         let mut state = AcceptCloseState::default();
         let key = 42u64;
-        driver.force_start_tracing(key, 0, &mut state, &());
+        driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         let start = driver.meta.trace_ctx().unwrap().current_merge_points[0].position;
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(9));
@@ -14105,7 +14182,7 @@ mod tests {
             .set_param_enable_opts("intbounds:heap");
         let mut state = AcceptCloseState::default();
         let key = 42u64;
-        driver.force_start_tracing(key, 0, &mut state, &());
+        driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         assert!(
             driver.cell_is_tracing(key),
@@ -14162,7 +14239,7 @@ mod tests {
             );
         }
         assert!(!driver.meta.take_keep_tracing_after_close());
-        driver.force_start_tracing(key, 0, &mut state, &());
+        driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(
             driver.is_tracing(),
             "a later trace must be able to start on the same key"
@@ -14185,7 +14262,7 @@ mod tests {
         let mut state = AcceptCloseState::default();
         let key_a = 42u64;
         let key_b = 99u64;
-        driver.force_start_tracing(key_a, 0, &mut state, &());
+        driver.force_start_tracing(key_a, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         assert!(
             driver.cell_is_tracing(key_a),
@@ -14232,7 +14309,7 @@ mod tests {
             "retargeted B was never marked tracing"
         );
         assert!(!driver.meta.take_keep_tracing_after_close());
-        driver.force_start_tracing(key_a, 0, &mut state, &());
+        driver.force_start_tracing(key_a, None, 0, &mut state, &());
         assert!(
             driver.is_tracing(),
             "a later trace must be able to start on A"
@@ -14260,7 +14337,7 @@ mod tests {
             selected: 0,
             code_ptr,
         };
-        driver.force_start_tracing(key, target_pc, &mut state, &());
+        driver.force_start_tracing(key, None, target_pc, &mut state, &());
         assert!(driver.is_tracing());
         assert!(
             driver.cell_is_tracing(key),
@@ -14299,7 +14376,7 @@ mod tests {
             "WarmEnterState.finish_tracing must clear JC_TRACING on a Ref-green cell"
         );
         assert!(!driver.meta.take_keep_tracing_after_close());
-        driver.force_start_tracing(key, target_pc, &mut state, &());
+        driver.force_start_tracing(key, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
             "a later trace must be able to start on the same key"
@@ -14331,7 +14408,7 @@ mod tests {
 
         // Start a real trace: this seeds `driver.sym` via create_sym +
         // initialize_sym (sym.selected == 3) and installs the trace session.
-        driver.force_start_tracing(key, target_pc, &mut state, &());
+        driver.force_start_tracing(key, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
             "force_start_tracing must start a trace"
@@ -14402,7 +14479,7 @@ mod tests {
             writeback_applied: None,
         };
         let target_pc = 7usize;
-        driver.force_start_tracing(target_pc as u64, target_pc, &mut state, &());
+        driver.force_start_tracing(target_pc as u64, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
             "force_start_tracing must start a trace"
@@ -14439,7 +14516,7 @@ mod tests {
         let mut driver = JitDriver::<ScalarWalkState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let mut state = ScalarWalkState::default();
-        driver.force_start_tracing(A, A as usize, &mut state, &());
+        driver.force_start_tracing(A, None, A as usize, &mut state, &());
         assert!(driver.is_tracing());
         assert!(driver.cell_is_tracing(A));
         assert!(!driver.cell_is_tracing(B));
@@ -14452,7 +14529,7 @@ mod tests {
         let mut driver = JitDriver::<ScalarWalkState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let mut state = ScalarWalkState::default();
-        driver.force_start_tracing(ROOT, ROOT as usize, &mut state, &());
+        driver.force_start_tracing(ROOT, None, ROOT as usize, &mut state, &());
         assert!(driver.is_tracing());
 
         driver.merge_point(|meta, _sym| {
@@ -14484,7 +14561,7 @@ mod tests {
             assert!(!warmstate.should_force_finish_tracing(ROOT));
         }
         // A fresh attempt must remain possible after the callee is disabled.
-        driver.force_start_tracing(ROOT, ROOT as usize, &mut state, &());
+        driver.force_start_tracing(ROOT, None, ROOT as usize, &mut state, &());
         assert!(driver.is_tracing());
         assert_eq!(
             driver.meta.portal_trace_positions.as_ref().map(Vec::len),
@@ -14514,7 +14591,7 @@ mod tests {
 
         let primary_pc = 7usize;
         let primary_key = primary_pc as u64;
-        driver.force_start_tracing(primary_key, primary_pc, &mut state, &());
+        driver.force_start_tracing(primary_key, None, primary_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the primary trace started");
         driver.merge_point(|_meta, _sym| TraceAction::AbortPermanent);
         assert!(
@@ -14527,7 +14604,7 @@ mod tests {
 
         let bridge_pc = 11usize;
         let bridge_key = bridge_pc as u64;
-        driver.force_start_tracing(bridge_key, bridge_pc, &mut state, &());
+        driver.force_start_tracing(bridge_key, None, bridge_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the bridge trace started");
         driver
             .meta
@@ -14571,7 +14648,7 @@ mod tests {
 
         let primary_pc = 7usize;
         let primary_key = primary_pc as u64;
-        driver.force_start_tracing(primary_key, primary_pc, &mut state, &());
+        driver.force_start_tracing(primary_key, None, primary_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the primary trace started");
         assert!(
             driver
@@ -15199,9 +15276,13 @@ mod tests {
         let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
         let green_key = 406;
         assert!(matches!(
-            driver
-                .meta
-                .force_start_tracing(green_key, (0, 0), Some(descriptor), &[Value::Int(0)],),
+            driver.meta.force_start_tracing(
+                green_key,
+                (0, 0),
+                None,
+                Some(descriptor),
+                &[Value::Int(0)]
+            ),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -15285,9 +15366,13 @@ mod tests {
         let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
         let green_key = 407;
         assert!(matches!(
-            driver
-                .meta
-                .force_start_tracing(green_key, (0, 0), Some(descriptor), &[Value::Int(0)],),
+            driver.meta.force_start_tracing(
+                green_key,
+                (0, 0),
+                None,
+                Some(descriptor),
+                &[Value::Int(0)]
+            ),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -15452,7 +15537,7 @@ mod tests {
         assert!(matches!(
             driver
                 .meta
-                .force_start_tracing(green_key, (0, 0), None, &[Value::Int(0)]),
+                .force_start_tracing(green_key, (0, 0), None, None, &[Value::Int(0)]),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -16093,7 +16178,7 @@ mod cross_loop_cut_close_tests {
     /// and record one op into it.
     fn start_outer_trace(driver: &mut JitDriver<CutCloseState>, outer_key: u64) {
         let mut state = CutCloseState;
-        driver.force_start_tracing(outer_key, outer_key as usize, &mut state, &());
+        driver.force_start_tracing(outer_key, None, outer_key as usize, &mut state, &());
         assert!(driver.is_tracing(), "outer trace must start");
         assert!(
             driver.meta.bridge_info().is_none(),

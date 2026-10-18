@@ -85,7 +85,7 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     // Live Ref inputarg: seed the trace with a Ref start value so slot 0
     // is a Ref bank input (force_start_tracing's record_input_arg).
     let live_p: usize = 0xBEEF_0000;
-    let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_p))]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[Value::Ref(GcRef(live_p))]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     // Fold path requires EF_ELIDABLE_CANNOT_RAISE:
@@ -151,7 +151,7 @@ fn elidable_ref_canary_all_const_args_fold_to_const_ptr_not_const_int() {
 
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
-    let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);

@@ -7886,7 +7886,7 @@ fn drive_portal_metatrace(
     // Before the walk records a field descr. See `publish_kind0_descrs_before_trace`.
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
-    driver.force_start_tracing(green_key, loop_header_pc, &mut jit_state, env);
+    driver.force_start_tracing(green_key, None, loop_header_pc, &mut jit_state, env);
     let meta = driver.meta_interp_mut();
     if !meta.is_tracing() {
         return None;
@@ -8303,7 +8303,7 @@ fn drive_generatorentry_trace(
         // to jd0's `(next_instr, is_being_profiled, pycode)` cell.
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(meta);
-        meta.force_start_tracing(green_key, (0, 0), Some(descriptor), &live_values)
+        meta.force_start_tracing(green_key, (0, 0), None, Some(descriptor), &live_values)
     };
     if dbg {
         let name = match action {
@@ -8837,6 +8837,7 @@ fn drive_unpack_iterable_trace(
     let action = meta.force_start_tracing(
         green_key,
         (greenkey_raw as usize, 0),
+        None,
         Some(descriptor),
         &live_values,
     );
@@ -12602,7 +12603,7 @@ fn compile_and_run_once(
             driver.bound_reached(green_key, target_pc, &mut jit_state, env);
         }
         CompileOnceStart::FunctionEntry => {
-            driver.force_start_tracing(green_key, target_pc, &mut jit_state, env);
+            driver.force_start_tracing(green_key, None, target_pc, &mut jit_state, env);
         }
     }
     if !driver.is_tracing() {
