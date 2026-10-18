@@ -989,6 +989,11 @@ pub struct ReconstructRecipe {
     /// drain walks `descr_call_tail` from the resume pc
     /// (`resume.py rebuild_from_resumedata`).
     pub ctor_tail: bool,
+    /// Translated helper jitcode section. `resume.py rebuild_from_resumedata`
+    /// pushes `newframe(jitcode)` for every encoded section, helper included;
+    /// the section has no Python `code` object. Registers stay color-indexed
+    /// in the three banks (`consume_boxes`).
+    pub helper_section: bool,
     /// `NewWithVtable` of this frame on an exception-guard bridge, recorded
     /// while the framestack is rebuilt and before
     /// `prepare_resume_from_failure` records that guard. `None` for a level

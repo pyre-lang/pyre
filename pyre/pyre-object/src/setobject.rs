@@ -2358,7 +2358,10 @@ pub fn plain_int_already_in_int_set(set: PyObjectRef, value: PyObjectRef) -> boo
 /// Answers `1` or `0`. `-1` means the set no longer holds
 /// `IntegerSetStrategy` or its stripe is contended; the caller then takes
 /// `strategy.has_key` with the wrapped key.
-#[majit_macros::dont_look_inside]
+///
+/// `call.py getcalldescr` non-elidable `EF_CANNOT_RAISE`: the probe runs
+/// no `__hash__` / `__eq__`, so the residual has no `GUARD_NO_EXCEPTION`.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn jit_int_set_has_key(set: PyObjectRef, key: i64) -> i64 {
     unsafe {
         let Some(_guard) = try_w_set_lock(set) else {

@@ -138,6 +138,22 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// `core::slice::index::<Impl>::index(_mut)` — the trait shim for both
+    /// scalar `s[i]` and range `s[a..b]`. Scalar sites take
+    /// [`Self::is_slice_scalar_index_call`]; range sites take the
+    /// `__getslice_*` marker when the receiver is a string byte view.
+    pub(in crate::front::mir) fn is_slice_index_path(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
+            )
+        })
+    }
+
     /// `core::slice::index::SliceIndex<usize>::index(_mut)` — scalar slice
     /// indexing.  RPython represents the same operation directly as
     /// `getitem` / `setitem`; the Rust trait shim is opaque in Charon and must
@@ -153,15 +169,7 @@ impl<'a> Lowering<'a> {
         reg: &RegularCall,
         index_ty: Option<&TyRef>,
     ) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let is_index = self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            matches!(
-                fd.item_meta.name_path().as_str(),
-                "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
-            )
-        });
+        let is_index = self.is_slice_index_path(reg);
         let callsite_index_is_scalar = index_ty.is_some_and(|ty| {
             vec_index_type_is_scalar(
                 ty,
@@ -2510,46 +2518,339 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Return the owning `BytesBlock` for the exact
-    /// `bytes_block_chars(block)` raw-slice constructor.
+    /// Return the owning `BytesBlock` for a raw-slice constructor over
+    /// address-taken `chars` whose length is that same header's `length`.
     ///
     /// RPython's `STR` is a length-prefixed GC struct with a variable-sized
     /// `chars` array (`lltypesystem/rstr.py`). pyre's `BytesBlock` is that
     /// `STR` (`type BytesBlock = Utf8Str`): the lifted value is the header,
     /// not the interior `chars` address. Matching the defining FieldRead
-    /// also proves this is that layout adapter rather than an unrelated
-    /// raw slice in the helper.
+    /// plus [`crate::front::from_raw_parts::len_names_same_header`] proves
+    /// this is that layout adapter rather than an unrelated raw slice.
+    /// The enclosing function name is not consulted; this subsumes the
+    /// previous `leaf == "bytes_block_chars"` / `_mut` gate.
     pub(in crate::front::mir) fn bytes_block_header_from_raw_parts(
         &self,
         bb_id: BlockId,
         reg: &RegularCall,
         chars: &Variable,
+        len: &Variable,
     ) -> Option<Variable> {
-        if !self.graph_is_bytes_block_chars_or_string_view() {
-            return None;
-        }
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        if self.llbc.fn_by_id(*id)?.item_meta.name_path() != "core::slice::raw::from_raw_parts" {
+        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path();
+        if path != "core::slice::raw::from_raw_parts"
+            && path != "core::slice::raw::from_raw_parts_mut"
+        {
             return None;
         }
+        // Adapter graphs split the address-taken `chars` FieldRead and
+        // `from_raw_parts` across blocks (`length_relaxed` sits between
+        // them). Predecessor edges are not always installed yet, so the
+        // SSA producer walk cannot follow the forwarded inputarg. A unique
+        // address-taken `chars` FieldRead names the header; the length
+        // must still be that header's, or the rewrite is declined.
+        let header = self
+            .unique_address_taken_bytes_block_chars_header()
+            .or_else(|| self.bytes_block_header_of_chars_ptr(bb_id, chars))?;
+        crate::front::from_raw_parts::len_names_same_header(&self.graph, len, &header)
+            .then_some(header)
+    }
+
+    fn unique_address_taken_bytes_block_chars_header(&self) -> Option<Variable> {
+        let mut found = None;
+        for block in &self.graph.blocks {
+            for op in &block.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    continue;
+                };
+                if field.name != "chars"
+                    || field.owner_root.as_deref() != Some("bytesobject::BytesBlock")
+                    || !field.taken_by_address
+                {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(base.clone());
+            }
+        }
+        found
+    }
+
+    /// Items address of an address-taken array field used as a pair
+    /// `from_raw_parts` pointer (`lltype.py direct_arrayitems`).
+    ///
+    /// `addr_of!((*header).chars) as *const T` leaves a `FieldRead` of
+    /// the `[T; 0]` tail; using that result as the pair pointer loads
+    /// item zero. Recover the header and `array_items_base`. When
+    /// `length_relaxed` splits the FieldRead and `from_raw_parts`
+    /// across blocks, the ptr is a forwarded inputarg and the unique
+    /// address-taken array FieldRead names the header — the same
+    /// split [`Self::bytes_block_header_from_raw_parts`] already
+    /// handles for a same-header view.
+    pub(in crate::front::mir) fn array_tail_of_pair_from_raw_parts_ptr(
+        &self,
+        mir_bb: usize,
+        ptr: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Ok(Some(found)) = self.taken_array_field_address(bb_id, ptr, dest_ty) {
+            return Some(found);
+        }
+        if let Some(found) = self.taken_array_field_address_chased(ptr, dest_ty) {
+            return Some(found);
+        }
+        let peeled = self.peel_identity_ptr(ptr);
+        if self.graph_defines(&peeled) {
+            return None;
+        }
+        self.unique_taken_array_field_address(dest_ty)
+    }
+
+    fn graph_defines(&self, var: &Variable) -> bool {
         self.graph
-            .block(bb_id)
-            .operations
+            .blocks
             .iter()
-            .rev()
-            .find_map(|op| match (&op.result, &op.kind) {
-                (Some(result), OpKind::FieldRead { base, field, .. })
-                    if result == chars
-                        && field.name == "chars"
+            .flat_map(|block| block.operations.iter())
+            .any(|op| op.result.as_ref() == Some(var))
+    }
+
+    fn peel_identity_ptr(&self, ptr: &Variable) -> Variable {
+        let mut current = ptr.clone();
+        for _ in 0..12 {
+            let Some(producer) = self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .find(|op| op.result.as_ref() == Some(&current))
+            else {
+                break;
+            };
+            match &producer.kind {
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    current = operand.clone();
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if args.len() == 1
+                    && segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "cast"
+                                | "cast_ptr_to_int"
+                                | "cast_int_to_ptr"
+                                | "from_exposed_addr"
+                                | "from_exposed_addr_mut"
+                        )
+                    }) =>
+                {
+                    current = args[0].clone().into_variable();
+                }
+                _ => break,
+            }
+        }
+        current
+    }
+
+    fn taken_array_field_address_chased(
+        &self,
+        ptr: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        let mut current = ptr.clone();
+        for _ in 0..12 {
+            if let Some(found) = self.taken_array_field_read_of(&current, dest_ty) {
+                return Some(found);
+            }
+            let producer = self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .find(|op| op.result.as_ref() == Some(&current))?;
+            match &producer.kind {
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    current = operand.clone();
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if args.len() == 1
+                    && segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "cast"
+                                | "cast_ptr_to_int"
+                                | "cast_int_to_ptr"
+                                | "from_exposed_addr"
+                                | "from_exposed_addr_mut"
+                        )
+                    }) =>
+                {
+                    current = args[0].clone().into_variable();
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn taken_array_field_read_of(
+        &self,
+        var: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        for block in &self.graph.blocks {
+            for op in &block.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    continue;
+                };
+                if op.result.as_ref() != Some(var) || !field.taken_by_address {
+                    continue;
+                }
+                let owner = field.owner_root.as_deref()?;
+                let offset = self.array_field_offset_for(
+                    owner,
+                    &field.name,
+                    dest_ty,
+                    Some(var),
+                    Some(base),
+                )?;
+                return Some((base.clone(), offset));
+            }
+        }
+        None
+    }
+
+    fn unique_taken_array_field_address(&self, dest_ty: Option<&TyRef>) -> Option<(Variable, u64)> {
+        let mut found = None;
+        for block in &self.graph.blocks {
+            for op in &block.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    continue;
+                };
+                if !field.taken_by_address {
+                    continue;
+                }
+                let Some(owner) = field.owner_root.as_deref() else {
+                    continue;
+                };
+                let Some(offset) = self.array_field_offset_for(
+                    owner,
+                    &field.name,
+                    dest_ty,
+                    op.result.as_ref(),
+                    Some(base),
+                ) else {
+                    continue;
+                };
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((base.clone(), offset));
+            }
+        }
+        found
+    }
+
+    fn array_field_offset_for(
+        &self,
+        owner: &str,
+        field_name: &str,
+        dest_ty: Option<&TyRef>,
+        var: Option<&Variable>,
+        header: Option<&Variable>,
+    ) -> Option<u64> {
+        let instantiated_align = Self::array_tail_instantiated_elem_align(
+            var.and_then(|v| self.instantiated_elem_align_of_var(v, field_name)),
+            header.and_then(|h| self.instantiated_elem_align_of_var(h, field_name)),
+            dest_ty.and_then(|ty| self.instantiated_elem_align_from_tyref(ty, field_name)),
+        )
+        .or_else(|| {
+            dest_ty.and_then(|ty| {
+                (self.pair_slice_kind(ty) == Some(majit_ir::rvec::VecItemKind::Int)
+                    && tyref_slice_elem_is_u8(ty, self.llbc))
+                .then_some(1)
+            })
+        });
+        self.array_field_tail_offset(owner, field_name, instantiated_align)
+    }
+
+    fn bytes_block_header_of_chars_ptr(
+        &self,
+        bb_id: BlockId,
+        chars: &Variable,
+    ) -> Option<Variable> {
+        let mut current = chars.clone();
+        for _ in 0..12 {
+            if let Some(base) =
+                self.graph
+                    .block(bb_id)
+                    .operations
+                    .iter()
+                    .rev()
+                    .find_map(|op| match (&op.result, &op.kind) {
+                        (Some(result), OpKind::FieldRead { base, field, .. })
+                            if result == &current
+                                && field.name == "chars"
+                                && field.owner_root.as_deref()
+                                    == Some("bytesobject::BytesBlock")
+                                && field.taken_by_address =>
+                        {
+                            Some(base.clone())
+                        }
+                        _ => None,
+                    })
+            {
+                return Some(base);
+            }
+            let producer = self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .find(|op| op.result.as_ref() == Some(&current))?;
+            match &producer.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if field.name == "chars"
                         && field.owner_root.as_deref() == Some("bytesobject::BytesBlock")
                         && field.taken_by_address =>
                 {
-                    Some(base.clone())
+                    return Some(base.clone());
                 }
-                _ => None,
-            })
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    current = operand.clone();
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if args.len() == 1
+                    && segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "cast"
+                                | "cast_ptr_to_int"
+                                | "cast_int_to_ptr"
+                                | "from_exposed_addr"
+                                | "from_exposed_addr_mut"
+                        )
+                    }) =>
+                {
+                    current = args[0].clone().into_variable();
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Whether this is the sole Rust-only forwarding query inside
@@ -2964,6 +3265,13 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_str_storage"))
     }
 
+    pub(in crate::front::mir) fn is_bytes_block_chars(&self, reg: &RegularCall) -> bool {
+        // Replaces `leaf == "bytes_block_chars"` (and `_mut`): a naked
+        // `&[u8]` return whose first input is a `BytesBlock` pointer and
+        // whose body is `from_raw_parts(chars, same-header length)`.
+        callee_returns_bytes_block_slice_of_block_ptr(reg, self.llbc)
+    }
+
     pub(in crate::front::mir) fn is_w_bytes_data(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -2980,24 +3288,6 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_bytes_block"))
-    }
-
-    pub(in crate::front::mir) fn is_bytes_block_chars(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_block_chars")
-        })
-    }
-
-    pub(in crate::front::mir) fn graph_is_bytes_block_chars_or_string_view(&self) -> bool {
-        self.graph
-            .name
-            .rsplit("::")
-            .next()
-            .unwrap_or(&self.graph.name)
-            == "bytes_block_chars"
     }
 
     /// `W_BytesObject.data` as `rstr.py` `STR` (`W_BytesObject._value`).

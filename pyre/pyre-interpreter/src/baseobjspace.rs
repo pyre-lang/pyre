@@ -2768,8 +2768,9 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // acquire/release), so the `gil_ready == 0` arm's look-inside call is
     // what `grab_initial_jitcodes` uses to reach `w_list_getitem_inner`.
     // Publication fails the guard and the retrace takes the locked wrapper.
-    // The BINARY_SUBSCR walker descends that inner body by name
-    // (`list_getitem_jitcode`).
+    // The BINARY_SUBSCR walker descends this `getitem_list` body
+    // (`getitem_list_jitcode`) so a helper-innermost guard still runs
+    // the `match` that maps `None` to IndexError.
     let ready = pyre_object::gil_ready::gil_ready_word();
     let item = if ready != 0 {
         w_list_getitem(obj, idx)
@@ -6021,7 +6022,7 @@ unsafe fn setitem_bytearray_slice(
     if sequence2.len() as i64 != slicelength {
         crate::builtins::bytearray_check_exports(obj)?;
     }
-    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+    let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     let old_size = vec.len();
     if step == 1 {
         let cur = vec.len();
@@ -6034,7 +6035,7 @@ unsafe fn setitem_bytearray_slice(
             );
         }
         vec.splice(s..e, sequence2.iter().copied());
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
         return Ok(w_none());
     }
     // Extended slice: `descr_setitem` forbids resizing — the source length
@@ -6057,7 +6058,7 @@ unsafe fn setitem_bytearray_slice(
     let mut k = 0usize;
     while k < sequence2.len() {
         if i >= 0 && (i as usize) < vec.len() {
-            vec[i as usize] = sequence2[k];
+            vec.set_at(i as usize, sequence2[k]);
         }
         k += 1;
         if k < sequence2.len() {
@@ -26275,7 +26276,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
                 let (start, stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-                let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+                let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
                 let old_size = vec.len();
                 if step == 1 {
                     let s = start.max(0) as usize;
@@ -26284,7 +26285,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                         pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, e - s);
                     }
                     vec.drain(s..e);
-                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
+                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
                     return Ok(());
                 }
                 let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
@@ -26304,7 +26305,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                         vec.remove(idx as usize);
                     }
                 }
-                pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
                 return Ok(());
             }
             let i = {
@@ -26320,8 +26321,9 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 if idx == 0 {
                     pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, 1);
                 }
-                pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
-                pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, len as usize);
+                let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
+                vec.remove(idx as usize);
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), len as usize);
                 return Ok(());
             }
             return Err(PyError::index_error("bytearray index out of range"));

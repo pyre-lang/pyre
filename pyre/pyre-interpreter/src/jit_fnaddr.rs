@@ -2907,14 +2907,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_bytearray_new",
         pyre_object::bytearrayobject::w_bytearray_new,
     );
-    // ABI-UNSOUND: `&[u8]` does not fit one residual slot.
-    push_abi_unsound_argument_alias_pair(
-        &mut entries,
-        &mut abi_unsound_arguments,
-        "pyre_object::bytearrayobject::w_bytearray_from_bytes",
-        "pyre_object::w_bytearray_from_bytes",
-        pyre_object::bytearrayobject::w_bytearray_from_bytes as *const (),
-    );
     // ABI-UNSOUND: `W_DictObject` does not fit one residual slot.
     push_abi_unsound_argument_alias_pair(
         &mut entries,
@@ -9241,8 +9233,7 @@ mod tests {
     }
 
     /// `space.newbytes(cdata[0])` is the 1-byte `jit_w_bytes_from_u8`
-    /// residual. `&[u8]` is two words, so the slice form declines the
-    /// `_CDataBase` convert descent.
+    /// residual.
     #[test]
     fn jit_trace_fnaddrs_covers_jit_w_bytes_from_u8() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();

@@ -2034,7 +2034,8 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             &llbc,
             spec,
             &empty_gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         )
         .as_deref(),
         Some("raw:Owner"),
@@ -2059,7 +2060,8 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             &llbc,
             spec,
             &empty_gc,
-            &std::collections::HashSet::<String>::new()
+            &std::collections::HashSet::<String>::new(),
+            None,
         )
         .as_deref(),
         Some("i64")
@@ -9795,6 +9797,8 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
+        &[],
+        crate::ErrorCarrierSpec::default(),
     );
     let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
         panic!("slot op is an input");
@@ -9822,6 +9826,8 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
         &gc_struct_ids,
         false,
         &std::collections::HashSet::<String>::new(),
+        &[],
+        crate::ErrorCarrierSpec::default(),
     );
     let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
         panic!("slot op is an input");

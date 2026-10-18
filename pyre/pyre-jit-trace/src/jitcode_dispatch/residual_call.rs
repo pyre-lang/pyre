@@ -2130,15 +2130,24 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             return false;
         };
         let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
-        if frame_reg == u16::MAX {
+        if frame_reg == u16::MAX || !crate::state::jitcode_owns_python_frame(&frame.jitcode) {
             // Codeless continuation (`ctor_continuation`, `OperatorTail`):
             // `PyJitCode::from_core_degenerate` leaves `portal_frame_reg` at
-            // `u16::MAX`. Skip PyFrame / virtualizable validation; keep the
-            // MIFrame so `_setup_return_value_r` (`blackhole.py`) lands the
-            // callee return in this level. `convert_and_run_from_pyjitpl`
-            // copies every framestack level, including one without a
-            // virtualizable. The remaining-body scan runs innermost-first
-            // below, once every Python level has been checked.
+            // `u16::MAX`. A translated helper is `from_canonical` with no
+            // merge-point (`jitcode_owns_python_frame`); its reds are the
+            // helper's own arguments, not a `PyFrame`. Skip PyFrame /
+            // virtualizable validation; keep the MIFrame so
+            // `_setup_return_value_r` (`blackhole.py`) lands the callee
+            // return in this level. `convert_and_run_from_pyjitpl` copies
+            // every framestack level, including one without a virtualizable.
+            // The remaining-body scan runs innermost-first below, once every
+            // Python level has been checked (`codeless_level_may_stop_blackhole`
+            // with `in_flight_callee_may_raise`).
+            latchdbg!(
+                "origin={origin} pf-codeless-continuation index={index} jitcode={} pc={}",
+                frame.jitcode.name(),
+                frame.pc
+            );
             continue;
         }
         let Some(frame_ptr) = banks
@@ -2165,10 +2174,14 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             latchdbg!("origin={origin} pf-array-len");
             return false;
         };
+        // Helpers / continuations were skipped above, so `index` is the
+        // MIFrame position, not the Python-frame position. The portal root
+        // is the first remaining PyFrame, not necessarily framestack[0].
+        let python_index = seen.len();
         if stack_depth < stack_base
             || stack_depth > array_len
-            || (index == 0 && frame_ptr != root)
-            || (index > 0 && frame_ptr == root)
+            || (python_index == 0 && frame_ptr != root)
+            || (python_index > 0 && frame_ptr == root)
             || seen.contains(&frame_ptr)
         {
             latchdbg!("origin={origin} pf-shape");
@@ -3430,6 +3443,15 @@ fn build_parent_miframe_from_paused_live<Sym: WalkSym>(
         }
         return None;
     };
+    let Some(call_jitcode_pc) = live.call_jitcode_pc else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: paused live \
+                 jitcode_index={jitcode_index} has no call_jitcode_pc"
+            );
+        }
+        return None;
+    };
     let parent = InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: live.call_jitcode_pc,
@@ -3437,7 +3459,7 @@ fn build_parent_miframe_from_paused_live<Sym: WalkSym>(
         resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
-        resume_coord: ParentResumeCoord::Backxlat(live.call_jitcode_pc.unwrap_or(0)),
+        resume_coord: ParentResumeCoord::Backxlat(call_jitcode_pc),
         resume_marker_jit_pc: None,
         boxes: Vec::new(),
         registers_r: Some(live.registers_r.clone()),
@@ -3567,16 +3589,24 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     // pushed by `build_paused_portal_miframe`. Ancestor helpers are
     // spliced after latch (`splice_active_driver_ancestors` /
     // `blackhole.py` `convert_and_run_from_pyjitpl`).
+    //
+    // A helper `InlineFrame` (`w_code == 0`, not the portal) already listed
+    // its Python caller in `parents`. `bind_paused_caller_regs` still writes
+    // `last().live` on that helper level and `mark_paused_caller_call` can
+    // stamp the portal jitcode index onto it, which rebuilt a second `main`
+    // MIFrame whose portal red was not a `PyFrame` (`is_op_identity` SIGSEGV
+    // at `concrete_nlocals`).
     if ctx.fbw_mode.transparent_helper_jitcode_index.is_some() {
         let live = {
             let session = ctx.session.borrow();
             if session.at_portal() {
                 None
             } else {
-                session
-                    .framestack
-                    .last()
-                    .and_then(|frame| frame.live.clone())
+                session.framestack.last().and_then(|last| {
+                    (last.is_portal || last.w_code != 0)
+                        .then(|| last.live.clone())
+                        .flatten()
+                })
             }
         };
         if let Some(live) = live {
@@ -5503,8 +5533,7 @@ pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
 ///
 /// A plain `dont_look_inside*` body has no `RuntimeHelperKind`, so the table
 /// above cannot name it and the funcptr is the only coordinate the call
-/// carries; resolve it against the published registry the way
-/// `records_inside_transparent_helper` does.
+/// carries; resolve it against the published `jit_trace_fnaddrs` registry.
 fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: usize) -> bool {
     if target <= 0 {
         return false;
@@ -5769,43 +5798,6 @@ fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
     }
 }
 
-/// `dont_look_inside_cannot_raise` helpers whose descr stays
-/// `EF_RANDOM_EFFECTS`. Recording the call inside a transparent helper
-/// is sound: they do not call Python, so `GUARD_NOT_FORCED` does not fail.
-/// `module_spec_get_initializing` answers `-1` instead of running `__eq__`,
-/// `__get__`, or `__bool__`. `bootstrap_handle_fromlist` and
-/// `default_importlib_import_word` are the same kind of lookup: a miss is
-/// null, and neither calls `_handle_fromlist`.
-fn records_inside_transparent_helper(addr: i64) -> bool {
-    if addr <= 0 {
-        return false;
-    }
-    pyre_interpreter::jit_trace_fnaddrs()
-        .iter()
-        .any(|(path, registered)| *registered == addr && transparent_helper_recordable_leaf(path))
-}
-
-fn transparent_helper_recordable_leaf(path: &str) -> bool {
-    path.rsplit("::").next().is_some_and(|leaf| {
-        let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
-        matches!(
-            leaf,
-            "tuple_from_exact_list"
-                | "dict_get_plain"
-                | "exc_init_one_positional"
-                | "value_error_one_arg"
-                | "extend_from_frame_locals_proxy"
-                | "proxy_list_new"
-                | "proxy_list_append"
-                | "append_extra_locals"
-                | "append_extra_locals_items"
-                | "module_spec_get_initializing"
-                | "bootstrap_handle_fromlist"
-                | "default_importlib_import_word"
-        )
-    })
-}
-
 /// `jit_portal_call_3` is `space.call_method` (`baseobjspace.py`) as five
 /// words. The codewriter leaves `runtime_helper` empty; the inliner enters
 /// only for `CallFn`. Other helpers keep their own tag, so a `store_subscr`
@@ -5829,16 +5821,20 @@ fn portal_user_call_helper<Sym: WalkSym>(
 }
 
 /// Funcptr word of a residual that is NULL or a `symbolic_fnaddr` hash.
-/// Other `ResidualDecline::Symbolic` causes (non-const funcbox, LoadConst)
-/// stay recorded: those calls are real at runtime.
-fn recorded_symbolic_funcptr<Sym: WalkSym>(
+///
+/// Gating on `is_constant()` missed the baked-immediate case: a non-const
+/// funcbox whose `box_value` is already the hash is still printed as
+/// `CallN(<hash>, …)` (`record_op` folds the known Int) and the backend
+/// emits a call to that hash. `look_inside_iff` residual of
+/// `extend_from_tuple_trampoline` (`rlib/jit.py` trampoline =
+/// `dont_look_inside`) is the one `for_iter_list_fold` `hot_truncate_during`
+/// compiled into a SIGBUS. An unknown (`None`) or real address stays
+/// recorded: those calls are real at runtime.
+pub(crate) fn recorded_symbolic_funcptr<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
 ) -> Option<i64> {
     let funcbox = allboxes.first()?;
-    if !funcbox.is_constant() {
-        return None;
-    }
     match ctx.trace_ctx.box_value(*funcbox) {
         Some(majit_ir::Value::Int(addr))
             if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) =>
@@ -5847,6 +5843,29 @@ fn recorded_symbolic_funcptr<Sym: WalkSym>(
         }
         _ => None,
     }
+}
+
+/// Abort when the just-recorded residual's funcptr is a `symbolic_fnaddr`
+/// hash. Must run *before* `try_execute`: the executor's inline-subwalk arm
+/// returns `Err(OrthodoxSubWalkTraceUnsupported)` for the same hash, and
+/// the dispatcher's `?` used to propagate that without cutting, leaving
+/// `CallN(<hash>)` in a parent walk that then residualized the outer helper
+/// (`CallMayForceN` of `list_extend_items`) beside it.
+///
+/// Always abort. Catchers at the residual-call site already cut on
+/// `nothing_applied` (`cut_declined_subwalk`); an empty prefix keeps the
+/// recorded `CallR` for
+/// `symbolic_box_str_constant_residual_declines_unsafe_arguments`.
+pub(crate) fn abort_if_recorded_symbolic_funcptr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+    _patch_pos: majit_metainterp::recorder::TracePosition,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if let Some(addr) = recorded_symbolic_funcptr(ctx, allboxes) {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: addr });
+    }
+    Ok(())
 }
 
 /// The symbolic decline, minted in one place so it carries provenance.
@@ -6178,9 +6197,7 @@ pub(crate) enum AssemblerContinuationEscape {
 /// `OrthodoxSubWalkTraceUnsupported` before executing the call.
 pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
-    call_opcode: OpCode,
     allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
 ) -> Option<(&'static str, i64, i64)> {
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
     // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
@@ -6206,15 +6223,11 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     // with such a parameter, so the descent declines before running one and
     // the interpreter makes the call with the argument whole.
     //
-    // A may-force residual inside a transparent helper is declined for the
-    // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
-    // after the Python code it called back into has run: a callback that
-    // raises forces the caller's frame vref on `leave`, and so does one that
-    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
-    // helper's own frame, past the call.  A transparent helper has no frame of
-    // its own, so its guards resume at the Python CALL that entered it, and
-    // the CALL runs the callback a second time -- or, with the exception still
-    // pending at that coordinate, lets it past the CALL's handler.
+    // A helper jitcode is one `capture_resumedata` section
+    // (`resume.py` `rebuild_from_resumedata` / `newframe(jitcode)`).
+    // `do_residual_call` records a may-force residual inside that
+    // MIFrame; `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` resume at the
+    // helper pc past the call, not at the Python CALL that entered it.
     if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
@@ -6227,29 +6240,6 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             // A real funcptr reached here, so there is no hash to carry, and
             // zero is what this variant spells for that.
             Some(("abi-unsound-arg", addr, 0))
-        } else if ctx.fbw_mode.transparent_helper_subwalk
-            && call_opcode.is_call_may_force()
-            && !records_inside_transparent_helper(addr)
-            && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
-            && !call_descr.get_extra_info().is_call_release_gil()
-            // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
-            // and records `call_release_gil`. The helper is
-            // `dont_look_inside` and does not re-enter Python; the forces
-            // guard belongs to the recorded release-gil op.
-            && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
-        {
-            // These helpers are `dont_look_inside_cannot_raise`. Their
-            // call descr is still `EF_RANDOM_EFFECTS` because the graph
-            // is top, so the opcode is may-force. They do not call back
-            // into Python, so the guard the comment above is about does
-            // not fail and the call can be recorded.
-            // `do_residual_call` runs `executor.execute_varargs` on
-            // `call_external_function` (`ccall_*`), then
-            // `direct_call_release_gil` records `CALL_RELEASE_GIL_*`
-            // (`history.record_nospec`). The wrapper releases the GIL around
-            // the C call, so it does not re-enter Python and
-            // `GUARD_NOT_FORCED` cannot fail for a callback.
-            Some(("may-force-in-transparent-helper", addr, 0))
         } else {
             None
         }
@@ -6312,8 +6302,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // (`declined_symbolic`): that leaves subsequent steps without the
     // concrete result `execute_varargs` would have produced.
 
-    let unsupported_funcbox =
-        residual_call_refused_up_front(ctx, call_opcode, allboxes, call_descr);
+    let unsupported_funcbox = residual_call_refused_up_front(ctx, allboxes);
     if let Some((reason, addr, symbolic)) = unsupported_funcbox {
         // Every caller catches this variant to decline its whole fold, so
         // without a report here the helper that stopped the descent is
@@ -9574,7 +9563,7 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
     // caller's latch (`blackhole.py convert_and_run_from_pyjitpl` resumes
     // past `__new__`). Any later error comes after the call ran and
     // propagates.
-    if residual_call_refused_up_front(ctx, call_opcode, &allboxes, call_descr).is_some() {
+    if residual_call_refused_up_front(ctx, &allboxes).is_some() {
         return Ok(OperatorTailResidual::NotRun);
     }
     // `do_residual_call`: preparation, the concrete call, then
@@ -10753,6 +10742,7 @@ fn try_perform_call<Sym: WalkSym>(
         ctx,
         op_pc,
         &sub_body,
+        jitcode.index(),
         i_args,
         &int_concretes,
         r_args,
@@ -11420,6 +11410,27 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::SysExcInfo, || {
             try_walker_specialize_sys_exc_info(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // Zero-argument `locals()` / `vars()` / `dir()`.  Same placement as
+    // `SysExcInfo`: `__majit_wrap_builtin_locals` is a `BuiltinCode.func`
+    // PBC member, so the wrapper descent below would enter its jitcode
+    // first.  That wrapper exists for reach (`rewrite_op_jit_force_virtualizable`
+    // deletes the force in `topframe_for_locals`), not for a descent;
+    // `try_walker_specialize_builtin_locals` is the look-inside of
+    // `pyframe.py fast2locals` (`@jit.unroll_safe`).  A wrap-body walk
+    // residualizes `frame_locals_proxy_snapshot` (`&mut self`, no
+    // trampoline) and a blackhole resume of that abort leaves the CALL
+    // dest unwritten.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::BuiltinLocals, || {
+            try_walker_specialize_builtin_locals(ctx, code, op, &r_args, dst)
         })?
         .is_some()
     {
@@ -12110,26 +12121,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })? {
             return Ok((outcome, op.next_pc));
         }
-    }
-
-    // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
-    // frame: model `fast2locals`' fastlocals reads as `getarrayitem_vable_r`
-    // plus a non-forcing dict-build chain — the shape the meta-tracer produces
-    // upstream, where `pyframe.py fast2locals` is `@jit.unroll_safe` and
-    // therefore looked into.  This arm runs BEFORE
-    // `try_execute_residual_call_via_executor_inner` arms the vable token protocol,
-    // which is the point: the opaque residual is what turns the locals-read
-    // barrier into `VableEscapedDuringResidualCall`.  Any non-matching shape
-    // falls through to the generic residual (SAFE).
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::BuiltinLocals, || {
-            try_walker_specialize_builtin_locals(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // `sys._getframe()` / `sys._getframe(depth)` : publish the per-level red

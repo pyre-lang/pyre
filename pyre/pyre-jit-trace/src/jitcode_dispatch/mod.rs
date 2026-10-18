@@ -1515,6 +1515,9 @@ fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
     }
     let hook = majit_metainterp::record_discarded_level_traceback_hook_address();
     for &(w_code, py_pc) in levels.iter().rev() {
+        if w_code == 0 {
+            continue;
+        }
         let old = exc_ptr;
         journaled_concrete_traceback_attach(&mut exc_ptr, |slot| {
             let live = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -5952,6 +5955,16 @@ pub fn walk<Sym: WalkSym>(
             // returns `TraceTooLong` so the enclosing Python CALL can
             // latch; an effectful walk without a complete image keeps
             // executing every call (`helper_too_long_decision`).
+            // A recovered helper subwalk may have left a multi-frame image.
+            // This too-long is a new unwind after a completed step
+            // (`blackhole_if_trace_too_long` after `run_one_step`). Force-qmut
+            // already discards on a new unwind; without it `try_adopt` prefers
+            // the stale helper image over the single-frame latch this arm
+            // writes. An inline too-long keeps its innermost image: `step()`
+            // returned Continue, so that image is this abort, not a leftover.
+            if snapshot_safe && !ctx.fbw_mode.inline_subwalk {
+                discard_staged_abort(ctx.session);
+            }
             let mut blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
             // Root-walk too-long publishes the walker mirror (`_copy_data_from_miframe`
             // equivalent).  Ask the height check here, while a refusal can still
@@ -7499,84 +7512,44 @@ fn dispatch_switch_id<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// Bridge an `MIFrame`'s register banks +
-/// trace recorder + last-exc state into a `WalkContext` and run
-/// `walk()` against the supplied jitcode body.
+/// Fresh `MetaInterp` (`pyjitpl.py`) plus `prepare_resume_from_failure`.
+/// Call once per compile attempt (`full_body_walk_trace` Reset,
+/// `drive_bridge_carrier_walk`), not from [`dispatch_via_miframe`]: that
+/// function is one jitcode body (`interpret()`), and a no-raise body must
+/// leave `class_of_last_exc_is_const` alone.
 ///
-/// RPython parity context: in RPython the metainterp loop iterates
-/// over `metainterp.framestack[-1].pc` calling `bytecode_step` which
-/// dispatches to the right `opimpl_*`. There's no separate "walker
-/// entry" because the metainterp loop *is* the walker. This entry
-/// point is pyre's equivalent: it drives the walker against the
-/// supplied `MIFrame` state and is the sole production tracing path.
-///
-/// Field plumbing:
-/// * `registers_r/i/f` — allocated fresh per call sized to
-///   `top_num_regs_* + top_constants_*.len()`, then populated by
-///   the inline `setup_call` from `argboxes_*` and constant slots.
-///   PyPy parity: `pyjitpl.py MIFrame.__init__` allocates
-///   the bank vectors at frame construction; `:188 setup_call`
-///   populates slots `[0..argboxes.len())` from the caller's
-///   argboxes. Walker handlers writing dst slots (`int_copy`,
-///   `binop_int_record`, etc.) mutate them in place; the banks are
-///   dropped when this function returns (matching PyPy's per-frame
-///   lifetime).
-/// * `trace_ctx` — borrowed mutably from `miframe.ctx`'s
-///   `TraceCtx`. Recording (`record_op`, `finish`, etc.) goes
-///   through this.
-/// * `last_exc_value` — reads `sym.last_exc_box` as the initial
-///   value (`OpRef::NONE` collapses to `None`). On exit the
-///   walker's final `last_exc_value` is mirrored back if non-None,
-///   so a `raise/r` -> `catch_exception/L` -> handler trace
-///   leaves `sym.last_exc_box` pointing at the in-flight exc OpRef
-///   (parity with RPython metainterp.last_exc_value).
-/// * `descr_refs`, `sub_jitcode_lookup` — caller-provided, same
-///   contract as direct `walk()` callers. Production callers wire
-///   `crate::jitcode_runtime::all_descrs()` + a JitCode-resolving
-///   closure over the lazy runtime jitcode cache.
-///
-/// `is_top_level` selects the outer-frame semantic:
-///
-/// * `true` — outermost trace entry. `*_return/*` arms record
-///   `Finish(value, done_with_this_frame_descr_<kind>)` and a `raise/r`
-///   that is never caught records
-///   `Finish(exc, exit_frame_with_exception_descr_ref)`.
-/// * `false` — sub-frame entry: `*_return/*` arms surface
-///   `SubReturn { result }` and uncaught `raise/r` arms surface
-///   `SubRaise { exc }` to the caller. The shadow validator (Phase
-///   D-3) drives this for per-Python-opcode arms — a Python-opcode arm
-///   compiled by the codewriter ends with `*_return/*` (since each arm
-///   is a self-contained sub-jitcode invoked from the outer dispatcher
-///   via `inline_call_r_r/dR>r`), so shadow mode must NOT emit a FINISH
-///   per Python opcode.
-///
-/// Sub-walks driven by `inline_call_r_r/dR>r` recursion always set
-/// `is_top_level=false` regardless of this caller-side flag (the
-/// recursion constructs its own `WalkContext`).
-///
-/// **Production wiring**: the full-body-walk walker
-/// (`full_body_walk_trace`) is the caller, dispatching each JitCode
-/// opcode through this entry as it walks the body.
-///
-/// Bridge exception seeding follows `pyjitpl.py`: every trace runs on a
-/// fresh `MetaInterp`, whose `last_exc_value` is null until an op of the
-/// trace raises. Only `prepare_resume_from_failure` installs one before the
-/// first op, and only for a `ResumeGuardExcDescr` /
-/// `ResumeGuardCopiedExcDescr` source guard, from that failure's
+/// Every trace runs on a fresh `MetaInterp`, whose `last_exc_value` is
+/// null until an op of the trace raises. Only `prepare_resume_from_failure`
+/// installs one before the first op, and only for a `ResumeGuardExcDescr`
+/// / `ResumeGuardCopiedExcDescr` source guard, from that failure's
 /// `cpu.grab_exc_value(deadframe)`. A root trace and a non-exception-guard
 /// bridge are therefore not seeded: neither a residual helper's leftover in
 /// `BH_LAST_EXC_VALUE` nor the exception an enclosing `except` block is
 /// handling (`ExecutionContext.sys_exc_value`) is this trace's exception.
-fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut TraceCtx) {
+pub(crate) fn seed_standing_exception_for_walk<Sym: WalkSym>(
+    sym: &mut Sym,
+    trace_ctx: &mut TraceCtx,
+) {
     if !(trace_ctx.is_bridge_trace && trace_ctx.bridge_source_is_exception_guard()) {
+        // Fresh `MetaInterp` (`pyjitpl.py`): `last_exc_value` is null until
+        // an op of THIS trace raises. The sym persists across walks, so a
+        // previous loop's handler leftover would otherwise survive into a
+        // non-exception-guard bridge and abort at the next
+        // `catch_exception/L` (`CatchExceptionWithActiveException`).
+        // `prepare_resume_from_failure` is the only seeder, and only for
+        // `ResumeGuardExcDescr` / `ResumeGuardCopiedExcDescr`.
+        sym.set_current_exc_value(pyre_object::PY_NULL);
+        sym.set_current_exc_box(OpRef::NONE);
+        sym.set_last_exc_value(pyre_object::PY_NULL);
+        sym.set_last_exc_box(OpRef::NONE);
+        sym.set_class_of_last_exc_is_const(false);
         return;
     }
 
     // `call_jit.rs` publishes the grab in `BH_LAST_EXC_VALUE` before bridge
     // tracing starts and zeroes it when the guard carried no exception. The
     // sym persists across walks, so the publish overwrites whatever a
-    // previous walk left on it. The multi-frame carrier walk seeds the same
-    // cell in `drive_bridge_carrier_walk`.
+    // previous walk left on it.
     let bh_exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
     if bh_exc != 0 {
         let exc = bh_exc as pyre_object::PyObjectRef;
@@ -7587,6 +7560,7 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut
             sym.set_last_exc_value(exc);
             sym.set_last_exc_box(exc_box);
             sym.set_class_of_last_exc_is_const(true);
+            trace_ctx.set_bridge_grab_seeded(true);
             return;
         }
     }
@@ -14104,7 +14078,7 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
 /// pool (`JitCodeBody` has no `descrs` field), so it resolves its `d`/`j`
 /// descr operands through the global pool (`all_descr_refs()` /
 /// `RawDescrPool::Global`), and its inline-call descrs through this lookup.
-static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
+pub(crate) static GLOBAL_SUB_JITCODE_LOOKUP_FN: fn(usize) -> Option<SubJitCodeBody> =
     sub_jitcode_body_by_index;
 
 fn mark_trace_reads_module_global(
@@ -14332,7 +14306,9 @@ fn guarded_branch_core<Sym: WalkSym>(
     // `bhimpl_goto_if_not` re-evaluates the restored condition.
     // `other_target` is still the not-taken arm (kept-stack trampoline
     // decode, depth gate, unrestorable-arm decline). Capture keys the
-    // jump itself rather than this destination.
+    // jump itself rather than this destination. Helper graphs have no
+    // Python trampoline (`flatten.py` `-live-` then `goto_if_not`); they
+    // take the same orgpc live-before path.
     let other_target = resolve_branch_target_through_trampoline(code, other_pc);
     {
         // #124/#281: a branch guard whose resume target still holds a
@@ -14394,12 +14370,9 @@ fn guarded_branch_core<Sym: WalkSym>(
         // which is an unmapped address rather than a wrong answer.
         //
         // Depth 0 is the right answer, not merely the safe one: a helper frame
-        // owns no Python operand stack, and its guards resume at the paused
-        // parents' CALL coordinates
-        // (`walker_capture_transparent_helper_snapshot`), re-executing the call
-        // -- exactly the reasoning `single_frame_collapse` above already
-        // applies to the helper walk whose framestack is empty.  This closes
-        // the same case when it is not.
+        // owns no Python operand stack. Its guards resume inside the helper
+        // (`walker_capture_transparent_helper_snapshot` encodes the helper
+        // section at the guard's pc).
         //
         // `transparent_helper_subwalk` and not `inline_subwalk`: the latter is
         // also set for a Python-callee sub-walk, where the bank and the target
@@ -14661,7 +14634,9 @@ fn guarded_branch_core<Sym: WalkSym>(
         // Capture at the jump's `-live-` BEFORE (`ctx.live_before_jit_pc`)
         // so the snapshot boxes are the live set before `goto_if_not`
         // (condition included) and blackhole `bhimpl_goto_if_not`
-        // re-evaluates the branch.
+        // re-evaluates the branch. A helper has no trampoline, so this is
+        // the same live-before (or `op.pc` when that anchor is unset) —
+        // `get_list_of_active_boxes` at `orgpc - SIZE_LIVE_OP`.
         let capture_pc = if ctx.live_before_jit_pc != usize::MAX {
             ctx.live_before_jit_pc
         } else {
@@ -17379,7 +17354,14 @@ fn handle<Sym: WalkSym>(
             // An unknown length keeps the Null posture. Signed/Float
             // arrays stamp a typed items block so `OS_ARRAYCOPY` can run;
             // `NEW_ARRAY_CLEAR` zeroes it (`bh_new_array_clear`) so
-            // `getarrayitem_gc_i` reads `FREE` (0).
+            // `getarrayitem_gc_i` reads `FREE` (0). A `[u8]` /
+            // `GcArray(Char)` dest is BytesBlock (item_size 1, chars at
+            // 8): the word-sized arm cannot represent it, and leaving
+            // it unbound aborts the void `OS_ARRAYCOPY` that
+            // `ll_listslice_startstop` records (`ResidualCallArgUnbound`
+            // on dest). Stamp a zeroed BytesBlock so that copy runs
+            // during the walk, the same way `bh_new_array` (`llmodel.py`)
+            // allocates from the live arraydescr.
             let mut concrete = ConcreteValue::Null;
             if let Some((tid, item_size, items_base)) = cleared_struct_array {
                 // `cd>r` encodes the length in the opcode byte. Reading
@@ -17417,8 +17399,9 @@ fn handle<Sym: WalkSym>(
                                 .map(|p| p as *mut u8)
                         }
                     } else if let Some(ad) = descr.as_array_descr() {
-                        if ad.is_array_of_structs() || ad.item_size() != std::mem::size_of::<u64>()
-                        {
+                        if ad.is_array_of_structs() {
+                            None
+                        } else if ad.item_size() != std::mem::size_of::<u64>() {
                             None
                         } else {
                             // Analyzer `get_array_descr` leaves

@@ -1206,7 +1206,7 @@ fn is_pair_slice_item(ty: &Type) -> bool {
     primitive_type_ident(ty).is_some_and(|ident| {
         matches!(
             ident.to_string().as_str(),
-            "i64" | "u64" | "isize" | "usize"
+            "u8" | "i64" | "u64" | "isize" | "usize"
         )
     })
 }
@@ -1355,9 +1355,14 @@ fn wrap_result_exc_call(
 /// length-prefixed object-array word, rebuilt by
 /// [`majit_ir::helper_fnaddr::object_gcarray_slice`].  `&mut [PyObjectRef]`
 /// stays a fat-pointer argument (the pair view of a `Vec` buffer).  Every
-/// other fat pointer (`&mut str`, `&Path`, `&[u8]`, `&[u32]`, `&[f64]`,
+/// other fat pointer (`&mut str`, `&Path`, `&[u32]`, `&[f64]`,
 /// `*const str`, `*const [T]`, `&dyn Trait`, a slice of any other item)
-/// still skips as `FatPointerArg`.  A return of `&str` or `&Wtf8` still skips.
+/// still skips as `FatPointerArg`.  A naked pair-slice return (`&[u8]`,
+/// `&[i64]`, …) is the same ABI the other way: the trampoline takes a
+/// trailing length slot and returns the pointer word.  After `result_exc`
+/// projects `Result<T, PyError>` to `T`, a pair-slice `T` is that same pair
+/// (pointer word plus length slot); a non-pair fat-pointer `T` still
+/// skips.  A return of `&str` or `&Wtf8` still skips.
 fn trampoline_skip_reason(
     func: &ItemFn,
     attr_name: &str,
@@ -1381,11 +1386,13 @@ fn trampoline_skip_reason(
             if attr_name == "dont_look_inside_cannot_raise" || !is_project_error_type(err_ty) {
                 return Some(HelperFnAddrSkip::ResultReturn);
             }
-            if is_fat_pointer_arg(ok_ty) {
-                return Some(HelperFnAddrSkip::Other);
-            }
-            if !payload_is_projectable(ok_ty) {
-                return Some(HelperFnAddrSkip::ResultReturn);
+            if pair_slice_param(ok_ty).is_none() {
+                if is_fat_pointer_arg(ok_ty) {
+                    return Some(HelperFnAddrSkip::Other);
+                }
+                if !payload_is_projectable(ok_ty) {
+                    return Some(HelperFnAddrSkip::ResultReturn);
+                }
             }
             Some(ok_ty)
         } else {
@@ -1397,6 +1404,7 @@ fn trampoline_skip_reason(
     if let ReturnType::Type(_, ty) = &func.sig.output
         && result_payload.is_none()
         && is_fat_pointer_arg(ty)
+        && pair_slice_param(ty).is_none()
     {
         return Some(HelperFnAddrSkip::Other);
     }
@@ -1417,6 +1425,11 @@ fn trampoline_skip_reason(
         }
     }
     if result_payload.is_some() {
+        return None;
+    }
+    if let ReturnType::Type(_, ty) = &func.sig.output
+        && pair_slice_param(ty).is_some()
+    {
         return None;
     }
     match helper_call_kind_for_return(&func.sig.output) {
@@ -1793,12 +1806,56 @@ fn emit_helper_call_target_fn(
         quote! { #helper_name(#(#fnaddr_args),*) }
     };
     let result_payload = result_exc_payload(&func.sig.output);
-    let return_kind = if let Some(ok_ty) = result_payload {
+    let pair_return = match &func.sig.output {
+        ReturnType::Type(_, ty) => {
+            pair_slice_param(ty).or_else(|| result_payload.and_then(pair_slice_param))
+        }
+        _ => None,
+    };
+    let return_kind = if pair_return.is_some() {
+        HelperCallKind::Int
+    } else if let Some(ok_ty) = result_payload {
         helper_call_kind_for_type(ok_ty)
     } else {
         helper_call_kind_for_return(&func.sig.output)
     };
-    if let Some(ok_ty) = result_payload {
+    if pair_return.is_some() {
+        let slot = format_ident!("__majit_ret_len_slot");
+        wrapper_params.push(quote! { #slot: i64 });
+        fnaddr_params.push(quote! { #slot: i64 });
+        let wrap_pair_return = |inner: proc_macro2::TokenStream| {
+            if result_payload.is_some() {
+                quote! {
+                    match #inner {
+                        ::core::result::Result::Ok(__majit_slice) => {
+                            ::majit_rlib::lltypesystem::rvec::ll_slice_len_slot_store(
+                                #slot as usize,
+                                __majit_slice.len(),
+                            );
+                            __majit_slice.as_ptr() as usize as i64
+                        }
+                        ::core::result::Result::Err(__majit_err) => {
+                            ::majit_ir::helper_fnaddr::ResidualError::publish_residual(
+                                __majit_err,
+                            );
+                            0
+                        }
+                    }
+                }
+            } else {
+                quote! {{
+                    let __majit_slice = #inner;
+                    ::majit_rlib::lltypesystem::rvec::ll_slice_len_slot_store(
+                        #slot as usize,
+                        __majit_slice.len(),
+                    );
+                    __majit_slice.as_ptr() as usize as i64
+                }}
+            }
+        };
+        call_expr = wrap_pair_return(call_expr);
+        fnaddr_call_expr = wrap_pair_return(fnaddr_call_expr);
+    } else if let Some(ok_ty) = result_payload {
         let Some(wrapped) = wrap_result_exc_call(call_expr, return_kind, ok_ty) else {
             return Ok(None);
         };
@@ -1809,7 +1866,10 @@ fn emit_helper_call_target_fn(
         };
         fnaddr_call_expr = fnaddr_wrapped;
     }
-    let arity = helper_abi_words(&func.sig.inputs);
+    let mut arity = helper_abi_words(&func.sig.inputs);
+    if pair_return.is_some() {
+        arity = arity.saturating_add(1);
+    }
     let shim_registration = if register_fnaddr && !has_float_arg {
         emit_helper_fnaddr_registrations(&fnaddr_path_names, &trace_target_name, arity)
     } else {
@@ -1833,7 +1893,7 @@ fn emit_helper_call_target_fn(
             }
         },
         HelperCallKind::Int | HelperCallKind::Ref => {
-            let converted_return = if result_payload.is_some() {
+            let converted_return = if result_payload.is_some() || pair_return.is_some() {
                 call_expr.clone()
             } else {
                 let Some(ty) = abi_return_ty else {
@@ -1912,7 +1972,7 @@ fn emit_helper_call_target_fn(
                 }
             },
             HelperCallKind::Int | HelperCallKind::Ref => {
-                let converted_return = if result_payload.is_some() {
+                let converted_return = if result_payload.is_some() || pair_return.is_some() {
                     fnaddr_call_expr.clone()
                 } else {
                     let Some(ty) = abi_return_ty else {
@@ -1966,7 +2026,7 @@ fn emit_helper_call_target_fn(
                 }
             },
             HelperCallKind::Int | HelperCallKind::Ref => {
-                let converted_return = if result_payload.is_some() {
+                let converted_return = if result_payload.is_some() || pair_return.is_some() {
                     fnaddr_call_expr.clone()
                 } else {
                     let Some(ty) = abi_return_ty else {
@@ -5207,10 +5267,24 @@ mod tests {
             skip("fn f(name: &str, path: &Path) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
-        assert_eq!(
-            skip("fn f(xs: &[u8]) -> i64 { 0 }"),
-            Some(HelperFnAddrSkip::FatPointerArg)
+        assert_eq!(skip("fn f(xs: &[u8]) -> i64 { 0 }"), None);
+        let u8_func = parse_fn("fn f(xs: &[u8]) -> i64 { 0 }");
+        let (_, _, u8_tokens) =
+            emit_helper_call_target_fn(&u8_func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("u8 pair trampoline");
+        let u8_text = u8_tokens.to_string();
+        assert!(
+            u8_text.contains(
+                "fn __majit_call_target_f (__majit_arg_0 : i64 , __majit_arg_0_len : i64) -> i64"
+            ),
+            "{u8_text}"
         );
+        assert!(
+            u8_text.contains("std :: slice :: from_raw_parts"),
+            "{u8_text}"
+        );
+        assert!(u8_text.contains("as * const () , 2"), "{u8_text}");
         assert_eq!(skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"), None);
         assert_eq!(skip("fn f(xs: &[*mut PyObject]) -> i64 { 0 }"), None);
         assert_eq!(skip("fn f(a: Option<PyObjectRef>) -> i64 { 0 }"), None);
@@ -5257,9 +5331,50 @@ mod tests {
             skip("fn f() -> *const [u8] { loop {} }"),
             Some(HelperFnAddrSkip::Other)
         );
+        assert_eq!(skip("fn f(x: i64) -> &[u8] { &[] }"), None);
+        assert_eq!(
+            skip("fn f(&self) -> &[u8] { &[] }"),
+            Some(HelperFnAddrSkip::MethodReceiver)
+        );
+        let pair_ret = parse_fn("fn f(x: i64) -> &[u8] { &[] }");
+        let (_, _, pair_ret_tokens) =
+            emit_helper_call_target_fn(&pair_ret, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("pair-return trampoline");
+        let pair_ret_text = pair_ret_tokens.to_string();
+        assert!(
+            pair_ret_text.contains(
+                "fn __majit_call_target_f (__majit_arg_0 : i64 , __majit_ret_len_slot : i64) -> i64"
+            ),
+            "{pair_ret_text}"
+        );
+        assert!(
+            pair_ret_text.contains("ll_slice_len_slot_store"),
+            "{pair_ret_text}"
+        );
         assert_eq!(
             skip("fn f(x: i64) -> Result<&[u8], PyError> { Ok(&[]) }"),
-            Some(HelperFnAddrSkip::Other)
+            None
+        );
+        let result_pair = parse_fn("fn f(x: i64) -> Result<&[u8], PyError> { Ok(&[]) }");
+        let (_, _, result_pair_tokens) =
+            emit_helper_call_target_fn(&result_pair, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("Result pair-return trampoline");
+        let result_pair_text = result_pair_tokens.to_string();
+        assert!(
+            result_pair_text.contains(
+                "fn __majit_call_target_f (__majit_arg_0 : i64 , __majit_ret_len_slot : i64) -> i64"
+            ),
+            "{result_pair_text}"
+        );
+        assert!(
+            result_pair_text.contains("ll_slice_len_slot_store"),
+            "{result_pair_text}"
+        );
+        assert!(
+            result_pair_text.contains("publish_residual"),
+            "{result_pair_text}"
         );
         assert_eq!(
             skip("fn f(x: i64) -> Result<i64, ()> { Ok(x) }"),
@@ -5308,6 +5423,34 @@ mod tests {
         assert_eq!(
             skip("fn f(a: &BigInt, b: &BigInt) -> Result<f64, PyError> { Ok(0.0) }"),
             None
+        );
+    }
+
+    #[test]
+    fn look_inside_iff_trampoline_gets_its_own_helper_fnaddr_row() {
+        let trampoline = parse_fn(
+            "fn extend_from_tuple_trampoline(list: PyObjectRef, other: PyObjectRef) -> Result<(), PyError> { Ok(()) }",
+        );
+        assert_eq!(
+            trampoline_skip_reason(&trampoline, "look_inside_iff", &[]),
+            None
+        );
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&trampoline, true, None, "look_inside_iff", &[], false)
+                .expect("emit")
+                .expect("nameable look_inside_iff trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains("__MAJIT_HELPER_FNADDR_extend_from_tuple_trampoline"),
+            "{text}"
+        );
+        assert!(
+            text.contains("extend_from_tuple_trampoline as * const ()"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fn __majit_call_target_extend_from_tuple_trampoline"),
+            "{text}"
         );
     }
 

@@ -1695,12 +1695,10 @@ fn catch_exception_handler_is_reachable_with_this_points_state() {
     assert!(!summary.body_not_walked);
 }
 
-/// Taken-path `blocker_after_effect` still refuses descent: a wrapper that
-/// records an effect and then compiles still resumes later helper guards at
-/// the Python CALL (`walker_capture_transparent_helper_snapshot`), which
-/// replays the effect. Tracing-abort conversion is a different path.
+/// Taken-path `blocker_after_effect` no longer refuses descent: a helper
+/// guard encodes the helper's own snapshot section and resumes there.
 #[test]
-fn descent_decline_refuses_a_blocker_after_effect() {
+fn descent_decline_does_not_refuse_a_blocker_after_effect() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
     assert!(!majit_jitcode::codewriter::call::is_symbolic_fnaddr(real));
@@ -1710,7 +1708,7 @@ fn descent_decline_refuses_a_blocker_after_effect() {
     let summary =
         super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
     assert_eq!(summary.blocker_after_effect, Some(symbolic));
-    assert!(super::inline_call::descent_decline_from_summary(&summary).is_some());
+    assert!(super::inline_call::descent_decline_from_summary(&summary).is_none());
 }
 
 /// An `inline_call` whose descr does not resolve to a JitCode is the same

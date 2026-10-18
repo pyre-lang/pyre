@@ -542,8 +542,10 @@ fn fat_box_len_and_index_keep_the_field_read() {
 /// while a shared ref to a nominal `{"Adt": {"id": N}}` pointee
 /// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
 /// (`llbc_with_trait_impls` in this file), no real corpus.
-/// A one-word-item `&[T]` / `&mut [T]` is a pair slice; a byte slice, a
-/// borrowed array, a double borrow and a bare slice are not.
+/// A one-word-item `&[T]` / `&mut [T]` is a pair slice, and so is a
+/// host `&[u8]`. A borrowed array, a double borrow and a bare slice
+/// are not. BytesBlock / STR views share the `&[u8]` spelling and
+/// are excluded by provenance, not by this type predicate.
 #[test]
 fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
     use majit_ir::rvec::VecItemKind;
@@ -582,7 +584,7 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         kind(
             serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"] })
         ),
-        None
+        Some(VecItemKind::Int)
     );
     assert_eq!(
         kind(

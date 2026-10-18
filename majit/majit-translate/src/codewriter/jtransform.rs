@@ -2110,6 +2110,159 @@ fn collect_unsigned_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64
     unsigned
 }
 
+/// Frontend `ValueType` on a producer, as `ConcreteType`. `Unknown` and
+/// the 128-bit / single-float leftovers stay unset so
+/// `stamp_value_kind_from_value_type` does not invent a Ref.
+fn declared_result_concrete_type(
+    kind: &OpKind,
+) -> Option<crate::codewriter::type_state::ConcreteType> {
+    use crate::codewriter::type_state::ConcreteType;
+    let ty = match kind {
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::LoadStatic { ty, .. } => ty,
+        OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. }
+        | OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. } => result_ty,
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. }
+        | OpKind::RawLoad { item_ty, .. } => item_ty,
+        OpKind::ArrayLen { .. }
+        | OpKind::ConstInt(_)
+        | OpKind::ConstBool(_)
+        | OpKind::ConstUInt(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_) => {
+            return Some(ConcreteType::Signed);
+        }
+        OpKind::ConstFloat(_) => return Some(ConcreteType::Float),
+        OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
+        | OpKind::ConstRef(_)
+        | OpKind::ConstRefNull
+        | OpKind::ConstRefAddr(_) => {
+            return Some(ConcreteType::GcRef);
+        }
+        OpKind::ConstNone => return Some(ConcreteType::Void),
+        _ => return None,
+    };
+    match ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
+            Some(ConcreteType::Signed)
+        }
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => Some(ConcreteType::GcRef),
+        ValueType::Float => Some(ConcreteType::Float),
+        ValueType::Void => Some(ConcreteType::Void),
+        ValueType::Unknown | ValueType::Int128 | ValueType::UInt128 | ValueType::SingleFloat => {
+            None
+        }
+    }
+}
+
+fn link_arg_concrete_type(arg: &LinkArg) -> crate::codewriter::type_state::ConcreteType {
+    use crate::codewriter::type_state::ConcreteType;
+    match arg {
+        LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+        LinkArg::Const(c) => match &c.value {
+            crate::flowspace::model::ConstValue::Int(_)
+            | crate::flowspace::model::ConstValue::Int128(_)
+            | crate::flowspace::model::ConstValue::UInt128(_) => ConcreteType::Signed,
+            crate::flowspace::model::ConstValue::Float(_) => ConcreteType::Float,
+            _ => ConcreteType::Unknown,
+        },
+    }
+}
+
+/// RPython's rtyper writes `op.result.concretetype` before jtransform
+/// `getkind`. The frontend leaves dests `Unknown` even when `ty` is Int
+/// (`W_BytesIO.pos`), so `get_value_kind_var` defaults to `'r'` and
+/// `p + count` becomes `ll_strconcat`. Stamp Unknown dests from the
+/// declared ty, then phis that join a single non-Unknown kind.
+fn stamp_unknown_results_from_declared_ty(graph: &FunctionGraph) {
+    use crate::codewriter::type_state::ConcreteType;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(result) = &op.result else {
+                continue;
+            };
+            // A one-byte host load is an integer word. The annotator can
+            // still paint the dest `Ptr(object)` when the Index place is
+            // a Deduplicated `u8` that fell back to `Ref`; `getkind` is
+            // then `'r'` and `rewrite_op_raw_load` wraps `cast_int_to_ptr`,
+            // so a `match bytes[0]` SwitchInt fails in flatten.
+            if let OpKind::RawLoad {
+                itemsize: 1,
+                item_ty: ValueType::Unsigned | ValueType::Int | ValueType::Bool,
+                ..
+            } = &op.kind
+            {
+                FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+                continue;
+            }
+            if FunctionGraph::concretetype_of(result) != ConcreteType::Unknown {
+                continue;
+            }
+            let Some(ct) = declared_result_concrete_type(&op.kind) else {
+                continue;
+            };
+            FunctionGraph::set_concretetype_of_inline(result, ct);
+        }
+    }
+    loop {
+        let mut grew = false;
+        for block in &graph.blocks {
+            if block.inputargs.is_empty() {
+                continue;
+            }
+            let incoming: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|pred| &pred.exits)
+                .filter(|link| link.target == block.id)
+                .collect();
+            if incoming.is_empty() {
+                continue;
+            }
+            for (slot, arg) in block.inputargs.iter().enumerate() {
+                if FunctionGraph::concretetype_of(arg) != ConcreteType::Unknown {
+                    continue;
+                }
+                let mut agreed: Option<ConcreteType> = None;
+                let mut ok = true;
+                for link in &incoming {
+                    let Some(link_arg) = link.args.get(slot) else {
+                        ok = false;
+                        break;
+                    };
+                    let kind = link_arg_concrete_type(link_arg);
+                    if kind == ConcreteType::Unknown {
+                        ok = false;
+                        break;
+                    }
+                    match agreed {
+                        None => agreed = Some(kind),
+                        Some(prev) if prev != kind => {
+                            ok = false;
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                if ok && let Some(kind) = agreed {
+                    FunctionGraph::set_concretetype_of_inline(arg, kind);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+}
+
 /// After `_rewrite_symmetric`, rename `lt`/`le`/`gt`/`ge` to `uint_*`
 /// when both pre-alias operands are unsigned, and `rshift` when the
 /// shifted value is (`lloperation.py` `uint_rshift` count stays signed).
@@ -3286,6 +3439,10 @@ impl<'a> Transformer<'a> {
         // the pre-alias result; `remap_op` would otherwise show the signed
         // source word.
         self.unsigned_vars = collect_unsigned_vars(&rewritten);
+        // `jtransform.py getkind(v.concretetype)`: rtyper has already
+        // written dest kinds. Stamp leftover Unknown dests from the
+        // frontend ty so later blocks' `p + count` sees Signed, not Ref.
+        stamp_unknown_results_from_declared_ty(&rewritten);
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
@@ -4763,30 +4920,44 @@ impl<'a> Transformer<'a> {
     /// Reconcile a call's front-derived result type with the callee's
     /// post-`?` declared `RESULT` (`call.py:230` `RESULT == FUNC.RESULT`).
     ///
-    /// A `Result<(), PyError>` scoped callee declares `FUNC.RESULT = void`,
-    /// but `front::mir` types the call's result `Ref`: every aggregate,
-    /// including the unit `()`, lowers to `Ref`.  This is the caller-side
-    /// mirror of the `declared=='v' && cfg=='r'` returnblock widen
-    /// `finalize_rewritten_graph_to_jitcode` runs on the callee — reconcile
-    /// the call to the declared void so the residual_call emits a `_v`
-    /// opname with no result slot.  Emitting the `Ref` slot would hand GC a
-    /// register holding the void call's garbage.  Only the
-    /// declared-void-vs-resolved-Ref shell case and a declared raw ADT's
-    /// coarse Ref token are rewritten; other calls keep `result_ty`.
+    /// `rewrite_call` (`jtransform.py`) picks
+    /// `inline_call_<argkinds>_<reskind>` from `getkind(op.result.concretetype)`,
+    /// and that concretetype is `FUNC.RESULT`. A front-derived `Ref` dest
+    /// for a scalar callee — `Result<(), PyError>` (void) or `bool` (`is_w`)
+    /// — would emit `inline_call_*_r` against an `int_return` / `void_return`
+    /// jitcode; the Int box then sits in a Ref register. This is the
+    /// caller-side mirror of the `declared=='v' && cfg=='r'` returnblock
+    /// widen `finalize_rewritten_graph_to_jitcode` runs on the callee.
+    /// A declared scalar (`void`/`int`/`float`) overrides a resolved `Ref`;
+    /// a declared `Ref` never replaces an Int dest. A declared raw ADT's
+    /// coarse `Ref` token is `Int` (`call.py getcalldescr`).
     fn effective_call_result_ty(
         &self,
         target: &CallTarget,
         op_result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> ValueType {
-        let declared_void = self
+        if let Some(declared) = self
             .callcontrol
             .as_deref()
             .and_then(|cc| cc.declared_result_type_for_target(target))
-            == Some(majit_ir::value::Type::Void);
-        if declared_void && self.resolve_call_result(op_result, result_ty).kind == 'r' {
-            ValueType::Void
-        } else if matches!(result_ty, ValueType::Ref(_))
+        {
+            let declared_kind = match declared {
+                majit_ir::value::Type::Void => 'v',
+                majit_ir::value::Type::Int => 'i',
+                majit_ir::value::Type::Ref => 'r',
+                majit_ir::value::Type::Float => 'f',
+            };
+            if declared_kind != 'r' && self.resolve_call_result(op_result, result_ty).kind == 'r' {
+                return match declared {
+                    majit_ir::value::Type::Void => ValueType::Void,
+                    majit_ir::value::Type::Int => ValueType::Int,
+                    majit_ir::value::Type::Float => ValueType::Float,
+                    majit_ir::value::Type::Ref => result_ty.clone(),
+                };
+            }
+        }
+        if matches!(result_ty, ValueType::Ref(_))
             && self
                 .callcontrol
                 .as_deref()
@@ -4795,10 +4966,9 @@ impl<'a> Transformer<'a> {
             // `call.py getcalldescr` uses FUNC.RESULT, not the frontend's
             // aggregate token. This also covers a caller whose annotation
             // did not publish the raw result's concrete Ptr.
-            ValueType::Int
-        } else {
-            result_ty.clone()
+            return ValueType::Int;
         }
+        result_ty.clone()
     }
 
     fn direct_funcptr_value(
@@ -8798,6 +8968,11 @@ impl<'a> Transformer<'a> {
             });
             return RewriteResult::Replace(Vec::new());
         }
+        // `jtransform.py rewrite_op_getfield`: `RESULT = op.result.concretetype`.
+        // The frontend FieldRead carries `ty: Int` (`W_BytesIO.pos`) while
+        // the dest cell stays Unknown; stamp it the way the vtable-slot
+        // arm already stamps Int, so `getkind` is `'i'` not `'r'`.
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
         // A rustc vtable slot is a function address. MIR may type the
         // `method_*` FieldRead as Ref (a fn-pointer); leaving that
         // assembles `getfield_gc_r` and `optimize_getfield` then
@@ -10003,7 +10178,7 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        // `jtransform.py rewrite_op_cast_opaque_ptr` returns None (alias
+        // `jtransform.py rewrite_op_cast_opaque_ptr` returns None (alias)
         // args[0]).  The same identity applies to the Rust spelling of
         // that op: `cast_int_to_ptr(cast_ptr_to_int(p))`.
         // Match the `lltype.cast_*` host path `cast_call_segments` emits,
@@ -10372,6 +10547,59 @@ impl<'a> Transformer<'a> {
                 },
             };
             return self.rewrite_operation(&helper_call, graph_name, graph);
+        }
+        // `__getslice_range` on a BytesBlock / untyped byte-string view.
+        // `w_bytearray_data` stamps `ValueType::Str` but the payload is a
+        // length-prefixed GcArray of `Char` (`BytesBlock`), not rstr `STR`
+        // (no hash word). `_ll_stringslice` / `stroruni.slice` would use
+        // STR offsets and `_handle_stroruni_call` panics on `Other`.
+        // `RStringIO.read` slices `__bigbuffer` as a list of chars; mint
+        // `ll_listslice_startstop` for `[u8]` the same way a GC-array
+        // marker does. A typed `Ptr(STR)` / `Ptr(UNICODE)` keeps the
+        // list-identity miss so rtyper's stringslice path owns it.
+        if crate::codewriter::getslice::is_getslice_range(op)
+            && crate::codewriter::getslice::getslice_base_is_str(graph, op)
+            && crate::codewriter::getslice::getslice_marker_identity(graph, op).is_none()
+            && matches!(stroruni_first_arg_kind(&args[0]), StrOrUniKind::Other)
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::getslice::listslice_range_path(
+                cc,
+                &ValueType::Int,
+                Some("[u8]"),
+            );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                        segments: path.segments.clone(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return match self.rewrite_operation(&helper_call, graph_name, graph) {
+                RewriteResult::Keep => RewriteResult::Replace(vec![helper_call]),
+                other => other,
+            };
+        }
+        // `_ll_stringslice` already copied. `buf[a..b].to_vec()` on a STR is
+        // that copy; a leftover `list` / `to_vec` would allocate again from a
+        // symbolic path. Lifted `Vec<u8>` is the same `STR` (`w_bytearray_data`
+        // / `BytesBlock`).
+        if args.len() == 1
+            && let CallTarget::FunctionPath { segments, .. } = target
+            && (segments.as_slice() == ["list"]
+                || matches!(
+                    segments.as_slice(),
+                    [a, b, c, d]
+                        if a == "alloc" && b == "slice" && c == "<Impl>" && d == "to_vec"
+                ))
+            && crate::codewriter::getslice::value_is_str(graph, &args[0])
+        {
+            return RewriteResult::Identity(args[0].clone());
         }
         // `core::cmp::{min,max}` — the front's residual of an Opaque
         // core call.  `rtype_builtin_min` (`rbuiltin.py`) turns the
@@ -12261,11 +12489,25 @@ impl<'a> Transformer<'a> {
             // `single_write_descr_array` from writeanalyze of
             // `rgc.ll_arraycopy`, whose body is `setarrayitem` on dest.
             // The residual helper has no graph, so name dest's ARRAY
-            // (`copy_args[1]`) with `newlist_clear_shape`. Resized and a
+            // (`copy_args[1]`) with `newlist_clear_shape`. A minted
+            // `ll_listslice_*` dest is the `NewArrayClear` in this graph
+            // (`rlist.py` `RESLIST.ll_newlist`); that ARRAY identity is
+            // the write descr, including `[u8]` / BytesBlock. Kind-collapsed
+            // dests without a producer still fall through. Resized and a
             // non-GC Fallback leave `extradescrs` unset so
             // `effectinfo_from_writeanalyze` takes `WriteAnalyzer.top_result`.
+            let dest_identity =
+                crate::codewriter::getslice::array_identity_of_base(graph, &copy_args[1]);
             let array_descrs = self.callcontrol.as_deref().and_then(|cc| {
-                match newlist_clear_shape(Some(&copy_args[1]), Some(cc)) {
+                let shape = if let Some((item_ty, array_type_id)) = dest_identity {
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                    }
+                } else {
+                    newlist_clear_shape(Some(&copy_args[1]), Some(cc))
+                };
+                match shape {
                     NewlistClearShape::Fixed {
                         item_ty,
                         array_type_id,
@@ -13013,6 +13255,117 @@ impl<'a> Transformer<'a> {
                     ],
                 )
             }
+            "list.bytes_set_len" => {
+                let l = args.first()?.clone();
+                let n = args.get(1)?.clone();
+                (
+                    "list.bytes_set_len → setfield_gc_i(bytes_items.len)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "bytes_items.len",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Value(n),
+                            ty: ValueType::Int,
+                        },
+                    }],
+                )
+            }
+            "list.bytes_set_items" => {
+                let l = args.first()?.clone();
+                let items = args.get(1)?.clone();
+                (
+                    "list.bytes_set_items → setfield_gc_r(bytes_items.block)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "bytes_items.block",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Value(items),
+                            ty: ValueType::Ref(None),
+                        },
+                    }],
+                )
+            }
+            "list.bytes_items" => {
+                let l = args.first()?.clone();
+                (
+                    "list.bytes_items → getfield_gc_r(bytes_items.block)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "bytes_items.block",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            ty: ValueType::Ref(None),
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            "list.bytes_setitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let value = args.get(2)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.bytes_setitem → getfield_gc_r(bytes_items.block) + setarrayitem_gc_r",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "bytes_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayWrite {
+                                base: block,
+                                index,
+                                value: crate::model::LinkArg::Value(value),
+                                item_ty: ValueType::Ref(None),
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
+                                nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
+                            },
+                        },
+                    ],
+                )
+            }
+            "list.ascii_items" => {
+                let l = args.first()?.clone();
+                (
+                    "list.ascii_items → getfield_gc_r(ascii_items.block)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldRead {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "ascii_items.block",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            ty: ValueType::Ref(None),
+                            pure: false,
+                        },
+                    }],
+                )
+            }
             "list.ascii_len" => {
                 let l = args.first()?.clone();
                 (
@@ -13117,6 +13470,25 @@ impl<'a> Transformer<'a> {
                             ),
                             value: crate::model::LinkArg::Value(n),
                             ty: ValueType::Int,
+                        },
+                    }],
+                )
+            }
+            "list.ascii_set_items" => {
+                let l = args.first()?.clone();
+                let items = args.get(1)?.clone();
+                (
+                    "list.ascii_set_items → setfield_gc_r(ascii_items.block)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "ascii_items.block",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Value(items),
+                            ty: ValueType::Ref(None),
                         },
                     }],
                 )
@@ -13602,14 +13974,40 @@ impl<'a> Transformer<'a> {
         // qualified key (in `call.rs`) and leaves the shell body-less in
         // `drain_pending_graphs`.
         let jitcode = if let Some(cc) = self.callcontrol.as_mut() {
+            // Same graph identity `declared_result_type_for_target` reads
+            // FUNC.RESULT from: crate-stripped funcobj, `__fn_const` strip,
+            // Method-name fallback. Spelled `target_to_path` alone would
+            // mint a second shell whose dest kind is the front Ref.
             let path = cc
-                .target_to_path(target)
+                .path_for_jitcode_lookup(target)
                 .unwrap_or_else(|| target_to_call_path(target));
             crate::jitcode::JitCodeHandle::new(cc.get_jitcode(&path))
         } else {
             crate::jitcode::JitCodeHandle::new(std::sync::Arc::new(crate::jitcode::JitCode::new(
                 "<missing-callcontrol>",
             )))
+        };
+        // Assembled `calldescr.result_type` is FUNC.RESULT once the
+        // header OnceLock is set (`jitcode.py` `__init__`). A first-time
+        // shell has none; the graph returnblock path in
+        // `declared_result_type_for_target` covers that. `calldescr()` on
+        // an unset lock answers the empty default `'v'`.
+        let result_ty_from_calldescr = jitcode.calldescr.get().and_then(|d| match d.result_type {
+            'i' => Some(ValueType::Int),
+            'f' => Some(ValueType::Float),
+            'v' => Some(ValueType::Void),
+            _ => None,
+        });
+        let result_ty_owned;
+        let result_ty = match (result_ty, result_ty_from_calldescr) {
+            (
+                ValueType::Ref(_),
+                Some(scalar @ (ValueType::Int | ValueType::Float | ValueType::Void)),
+            ) => {
+                result_ty_owned = scalar;
+                &result_ty_owned
+            }
+            _ => result_ty,
         };
         // RPython jtransform.py: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
@@ -22956,6 +23354,414 @@ mod tests {
             other => panic!("expected CallResidual, got {other:?}"),
         }
         assert!(matches!(ops[3].kind, OpKind::Live { .. }));
+    }
+
+    fn getslice_is_listslice_or_arraycopy(ops: &[SpaceOperation]) -> bool {
+        ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments
+                .last()
+                .is_some_and(|leaf| leaf.starts_with("ll_listslice_") || leaf == "ll_arraycopy"),
+            OpKind::InlineCall { jitcode, .. } => jitcode.0.name.contains("ll_listslice_"),
+            OpKind::ConstFnAddr { path, .. } => {
+                path.contains("ll_listslice_") || path.contains("ll_arraycopy")
+            }
+            OpKind::NewArrayClear {
+                array_type_id: Some(id),
+                ..
+            } => id == "[u8]",
+            _ => false,
+        })
+    }
+
+    fn getslice_still_marker(ops: &[SpaceOperation]) -> bool {
+        ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__getslice_range")
+            )
+        })
+    }
+
+    /// `s[start:stop]` on a `BytesBlock` Input is `ll_listslice_startstop`
+    /// for `[u8]` (`rStringIO.read` slices `__bigbuffer` as a list of
+    /// chars), not `_ll_stringslice` (STR offsets) and not a leftover
+    /// `__getslice_range` marker.
+    #[test]
+    fn transform_graph_rewrites_bytesblock_getslice_range_to_listslice() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Str,
+                    class_root: Some("BytesBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__getslice_range"]),
+                    args: crate::model::call_args(vec![s.clone(), start.clone(), stop.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !getslice_still_marker(ops),
+            "BytesBlock getslice must not stay a marker: {ops:?}"
+        );
+        assert!(
+            getslice_is_listslice_or_arraycopy(ops),
+            "BytesBlock getslice must lower to ll_listslice_startstop: {ops:?}"
+        );
+    }
+
+    /// `w_bytearray_data` stamps `ValueType::Str` with no Input identity.
+    /// The untyped byte-string view is `StrOrUniKind::Other`; mint
+    /// `ll_listslice_startstop` for `[u8]`.
+    #[test]
+    fn transform_graph_rewrites_bytearray_data_getslice_range_to_listslice() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let owner = graph.alloc_value_var();
+        let buf = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["w_bytearray_data"]),
+                    args: crate::model::call_args(vec![owner]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__getslice_range"]),
+                    args: crate::model::call_args(vec![buf.clone(), start.clone(), stop.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !getslice_still_marker(ops),
+            "bytearray_data getslice must not stay a marker: {ops:?}"
+        );
+        assert!(
+            getslice_is_listslice_or_arraycopy(ops),
+            "bytearray_data getslice must lower to ll_listslice_startstop: {ops:?}"
+        );
+    }
+
+    fn graph_mentions_leaf(graph: &FunctionGraph, leaf: &str) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| format!("{:?}", op.kind).contains(leaf))
+    }
+
+    /// A non-empty `w_bytes_from_bytes` slice stays the copy helper.
+    #[test]
+    fn transform_graph_keeps_nonempty_bytes_from_bytes() {
+        let mut graph = FunctionGraph::new("nonempty_from_bytes");
+        let ptr = graph.alloc_value_var();
+        let len = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(4), true)
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_object",
+                        "bytesobject",
+                        "w_bytes_from_bytes",
+                    ]),
+                    args: crate::model::call_args(vec![ptr, len]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        assert!(
+            graph_mentions_leaf(&transformed.graph, "w_bytes_from_bytes"),
+            "non-empty from_bytes must remain; ops: {:#?}",
+            transformed.graph.block(graph.startblock).operations
+        );
+        assert!(
+            !graph_mentions_leaf(&transformed.graph, "w_bytes_empty"),
+            "non-empty from_bytes must not become w_bytes_empty; ops: {:#?}",
+            transformed.graph.block(graph.startblock).operations
+        );
+    }
+
+    /// Frontend FieldRead `ty: Int` dests used to stay `concretetype
+    /// Unknown`, so `get_value_kind_var` defaulted them to `'r'` and
+    /// `p + count` became `jit_ll_strconcat` (`rstr.py ll_strconcat`).
+    /// RPython's rtyper sets `op.result.concretetype` before
+    /// `jtransform.py getkind`.
+    #[test]
+    fn transform_graph_int_field_add_is_not_strconcat() {
+        let mut graph = FunctionGraph::new("pos_add");
+        let owner = graph.alloc_value_var();
+        let p = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: owner,
+                    field: FieldDescriptor::new("pos", Some("W_BytesIO".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let count = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "count".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: p.clone(),
+                    rhs: count.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&p),
+            ConcreteType::Signed,
+            "FieldRead ty:Int dest must be Signed"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&count),
+            ConcreteType::Signed,
+            "Input ty:Int dest must be Signed"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed,
+            "int add dest must be Signed"
+        );
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| match &op.kind {
+                OpKind::ConstFnAddr { path, .. } => path.contains("strconcat"),
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.iter().any(|s| s.contains("strconcat")),
+                OpKind::CallResidual { .. } => false,
+                _ => false,
+            }),
+            "int FieldRead dests must not concat as strings; ops: {ops:?}"
+        );
+        // CallResidual of strconcat is paired with ConstFnAddr; also
+        // reject a residual whose descriptor is StrConcat.
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::CallResidual { descriptor, .. }
+                    if descriptor.extra_info.oopspecindex == OopSpecIndex::StrConcat
+            )),
+            "p + count must not be OS_STR_CONCAT; ops: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, result_ty, .. }
+                    if op == "add" && *result_ty == ValueType::Int
+            )),
+            "p + count must stay int add; ops: {ops:?}"
+        );
+    }
+
+    /// `buf[a..b].to_vec()` on a byte-string view is the copy
+    /// `ll_listslice_startstop` already made (`rStringIO.read`).
+    #[test]
+    fn transform_graph_identity_to_vec_of_str_getslice() {
+        let mut graph = FunctionGraph::new("read_bytes");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Str,
+                    class_root: Some("BytesBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let start = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "start".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let stop = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "stop".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let sliced = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__getslice_range"]),
+                    args: crate::model::call_args(vec![s.clone(), start.clone(), stop.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let copied = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["alloc", "slice", "<Impl>", "to_vec"]),
+                    args: crate::model::call_args(vec![sliced.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(copied.clone()));
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let leftover_to_vec = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice()
+                    == ["alloc", "slice", "<Impl>", "to_vec"]
+                    || segments.first().map(String::as_str) == Some("list")
+            )
+        });
+        assert!(
+            !leftover_to_vec,
+            "to_vec of a STR getslice must be identity: {ops:?}"
+        );
+        assert!(
+            !getslice_still_marker(ops),
+            "STR getslice must not stay a marker: {ops:?}"
+        );
     }
 
     /// `str(int)` over an Int operand, as one graph, for the two tests below.
@@ -40379,14 +41185,16 @@ mod tests {
         assert_eq!(lowered, count);
     }
 
-    /// `list.int_items(l)` / `list.float_items(l)` lower to
-    /// `getfield_gc_r(l, {int,float}_items.block)`
+    /// `list.int_items(l)` / `list.float_items(l)` / `list.ascii_items(l)`
+    /// lower to `getfield_gc_r(l, {int,float,ascii}_items.block)`
     /// (`rlist.py LIST.ll_items` / `emit_list_items_read`).
     #[test]
     fn handle_list_call_typed_items_lowers_to_getfield_block() {
         for (oopspec, field_name) in [
             ("list.int_items", "int_items.block"),
             ("list.float_items", "float_items.block"),
+            ("list.bytes_items", "bytes_items.block"),
+            ("list.ascii_items", "ascii_items.block"),
         ] {
             let config = GraphTransformConfig::default();
             let mut graph = FunctionGraph::new("list_typed_items");
@@ -40716,6 +41524,108 @@ mod tests {
         assert_eq!(ops[0].result, None);
     }
 
+    /// `list.bytes_set_len(l, n)` lowers to `setfield_gc_i(bytes_items.len)`.
+    #[test]
+    fn handle_list_call_bytes_set_len_lowers_to_len_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_bytes_set_len");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.bytes_set_len",
+                &op,
+                &[l.clone(), n.clone()],
+                &mut graph,
+                "list_bytes_set_len",
+            )
+            .expect("list.bytes_set_len must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "bytes_items.len");
+                assert_eq!(value.as_variable(), Some(&n));
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.bytes_setitem(l, i, v)` lowers to `getfield_gc_r(bytes_items.block)`
+    /// feeding `setarrayitem_gc_r` of the erased bytes array.
+    #[test]
+    fn handle_list_call_bytes_setitem_lowers_to_block_plus_setarrayitem() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_bytes_setitem");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.bytes_setitem",
+                &op,
+                &[l.clone(), index.clone(), value.clone()],
+                &mut graph,
+                "list_bytes_setitem",
+            )
+            .expect("list.bytes_setitem must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead { base, field, .. } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "bytes_items.block");
+                ops[0].result.clone().expect("block result var")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayWrite {
+                base,
+                index: idx,
+                value: written,
+                item_ty,
+                array_type_id,
+                nolength,
+                gckind: _,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(idx, &index);
+                assert_eq!(written.as_variable(), Some(&value));
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+                );
+                assert!(!nolength);
+            }
+            other => panic!("expected ArrayWrite, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, None);
+    }
+
     /// `list.ascii_set_len(l, n)` lowers to `setfield_gc_i(ascii_items.len)`.
     #[test]
     fn handle_list_call_ascii_set_len_lowers_to_len_field_write() {
@@ -40752,6 +41662,94 @@ mod tests {
                 assert_eq!(field.name, "ascii_items.len");
                 assert_eq!(value.as_variable(), Some(&n));
                 assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.bytes_set_items(l, items)` lowers to `setfield_gc_r(l,
+    /// bytes_items.block)` (`rlist.py` `l.items = newitems`).
+    #[test]
+    fn handle_list_call_bytes_set_items_lowers_to_block_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_bytes_set_items");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let items = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.bytes_set_items",
+                &op,
+                &[l.clone(), items.clone()],
+                &mut graph,
+                "list_bytes_set_items",
+            )
+            .expect("list.bytes_set_items must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "bytes_items.block");
+                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                assert_eq!(value.as_variable(), Some(&items));
+                assert!(matches!(ty, ValueType::Ref(_)));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.ascii_set_items(l, items)` lowers to `setfield_gc_r(l,
+    /// ascii_items.block)` (`rlist.py` `l.items = newitems`).
+    #[test]
+    fn handle_list_call_ascii_set_items_lowers_to_block_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_ascii_set_items");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let items = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.ascii_set_items",
+                &op,
+                &[l.clone(), items.clone()],
+                &mut graph,
+                "list_ascii_set_items",
+            )
+            .expect("list.ascii_set_items must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "ascii_items.block");
+                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                assert_eq!(value.as_variable(), Some(&items));
+                assert!(matches!(ty, ValueType::Ref(_)));
             }
             other => panic!("expected FieldWrite, got {other:?}"),
         }

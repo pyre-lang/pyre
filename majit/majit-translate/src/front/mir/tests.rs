@@ -20055,6 +20055,429 @@ fn bytes_block_chars_folds_header_length_view() {
     );
 }
 
+/// `w_bytearray_data` returns a host `&[u8]` pair: FieldRead of `.data`,
+/// then `from_raw_parts` inlined as `(chars_ptr, length)`. Loads the
+/// real pyre-object LLBC, so ignored by default.
+#[test]
+#[ignore]
+fn w_bytearray_data_aliases_to_bytes_block_header() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-object.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let graph = super::lower_function(&llbc, "w_bytearray_data").expect("lower w_bytearray_data");
+    let residual = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("from_raw_parts")
+            )
+        })
+        .count();
+    let ops: Vec<String> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            b.operations.iter().map(move |op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => format!("{i}: call {}", segments.join("::")),
+                OpKind::FieldRead { field, .. } => format!(
+                    "{i}: field {} owner={:?} addr={}",
+                    field.name, field.owner_root, field.taken_by_address
+                ),
+                other => format!("{i}: {other:?}"),
+            })
+        })
+        .collect();
+    assert_eq!(
+        residual, 0,
+        "from_raw_parts must inline as the host pair; ops: {ops:#?}"
+    );
+    let saw_data = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "data"
+                        && field.owner_root.as_deref() == Some("W_BytearrayObject")
+            )
+        });
+    assert!(
+        saw_data,
+        "w_bytearray_data must read W_BytearrayObject.data; ops: {ops:#?}"
+    );
+    // `addr_of!((*data).chars) as *const u8` is `direct_arrayitems`:
+    // header + items offset, not a value load of chars[0].
+    let saw_items_add = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op: add, .. } if add == "add"));
+    assert!(
+        saw_items_add,
+        "pair ptr is header + items offset (direct_arrayitems); ops: {ops:#?}"
+    );
+    let saw_chars_offset = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| matches!(&op.kind, OpKind::ConstInt(8)));
+    assert!(
+        saw_chars_offset,
+        "BytesBlock.chars items offset is the length word; ops: {ops:#?}"
+    );
+}
+
+/// The object-bytes payload intercept is the unique BytesBlock-pointer
+/// field of arg0 (pointer result or chars-view), not a callee-name list.
+/// `w_bytearray_data` uses a live length distinct from the header, and
+/// `bytes_like_data` has two owner ADTs, so neither matches. Loads the
+/// real pyre-object LLBC, so ignored by default.
+#[test]
+#[ignore]
+fn object_bytes_block_field_is_unique_header_field_of_arg0() {
+    use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-object.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let classify = |name: &str| {
+        let fd = llbc
+            .local_fn(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let reg = RegularCall {
+            kind: CallKind::Fun(FunId::Regular { id: fd.def_id }),
+            generics: serde_json::Value::Null,
+        };
+        super::callee_returns_object_bytes_block_field(&reg, &llbc)
+    };
+    assert!(
+        classify("w_bytes_data"),
+        "w_bytes_data returns the chars-view of arg0's BytesBlock field"
+    );
+    assert!(
+        classify("w_bytes_block"),
+        "w_bytes_block returns arg0's BytesBlock pointer field"
+    );
+    assert!(
+        !classify("bytes_block_chars"),
+        "bytes_block_chars takes a BytesBlock pointer, not an object"
+    );
+    assert!(
+        !classify("w_bytearray_data"),
+        "w_bytearray_data is a host pair (length_relaxed)"
+    );
+    assert!(
+        !classify("bytes_like_data"),
+        "bytes_like_data has bytes and bytearray arms"
+    );
+}
+
+/// `dict_entries_get_str` passes `key.as_bytes()` (`&str` → STR header
+/// view) to `hash_str_hooked_bytes(&[u8])`, whose naked `&[u8]` is the
+/// host pair. The call site must splice `(chars_ptr, ll_strlen)`.
+/// Loads the real pyre-object LLBC, so ignored by default.
+#[test]
+#[ignore]
+fn str_as_bytes_to_host_pair_callee_splices_chars_and_strlen() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-object.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let graph =
+        super::lower_function(&llbc, "dict_entries_get_str").expect("lower dict_entries_get_str");
+    let ops: Vec<String> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            b.operations.iter().map(move |op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } => format!("{i}: call {} argc={}", segments.join("::"), args.len()),
+                other => format!("{i}: {other:?}"),
+            })
+        })
+        .collect();
+    let has_strlen = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("__strlen")
+            )
+        });
+    let has_cast = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("cast_ptr_to_int")
+            )
+        });
+    let has_add = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"));
+    assert!(
+        has_strlen && has_cast && has_add,
+        "STR view → host pair must emit __strlen and cast_ptr_to_int+add; ops: {ops:#?}"
+    );
+    let hooked = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("hash_str_hooked_bytes") => {
+                Some(args.len())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        hooked.iter().all(|&n| n == 2) && (!hooked.is_empty() || has_strlen),
+        "hash_str_hooked_bytes must take the spliced pair, or the body \
+         inlines past it after the conversion; argc={hooked:?}; ops: {ops:#?}"
+    );
+}
+
+/// `BytesIO.read_slice` indexes `w_bytearray_data(buf)[p..p+count]`.
+/// That range is a host `&[u8]` pair subslice (byte add of `p`), then
+/// residual `w_bytes_from_bytes`. Loads the real pyre-interpreter LLBC,
+/// so ignored by default.
+#[test]
+#[ignore]
+fn read_slice_range_index_is_getslice() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+    let graph = super::lower_function(
+        &llbc,
+        "pyre_interpreter::module::_io::interp_bytesio::<Impl>::read_slice",
+    )
+    .expect("lower read_slice");
+    let ops: Vec<String> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            b.operations.iter().map(move |op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => format!("{i}: call {}", segments.join("::")),
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => format!("{i}: method {name}"),
+                other => format!("{i}: {other:?}"),
+            })
+        })
+        .collect();
+    let residual_index = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("index")
+                    && segments.iter().any(|s| s == "slice")
+            }
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "index",
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        residual_index, 0,
+        "read_slice must not leave residual slice::index; ops: {ops:#?}"
+    );
+    let wrap = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str);
+                leaf == Some("w_bytes_from_bytes") || leaf == Some("we_are_jitted")
+            }
+            _ => false,
+        })
+        .count();
+    assert!(
+        wrap >= 1,
+        "read_slice must copy the char range via w_bytes_from_bytes; ops: {ops:#?}"
+    );
+    let object_llbc = Llbc::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-object.ullbc"
+    ))
+    .expect("load pyre-object LLBC");
+    let callee =
+        super::lower_function(&object_llbc, "w_bytearray_data").expect("lower w_bytearray_data");
+    let callee = std::rc::Rc::new(callee);
+    let mut cc = crate::call::CallControl::new();
+    cc.register_function_graph(
+        crate::CallPath::from_segments(["bytearrayobject", "w_bytearray_data"]),
+        std::rc::Rc::clone(&callee),
+    );
+    cc.register_function_graph(
+        crate::CallPath::from_segments(["pyre_object", "bytearrayobject", "w_bytearray_data"]),
+        callee,
+    );
+    cc.find_all_graphs_for_tests();
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let transformed = crate::codewriter::jtransform::Transformer::new(&config)
+        .with_callcontrol(&mut cc)
+        .transform(&graph);
+    let mut saw_data_field = false;
+    let mut saw_bytearray_data = false;
+    let mut saw_strconcat = false;
+    for b in &transformed.graph.blocks {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::FieldRead { field, .. }
+                    if field.name == "data"
+                        && field.owner_root.as_deref() == Some("W_BytearrayObject") =>
+                {
+                    saw_data_field = true;
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("w_bytearray_data") => {
+                    saw_bytearray_data = true;
+                }
+                OpKind::InlineCall { jitcode, .. } if jitcode.name.contains("w_bytearray_data") => {
+                    saw_bytearray_data = true;
+                }
+                OpKind::ConstFnAddr { path, .. } if path.contains("strconcat") => {
+                    saw_strconcat = true;
+                }
+                OpKind::CallResidual { descriptor, .. }
+                    if descriptor.extra_info.oopspecindex
+                        == majit_ir::descr::OopSpecIndex::StrConcat =>
+                {
+                    saw_strconcat = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_data_field || saw_bytearray_data,
+        "read_slice must inline w_bytearray_data or residual-call the pair; \
+         lowered: {ops:#?}"
+    );
+    assert!(
+        !saw_strconcat,
+        "read_slice p+count must stay int add, not ll_strconcat"
+    );
+    // Charon spells the inherent method `<Impl>::read_slice`; the
+    // shipped jitcode display name is `W_BytesIO::read_slice`.
+}
+
+/// `BytesIO.read` is `read_w`: check_closed + convert_size + RStringIO.read.
+/// The slice+join lives in `read_slice` (returns bytes). `read` must not
+/// wrap a residual `&[u8]` dest.
+#[test]
+#[ignore]
+fn bytesio_read_range_index_is_getslice() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+    let graph = super::lower_function(
+        &llbc,
+        "pyre_interpreter::module::_io::interp_bytesio::<Impl>::read",
+    )
+    .expect("lower BytesIO.read");
+    let ops: Vec<String> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            b.operations.iter().map(move |op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => format!("{i}: call {}", segments.join("::")),
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => format!("{i}: method {name}"),
+                other => format!("{i}: {other:?}"),
+            })
+        })
+        .collect();
+    let calls_read_slice =
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "read_slice",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some("read_slice"),
+                _ => false,
+            });
+    eprintln!("BytesIO.read ops:\n{ops:#?}");
+    assert!(
+        calls_read_slice,
+        "BytesIO.read must call read_slice (RStringIO.read); ops: {ops:#?}"
+    );
+}
+
 /// The Rust interpreter reloads a possibly-moved pointer explicitly;
 /// RPython's translated graph instead gets the updated GCREF from
 /// `gc_restore_root`.  The source adapter must therefore lower to an
@@ -24228,6 +24651,149 @@ fn match_on_call_returned_option_usize_reads_instantiated_some_pos0() {
         breaks.is_empty(),
         "Break's Option<Never> residual is lltype.Void so there is no Break.__pos_0 FieldRead, got {breaks:?}"
     );
+}
+
+#[test]
+fn option_usize_try_none_returns_enclosing_niche_null() {
+    // `w_list_getitem_inner` does `ll_getitem_index(...)?`.
+    // `front::option_try` is the Rust-idiom lowering of `Try::branch`
+    // → `FromResidual`; closest rtyper analog is a nullable
+    // `SomeInstance` miss (`lltype.nullptr`). The None arm must
+    // return the enclosing `Option<PyObjectRef>` None (C-null via
+    // `push_niche_null`). A leftover `Option<usize>` None recast
+    // onto that return is a heap object on `REF_RETURN`.
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = Llbc::load(path).expect("load real LLBC");
+    let graph =
+        super::lower_function(&llbc, "w_list_getitem_inner").expect("lower w_list_getitem_inner");
+    assert_eq!(
+        count_method_calls(&graph, "branch"),
+        0,
+        "w_list_getitem_inner: residual Try::branch after Option `?` lowering"
+    );
+    assert_eq!(
+        count_method_calls(&graph, "from_residual"),
+        0,
+        "w_list_getitem_inner: residual from_residual after Option `?` lowering"
+    );
+    let has_niche_null = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.iter().any(|s| s == "null_mut" || s == "null"),
+            OpKind::ConstRefNull => true,
+            _ => false,
+        })
+    });
+    assert!(
+        has_niche_null,
+        "w_list_getitem_inner: enclosing Option<PyObjectRef> None must be C-null"
+    );
+}
+
+#[test]
+fn notify_version_watchers_traces_installed_check() {
+    // `celldict.py` / `quasiimmut.py make_invalidation_function.invalidation`:
+    // the installed check (`is_installed`, Acquire load of
+    // `QuasiImmutField.ptr`) stays in the trace as `getfield_gc`;
+    // only `sweep_quasi_immut_field` is residual.
+    // Native spelling is `ModuleDictStrategy::jit_force_quasi_immutable`
+    // (`warmspot.py rewrite_force_quasi_immutable`).
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = Llbc::load(path).expect("load real LLBC");
+    let notify = super::lower_function(&llbc, "jit_force_quasi_immutable")
+        .expect("lower jit_force_quasi_immutable");
+    let notify_calls: Vec<String> = notify
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { target, .. } => Some(target.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notify_calls.iter().any(|c| c.contains("is_installed")),
+        "jit_force_quasi_immutable must keep the installed check: {notify_calls:?}"
+    );
+    assert!(
+        notify_calls
+            .iter()
+            .any(|c| c.contains("sweep_quasi_immut_field")),
+        "jit_force_quasi_immutable must residualize the sweep: {notify_calls:?}"
+    );
+    let graph = super::lower_function(&llbc, "is_installed")
+        .expect("lower is_installed: Acquire of QuasiImmutField.ptr must be getfield_gc");
+    let field_reads: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => Some(format!(
+                "{}::{}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name
+            )),
+            _ => None,
+        })
+        .collect();
+    let has_ptr_read = field_reads.iter().any(|s| s.ends_with("::ptr"));
+    assert!(
+        has_ptr_read,
+        "is_installed: Acquire load of QuasiImmutField.ptr must be getfield_gc; field_reads={field_reads:?}"
+    );
+}
+
+#[test]
+fn look_inside_unit_signature_stamps_void_result() {
+    // `_setitem_str_cell_known` returns `()`. The CFG colours that
+    // empty-tuple ADT Ref; the header must still stamp `FUNC.RESULT`
+    // void so the codewriter widens the returnblock.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-object.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load real LLBC");
+    let graph = super::lower_function(&llbc, "_setitem_str_cell_known")
+        .expect("lower _setitem_str_cell_known");
+    assert_eq!(graph.return_type.as_deref(), Some("()"));
+
+    // The production path is the funcobj header + lazy body, not
+    // `lower_function`. Both the header and the built graph must
+    // carry the void stamp so `declared_return_kind` is `'v'`.
+    let program = super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        crate::HostStaticAddrs::default(),
+        &["celldict"],
+        &["_setitem_str_cell_known"],
+    )
+    .expect("lower celldict::_setitem_str_cell_known");
+    let matches: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name == "_setitem_str_cell_known")
+        .collect();
+    assert!(
+        !matches.is_empty(),
+        "no _setitem_str_cell_known funcobj in the celldict program"
+    );
+    for func in &matches {
+        assert_eq!(
+            func.return_type.as_deref(),
+            Some("()"),
+            "header return_type of {} ({:?})",
+            func.name,
+            func.self_ty_root
+        );
+        assert_eq!(
+            func.graph().return_type.as_deref(),
+            Some("()"),
+            "graph return_type of {} ({:?})",
+            func.name,
+            func.self_ty_root
+        );
+    }
 }
 
 #[test]

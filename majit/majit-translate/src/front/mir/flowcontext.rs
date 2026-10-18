@@ -680,12 +680,14 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    block_u8: &[bool],
+    error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[]);
+    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[], block_u8, error_carrier);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
     let ret_len_slot_local = ret_len_slot_index(locals, llbc, &len_shadow, n_slots);
     // Arguments become startblock inputargs in source order
@@ -1372,7 +1374,7 @@ impl<'a> Lowering<'a> {
         );
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
-            pair_len_shadows(body, llbc, &name, accum);
+            pair_len_shadows(body, llbc, &name, accum, static_addrs.error_carrier);
         let mut graph = FunctionGraph::new(name);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
@@ -3676,8 +3678,10 @@ impl<'a> Lowering<'a> {
         discr: Operand,
         targets: SwitchTargets,
     ) -> Result<(), LowerError> {
-        let bb_id = self.emit_bb(mir_bb);
         let discr_var = self.resolve_operand(mir_bb, discr)?;
+        // A pair-slice Index scrutinee (`match bytes[0]`) is `pair_getitem`,
+        // which `fork_in_bounds` closes the head of. Close the emit tail.
+        let bb_id = self.emit_bb(mir_bb);
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
                 // Constant-bool discriminant: take the known arm

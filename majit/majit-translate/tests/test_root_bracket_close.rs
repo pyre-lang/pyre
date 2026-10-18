@@ -746,6 +746,34 @@ fn a_captured_len_getter_lowers_once_root_stack_effects_are_published() {
     });
 }
 
+/// `install_ascii_items` pins the list and the fresh block around the
+/// owner barrier + field stores. `pin_block` / `UnicodeArray::install`
+/// as callees refuse the rewrite (`returns_index` / nested Open); the
+/// in-body `shadow_stack_len` + `pin_root` shape is the one
+/// `ll_listslice_new_int_list` uses, so the walked jitcode has no
+/// residual `push_roots`.
+#[test]
+fn install_ascii_items_bracket_is_scalar_replaced() {
+    let Some(llbc) = object_llbc() else { return };
+    let graph = lower_named(llbc, "install_ascii_items");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "pin_block",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "install_ascii_items still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
 /// `ll_listslice_new_int_list` pins source and dest around `newlist` +
 /// `ll_arraycopy`. The native RootScope is scalar-replaced so a
 /// BINARY_SLICE sub-walk records the copy, not residual `pin_root`.

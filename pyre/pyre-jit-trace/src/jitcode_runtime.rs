@@ -191,6 +191,23 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
     get_jitcode_ref_by_index(index).cloned()
 }
 
+/// `all_jitcodes[i].code` identity of an already-decoded body.
+///
+/// `MIFrame.jitcode` is that table entry (`warmspot.py` / `pyjitpl.py
+/// setup_call`). A helper walk that received only the body's bytes recovers
+/// the index from the same allocation `sub_jitcode_body_by_index` borrowed.
+/// Uninitialized cells stay untouched so this does not force the table.
+pub(crate) fn jitcode_index_for_loaded_code_ptr(ptr: *const u8) -> Option<usize> {
+    for (i, cell) in JITCODE_CELLS.iter().enumerate() {
+        if let Some(frozen) = cell.get()
+            && frozen.0.code.as_ptr() == ptr
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Runtime wrappers for canonical source-translator JitCodes embedded as
 /// `AbstractDescr` operands in per-Python-function bytecode.  RPython owns
 /// these in the process-wide `CallControl.jitcodes[graph]` map, so this cache
@@ -655,6 +672,8 @@ static TUPLE_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 static INT_DESCR_STR_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// `baseobjspace::getitem_str` (`unicodeobject.py descr_getitem`).
 static STR_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// `baseobjspace::getitem_list` (`listobject.py descr_getitem`).
+static GETITEM_LIST_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// `objspace.py StdObjSpace.newutf8` / `W_UnicodeObject.__init__`.
 static NEWUTF8_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of the interpreter-source
@@ -943,6 +962,17 @@ pub fn int_descr_str_jitcode() -> Option<Arc<JitCode>> {
 pub fn str_getitem_jitcode() -> Option<Arc<JitCode>> {
     let idx = (*STR_GETITEM_JITCODE_INDEX.get_or_init(|| {
         compute_pathed_jitcode_index("pyre_interpreter::baseobjspace::getitem_str")
+    }))?;
+    get_jitcode_by_index(idx)
+}
+
+/// `baseobjspace::getitem_list` — `descr_getitem` after slice/index
+/// coercion. The BINARY_OP walker descends this body so a guard inside
+/// the inner helper resumes through getitem_list's `match` (`resume.py
+/// rebuild_from_resumedata`: every inlined call is a framestack frame).
+pub fn getitem_list_jitcode() -> Option<Arc<JitCode>> {
+    let idx = (*GETITEM_LIST_JITCODE_INDEX.get_or_init(|| {
+        compute_pathed_jitcode_index("pyre_interpreter::baseobjspace::getitem_list")
     }))?;
     get_jitcode_by_index(idx)
 }
@@ -3124,6 +3154,9 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// keys are registered by `build_inline_call_only_bh_builder`.
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
+    // `blackhole.py BlackholeInterpBuilder.__init__`: `setup_insns(asm.insns)`
+    // then `setup_descrs(asm.descrs)`. Helper jitcodes resume through
+    // `descr_at` → this pool (`from_canonical` leaves `exec.descrs` empty).
     // Same `JitCode::descr_at` pool the FBW abort builder installs.
     // Guard-failure resume (`eval.rs`) walks helper `inline_call` too.
     install_global_build_descr_pool();
@@ -3160,6 +3193,10 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
         })
         .collect();
     let mut builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
+    // `blackhole.py setup_descrs(asm.descrs)`: `read_descr` falls back to
+    // `bh.descrs` when `descr_at` misses. A helper-innermost resume runs
+    // build-time bytecode whose `d`/`j` indices name this table.
+    builder.setup_descrs(descr_table());
     // Legacy `NewList` / `NewTuple` that the rtyper did not rewrite still
     // reach the assembler as `newlist/>r` and `newtuple/rr>r`. Their bytes
     // are assigned by `get_opnum` while emitting jitcodes, so the slot is

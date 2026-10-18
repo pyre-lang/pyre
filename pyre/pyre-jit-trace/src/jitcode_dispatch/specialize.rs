@@ -6617,8 +6617,8 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         (sid, index)
     };
 
-    // Walk `w_list_getitem_inner`. A missing body or an unfinished walk
-    // leaves the generic residual.
+    // Walk `getitem_list`. A missing body or an unfinished walk leaves
+    // the generic residual.
     let Some(boxed) = try_walker_orthodox_list_getitem(
         ctx, op_pc, list_op, key_op, list_obj, key_obj, sid, index,
     )?
@@ -7725,7 +7725,7 @@ pub(crate) fn try_walker_orthodox_unary_pos<Sym: WalkSym>(
 fn orthodox_list_getitem_body_and_sym<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(SubJitCodeBody, *const Sym)> {
-    let jc_arc = crate::jitcode_runtime::list_getitem_jitcode()?;
+    let jc_arc = crate::jitcode_runtime::getitem_list_jitcode()?;
     let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
@@ -7737,7 +7737,17 @@ fn orthodox_list_getitem_body_and_sym<Sym: WalkSym>(
     Some((sub_body, sym_ptr))
 }
 
-/// Descend `w_list_getitem_inner` the way list-setitem descends its inner.
+/// Descend `baseobjspace::getitem_list` (`descr_getitem` after index
+/// coercion) the way str-getitem descends `getitem_str`.
+///
+/// A BINARY_OP walk that skipped this frame and entered
+/// `w_list_getitem_inner` directly left the resume chain without the
+/// `match` that maps `None` to IndexError (`pyjitpl.py
+/// capture_resumedata`, `resume.py rebuild_from_resumedata`: every
+/// inlined call is a framestack frame). The inner is reached from this
+/// body's look-inside call, so a helper-innermost guard still rebuilds
+/// this section.
+///
 /// Returns `Ok(None)` when the body is missing or the walk does not finish.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
@@ -7782,6 +7792,10 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         list_op,
         majit_ir::Value::Ref(majit_ir::GcRef(list_obj as usize)),
     );
+    ctx.trace_ctx.set_opref_concrete(
+        key_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(key_obj as usize)),
+    );
 
     let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
@@ -7795,11 +7809,11 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "list_getitem_commit",
-        "w_list_getitem_call_site",
-        &[raw_index],
-        &[ConcreteValue::Int(index)],
-        &[list_op],
-        &[ConcreteValue::Ref(list_obj)],
+        "getitem_list_call_site",
+        &[],
+        &[],
+        &[list_op, key_op],
+        &[ConcreteValue::Ref(list_obj), ConcreteValue::Ref(key_obj)],
         &[],
     );
     match walk {
@@ -7814,12 +7828,16 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
             ctx.trace_ctx.heap_cache_mut().reset();
             Ok(None)
         }
-        Ok((
-            DispatchOutcome::SubReturn {
-                result: Some(boxed),
-            },
-            _,
-        )) => Ok(Some(boxed)),
+        Ok((DispatchOutcome::SubReturn { result }, _)) => {
+            match finish_inline_callee_return(ctx, result) {
+                Some(boxed) => Ok(Some(boxed)),
+                None => {
+                    ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+                    ctx.trace_ctx.heap_cache_mut().reset();
+                    Ok(None)
+                }
+            }
+        }
         Ok(_) => {
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -7830,7 +7848,7 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
 }
 
 /// Exact `list[int]` when an inlined getitem helper declines. Walks
-/// `w_list_getitem_inner`. An unfinished walk leaves the inline site on
+/// `getitem_list`. An unfinished walk leaves the inline site on
 /// its residual.
 pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -16718,6 +16736,12 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.subwalk_floor = Some(walk_start);
     ctx.fbw_mode.helper_return = nested_entry.ret;
+    // `MIFrame.jitcode` (`pyjitpl.py setup_call`). Capture encodes the
+    // helper section from this index (`capture_resumedata`).
+    if ctx.fbw_mode.transparent_helper_jitcode_index.is_none() {
+        ctx.fbw_mode.transparent_helper_jitcode_index =
+            crate::jitcode_runtime::jitcode_index_for_loaded_code_ptr(sub_body.code.as_ptr());
+    }
     let helper_frame = enter_helper_level(ctx, nested_entry.level);
     let walk_result = run_sub_jitcode_walk(
         ctx,
@@ -16752,7 +16776,8 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     // as `CONST_NULL` is a representation defect; converting it here would
     // residualize the helper instead of recording the body.
     let walk_result = match walk_result {
-        Err(DispatchError::AbortMarkerReached { pc }) => {
+        Err(DispatchError::AbortMarkerReached { pc })
+        | Err(DispatchError::GuardResumeCoordinateUnavailable { pc }) => {
             Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
         }
         other => other,
@@ -16785,6 +16810,7 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     sub_body: &SubJitCodeBody,
+    helper_jitcode_index: usize,
     int_args: &[OpRef],
     int_arg_concretes: &[ConcreteValue],
     ref_args: &[OpRef],
@@ -16795,6 +16821,7 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
         ctx,
         op_pc,
         sub_body,
+        helper_jitcode_index,
         None,
         int_args,
         int_arg_concretes,
@@ -16817,6 +16844,7 @@ pub(crate) fn run_codewriter_helper_inline_call_under_parent<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     sub_body: &SubJitCodeBody,
+    helper_jitcode_index: usize,
     extra_parent: InlineParentFrame,
     int_args: &[OpRef],
     int_arg_concretes: &[ConcreteValue],
@@ -16828,6 +16856,7 @@ pub(crate) fn run_codewriter_helper_inline_call_under_parent<Sym: WalkSym>(
         ctx,
         op_pc,
         sub_body,
+        helper_jitcode_index,
         Some(extra_parent),
         int_args,
         int_arg_concretes,
@@ -16842,6 +16871,7 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     sub_body: &SubJitCodeBody,
+    helper_jitcode_index: usize,
     extra_parent: Option<InlineParentFrame>,
     int_args: &[OpRef],
     int_arg_concretes: &[ConcreteValue],
@@ -16862,7 +16892,9 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
         };
         nested_entry.level = Some(append_helper_parent(level, parent));
     }
-    run_orthodox_helper_subwalk(
+    let saved_helper = ctx.fbw_mode.transparent_helper_jitcode_index;
+    ctx.fbw_mode.transparent_helper_jitcode_index = Some(helper_jitcode_index);
+    let result = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
         sym,
@@ -16875,8 +16907,9 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
         ref_args,
         ref_arg_concretes,
         float_args,
-    )
-    .map(|(outcome, _)| outcome)
+    );
+    ctx.fbw_mode.transparent_helper_jitcode_index = saved_helper;
+    result.map(|(outcome, _)| outcome)
 }
 
 /// Re-read a ref the collector may have moved.

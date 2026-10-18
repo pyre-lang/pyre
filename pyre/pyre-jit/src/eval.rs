@@ -1004,14 +1004,13 @@ unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 ///
 /// `W_BytearrayObject` holds `_data` (the char list, `data`) and `_offset`
 /// (`logical_offset`, an integer). The GC edges are `w_class` and the
-/// GC-managed leaf `Vec<u8>` storage box behind `data`, for the exact type
-/// and the subclass alike (`w_bytearray_alloc` /
-/// `w_bytearray_subclass_from_bytes`). The `Vec` bytes themselves sit off
-/// the GC heap.
+/// GC-managed [`BytesBlock`] (`rstr.STR`) leaf behind `data`, the same
+/// varsize leaf `W_BytesObject` holds, for the exact type and the subclass
+/// alike (`w_bytearray_alloc` / `w_bytearray_subclass_from_bytes`).
 ///
-/// `try_gc_owns_object` remains only for the `gc_alloc_storage_box`
-/// `malloc_raw` fallback (`tid == 0` or no GC hook); product constructors
-/// always store a collected box.
+/// `try_gc_owns_object` remains only for the no-hook `malloc` fallback
+/// (`tid == 0` or no GC hook); product constructors always store a collected
+/// block.
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
     f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -1028,7 +1027,7 @@ unsafe fn bytearray_user_object_custom_trace(
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
     // Same `data` visit as the exact type: the subclass constructor now
-    // allocates the payload through `gc_alloc_storage_box`.
+    // allocates the payload through `alloc_bytes_block`.
     unsafe { bytearray_object_custom_trace(obj_addr, f) };
     unsafe {
         pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
@@ -2717,8 +2716,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::bytesobject::BYTES_TYPE as *const _ as usize,
         w_bytes_tid,
     );
-    // W_BytearrayObject (mutable byte sequence) carries `data`, a `*mut Vec<u8>`
-    // GC-managed storage box. Same registration shape as W_BytesObject.
+    // W_BytearrayObject (mutable byte sequence) carries `data`, a
+    // `*mut BytesBlock`. Same registration shape as W_BytesObject.
     let w_bytearray_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_object::bytearrayobject::W_BytearrayObject>(),
         object_tid,
@@ -5105,10 +5104,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         >,
         pyre_object::dictmultiobject::set_dict_strategy_ref_gc_type_id,
     );
-    // bytearray `data` storage box (off-GC storage). A leaf `Vec<u8>` (no inner
-    // refs); `bytearray_object_custom_trace` greys it through the `data` field
-    // slot and the box tid's drop glue reclaims the buffer on sweep. Keep this
-    // id at the absolute registration tail.
+    // Leftover `Vec<u8>` leaf storage box. `bytes` / `bytearray` hold a
+    // `BytesBlock`; this tid stays registered for any remaining box alloc.
+    // Keep this id at the absolute registration tail.
     register_leaf_storage_box::<pyre_object::bytesobject::BytesDataStorage>(
         &mut gc,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::bytesobject::BytesDataStorage>,
@@ -13348,6 +13346,13 @@ fn compile_and_run_once(
     };
     let Some(entry) = entry else {
         majit_metainterp::mc_diag_bump(21);
+        if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
+            eprintln!(
+                "[jit] caro_no_merge_entry start={start:?} pc={target_pc} last_instr={} name={}",
+                frame_root.frame().last_instr,
+                code.obj_name.as_str(),
+            );
+        }
         return None;
     };
 
@@ -15622,22 +15627,41 @@ pub(crate) fn decode_and_restore_guard_failure(
         // (`pyjitpl.py handle_guard_failure` -> `resume.py
         // rebuild_from_resumedata` -> `MIFrame.setup_resume_at_op`).
         let ni = jit_state.next_instr();
+        // Helper / continuation sections have no Python code object.
+        // `resume.py` `rebuild_from_resumedata` still rebuilds an MIFrame
+        // for every jitcode (`setposition`), but Python-level consumers
+        // (`last_instr`, exception tables, `sys._getframe`, settrace)
+        // only name PyCode sections. Blackhole resumes inside the helper
+        // from that section's jitcode pc; the live frame's `last_instr` is
+        // the paused Python section's pc (`CallFallthrough` when that
+        // section is the CALL the helper was inlined from).
         let innermost = resumed_frames.last();
+        let python_frames: Vec<&crate::call_jit::ResumedFrame> = resumed_frames
+            .iter()
+            .filter(|frame| !frame.code.is_null())
+            .collect();
+        let innermost_python = python_frames.last().copied();
+        // Helper-innermost uses the restored vable next-instr; other
+        // multi-frame resumes use the innermost Python section pc.
         let resume_pc = if innermost.is_some_and(|f| f.py_pc == usize::MAX) {
             // Helper innermost: the live frame's vable next-instr, not
             // a fake Python pc. Continuations keep their twin / trivia pc.
             ni
         } else {
-            innermost.map(|f| f.py_pc).unwrap_or(ni)
+            innermost_python
+                .map(|frame| frame.py_pc)
+                .filter(|&pc| pc != usize::MAX)
+                .unwrap_or(ni)
         };
         // `write_from_resume_data_partial` / `consume_vable_info` write the
         // virtualizable (outermost) frame. An inlined callee is a separate
         // object this rebuild materializes; its depth does not index the
         // portal `locals_cells_stack_w`. Correct vsd only when the innermost
-        // section IS that physical frame.
+        // Python section IS that physical frame (a helper-innermost snapshot
+        // still belongs to the portal PyFrame).
         let outermost_ptr = resumed_frames.first().map(|f| f.frame_ptr);
         if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(inner) = innermost {
+            if let Some(inner) = innermost_python {
                 let same_physical = outermost_ptr.is_some_and(|outer| {
                     !inner.frame_ptr.is_null() && std::ptr::eq(inner.frame_ptr, outer)
                 });
@@ -16308,24 +16332,6 @@ fn build_resumed_frames(
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        // resume.py writes jitcode_index and pc. The Python resume pc is
-        // `resume_py_pc_for_jitcode_word` (the codewriter forward twin).
-        // pc<0 is the no-snapshot sentinel → fall back to the vable next-instr.
-        let py_pc = if frame.pc >= 0 {
-            if pyre_jit_trace::state::jitcode_is_transparent_helper(frame.jitcode_index) {
-                // Helper body: no Python coordinate. Continuations keep
-                // `resume_py_pc_for_jitcode_word` so their bridges still
-                // start at the twin / trivia pc.
-                usize::MAX
-            } else {
-                pyre_jit_trace::py_coord::resume_py_pc_for_jitcode_word(
-                    frame.jitcode_index,
-                    frame.pc,
-                ) as usize
-            }
-        } else {
-            vable_ni
-        };
         // resume.py:1339 jitcodes[jitcode_pos]:
         // Outermost frame: code from vable resume data.
         // Inner frames: code from jitcode_index registry (inlined calls).
@@ -16365,12 +16371,6 @@ fn build_resumed_frames(
                 own
             }
         };
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[dynasm-debug] frame_ptr={:?} py_pc={} idx={}",
-                frame_ptr, py_pc, idx
-            );
-        }
         let w_code = if is_outermost {
             // virtualizable.py read_boxes: code from resume data, not heap.
             if !vable_pycode.is_null() {
@@ -16383,9 +16383,68 @@ fn build_resumed_frames(
         } else if !frame_ptr.is_null() {
             unsafe { (*frame_ptr).pycode }
         } else {
-            pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
+            // Helper sections are not Python frames (`resume.py`
+            // `rebuild_from_resumedata`): only a portal / Python-code
+            // jitcode carries a `PyCode`. Inspect the section's own
+            // payload jitcode (`jitcode_owns_python_frame`); a helper
+            // index must not pick up a Python wrapper.
+            pyre_jit_trace::state::pyjitcode_for_jitcode_index(frame.jitcode_index)
+                .filter(|payload| {
+                    pyre_jit_trace::state::jitcode_owns_python_frame(&payload.jitcode)
+                        && !payload.code_ptr.is_null()
+                })
+                .and_then(|_| pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index))
                 .unwrap_or(std::ptr::null())
         };
+        let raw_code = if !w_code.is_null() {
+            unsafe {
+                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject
+            }
+        } else {
+            std::ptr::null()
+        };
+        // resume.py writes jitcode_index and pc. The Python resume pc is
+        // `resume_py_pc_for_jitcode_word` (the codewriter forward twin).
+        // pc<0 is the no-snapshot sentinel → fall back to the vable next-instr.
+        // A helper body has no Python coordinate (`py_pc == usize::MAX`).
+        // Continuations keep the twin so their bridges still start at the
+        // trivia pc. A section paused in a CALL
+        // (`get_list_of_active_boxes(in_a_call=True)`, dest pending at the
+        // trailing `-live-`) uses the CALL fallthrough so the interpreter
+        // does not re-enter the CALL. JitCode resume stays at that `-live-`
+        // (`blackhole.py _setup_return_value_*`).
+        let py_pc = if frame.pc >= 0 {
+            if pyre_jit_trace::state::jitcode_is_transparent_helper(frame.jitcode_index) {
+                usize::MAX
+            } else {
+                let word_py = pyre_jit_trace::py_coord::resume_py_pc_for_jitcode_word(
+                    frame.jitcode_index,
+                    frame.pc,
+                ) as usize;
+                let in_a_call =
+                    pyre_jit_trace::state::pyjitcode_for_jitcode_index(frame.jitcode_index)
+                        .is_some_and(|pjc| {
+                            pyre_jit_trace::state::resume_pc_is_after_call(
+                                &pjc.jitcode.code,
+                                frame.pc as usize,
+                            )
+                        });
+                if in_a_call && !raw_code.is_null() {
+                    pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(unsafe { &*raw_code }, word_py)
+                } else {
+                    word_py
+                }
+            }
+        } else {
+            vable_ni
+        };
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[dynasm-debug] frame_ptr={:?} py_pc={} idx={}",
+                frame_ptr, py_pc, idx
+            );
+        }
         // consume_vable_info writes the outermost vsd; an inlined
         // callee answers from its own materialized frame.
         let vsd = if is_outermost {

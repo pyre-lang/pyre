@@ -73,6 +73,23 @@ pub(super) fn push_helper_live(
     session.borrow_mut().helper_live.push(live);
 }
 
+/// Pops the helper live slot this walk pushed (`pyjitpl.py popframe`).
+pub(super) struct HelperLiveGuard<'a> {
+    session: &'a std::cell::RefCell<WalkSession>,
+}
+
+impl<'a> HelperLiveGuard<'a> {
+    pub(super) fn after_push(session: &'a std::cell::RefCell<WalkSession>) -> Self {
+        Self { session }
+    }
+}
+
+impl Drop for HelperLiveGuard<'_> {
+    fn drop(&mut self) {
+        pop_helper_live(self.session);
+    }
+}
+
 /// Stamp the CALL that paused this frame. `MIFrame.run_one_step` has already
 /// advanced past that op, so `build_parent_miframe_from_live_banks` resumes
 /// at `next_pc` (`_setup_return_value_*` / `get_list_of_active_boxes(in_a_call=True)`).
