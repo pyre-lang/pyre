@@ -448,26 +448,26 @@ pub fn decode_fieldnum(
     let (val, tagbits) = untag(tagged);
     match tagbits {
         TAGBOX => {
-            // resume.py decode_box parity:
+            // resume.py ResumeDataBoxReader.decode_box TAGBOX:
             //   if num < 0: num += len(liveboxes)
-            //   return self.liveboxes[num]
+            //   box = self.liveboxes[num]
+            //   if box is None: box = self.load_box_from_cpu(num, kind)
             // The returned Box object carries `box.type` intrinsically
-            // (history.py:220). For the bridge tracer, those liveboxes
-            // are the bridge's `InputArg{Int,Ref,Float}` slots, so we
-            // mint the typed `OpRef::input_arg_typed` variant matching
-            // `fail_arg_types[idx]` rather than a bare untyped raw
-            // OpRef — variant-aware Eq (`OpRef`'s `PartialEq` in
-            // `majit-ir/src/resoperation.rs`) requires
-            // the optimizer/heap-cache key to be the same typed variant
+            // (`history.py`). For the bridge tracer, those liveboxes
+            // are the bridge's `InputArg{Int,Ref,Float}` slots; decode_box
+            // mints the typed `OpRef::input_arg_typed` variant matching
+            // `fail_arg_types[idx]` — variant-aware Eq (`OpRef`'s `PartialEq`
+            // in `majit-ir/src/resoperation.rs`) requires the
+            // optimizer/heap-cache key to be the same typed variant
             // the bridge inputarg list produces.
             let idx = if val < 0 {
                 val + resume_data.num_failargs
             } else {
                 val
             };
-            // resume.py `box = self.liveboxes[num]` — direct
-            // indexing, IndexError on out-of-range. Encoder /
-            // decoder asymmetry is a bug, not a silent fallback;
+            // resume.py `box = self.liveboxes[num]`; IndexError on
+            // out-of-range, then `if box is None: load_box_from_cpu`.
+            // Encoder / decoder asymmetry is a bug, not a silent fallback;
             // mirror the upstream fail-loud contract.
             let tp = *resume_data
                 .fail_arg_types
@@ -482,7 +482,7 @@ pub fn decode_fieldnum(
                         resume_data.fail_arg_types.len()
                     )
                 });
-            OpRef::input_arg_typed(idx as u32, tp)
+            decode_box(ctx, cache, idx as u32, tp)
         }
         TAGINT => ctx.const_int(val as i64),
         TAGCONST => {
@@ -562,6 +562,24 @@ fn operand_concrete(
         });
     }
     ctx.box_value(opref)
+}
+
+/// `resume.py ResumeDataBoxReader.decode_box` TAGBOX arm: `box = self.liveboxes[num]`;
+/// `if box is None: box = self.load_box_from_cpu(num, kind)`.
+fn decode_box(
+    ctx: &mut crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
+    num: u32,
+    kind: majit_ir::Type,
+) -> OpRef {
+    let opref = OpRef::input_arg_typed(num, kind);
+    if ctx.box_value(opref).is_some() {
+        return opref;
+    }
+    match operand_concrete(ctx, cache, opref) {
+        Some(value) => ctx.load_box_from_cpu(num, kind, value),
+        None => opref,
+    }
 }
 
 /// resume.py `ResumeDataBoxReader.setfield` applying half.
@@ -1596,7 +1614,7 @@ pub fn rebuilt_value_to_opref(
 ) -> OpRef {
     use majit_ir::resumedata::RebuiltValue;
     match v {
-        RebuiltValue::Box(n, tp) => OpRef::input_arg_typed(*n as u32, *tp),
+        RebuiltValue::Box(n, tp) => decode_box(ctx, cache, *n as u32, *tp),
         RebuiltValue::Const(c) => match c.get_type() {
             majit_ir::Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
             majit_ir::Type::Float => ctx.const_float(c.getfloatstorage()),
@@ -2116,6 +2134,39 @@ mod tests {
             }
         });
         assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x2000)));
+    }
+
+    /// resume.py ResumeDataBoxReader.decode_box TAGBOX:
+    /// `box = self.liveboxes[num]`; `if box is None: box = self.load_box_from_cpu(num, kind)`.
+    /// A live Int failarg recorded without a value is born from the deadframe
+    /// on first decode; a second decode reuses that box.
+    #[test]
+    fn tagbox_decode_loads_unstamped_live_failarg_from_cpu() {
+        struct DummyAlloc;
+        impl crate::resume::BlackholeAllocator for DummyAlloc {}
+
+        let fail_types = [Type::Int];
+        let fail_values = [42i64];
+        let mut ctx = crate::TraceCtx::for_test_input_layout(&fail_types, &[true]);
+        let live = OpRef::input_arg_int(0);
+        assert_eq!(ctx.box_value(live), None);
+
+        let resume_data = empty_resume_data(fail_types.to_vec());
+        let alloc = DummyAlloc;
+        let mut cache = BridgeVirtualCache::executing(
+            1,
+            default_bridge_array_descr,
+            &alloc,
+            &fail_values,
+            &fail_types,
+        );
+        let tagged = tag_box(0);
+        let first = decode_fieldnum(&mut ctx, tagged, None, &resume_data, &mut cache);
+        assert_eq!(first, live);
+        assert_eq!(ctx.box_value(first), Some(majit_ir::Value::Int(42)));
+        let second = decode_fieldnum(&mut ctx, tagged, None, &resume_data, &mut cache);
+        assert_eq!(second, first);
+        assert_eq!(ctx.box_value(second), Some(majit_ir::Value::Int(42)));
     }
 
     /// The funnel folds through the executor row, so the concrete this helper
