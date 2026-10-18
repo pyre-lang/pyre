@@ -339,6 +339,17 @@ pub struct VirtualStructInfo {
     pub avpi: AbstractVirtualPtrInfo,
 }
 
+impl VirtualStructInfo {
+    pub fn new(descr: DescrRef) -> Self {
+        Self {
+            descr,
+            fields: VirtualFieldList::new(),
+            last_guard_pos: -1,
+            avpi: AbstractVirtualPtrInfo::new(),
+        }
+    }
+}
+
 /// A virtual array of structs (interior field access pattern).
 ///
 /// Mirrors RPython's VArrayStructInfo where each array element
@@ -809,12 +820,7 @@ impl PtrInfo {
 
     /// Create a VirtualStruct PtrInfo.
     pub fn virtual_struct(descr: DescrRef) -> Self {
-        PtrInfo::VirtualStruct(VirtualStructInfo {
-            descr,
-            fields: VirtualFieldList::new(),
-            last_guard_pos: -1,
-            avpi: AbstractVirtualPtrInfo::new(),
-        })
+        PtrInfo::VirtualStruct(VirtualStructInfo::new(descr))
     }
 
     // ── Query methods ──

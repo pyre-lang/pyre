@@ -2653,7 +2653,9 @@ impl GcCache {
     ) -> Arc<SimpleFieldDescr> {
         // descr.py: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
-        // descr.py:220-221: cache[STRUCT][fieldname]
+        // descr.py get_field_descr: cache[STRUCT][fieldname]. First insert
+        // owns the descriptor; a later caller with different geometry still
+        // receives that object.
         let cached = self
             ._cache_field
             .get(&struct_key)
@@ -2695,7 +2697,8 @@ impl GcCache {
                 } else {
                     (is_immutable, is_quasi_immutable)
                 };
-            // descr.py:220-221 returns the cached descr with no caller re-check.
+            // descr.py get_field_descr returns the cached descr with no
+            // caller re-check.
             // The authoritative slot number is the cached descr's own — it was
             // normalised (rederived against the parent's positional list) when
             // minted, so a field that was rederived once stays rederived. When
@@ -2758,19 +2761,19 @@ impl GcCache {
                         .unwrap_or(false);
                     eprintln!(
                         "MAJIT_FIELD_MINT_TRACE cache_hit_disagree field_key={field_name:?} \
-                         display_name={display_name:?} cached_display_name={:?} \
-                         struct_key={struct_key:?} cached_offset={} requested_offset={offset} \
-                         cached_size={} requested_size={field_size} cached_type={:?} \
-                         requested_type={field_type:?} cached_flag={:?} requested_flag={flag:?} \
-                         cached_immutable={} requested_immutable={is_immutable} \
-                         effective_requested_immutable={expected_immutable} \
-                         cached_quasi_immutable={} \
-                         requested_quasi_immutable={is_quasi_immutable} \
-                         effective_requested_quasi_immutable={expected_quasi_immutable} \
-                         cached_virtualizable={} requested_virtualizable={virtualizable} \
-                         cached_index_in_parent={} caller_index_in_parent={index_in_parent:?} \
-                         expected_index_in_parent={expected_index_in_parent} \
-                         cached_parent_has_positional_list={cached_parent_has_positional_list}",
+                     display_name={display_name:?} cached_display_name={:?} \
+                     struct_key={struct_key:?} cached_offset={} requested_offset={offset} \
+                     cached_size={} requested_size={field_size} cached_type={:?} \
+                     requested_type={field_type:?} cached_flag={:?} requested_flag={flag:?} \
+                     cached_immutable={} requested_immutable={is_immutable} \
+                     effective_requested_immutable={expected_immutable} \
+                     cached_quasi_immutable={} \
+                     requested_quasi_immutable={is_quasi_immutable} \
+                     effective_requested_quasi_immutable={expected_quasi_immutable} \
+                     cached_virtualizable={} requested_virtualizable={virtualizable} \
+                     cached_index_in_parent={} caller_index_in_parent={index_in_parent:?} \
+                     expected_index_in_parent={expected_index_in_parent} \
+                     cached_parent_has_positional_list={cached_parent_has_positional_list}",
                         descr.name,
                         descr.offset,
                         descr.field_size,
@@ -2786,37 +2789,9 @@ impl GcCache {
                     }
                 }
             }
-            debug_assert!(
-                descr.describes_same_field(
-                    offset,
-                    field_size,
-                    field_type,
-                    expected_immutable,
-                    expected_quasi_immutable,
-                    virtualizable,
-                    // The completed parent list can shift the positional
-                    // slot after the first mint (`args_w` 1 → 2).  Offset
-                    // still names the same field; `get_field_descr` returns
-                    // the cached descr.  Virtualize looks the slot up on
-                    // the parent list, not this mint number.
-                    descr.index_in_parent,
-                ),
-                "get_field_descr cache hit for {field_name} disagrees with the caller: \
-                     cached {:?} (offset {}, size {}, type {:?}, immutable {}, quasi {}, vable {}, \
-                     index_in_parent {}) vs requested {display_name:?} (offset {offset}, \
-                     size {field_size}, type {field_type:?}, immutable \
-                     {expected_immutable}, quasi {expected_quasi_immutable}, \
-                     vable {virtualizable}, index_in_parent \
-                     {expected_index_in_parent} [caller said {index_in_parent:?}])",
-                descr.name,
-                descr.offset,
-                descr.field_size,
-                descr.field_type,
-                descr.is_immutable,
-                descr.is_quasi_immutable(),
-                descr.virtualizable,
-                descr.index_in_parent,
-            );
+            // descr.py get_field_descr returns cache[STRUCT][fieldname] with
+            // no caller re-check. Geometry disagreement is counted above;
+            // the first cached object still owns the row.
             // The class word is not one of the components checked above: it is
             // settled, not compared. `describes_same_field` asks whether this
             // slot answers for the field the caller means, and both answers
@@ -2868,11 +2843,17 @@ impl GcCache {
             if let Some(is_class_word) = declared_class_word {
                 simple.declare_class_word(is_class_word);
             }
+            // descr.py get_field_descr: first cache[STRUCT][fieldname]
+            // occupant owns the row. Adopt the listed object only when
+            // that slot is vacant.
             let inner = self._cache_field.entry(struct_key.clone()).or_default();
-            if let indexmap::map::Entry::Vacant(slot) = inner.entry(field_name.to_string()) {
-                slot.insert(simple.clone());
-            }
-            return simple;
+            return match inner.entry(field_name.to_string()) {
+                indexmap::map::Entry::Vacant(slot) => {
+                    slot.insert(simple.clone());
+                    simple
+                }
+                indexmap::map::Entry::Occupied(slot) => slot.get().clone(),
+            };
         }
         self.mint_field_descr(
             struct_key,
@@ -2974,13 +2955,16 @@ impl GcCache {
         }
         let descr = Arc::new(fd);
         // descr.py `get_field_descr`: cache[STRUCT][fieldname] is the first
-        // FieldDescr stored for that name. A later mint returns it.
+        // FieldDescr stored for that name. A later caller with different
+        // geometry still receives that object.
         let inner = self._cache_field.entry(struct_key).or_default();
-        if let Some(existing) = inner.get(&field_key) {
-            return existing.clone();
+        match inner.entry(field_key) {
+            indexmap::map::Entry::Vacant(slot) => {
+                slot.insert(descr.clone());
+                descr
+            }
+            indexmap::map::Entry::Occupied(slot) => slot.get().clone(),
         }
-        inner.insert(field_key, descr.clone());
-        descr
     }
 
     /// [`Self::get_field_descr_declaring`] for a caller that already owns the
@@ -3453,7 +3437,22 @@ impl GcCache {
                     match (existing_vtable != 0, new_vtable != 0) {
                         (true, false) => false,
                         (false, true) => true,
-                        _ => new_count > existing_count,
+                        _ => {
+                            // Both sides carry a vtable, or neither does.
+                            // `heaptracker.py all_fielddescrs` never lists
+                            // `typeptr`; a longer analyzer list that still
+                            // carries that header word is not a fuller
+                            // layout. Prefer the typeptr-free list, then
+                            // the existing field-count upgrade.
+                            match (
+                                size_list_has_typeptr(existing),
+                                size_list_has_typeptr(&descr),
+                            ) {
+                                (true, false) => true,
+                                (false, true) => false,
+                                _ => new_count > existing_count,
+                            }
+                        }
                     }
                 }
             }
@@ -6359,6 +6358,44 @@ pub use crate::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
 
 // ── Concrete descriptor implementations (descr.py) ──
 
+/// Leaf of a fieldname, used by `heaptracker.py` `c__pad` skip.
+/// Cache identity is the full `fieldname` (`descr.py cache[STRUCT][fieldname]`).
+pub fn cache_fieldname(field_name: &str) -> &str {
+    field_name.rsplit('.').next().unwrap_or(field_name)
+}
+
+/// `heaptracker.py all_fielddescrs`: `if name == 'typeptr': continue`
+/// (`dealt otherwise`) and `if name.startswith('c__pad'): continue`.
+/// `rewrite.py handle_malloc_operation` stamps the vtable through
+/// `fielddescr_vtable` at offset 0, then `clear_gc_fields` delayed-zeros
+/// every `gc_fielddescrs` offset; a listed Ref at 0 wipes `ob_type`.
+fn heaptracker_skips_listed_field(fd: &dyn FieldDescr) -> bool {
+    fd.is_typeptr() || cache_fieldname(fd.field_key()).starts_with("c__pad")
+}
+
+fn listed_fielddescrs(all: Vec<Arc<dyn FieldDescr>>) -> Vec<Arc<dyn FieldDescr>> {
+    all.into_iter()
+        .filter(|fd| !heaptracker_skips_listed_field(fd.as_ref()))
+        .collect()
+}
+
+fn gc_pointers_in_fixed_part(
+    listed: &[Arc<dyn FieldDescr>],
+    size: usize,
+) -> Vec<Arc<dyn FieldDescr>> {
+    listed
+        .iter()
+        .filter(|fd| fd.is_pointer_field() && fd.offset() < size)
+        .cloned()
+        .collect()
+}
+
+fn size_list_has_typeptr(descr: &DescrRef) -> bool {
+    descr
+        .as_size_descr()
+        .is_some_and(|sd| sd.all_fielddescrs().iter().any(|fd| fd.is_typeptr()))
+}
+
 /// `descr.py name = '%s.%s' % (STRUCT._name, fieldname)` — locate the
 /// external `_cache_field[STRUCT][fieldname]` key inside the display name so
 /// every descriptor does not need a second owned string. Both the struct name
@@ -6451,7 +6488,10 @@ pub struct SimpleFieldDescr {
     /// `_static_field_descrs` / `_array_field_descrs` / `vable_token_descr`
     /// slots); a strong back-ref would form a reference cycle. Populated
     /// by `VirtualizableInfo::finalize_arc` via `Arc::new_cyclic`.
-    pub vinfo: Option<Weak<dyn VinfoMarker>>,
+    /// Interior-mutable because `virtualizable.py` stamps `descr.vinfo`
+    /// on the cached `cpu.fielddescrof` object after that descr is
+    /// already shared as `Arc<SimpleFieldDescr>`.
+    pub vinfo: RwLock<Option<Weak<dyn VinfoMarker>>>,
 }
 
 /// Where a [`SimpleFieldDescr`]'s class-word answer came from.
@@ -6555,7 +6595,7 @@ impl Clone for SimpleFieldDescr {
             class_word: AtomicU8::new(self.class_word.load(Ordering::Relaxed)),
             index_in_parent: self.index_in_parent,
             parent_descr: RwLock::new(self.parent_descr.read().clone()),
-            vinfo: self.vinfo.clone(),
+            vinfo: RwLock::new(self.vinfo.read().clone()),
         }
     }
 }
@@ -6631,7 +6671,7 @@ impl SimpleFieldDescr {
             class_word: AtomicU8::new(ClassWordDeclaration::InferredNot as u8),
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
-            vinfo: None,
+            vinfo: RwLock::new(None),
         }
     }
 
@@ -6675,7 +6715,7 @@ impl SimpleFieldDescr {
             class_word: AtomicU8::new(class_word as u8),
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
-            vinfo: None,
+            vinfo: RwLock::new(None),
         }
     }
 
@@ -6812,8 +6852,14 @@ impl SimpleFieldDescr {
     /// reference; upgrades succeed for as long as the owning vinfo Arc
     /// is alive. Upstream: pyjitpl.py emit_force_virtualizable `fielddescr.get_vinfo()`.
     pub fn with_vinfo(mut self, vinfo: Weak<dyn VinfoMarker>) -> Self {
-        self.vinfo = Some(vinfo);
+        *self.vinfo.get_mut() = Some(vinfo);
         self
+    }
+
+    /// `virtualizable.py` `descr.vinfo = self` on the cached
+    /// `cpu.fielddescrof` object.
+    pub fn set_vinfo(&self, vinfo: Weak<dyn VinfoMarker>) {
+        *self.vinfo.write() = Some(vinfo);
     }
 }
 
@@ -6930,7 +6976,7 @@ impl FieldDescr for SimpleFieldDescr {
         self.parent_descr.read().as_ref().and_then(|p| p.upgrade())
     }
     fn get_vinfo(&self) -> Option<Arc<dyn VinfoMarker>> {
-        self.vinfo.as_ref().and_then(|w| w.upgrade())
+        self.vinfo.read().as_ref().and_then(|w| w.upgrade())
     }
 }
 
@@ -7086,19 +7132,16 @@ impl SimpleSizeDescr {
     /// is that object before the assignment; later producers publish the
     /// list onto the same Arc so `info.py _force_elements` can walk it.
     pub fn assign_all_fielddescrs(&self, all_fielddescrs: Vec<Arc<dyn FieldDescr>>) {
-        if all_fielddescrs.is_empty() {
+        let listed = listed_fielddescrs(all_fielddescrs);
+        if listed.is_empty() {
             return;
         }
         if !self.all_fielddescrs.is_empty() || self.assigned_all_fielddescrs.get().is_some() {
             return;
         }
-        let gc_fielddescrs: Vec<Arc<dyn FieldDescr>> = all_fielddescrs
-            .iter()
-            .filter(|fd| fd.is_pointer_field() && fd.offset() < self.size)
-            .cloned()
-            .collect();
+        let gc_fielddescrs = gc_pointers_in_fixed_part(&listed, self.size);
         let _ = self.assigned_gc_fielddescrs.set(gc_fielddescrs);
-        let _ = self.assigned_all_fielddescrs.set(all_fielddescrs);
+        let _ = self.assigned_all_fielddescrs.set(listed);
     }
 
     /// Override the GC-header flag (default `true` from the constructors).
@@ -7135,13 +7178,11 @@ impl SimpleSizeDescr {
         // recurses into a struct and does not record the array's address).
         // A field whose offset is at or past `size` is that variable part,
         // or a capture's interior offset adopted onto the closure. Neither
-        // is a fixed GC slot.
-        self.gc_fielddescrs = all_fielddescrs
-            .iter()
-            .filter(|fd| fd.is_pointer_field() && fd.offset() < self.size)
-            .cloned()
-            .collect();
-        self.all_fielddescrs = all_fielddescrs;
+        // is a fixed GC slot. `heaptracker.py all_fielddescrs` also drops
+        // `typeptr` before either list is stored.
+        let listed = listed_fielddescrs(all_fielddescrs);
+        self.gc_fielddescrs = gc_pointers_in_fixed_part(&listed, self.size);
+        self.all_fielddescrs = listed;
         self
     }
 
@@ -7151,6 +7192,9 @@ impl SimpleSizeDescr {
     /// edge lives in `all_fielddescrs`; this remains for headerless
     /// layouts and for extra traced pointers the payload census omits.
     pub fn with_extra_gc_fielddescr(mut self, fd: Arc<dyn FieldDescr>) -> Self {
+        if heaptracker_skips_listed_field(fd.as_ref()) {
+            return self;
+        }
         if !self
             .gc_fielddescrs
             .iter()
@@ -7391,6 +7435,9 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
     let mut leading: Vec<Arc<dyn FieldDescr>> = Vec::new();
     let mut gc_only: Vec<Arc<dyn FieldDescr>> = Vec::new();
     for fd in extra_gc_fielddescrs {
+        if heaptracker_skips_listed_field(fd.as_ref()) {
+            continue;
+        }
         if !headerless && fd.is_w_class() {
             leading.push(fd.clone());
         } else {
@@ -7695,6 +7742,9 @@ fn publish_borrowed_struct_layout_inner(
     let mut leading: Vec<Arc<dyn FieldDescr>> = Vec::new();
     let mut gc_only: Vec<Arc<dyn FieldDescr>> = Vec::new();
     for fd in extra_gc_fielddescrs {
+        if heaptracker_skips_listed_field(fd.as_ref()) {
+            continue;
+        }
         if !headerless && fd.is_w_class() {
             leading.push(fd.clone());
         } else {
@@ -7853,7 +7903,7 @@ fn make_simple_descr_group_inner(
                     } as u8),
                     index_in_parent: spec.index_in_parent,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
-                    vinfo: None,
+                    vinfo: RwLock::new(None),
                 })
             })
             .collect();
@@ -8700,7 +8750,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     class_word: AtomicU8::new(ClassWordDeclaration::DeclaredNot as u8),
                     index_in_parent: 0,
                     parent_descr: RwLock::new(Some(parent_descr)),
-                    vinfo: None,
+                    vinfo: RwLock::new(None),
                 });
                 *field_descr_cell.borrow_mut() = Some(field_descr.clone());
                 let all_fielddescrs = vec![field_descr as Arc<dyn FieldDescr>];
@@ -9797,6 +9847,108 @@ mod register_keyed_size_authority_tests {
         assert_eq!(second.index_in_parent, 1);
     }
 
+    /// `descr.py cache[STRUCT][fieldname]` keys on the `fieldname` argument.
+    /// Display spelling `"PyFrame.flags"` as `fieldname` occupies a different
+    /// row from `"flags"`; callers pass the STRUCT-local name.
+    #[test]
+    fn a_qualified_fieldname_is_the_struct_local_cache_key() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(11);
+        gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
+        let short = gc.get_field_descr(
+            key.clone(),
+            "flags",
+            Some("PyFrame.flags"),
+            48,
+            1,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Unsigned,
+            0,
+            false,
+            Some(10),
+        );
+        let qualified = gc.get_field_descr(
+            key.clone(),
+            "PyFrame.flags",
+            None,
+            48,
+            1,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Unsigned,
+            0,
+            false,
+            Some(10),
+        );
+        assert_eq!(short.field_key(), "flags");
+        assert_eq!(qualified.field_key(), "PyFrame.flags");
+        assert!(
+            !std::sync::Arc::ptr_eq(&short, &qualified),
+            "display spelling as fieldname is a distinct cache[STRUCT][fieldname] key"
+        );
+        let reverse = gc.get_field_descr(
+            key,
+            "flags",
+            Some("PyFrame.flags"),
+            48,
+            1,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Unsigned,
+            0,
+            false,
+            Some(10),
+        );
+        assert!(std::sync::Arc::ptr_eq(&short, &reverse));
+    }
+
+    /// Nested paths that only share a leaf occupy different words and must
+    /// not collapse onto `cache[STRUCT][block]`.
+    #[test]
+    fn same_leaf_at_two_offsets_keeps_two_cache_rows() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(13);
+        gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
+        let outer = gc.get_field_descr(
+            key.clone(),
+            "block",
+            Some("Traceback.block"),
+            48,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(5),
+        );
+        let nested = gc.get_field_descr(
+            key.clone(),
+            "inner.block",
+            None,
+            64,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(7),
+        );
+        assert_eq!(outer.offset(), 48);
+        assert_eq!(nested.offset(), 64);
+        assert!(
+            !std::sync::Arc::ptr_eq(&outer, &nested),
+            "inner.block at a different offset is not Traceback.block"
+        );
+    }
+
     /// The mint path binds a fieldless size-descr shell (`get_size_descr`
     /// populates no `all_fielddescrs`), so `find_index_in_parent` cannot
     /// arbitrate. The runtime published a headerless descr (`index 0`) first;
@@ -9845,6 +9997,216 @@ mod register_keyed_size_authority_tests {
             Some(2),
         );
         assert_eq!(second.index_in_parent, 0, "the cached descr wins");
+    }
+
+    /// `descr.py get_field_descr` returns `cache[STRUCT][fieldname]` on
+    /// every later lookup, even when the caller supplies a different offset.
+    #[test]
+    fn get_field_descr_keeps_the_first_cached_geometry() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0x0A81_E_70_4E);
+        gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
+        let first = gc.get_field_descr(
+            key.clone(),
+            "vable_token",
+            Some("PyFrame.vable_token"),
+            16,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        assert_eq!(first.offset(), 16);
+        let second = gc.get_field_descr(
+            key.clone(),
+            "vable_token",
+            Some("PyFrame.vable_token"),
+            64,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        assert_eq!(second.offset(), 16);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "cache[STRUCT][fieldname] is first-wins"
+        );
+        let third = gc.get_field_descr(
+            key,
+            "vable_token",
+            Some("PyFrame.vable_token"),
+            64,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        assert!(std::sync::Arc::ptr_eq(&first, &third));
+    }
+
+    /// A listed parent row is adopted only when `cache[STRUCT][fieldname]`
+    /// is vacant. A later listed geometry does not replace the occupant.
+    #[test]
+    fn get_field_descr_adopts_listed_row_only_when_cache_is_vacant() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0x0A81_E_70_5E);
+        let listed = SimpleFieldDescr::new_with_name(
+            1,
+            64,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            "PyFrame.vable_token".to_string(),
+            "vable_token",
+        );
+        let mut sd = SimpleSizeDescr::new(0, 72, 0);
+        sd = sd.with_all_fielddescrs(vec![
+            std::sync::Arc::new(listed.clone()) as std::sync::Arc<dyn FieldDescr>
+        ]);
+        gc._cache_size
+            .insert(key.clone(), std::sync::Arc::new(sd) as DescrRef);
+        let first = gc.get_field_descr(
+            key.clone(),
+            "vable_token",
+            Some("PyFrame.vable_token"),
+            16,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        assert_eq!(first.offset(), 16);
+        let second = gc.get_field_descr(
+            key.clone(),
+            "vable_token",
+            Some("PyFrame.vable_token"),
+            64,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        assert_eq!(second.offset(), 16);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        let third = gc.get_field_descr(
+            key,
+            "vable_token",
+            Some("PyFrame.vable_token"),
+            64,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        assert!(std::sync::Arc::ptr_eq(&first, &third));
+        assert_eq!(third.offset(), 16);
+    }
+
+    /// Nested paths that only share a leaf (`a.block` vs `b.block`) stay
+    /// distinct `cache[STRUCT][fieldname]` rows even at the same offset.
+    #[test]
+    fn nested_same_geometry_keeps_two_cache_rows() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0x0A81_E_70_6E);
+        gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
+        let a = gc.get_field_descr(
+            key.clone(),
+            "a.block",
+            Some("S.a.block"),
+            16,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        let b = gc.get_field_descr(
+            key,
+            "b.block",
+            Some("S.b.block"),
+            16,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            0,
+            false,
+            Some(0),
+        );
+        assert!(!std::sync::Arc::ptr_eq(&a, &b));
+        assert_eq!(a.field_key(), "a.block");
+        assert_eq!(b.field_key(), "b.block");
+    }
+
+    /// `heaptracker.py all_fielddescrs` skips typeptr while numbering.
+    /// Post-filter is a safety net: it drops the typeptr row and does not
+    /// clone or reindex the remaining shared descriptors.
+    #[test]
+    fn listed_fielddescrs_drops_typeptr_without_reindexing() {
+        let typeptr = SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            true,
+            ArrayFlag::Signed,
+            "object.typeptr".to_string(),
+            "typeptr",
+        )
+        .with_index_in_parent(0);
+        let payload = SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Int,
+            false,
+            ArrayFlag::Signed,
+            "S.payload".to_string(),
+            "payload",
+        )
+        .with_index_in_parent(1);
+        let sd = SimpleSizeDescr::new(0, 16, 0).with_all_fielddescrs(vec![
+            std::sync::Arc::new(typeptr) as std::sync::Arc<dyn FieldDescr>,
+            std::sync::Arc::new(payload) as std::sync::Arc<dyn FieldDescr>,
+        ]);
+        let listed = SizeDescr::all_fielddescrs(&sd);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].field_key(), "payload");
+        assert_eq!(
+            listed[0].index_in_parent(),
+            1,
+            "post-filter does not reindex a shared descr"
+        );
     }
 
     /// Kind-0 bake supplies one complete layout (`descr.py` `get_size_descr`
@@ -10142,6 +10504,83 @@ mod tests {
         let sd = SimpleSizeDescr::new(0, 8, 0).with_all_fielddescrs(vec![inside, array_tail]);
         let offsets: Vec<usize> = sd.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
         assert_eq!(offsets, vec![0]);
+    }
+
+    fn named_ptr(offset: usize, name: &str, key: &str) -> Arc<dyn FieldDescr> {
+        Arc::new(SimpleFieldDescr::new_with_name(
+            0,
+            offset,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            name.to_string(),
+            key.to_string(),
+        ))
+    }
+
+    /// `heaptracker.py all_fielddescrs` drops `typeptr` before either list
+    /// is stored. An unnamed Ref at offset 0 stays (`gc_fielddescrs_drops_
+    /// offsets_outside_the_fixed_part`); a named `ob_type` does not.
+    #[test]
+    fn all_fielddescrs_skips_typeptr_like_heaptracker() {
+        let typeptr = named_ptr(0, "PyObject.ob_type", "ob_type");
+        let w_class = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class".to_string(),
+            )
+            .with_class_word(true),
+        ) as Arc<dyn FieldDescr>;
+        let payload: Arc<dyn FieldDescr> =
+            Arc::new(SimpleFieldDescr::new(1, 16, 8, Type::Int, false));
+        let pad = Arc::new(SimpleFieldDescr::new_with_name(
+            0,
+            4,
+            4,
+            Type::Int,
+            false,
+            ArrayFlag::Signed,
+            "c__pad0".to_string(),
+            "c__pad0".to_string(),
+        )) as Arc<dyn FieldDescr>;
+        assert!(typeptr.is_typeptr());
+        let sd = SimpleSizeDescr::with_vtable(0x3000_3000, 32, 7, 0x1000)
+            .with_all_fielddescrs(vec![typeptr, pad, w_class.clone(), payload]);
+        let all_names: Vec<&str> = sd
+            .all_fielddescrs()
+            .iter()
+            .map(|fd| fd.field_name())
+            .collect();
+        assert_eq!(all_names, vec!["PyObject.w_class", ""]);
+        assert!(sd.all_fielddescrs().iter().all(|fd| !fd.is_typeptr()));
+        let gc_offsets: Vec<usize> = sd.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
+        assert_eq!(gc_offsets, vec![8]);
+        assert_eq!(sd.class_word_field().map(|fd| fd.offset()), Some(8));
+    }
+
+    #[test]
+    fn assign_all_fielddescrs_skips_typeptr_like_heaptracker() {
+        let typeptr = named_ptr(0, "object.typeptr", "typeptr");
+        let w_class = named_ptr(8, "PyObject.w_class", "w_class");
+        let sd = SimpleSizeDescr::new(0, 32, 7);
+        sd.assign_all_fielddescrs(vec![typeptr, w_class]);
+        assert_eq!(sd.all_fielddescrs().len(), 1);
+        assert_eq!(sd.all_fielddescrs()[0].offset(), 8);
+        assert!(sd.gc_fielddescrs().iter().all(|fd| fd.offset() != 0));
+    }
+
+    #[test]
+    fn extra_gc_typeptr_does_not_enter_gc_fielddescrs() {
+        let typeptr = named_ptr(0, "PyObject.ob_type", "ob_type");
+        let sd = SimpleSizeDescr::new(0, 32, 7).with_extra_gc_fielddescr(typeptr);
+        assert!(sd.gc_fielddescrs().is_empty());
     }
 
     #[test]

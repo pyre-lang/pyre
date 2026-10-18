@@ -416,12 +416,7 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let descr = op.getdescr().expect("NEW needs descr");
-        let vinfo = VirtualStructInfo {
-            descr,
-            fields: majit_ir::ptr_info::VirtualFieldList::new(),
-            last_guard_pos: -1,
-            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-        };
+        let vinfo = VirtualStructInfo::new(descr);
         let b = Operand::from_bound_op(op_rc);
         ctx.set_ptr_info(&b, PtrInfo::VirtualStruct(vinfo));
         OptimizationResult::Remove
@@ -601,10 +596,24 @@ impl OptVirtualize {
                         // header at offset 0.  Seeding from the mirror's field
                         // would hand a later header read the wrong class.
                         if is_typeptr && field_descr.offset() == 0 {
-                            if vinfo.known_class.is_none()
-                                && let Some(class_val) = value_as_constant {
+                            // `heaptracker.py all_fielddescrs` excludes typeptr
+                            // (`dealt otherwise`): `_fields` never contains it.
+                            // `PtrInfo::Virtual` is `optimize_NEW_WITH_VTABLE`
+                            // (`virtualize.py make_virtual`); that op already
+                            // stamped the class word. A CONSTANT store is
+                            // `known_class`. A runtime store is the residual
+                            // malloc shape `rewrite_op_malloc` never emits on
+                            // a vtable'd GcStruct (`rclass` `instantiate` of a
+                            // non-constant class is an indirect call to a
+                            // per-class `ll_instantiate`, each `malloc` →
+                            // `new_with_vtable` with a CONSTANT vtable).
+                            // Emitting the SETFIELD (`PassOn`) would leak this
+                            // virtual into an emitted op and force it.
+                            if let Some(class_val) = value_as_constant {
+                                if vinfo.known_class.is_none() {
                                     vinfo.known_class = Some(class_val as i64);
                                 }
+                            }
                             return Some(OptimizationResult::Remove);
                         }
                         // PyPy's typeptr never enters `_fields`: its class
@@ -655,13 +664,23 @@ impl OptVirtualize {
                             value_op.clone(),
                         ))
                     }
-                    PtrInfo::VirtualStruct(vinfo) => Some(store_virtual_field_or_emit(
-                        &vinfo.descr,
-                        &mut vinfo.fields,
-                        field_idx,
-                        field_descr,
-                        value_op.clone(),
-                    )),
+                    PtrInfo::VirtualStruct(vinfo) => {
+                        // `heaptracker.py all_fielddescrs` skips typeptr
+                        // (`dealt otherwise`): `_fields` never contains it.
+                        // `jtransform.py rewrite_op_setfield` drops the
+                        // store; residual allocation stamps the class word
+                        // at `new_with_vtable`.
+                        if is_typeptr && field_descr.offset() == 0 {
+                            return Some(OptimizationResult::Remove);
+                        }
+                        Some(store_virtual_field_or_emit(
+                            &vinfo.descr,
+                            &mut vinfo.fields,
+                            field_idx,
+                            field_descr,
+                            value_op.clone(),
+                        ))
+                    }
                     _ => None,
                 }
             }))
@@ -2379,6 +2398,12 @@ fn setfield_kind_matches(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool 
 fn named_field_keys_agree(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
     let slot_key = slot.field_key();
     let field_key = field.field_key();
+    // `descr.py cache[STRUCT][fieldname]` identity. Reconstitution asks
+    // `get_field_descr` with the STRUCT-local fieldname recovered by
+    // `bh_field_cache_key`, so a listed row and the live descr share
+    // `field_key()`. A display spelling used as fieldname is a different
+    // key. Overlay siblings at one offset (`dstorage` / `dstorage_as_gcref`)
+    // keep distinct keys.
     slot_key.is_empty() || field_key.is_empty() || slot_key == field_key
 }
 
@@ -2389,7 +2414,10 @@ fn named_field_keys_agree(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool
 /// `AbstractResumeDataReader.setfield` kind. Named fields with distinct
 /// `field_key()`s are not the same row even when they share
 /// `descr.index()` (`descr.py` `cache[STRUCT][fieldname]`).
-fn slot_in_field_list(fields: &[Arc<dyn FieldDescr>], field: &dyn FieldDescr) -> Option<u32> {
+pub(crate) fn slot_in_field_list(
+    fields: &[Arc<dyn FieldDescr>],
+    field: &dyn FieldDescr,
+) -> Option<u32> {
     if let Some(i) = fields.iter().position(|slot| {
         slot.index() == field.index()
             && slot.offset() == field.offset()
@@ -2416,6 +2444,7 @@ fn slot_in_field_list(fields: &[Arc<dyn FieldDescr>], field: &dyn FieldDescr) ->
         .position(|slot| {
             slot.offset() == field.offset()
                 && setfield_kind_matches(slot.as_ref(), field)
+                && slot.field_type() == field.field_type()
                 && named_field_keys_agree(slot.as_ref(), field)
         })
         .map(|i| i as u32)
@@ -2721,7 +2750,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     };
     let named_apart = !field.field_key().is_empty()
         && !slot.field_key().is_empty()
-        && slot.field_key() != field.field_key();
+        && !named_field_keys_agree(slot, field);
     // Resume `AbstractResumeDataReader.setfield` classifies by
     // `is_pointer_field` / `is_float_field` / else. Empty-name flattened
     // leaves at one offset must not alias across that split.
@@ -4946,6 +4975,137 @@ mod tests {
         assign_positions(&mut ops);
         let result = run_pass(&ops);
         assert!(result.is_empty(), "NEW_WITH_VTABLE should be removed");
+    }
+
+    #[test]
+    fn runtime_typeptr_setfield_on_new_with_vtable_is_removed() {
+        // `virtualize.py optimize_SETFIELD_GC` never sees typeptr:
+        // `rewrite_op_malloc` stamped it and `rewrite_op_setfield` dropped
+        // the store. A runtime typeptr SETFIELD on `PtrInfo::Virtual` must
+        // not `PassOn` (that emits the op with a virtual base and forces it).
+        let sd: DescrRef = majit_ir::make_size_descr_with_vtable(1, 8, 0, 0xCAFE);
+        let typeptr_descr: DescrRef = Arc::new(majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "PyObject.ob_type".to_string(),
+            "ob_type".to_string(),
+        ));
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 1),
+                ],
+                typeptr_descr,
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_pass(&ops);
+        assert!(
+            result.is_empty(),
+            "runtime typeptr SETFIELD on new_with_vtable must not force: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn runtime_typeptr_setfield_on_plain_new_is_removed() {
+        // Residual `new` does not stamp the class word. A runtime typeptr
+        // SETFIELD on `PtrInfo::VirtualStruct` must not `PassOn` (that
+        // emits the op with a virtual base and forces a 16-byte header).
+        let sd = size_descr(1);
+        let typeptr_descr: DescrRef = Arc::new(majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "PyObject.ob_type".to_string(),
+            "ob_type".to_string(),
+        ));
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], sd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 50),
+                ],
+                typeptr_descr,
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_pass(&ops);
+        let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
+        assert!(
+            result.is_empty(),
+            "runtime typeptr SETFIELD on plain new must not force: {opcodes:?}"
+        );
+    }
+
+    fn new_with_vtable_then_guard_class(vtable: i64, expected: i64) -> Vec<Op> {
+        let sd: DescrRef = majit_ir::make_size_descr_with_vtable(1, 8, 0, vtable as usize);
+        let mut guard = Op::new(
+            OpCode::GuardClass,
+            &[
+                crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                Operand::const_from_value(Value::Int(expected)),
+            ],
+        );
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
+        let mut ops = vec![Op::with_descr(OpCode::NewWithVtable, &[], sd), guard];
+        assign_positions(&mut ops);
+        ops
+    }
+
+    #[test]
+    fn matching_guard_class_on_new_with_vtable_is_removed() {
+        // rewrite.py optimize_GUARD_CLASS: known class matches → drop.
+        // `new_with_vtable` stamps known_class; the typeptr store is dropped.
+        let ops = new_with_vtable_then_guard_class(0xCAFE, 0xCAFE);
+        let result = run_default_pipeline(&ops);
+        assert!(
+            result.is_empty(),
+            "matching new_with_vtable class must drop GUARD_CLASS: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mismatch_guard_class_on_new_with_vtable_is_invalid_loop() {
+        // rewrite.py optimize_GUARD_CLASS: known class mismatch → InvalidLoop.
+        let ops = new_with_vtable_then_guard_class(0xBEEF, 0xCAFE);
+        let err =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_default_pipeline(&ops)));
+        let payload = match err {
+            Err(payload) => payload,
+            Ok(result) => panic!(
+                "mismatch must InvalidLoop, got {:?}",
+                result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+            ),
+        };
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("InvalidLoop"),
+            "expected InvalidLoop panic, got {msg:?}"
+        );
     }
 
     #[test]

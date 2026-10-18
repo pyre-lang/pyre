@@ -942,7 +942,10 @@ impl OptRewrite {
             let expected = ctx.get_constant_int_box(&op.arg(1));
             if let Some(expected) = expected {
                 if known_class == expected {
-                    // rewrite.py:403-404: known class matches — drop the guard.
+                    // `rewrite.py` `optimize_GUARD_CLASS`: known class matches — drop the
+                    // guard. TRACE-level GUARD_CLASS is VOID
+                    // (`resoperation.py` `'GUARD_CLASS/2d/n'`); there is
+                    // no result box to forward.
                     return OptimizationResult::Remove;
                 }
                 // rewrite.py:404-407: known class mismatch is a

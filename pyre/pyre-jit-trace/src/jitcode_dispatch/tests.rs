@@ -8201,12 +8201,28 @@ fn top_level_raise_settles_the_vable_token() {
         majit_ir::OpCode::GuardNotForced2,
         "the token protocol must end in GUARD_NOT_FORCED_2",
     );
-    let token_store = tc
-        .ops()
+    // The last SETFIELD_GC in the whole trace can be `pycode` (offset 16)
+    // when an earlier field store is remapped onto the first listed row
+    // at that offset. The token protocol is the SETFIELD whose value is
+    // FORCE_TOKEN; `cpu.fielddescrof(VTYPE, 'vable_token')` names it.
+    let ops: Vec<_> = tc.ops().iter().cloned().collect();
+    let token_store = ops
         .iter()
         .rev()
-        .find(|op| op.opcode == majit_ir::OpCode::SetfieldGc)
-        .expect("token protocol carries a SETFIELD_GC");
+        .find(|op| {
+            if op.opcode != majit_ir::OpCode::SetfieldGc {
+                return false;
+            }
+            let args = op.getarglist();
+            let Some(value) = args.get(1) else {
+                return false;
+            };
+            let value = value.to_opref();
+            ops.iter().any(|prod| {
+                prod.pos().get() == value && prod.opcode == majit_ir::OpCode::ForceToken
+            })
+        })
+        .expect("token protocol stores FORCE_TOKEN through SETFIELD_GC");
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let recorded_descr = token_store
         .getdescr()
@@ -8215,24 +8231,19 @@ fn top_level_raise_settles_the_vable_token() {
         .as_field_descr()
         .expect("token store's descr is a FieldDescr");
     assert_eq!(
+        majit_ir::descr::cache_fieldname(field.field_key()),
+        "vable_token",
+        "the token store must resolve by (STRUCT, fieldname), not an offset alias",
+    );
+    assert_eq!(
+        field.offset(),
+        crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
+        "the token store's descr offset must be the host offset_of! slot",
+    );
+    assert_eq!(
         field.offset(),
         info.token_offset,
         "the tail store must target the vable_token slot",
-    );
-    let value = token_store
-        .getarglist()
-        .get(1)
-        .expect("SetfieldGc args are [obj, value]")
-        .to_opref();
-    let token_op = tc
-        .ops()
-        .iter()
-        .find(|op| op.pos().get() == value)
-        .expect("stored token is produced by an operation");
-    assert_eq!(
-        token_op.opcode,
-        majit_ir::OpCode::ForceToken,
-        "the exception exit must store the live FORCE_TOKEN",
     );
 }
 

@@ -3604,6 +3604,118 @@ mod tests {
         }
     }
 
+    /// After kind-0 publication, listed `gc_fielddescrs` must skip the
+    /// typeptr word. `heaptracker.py all_fielddescrs` drops
+    /// `name == 'typeptr'` before building either list.
+    /// `rewrite.py handle_malloc_operation` stamps `fielddescr_vtable` at
+    /// offset 0 and then `clear_gc_fields` delayed-zeros every
+    /// `gc_fielddescrs` offset; a Ref at 0 in that list wipes `ob_type`.
+    /// PyFrame listed offsets vs host `offset_of!` live in
+    /// `descr.rs pyframe_listed_descr_offsets_match_host_offset_of`.
+    #[test]
+    fn listed_object_descrs_match_rust_offsets_after_kind0() {
+        use majit_ir::SizeDescr;
+
+        materialize_gccache_owned_descrs();
+
+        let check_size = |label: &str, descr: majit_ir::DescrRef| {
+            let size = descr
+                .as_size_descr()
+                .unwrap_or_else(|| panic!("{label} SizeDescr"));
+            let mut violations = Vec::new();
+            if size.all_fielddescrs().iter().any(|fd| fd.is_typeptr()) {
+                violations.push(format!("{label}: all_fielddescrs contains typeptr"));
+            }
+            if size
+                .gc_fielddescrs()
+                .iter()
+                .any(|fd| fd.is_typeptr() || fd.offset() == 0)
+            {
+                violations.push(format!(
+                    "{label}: gc_fielddescrs contains typeptr or offset 0"
+                ));
+            }
+            if let Some(fd) = size.class_word_field() {
+                if fd.offset() != pyre_object::pyobject::W_CLASS_OFFSET {
+                    violations.push(format!(
+                        "{label}: class_word_field offset {} want {}",
+                        fd.offset(),
+                        pyre_object::pyobject::W_CLASS_OFFSET
+                    ));
+                }
+            } else {
+                violations.push(format!("{label}: class_word_field is None"));
+            }
+            violations
+        };
+
+        let mut violations = Vec::new();
+        violations.extend(check_size("W_IntObject", crate::descr::w_int_size_descr()));
+        violations.extend(check_size(
+            "W_ObjectObject",
+            crate::descr::w_object_object_size_descr(),
+        ));
+        violations.extend(check_size(
+            "W_ObjectObjectUser",
+            crate::descr::w_object_object_user_size_descr(),
+        ));
+        violations.extend(check_size("PyFrame", crate::descr::pyframe_size_descr()));
+
+        let intval_descr = crate::descr::int_intval_descr();
+        let intval = intval_descr.as_field_descr().expect("intval FieldDescr");
+        if intval.offset() != pyre_object::INT_INTVAL_OFFSET {
+            violations.push(format!(
+                "int_intval_descr offset {} want {}",
+                intval.offset(),
+                pyre_object::INT_INTVAL_OFFSET
+            ));
+        }
+        let map_descr = crate::descr::object_map_descr();
+        let map = map_descr.as_field_descr().expect("map FieldDescr");
+        let map_offset = std::mem::offset_of!(pyre_object::W_ObjectObject, map);
+        if map.offset() != map_offset {
+            violations.push(format!(
+                "object_map_descr offset {} want {}",
+                map.offset(),
+                map_offset
+            ));
+        }
+        let storage_descr = crate::descr::object_storage_descr();
+        let storage = storage_descr.as_field_descr().expect("storage FieldDescr");
+        let storage_offset = std::mem::offset_of!(pyre_object::W_ObjectObject, storage);
+        if storage.offset() != storage_offset {
+            violations.push(format!(
+                "object_storage_descr offset {} want {}",
+                storage.offset(),
+                storage_offset
+            ));
+        }
+
+        let user_lazy = crate::descr::w_object_object_user_size_descr();
+        let user_key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(
+            "objectobject::W_ObjectObjectUser",
+        ));
+        let user_cached = majit_ir::descr::gc_cache()
+            .lock()
+            ._cache_size
+            .get(&user_key)
+            .cloned();
+        match user_cached {
+            None => violations.push("W_ObjectObjectUser missing from _cache_size".into()),
+            Some(cached) => {
+                if !std::sync::Arc::ptr_eq(&user_lazy, &cached) {
+                    violations.extend(check_size("W_ObjectObjectUser-cache", cached));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "listed descr offsets disagree with the Rust layout:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
     #[test]
     fn descr_index_kind_matches_each_serialized_entry() {
         let index = descrs_index();
