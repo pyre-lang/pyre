@@ -2427,6 +2427,7 @@ impl Trace {
 
     // ── Snapshot writers (opencoder.py _list_of_boxes) ──
 
+    #[inline]
     fn clamp_snapshot_int(&mut self, i: i64) -> i64 {
         if !(MIN_VALUE..=MAX_VALUE).contains(&i) {
             self.tag_overflow = true;
@@ -2456,6 +2457,7 @@ impl Trace {
     ///
     /// Appends a pre-encoded tagged box value to `_snapshot_array_data`.
     /// The caller computes the tag via the `_encode_*` helpers above.
+    #[inline]
     pub fn _add_box_to_storage(&mut self, tagged: i64) {
         self.append_snapshot_array_data_int(tagged);
     }
@@ -2486,18 +2488,10 @@ impl Trace {
     /// opencoder.py _list_of_boxes(boxes). Writes an array
     /// header then each box, returns the array index (0 for empty).
     pub fn _list_of_boxes(&mut self, boxes: &[i64]) -> i64 {
-        if boxes.is_empty() {
-            return 0;
+        let res = self.new_array(boxes.len());
+        for &b in boxes {
+            self._add_box_to_storage(b);
         }
-        let res = self._snapshot_array_data.len() as i64;
-        let n = self.clamp_snapshot_int(boxes.len() as i64);
-        self._snapshot_array_data.append_prefixed_varints_checked(
-            n,
-            boxes,
-            MIN_VALUE,
-            MAX_VALUE,
-            &mut self.tag_overflow,
-        );
         res
     }
 
@@ -2511,27 +2505,11 @@ impl Trace {
         if boxes.is_empty() {
             return 0;
         }
-        let res = self._snapshot_array_data.len() as i64;
-        let n = self.clamp_snapshot_int(boxes.len() as i64);
-        let last = *boxes.last().unwrap();
-        let rest = &boxes[..boxes.len() - 1];
-        // boxes[-1] first (the virtualizable), then boxes[:-1]. Two
-        // header() loads: length+last, then the remainder. No GC alloc
-        // between them. Each value still goes through the
-        // `append_snapshot_array_data_int` range check (`tag_overflow`).
-        self._snapshot_array_data.append_prefixed_varints_checked(
-            n,
-            std::slice::from_ref(&last),
-            MIN_VALUE,
-            MAX_VALUE,
-            &mut self.tag_overflow,
-        );
-        self._snapshot_array_data.append_varints_checked(
-            rest,
-            MIN_VALUE,
-            MAX_VALUE,
-            &mut self.tag_overflow,
-        );
+        let res = self.new_array(boxes.len());
+        self._add_box_to_storage(*boxes.last().unwrap());
+        for &b in &boxes[..boxes.len() - 1] {
+            self._add_box_to_storage(b);
+        }
         res
     }
 
@@ -2569,18 +2547,14 @@ impl Trace {
             );
         }
         let res = self._snapshot_data.len() as i64;
-        let prev = if is_last {
-            SNAPSHOT_PREV_NONE as i64
+        self.append_snapshot_data_int(index);
+        self.append_snapshot_data_int(pc);
+        self.append_snapshot_data_int(array);
+        if is_last {
+            self.append_snapshot_data_int(SNAPSHOT_PREV_NONE as i64);
         } else {
-            SNAPSHOT_PREV_NEEDS_PATCHING as i64
-        };
-        let vals = [
-            self.clamp_snapshot_int(index),
-            self.clamp_snapshot_int(pc),
-            self.clamp_snapshot_int(array),
-            self.clamp_snapshot_int(prev),
-        ];
-        self._snapshot_data.append_varints(&vals);
+            self.append_snapshot_data_int(SNAPSHOT_PREV_NEEDS_PATCHING as i64);
+        }
         res
     }
 
@@ -3458,12 +3432,14 @@ impl Trace {
     /// Writes a signed varint into `_snapshot_array_data`; values outside
     /// [MIN_VALUE, MAX_VALUE] trip `tag_overflow` (and encode 0 to keep
     /// the stream parseable).
+    #[inline]
     pub(crate) fn append_snapshot_array_data_int(&mut self, i: i64) {
         let i = self.clamp_snapshot_int(i);
         self._snapshot_array_data.append_varint(i);
     }
 
     /// opencoder.py append_snapshot_data_int(i).
+    #[inline]
     #[allow(dead_code)]
     pub(crate) fn append_snapshot_data_int(&mut self, i: i64) {
         let i = self.clamp_snapshot_int(i);

@@ -8075,7 +8075,7 @@ pub fn cranelift_resumedata_deopt(
         None,
         &allocator,
     );
-    reader.bind_deadframe_root();
+    let mut reader = reader.bind_deadframe_root();
     // `resumecode.py` `Reader.next_item` reloads `numb.code` after a
     // collection. `prepare_resume_heap_with_roots` materializes virtuals
     // and can minor-collect. Same bind as `blackhole_from_resumedata`.
@@ -8085,7 +8085,7 @@ pub fn cranelift_resumedata_deopt(
     //    consume the vref + vable sections that precede the per-frame
     //    sections.
     let _resume_roots =
-        resume::prepare_resume_heap_with_roots(&mut reader, rd_virtuals_slice, rd_pendingfields);
+        resume::prepare_resume_heap_with_roots(&mut *reader, rd_virtuals_slice, rd_pendingfields);
     let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
     if std::env::var_os("PYRE_DEOPT_PROBE").is_some() {

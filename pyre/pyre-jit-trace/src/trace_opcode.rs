@@ -1197,21 +1197,28 @@ impl MIFrame {
                         Vec::with_capacity((length_i + length_r + length_f) as usize);
                     use majit_jitcode::liveness::LivenessIterator;
                     if length_i != 0 {
-                        let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
+                        // SAFETY: `all_liveness` bank at `cursor` is a complete
+                        // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+                        let mut it =
+                            unsafe { LivenessIterator::new(cursor, length_i, &all_liveness) };
                         while let Some(reg_idx) = it.next() {
                             out.push((LiveBank::Int, reg_idx as usize));
                         }
-                        cursor = it.offset;
+                        cursor = it.offset();
                     }
                     if length_r != 0 {
-                        let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
+                        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+                        let mut it =
+                            unsafe { LivenessIterator::new(cursor, length_r, &all_liveness) };
                         while let Some(reg_idx) = it.next() {
                             out.push((LiveBank::Ref, reg_idx as usize));
                         }
-                        cursor = it.offset;
+                        cursor = it.offset();
                     }
                     if length_f != 0 {
-                        let mut it = LivenessIterator::new(cursor, length_f, &all_liveness);
+                        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+                        let mut it =
+                            unsafe { LivenessIterator::new(cursor, length_f, &all_liveness) };
                         while let Some(reg_idx) = it.next() {
                             out.push((LiveBank::Float, reg_idx as usize));
                         }
@@ -1547,11 +1554,13 @@ impl MIFrame {
         // silent NONE.
         use majit_jitcode::liveness::LivenessIterator;
         if length_i != 0 {
-            let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
+            // SAFETY: `all_liveness` bank at `cursor` is a complete
+            // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(cursor, length_i, &all_liveness) };
             while let Some(reg_idx) = it.next() {
                 boxes.push(registers_i[reg_idx as usize]);
             }
-            cursor = it.offset;
+            cursor = it.offset();
         }
         if length_r != 0 {
             // PyPy parity: portal red args (`pypy/module/pypyjit/
@@ -1574,7 +1583,8 @@ impl MIFrame {
             // recovers it via GETFIELD_GC(frame, execution_context_descr)
             // when needed; otherwise returns the seeded value.
             let sym_ec = self.ensure_execution_context(ctx);
-            let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(cursor, length_r, &all_liveness) };
             while let Some(reg_idx) = it.next() {
                 // Portal-red substitution applies only to the force-alived
                 // SCRATCH case. The register allocator reuses these low
@@ -1655,10 +1665,11 @@ impl MIFrame {
                 };
                 boxes.push(opref);
             }
-            cursor = it.offset;
+            cursor = it.offset();
         }
         if length_f != 0 {
-            let mut it = LivenessIterator::new(cursor, length_f, &all_liveness);
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(cursor, length_f, &all_liveness) };
             while let Some(reg_idx) = it.next() {
                 boxes.push(registers_f[reg_idx as usize]);
             }

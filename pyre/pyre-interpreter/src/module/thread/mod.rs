@@ -995,6 +995,8 @@ mod lock_class {
             crate::typedef::check_user_subclass(type_object(), cls)?;
             let obj = Self::allocate_stable(Self::default());
             unsafe { (*obj).w_class = cls };
+            // Old-gen shell may hold a young subclass; incminimark.py write_barrier records the old->young edge.
+            pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
             Ok(obj)
         }
 
@@ -1160,6 +1162,8 @@ mod rlock_class {
             crate::typedef::check_user_subclass(type_object(), cls)?;
             let obj = Self::allocate_stable(Self::default());
             unsafe { (*obj).w_class = cls };
+            // Old-gen shell may hold a young subclass; incminimark.py write_barrier records the old->young edge.
+            pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
             Ok(obj)
         }
 
@@ -1396,6 +1400,8 @@ mod handle_class {
             crate::typedef::check_user_subclass(type_object(), cls)?;
             let obj = Self::allocate_stable(Self::default());
             unsafe { (*obj).w_class = cls };
+            // Old-gen shell may hold a young subclass; incminimark.py write_barrier records the old->young edge.
+            pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
             Ok(obj)
         }
 

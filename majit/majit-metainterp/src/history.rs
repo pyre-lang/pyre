@@ -671,7 +671,9 @@ impl TreeLoop {
         }
     }
 
-    /// Get the input arg types.
+    /// Types of the live inputargs, in `History.set_inputargs` order.
+    /// Dead failarg holes are absent, so this list is not indexed by
+    /// `get_position()`.
     pub fn inputarg_types(&self) -> Vec<majit_ir::Type> {
         self.inputargs.iter().map(|ia| ia.tp.get()).collect()
     }
@@ -679,16 +681,21 @@ impl TreeLoop {
     /// opencoder.py Trace.get_iter() — produce a TraceIterator over
     /// the recorded ops with fresh per-iteration boxes.
     ///
-    /// `start_index = 0` reproduces the canonical positional layout:
-    /// inputargs allocated at `OpRef::input_arg_typed(0..num_inputargs,
-    /// tp)` (typed by `inputarg_from_tp(arg.type)` per
-    /// opencoder.py), op results at op-namespace OpRefs
-    /// starting at `num_inputargs`. Phase 2 / bridge callers that need
-    /// disjoint OpRef namespaces must construct `TraceIterator::new`
-    /// directly with a higher `start_index`.
+    /// Seeds `_cache` by each inputarg's `get_position()`
+    /// (`TraceIterator.new_with_inputargs`), so a hole-filtered bridge
+    /// list keeps its original coordinates. `start_fresh = 0` remints
+    /// those boxes from `inputarg_from_tp(arg.type)`. Phase 2 / bridge
+    /// callers that need disjoint OpRef namespaces must construct
+    /// `TraceIterator::new` directly with a higher `start_index`.
     pub fn get_iter(&self) -> crate::opencoder::TraceIterator<'_> {
-        let inputarg_types = self.inputarg_types();
-        crate::opencoder::TraceIterator::new(&self.ops, 0, self.ops.len(), None, &inputarg_types, 0)
+        crate::opencoder::TraceIterator::new_with_inputargs(
+            &self.ops,
+            0,
+            self.ops.len(),
+            None,
+            &self.inputargs,
+            0,
+        )
     }
 
     /// history.py check_consistency — full structural validation.
@@ -2527,6 +2534,19 @@ impl TraceCtx {
         self.recorder.record_op_with_value(opcode, args, value)
     }
 
+    /// `resoperation.py InputArgInt()` — type only; the live value is
+    /// attached by `stamp_live_inputargs` / `load_box_from_cpu`.
+    pub fn record_input_arg(&mut self, tp: Type) -> OpRef {
+        self.record_input_arg_with_value(tp, None)
+    }
+
+    /// `resoperation.py InputArgInt(intval)` / `resume.py
+    /// ResumeDataBoxReader.load_box_from_cpu`: the box is born with
+    /// `value`. `None` is `InputArgInt()`.
+    pub fn record_input_arg_with_value(&mut self, tp: Type, value: Option<Value>) -> OpRef {
+        self.recorder.record_input_arg_with_value(tp, value)
+    }
+
     /// Record an operation with a descriptor (e.g., calls).
     pub fn record_op_with_descr(
         &mut self,
@@ -2548,12 +2568,16 @@ impl TraceCtx {
             .record_op_with_descr_value(opcode, args, descr, value)
     }
 
-    /// pyjitpl.py `MetaInterp.execute_new_with_vtable`: record the allocation,
-    /// then `heapcache.new(resbox)` and `heapcache.class_now_known(resbox)`.
-    pub fn execute_new_with_vtable(&mut self, descr: DescrRef) -> OpRef {
+    /// pyjitpl.py `MetaInterp.execute_new_with_vtable`:
+    /// `execute_and_record(rop.NEW_WITH_VTABLE, descr)` then
+    /// `heapcache.new(resbox)` and `heapcache.class_now_known(resbox)`.
+    /// `value` is the allocated pointer (`history.py History._make_op`);
+    /// `None` is the record-only virtualization emit (no live object yet).
+    pub fn execute_new_with_vtable(&mut self, descr: DescrRef, value: Option<Value>) -> OpRef {
         let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
         let resbox =
-            Self::do_record_op_with_descr(&mut self.recorder, OpCode::NewWithVtable, &[], descr);
+            self.recorder
+                .record_op_with_descr_value(OpCode::NewWithVtable, &[], descr, value);
         self.heap_cache_mut().new_object(resbox);
         if known_class.is_some() {
             self.heap_cache_mut().class_now_known(resbox);
@@ -2986,8 +3010,22 @@ impl TraceCtx {
     /// stamping — kept on the signature for caller compatibility but
     /// no longer used.
     pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
+        self.record_guard_with_value(opcode, args, num_live, None)
+    }
+
+    /// Sibling of [`Self::record_guard`] that attaches `value` at
+    /// construction (`history.py History._make_op`).
+    /// `pyjitpl.py MetaInterp.generate_guard(GUARD_EXCEPTION)` records a
+    /// `RefFrontendOp` with the exception; pass `Some(Value::Ref(...))`.
+    pub fn record_guard_with_value(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        num_live: usize,
+        value: Option<Value>,
+    ) -> OpRef {
         let _ = num_live;
-        let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
+        let opref = Self::do_record_guard_with_value(&mut self.recorder, opcode, args, None, value);
         // pyjitpl.py `count_ops(opnum, Counters.GUARDS)` — counted
         // here at the record chokepoint so every recording call site
         // bumps the bucket exactly once. generate_guard's Const-box
@@ -3043,7 +3081,17 @@ impl TraceCtx {
         args: &[OpRef],
         descr: Option<DescrRef>,
     ) -> OpRef {
-        recorder.record_guard(opcode, args, descr)
+        Self::do_record_guard_with_value(recorder, opcode, args, descr, None)
+    }
+
+    pub(crate) fn do_record_guard_with_value(
+        recorder: &mut Trace,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: Option<DescrRef>,
+        value: Option<Value>,
+    ) -> OpRef {
+        recorder.record_guard_with_value(opcode, args, descr, value)
     }
 
     pub(crate) fn do_close_loop(recorder: &mut Trace, jump_args: &[OpRef]) {
@@ -3145,6 +3193,14 @@ impl TraceCtx {
         self.recorder.opcode_at(i)
     }
 
+    /// Number of recorded ops [`Self::opcode_at`] indexes.
+    ///
+    /// Distinct from [`Self::num_ops`] / [`Self::num_recorded_ops`]
+    /// (`History.length`), which count dead failarg holes.
+    pub fn opcode_at_len(&self) -> usize {
+        self.recorder.opcode_at_len()
+    }
+
     /// `num_inputargs()` — alias for `num_inputs()` keeping RPython
     /// `Trace.num_inputargs` name parity in external call sites.
     pub fn num_inputargs(&self) -> usize {
@@ -3176,14 +3232,14 @@ impl TraceCtx {
     }
 
     /// pyjitpl.py `blackhole_if_trace_too_long` check:
-    /// `length > warmrunnerstate.trace_limit`.  `num_ops` is the non-inputarg
-    /// op count (= `history.length()`); `trace_limit` is cached from warmstate
-    /// at trace start.
+    /// `length > warmrunnerstate.trace_limit`.  `num_ops` is
+    /// `History.length` (`trace._count - len(trace.inputargs)`);
+    /// `trace_limit` is cached from warmstate at trace start.
     pub fn is_too_long(&self) -> bool {
         self.recorder.num_ops() > self.trace_limit
     }
 
-    /// Non-inputarg recorded op count (`History.length`).
+    /// `History.length`: `trace._count - len(trace.inputargs)`.
     ///
     /// Read by the `[interpret]` logs in `JitCodeMachine::run_to_end` and
     /// `compile_and_run_once`, and copied onto `DispatchError::TraceTooLong`
@@ -3347,13 +3403,13 @@ impl TraceCtx {
     /// frames or raise exceptions. Must be followed by `GUARD_NOT_FORCED`.
     pub fn call_may_force_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
-        self.call_may_force_int_typed(func_ptr, args, &arg_types)
+        self.call_may_force_int_typed(func_ptr, args, &arg_types, None)
     }
 
     /// Record a ref-returning call to a may-force function.
     pub fn call_may_force_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
-        self.call_may_force_ref_typed(func_ptr, args, &arg_types)
+        self.call_may_force_ref_typed(func_ptr, args, &arg_types, None)
     }
 
     /// Record a void-returning call to a may-force function.
@@ -3460,6 +3516,19 @@ impl TraceCtx {
         args: &[OpRef],
         descr: majit_ir::DescrRef,
     ) -> OpRef {
+        self.record_call_with_descr_value(opcode, func_ptr, args, descr, None)
+    }
+
+    /// `pyjitpl.py execute_and_record_varargs` → `history.record(..., resvalue)`
+    /// so the box is born with the executed result (`History._make_op(pos, value)`).
+    pub(crate) fn record_call_with_descr_value(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        descr: majit_ir::DescrRef,
+        value: Option<Value>,
+    ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let call_args = call_arg_boxes(func_ref, args);
         if let Some(call_descr) = descr.as_call_descr() {
@@ -3478,7 +3547,7 @@ impl TraceCtx {
             );
         }
         self.recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone())
+            .record_op_with_descr_value(opcode, &call_args, descr.clone(), value)
     }
 
     pub fn call_void_typed(&mut self, func_ptr: *const (), args: &[OpRef], arg_types: &[Type]) {
@@ -3784,14 +3853,14 @@ impl TraceCtx {
         )
     }
 
-    // ── conditional_call / record_known_result (jtransform.py _rewrite_op_cond_call, 292) ──
+    // ── conditional_call / record_known_result (jtransform.py _rewrite_op_cond_call) ──
 
     /// RPython pyjitpl.py opimpl_conditional_call_ir_v: emit CondCallN.
     ///
-    /// `slot` carries the per-callee `EffectInfo` classification produced
-    /// by the macro-time analyzer-equivalent at
-    /// `pyre-jit/src/jit/codewriter.rs::register_helper_fn_pointers`,
-    /// mirroring `call.py getcalldescr`'s analyzer chain output.
+    /// Leftover `opimpl_cond_call_void` still classifies the callee through
+    /// `JitCallTarget.effect_info_slot` (`call.py getcalldescr` extraeffect
+    /// without a decoded `d` operand). Canonical `opimpl_conditional_call_ir_v`
+    /// records the pool descr via [`Self::cond_call_void_typed_with_descr`].
     pub fn cond_call_void_typed(
         &mut self,
         condition: OpRef,
@@ -3800,16 +3869,34 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) {
+        let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
+        self.cond_call_void_typed_with_descr(condition, func_ptr, args, descr);
+    }
+
+    /// `pyjitpl.py MIFrame.opimpl_conditional_call_ir_v` records `condbox`
+    /// plus the `d` calldescr (`do_conditional_call` → `execute_varargs`).
+    pub fn cond_call_void_typed_with_descr(
+        &mut self,
+        condition: OpRef,
+        func_ptr: *const (),
+        args: &[OpRef],
+        descr: DescrRef,
+    ) {
         // `pyjitpl.py opimpl_conditional_call_ir_v` records `condbox`
         // itself, not a ConstInt snapshot of this iteration's value.
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
         let call_args = call_arg_boxes_prefixed(condition, func_ref, args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallN, &call_args, descr);
     }
 
     /// RPython pyjitpl.py opimpl_conditional_call_value_ir_i: emit CondCallValueI.
+    ///
+    /// Leftover `BC_COND_CALL_VALUE_INT` still rebuilds the descr from a
+    /// target slot. Canonical `BC_CONDITIONAL_CALL_VALUE_IR_I` records the
+    /// pool descr via [`Self::cond_call_value_int_typed_with_descr`].
+    /// `resvalue` is the executor result (`execute_and_record_varargs`
+    /// → `history.record(..., resvalue)` / `_make_op`).
     pub fn cond_call_value_int_typed(
         &mut self,
         value: OpRef,
@@ -3817,12 +3904,31 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         slot: EffectInfoSlot,
+        resvalue: i64,
+    ) -> OpRef {
+        let descr = make_call_descr_from_target_slot(arg_types, Type::Int, slot);
+        self.cond_call_value_int_typed_with_descr(value, func_ptr, args, descr, resvalue)
+    }
+
+    /// `pyjitpl.py MIFrame.opimpl_conditional_call_value_ir_i` records
+    /// `valuebox` plus the `d` calldescr. `resvalue` is born on the
+    /// result box (`history.py History._make_op`).
+    pub fn cond_call_value_int_typed_with_descr(
+        &mut self,
+        value: OpRef,
+        func_ptr: *const (),
+        args: &[OpRef],
+        descr: DescrRef,
+        resvalue: i64,
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let descr = make_call_descr_from_target_slot(arg_types, Type::Int, slot);
         let call_args = call_arg_boxes_prefixed(value, func_ref, args);
-        self.recorder
-            .record_op_with_descr(OpCode::CondCallValueI, &call_args, descr)
+        self.recorder.record_op_with_descr_value(
+            OpCode::CondCallValueI,
+            &call_args,
+            descr,
+            Some(Value::Int(resvalue)),
+        )
     }
 
     /// RPython pyjitpl.py opimpl_conditional_call_value_ir_r: emit CondCallValueR.
@@ -3833,8 +3939,14 @@ impl TraceCtx {
     /// arg must be a `ConstPtr` rather than a `ConstInt`.  Routing the
     /// raw pointer-as-i64 through `get_or_insert` would produce a
     /// `ConstInt` slot that aliases with any int constant of the same
-    /// numeric value (`history.py` `ConstInt` vs `:307 ConstPtr`
+    /// numeric value (`history.py` `ConstInt` vs `ConstPtr`
     /// pin distinct types at construction).
+    ///
+    /// Leftover `BC_COND_CALL_VALUE_REF` still rebuilds the descr from a
+    /// target slot. Canonical `BC_CONDITIONAL_CALL_VALUE_IR_R` records the
+    /// pool descr via [`Self::cond_call_value_ref_typed_with_descr`].
+    /// `resvalue` is the executor result (`execute_and_record_varargs`
+    /// → `history.record(..., resvalue)` / `_make_op`).
     pub fn cond_call_value_ref_typed(
         &mut self,
         value: OpRef,
@@ -3842,15 +3954,32 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         slot: EffectInfoSlot,
+        resvalue: i64,
     ) -> OpRef {
-        // `pyjitpl.py _opimpl_conditional_call_value` records `valuebox`
-        // (a Ref box). The caller must pass that box, not a ConstInt of
-        // this iteration's pointer bits.
-        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Ref, slot);
+        self.cond_call_value_ref_typed_with_descr(value, func_ptr, args, descr, resvalue)
+    }
+
+    /// `pyjitpl.py MIFrame._opimpl_conditional_call_value` records `valuebox`
+    /// (a Ref box) plus the `d` calldescr. The caller must pass that box,
+    /// not a ConstInt of this iteration's pointer bits. `resvalue` is the
+    /// pointer bits of the executed result (`History._make_op`).
+    pub fn cond_call_value_ref_typed_with_descr(
+        &mut self,
+        value: OpRef,
+        func_ptr: *const (),
+        args: &[OpRef],
+        descr: DescrRef,
+        resvalue: i64,
+    ) -> OpRef {
+        let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let call_args = call_arg_boxes_prefixed(value, func_ref, args);
-        self.recorder
-            .record_op_with_descr(OpCode::CondCallValueR, &call_args, descr)
+        self.recorder.record_op_with_descr_value(
+            OpCode::CondCallValueR,
+            &call_args,
+            descr,
+            Some(Value::Ref(majit_ir::GcRef(resvalue as usize))),
+        )
     }
 
     /// RPython pyjitpl.py opimpl_record_known_result_i / _r: emit RecordKnownResult.
@@ -4057,6 +4186,10 @@ impl TraceCtx {
     /// address, potentially distinct from the wrapper at `argboxes[0]`
     /// per `call.py:252-258`).  That shape is implemented by
     /// [`Self::record_release_gil_typed_with_effect`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn call_family_typed(
         &mut self,
         opcode: OpCode,
@@ -4064,22 +4197,23 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         ret_type: Type,
+        value: Option<Value>,
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_may_force_descr(arg_types, ret_type);
         let call_args = call_arg_boxes(func_ref, args);
         // pyjitpl.py `do_residual_call` may-force branch:
-        // `direct_call_may_force` (line 2067) RECORDS first, then
+        // `direct_call_may_force` RECORDS first, then
         // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
-        // runs at line 2072 "based on the CALL_MAY_FORCE operation
-        // executed above in step 2".  This is the inverse of
-        // `_record_helper_varargs`'s invalidate-before-record (line
-        // 2683-2684); CALL_MAY_FORCE_* / CALL_RELEASE_GIL_* /
-        // CALL_ASSEMBLER_* go through this branch and must keep the
-        // record-then-invalidate order.
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // runs "based on the CALL_MAY_FORCE operation executed above
+        // in step 2".  This is the inverse of
+        // `_record_helper_varargs`'s invalidate-before-record;
+        // CALL_MAY_FORCE_* / CALL_RELEASE_GIL_* / CALL_ASSEMBLER_* go
+        // through this branch and must keep the record-then-invalidate
+        // order. `execute_and_record_varargs` → `history.record(..., resvalue)`.
+        let result =
+            self.recorder
+                .record_op_with_descr_value(opcode, &call_args, descr.clone(), value);
         if let Some(call_descr) = descr.as_call_descr() {
             let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
@@ -4110,6 +4244,7 @@ impl TraceCtx {
             args,
             arg_types,
             Type::Void,
+            None,
         );
     }
 
@@ -4120,6 +4255,10 @@ impl TraceCtx {
     /// instead of the static-`EffectInfo` `MetaCallMayForceDescr`, so
     /// `oopspecindex`, `read/write_descrs_*`, and
     /// `call_release_gil_target` survive into the trace IR.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn call_family_typed_with_effect(
         &mut self,
         opcode: OpCode,
@@ -4128,6 +4267,7 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
         effect_info: majit_ir::EffectInfo,
+        value: Option<Value>,
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr =
@@ -4135,9 +4275,10 @@ impl TraceCtx {
         let call_args = call_arg_boxes(func_ref, args);
         // pyjitpl.py:2053-2072 (see `call_family_typed` for rationale):
         // record before invalidate.
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // `execute_and_record_varargs` → `history.record(..., resvalue)`.
+        let result =
+            self.recorder
+                .record_op_with_descr_value(opcode, &call_args, descr.clone(), value);
         if let Some(call_descr) = descr.as_call_descr() {
             let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
@@ -4170,6 +4311,7 @@ impl TraceCtx {
             arg_types,
             Type::Void,
             effect_info,
+            None,
         );
     }
 
@@ -4220,6 +4362,7 @@ impl TraceCtx {
             arg_types,
             Type::Void,
             effect_info,
+            None,
         );
     }
 
@@ -4244,6 +4387,10 @@ impl TraceCtx {
     /// require this shape uniformly; emitting the legacy `[func, args]`
     /// shape for int/float typed release-gil silently mis-routes the
     /// first real arg as the function pointer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
     fn record_release_gil_typed_with_effect(
         &mut self,
         opcode: OpCode,
@@ -4252,6 +4399,7 @@ impl TraceCtx {
         arg_types: &[Type],
         ret_type: Type,
         effect_info: majit_ir::EffectInfo,
+        value: Option<Value>,
     ) -> OpRef {
         // pyjitpl.py:3675-3677:
         //   realfuncaddr, saveerr = effectinfo.call_release_gil_target
@@ -4293,9 +4441,10 @@ impl TraceCtx {
         // step 2 (line 2024/2029/2034/2039), NOT the CALL_RELEASE_GIL_*
         // opnum of the recorded op.  Match upstream by passing the
         // result-typed CALL_MAY_FORCE_* opnum to the invalidation call.
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // `execute_and_record_varargs` → `history.record(..., resvalue)`.
+        let result =
+            self.recorder
+                .record_op_with_descr_value(opcode, &call_args, descr.clone(), value);
         if let Some(call_descr) = descr.as_call_descr() {
             let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
@@ -4378,6 +4527,7 @@ impl TraceCtx {
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
+        value: Option<Value>,
     ) -> OpRef {
         self.call_family_typed(
             OpCode::call_may_force_for_type(Type::Int),
@@ -4385,6 +4535,7 @@ impl TraceCtx {
             args,
             arg_types,
             Type::Int,
+            value,
         )
     }
 
@@ -4393,6 +4544,7 @@ impl TraceCtx {
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
+        value: Option<Value>,
     ) -> OpRef {
         self.call_family_typed(
             OpCode::call_may_force_for_type(Type::Ref),
@@ -4400,13 +4552,14 @@ impl TraceCtx {
             args,
             arg_types,
             Type::Ref,
+            value,
         )
     }
 
     /// Record a float-returning may-force call (CallMayForceF).
     pub fn call_may_force_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
-        self.call_may_force_float_typed(func_ptr, args, &arg_types)
+        self.call_may_force_float_typed(func_ptr, args, &arg_types, None)
     }
 
     pub fn call_may_force_float_typed(
@@ -4414,6 +4567,7 @@ impl TraceCtx {
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
+        value: Option<Value>,
     ) -> OpRef {
         self.call_family_typed(
             OpCode::call_may_force_for_type(Type::Float),
@@ -4421,6 +4575,7 @@ impl TraceCtx {
             args,
             arg_types,
             Type::Float,
+            value,
         )
     }
 
@@ -4482,6 +4637,7 @@ impl TraceCtx {
             arg_types,
             Type::Int,
             effect_info,
+            None,
         )
     }
 
@@ -4506,6 +4662,7 @@ impl TraceCtx {
             arg_types,
             Type::Float,
             effect_info,
+            None,
         )
     }
 
@@ -4638,6 +4795,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         effect_info: majit_ir::EffectInfo,
+        value: Value,
     ) -> OpRef {
         self.call_family_typed_with_effect(
             OpCode::call_may_force_for_type(Type::Int),
@@ -4646,6 +4804,7 @@ impl TraceCtx {
             arg_types,
             Type::Int,
             effect_info,
+            Some(value),
         )
     }
 
@@ -4655,6 +4814,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         effect_info: majit_ir::EffectInfo,
+        value: Value,
     ) -> OpRef {
         self.call_family_typed_with_effect(
             OpCode::call_may_force_for_type(Type::Ref),
@@ -4663,6 +4823,7 @@ impl TraceCtx {
             arg_types,
             Type::Ref,
             effect_info,
+            Some(value),
         )
     }
 
@@ -4672,6 +4833,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         effect_info: majit_ir::EffectInfo,
+        value: Value,
     ) -> OpRef {
         self.call_family_typed_with_effect(
             OpCode::call_may_force_for_type(Type::Float),
@@ -4680,6 +4842,7 @@ impl TraceCtx {
             arg_types,
             Type::Float,
             effect_info,
+            Some(value),
         )
     }
 
@@ -4694,6 +4857,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         effect_info: majit_ir::EffectInfo,
+        value: Value,
     ) -> OpRef {
         self.record_release_gil_typed_with_effect(
             OpCode::call_release_gil_for_type(Type::Int),
@@ -4702,6 +4866,7 @@ impl TraceCtx {
             arg_types,
             Type::Int,
             effect_info,
+            Some(value),
         )
     }
 
@@ -4711,6 +4876,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         effect_info: majit_ir::EffectInfo,
+        value: Value,
     ) -> OpRef {
         self.record_release_gil_typed_with_effect(
             OpCode::call_release_gil_for_type(Type::Float),
@@ -4719,6 +4885,7 @@ impl TraceCtx {
             arg_types,
             Type::Float,
             effect_info,
+            Some(value),
         )
     }
 
@@ -4851,9 +5018,16 @@ impl TraceCtx {
                 const_value,
             );
         }
-        let result = self
-            .recorder
-            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // `execute_and_record_varargs` → `history.record(..., resvalue)`.
+        let resvalue = match ret_type {
+            Type::Int => Some(Value::Int(concrete_resvalue)),
+            Type::Ref => Some(Value::Ref(majit_ir::GcRef(concrete_resvalue as usize))),
+            Type::Float => Some(Value::Float(f64::from_bits(concrete_resvalue as u64))),
+            Type::Void => None,
+        };
+        let result =
+            self.recorder
+                .record_op_with_descr_value(opcode, &call_args, descr.clone(), resvalue);
         // pyjitpl.py:2109 call_loopinvariant_now_known(allboxes, descr, res):
         // store the concrete result so the next iteration's
         // `call_loopinvariant_known_result` returns it without re-executing
@@ -4978,6 +5152,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         result_type: Type,
+        value: Option<Value>,
     ) -> OpRef {
         // `pyjitpl.py do_residual_call` step 5 invalidates on
         // `CALL_MAY_FORCE` with `allboxes` (funcbox + args).
@@ -4989,7 +5164,7 @@ impl TraceCtx {
         let descr =
             crate::call_descr::make_call_assembler_descr(target_arc, arg_types, result_type);
         let opcode = OpCode::call_assembler_for_type(result_type);
-        let result = self.record_op_with_descr(opcode, args, descr);
+        let result = self.record_op_with_descr_value(opcode, args, descr, value);
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         let const_value = |opref: OpRef| match opref.inline_const_to_value() {
             Some(majit_ir::Value::Int(n)) => Some(n),
@@ -5012,34 +5187,61 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) {
-        let _ = self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Void);
+        let _ = self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Void, None);
     }
 
-    pub fn call_assembler_int_arc_typed(
+    /// Record CALL_ASSEMBLER_I with the executed result at construction
+    /// (`history.py History._make_op`).
+    pub fn call_assembler_int_arc_typed_with_value(
         &mut self,
         target_arc: std::sync::Arc<JitCellToken>,
         args: &[OpRef],
         arg_types: &[Type],
+        value: i64,
     ) -> OpRef {
-        self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Int)
+        self.call_assembler_typed_arc(
+            target_arc,
+            args,
+            arg_types,
+            Type::Int,
+            Some(Value::Int(value)),
+        )
     }
 
-    pub fn call_assembler_ref_arc_typed(
+    /// Record CALL_ASSEMBLER_R with the executed result at construction
+    /// (`history.py History._make_op`).
+    pub fn call_assembler_ref_arc_typed_with_value(
         &mut self,
         target_arc: std::sync::Arc<JitCellToken>,
         args: &[OpRef],
         arg_types: &[Type],
+        value: i64,
     ) -> OpRef {
-        self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Ref)
+        self.call_assembler_typed_arc(
+            target_arc,
+            args,
+            arg_types,
+            Type::Ref,
+            Some(Value::Ref(majit_ir::GcRef(value as usize))),
+        )
     }
 
-    pub fn call_assembler_float_arc_typed(
+    /// Record CALL_ASSEMBLER_F with the executed result at construction
+    /// (`history.py History._make_op`).
+    pub fn call_assembler_float_arc_typed_with_value(
         &mut self,
         target_arc: std::sync::Arc<JitCellToken>,
         args: &[OpRef],
         arg_types: &[Type],
+        value: i64,
     ) -> OpRef {
-        self.call_assembler_typed_arc(target_arc, args, arg_types, Type::Float)
+        self.call_assembler_typed_arc(
+            target_arc,
+            args,
+            arg_types,
+            Type::Float,
+            Some(Value::Float(f64::from_bits(value as u64))),
+        )
     }
 
     /// RPython `direct_assembler_call` red-args-only emission
@@ -5085,9 +5287,10 @@ impl TraceCtx {
         target_arc: std::sync::Arc<JitCellToken>,
         args: &[OpRef],
         arg_types: &[Type],
+        value: Option<Value>,
     ) -> OpRef {
         let descr = crate::call_descr::make_call_assembler_descr(target_arc, arg_types, Type::Ref);
-        self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
+        self.record_op_with_descr_value(OpCode::CallAssemblerR, args, descr, value)
     }
 
     /// Emit CALL_ASSEMBLER_N (void), inferring arg types from the current boxes.
@@ -5205,8 +5408,9 @@ impl TraceCtx {
     }
 
     /// Record NEW: allocate a new object described by `descr`.
-    pub fn record_new(&mut self, descr: DescrRef) -> OpRef {
-        self.record_op_with_descr(OpCode::New, &[], descr)
+    /// `value` is the allocated pointer (`execute_and_record` → `history.record(..., resvalue)`).
+    pub fn record_new(&mut self, descr: DescrRef, value: Value) -> OpRef {
+        self.record_op_with_descr_value(OpCode::New, &[], descr, Some(value))
     }
 
     /// Record NEW_WITH_VTABLE: allocate a new object with an explicit vtable pointer.
@@ -5215,13 +5419,19 @@ impl TraceCtx {
     }
 
     /// Record NEW_ARRAY: allocate a new array with the given length.
-    pub fn record_new_array(&mut self, length: OpRef, descr: DescrRef) -> OpRef {
-        self.record_op_with_descr(OpCode::NewArray, &[length], descr)
+    /// `value` is the allocated pointer (`execute_and_record` → `history.record(..., resvalue)`).
+    pub fn record_new_array(&mut self, length: OpRef, descr: DescrRef, value: Value) -> OpRef {
+        self.record_op_with_descr_value(OpCode::NewArray, &[length], descr, Some(value))
     }
 
     /// Record NEW_ARRAY_CLEAR: allocate a zero-initialized array.
-    pub fn record_new_array_clear(&mut self, length: OpRef, descr: DescrRef) -> OpRef {
-        self.record_op_with_descr(OpCode::NewArrayClear, &[length], descr)
+    pub fn record_new_array_clear(
+        &mut self,
+        length: OpRef,
+        descr: DescrRef,
+        value: Value,
+    ) -> OpRef {
+        self.record_op_with_descr_value(OpCode::NewArrayClear, &[length], descr, Some(value))
     }
 
     /// Record VIRTUAL_REF_R: create a virtual reference (ref-typed result).
@@ -5326,7 +5536,7 @@ mod history_record_tests {
     use crate::recorder::Trace;
     use crate::trace_ctx::TraceCtx;
     use majit_backend::JitCellToken;
-    use majit_ir::{OpCode, OpRef, Type};
+    use majit_ir::{OpCode, OpRef, Type, Value};
 
     extern "C" fn dummy_call_target() {}
 
@@ -5398,6 +5608,7 @@ mod history_record_tests {
             dummy_call_target as *const (),
             &args,
             &[Type::Ref, Type::Float, Type::Int],
+            None,
         );
         let (arg_types, opcode) = take_single_call_descr(ctx, &args);
         assert_eq!(opcode, OpCode::CallMayForceR);
@@ -5505,5 +5716,44 @@ mod history_record_tests {
         assert_eq!(call_descr.arg_types(), &[Type::Ref]);
         assert_eq!(call_descr.call_target_token(), Some(999));
         assert_eq!(call_descr.call_virtualizable_index(), Some(0));
+    }
+
+    /// `execute_and_record_varargs` records COND_CALL_VALUE with the
+    /// executor's resvalue (`history.py History._make_op`). A later op
+    /// that reads the result box (`IntFrontendOp.getint`) needs that
+    /// payload at construction; recording without it leaves
+    /// `lookup_opref_concrete` empty.
+    #[test]
+    fn cond_call_value_int_result_box_carries_executed_value_for_later_op() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Int]);
+        let value_box = OpRef::input_arg_int(0);
+        let executed = 41i64;
+        let result = ctx.cond_call_value_int_typed(
+            value_box,
+            dummy_call_target as *const (),
+            &[],
+            &[],
+            crate::call_descr::EffectInfoSlot::ElidableCannotRaise,
+            executed,
+        );
+        assert_eq!(
+            ctx.lookup_opref_concrete(result),
+            Some(Value::Int(executed)),
+            "COND_CALL_VALUE_I must be born with the executor result"
+        );
+        let later = ctx.record_op_with_value(
+            OpCode::IntAdd,
+            &[result, OpRef::const_int(1)],
+            Some(Value::Int(executed + 1)),
+        );
+        assert_eq!(
+            ctx.box_bits(result),
+            Some(executed),
+            "later INT_ADD reads the COND_CALL_VALUE result box"
+        );
+        assert_eq!(
+            ctx.lookup_opref_concrete(later),
+            Some(Value::Int(executed + 1))
+        );
     }
 }

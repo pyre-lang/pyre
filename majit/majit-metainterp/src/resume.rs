@@ -10,6 +10,7 @@ use indexmap::{IndexMap, IndexSet};
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 use std::cell::UnsafeCell;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use majit_backend::{
@@ -6062,6 +6063,37 @@ pub struct ResumeDataDirectReader<'a> {
     pub virtualizable_ptr: i64,
 }
 
+/// Holds `&mut ResumeDataDirectReader` while `self.deadframe` is a
+/// resume GCREF root. `resume.py` `ResumeDataDirectReader.__init__`
+/// traces the field; the borrow keeps the reader from moving while
+/// the collector can rewrite it in place.
+#[must_use]
+pub struct DeadframeRootGuard<'r, 'a> {
+    reader: &'r mut ResumeDataDirectReader<'a>,
+}
+
+impl Drop for DeadframeRootGuard<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(depth) = self.reader.deadframe_root_base_depth.take() {
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
+    }
+}
+
+impl<'a> Deref for DeadframeRootGuard<'_, 'a> {
+    type Target = ResumeDataDirectReader<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        self.reader
+    }
+}
+
+impl<'a> DerefMut for DeadframeRootGuard<'_, 'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.reader
+    }
+}
+
 /// resume.py:1433-1456 CPU allocation interface for virtual materialization.
 ///
 /// ResumeDataDirectReader calls these methods when TAGVIRTUAL values
@@ -6304,6 +6336,20 @@ fn llmodel_alloc(type_id: u32, size: usize) -> i64 {
     ptr as i64
 }
 
+/// descr.py `unpack_interiorfielddescr`: `(ofs, itemsize, fieldsize)`
+/// with `ofs = arraydescr.basesize + fielddescr.offset`. The store then
+/// adds `itemindex * itemsize` (`llmodel.py bh_setinteriorfield_gc_*`).
+fn unpack_interiorfielddescr(descr: &majit_ir::DescrRef) -> Option<(usize, usize, usize)> {
+    let ifd = descr.as_interior_field_descr()?;
+    let ad = ifd.array_descr();
+    let fd = ifd.field_descr();
+    Some((
+        ad.base_size().wrapping_add(fd.offset()),
+        ad.item_size(),
+        fd.field_size(),
+    ))
+}
+
 impl BlackholeAllocator for LlmodelBlackholeAllocator {
     fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
         let Some(sd) = descr.as_size_descr() else {
@@ -6453,6 +6499,137 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
                 ofs,
                 f64::from_bits(value as u64),
             );
+        }
+    }
+
+    fn bh_setinteriorfield_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        // llmodel.py AbstractLLCPU.bh_setinteriorfield_gc_i:
+        // unpack_arraydescr_size + unpack_fielddescr_size, then
+        // ofs += itemindex * itemsize + field_offset.
+        let Some((ofs, itemsize, fieldsize)) = unpack_interiorfielddescr(descr) else {
+            return;
+        };
+        let ofs = ofs.wrapping_add(index.wrapping_mul(itemsize));
+        unsafe {
+            majit_backend::llmodel::write_int_at_mem(array as usize, ofs, fieldsize, value);
+        }
+    }
+
+    fn bh_setinteriorfield_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        // llmodel.py AbstractLLCPU.bh_setinteriorfield_gc_r:
+        // ofs = basesize + itemindex * itemsize + fielddescr.offset.
+        let Some((ofs, itemsize, _)) = unpack_interiorfielddescr(descr) else {
+            return;
+        };
+        let ofs = ofs.wrapping_add(index.wrapping_mul(itemsize));
+        // Barrier first: same as `bh_setarrayitem_gc_r` on this allocator.
+        majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
+        unsafe {
+            majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize);
+        }
+    }
+
+    fn bh_setinteriorfield_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
+        // llmodel.py AbstractLLCPU.bh_setinteriorfield_gc_f:
+        // ofs = basesize + itemindex * itemsize + fielddescr.offset.
+        let Some((ofs, itemsize, _)) = unpack_interiorfielddescr(descr) else {
+            return;
+        };
+        let ofs = ofs.wrapping_add(index.wrapping_mul(itemsize));
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem(
+                array as usize,
+                ofs,
+                f64::from_bits(value as u64),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod llmodel_interiorfield_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn llmodel_allocator_setinteriorfield_writes_memory() {
+        let allocator = LlmodelBlackholeAllocator;
+        let arr = Arc::new(majit_ir::descr::SimpleArrayDescr::with_flag(
+            0,
+            16,
+            24,
+            0,
+            majit_ir::Type::Int,
+            majit_ir::ArrayFlag::Struct,
+        ));
+        let int_fd: Arc<dyn majit_ir::FieldDescr> = Arc::new(majit_ir::SimpleFieldDescr::new(
+            0,
+            0,
+            8,
+            majit_ir::Type::Int,
+            false,
+        ));
+        let ref_fd: Arc<dyn majit_ir::FieldDescr> = Arc::new(majit_ir::SimpleFieldDescr::new(
+            1,
+            8,
+            8,
+            majit_ir::Type::Ref,
+            false,
+        ));
+        let float_fd: Arc<dyn majit_ir::FieldDescr> = Arc::new(majit_ir::SimpleFieldDescr::new(
+            2,
+            16,
+            8,
+            majit_ir::Type::Float,
+            false,
+        ));
+        let int_d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            0,
+            arr.clone(),
+            int_fd,
+        ));
+        let ref_d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            1,
+            arr.clone(),
+            ref_fd,
+        ));
+        let float_d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            2,
+            arr.clone(),
+            float_fd,
+        ));
+        let arraydescr: majit_ir::DescrRef = arr;
+        let ptr = allocator.bh_new_array_clear(1, &arraydescr);
+        assert_ne!(ptr, 0);
+        allocator.bh_setinteriorfield_gc_i(ptr, 0, 7, &int_d);
+        allocator.bh_setinteriorfield_gc_r(ptr, 0, 0xBEEF, &ref_d);
+        allocator.bh_setinteriorfield_gc_f(ptr, 0, 1.5f64.to_bits() as i64, &float_d);
+        let base = ptr as usize;
+        unsafe {
+            assert_eq!((base.wrapping_add(16) as *const i64).read_unaligned(), 7);
+            assert_eq!(
+                (base.wrapping_add(24) as *const usize).read_unaligned(),
+                0xBEEF
+            );
+            assert_eq!((base.wrapping_add(32) as *const f64).read_unaligned(), 1.5);
         }
     }
 }
@@ -7022,22 +7199,23 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// Root `self.deadframe` after the reader sits in its final stack
-    /// slot. `resume.py` traces the GCREF field; a collection during
-    /// `consume_one_section` / virtual allocate forwards it in place.
-    /// Call once the value will not move. Off-heap and Slice arms skip.
-    pub fn bind_deadframe_root(&mut self) {
-        if !self.deadframe_on_heap
-            || self.deadframe == 0
-            || self.deadframe_root_base_depth.is_some()
+    /// slot. `resume.py` `ResumeDataDirectReader.__init__` traces the
+    /// GCREF field; a collection during `consume_one_section` / virtual
+    /// allocate forwards it in place. The returned guard holds `&mut
+    /// self` so the reader cannot move while registered. Off-heap and
+    /// Slice arms skip the push; the guard still borrows the reader.
+    #[must_use]
+    pub fn bind_deadframe_root(&mut self) -> DeadframeRootGuard<'_, 'a> {
+        if self.deadframe_on_heap && self.deadframe != 0 && self.deadframe_root_base_depth.is_none()
         {
-            return;
+            self.deadframe_root_base_depth = Some(majit_gc::shadow_stack::resume_ref_roots_depth());
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+                    &mut self.deadframe,
+                ));
+            }
         }
-        self.deadframe_root_base_depth = Some(majit_gc::shadow_stack::resume_ref_roots_depth());
-        unsafe {
-            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
-                &mut self.deadframe,
-            ));
-        }
+        DeadframeRootGuard { reader: self }
     }
 
     /// `llmodel.py get_int_value` / `get_ref_value`: `_decode_pos` then
@@ -7738,12 +7916,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         let all_liveness: &[u8] = self.all_liveness;
 
         // jitcode.py `enumerate_vars` — three length bytes.
-        // `ord(all_liveness[offset])` after translation is an `rffi` load;
-        // a truncated record is a producer bug.
-        debug_assert!(info + 2 < all_liveness.len());
-        let length_i = unsafe { *all_liveness.get_unchecked(info) } as u32;
-        let length_r = unsafe { *all_liveness.get_unchecked(info + 1) } as u32;
-        let length_f = unsafe { *all_liveness.get_unchecked(info + 2) } as u32;
+        // `ord(all_liveness[offset])` after translation is an `rffi` load.
+        // Validate the header once at section start; bank walks are then
+        // unchecked under `LivenessIterator::new`.
+        let length_i = all_liveness[info] as u32;
+        let length_r = all_liveness[info + 1] as u32;
+        let length_f = all_liveness[info + 2] as u32;
         // jitcode.py:152
         let mut offset = info + 3;
 
@@ -7754,9 +7932,11 @@ impl<'a> ResumeDataDirectReader<'a> {
         let vinfo_heap = vinfo.filter(|v| v.has_vable_token());
         // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
-            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            // SAFETY: `all_liveness` bank at `offset` is a complete
+            // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_i, all_liveness) };
             // jitcode.py `enumerate_vars`: `for index in it: callback_i(index)`.
-            while it.length != 0 {
+            while it.remaining() != 0 {
                 // SAFETY: `it` walks a complete `all_liveness` bank
                 // (`liveness.py` `LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
@@ -7770,12 +7950,13 @@ impl<'a> ResumeDataDirectReader<'a> {
                 let value = self.next_live_int(&bh.jitcode.name, bh.position, reg_idx);
                 bh.registers_i[reg_idx as usize] = value;
             }
-            offset = it.offset;
+            offset = it.offset();
         }
         // resume.py `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
-            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            while it.length != 0 {
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
+            while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
@@ -7791,12 +7972,13 @@ impl<'a> ResumeDataDirectReader<'a> {
                     vinfo.push_resume_ref_roots_for_value(value);
                 }
             }
-            offset = it.offset;
+            offset = it.offset();
         }
         // resume.py `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
-            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            while it.length != 0 {
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
+            while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
@@ -7839,18 +8021,22 @@ impl<'a> ResumeDataDirectReader<'a> {
         // free to take `&mut self`.
         let all_liveness: &[u8] = self.all_liveness;
 
-        // jitcode.py `enumerate_vars` — three length bytes. `ord(all_liveness[offset])`.
-        debug_assert!(info + 2 < all_liveness.len());
-        let length_i = unsafe { *all_liveness.get_unchecked(info) } as u32;
-        let length_r = unsafe { *all_liveness.get_unchecked(info + 1) } as u32;
-        let length_f = unsafe { *all_liveness.get_unchecked(info + 2) } as u32;
+        // jitcode.py `enumerate_vars` — three length bytes.
+        // `ord(all_liveness[offset])` after translation is an `rffi` load.
+        // Validate the header once at section start; bank walks are then
+        // unchecked under `LivenessIterator::new`.
+        let length_i = all_liveness[info] as u32;
+        let length_r = all_liveness[info + 1] as u32;
+        let length_f = all_liveness[info + 2] as u32;
         // jitcode.py:152
         let mut offset = info + 3;
 
         // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
-            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-            while it.length != 0 {
+            // SAFETY: `all_liveness` bank at `offset` is a complete
+            // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_i, all_liveness) };
+            while it.remaining() != 0 {
                 // SAFETY: `it` walks a complete `all_liveness` bank
                 // (`liveness.py` `LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
@@ -7864,12 +8050,13 @@ impl<'a> ResumeDataDirectReader<'a> {
                 let value = self.next_live_int(jitcode_name, pc, reg_idx);
                 cb(majit_ir::Type::Int, reg_idx, value);
             }
-            offset = it.offset;
+            offset = it.offset();
         }
         // resume.py `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
-            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            while it.length != 0 {
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
+            while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
@@ -7882,12 +8069,13 @@ impl<'a> ResumeDataDirectReader<'a> {
                 let value = self.next_live_ref(jitcode_name, pc, reg_idx);
                 cb(majit_ir::Type::Ref, reg_idx, value);
             }
-            offset = it.offset;
+            offset = it.offset();
         }
         // resume.py `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
-            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            while it.length != 0 {
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
+            while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
@@ -9326,30 +9514,36 @@ where
     // replay its heap writes.
     let empty_pending = rd_guard_pendingfields.is_none_or(|p| p.is_empty());
     let empty_virtuals = rd_virtuals.is_none_or(|v| v.is_empty());
+    let skip_prepare = !resuming_after_guard_not_forced && empty_virtuals && empty_pending;
+    if skip_prepare {
+        // regex leaf: nvirtuals=0 and no pending fields. Skip the
+        // empty `VirtualCache` root and the pending-field walk.
+        // `resumecode.py` `Reader.next_item` / `numb_next_item` load
+        // `numb.code[index]`. `incminimark.py` never moves old objects;
+        // after the first minor, `collect_young_numberings`
+        // (`collect_oldrefs_to_nursery`) has promoted
+        // `compile.py` `ResumeGuardDescr.rd_numb`. A still-young cell
+        // stays on `YOUNG_NUMBERINGS` and can move; pin only when the
+        // cell cannot. `consume_vref_and_vable` may allocate
+        // (`write_from_resume_data_partial`); re-stabilize after it.
+        resumereader.resumecodereader.mark_payload_stable();
+    }
+    // `resume.py` traces `self.deadframe`; bind so a collection
+    // forwards the field. The guard keeps the reader from moving.
+    let mut resumereader = resumereader.bind_deadframe_root();
     let _resume_roots = if resuming_after_guard_not_forced {
         // Virtuals already live in the cache; a collection during
         // consume still forwards `self.deadframe`.
-        resumereader.bind_deadframe_root();
         Some(prepare_resume_heap_with_roots(
-            &mut resumereader,
+            &mut *resumereader,
             None,
             None,
         ))
-    } else if empty_virtuals && empty_pending {
-        // regex leaf: nvirtuals=0 and no pending fields. Skip the
-        // empty `VirtualCache` root and the pending-field walk.
-        // `resumecode.py` `Reader.code` is that numbering pointer:
-        // `numb_next_item` indexes it without a side-cell reload.
-        // `consume_vref_and_vable` still runs and may allocate
-        // (`write_from_resume_data_partial`); bind so a collection
-        // forwards `self.deadframe` (`resume.py` traces the field).
-        resumereader.resumecodereader.mark_payload_stable();
-        resumereader.bind_deadframe_root();
+    } else if skip_prepare {
         None
     } else {
-        resumereader.bind_deadframe_root();
         Some(prepare_resume_heap_with_roots(
-            &mut resumereader,
+            &mut *resumereader,
             rd_virtuals,
             rd_guard_pendingfields,
         ))
@@ -9357,6 +9551,17 @@ where
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);
+    if skip_prepare {
+        resumereader.resumecodereader.mark_payload_stable();
+        #[cfg(debug_assertions)]
+        if let Some(numb) = numb_root {
+            debug_assert!(
+                !resumereader.resumecodereader.payload_is_stable() || !numb.is_young(),
+                "Reader.code pin requires an old or host numbering \
+                 (incminimark.py / collect_oldrefs_to_nursery)"
+            );
+        }
+    }
     drop(_cc_guard);
 
     // consume_vable_info rooted `virtualizable_ptr` before restoring any
@@ -9496,7 +9701,7 @@ pub fn force_from_resumedata<'a>(
         None,
         allocator,
     );
-    resumereader.bind_deadframe_root();
+    let mut resumereader = resumereader.bind_deadframe_root();
     if let Some(numb) = numb_root {
         resumereader.resumecodereader.bind_numbering(numb);
     }
@@ -9510,7 +9715,7 @@ pub fn force_from_resumedata<'a>(
     // triggered while materializing virtual N leaves every virtual already
     // written for N-1 pointing into from-space, and a major sweeps them.
     let _resume_roots =
-        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, rd_guard_pendingfields);
+        prepare_resume_heap_with_roots(&mut *resumereader, rd_virtuals, rd_guard_pendingfields);
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);

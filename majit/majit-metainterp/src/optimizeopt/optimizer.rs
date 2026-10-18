@@ -3569,32 +3569,37 @@ impl Optimizer {
         // `optimize_peeled_loop` (compile.py) chain walk reaches it
         // via `partial_trace.operations`.
         //
-        // pyre's per-iter `TraceIterator::next()` (`opencoder.rs`)
-        // pushes a fresh resop operand slot for every visited op
-        // BEFORE the optimizer pipeline decides whether to emit. Two
-        // categories of slot escape the `new_operations` carry above
-        // and need explicit handling so retrace sees the same
-        // `Forwarded::Op(_)` chain targets Phase 1 installed:
-        //
-        //   - Unbound orphan: the pipeline folded/dropped the op so
-        //     `ctx.emit` never ran. Synthesize a `SameAs` stand-in
-        //     and bind the slot.
-        //   - Synthetic-bound: a forward reference reached `materialize_operand_at`
-        //     first; `materialize_operand_at` minted a `SameAs` stand-in into
-        //     `ctx.resop_refs[idx]` and `bind_op`'ed it. When `emit`
-        //     never arrived to upgrade the binding to a real producer,
-        //     the stand-in itself is the chain target carrier.
-        //
-        // In both cases the stand-in OpRc must travel into
-        // `phase1_emit_ops` (and from there into
-        // `ExportedState.partial_trace_operations`) so retrace reads it as
-        // part of the partial trace.
-        // `live_synthetics` is the incrementally-maintained set of synthetic
-        // stand-ins (mint_synthetic_resop / bind_input_resops) whose position
-        // was never superseded by an `emit` — the box-bound-to-synthetic
-        // producers that must travel into `phase1_emit_ops`. Positions that
-        // were never synthesized carry no producer, so nothing else needs
-        // draining here.
+        // Never-emitted recorder ops come from the iterator's op list
+        // (`opencoder.py TraceIterator._cache`), not a side map. Skip
+        // positions already in `new_operations` and recorder ops that
+        // `install_canonical_producer` / `mint_synthetic_resop` replaced
+        // as the `resop_refs` host — those replacements live in
+        // `live_synthetics` below.
+        for op in ops {
+            let pos = op.pos().get();
+            if pos.is_none() || pos.is_constant() {
+                continue;
+            }
+            if matches!(
+                pos,
+                OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+            ) {
+                continue;
+            }
+            if ctx.new_operations_index.contains_key(&pos) {
+                continue;
+            }
+            if !ctx
+                .resop_refs
+                .get(&pos)
+                .is_some_and(|canonical| OpRc::ptr_eq(canonical, op))
+            {
+                continue;
+            }
+            self.phase1_emit_ops.push(op.clone());
+        }
+        // Remaining `mint_synthetic_resop` / extra-producer stand-ins
+        // that were never superseded by an emit.
         self.phase1_emit_ops
             .extend(ctx.live_synthetics.iter().cloned());
         // Transfer exported virtual state from context to optimizer

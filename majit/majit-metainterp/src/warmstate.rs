@@ -2944,17 +2944,19 @@ impl WarmEnterState {
                 // when the chain holds one occupant. A 64-bit `get_uhash`
                 // collision with a different green key must miss.
                 Some(make_key) if !cell.comparekey_matches(&make_key()) => {
-                    let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
-                    (cell_key, self.cell_by_key(cell_key))
+                    // `JitCell.get_jitcell` returns None after the
+                    // comparekey chain is exhausted. Do not recover the
+                    // mismatching occupant via `unwrap_or(hash)`.
+                    (hash, None)
                 }
                 _ => (cell_key, Some(cell)),
             },
             (0, _) => (hash, cell_named_by_hash()),
             _ => match make_key {
-                Some(make_key) => {
-                    let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
-                    (cell_key, self.cell_by_key(cell_key))
-                }
+                Some(make_key) => match self.cell_key_for(&make_key()) {
+                    Some(cell_key) => (cell_key, self.cell_by_key(cell_key)),
+                    None => (hash, None),
+                },
                 None => (hash, cell_named_by_hash()),
             },
         }
@@ -5288,15 +5290,28 @@ mod tests {
     }
 
     /// `JitCell.get_jitcell`: a unique hash occupant is still accepted
-    /// only after `comparekey`. A different green key under the same
-    /// lookup hash must miss.
+    /// only after `comparekey`. A different green key with the same
+    /// `get_uhash` must miss even when the occupant already holds an
+    /// executable token.
     #[test]
     fn unique_hash_candidate_still_compares_greens() {
         let mut ws = WarmEnterState::new(100);
-        let key_hit = GreenKey::new(vec![1, 2]);
-        let key_miss = GreenKey::new(vec![3, 4]);
-        ws.ensure_cell_for_key(&key_hit);
+        // Closed-form `get_uhash` collision: Int greens `[1, 0]` and
+        // `[2, 13080698639]` fold to the same u64.
+        let key_hit = GreenKey::new(vec![1, 0]);
+        let key_miss = GreenKey::new(vec![2, 13080698639]);
         let hash = key_hit.get_uhash();
+        assert_eq!(
+            hash,
+            key_miss.get_uhash(),
+            "fixture is a full-hash collision"
+        );
+        ws.ensure_cell_for_key(&key_hit);
+        attach_alive_for_key(
+            &mut ws,
+            &key_hit,
+            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+        );
         assert!(
             ws.lookup_chain(hash)
                 .expect("installed")
@@ -5305,11 +5320,16 @@ mod tests {
                 .is_none(),
             "test needs a unique occupant"
         );
+        assert!(
+            ws.resolved_cell_procedure_token(hash, Some(&|| key_hit.clone()))
+                .1
+                .is_some(),
+            "occupant holds an executable token"
+        );
 
         let (_cell_key, cell) = ws.resolved_cell(hash, Some(&|| key_miss.clone()));
         assert!(
-            cell.as_ref()
-                .is_none_or(|c| !c.comparekey_matches(&key_miss)),
+            cell.is_none(),
             "unique hash occupant must not win without comparekey"
         );
 
@@ -5323,7 +5343,7 @@ mod tests {
         let (_cell_key, token) = ws.resolved_cell_procedure_token(hash, Some(&|| key_miss.clone()));
         assert!(
             token.is_none(),
-            "unchained shortcut must not accept a comparekey miss"
+            "comparekey miss must not recover the occupant's token"
         );
     }
 

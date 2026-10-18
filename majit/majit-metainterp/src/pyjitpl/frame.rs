@@ -1075,7 +1075,9 @@ impl MIFrame {
         // corresponding `ConstInt` box — matching what RPython's
         // `copy_constants` + `registers_i[index]` lookup would return.
         if length_i > 0 {
-            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            // SAFETY: `all_liveness` bank at `offset` is a complete
+            // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_i, all_liveness) };
             for index in it.by_ref() {
                 let idx = index as usize;
                 let b = if Some(idx) == clear_int_idx {
@@ -1086,14 +1088,15 @@ impl MIFrame {
                 };
                 trace._add_box_to_storage_box(b);
             }
-            offset = it.offset;
+            offset = it.offset();
         }
 
         // pyjitpl.py `get_list_of_active_boxes` — push live ref registers.
         // `add_box_to_storage(self.registers_r[index])`: constants live
         // in the same file after `copy_constants`.
         if length_r > 0 {
-            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
             for index in it.by_ref() {
                 let idx = index as usize;
                 let b = if Some(idx) == clear_ref_idx {
@@ -1104,12 +1107,13 @@ impl MIFrame {
                 };
                 trace._add_box_to_storage_box(b);
             }
-            offset = it.offset;
+            offset = it.offset();
         }
 
         // pyjitpl.py:228-233 — push live float registers.
         if length_f > 0 {
-            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
             for index in it.by_ref() {
                 let idx = index as usize;
                 let b = if Some(idx) == clear_float_idx {
@@ -1120,7 +1124,7 @@ impl MIFrame {
                 };
                 trace._add_box_to_storage_box(b);
             }
-            let _ = it.offset; // offset no longer read after the last bank
+            let _ = it.offset(); // offset no longer read after the last bank
         }
 
         storage
@@ -1218,7 +1222,9 @@ impl MIFrame {
         let num_regs_f = self.jitcode.c_num_regs_f as usize;
 
         if length_i > 0 {
-            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            // SAFETY: `all_liveness` bank at `offset` is a complete
+            // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_i, all_liveness) };
             for index in it.by_ref() {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_int_idx {
@@ -1246,11 +1252,12 @@ impl MIFrame {
                 };
                 boxes.push(tagged);
             }
-            offset = it.offset;
+            offset = it.offset();
         }
 
         if length_r > 0 {
-            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
             for index in it.by_ref() {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_ref_idx {
@@ -1260,11 +1267,12 @@ impl MIFrame {
                 };
                 boxes.push(tagged);
             }
-            offset = it.offset;
+            offset = it.offset();
         }
 
         if length_f > 0 {
-            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+            // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
             for index in it {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_float_idx {

@@ -1252,21 +1252,25 @@ pub fn enumerate_vars_by_bank(
     let length_f = all_liveness[offset + 2] as u32;
     offset += 3;
     if length_i != 0 {
-        let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+        // SAFETY: `all_liveness` bank at `offset` is a complete
+        // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_i, all_liveness) };
         for index in &mut it {
             callback(majit_ir::Type::Int, index);
         }
-        offset = it.offset;
+        offset = it.offset();
     }
     if length_r != 0 {
-        let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
         for index in &mut it {
             callback(majit_ir::Type::Ref, index);
         }
-        offset = it.offset;
+        offset = it.offset();
     }
     if length_f != 0 {
-        let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
         for index in &mut it {
             callback(majit_ir::Type::Float, index);
         }

@@ -126,11 +126,13 @@ pub fn decode_liveness_records(all_liveness: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Ve
                 // consumes none either.
                 continue;
             }
-            let mut it = LivenessIterator::new(pos, u32::from(count), all_liveness);
+            // SAFETY: `decode_liveness_records` walks assembler records;
+            // each bank is an `encode_liveness` bitset (`LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(pos, u32::from(count), all_liveness) };
             for index in it.by_ref() {
                 sets[bank].push(index as u8);
             }
-            pos = it.offset;
+            pos = it.offset();
         }
         let [live_i, live_r, live_f] = sets;
         records.push((live_i, live_r, live_f, offset));
@@ -144,17 +146,27 @@ pub fn decode_liveness_records(all_liveness: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Ve
 /// starting at `offset`, producing `length` indices total.
 #[derive(Debug, Clone)]
 pub struct LivenessIterator<'a> {
-    pub all_liveness: &'a [u8],
-    pub offset: usize,
-    pub length: u32,
-    pub curr_byte: u32,
-    pub count: u32,
+    all_liveness: &'a [u8],
+    offset: usize,
+    length: u32,
+    curr_byte: u32,
+    count: u32,
 }
 
 impl<'a> LivenessIterator<'a> {
     /// RPython liveness.py `__init__(self, offset, length, all_liveness)`.
-    pub fn new(offset: usize, length: u32, all_liveness: &'a [u8]) -> Self {
+    ///
+    /// # Safety
+    /// `all_liveness[offset..]` holds a complete encoded bank of `length`
+    /// set bits (`encode_liveness` / assembler `all_liveness`).
+    /// `LivenessIterator.next` does `ord(all_liveness[self.offset])`.
+    /// A truncated buffer is a producer bug.
+    pub unsafe fn new(offset: usize, length: u32, all_liveness: &'a [u8]) -> Self {
         assert!(length != 0);
+        assert!(
+            offset < all_liveness.len(),
+            "liveness bank offset past all_liveness"
+        );
         LivenessIterator {
             all_liveness,
             offset,
@@ -162,6 +174,18 @@ impl<'a> LivenessIterator<'a> {
             curr_byte: 0,
             count: 0,
         }
+    }
+
+    /// `LivenessIterator.offset` after a bank walk (`enumerate_vars`).
+    #[inline(always)]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Remaining set bits (`self.length` after `if not self.length`).
+    #[inline(always)]
+    pub fn remaining(&self) -> u32 {
+        self.length
     }
 
     /// liveness.py `next` after `if not self.length: raise StopIteration`.
@@ -220,9 +244,8 @@ impl<'a> Iterator for LivenessIterator<'a> {
         if self.length == 0 {
             return None;
         }
-        // SAFETY: `new` is only built for a nonzero bank in a complete
-        // `all_liveness` record, and `length` counts remaining set bits
-        // in that record (`LivenessIterator.next`).
+        // SAFETY: [`Self::new`] requires a complete encoded bank, and
+        // `length` counts remaining set bits (`LivenessIterator.next`).
         Some(unsafe { self.next_index() })
     }
 }
@@ -283,7 +306,8 @@ mod tests {
     fn liveness_iterator_roundtrip() {
         let live = [0u8, 3, 5, 9, 12, 17];
         let encoded = encode_liveness(&live);
-        let mut it = LivenessIterator::new(0, live.len() as u32, &encoded);
+        // SAFETY: `encoded` is `encode_liveness(&live)` (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(0, live.len() as u32, &encoded) };
         let decoded: Vec<u32> = (&mut it).collect();
         assert_eq!(decoded, live.iter().map(|&i| i as u32).collect::<Vec<_>>());
     }
@@ -294,7 +318,9 @@ mod tests {
         let live = [0u8, 16, 23];
         let encoded = encode_liveness(&live);
         assert_eq!(encoded, vec![0x01, 0x00, 0x81]);
-        let decoded: Vec<u32> = LivenessIterator::new(0, live.len() as u32, &encoded).collect();
+        // SAFETY: `encoded` is `encode_liveness(&live)` (`LivenessIterator.__init__`).
+        let decoded: Vec<u32> =
+            unsafe { LivenessIterator::new(0, live.len() as u32, &encoded) }.collect();
         assert_eq!(decoded, vec![0, 16, 23]);
     }
 }

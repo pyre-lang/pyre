@@ -2619,11 +2619,16 @@ impl<'a> RegAlloc<'a> {
         (start, locs.len() as u32)
     }
 
-    /// x86/regalloc.py locs_for_fail
+    /// x86/regalloc.py locs_for_fail. Iterates `guard_op.getfailargs()`
+    /// directly; an absent list skipped `store_final_boxes_in_guard` /
+    /// `ResumeDataVirtualAdder.finish`.
     pub fn locs_for_fail(&mut self, guard_op: &Op) -> (u32, u32) {
-        let Some(fail_args) = guard_op.guard_fail_args() else {
-            return (self.faillocs_arena.len() as u32, 0);
-        };
+        let fail_args = guard_op.guard_fail_args().unwrap_or_else(|| {
+            panic!(
+                "{:?} reached the backend without fail args",
+                guard_op.opcode
+            )
+        });
         let start = self.faillocs_arena.len();
         for arg in fail_args.iter() {
             self.push_failloc(arg.to_opref());
@@ -4551,13 +4556,11 @@ impl<'a> RegAlloc<'a> {
     fn consider_guard_not_forced_2(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let fail_args: Vec<OpRef> = op
             .guard_fail_args()
-            .map(|fa| {
-                fa.iter()
-                    .filter(|arg| !arg.is_none())
-                    .map(|arg| arg.to_opref())
-                    .collect()
-            })
-            .unwrap_or_default();
+            .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode))
+            .iter()
+            .filter(|arg| !arg.is_none())
+            .map(|arg| arg.to_opref())
+            .collect();
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,

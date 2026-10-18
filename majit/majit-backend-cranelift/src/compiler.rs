@@ -9525,9 +9525,9 @@ fn max_opref_raw(inputargs: &[InputArgRc], ops: &[Op]) -> u32 {
 /// the `0xFFFF` marker `rebuild_faillocs_from_descr` skips. An empty
 /// `rd_locs` is the identity fast path: every present fail arg is live.
 fn nonhole_fail_args(op: &Op) -> Vec<OpRef> {
-    let Some(fail_args) = op.getfailargs() else {
-        return Vec::new();
-    };
+    let fail_args = op
+        .getfailargs()
+        .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode));
     let rd = op
         .getdescr()
         .map(|descr| {
@@ -20791,13 +20791,10 @@ fn counter_slot_for(inputargs: &[InputArgRc], ops: &[Op]) -> Option<usize> {
         op.opcode == OpCode::GuardValue && {
             let fail_args: Vec<OpRef> = op
                 .getfailargs()
-                .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
-                .unwrap_or_else(|| {
-                    inputargs
-                        .iter()
-                        .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
-                        .collect()
-                });
+                .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode))
+                .iter()
+                .map(|a| a.to_opref())
+                .collect();
             counter_value_spill(op, &fail_args).is_some()
         }
     });
@@ -20825,10 +20822,13 @@ fn precompute_max_output_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
         }
         let n = if is_finish || is_external_jump {
             op.num_args()
-        } else if let Some(fa) = op.getfailargs() {
-            fa.len()
         } else {
-            num_inputs
+            // x86/regalloc.py locs_for_fail iterates guard_op.getfailargs()
+            // directly. An absent list skipped store_final_boxes_in_guard /
+            // ResumeDataVirtualAdder.finish.
+            op.getfailargs()
+                .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode))
+                .len()
         };
         let n = n + usize::from(op.opcode == OpCode::GuardNotForced2);
         if n > max_slots {
@@ -20902,7 +20902,15 @@ fn collect_guards(
                 infer_fail_arg_types(&refs, &type_index, &type_overrides, op_idx)?
             };
             (refs, types)
-        } else if let Some(fa) = op.getfailargs() {
+        } else {
+            // x86/regalloc.py locs_for_fail iterates guard_op.getfailargs()
+            // directly. Production stamps the list in compile.py
+            // ResumeGuardDescr.store_final_boxes
+            // (store_final_boxes_in_guard). An absent list skipped that
+            // step / ResumeDataVirtualAdder.finish.
+            let fa = op
+                .getfailargs()
+                .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode));
             let refs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
             let __descr_arc_descr_fd = op.getdescr();
             let descr_fd = __descr_arc_descr_fd
@@ -20931,30 +20939,6 @@ fn collect_guards(
                     op_idx,
                 )?,
             };
-            (refs, types)
-        } else {
-            // RPython parity: a guard with no explicit fail_args carries the
-            // current trace inputargs as live boxes. Phase E.2b shifted bridge
-            // inputargs into `[bridge_inputarg_base..)`, so the fallback must
-            // read each `InputArg.index` rather than assuming dense
-            // `[0..num_inputs)`.  The outer match arm at 12399 already handles
-            // `op.fail_args = Some(_)`; this branch is the `None` fallback.
-            // resoperation.py InputArgInt/727/739 InputArg{Int,Float,Ref}.type — the
-            // type for each synthesized fail_arg lives directly on the
-            // InputArg, so mint a typed OpRef per entry.
-            let refs: Vec<OpRef> = inputargs
-                .iter()
-                .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
-                .collect();
-            let fb_descr_arc = op.getdescr();
-            let types = resolve_fail_arg_types(
-                &refs,
-                fb_descr_arc.as_ref().and_then(|d| d.as_fail_descr()),
-                &type_index,
-                &type_overrides,
-                &op_def_positions,
-                op_idx,
-            )?;
             (refs, types)
         };
 
@@ -23986,6 +23970,9 @@ mod tests {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::new(opcode, &bx);
         o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
+        if opcode.is_guard() && o.getfailargs().is_none() {
+            o.setfailargs(vec![].into());
+        }
         OpRc::new(o)
     }
 
@@ -24051,6 +24038,9 @@ mod tests {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
         let o = Op::with_descr(opcode, &bx, descr);
         o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
+        if opcode.is_guard() && o.getfailargs().is_none() {
+            o.setfailargs(vec![].into());
+        }
         OpRc::new(o)
     }
 
@@ -24809,6 +24799,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
+        ops[3].setfailargs(smallvec::smallvec![rb(ia0)]);
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, 1i64);
@@ -26648,9 +26639,11 @@ mod tests {
     fn merge_source_is_none_for_an_excluded_opcode() {
         let mut backend = CraneliftBackend::new();
         let inputargs = vec![InputArg::new_int_rc(0)];
+        let guard = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw()),
+            guard,
             mk_op(
                 OpCode::Finish,
                 &[OpRef::input_arg_int(0)],
@@ -29145,6 +29138,7 @@ mod tests {
             ),
             mk_op(OpCode::Jump, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
+        ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, 0i64);
@@ -29885,6 +29879,10 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
+        ops[4].setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
+        ]);
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, 1i64);
@@ -30132,6 +30130,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
+        ops[3].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, add_one as *const () as i64);
@@ -30192,6 +30191,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
+        ops[5].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, log_char as *const () as i64);
@@ -30882,6 +30882,7 @@ mod tests {
             mk_op(OpCode::GuardNonnull, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
+        ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, 1i64);
@@ -32422,6 +32423,11 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
+        // `x86/regalloc.py` `locs_for_fail` / `compile.py`
+        // `store_final_boxes_in_guard`: the bridge's inputargs are this
+        // guard's fail args, recovered through the faildescr's locations
+        // (`runner_test.py` `operations[3].setfailargs(inputargs[:])`).
+        ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, 0i64); // guard: x > 0
@@ -35901,6 +35907,7 @@ mod tests {
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
+        ops[4].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
 
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, 1i64);

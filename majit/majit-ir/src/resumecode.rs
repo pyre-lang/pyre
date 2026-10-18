@@ -40,20 +40,33 @@ pub fn append_numbering(buf: &mut Vec<u8>, item: i32) {
 
 /// resumecode.py: numb_next_item(numb, index)
 ///
-/// One load of `numb.code[index]` on the one-byte path. A truncated
-/// buffer is a bug in resume data generation and panics through slice
-/// indexing rather than returning 0.
+/// Safe wrapper around the translated `rffi` load. A truncated buffer
+/// panics through slice indexing rather than reading off the end.
 #[inline]
 pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
-    decode_varint_at(buf.as_ptr(), buf.len(), index)
+    let b0 = buf[index];
+    let mut last = index;
+    if b0 & (1 << 7) != 0 {
+        last = index + 1;
+        let b1 = buf[last];
+        if b1 & (1 << 7) != 0 {
+            last = index + 2;
+        }
+    }
+    let _ = buf[last];
+    // SAFETY: `last` is in bounds, so this item's bytes are in `buf`.
+    unsafe { decode_varint_at(buf.as_ptr(), buf.len(), index) }
 }
 
 /// `resumecode.py` `numb_next_item`. `_always_inline_ = True`: the
-/// one-, two-, and three-byte forms are one function. A truncated
-/// buffer is a producer bug; the translated `rffi` load has no length
-/// test. Debug still panics through `varint_oob`.
+/// one-, two-, and three-byte forms are one function.
+///
+/// # Safety
+/// `index` is the start of a complete encoded item in `ptr[..len]`
+/// (`Writer.create_numbering` / `NUMBERING.code`). A truncated buffer
+/// is a producer bug. Debug panics through `varint_oob`.
 #[inline(always)]
-fn decode_varint_at(
+unsafe fn decode_varint_at(
     ptr: *const u8,
     #[cfg_attr(not(debug_assertions), allow(unused_variables))] len: usize,
     index: usize,
@@ -68,11 +81,14 @@ fn decode_varint_at(
         let value = if b0 & 1 != 0 { -1 - b0 } else { b0 };
         return ((value >> 1) as i32, index + 1);
     }
-    decode_varint_rest(ptr, len, index, b0)
+    unsafe { decode_varint_rest(ptr, len, index, b0) }
 }
 
+/// # Safety
+/// Same as [`decode_varint_at`]: `index` starts a two- or three-byte
+/// item that is fully inside `ptr[..len]`.
 #[inline(always)]
-fn decode_varint_rest(
+unsafe fn decode_varint_rest(
     ptr: *const u8,
     #[cfg_attr(not(debug_assertions), allow(unused_variables))] len: usize,
     mut index: usize,
@@ -295,17 +311,37 @@ impl<'a> Reader<'a> {
         reader
     }
 
-    /// Pin `Reader.code` for a walk that does not allocate.
+    /// Pin `Reader.code` when the numbering cannot move.
     ///
     /// `numb_next_item` then indexes this pointer the way translated
     /// `Reader.next_item` indexes `self.code` after the GC map has
-    /// already forwarded it.
+    /// already forwarded it. `incminimark.py` never moves old objects.
+    /// After the first minor, `collect_young_numberings`
+    /// (`collect_oldrefs_to_nursery`) has promoted
+    /// `compile.py` `ResumeGuardDescr.rd_numb` and the payload is old.
+    /// A still-young cell stays on `YOUNG_NUMBERINGS` and the next minor
+    /// rewrites `NumSlot.addr`; those reads keep following the slot.
+    /// Host blocks do not move.
     #[inline]
     pub fn mark_payload_stable(&mut self) {
         if self.slot != 0 {
             self.refresh_from_slot();
+            let slot = unsafe { &*(self.slot as *const NumSlot) };
+            self.stable = slot.host || slot.young_index.load(Ordering::Relaxed) == usize::MAX;
+            #[cfg(debug_assertions)]
+            if self.stable {
+                let (ptr, len) = self.payload_from_slot();
+                debug_assert_eq!(ptr, self.payload_ptr);
+                debug_assert_eq!(len, self.payload_len);
+            }
+        } else {
+            self.stable = true;
         }
-        self.stable = true;
+    }
+
+    #[inline]
+    pub fn payload_is_stable(&self) -> bool {
+        self.stable
     }
 
     #[inline(always)]
@@ -348,7 +384,9 @@ impl<'a> Reader<'a> {
     #[inline(always)]
     fn take_item(&mut self, ptr: *const u8, len: usize) -> i32 {
         let index = self.cur_pos;
-        let (result, new_pos) = decode_varint_at(ptr, len, index);
+        // SAFETY: `payload` is a complete `NUMBERING.code`
+        // (`resumecode.py` `Writer.create_numbering`; `numb_next_item`).
+        let (result, new_pos) = unsafe { decode_varint_at(ptr, len, index) };
         self.cur_pos = new_pos;
         self.items_read += 1;
         result
@@ -381,7 +419,8 @@ impl<'a> Reader<'a> {
     #[inline]
     pub fn peek(&self) -> i32 {
         let (ptr, len) = self.payload();
-        let (result, _) = decode_varint_at(ptr, len, self.cur_pos);
+        // SAFETY: `payload` is a complete `NUMBERING.code` (`numb_next_item`).
+        let (result, _) = unsafe { decode_varint_at(ptr, len, self.cur_pos) };
         result
     }
 
@@ -390,7 +429,8 @@ impl<'a> Reader<'a> {
         for _ in 0..size {
             let index = self.cur_pos;
             let (ptr, len) = self.payload();
-            let (_, new_pos) = decode_varint_at(ptr, len, index);
+            // SAFETY: `payload` is a complete `NUMBERING.code` (`numb_next_item`).
+            let (_, new_pos) = unsafe { decode_varint_at(ptr, len, index) };
             self.cur_pos = new_pos;
         }
         self.items_read += size;
@@ -711,6 +751,14 @@ impl NumberingRef {
 
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.payload_addr() == b.payload_addr() && a.payload_addr() != 0
+    }
+
+    /// `true` while this cell is on `YOUNG_NUMBERINGS`.
+    /// After `collect_young_numberings` (`collect_oldrefs_to_nursery`)
+    /// the payload is old and the old generation does not move it.
+    #[inline]
+    pub fn is_young(&self) -> bool {
+        unsafe { self.slot.as_ref().young_index.load(Ordering::Relaxed) != usize::MAX }
     }
 }
 

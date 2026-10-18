@@ -484,7 +484,9 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     let mut offset = info + 3;
 
     if length_i != 0 {
-        let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+        // SAFETY: `all_liveness` bank at `offset` is a complete
+        // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_i, all_liveness) };
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.int_scalar_base + layout.num_scalars;
@@ -494,11 +496,12 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
                 state.writeback_live_scalar_state_field(reg_idx - layout.int_scalar_base, value);
             }
         }
-        offset = it.offset;
+        offset = it.offset();
     }
 
     if length_r != 0 {
-        let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.ref_scalar_base + layout.num_ref_scalars;
@@ -509,11 +512,12 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
                     .writeback_live_ref_scalar_state_field(reg_idx - layout.ref_scalar_base, value);
             }
         }
-        offset = it.offset;
+        offset = it.offset();
     }
 
     if length_f != 0 {
-        let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.float_scalar_base + layout.num_float_scalars;
@@ -6401,12 +6405,30 @@ impl<S: JitState> JitDriver<S> {
                                 return;
                             }
                             let (opref, value) = match &values[cursor] {
-                                RebuiltValue::Box(n, kind) => crate::jit_state::bridge_decode_red(
-                                    *n,
-                                    *kind,
-                                    raw_values,
-                                    &fail_types,
-                                ),
+                                RebuiltValue::Box(n, kind) => {
+                                    let (_opref, value) = crate::jit_state::bridge_decode_red(
+                                        *n,
+                                        *kind,
+                                        raw_values,
+                                        &fail_types,
+                                    );
+                                    // resume.py ResumeDataBoxReader.load_box_from_cpu:
+                                    // IntFrontendOp(num, cpu.get_int_value(deadframe, num)).
+                                    // with_input_layout reserved the failarg coordinate
+                                    // (`opencoder.py Trace.__init__(max_num_inputargs)`);
+                                    // the box is born here with the deadframe value.
+                                    let typed = match *kind {
+                                        majit_ir::Type::Ref => {
+                                            majit_ir::Value::Ref(majit_ir::GcRef(value as usize))
+                                        }
+                                        majit_ir::Type::Float => {
+                                            majit_ir::Value::Float(f64::from_bits(value as u64))
+                                        }
+                                        _ => majit_ir::Value::Int(value),
+                                    };
+                                    let opref = ctx.load_box_from_cpu(*n as u32, *kind, typed);
+                                    (opref, value)
+                                }
                                 RebuiltValue::Const(c) => {
                                     let bits = c.as_raw_i64();
                                     let opref = match bank {

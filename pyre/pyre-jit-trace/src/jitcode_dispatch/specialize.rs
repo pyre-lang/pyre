@@ -11780,7 +11780,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
 
     let new = ctx
         .trace_ctx
-        .execute_new_with_vtable(crate::descr::w_range_size_descr());
+        .execute_new_with_vtable(crate::descr::w_range_size_descr(), None);
 
     let field_descrs = [
         crate::descr::range_start_descr(),
@@ -17222,8 +17222,11 @@ pub(crate) fn subwalk_guard_follows_store(
 ) -> bool {
     // Byte-mode `_pos` is the opencoder cursor, not an `ops` index.
     // `opcode_at` reads `FrontendSlot` without materializing `Rc<Op>`.
+    // The window is that recorded-op sequence (`opcode_at_len`), not
+    // `num_ops()` (`History.length`), which counts dead failarg holes
+    // and is the trace-length limit.
     let start_i = start.tree_loop_op_index(trace_ctx.num_inputargs());
-    let end = trace_ctx.num_ops();
+    let end = trace_ctx.opcode_at_len();
     if start_i > end {
         return true;
     }

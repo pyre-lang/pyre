@@ -3618,6 +3618,9 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// Extra-root walk for in-flight resume pools, numbering cells, and
+    /// `OptUnroll.finalize_short_preamble` / `TargetToken.virtual_state`
+    /// ConstPtr fields that MiniMark would trace as ordinary GC fields.
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         self.walk_rd_numb_refs(&mut visitor);
         fn walk_target_token_const_ptrs(
@@ -7083,10 +7086,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `initialize_virtualizable` has appended `virtualizable_boxes`.
     /// `initial_inputarg_consts` already interns the reds, and
     /// `walk_active_trace_refs` forwards those ConstPtrs only from
-    /// `self.tracing`, so the ctx is stored first. `set_cpu` and
-    /// `set_force_finish` do not allocate. Bridges go through
-    /// `start_retrace_from_guard` and do not use this helper, so their
-    /// merge-point list stays empty.
+    /// `self.tracing`, so the ctx is stored first. `set_cpu`,
+    /// `set_metainterp_cpu` and `set_force_finish` do not allocate.
+    /// Bridges go through `start_retrace_from_guard` and do not use this
+    /// helper, so their merge-point list stays empty.
     fn publish_trace_start(
         &mut self,
         mut ctx: TraceCtx,
@@ -7101,6 +7104,9 @@ impl<M: Clone> MetaInterp<M> {
         // MetaInterp owns both `tracing` and `backend`, and tracing is
         // torn down before `self` moves.
         ctx.set_cpu(Some(&self.backend));
+        // pyjitpl.py `MetaInterp.cpu` for `execute_and_record` /
+        // `executor.execute` (`model.py AbstractCPU`).
+        ctx.set_metainterp_cpu(self.cpu.clone());
         self.tracing = Some(ctx);
         self.initialize_virtualizable(live_values);
         if let Some(ctx) = self.tracing.as_mut() {
@@ -17844,6 +17850,7 @@ impl<M: Clone> MetaInterp<M> {
         // pinning by MetaInterp ownership.  Bridge traces share the
         // same backend reference as the source loop.
         ctx.set_cpu(Some(&self.backend));
+        ctx.set_metainterp_cpu(self.cpu.clone());
         // pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
         // Stash the source token on the trace context so
         // `prepare_trace_segmenting` can set FORCE_BRIDGE_SEGMENTING here.
@@ -19127,7 +19134,14 @@ impl<M: Clone> MetaInterp<M> {
         let effectinfo = descr.as_call_descr().map(|cd| cd.get_extra_info());
         ctx.heapcache_invalidate_caches_varargs(opnum, effectinfo, argboxes);
         // pyjitpl.py:2660: op = self.history.record(opnum, argboxes, resvalue, descr)
-        let op = ctx.record_op_with_descr(opnum, argboxes, descr);
+        // `History._make_op(pos, value)` attaches the executor result.
+        let recorded_value = match opnum.result_type() {
+            majit_ir::Type::Int => Some(majit_ir::Value::Int(resvalue)),
+            majit_ir::Type::Ref => Some(majit_ir::Value::Ref(majit_ir::GcRef(resvalue as usize))),
+            majit_ir::Type::Float => Some(majit_ir::Value::Float(f64::from_bits(resvalue as u64))),
+            majit_ir::Type::Void => None,
+        };
+        let op = ctx.record_op_with_descr_value(opnum, argboxes, descr, recorded_value);
         // pyjitpl.py: self.attach_debug_info(op)
         self.attach_debug_info(Some(op));
         // pyjitpl.py:2662-2663: if op.type != 'v': return op
@@ -21020,23 +21034,20 @@ impl<M: Clone> MetaInterp<M> {
     /// ```
     ///
     /// `valueconst` is the concrete result of the already-executed
-    /// call (RPython's `c_result`).  Pyre tracks resvalue separately
-    /// from the recorded OpRef, so the caller is responsible for
-    /// keeping the concrete result alongside the returned OpRef.
+    /// call (RPython's `c_result`), recorded on the op at construction
+    /// (`history.py History.record` / `_make_op`).
     pub fn direct_call_may_force(
         &mut self,
         argboxes: &[OpRef],
+        valueconst: Option<Value>,
         descr_ref: majit_ir::DescrRef,
         descr_view: &dyn majit_ir::descr::CallDescr,
     ) -> Option<OpRef> {
-        // pyjitpl.py:3586: opnum = rop.call_may_force_for_descr(calldescr)
+        // pyjitpl.py: opnum = rop.call_may_force_for_descr(calldescr)
         let opnum = OpCode::call_may_force_for_type(descr_view.result_type());
-        // pyjitpl.py:3587: history.record_nospec(opnum, argboxes, valueconst, calldescr)
+        // pyjitpl.py: history.record_nospec(opnum, argboxes, valueconst, calldescr)
         let ctx = self.tracing.as_mut()?;
-        Some(
-            ctx.recorder
-                .record_op_with_descr(opnum, argboxes, descr_ref),
-        )
+        Some(ctx.record_op_with_descr_value(opnum, argboxes, descr_ref, valueconst))
     }
 
     /// pyjitpl.py `MetaInterp.direct_call_release_gil(argboxes, valueconst, calldescr)`.
@@ -21061,6 +21072,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn direct_call_release_gil(
         &mut self,
         argboxes: &[OpRef],
+        valueconst: Option<Value>,
         descr_ref: majit_ir::DescrRef,
         descr_view: &dyn majit_ir::descr::CallDescr,
     ) -> Option<OpRef> {
@@ -21093,10 +21105,7 @@ impl<M: Clone> MetaInterp<M> {
         if argboxes.len() > 1 {
             new_args.extend_from_slice(&argboxes[1..]);
         }
-        Some(
-            ctx.recorder
-                .record_op_with_descr(opnum, &new_args, descr_ref),
-        )
+        Some(ctx.record_op_with_descr_value(opnum, &new_args, descr_ref, valueconst))
     }
 
     /// pyjitpl.py `MetaInterp.direct_libffi_call`.
@@ -21181,6 +21190,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn direct_assembler_call(
         &mut self,
         arglist: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+        valueconst: Option<Value>,
         descr_view: &dyn majit_ir::descr::CallDescr,
         targetjitdriver_sd: usize,
     ) -> (Option<OpRef>, Option<OpRef>) {
@@ -21312,7 +21322,7 @@ impl<M: Clone> MetaInterp<M> {
             majit_ir::Type::Float => OpCode::CallAssemblerF,
             majit_ir::Type::Void => OpCode::CallAssemblerN,
         };
-        // pyjitpl.py:3602 op = self.history.record_nospec(opnum, args, valueconst, descr=token)
+        // pyjitpl.py: op = self.history.record_nospec(opnum, args, valueconst, descr=token)
         let opref_args: Vec<OpRef> = args.iter().map(|(_, opref, _)| *opref).collect();
         let op_ref = {
             let ctx = match self.tracing.as_mut() {
@@ -21324,7 +21334,7 @@ impl<M: Clone> MetaInterp<M> {
                 &arg_types,
                 descr_view.result_type(),
             );
-            ctx.record_op_with_descr(opnum, &opref_args, descr)
+            ctx.record_op_with_descr_value(opnum, &opref_args, descr, valueconst)
         };
         // pyjitpl.py:3604-3608 return vablebox per jd.index_of_virtualizable.
         let vablebox = vable_index.and_then(|idx| args.get(idx).map(|(_, opref, _)| *opref));
@@ -21877,11 +21887,17 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py: vrefs_after_residual_call (stub)
             self.vrefs_after_residual_call();
             // pyjitpl.py:2053-2068: pick the right CALL recording path.
+            // `valueconst` is `c_result` (`history.record_nospec(..., valueconst, ...)`).
+            let valueconst = if descr_view.result_type() == majit_ir::Type::Void {
+                None
+            } else {
+                Some(heap_value_for(descr_view.result_type(), c_result))
+            };
             let opref_args: Vec<OpRef> = allboxes.iter().map(|(_, op, _)| *op).collect();
             let (vablebox, resbox) = if assembler_call {
                 // pyjitpl.py: direct_assembler_call
                 let jd = _assembler_call_jd.unwrap_or(0);
-                self.direct_assembler_call(&allboxes, descr_view, jd)
+                self.direct_assembler_call(&allboxes, valueconst, descr_view, jd)
             } else {
                 // pyjitpl.py:2057-2068: libffi → release_gil → may_force
                 let mut resbox = None;
@@ -21890,9 +21906,19 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 if resbox.is_none() {
                     resbox = if effectinfo.is_call_release_gil() {
-                        self.direct_call_release_gil(&opref_args, descr_ref.clone(), descr_view)
+                        self.direct_call_release_gil(
+                            &opref_args,
+                            valueconst,
+                            descr_ref.clone(),
+                            descr_view,
+                        )
                     } else {
-                        self.direct_call_may_force(&opref_args, descr_ref.clone(), descr_view)
+                        self.direct_call_may_force(
+                            &opref_args,
+                            valueconst,
+                            descr_ref.clone(),
+                            descr_view,
+                        )
                     };
                 }
                 (None, resbox)
@@ -33104,10 +33130,11 @@ mod tests {
 
     fn take_recorded_ops(meta: &mut MetaInterp<()>) -> Vec<Op> {
         let mut ctx = meta.tracing.take().expect("expected active trace context");
-        let num_inputs = ctx.num_inputargs();
-        let input_types = ctx.inputarg_types();
-        let jump_args: Vec<OpRef> = (0..num_inputs)
-            .map(|i| OpRef::input_arg_typed(i as u32, input_types[i]))
+        let jump_args: Vec<OpRef> = ctx
+            .recorder
+            .inputargs()
+            .iter()
+            .map(|arg| arg.opref())
             .collect();
         ctx.close_loop(&jump_args);
         let trace = ctx.into_tree_loop();
@@ -33668,6 +33695,7 @@ mod tests {
                 (JitArgKind::Int, green_box, 55),
                 (JitArgKind::Int, frame_box, 1234),
             ],
+            None,
             descr.as_ref().as_call_descr().expect("call descr"),
             0,
         );
@@ -33727,6 +33755,7 @@ mod tests {
                 (JitArgKind::Int, green_box, 55),
                 (JitArgKind::Int, frame_box, 1234),
             ],
+            None,
             descr.as_ref().as_call_descr().expect("call descr"),
             0,
         );
@@ -33823,6 +33852,7 @@ mod tests {
                 (JitArgKind::Int, green_box, 55),
                 (JitArgKind::Int, frame_box, 1234),
             ],
+            None,
             descr.as_ref().as_call_descr().expect("call descr"),
             idx1,
         );
