@@ -262,7 +262,23 @@ impl CachedField {
         // a peeled body. The other three read a different struct box each
         // time, so no cache can reach them: upstream gets one box per loop from
         // `ThreadLocalReference(ExecutionContext, loop_invariant=True)`.
-        if descr.is_always_pure() || descr.is_quasi_immutable() {
+        //
+        // The instance class word is the analog of mapdict `inst_map`
+        // (`BaseUserClassMapdict.setclass`), which is not always_pure and
+        // which `setfield_gc` writes. pyre also tags it `?` so a *constant*
+        // object's class load can register `quasi_immutable_deps`
+        // (`notify_w_class_mutated`). On a red instance
+        // `optimize_QUASIIMMUT_FIELD` ignores the marker (`structvalue` is
+        // not constant, heap.py), so GNI does not protect the GETFIELD cache.
+        // A residual `CallMayForce` (`store_attr_fn`, `CallFlavor::MayForce`
+        // → `EffectInfo::MOST_GENERAL`) must drop it the way
+        // `heap.py clean_caches` drops `inst_map`. Leaving the promotion in
+        // the cache lets `serialize_optheap` export class B into a bridge
+        // whose `GUARD_VALUE` wants A (`class_reassign_hot`).
+        if descr.is_always_pure()
+            || (descr.is_quasi_immutable()
+                && !descr.as_field_descr().is_some_and(|f| f.is_w_class()))
+        {
             return;
         }
         let descr_idx = field_idx;
@@ -4837,6 +4853,94 @@ mod tests {
         );
     }
 
+    /// `CachedField.invalidate` keeps a `?` field across `clean_caches`
+    /// (pyre spelling of upstream `is_always_pure` covering
+    /// `IR_QUASIIMMUTABLE`). The instance class word is the analog of
+    /// mapdict `inst_map`, which is not always_pure, so a MOST_GENERAL
+    /// residual setattr drops it. `ExecutionContext.w_tracefunc` stays.
+    #[test]
+    fn clean_caches_drops_listed_w_class_keeps_other_quasiimmut() {
+        use majit_ir::GcRef;
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescr, SimpleSizeDescr};
+
+        let w_class: Arc<SimpleFieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class",
+            )
+            .with_class_word(true)
+            .with_quasi_immutable(true),
+        );
+        w_class.set_descr_index(99);
+        let tracefunc: Arc<SimpleFieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                1,
+                16,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "ExecutionContext.w_tracefunc".to_string(),
+                "w_tracefunc",
+            )
+            .with_quasi_immutable(true),
+        );
+        tracefunc.set_descr_index(100);
+        let size: DescrRef = Arc::new(
+            SimpleSizeDescr::with_vtable(0x3000_006b, 32, 53, 0x1000).with_all_fielddescrs(vec![
+                w_class.clone() as Arc<dyn FieldDescr>,
+                tracefunc.clone() as Arc<dyn FieldDescr>,
+            ]),
+        );
+        w_class.set_parent_descr(&size);
+        tracefunc.set_parent_descr(&size);
+
+        let w_class_ref: DescrRef = w_class.clone() as DescrRef;
+        let tracefunc_ref: DescrRef = tracefunc.clone() as DescrRef;
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+        let obj = rooted_resop_operand(Type::Ref, 10);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
+        ctx.set_ptr_info(&obj, PtrInfo::instance(Some(size.clone()), None));
+        let class_b = OpRef::const_ptr(GcRef(0xbbb));
+        let tf = OpRef::const_ptr(GcRef(0xccc));
+        ctx.with_ptr_info_mut(&obj, |info| {
+            info.setfield(
+                OptHeap::field_slot_index(&w_class_ref),
+                Operand::from_opref(class_b),
+            );
+            info.setfield(
+                OptHeap::field_slot_index(&tracefunc_ref),
+                Operand::from_opref(tf),
+            );
+        })
+        .unwrap();
+        heap.cache_field(&obj, &w_class_ref);
+        heap.cache_field(&obj, &tracefunc_ref);
+
+        heap.clean_caches(&mut ctx);
+
+        let exported = heap.export_cached_fields(&mut ctx);
+        assert!(
+            !exported
+                .iter()
+                .any(|(_, descr, _)| descr.as_field_descr().is_some_and(|f| f.is_w_class())),
+            "MOST_GENERAL clean_caches must drop listed w_class, got {exported:?}"
+        );
+        assert!(
+            exported.iter().any(|(_, descr, _)| descr
+                .as_field_descr()
+                .is_some_and(|f| f.field_key() == "w_tracefunc")),
+            "other ? field survives clean_caches, got {exported:?}"
+        );
+    }
+
     #[test]
     fn field_cache_is_keyed_by_descr_identity_not_field_slot() {
         let descr_a: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 1 });
@@ -8109,6 +8213,97 @@ mod tests {
         assert_eq!(
             guard_count, 2,
             "CallMayForce that can invalidate must keep the later GuardNotInvalidated"
+        );
+    }
+
+    #[test]
+    fn call_may_force_most_general_drops_w_class_getfield_cache() {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescr};
+
+        let w_class: DescrRef = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class",
+            )
+            .with_class_word(true)
+            .with_quasi_immutable(true),
+        );
+        w_class.set_descr_index(99);
+        let call_d = call_descr(80, EffectInfo::MOST_GENERAL);
+        let obj = rooted_inputarg_operand(Type::Ref, 100);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcR, &[obj.clone()], w_class.clone()),
+            Op::with_descr(
+                OpCode::CallMayForceN,
+                &[rooted_inputarg_operand(Type::Ref, 200)],
+                call_d,
+            ),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(OpCode::GetfieldGcR, &[obj], w_class),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcR)
+            .count();
+        assert_eq!(
+            get_count, 2,
+            "MOST_GENERAL CallMayForce must drop cached w_class GETFIELD"
+        );
+    }
+
+    #[test]
+    fn call_may_force_most_general_keeps_other_quasiimmut_getfield_cache() {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescr, SimpleSizeDescr};
+
+        let tracefunc_sd: Arc<SimpleFieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                1,
+                16,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "ExecutionContext.w_tracefunc".to_string(),
+                "w_tracefunc",
+            )
+            .with_quasi_immutable(true),
+        );
+        tracefunc_sd.set_descr_index(100);
+        let size: DescrRef = Arc::new(
+            SimpleSizeDescr::with_vtable(0x3000_006c, 32, 53, 0x1000)
+                .with_all_fielddescrs(vec![tracefunc_sd.clone() as Arc<dyn FieldDescr>]),
+        );
+        tracefunc_sd.set_parent_descr(&size);
+        let tracefunc: DescrRef = tracefunc_sd as DescrRef;
+        let call_d = call_descr(81, EffectInfo::MOST_GENERAL);
+        let obj = rooted_inputarg_operand(Type::Ref, 100);
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcR, &[obj.clone()], tracefunc.clone()),
+            Op::with_descr(
+                OpCode::CallMayForceN,
+                &[rooted_inputarg_operand(Type::Ref, 200)],
+                call_d,
+            ),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(OpCode::GetfieldGcR, &[obj], tracefunc),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+        let get_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetfieldGcR)
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "other ? field survives MOST_GENERAL CallMayForce"
         );
     }
 
