@@ -18652,7 +18652,44 @@ fn handle<Sym: WalkSym>(
                     },
                 },
             )? {
-                Some(outcome) => Ok((outcome, op.next_pc)),
+                Some(outcome) => {
+                    if matches!(&outcome, DispatchOutcome::CloseLoop { .. }) {
+                        // pyjitpl.py `get_procedure_token(greenboxes)`: publish
+                        // this merge point's own pc and greens, as the
+                        // `already_compiled_here` arm already does, so
+                        // `close_header_pc` does not fall back to the session
+                        // header (mc_diag slot 56).
+                        let live_typed = crate::driver::make_green_key_typed(
+                            code_ptr,
+                            next_instr,
+                            is_being_profiled,
+                        );
+                        let close_ints: Vec<i64> = gi
+                            .iter()
+                            .filter_map(|&op| ctx.trace_ctx.box_bits(op))
+                            .collect();
+                        let close_refs: Vec<i64> = gr
+                            .iter()
+                            .filter_map(|&op| ctx.trace_ctx.box_bits(op))
+                            .collect();
+                        let close_floats: Vec<i64> = gf
+                            .iter()
+                            .filter_map(|&op| ctx.trace_ctx.box_bits(op))
+                            .collect();
+                        let close_greens = (close_ints.len() == gi.len()
+                            && close_refs.len() == gr.len()
+                            && close_floats.len() == gf.len())
+                        .then_some((
+                            close_ints,
+                            close_refs,
+                            close_floats,
+                            live_typed.types.to_vec(),
+                        ));
+                        ctx.trace_ctx
+                            .publish_close_from_merge_point(close_greens, next_instr as i64);
+                    }
+                    Ok((outcome, op.next_pc))
+                }
                 None => {
                     put_back_virtualizable_mapped_colors(ctx, op.pc, op.next_pc, &red_r_regs);
                     Ok((DispatchOutcome::Continue, op.next_pc))

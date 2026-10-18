@@ -8244,6 +8244,9 @@ fn full_body_walk_trace<Sym: WalkSym>(
                     ctx.cut_inner_green_key = Some(typed.clone());
                 }
                 ctx.set_close_typed_key(typed);
+                // Walker CloseLoop already published close_greens + pc;
+                // keep the guest pc if that path did not run.
+                ctx.set_close_green_pc(loop_header_pc as i64);
                 TraceAction::CloseLoopWithArgs {
                     jump_args,
                     loop_header_pc: Some(loop_header_pc),

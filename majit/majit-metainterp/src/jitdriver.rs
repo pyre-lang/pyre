@@ -5820,6 +5820,11 @@ impl<S: JitState> JitDriver<S> {
             };
             // pyjitpl.py same_greenkey: the green key is the identity.
             // `header_pc` recorded below is this close's guest pc.
+            // Pass the typed close as-is: filtering on `get_uhash() ==
+            // target_key` dropped a live typed key whose hash disagreed
+            // with `green_key_from_code_ptr` (profiled folded to false)
+            // and fell through to hash-only, which then matched the
+            // origin seed.
             (
                 ctx.close_header_pc(),
                 ctx.close_green_key(),
@@ -5860,7 +5865,7 @@ impl<S: JitState> JitDriver<S> {
                 .cloned()
                 .or_else(|| start.as_ref().filter(|key| matches_target(key)).cloned())
                 .or_else(|| warm.installed_greenkey(target_key, &types))
-                .or(close)
+                .or(close.clone())
                 .or(start)
                 .expect(
                     "keep_tracing_after_declined_jump: a merge point keeps its greens: \
@@ -5871,7 +5876,8 @@ impl<S: JitState> JitDriver<S> {
             let Some(ctx) = self.meta.trace_ctx() else {
                 return false;
             };
-            ctx.find_merge_point_same_greenkey(&key_typed).is_some()
+            ctx.find_merge_point_same_greenkey(close.as_ref().unwrap_or(&key_typed))
+                .is_some()
         };
         if already {
             return false;
