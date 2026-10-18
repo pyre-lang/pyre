@@ -231,51 +231,45 @@ fn list_inner_bodies_use_one_descr_per_item_kind() {
     }
 }
 
-/// Helper-innermost resume of `list.pop()` (`pickle_terminal_raise_resume`
-/// `load_stop` → `self.stack.pop()`) blackhole-interprets this body. The
-/// first switch's Bytes (5) and Ascii (6) arms must not land on `abort`:
-/// fused `bytes_items.pop()` / `ascii_items.pop()` residualized as
-/// `abort/>r` and the blackhole then panics (`canonical blackhole aborted`).
+/// Helper-innermost resume of `list.pop()` (`pickle_bridge_call_assembler_resumes_caller`
+/// `load_stop` → `self.stack.pop()`) blackhole-interprets this body. Every
+/// strategy-switch arm must not land on `abort`: fused
+/// `float_items.len()` / `.pop()` (and the IntOrFloat twins) residualized
+/// as `abort/>r` and the blackhole then panics (`canonical blackhole aborted`).
 #[test]
-fn w_list_pop_end_inner_bytes_and_ascii_arms_do_not_abort() {
+fn w_list_pop_end_inner_strategy_arms_do_not_abort() {
     link_module_pytypes();
     let jc = all_jitcodes()
         .iter()
         .find(|jc| jc.name == "w_list_pop_end_inner")
         .expect("w_list_pop_end_inner in all_jitcodes");
     let table = descr_table();
-    let mut switch_dict = None;
+    let ops: Vec<_> = decoded_ops(&jc.code).collect();
+    let mut saw_switch = false;
     for op in decoded_ops(&jc.code) {
         if !op.opname.starts_with("switch") {
             continue;
         }
         for idx in descr_operands(&jc.code, &op) {
-            if let Some(BhDescr::Switch { dict, .. }) = table.get(idx) {
-                switch_dict = Some(dict.clone());
-                break;
+            let Some(BhDescr::Switch { dict, .. }) = table.get(idx) else {
+                continue;
+            };
+            saw_switch = true;
+            for (key, target) in dict {
+                let first_non_live = ops
+                    .iter()
+                    .find(|op| op.pc >= *target && op.opname != "live")
+                    .unwrap_or_else(|| panic!("no op at/after pc {target} for switch key {key}"));
+                assert!(
+                    !first_non_live.opname.starts_with("abort"),
+                    "w_list_pop_end_inner switch key {key} target {target} lands \
+                     on {} (pickle BH abort path)",
+                    first_non_live.key
+                );
             }
         }
-        if switch_dict.is_some() {
-            break;
-        }
     }
-    let dict = switch_dict.expect("w_list_pop_end_inner has a strategy switch");
-    let ops: Vec<_> = decoded_ops(&jc.code).collect();
-    for key in [5_i64, 6] {
-        let target = *dict
-            .get(&key)
-            .unwrap_or_else(|| panic!("strategy switch missing key {key}: {dict:?}"));
-        let first_non_live = ops
-            .iter()
-            .find(|op| op.pc >= target && op.opname != "live")
-            .unwrap_or_else(|| panic!("no op at/after pc {target} for key {key}"));
-        assert!(
-            !first_non_live.opname.starts_with("abort"),
-            "w_list_pop_end_inner strategy {key} target {target} lands on {} \
-             (pickle BH abort path)",
-            first_non_live.key
-        );
-    }
+    assert!(saw_switch, "w_list_pop_end_inner has a strategy switch");
 }
 
 /// `__majit_wrap_random` reads its `&[PyObjectRef]` argument with
