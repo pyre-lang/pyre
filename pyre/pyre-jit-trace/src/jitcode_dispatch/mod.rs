@@ -757,6 +757,12 @@ pub struct WalkSession {
     /// ran `note_root_trace_too_long` (`blackhole_if_trace_too_long`);
     /// the drain still has to return `SwitchToBlackhole(ABORT_TOO_LONG)`.
     pub trace_too_long: bool,
+    /// `mc_diag_bump(26)` keep-recording leftover: one tally per walk.
+    /// `_interpret` raises once; pyre's declined-latch leftover continues
+    /// the same walk (`execute_varargs`) and must not retally every step.
+    /// Per session rather than TLS: residual-while-tracing may start another
+    /// walk on the same OS thread (`open_inline_activations`).
+    pub keep_recording_too_long_tallied: bool,
     /// `MetaInterp.last_exc_value` (`pyjitpl.py`): the standing
     /// exception the walk is unwinding, as one slot for the whole walk
     /// rather than one per frame.
@@ -888,6 +894,7 @@ impl Default for WalkSession {
             crossed_inline_subwalk: false,
             portal_call_frame: None,
             trace_too_long: false,
+            keep_recording_too_long_tallied: false,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
             carrier_raise_seed: None,
@@ -2099,17 +2106,17 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     pub transparent_helper_subwalk: bool,
     /// Absolute build-time `MetaInterpStaticData.jitcodes` index of that
     /// helper. `None` outside a translated helper sub-walk.
+    /// `MIFrame.jitcode` (`pyjitpl.py`); abort recovery reads this, then
+    /// [`SubJitCodeBody::jitcode_index`], and does not scan by code pointer.
     pub transparent_helper_jitcode_index: Option<usize>,
     /// [`fbw_executed_effect_count`] sampled when the outermost helper in
-    /// this stack was entered. Nested helpers inherit it so a too-long
-    /// abort sees every unjournaled write in the popped helper stack
-    /// (`helper_has_unjournaled_executed_write`).
+    /// this stack was entered. Nested helpers inherit it. Abort recovery
+    /// uses the whole-walk odometer (`fbw_executed_effect_count`), not a
+    /// helper-only delta.
     pub(crate) transparent_helper_effects_at_entry: Option<usize>,
-    /// Journal lengths at that same outermost-helper entry.  A helper that
-    /// returns [`DispatchError::TraceTooLong`] without a latched helper
-    /// image rolls this delta so the enclosing Python CALL's
-    /// `latch_abort_blackhole` re-run is the sole remaining execution of
-    /// those writes.  A successful helper-frame latch leaves the journals.
+    /// Journal lengths at that same outermost-helper entry. A successful
+    /// helper-frame latch leaves the journals in place; the 0-effect
+    /// leftover never has a suffix to undo.
     pub(crate) transparent_helper_journal_at_entry: Option<FbwEffectJournalMark>,
     /// Set only while walking the generated `write_cell` helper.  Inner
     /// ops are `helper=None` Void writes the StoreName loop-var exemption
@@ -5031,13 +5038,11 @@ pub fn walk<Sym: WalkSym>(
         // `run_blackhole_interp_to_cancel_tracing`.
         //
         // A complete image makes the abort safe regardless of effects.  If the
-        // image cannot be built, a zero-effect walk may still take the legacy
-        // replay; an effectful walk keeps recording rather than replaying an
-        // irreversible write.  Residuals in a crossed helper are recorded-only
-        // (`declined_symbolic`) and a nested helper walk is refused
-        // (`OrthodoxSubWalkTraceUnsupported`), so this leftover cannot stack
-        // new executed writes or helper frames.  The overshoot is tallied
-        // (`mc_diag_bump(26)`).
+        // image cannot be built, a zero-effect walk may still take the leftover
+        // enclosing-CALL latch (`helper_too_long_result`); an effectful walk
+        // keeps executing every remaining call (`execute_varargs`) rather
+        // than replaying an irreversible write.  The overshoot is tallied
+        // once per walk (`mc_diag_bump(26)`).
         // pyjitpl.py raises out of `debug_merge_point`, i.e. from
         // INSIDE the step, so `blackhole_if_trace_too_long` (pyjitpl.py)
         // never sees a segmented trace. When a walk crosses a merge point
@@ -5080,10 +5085,13 @@ pub fn walk<Sym: WalkSym>(
             // `blackhole_if_trace_too_long` (`pyjitpl.py`) latches it at
             // this post-step pc; `convert_and_run_from_pyjitpl` copies
             // the helper with its own jitcode, pc, and registers. Latch
-            // that image here. A declined latch with no unjournaled
-            // helper write still returns `TraceTooLong` so the enclosing
-            // Python CALL can latch; an unjournaled write without a latch
-            // keeps recording.
+            // that image here. `finishframe` / `finishframe_exception`
+            // run first: a SubReturn / SubRaise is not snapshot-safe, so
+            // the length check does not fire until after that transition.
+            // A declined or failed latch with zero executed effects still
+            // returns `TraceTooLong` so the enclosing Python CALL can
+            // latch; an effectful walk without a complete image keeps
+            // executing every call (`helper_too_long_decision`).
             let mut blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
             // Root-walk too-long publishes the walker mirror (`_copy_data_from_miframe`
             // equivalent).  Ask the height check here, while a refusal can still
@@ -5098,6 +5106,10 @@ pub fn walk<Sym: WalkSym>(
                 discard_staged_abort(ctx.session);
                 blackhole_latched = false;
             }
+            if blackhole_latched && ctx.fbw_mode.transparent_helper_subwalk {
+                let splice_ok = inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
+                blackhole_latched = finish_helper_abort_latch(ctx.session, splice_ok);
+            }
             // `SwitchToBlackhole(ABORT_TOO_LONG)` always has a blackhole
             // resume upstream.  Abort only once `trace_too_long_abort_safe`
             // holds: a complete image, or a zero-effect walk that may still
@@ -5105,18 +5117,24 @@ pub fn walk<Sym: WalkSym>(
             let abort_safe =
                 trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count());
             if ctx.fbw_mode.transparent_helper_subwalk {
-                if blackhole_latched {
-                    let ops = ctx.trace_ctx.num_recorded_ops();
-                    return Err(DispatchError::TraceTooLong {
-                        pc: opcode_position,
-                        ops,
-                    });
-                } else if helper_has_unjournaled_executed_write(ctx) {
-                    majit_metainterp::mc_diag_bump(26);
-                } else if ctx.is_authoritative_executor || abort_safe {
-                    return Err(helper_too_long_result(ctx, opcode_position));
-                } else {
-                    majit_metainterp::mc_diag_bump(26);
+                match helper_too_long_decision(
+                    snapshot_safe,
+                    blackhole_latched,
+                    fbw_executed_effect_count(),
+                ) {
+                    HelperTooLongDecision::DeliverOutcome => {}
+                    HelperTooLongDecision::Abort => {
+                        return Err(helper_too_long_result(ctx, opcode_position));
+                    }
+                    HelperTooLongDecision::KeepExecuting => {
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[keep-recording] helper effects={}",
+                                fbw_executed_effect_count(),
+                            );
+                        }
+                        bump_keep_recording_too_long_once(ctx.session);
+                    }
                 }
             } else if abort_safe {
                 let ops = ctx.trace_ctx.num_recorded_ops();
@@ -5130,7 +5148,7 @@ pub fn walk<Sym: WalkSym>(
                     ops,
                 });
             } else {
-                majit_metainterp::mc_diag_bump(26);
+                bump_keep_recording_too_long_once(ctx.session);
             }
         }
         match outcome {

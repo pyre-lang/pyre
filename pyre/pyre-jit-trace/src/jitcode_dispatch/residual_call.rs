@@ -597,6 +597,66 @@ pub(crate) fn discard_staged_abort(session: &std::cell::RefCell<WalkSession>) {
     }
 }
 
+/// Complete-framestack latch, or nothing.
+///
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every
+/// `metainterp.framestack` level. An image that is missing ancestor helper
+/// frames resumes the innermost helper and returns into the wrong frame, so a
+/// failed ancestor splice is not a latch: discard the staged image and let
+/// the caller apply [`helper_too_long_decision`].
+pub(crate) fn finish_helper_abort_latch(
+    session: &std::cell::RefCell<WalkSession>,
+    splice_ok: bool,
+) -> bool {
+    if abort_blackhole_latched() && splice_ok {
+        return true;
+    }
+    if abort_blackhole_latched() {
+        discard_staged_abort(session);
+    }
+    false
+}
+
+/// After `run_one_step`, `blackhole_if_trace_too_long` (`pyjitpl.py`
+/// `_interpret`). A SubReturn / SubRaise is `finishframe` /
+/// `finishframe_exception` first. A complete helper+ancestor image raises
+/// `SwitchToBlackhole(ABORT_TOO_LONG)`. A declined latch with nothing
+/// executed lets the enclosing Python CALL latch. An effectful walk without
+/// an image keeps executing (`execute_varargs`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HelperTooLongDecision {
+    DeliverOutcome,
+    Abort,
+    KeepExecuting,
+}
+
+pub(crate) fn helper_too_long_decision(
+    snapshot_safe: bool,
+    latched_complete: bool,
+    executed_effects: usize,
+) -> HelperTooLongDecision {
+    if !snapshot_safe {
+        HelperTooLongDecision::DeliverOutcome
+    } else if latched_complete || executed_effects == 0 {
+        HelperTooLongDecision::Abort
+    } else {
+        HelperTooLongDecision::KeepExecuting
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn stage_test_helper_abort_image() {
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+            framestack: majit_metainterp::MIFrameStack::empty(),
+            last_exc_value: 0,
+            raising_exception: false,
+            mirror_stack: None,
+            origin: "test-splice-fail",
+        });
+    });
+}
+
 /// Name each decline under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_
 /// miframe`'s `s2dbg!` and `try_adopt_multi_frame_blackhole`'s `mfdbg!` name
 /// theirs: an unlatched abort and a latch that was never reached both end in the
@@ -798,26 +858,12 @@ pub(crate) fn helper_jitcode_arc(
 
 /// Jitcode index of the helper body about to be walked.
 ///
-/// `SubJitCodeBody.jitcode_index` is `JitCode.index` (`MIFrame.jitcode`)
-/// when the lookup already had it. A nested `inline_call` of a different
-/// helper must not inherit the parent's index; a synthetic body has no
-/// table slot. Never decode an unpublished build-time cell here:
-/// `load_jitcode` / `materialize_type_static_consts` panics on a type-static
-/// name this process has not published (`pyre_class_pytype_addrs`).
-pub(crate) fn helper_index_for_sub_body<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    sub_body: &SubJitCodeBody,
-) -> Option<usize> {
-    if let Some(index) = sub_body.jitcode_index {
-        return Some(index);
-    }
-    let ptr = sub_body.code.as_ptr();
-    let index = ctx.fbw_mode.transparent_helper_jitcode_index?;
-    let matches_index = crate::jitcode_runtime::peek_jitcode_ref_by_index(index)
-        .is_some_and(|jc| jc.code.as_ptr() == ptr)
-        || crate::state::pyjitcode_for_jitcode_index(index as i32)
-            .is_some_and(|pjc| pjc.jitcode.code.as_ptr() == ptr);
-    matches_index.then_some(index)
+/// `SubJitCodeBody.jitcode_index` is `JitCode.index` (`MIFrame.jitcode`).
+/// A synthetic test body has no table slot. The splice reads
+/// `transparent_helper_jitcode_index.or(body.jitcode_index)` and does
+/// not scan by code pointer.
+pub(crate) fn helper_index_for_sub_body(sub_body: &SubJitCodeBody) -> Option<usize> {
+    sub_body.jitcode_index
 }
 
 /// Operand-stack image of the Python portal paused under a helper.
@@ -883,9 +929,10 @@ fn build_paused_portal_miframe<Sym: WalkSym>(
         EntryPyPc::Jit(pc) => Some(pc),
         EntryPyPc::Py(_) => None,
     };
-    let resume_pc = ctx.outer_resume_marker_jit_pc.or_else(|| {
-        call_jit_pc.and_then(|pc| decode_op_at(&jitcode.code, pc).map(|op| op.next_pc))
-    })?;
+    // `_setup_return_value_*` writes `code[position-1]`. The Python-opcode
+    // resume marker is the CALL's enclosing instruction, not the CALL end.
+    let resume_pc =
+        paused_parent_resume_pc(call_jit_pc, ctx.outer_resume_marker_jit_pc, &jitcode.code)?;
     if !instruction_starts_at(&jitcode, resume_pc) {
         latchdbg!("origin={origin} paused-portal resume_pc={resume_pc} not an instruction start");
         return None;
@@ -1139,43 +1186,19 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     }
 }
 
-/// Executed residual / store during this helper stack that the journals
-/// do not cover.  CALL re-run would apply it twice.  Nested helpers inherit
-/// the outermost entry marks, so an ancestor write is visible here.  A
-/// declined residual only sets [`fbw_has_unjournaled_effect`] and has not
-/// run, so it is not this.
-pub(crate) fn helper_has_unjournaled_executed_write<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-) -> bool {
-    let Some(entry) = ctx.fbw_mode.transparent_helper_effects_at_entry else {
-        return false;
-    };
-    let effect_delta = fbw_executed_effect_count().saturating_sub(entry);
-    if effect_delta == 0 {
-        return false;
-    }
-    let journal_delta = ctx
-        .fbw_mode
-        .transparent_helper_journal_at_entry
-        .map(fbw_journaled_effect_delta_since)
-        .unwrap_or(0);
-    effect_delta > journal_delta
-}
-
-/// Helper crossed `trace_limit` with no executed unjournaled write, and
-/// the helper-frame blackhole latch declined.
+/// Helper crossed `trace_limit` with a Continue snapshot, no latched
+/// image, and zero executed effects across the walk.
 ///
-/// Roll back only this helper's journal delta and return `TraceTooLong`.
-/// Do not run `note_root_trace_too_long` here: the enclosing Python
-/// walk's `Err(TraceTooLong)` arm notes the root and latches at the
-/// CALL (`latch_abort_blackhole`, origin `mod2730-too-long`).
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies the live helper
+/// frame; unit tests and a declined preflight cannot. Returning
+/// `TraceTooLong` lets the enclosing Python CALL latch at that CALL
+/// (`latch_abort_blackhole`, origin `mod2730-too-long`). Journals stay
+/// applied: the leftover is only the 0-effect case, so there is no suffix
+/// to undo and no CALL to restart.
 pub(crate) fn helper_too_long_result<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
 ) -> DispatchError {
-    if let Some(mark) = ctx.fbw_mode.transparent_helper_journal_at_entry {
-        fbw_effect_journal_rollback_since(mark);
-    }
     let ops = ctx.trace_ctx.num_recorded_ops();
     DispatchError::TraceTooLong { pc, ops }
 }
@@ -1504,8 +1527,9 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     // spanning pc 8..19, and no build emits byte 5 as an opcode at all.
     //
     // `build_multi_frame_miframe` already declines this class for its own
-    // innermost frame. Declining is the supported outcome: every caller falls
-    // back to the rollback/replay path.
+    // innermost frame. A declined fill is not a rollback: the walk either
+    // keeps executing (`mc_diag_bump(26)`) or, with zero effects, lets the
+    // enclosing CALL latch.
     if !instruction_starts_at(&jitcode, resume_pc) {
         if fbw_debug_abort_enabled() {
             eprintln!(
@@ -1728,6 +1752,22 @@ fn fill_abort_miframe_register_banks(
     true
 }
 
+/// Resume pc of a paused parent sitting on a CALL.
+///
+/// `_setup_return_value_*` (`blackhole.py`) writes `code[position-1]`, so
+/// the parent must sit at the CALL's `next_pc`. The Python-opcode resume
+/// marker is only the fallback when this frame has no CALL coordinate
+/// (`descr_call` / operator tails).
+pub(crate) fn paused_parent_resume_pc(
+    call_jit_pc: Option<usize>,
+    outer_resume_marker_jit_pc: Option<usize>,
+    code: &[u8],
+) -> Option<usize> {
+    call_jit_pc
+        .and_then(|pc| decode_op_at(code, pc).map(|op| op.next_pc))
+        .or(outer_resume_marker_jit_pc)
+}
+
 /// Result-register of the CALL this paused parent sits on, if the op returns
 /// a value.  `_setup_return_value_*` writes that color when the callee
 /// finishes, so the captured image must leave it unset.
@@ -1751,11 +1791,11 @@ fn parent_resume_pc(
     if let Some(concrete) = parent.blackhole.as_ref() {
         return Some(concrete.resume_pc);
     }
-    if parent.call_jitcode_pc.is_none() {
-        return parent.resume_marker_jit_pc;
-    }
-    let call_jit_pc = parent.call_jitcode_pc?;
-    decode_op_at(&pjc.jitcode.code, call_jit_pc).map(|call| call.next_pc)
+    paused_parent_resume_pc(
+        parent.call_jitcode_pc,
+        parent.resume_marker_jit_pc,
+        &pjc.jitcode.code,
+    )
 }
 
 /// One paused caller as an `MIFrame`. Prefer the CALL-site blackhole capture;
@@ -4629,31 +4669,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // it is handling a fresh raise.
     clear_walk_exception(ctx);
 
-    // A helper that has already crossed `trace_limit` must not execute a
-    // residual in the walker: `_interpret` / `blackhole_if_trace_too_long`
-    // (`pyjitpl.py`) raises `SwitchToBlackhole(ABORT_TOO_LONG)` after
-    // `run_one_step`, and `convert_and_run_from_pyjitpl` runs this
-    // residual in the blackhole. Latch that image here. A declined latch
-    // with no unjournaled helper write falls back to `TraceTooLong` so
-    // the enclosing Python CALL can latch. An unjournaled write without
-    // a latch records the CALL and does not execute it: a new executed
-    // write would grow the walk with no resume
-    // (`mc_diag_bump(26)` keep-recording). The CALL stays recorded-only
-    // (`declined_symbolic`), the same way a non-authoritative residual
-    // is left for runtime.
-    if ctx.is_authoritative_executor
-        && ctx.fbw_mode.transparent_helper_subwalk
-        && ctx.trace_ctx.is_too_long()
-    {
-        if latch_abort_blackhole(ctx, op_pc, "helper-residual-too-long") {
-            let ops = ctx.trace_ctx.num_recorded_ops();
-            return Err(DispatchError::TraceTooLong { pc: op_pc, ops });
-        }
-        if !helper_has_unjournaled_executed_write(ctx) {
-            return Err(helper_too_long_result(ctx, op_pc));
-        }
-        return Ok(declined_symbolic(call_opcode));
-    }
+    // `_interpret` runs `run_one_step` (this residual) and only then
+    // `blackhole_if_trace_too_long`. A previous Continue that already
+    // crossed the limit either latched and raised, or is still executing
+    // every call until a later post-step can hand off
+    // (`helper_too_long_decision`). Do not residualize the CALL here
+    // (`declined_symbolic`): that leaves subsequent steps without the
+    // concrete result `execute_varargs` would have produced.
 
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
     // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`

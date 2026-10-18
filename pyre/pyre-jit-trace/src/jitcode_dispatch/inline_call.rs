@@ -10387,7 +10387,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // (`walk` starts at 0), not the caller's `op.pc`.
             let latched = super::residual_call::latch_abort_blackhole(&sub_wc, 0, "pre-callee");
             if !latched && fbw_executed_effect_count() != 0 {
-                majit_metainterp::mc_diag_bump(26);
+                bump_keep_recording_too_long_once(sub_wc.session);
             } else {
                 let ops = sub_wc.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
@@ -18634,6 +18634,13 @@ struct SubWalkExchange<'a, Sym: WalkSym> {
     /// `SubRaise` can still replay the CALL; a `SubReturn` drops it.
     step_heap_cache: Option<majit_metainterp::heapcache::HeapCache>,
     residual_step: bool,
+    /// Prefix of `SubWalkDriver.frames` from `split_last_mut` while the last
+    /// frame is in `drive()`. `walk` splices those ancestors into a helper
+    /// abort image (`convert_and_run_from_pyjitpl`) without aliasing the last
+    /// frame.
+    ancestor_frames: *const SubWalkFrame<'a, Sym>,
+    ancestor_len: usize,
+    active_caller_pc: usize,
 }
 
 struct SubWalkDriver<'a, Sym: WalkSym> {
@@ -18662,6 +18669,9 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 step_unjournaled: false,
                 step_heap_cache: None,
                 residual_step: false,
+                ancestor_frames: std::ptr::null(),
+                ancestor_len: 0,
+                active_caller_pc: 0,
             },
         };
         driver.push_frame(root);
@@ -18713,96 +18723,42 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
         self.frames.pop().expect("completed sub-walk frame missing")
     }
 
-    /// Copy ancestor helper MIFrames into the latched abort image, outermost
-    /// first, immediately below the innermost helper the walk already latched.
-    /// `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`
-    /// (`blackhole.py`) copies every framestack level, helper frames included.
-    ///
-    /// Python inline ancestors already sit on `session.framestack`
-    /// (`build_multi_frame_miframe`). They have no helper jitcode index;
-    /// skipping them is what keeps a successful helper-frame latch.
-    /// A paused helper sits at the CALL that entered its child: that
-    /// opcode lives in this helper's body at the child's `caller_pc`.
-    fn splice_ancestor_helpers(&self, trace_ctx: &TraceCtx) -> bool {
-        if self.frames.len() <= 1 {
-            return true;
-        }
-        let mut helpers = Vec::new();
-        for i in 0..self.frames.len() - 1 {
-            let frame = &self.frames[i];
-            if !frame.fbw_mode.transparent_helper_subwalk {
-                continue;
-            }
-            let Some(index) = frame.fbw_mode.transparent_helper_jitcode_index else {
-                return false;
-            };
-            let Some(jitcode) = helper_jitcode_arc(index) else {
-                return false;
-            };
-            let child = &self.frames[i + 1];
-            let Some((dst_bank, dst, resume_pc)) =
-                call_opcode_result_dst(frame.body.code, child.caller_pc)
-            else {
-                return false;
-            };
-            let skip = (dst_bank != 'v').then_some((dst_bank, dst));
-            let Some(miframe) = build_helper_parent_miframe(
-                trace_ctx,
-                jitcode,
-                resume_pc,
-                &frame.registers_i,
-                &frame.registers_r,
-                &frame.registers_f,
-                &frame.concrete_registers_i,
-                &frame.frame_state,
-                skip,
-            ) else {
-                return false;
-            };
-            helpers.push(miframe);
-        }
-        if !splice_helper_frames_before_innermost(helpers) {
-            return false;
-        }
-        true
-    }
-
     fn drive(
         &mut self,
         trace_ctx: &mut TraceCtx,
     ) -> Result<(DispatchOutcome, bool), DispatchError> {
         loop {
-            let frame = self
-                .frames
-                .last_mut()
-                .expect("sub-walk driver lost its root frame");
-            self.exchange.active_frame_id = frame.id;
-            self.exchange.completed = std::mem::take(&mut frame.replay_log);
-            self.exchange.completed_cursor = 0;
-            let driven = frame.drive(trace_ctx);
+            let driven = {
+                let (frame, ancestors) = self
+                    .frames
+                    .split_last_mut()
+                    .expect("sub-walk driver lost its root frame");
+                // borrow-checker split of `metainterp.framestack` (upstream
+                // `blackhole_if_trace_too_long` / `convert_and_run_from_pyjitpl`
+                // read the whole framestack); `split_last_mut` gives the
+                // disjoint prefix.
+                self.exchange.ancestor_frames = ancestors.as_ptr();
+                self.exchange.ancestor_len = ancestors.len();
+                self.exchange.active_caller_pc = frame.caller_pc;
+                self.exchange.active_frame_id = frame.id;
+                self.exchange.completed = std::mem::take(&mut frame.replay_log);
+                self.exchange.completed_cursor = 0;
+                let driven = frame.drive(trace_ctx);
+                self.exchange.ancestor_len = 0;
+                self.exchange.ancestor_frames = std::ptr::null();
+                driven
+            };
             match driven {
                 // `SwitchToBlackhole` unwinds `_interpret`. Replaying the
                 // parent CALL would record another step after the raise.
+                // Ancestor splice already ran inside `walk` as part of the
+                // helper latch (`finish_helper_abort_latch`); a failed splice
+                // discarded the staged image and either kept executing or
+                // returned this leftover `TraceTooLong`.
                 Err(error @ DispatchError::TraceTooLong { .. }) => {
-                    // `frame` is `&mut` into `self.frames`. Moving the
-                    // reference ends that borrow so the stack can be popped.
-                    // `drop` on a reference does not.
-                    let _ = frame;
                     self.exchange.completed.clear();
-                    let session = self.frames[0].session;
-                    let latched = abort_blackhole_latched();
-                    let splice_ok = latched && self.splice_ancestor_helpers(trace_ctx);
-                    if latched && !splice_ok {
-                        discard_staged_abort(session);
-                    }
-                    let rollback = !abort_blackhole_latched();
                     while !self.frames.is_empty() {
-                        let popped = self.pop_frame();
-                        if rollback
-                            && let Some(mark) = popped.fbw_mode.transparent_helper_journal_at_entry
-                        {
-                            fbw_effect_journal_rollback_since(mark);
-                        }
+                        let _ = self.pop_frame();
                     }
                     return Err(error);
                 }
@@ -18830,12 +18786,18 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         );
                         *trace_ctx.heap_cache_mut() = heap_cache;
                     }
-                    frame.pc = pc;
-                    // Keep the results this pass consumed; the callee that
-                    // just suspended appends its own when it finishes.
-                    let mut replay_log = std::mem::take(&mut self.exchange.completed);
-                    replay_log.truncate(self.exchange.completed_cursor);
-                    frame.replay_log = replay_log;
+                    {
+                        let frame = self
+                            .frames
+                            .last_mut()
+                            .expect("sub-walk driver lost its root frame");
+                        frame.pc = pc;
+                        // Keep the results this pass consumed; the callee that
+                        // just suspended appends its own when it finishes.
+                        let mut replay_log = std::mem::take(&mut self.exchange.completed);
+                        replay_log.truncate(self.exchange.completed_cursor);
+                        frame.replay_log = replay_log;
+                    }
                     let child = self
                         .exchange
                         .pending
@@ -18967,6 +18929,85 @@ pub(crate) fn subwalk_driver_is_active() -> bool {
     SUBWALK_DRIVER.with(|slot| !slot.get().is_null())
 }
 
+/// Copy ancestor helper MIFrames into the latched abort image, outermost
+/// first, immediately below the innermost helper the walk already latched.
+///
+/// `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`
+/// (`blackhole.py`) copies every framestack level, helper frames included.
+/// Python inline ancestors already sit on `session.framestack`
+/// (`build_multi_frame_miframe`). A paused helper sits at the CALL that
+/// entered its child (`child.caller_pc`). The frame's jitcode is
+/// `transparent_helper_jitcode_index` or `SubJitCodeBody.jitcode_index`
+/// (`MIFrame.jitcode`); a missing index is a failed splice, not a scan.
+pub(crate) fn splice_active_driver_ancestors<Sym: WalkSym>(trace_ctx: &TraceCtx) -> bool {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return true;
+        }
+        // SAFETY: `SubWalkDriverGuard` installs this exchange for the
+        // current `Sym` monomorphization. The ancestor pointer is the
+        // prefix from the same `split_last_mut` that yields the last frame,
+        // so it is disjoint from the last frame `drive()` holds mutably.
+        let exchange = unsafe { &*(pointer as *const SubWalkExchange<'_, Sym>) };
+        if exchange.ancestor_len == 0 {
+            return true;
+        }
+        let ancestors =
+            unsafe { std::slice::from_raw_parts(exchange.ancestor_frames, exchange.ancestor_len) };
+        splice_ancestor_helper_slice(trace_ctx, ancestors, exchange.active_caller_pc)
+    })
+}
+
+fn splice_ancestor_helper_slice<Sym: WalkSym>(
+    trace_ctx: &TraceCtx,
+    ancestors: &[SubWalkFrame<'_, Sym>],
+    innermost_caller_pc: usize,
+) -> bool {
+    let mut helpers = Vec::new();
+    for i in 0..ancestors.len() {
+        let frame = &ancestors[i];
+        if !frame.fbw_mode.transparent_helper_subwalk {
+            continue;
+        }
+        let Some(index) = frame
+            .fbw_mode
+            .transparent_helper_jitcode_index
+            .or(frame.body.jitcode_index)
+        else {
+            return false;
+        };
+        let Some(jitcode) = helper_jitcode_arc(index) else {
+            return false;
+        };
+        let child_caller_pc = ancestors
+            .get(i + 1)
+            .map(|child| child.caller_pc)
+            .unwrap_or(innermost_caller_pc);
+        let Some((dst_bank, dst, resume_pc)) =
+            call_opcode_result_dst(frame.body.code, child_caller_pc)
+        else {
+            return false;
+        };
+        let skip = (dst_bank != 'v').then_some((dst_bank, dst));
+        let Some(miframe) = build_helper_parent_miframe(
+            trace_ctx,
+            jitcode,
+            resume_pc,
+            &frame.registers_i,
+            &frame.registers_r,
+            &frame.registers_f,
+            &frame.concrete_registers_i,
+            &frame.frame_state,
+            skip,
+        ) else {
+            return false;
+        };
+        helpers.push(miframe);
+    }
+    splice_helper_frames_before_innermost(helpers)
+}
+
 /// Keep ops the active residual handler recorded before it yields.
 ///
 /// `SubWalkDriver::drive` cuts a residual step back to the opcode start and
@@ -19065,6 +19106,9 @@ mod subwalk_checkpoint_tests {
             step_unjournaled: false,
             step_heap_cache: None,
             residual_step: false,
+            ancestor_frames: std::ptr::null(),
+            ancestor_len: 0,
+            active_caller_pc: 0,
         };
         let _driver = SubWalkDriverGuard::install(&mut exchange);
         let position = majit_metainterp::recorder::TracePosition {
@@ -19126,6 +19170,9 @@ mod subwalk_checkpoint_tests {
             step_unjournaled: false,
             step_heap_cache: None,
             residual_step: false,
+            ancestor_frames: std::ptr::null(),
+            ancestor_len: 0,
+            active_caller_pc: 0,
         };
         let _driver = SubWalkDriverGuard::install(&mut exchange);
         let position = majit_metainterp::recorder::TracePosition {
@@ -19265,21 +19312,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             }
             return completed.result.clone();
         }
-    }
-
-    // `_interpret` / `blackhole_if_trace_too_long` (`pyjitpl.py`) has
-    // already raised on the live helper MIFrame. The keep-recording
-    // leftover (latch declined, unjournaled write in the helper stack)
-    // would otherwise stack another frame after the cut — recursive
-    // `isinstance` of nested tuples. Residualize through
-    // `jitcode.fnaddr` (`bhimpl_inline_call_*`) so the parent records
-    // the CALL and does not execute a new helper body. A 0-delta
-    // helper still walks so its post-step can return `TraceTooLong`.
-    if ctx.fbw_mode.transparent_helper_subwalk
-        && ctx.trace_ctx.is_too_long()
-        && helper_has_unjournaled_executed_write(ctx)
-    {
-        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
     }
 
     let (
@@ -19429,11 +19461,10 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         fbw_mode: FbwWalkMode {
             inline_subwalk: true,
             transparent_helper_subwalk: true,
-            // Sampled at the outermost helper. Nested helpers inherit so a
-            // too-long abort sees every unjournaled write in the helper
-            // stack (`helper_has_unjournaled_executed_write`) and rolls
-            // the whole stack's journals (`helper_too_long_result`) when
-            // the helper-frame latch declined.
+            // Sampled at the outermost helper. Nested helpers inherit the
+            // entry marks. Journals stay applied: `convert_and_run_from_pyjitpl`
+            // continues after those writes. Abort recovery uses the
+            // whole-walk odometer, not a helper-only delta.
             transparent_helper_effects_at_entry: if ctx.fbw_mode.transparent_helper_subwalk {
                 ctx.fbw_mode.transparent_helper_effects_at_entry
             } else {
@@ -19446,7 +19477,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             },
             // Overwrite the parent's index: a nested helper is a different
             // `MIFrame.jitcode`.
-            transparent_helper_jitcode_index: helper_index_for_sub_body(ctx, sub_body),
+            transparent_helper_jitcode_index: helper_index_for_sub_body(sub_body),
             // A helper has no Python PC. Residual last_instr publication
             // reads this field when `current_inline_concrete_frame()==0`.
             inline_caller_py_pc: ctx

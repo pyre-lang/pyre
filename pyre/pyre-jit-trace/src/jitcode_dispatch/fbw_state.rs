@@ -2814,6 +2814,14 @@ pub(crate) fn fbw_executed_effect_count() -> usize {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.get())
 }
 
+pub(crate) fn bump_keep_recording_too_long_once(session: &std::cell::RefCell<WalkSession>) {
+    let mut session = session.borrow_mut();
+    if !session.keep_recording_too_long_tallied {
+        session.keep_recording_too_long_tallied = true;
+        majit_metainterp::mc_diag_bump(26);
+    }
+}
+
 pub(crate) fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.get() == Some((pc, 0)))
 }
