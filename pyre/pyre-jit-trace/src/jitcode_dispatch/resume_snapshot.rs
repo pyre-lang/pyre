@@ -69,6 +69,31 @@ pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) ->
     (marker.opname == "live" && marker.next_pc == op_pc).then_some(pc)
 }
 
+/// Resume coordinate for a plain (non-after-residual) guard.
+///
+/// `op_pc` is the capture coordinate. Branch guards pass the jump's own
+/// `-live-` (`guarded_branch_core` capture_pc = `live_before_jit_pc`;
+/// `pyjitpl.py` `opimpl_goto_if_not` → `generate_guard(resumepc=orgpc)`).
+/// That word is already the `get_list_of_active_boxes` coordinate
+/// (`pc = self.pc - SIZE_LIVE_OP` when `self.pc` is the goto). Subtracting
+/// `SIZE_LIVE_OP` from the `-live-` itself looks at a non-adjacent byte;
+/// the opcode-start twin then re-executes the residual before the jump
+/// (`bhimpl_goto_if_not` must re-run only the jump). When `op_pc` is still
+/// the instruction after a `-live-`, [`preceding_live_marker`] recovers it.
+pub(crate) fn plain_guard_resume_jitcode_pc(payload: &crate::PyJitCode, op_pc: usize) -> i32 {
+    let op_live = crate::state::op_live();
+    if payload.jitcode.can_decode_live_vars(op_pc, op_live)
+        || payload.jitcode.code.get(op_pc) == Some(&op_live)
+    {
+        op_pc as i32
+    } else {
+        preceding_live_marker(payload, op_pc)
+            .or_else(|| payload.resume_marker_for_jitcode_pc(op_pc))
+            .map(|m| m as i32)
+            .unwrap_or(op_pc as i32)
+    }
+}
+
 /// Select the resume marker for an after-residual-call guard.  The bytecode's
 /// immediate trailing `-live-` is the RPython authority; metadata twins are
 /// compatibility fallbacks for incomplete/fixture bodies.
@@ -719,14 +744,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // ordinary marker would name a different resume point.
                 // Every guard-capture point is emitted after a `-live-` marker;
                 // its populated codewrite-time twin is therefore total here.
-                let marker = unsafe { (&walked_owned).payload.resume_marker_for_jitcode_pc(op_pc) };
                 // Specialization guards (`GuardValue`/`GuardClass`) and branch
                 // guards (`GuardTrue`/`GuardFalse`) source the resume
                 // coordinate from the walk cursor's per-op `-live-` BEFORE
                 // (`ctx.live_before_jit_pc`). Branch guards are
                 // `generate_guard(resumepc=orgpc)` (`pyjitpl.py
                 // opimpl_goto_if_not`); blackhole `bhimpl_goto_if_not`
-                // re-evaluates the restored condition.
+                // re-evaluates the restored condition. `op_pc` is already
+                // that `-live-` for a branch capture; the opcode-start twin
+                // is only the fallback when neither the capture pc nor the
+                // adjacent preceding `-live-` is a decode startpoint.
                 let live_before_decodable = ctx.live_before_jit_pc != usize::MAX
                     && unsafe {
                         (&walked_owned)
@@ -737,10 +764,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 if live_before_decodable {
                     ctx.live_before_jit_pc as i32
                 } else {
-                    match marker {
-                        Some(jp) => jp as i32,
-                        None => majit_ir::resumedata::NO_JITCODE_PC,
-                    }
+                    plain_guard_resume_jitcode_pc(&walked_owned.payload, op_pc)
                 }
             } else if after_residual_call {
                 // #366: extend the direct-pc carry to the after-residual-call
@@ -3160,16 +3184,11 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
                 .map(|m| m as i32)
                 .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
             // `get_list_of_active_boxes` (`pyjitpl.py`): a plain guard reads
-            // `pc = self.pc - SIZE_LIVE_OP`, the `-live-` immediately before
-            // the current jitcode instruction. `preceding_live_marker` is that
-            // adjacent `-live-`. The opcode-start resume marker is the
-            // fallback when the current op is not itself preceded by `-live-`
-            // (a later op in the same Python opcode, whose orgpc is the
-            // opcode start).
-            false => preceding_live_marker(&callee_pjc, callee_op_pc)
-                .or_else(|| callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc))
-                .map(|m| m as i32)
-                .unwrap_or(callee_op_pc as i32),
+            // `pc = self.pc - SIZE_LIVE_OP`. A branch guard's `callee_op_pc`
+            // is already that `-live-` (`generate_guard(resumepc=orgpc)`);
+            // [`plain_guard_resume_jitcode_pc`] keeps it instead of walking
+            // three bytes earlier onto the opcode-start twin.
+            false => plain_guard_resume_jitcode_pc(&callee_pjc, callee_op_pc),
         }
     };
     let mf_diag = fbw_mf_diag_enabled();

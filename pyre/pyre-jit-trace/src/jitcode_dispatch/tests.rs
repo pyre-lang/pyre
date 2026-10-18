@@ -1194,6 +1194,42 @@ fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
 }
 
 #[test]
+fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
+    let live = crate::state::op_live();
+    let int_copy = *insns_opname_to_byte()
+        .get("int_copy/i>i")
+        .expect("int_copy/i>i must be in the insns table");
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("branch_live_resume_test");
+    // Opcode-start `-live-` at 0, a 3-byte body op at 3, the jump's own
+    // `-live-` at 6. A FOR_ITER-shaped residual sits between those lives, so
+    // `preceding_live_marker(6)` is empty and the opcode-start twin is 0.
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![live, 0, 0, int_copy, 0, 0, live, 0, 0],
+        startpoints: Some([0_usize, 3, 6].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![(0, Some(0)), (3, Some(0)), (6, Some(0))];
+
+    assert_eq!(
+        pyjit.resume_marker_for_jitcode_pc(6),
+        Some(0),
+        "the opcode-start twin at the jump live must still name pc 0",
+    );
+    assert_eq!(
+        super::resume_snapshot::plain_guard_resume_jitcode_pc(&pyjit, 6),
+        6,
+        "a capture already sitting on the jump `-live-` must resume there",
+    );
+    assert_eq!(
+        super::resume_snapshot::plain_guard_resume_jitcode_pc(&pyjit, 9),
+        6,
+        "a capture at the goto itself still walks back one `-live-`",
+    );
+}
+
+#[test]
 fn vstack_permuted_for_iter_entry_uses_block_head_target() {
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.metadata.n_py_instrs = 19;
