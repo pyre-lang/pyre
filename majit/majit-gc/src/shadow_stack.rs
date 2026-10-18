@@ -1222,6 +1222,54 @@ impl Drop for OwnerRootGuard {
     }
 }
 
+/// `framework.py` `push_roots` / `pop_roots` for a livevars span around
+/// `collect_and_reserve`.
+///
+/// `shadowcolor.py` `expand_one_push_roots` stores each live GCREF
+/// (`gc_save_root`); `expand_one_pop_roots` writes the (possibly
+/// forwarded) value back (`gc_restore_root`). Fast-path `malloc_fast` /
+/// `malloc_varsize` do not construct this; only the `#[cold]` overflow
+/// that actually calls `collect_and_reserve` does.
+pub struct LiveRootFrame {
+    slot: ShadowStackSlot,
+    depth: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+}
+
+impl LiveRootFrame {
+    /// `gc_push_roots(livevars)`.
+    ///
+    /// # Safety
+    /// `roots` must address `root_count` contiguous mutable [`GcRef`]
+    /// slots that outlive this frame.
+    #[inline]
+    pub unsafe fn push(roots: *mut GcRef, root_count: usize) -> Self {
+        let slot = shadow_stack_slot();
+        let depth = slot.depth();
+        for i in 0..root_count {
+            slot.push(unsafe { *roots.add(i) });
+        }
+        Self {
+            slot,
+            depth,
+            roots,
+            root_count,
+        }
+    }
+}
+
+impl Drop for LiveRootFrame {
+    /// `gc_pop_roots(livevars)`: reload each slot, then `decr_stack`.
+    #[inline]
+    fn drop(&mut self) {
+        for i in 0..self.root_count {
+            unsafe { *self.roots.add(i) = self.slot.get(self.depth + i) };
+        }
+        self.slot.pop_to(self.depth);
+    }
+}
+
 /// One root slot for a GC local's live range.
 ///
 /// `shadowstack.py` `push_stack` / `pop_stack` are a LIFO pair
@@ -2681,6 +2729,20 @@ mod tests {
 
         pop_to(depth);
         assert_eq!(super::depth(), 0);
+    }
+
+    #[test]
+    fn live_root_frame_reloads_forwarded_slots_and_restores_depth() {
+        let _lock = TEST_MUTEX.lock();
+        let depth = shadow_stack_slot().depth();
+        let mut live = [GcRef(0x1000), GcRef(0x2000)];
+        {
+            let _frame = unsafe { LiveRootFrame::push(live.as_mut_ptr(), live.len()) };
+            assert_eq!(shadow_stack_slot().depth(), depth + 2);
+            walk_roots(|slot| slot.0 += 1);
+        }
+        assert_eq!(live, [GcRef(0x1001), GcRef(0x2001)]);
+        assert_eq!(shadow_stack_slot().depth(), depth);
     }
 
     #[test]

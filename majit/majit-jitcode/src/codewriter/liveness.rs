@@ -101,9 +101,58 @@ pub fn encode_liveness(live: &[u8]) -> Vec<u8> {
 /// prefix already holds, spending the 2-byte `-live-` operand's 64 KiB budget
 /// on duplicates.
 ///
+/// Bytes `LivenessIterator` consumes for a bank of `length` set bits.
+/// `None` if the slice ends before the iterator would finish
+/// (`ord(all_liveness[self.offset])` in `liveness.py` `LivenessIterator.next`).
+fn encoded_bank_len(all_liveness: &[u8], offset: usize, length: u32) -> Option<usize> {
+    if length == 0 {
+        return Some(0);
+    }
+    let mut remaining = length;
+    let mut pos = offset;
+    let mut count = 0u32;
+    let mut curr_byte = 0u32;
+    while remaining > 0 {
+        if (count & 7) == 0 {
+            curr_byte = *all_liveness.get(pos)? as u32;
+            pos += 1;
+        }
+        let tail = curr_byte >> (count & 7);
+        if tail != 0 {
+            count += tail.trailing_zeros();
+            remaining -= 1;
+            count += 1;
+        } else {
+            count = (count & !7) + 8;
+        }
+    }
+    Some(pos - offset)
+}
+
+/// True when `all_liveness[offset..]` is a complete assembler record:
+/// three count bytes then three `encode_liveness` banks of those lengths
+/// (`jitcode.py` `enumerate_vars`).
+pub fn liveness_record_is_complete(all_liveness: &[u8], offset: usize) -> bool {
+    if offset + 2 >= all_liveness.len() {
+        return false;
+    }
+    let mut bank_end = offset + 3;
+    for i in 0..3 {
+        match encoded_bank_len(all_liveness, bank_end, u32::from(all_liveness[offset + i])) {
+            Some(len) => bank_end += len,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Each returned tuple is `(live_i, live_r, live_f, offset)`, with the sets in
 /// the sorted/deduped form `encode_liveness` canonicalises to — the same shape
 /// upstream's `frozenset` key has.
+///
+/// Incomplete trailing bytes (a header that names more set bits than the
+/// remaining slice holds) are dropped: this is a safe assembler-seed walk,
+/// not the resume hot loop.
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
@@ -118,6 +167,20 @@ pub fn decode_liveness_records(all_liveness: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Ve
             all_liveness[pos + 1],
             all_liveness[pos + 2],
         ];
+        let mut bank_end = pos + 3;
+        let mut complete = true;
+        for &count in &counts {
+            match encoded_bank_len(all_liveness, bank_end, u32::from(count)) {
+                Some(len) => bank_end += len,
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            break;
+        }
         pos += 3;
         let mut sets: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for (bank, &count) in counts.iter().enumerate() {
@@ -126,14 +189,15 @@ pub fn decode_liveness_records(all_liveness: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Ve
                 // consumes none either.
                 continue;
             }
-            // SAFETY: `decode_liveness_records` walks assembler records;
-            // each bank is an `encode_liveness` bitset (`LivenessIterator.__init__`).
+            // SAFETY: `encoded_bank_len` just proved this bank is a complete
+            // `encode_liveness` bitset (`LivenessIterator.__init__`).
             let mut it = unsafe { LivenessIterator::new(pos, u32::from(count), all_liveness) };
             for index in it.by_ref() {
                 sets[bank].push(index as u8);
             }
             pos = it.offset();
         }
+        debug_assert_eq!(pos, bank_end);
         let [live_i, live_r, live_f] = sets;
         records.push((live_i, live_r, live_f, offset));
     }
@@ -280,6 +344,25 @@ mod tests {
             assert_eq!((i, r, f), (&banks[idx].0, &banks[idx].1, &banks[idx].2));
             assert_eq!(*off, offsets[idx]);
         }
+    }
+
+    #[test]
+    fn decode_liveness_records_drops_a_truncated_bank() {
+        // Header claims two int bits; one bank byte holds one set bit.
+        // `LivenessIterator.next_index` would load past the slice.
+        assert!(decode_liveness_records(&[2, 0, 0, 0x01]).is_empty());
+        assert_eq!(
+            decode_liveness_records(&[1, 0, 0, 0x01]),
+            vec![(vec![0], Vec::new(), Vec::new(), 0)]
+        );
+    }
+
+    #[test]
+    fn liveness_record_is_complete_rejects_a_header_with_missing_bank_bytes() {
+        assert!(!liveness_record_is_complete(&[2, 0, 0, 0x01], 0));
+        assert!(liveness_record_is_complete(&[1, 0, 0, 0x01], 0));
+        assert!(liveness_record_is_complete(&[0, 0, 0], 0));
+        assert!(!liveness_record_is_complete(&[0, 0], 0));
     }
 
     #[test]

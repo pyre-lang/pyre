@@ -2796,30 +2796,19 @@ impl WarmEnterState {
 
     /// **Resolve once**: the cell key the greens behind `hash` name.
     ///
-    /// `make_key` is called only when this hash owns SEVERAL cells — none and
-    /// one both have a single answer, so no `GreenKey` has to be built to
-    /// confirm it. Producers that cannot build one on an ambiguous hash get
-    /// `hash` back, which names that hash's original occupant or nothing: a
-    /// miss, not a guess.
-    ///
-    /// Cells belonging to other hashes that share the table slot
-    /// (counter.py _get_index truncates the index) are not candidates and do not
-    /// force a `GreenKey`: [`Self::cell_keys_at`] has already excluded them by
-    /// the full hash, which is the same exclusion `comparekey` makes upstream
-    /// (warmstate.py).
+    /// `warmstate.py` `JitCell.get_jitcell` walks `lookup_chain(hash)` and
+    /// returns a cell only after `cell.comparekey(*greenargs)`, including
+    /// when the chain holds one occupant. A 64-bit `get_uhash` collision
+    /// with a different green key must miss.
     ///
     /// See [`WarmEnterState`]'s type doc for why the resolve happens at the
     /// producer and the result is carried, rather than each consumer
     /// re-deriving a cell from the slot.
     #[inline]
     pub fn resolve_cell_key(&self, hash: u64, make_key: impl FnOnce() -> GreenKey) -> u64 {
-        match self.cell_keys_at(hash) {
-            // Nothing of this hash is filed, so `hash` is both the miss and the
-            // key a later install would take it under.
-            (0, _) => hash,
-            (1, Some(cell_key)) => cell_key,
-            _ => self.cell_key_for(&make_key()).unwrap_or(hash),
-        }
+        self.lookup_chain_with_key(&make_key())
+            .and_then(|cell| cell.cell_key.get())
+            .unwrap_or(hash)
     }
 
     /// [`Self::resolve_cell_key`] and the resolved cell's ENTRY TOKEN answered
@@ -2866,26 +2855,33 @@ impl WarmEnterState {
             && cell.next.borrow().is_none()
             && cell.cell_bucket.get() == hash
             && cell.jitdriver_sd == self.jitdriver_sd
-            && make_key.is_none_or(|mk| cell.comparekey_matches(&mk()))
         {
-            let cell_key = cell.cell_key.get().unwrap_or(hash);
-            if cell.flags.get().contains(JcFlags::JC_TRACING)
-                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+            // `JitCell.get_jitcell`: unique occupant still needs comparekey.
+            // `make_key is None` is an identity lookup by cell key (hash-only
+            // cells, already-resolved keys); greens-holding doors pass the
+            // comparator `maybe_compile_and_run` already has.
+            if let Some(mk) = make_key
+                && !cell.comparekey_matches(&mk())
             {
-                return (cell_key, None);
+                return (hash, None);
             }
-            return (cell_key, cell.get_procedure_token());
+            let cell_key = cell.cell_key.get().unwrap_or(hash);
+            return (cell_key, Self::cell_entry_procedure_token(&cell));
         }
         let (cell_key, cell) = self.resolved_cell(hash, make_key);
-        let token = cell.and_then(|cell| {
-            if cell.flags.get().contains(JcFlags::JC_TRACING)
-                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
-            {
-                return None;
-            }
-            cell.get_procedure_token()
-        });
+        let token = cell.and_then(|cell| Self::cell_entry_procedure_token(&cell));
         (cell_key, token)
+    }
+
+    /// `maybe_compile_and_run` flag-first then `cell.get_procedure_token()`.
+    /// `EnterJitAssembler` holds that owned token for the run.
+    fn cell_entry_procedure_token(cell: &BaseJitCell) -> Option<Arc<JitCellToken>> {
+        if cell.flags.get().contains(JcFlags::JC_TRACING)
+            || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+        {
+            return None;
+        }
+        cell.get_procedure_token()
     }
 
     /// [`Self::resolve_cell_key`]'s answer together with the cell it names,
@@ -2899,6 +2895,15 @@ impl WarmEnterState {
         hash: u64,
         make_key: Option<&dyn Fn() -> GreenKey>,
     ) -> (u64, Option<Rc<BaseJitCell>>) {
+        // `JitCell.get_jitcell`: walk this hash's chain and accept only
+        // after `comparekey`. A typed miss must not recover a minted
+        // cell from another bucket via `cell_named_by_hash`.
+        if let Some(make_key) = make_key {
+            return match self.lookup_chain_with_key(&make_key()) {
+                Some(cell) => (cell.cell_key.get().unwrap_or(hash), Some(cell)),
+                None => (hash, None),
+            };
+        }
         let mut count = 0usize;
         let mut found: Option<(Rc<BaseJitCell>, u64)> = None;
         // The cell this slot holds under `hash` ITSELF, whatever bucket filed
@@ -2939,26 +2944,8 @@ impl WarmEnterState {
             }
         };
         match (count, found) {
-            (1, Some((cell, cell_key))) => match make_key {
-                // `JitCell.get_jitcell`: `cell.comparekey(*greenargs)` even
-                // when the chain holds one occupant. A 64-bit `get_uhash`
-                // collision with a different green key must miss.
-                Some(make_key) if !cell.comparekey_matches(&make_key()) => {
-                    // `JitCell.get_jitcell` returns None after the
-                    // comparekey chain is exhausted. Do not recover the
-                    // mismatching occupant via `unwrap_or(hash)`.
-                    (hash, None)
-                }
-                _ => (cell_key, Some(cell)),
-            },
-            (0, _) => (hash, cell_named_by_hash()),
-            _ => match make_key {
-                Some(make_key) => match self.cell_key_for(&make_key()) {
-                    Some(cell_key) => (cell_key, self.cell_by_key(cell_key)),
-                    None => (hash, None),
-                },
-                None => (hash, cell_named_by_hash()),
-            },
+            (1, Some((cell, cell_key))) => (cell_key, Some(cell)),
+            _ => (hash, cell_named_by_hash()),
         }
     }
 
@@ -5327,6 +5314,20 @@ mod tests {
             "occupant holds an executable token"
         );
 
+        let occupant_key = ws
+            .cell_key_for(&key_hit)
+            .expect("installed occupant has a cell key");
+        assert_eq!(
+            ws.resolve_cell_key(hash, || key_hit.clone()),
+            occupant_key,
+            "matching greens resolve to the occupant's cell key"
+        );
+        assert_eq!(
+            ws.resolve_cell_key(hash, || key_miss.clone()),
+            hash,
+            "JitCell.get_jitcell returns None; do not hand back the occupant's key"
+        );
+
         let (_cell_key, cell) = ws.resolved_cell(hash, Some(&|| key_miss.clone()));
         assert!(
             cell.is_none(),
@@ -5344,6 +5345,41 @@ mod tests {
         assert!(
             token.is_none(),
             "comparekey miss must not recover the occupant's token"
+        );
+
+        // count==0 typed lookup: `hash` is a minted cell key sitting in
+        // another bucket. `cell_named_by_hash` would return that cell;
+        // `get_jitcell` walks this hash's chain and misses.
+        let mut minted_ws = WarmEnterState::new(100);
+        let parked = GreenKey::new(vec![7100, 7200]);
+        let parked_bucket = parked.get_uhash();
+        let squatter = GreenKey::new(vec![7300, colliding_last_green(&parked, 7300)]);
+        assert_eq!(squatter.get_uhash(), parked_bucket);
+        minted_ws.ensure_cell_for_key(&squatter);
+        let parked_token = token_with_compiled_code(&mut minted_ws);
+        minted_ws.attach_procedure_to_interp_for_key(&parked, Arc::clone(&parked_token));
+        let minted = minted_ws
+            .cell_key_for(&parked)
+            .expect("colliding squatter forces a minted key");
+        assert_ne!(minted, parked_bucket);
+        let arriving = green_key_hashing_to(minted, 8100);
+        assert_eq!(arriving.get_uhash(), minted);
+        assert_ne!(arriving, parked);
+        let (_cell_key, minted_cell) = minted_ws.resolved_cell(minted, Some(&|| arriving.clone()));
+        assert!(
+            minted_cell.is_none(),
+            "typed miss must not recover a minted cell from another bucket"
+        );
+        let (_cell_key, minted_token) =
+            minted_ws.resolved_cell_procedure_token(minted, Some(&|| arriving.clone()));
+        assert!(
+            minted_token.is_none(),
+            "typed miss must not return the minted cell's token"
+        );
+        assert_eq!(
+            minted_ws.resolve_cell_key(minted, || arriving.clone()),
+            minted,
+            "get_jitcell miss carries the arriving hash"
         );
     }
 

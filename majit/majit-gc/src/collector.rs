@@ -1958,10 +1958,10 @@ impl MiniMarkGC {
     /// Minor-collect before a Trace-pool allocation when
     /// [`crate::gc_stress_trace_alloc_enabled`] is set.
     ///
-    /// `opencoder.py` `Trace._ops` and the other pools in `trace_bufs` call
-    /// this through [`crate::stress_trace_pool_alloc`]. `malloc_fast`
-    /// (`framework.py`, `inline=True`) does not: rbigint digit arrays share
-    /// that entry (`rlist.try_alloc_typed_items_block_nursery_rooted`).
+    /// `opencoder.py` `Trace._ops` and the other pools in `trace_bufs` used
+    /// to call this through [`crate::stress_trace_pool_alloc`]. `malloc_fast`
+    /// (`framework.py`, `inline=True`) now consults the knob on the bump
+    /// itself, so those callers no longer prefix the alloc.
     ///
     /// A collection callback that allocates again must not re-enter: the
     /// flag is process-global because `gc_op` already serializes the
@@ -11082,6 +11082,14 @@ impl GcAllocator for MiniMarkGC {
         self.published_nursery_top.as_ptr() as usize
     }
 
+    fn malloc_fast_bump_addrs(&self) -> Option<(usize, usize, usize)> {
+        Some((
+            self.nursery.free_addr(),
+            self.nursery.top_addr(),
+            self.config.large_object_threshold,
+        ))
+    }
+
     fn max_nursery_object_size(&self) -> usize {
         self.config.large_object_threshold
     }
@@ -13458,6 +13466,18 @@ mod tests {
         );
         assert!(!gc.isenabled());
         assert_eq!(gc.minor_collections, 4);
+    }
+
+    #[test]
+    fn malloc_fast_bump_addrs_name_the_nursery_ptrs_fields() {
+        let gc = test_gc(4096);
+        let (free, top, large) = GcAllocator::malloc_fast_bump_addrs(&gc)
+            .expect("MiniMarkGC publishes nursery_free / nursery_top");
+        assert_eq!(free, gc.nursery.free_addr());
+        assert_eq!(top, gc.nursery.top_addr());
+        assert_eq!(large, gc.config.large_object_threshold);
+        assert_ne!(free, 0);
+        assert_ne!(top, 0);
     }
 
     #[test]

@@ -70,14 +70,11 @@ struct Table {
     young_mark: Vec<u8>,
 }
 
-/// Non-zero while a collection (or a test helper) is forwarding.
-/// Slots already traced in this wave are not written twice.
-static WAVE: AtomicU32 = AtomicU32::new(0);
-
-/// Next id `Wave::enter` publishes. Separate from `WAVE` so dropping a
-/// guard can restore the enclosing wave without reusing an id `marks`
-/// still holds. `0` is never issued. After the counter wraps, the next
-/// id is published only once `marks` has been cleared.
+/// Next id `Wave::enter` publishes. Separate from the collecting
+/// thread's current wave so dropping a guard can restore the enclosing
+/// wave without reusing an id `marks` still holds. `0` is never issued.
+/// After the counter wraps, the next id is published only once `marks`
+/// has been cleared.
 static NEXT_WAVE: AtomicU32 = AtomicU32::new(1);
 
 impl Table {
@@ -109,18 +106,34 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 });
 static READY: AtomicBool = AtomicBool::new(false);
 
-// Reentrancy on the walking thread. Another test thread must not
-// observe it: the table mutex is what serializes slot updates.
+// Reentrancy and the open `Wave` on the walking thread. Another test
+// thread must not observe either: the table mutex serializes slot
+// updates, and the wave id is this thread's STW generation.
 thread_local! {
-    static WALKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WALKING: std::cell::Cell<(bool, u32)> =
+        const { std::cell::Cell::new((false, 0)) };
 }
 
 fn walking() -> bool {
-    WALKING.with(|cell| cell.get())
+    WALKING.with(|cell| cell.get().0)
 }
 
 fn set_walking(value: bool) {
-    WALKING.with(|cell| cell.set(value));
+    WALKING.with(|cell| {
+        let (_, wave) = cell.get();
+        cell.set((value, wave));
+    })
+}
+
+fn current_wave() -> u32 {
+    WALKING.with(|cell| cell.get().1)
+}
+
+fn set_current_wave(wave: u32) {
+    WALKING.with(|cell| {
+        let (walking, _) = cell.get();
+        cell.set((walking, wave));
+    })
 }
 
 /// Lock-free mirror of `Table.slots` for `history.py` `ConstPtr.getref_base`.
@@ -348,9 +361,9 @@ pub struct Wave {
 
 impl Wave {
     pub fn enter() -> Self {
-        let prev = WAVE.load(Ordering::Relaxed);
+        let prev = current_wave();
         let next = alloc_wave_id();
-        WAVE.store(next, Ordering::Relaxed);
+        set_current_wave(next);
         Wave { prev }
     }
 }
@@ -384,7 +397,7 @@ fn alloc_wave_id() -> u32 {
 
 impl Drop for Wave {
     fn drop(&mut self) {
-        WAVE.store(self.prev, Ordering::Release);
+        set_current_wave(self.prev);
     }
 }
 
@@ -437,7 +450,7 @@ pub fn trace_index(index: u32, visitor: &mut dyn FnMut(&mut GcRef)) {
 
 /// `true` when this wave has not yet traced `idx`. Wave 0 always claims.
 fn claim_wave(marks: &mut Vec<u32>, idx: usize) -> bool {
-    let wave = WAVE.load(Ordering::Relaxed);
+    let wave = current_wave();
     if wave == 0 {
         return true;
     }
@@ -814,8 +827,18 @@ fn find(table: &Table, hash: u64, addr: usize) -> Option<u32> {
     // `id_or_identityhash` is unique per object. After a move the
     // live address misses the slot, but the recorded hash still names
     // the one intern. Several hits would be a hash collision.
+    //
+    // When the hash *is* the address (no identity hook), a hit whose
+    // slot has moved is the vacated from-space word, not the same
+    // object. `history.py` `ConstPtr` identity does not reuse that
+    // intern for a later object at the old address.
     if identity_hits == 1 {
-        identity_hit
+        let idx = identity_hit.unwrap();
+        if table.hashes.get(idx as usize).copied() != Some(addr as u64) {
+            identity_hit
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -958,6 +981,28 @@ mod tests {
         });
         assert_eq!(intern(to), idx);
         assert_eq!(resolve(idx), to);
+    }
+
+    #[test]
+    fn intern_of_a_vacated_address_does_not_reuse_when_hash_is_the_address() {
+        let _serial = TEST_SERIAL.lock();
+        // Default hook: identity is the address. After a walk the from-space
+        // word is a different object. `history.py` `ConstPtr` identity must
+        // mint a new intern rather than rewrite dest back to from-space.
+        let from = GcRef(0x5555_5000);
+        let to = GcRef(0x5555_5080);
+        let idx = intern(from);
+        walk(&mut |slot| {
+            if slot.0 == from.0 {
+                *slot = to;
+            }
+        });
+        assert_eq!(intern(to), idx);
+        assert_eq!(resolve(idx), to);
+        let vacated = intern(from);
+        assert_ne!(vacated, idx);
+        assert_eq!(resolve(idx), to);
+        assert_eq!(resolve(vacated), from);
     }
 
     #[test]

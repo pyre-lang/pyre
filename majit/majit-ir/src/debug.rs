@@ -74,6 +74,7 @@
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 /// Parsed `MAJIT_LOG` value. `debug_print.c` `pypy_debug_open`.
@@ -252,14 +253,38 @@ fn read_timestamp() -> u128 {
     ts_origin().elapsed().as_nanos()
 }
 
+/// `debug_print.c` `pypy_have_debug_prints` is one C `long`.
+/// `OP_HAVE_DEBUG_PRINTS(r) r = (pypy_have_debug_prints & 1)` is one load.
+///
+/// 0 = uninit, 1 = `MAJIT_LOG` unset (`pypy_have_debug_prints` stays 0),
+/// 2 = logging on (the ready bit lives in TLS so a second thread's
+/// `debug_start` does not clear this thread's gates).
+static HAVE_DEBUG_PRINTS_FLAG: AtomicU8 = AtomicU8::new(0);
+
 /// `rlib/debug.py have_debug_prints()` — true when the next
 /// `debug_print` would be emitted. That is the low bit of this thread's
 /// ready word (`debug_print.c` `OP_HAVE_DEBUG_PRINTS`).
 #[inline]
 pub fn have_debug_prints() -> bool {
-    // A disabled log keeps `pypy_have_debug_prints` at 0, so the gate
-    // answers without touching this thread's section state.
-    if !with_config(|cfg| cfg.enabled) {
+    #[cfg(test)]
+    {
+        if CONFIG_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+            return with_debug_state(|state, _| (state.ready & 1) != 0);
+        }
+    }
+    match HAVE_DEBUG_PRINTS_FLAG.load(Ordering::Relaxed) {
+        1 => false,
+        2 => with_debug_state(|state, _| (state.ready & 1) != 0),
+        _ => have_debug_prints_init(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn have_debug_prints_init() -> bool {
+    let enabled = global_config().enabled;
+    HAVE_DEBUG_PRINTS_FLAG.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+    if !enabled {
         return false;
     }
     with_debug_state(|state, _| (state.ready & 1) != 0)

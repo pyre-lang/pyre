@@ -6335,10 +6335,10 @@ impl<S: JitState> JitDriver<S> {
                     None
                 } else {
                     let info = jitcode.get_live_vars_info(pc, op_live);
-                    if info + 2 >= all_liveness.len() {
+                    if !majit_jitcode::liveness::liveness_record_is_complete(&all_liveness, info) {
                         if crate::bridge_debug_enabled() {
                             eprintln!(
-                                "[bridgeB] read_frame_liveness_reg_indices: liveness info {info} out of range (len={}) at pc={pc} — declining (empty banks)",
+                                "[bridgeB] read_frame_liveness_reg_indices: liveness info {info} incomplete (len={}) at pc={pc} — declining (empty banks)",
                                 all_liveness.len()
                             );
                         }
@@ -6500,11 +6500,16 @@ impl<S: JitState> JitDriver<S> {
                             });
                             cursor += 1;
                         };
-                        majit_jitcode::codewriter::jitcode::enumerate_vars_by_bank(
-                            info,
-                            &all_liveness,
-                            consume,
-                        );
+                        // SAFETY: `liveness_record_is_complete` proved the
+                        // three count bytes and the three banks of those
+                        // lengths (`jitcode.py` `enumerate_vars`).
+                        unsafe {
+                            majit_jitcode::codewriter::jitcode::enumerate_vars_by_bank(
+                                info,
+                                &all_liveness,
+                                consume,
+                            );
+                        }
                     }
                     if let Some(why) = decline {
                         return Err(why);
@@ -6838,6 +6843,8 @@ impl<S: JitState> JitDriver<S> {
         // into it, so the amplified gate can take the same one.
         #[cfg(feature = "__back-edge-stage-probe")]
         let carried_token = carried_procedure_token.is_some();
+        // `EnterJitAssembler.procedure_token` is a live reference for the
+        // run (`maybe_compile_and_run`). Carry the upgraded Arc the same way.
         let (green_key, entry_procedure_token) = match carried_procedure_token {
             Some(token) => (green_key_hash, Some(token)),
             None => self.resolved_entry_procedure_token(green_key_hash, structured_green_key),
@@ -7237,29 +7244,39 @@ impl<S: JitState> JitDriver<S> {
                     // green banks on that path.
                     return Some(PortalResume::DoneWithThisFrame(None));
                 }
-            }
-            let result = if polled_raw_int {
-                self.meta
+                let frame = self
+                    .meta
                     .raw_int_fallback
                     .take()
-                    .expect("poll_raw_int_finish stored the general-case result")
-            } else {
-                self.meta.execute_assembler_at_dispatch_key(
-                    &procedure_token,
+                    .expect("poll_raw_int_finish stored the deadframe");
+                self.entry_scratch_out(scratch);
+                return self.dispatch_handle_fail(
                     green_key,
-                    // The run is handed the meta the gate above already read out of
-                    // `compiled_loops`, rather than probing that map a third time
-                    // for the same slot. Nothing between the two can replace the
-                    // entry: `pre_run` cannot capture the driver and the
-                    // `on_compiled_entry` hook is called through `&self.meta`.
-                    // Not carried: this entry reads its snapshot from
-                    // `compiled_meta` on every arm below, so a copy on the result
-                    // would ride out and drop unread.
-                    None,
-                    live_values,
+                    target_pc,
+                    state,
+                    env,
+                    frame,
+                    &compiled_meta,
+                    vable,
                     selected_dispatch_key,
-                )
-            };
+                    portal_rca,
+                );
+            }
+            let result = self.meta.execute_assembler_at_dispatch_key(
+                &procedure_token,
+                green_key,
+                // The run is handed the meta the gate above already read out of
+                // `compiled_loops`, rather than probing that map a third time
+                // for the same slot. Nothing between the two can replace the
+                // entry: `pre_run` cannot capture the driver and the
+                // `on_compiled_entry` hook is called through `&self.meta`.
+                // Not carried: this entry reads its snapshot from
+                // `compiled_meta` on every arm below, so a copy on the result
+                // would ride out and drop unread.
+                None,
+                live_values,
+                selected_dispatch_key,
+            );
             // The compiled body no longer reads its entry arguments. Return
             // these buffers before any guard-resume path can re-enter the
             // driver to trace a bridge.
@@ -7274,6 +7291,7 @@ impl<S: JitState> JitDriver<S> {
                 vable,
                 selected_dispatch_key,
                 portal_rca,
+                false,
             );
         }
 
@@ -7308,6 +7326,123 @@ impl<S: JitState> JitDriver<S> {
         None
     }
 
+    /// `warmstate.py execute_assembler` after `func_execute_token` returns a
+    /// deadframe: `fail_descr.handle_fail(deadframe, ...)`.
+    ///
+    /// One class dispatch (`FailDescr::handle_fail_is_plain_resume_guard`),
+    /// matching the virtual `handle_fail`. Plain `ResumeGuardDescr` /
+    /// `ResumeAtPositionDescr` on a driver with no virtualizable take the
+    /// straight-line function; Forced / Exc / Copied / Finish / Propagate
+    /// keep `consume_executed_frame` + [`Self::consume_compiled_entry_result`].
+    fn dispatch_handle_fail(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        frame: majit_backend::DeadFrame,
+        compiled_meta: &std::sync::Arc<S::Meta>,
+        vable: Option<&JitDriverVar>,
+        selected_dispatch_key: u32,
+        portal_rca: bool,
+    ) -> Option<PortalResume> {
+        let descr_arc = self.meta.backend().get_latest_descr_arc(&frame);
+        let is_plain = descr_arc
+            .as_fail_descr()
+            .is_some_and(|fd| fd.handle_fail_is_plain_resume_guard());
+        if is_plain && self.meta.virtualizable_info().is_none() {
+            return self.handle_fail_plain_resume_guard(
+                green_key,
+                target_pc,
+                state,
+                env,
+                frame,
+                descr_arc,
+                compiled_meta,
+                portal_rca,
+            );
+        }
+        let result = self.meta.consume_executed_frame(green_key, None, frame);
+        self.consume_compiled_entry_result(
+            green_key,
+            target_pc,
+            state,
+            env,
+            result,
+            compiled_meta,
+            vable,
+            selected_dispatch_key,
+            portal_rca,
+            false,
+        )
+    }
+
+    /// `compile.py ResumeGuardDescr.handle_fail` when the descr is the
+    /// plain class (not Forced / Exc / Copied) and the jitdriver has no
+    /// virtualizable. Fail values stay on the deadframe
+    /// (`cpu.get_int_value`); no savedata / grab_exc
+    /// (`ResumeGuardDescr.handle_fail` does not read `jf_savedata` or
+    /// `jf_guard_exc`).
+    fn handle_fail_plain_resume_guard(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        frame: majit_backend::DeadFrame,
+        descr_arc: majit_ir::DescrRef,
+        compiled_meta: &std::sync::Arc<S::Meta>,
+        portal_rca: bool,
+    ) -> Option<PortalResume> {
+        crate::pyjitpl::MetaInterp::<S::Meta>::finish_compiled_run_io();
+        let fd: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("handle_fail keeps the deadframe");
+        let fail_index = fd.fail_index();
+        let trace_id = fd.trace_id();
+        self.meta.record_guard_failure_event(
+            green_key,
+            trace_id,
+            fail_index,
+            fd.is_back_edge_poll(),
+        );
+        let rd_loop_token = majit_backend::descr_owning_green_key(fd);
+        let status = fd.get_status();
+        let guard_value_operand = self.meta.resolve_guard_value_operand(fd, &frame);
+        let result = crate::compile::CompileResult {
+            typed_values: crate::compile::ExitValues::new(),
+            meta: None,
+            fail_index,
+            trace_id,
+            descr_arc: Some(descr_arc),
+            is_finish: false,
+            is_exit_frame_with_exception: false,
+            exit_layout: None,
+            rd_loop_token,
+            savedata: None,
+            deadframe: Some(frame),
+            exception: crate::blackhole::ExceptionState {
+                exc_class: 0,
+                exc_value: 0,
+                ovf_flag: false,
+            },
+            status,
+            guard_value_operand,
+        };
+        self.consume_compiled_entry_result(
+            green_key,
+            target_pc,
+            state,
+            env,
+            result,
+            compiled_meta,
+            None,
+            0,
+            portal_rca,
+            true,
+        )
+    }
+
     /// Finish, loop-back, or guard failure after the assembler returned.
     ///
     /// `warmstate.py execute_assembler` reads `get_latest_descr` and either
@@ -7324,6 +7459,7 @@ impl<S: JitState> JitDriver<S> {
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
         portal_rca: bool,
+        plain_handle_fail: bool,
     ) -> Option<PortalResume> {
         let mut result = result;
         if portal_rca {
@@ -7558,12 +7694,15 @@ impl<S: JitState> JitDriver<S> {
         // live (`compile.py must_compile` `cpu.get_value_direct`). The
         // fail-values slice is only the fallback for backends that
         // resolve the GUARD_VALUE index from the dense vector.
-        let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
-            &descr_arc,
-            &[],
-            guard_value_operand,
-            owning_key,
-        );
+        let (must_compile, owning_key) = if plain_handle_fail {
+            let rgd = crate::compile::resume_guard_from_fail(fd)
+                .expect("plain handle_fail is ResumeGuardDescr");
+            self.meta
+                .must_compile_resume_guard(rgd, &[], guard_value_operand, owning_key)
+        } else {
+            self.meta
+                .must_compile_with_owning_key(&descr_arc, &[], guard_value_operand, owning_key)
+        };
         // compile.py: must_compile() and not stack_almost_full().
         // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
         // guard failure resumes via blackhole — isolates bridge-record
@@ -7769,7 +7908,6 @@ impl<S: JitState> JitDriver<S> {
                 rd_consts_slice,
                 &all_liveness,
                 fail_args,
-                Some(fail_arg_types),
                 rd_virtuals_slice,
                 Some(rd_pendingfields), // rd_guard_pendingfields
                 Some(
@@ -7855,7 +7993,11 @@ impl<S: JitState> JitDriver<S> {
                             Some(caller) => {
                                 // Layout + vinfo were seeded across the
                                 // whole chain before the loop started.
-                                bh_builder.release_interp(bh);
+                                if plain_handle_fail {
+                                    bh_builder.release_interp_plain(bh);
+                                } else {
+                                    bh_builder.release_interp(bh);
+                                }
                                 bh = caller;
                                 cur_exc = next_exc;
                             }
@@ -8120,7 +8262,11 @@ impl<S: JitState> JitDriver<S> {
                             .map(|pc| PortalResume::ExitFrameWithException { pc, args })
                     }
                 };
-                bh_builder.release_interp(bh);
+                if plain_handle_fail {
+                    bh_builder.release_interp_plain(bh);
+                } else {
+                    bh_builder.release_interp(bh);
+                }
                 // `BlackholeInterpBuilder.release_interp` makes the frame
                 // reusable as soon as `_run_forever` is done. The
                 // interpreter may re-enter the portal on the pc we return,
@@ -10191,9 +10337,9 @@ impl<S: JitState> JitDriver<S> {
 
     /// `poll_raw_int_finish` / `poll_raw_int_finish_raw` returned `None`.
     ///
-    /// The trace already ran; `raw_int_fallback` holds the general-case
-    /// result. `execute_assembler` then takes `handle_fail` via
-    /// `consume_compiled_entry_result`.
+    /// The trace already ran; `raw_int_fallback` holds the deadframe.
+    /// `execute_assembler` then takes `fail_descr.handle_fail` via
+    /// [`Self::dispatch_handle_fail`].
     #[cold]
     #[inline(never)]
     fn enter_compiled_general_case(
@@ -10204,11 +10350,11 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         scratch: Box<EntryScratch>,
     ) -> SteadyCompiledEntry {
-        let result = self
+        let frame = self
             .meta
             .raw_int_fallback
             .take()
-            .expect("poll_raw_int_finish stored the general-case result");
+            .expect("poll_raw_int_finish stored the deadframe");
         self.entry_scratch_out(scratch);
         let compiled_meta = self
             .meta
@@ -10216,12 +10362,12 @@ impl<S: JitState> JitDriver<S> {
             .cloned()
             .expect("compiled meta survived the run");
         SteadyCompiledEntry::Done(
-            self.consume_compiled_entry_result(
+            self.dispatch_handle_fail(
                 cell_key,
                 target_pc,
                 state,
                 env,
-                result,
+                frame,
                 &compiled_meta,
                 None,
                 0,
@@ -10454,8 +10600,8 @@ impl<S: JitState> JitDriver<S> {
     /// hash and hands that hash on has matched nothing, and on a chained bucket
     /// can decide about one cell and run another's code.
     ///
-    /// `make_green_key` is called only when the bucket actually holds more than
-    /// one cell, so the common path builds no `GreenKey`.
+    /// `make_green_key` is `JitCell.get_jitcell`'s `*greenargs`: the unique
+    /// occupant is still accepted only after `comparekey`.
     #[inline]
     pub fn resolve_cell_key(
         &self,

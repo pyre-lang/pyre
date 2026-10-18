@@ -27,8 +27,8 @@ use majit_backend::{
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
-    AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, InputArgRc, Op,
-    OpCode, OpRc, OpRef, RdVirtualInfo, Type, Value,
+    AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, HandleFailClass,
+    InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, RdVirtualInfo, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;
@@ -3611,6 +3611,12 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
 }
 
 impl FailDescr for ResumeAtPositionDescr {
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::ResumeGuard
+    }
+    fn handle_fail_is_plain_resume_guard(&self) -> bool {
+        true
+    }
     fn fail_index(&self) -> u32 {
         // Per-trace key (see ResumeGuardDescr::fail_index).
         self.inner.fail_index_per_trace.load(Ordering::Relaxed)
@@ -4010,6 +4016,9 @@ impl ResumeGuardForcedDescr {
 }
 
 impl FailDescr for ResumeGuardForcedDescr {
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::Forced
+    }
     fn fail_index(&self) -> u32 {
         // Per-trace key (see ResumeGuardDescr::fail_index).
         self.inner.fail_index_per_trace.load(Ordering::Relaxed)
@@ -4256,6 +4265,9 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
 }
 
 impl FailDescr for ResumeGuardExcDescr {
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::Exc
+    }
     fn fail_index(&self) -> u32 {
         // Per-trace key (see ResumeGuardDescr::fail_index).
         self.inner.fail_index_per_trace.load(Ordering::Relaxed)
@@ -4653,6 +4665,9 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
 }
 
 impl FailDescr for ResumeGuardCopiedDescr {
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::Copied
+    }
     fn fail_index(&self) -> u32 {
         // Per-trace key (see ResumeGuardDescr::fail_index).  Global id
         // remains available via Descr::index() / get_descr_index().
@@ -5009,6 +5024,9 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
 }
 
 impl FailDescr for ResumeGuardCopiedExcDescr {
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::Exc
+    }
     fn fail_index(&self) -> u32 {
         // Per-trace key (see ResumeGuardDescr::fail_index).
         self.inner.fail_index_per_trace.load(Ordering::Relaxed)
@@ -6315,6 +6333,16 @@ mod fail_descr_tests {
         assert!(!plain.is_resume_at_position());
         assert!(!plain.is_guard_forced());
         assert!(!plain.is_guard_exc());
+        assert!(
+            plain
+                .as_fail_descr()
+                .unwrap()
+                .handle_fail_is_plain_resume_guard()
+        );
+        assert_eq!(
+            plain.as_fail_descr().unwrap().handle_fail_class(),
+            HandleFailClass::ResumeGuard
+        );
         assert_eq!(
             plain.as_fail_descr().unwrap().fail_arg_types(),
             &[Type::Float]
@@ -6327,6 +6355,16 @@ mod fail_descr_tests {
         let forced_ptr = Arc::as_ptr(&forced);
         assert!(forced.is_guard_forced());
         assert!(!forced.is_guard_exc());
+        assert!(
+            !forced
+                .as_fail_descr()
+                .unwrap()
+                .handle_fail_is_plain_resume_guard()
+        );
+        assert_eq!(
+            forced.as_fail_descr().unwrap().handle_fail_class(),
+            HandleFailClass::Forced
+        );
 
         forced
             .as_fail_descr()
@@ -6347,6 +6385,15 @@ mod fail_descr_tests {
         let exc_ptr = Arc::as_ptr(&exc);
         assert!(exc.is_guard_exc());
         assert!(!exc.is_guard_forced());
+        assert!(
+            !exc.as_fail_descr()
+                .unwrap()
+                .handle_fail_is_plain_resume_guard()
+        );
+        assert_eq!(
+            exc.as_fail_descr().unwrap().handle_fail_class(),
+            HandleFailClass::Exc
+        );
 
         exc.as_fail_descr()
             .unwrap()

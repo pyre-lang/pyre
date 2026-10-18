@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::Backend;
-use majit_ir::{Descr, DescrRef, FailDescr, Type};
+use majit_ir::{Descr, DescrRef, FailDescr, HandleFailClass, Type};
 
 /// `compile.py` `def make_and_attach_done_descrs(targets)`.
 ///
@@ -180,6 +180,9 @@ impl FailDescr for DoneWithThisFrameDescrVoid {
         // `compile.py` `final_descr = True`.
         true
     }
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::DoneWithThisFrame
+    }
     fn adr_jump_offset(&self) -> usize {
         self.0.adr_jump_offset()
     }
@@ -234,6 +237,9 @@ impl FailDescr for DoneWithThisFrameDescrInt {
     }
     fn is_finish(&self) -> bool {
         true
+    }
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::DoneWithThisFrame
     }
     fn adr_jump_offset(&self) -> usize {
         self.0.adr_jump_offset()
@@ -290,6 +296,9 @@ impl FailDescr for DoneWithThisFrameDescrRef {
     fn is_finish(&self) -> bool {
         true
     }
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::DoneWithThisFrame
+    }
     fn adr_jump_offset(&self) -> usize {
         self.0.adr_jump_offset()
     }
@@ -341,6 +350,9 @@ impl FailDescr for DoneWithThisFrameDescrFloat {
     }
     fn fail_arg_types(&self) -> &[Type] {
         &self.0.fail_arg_types
+    }
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::DoneWithThisFrame
     }
     fn is_finish(&self) -> bool {
         true
@@ -432,6 +444,9 @@ impl FailDescr for DoneWithThisFrameDescrMulti {
     fn is_finish(&self) -> bool {
         true
     }
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::DoneWithThisFrame
+    }
     fn adr_jump_offset(&self) -> usize {
         self.0.adr_jump_offset()
     }
@@ -492,6 +507,9 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
         // `compile.py` subclass identity: ExitFrameWithExceptionDescrRef
         // dispatches to `jitexc.ExitFrameWithExceptionRef` via `handle_fail`.
         true
+    }
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::ExitFrameWithException
     }
     fn adr_jump_offset(&self) -> usize {
         self.0.adr_jump_offset()
@@ -607,6 +625,9 @@ impl FailDescr for PropagateExceptionDescr {
         // `compile.py` `class PropagateExceptionDescr(AbstractFailDescr)` —
         // inherits `final_descr = False`.  This is a guard descr, not a finish.
         false
+    }
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::Propagate
     }
     fn adr_jump_offset(&self) -> usize {
         // Safety: single-threaded JIT (RPython GIL parity).

@@ -12144,7 +12144,6 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             majit_backend::FailArgSource::from(&*raw_values),
             storage.rd_pendingfields(),
             storage.rd_virtuals(),
-            Some(exit_layout.exit_types.as_slice()),
             guard_exc,
             novable,
             all_virtuals,

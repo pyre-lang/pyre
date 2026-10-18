@@ -2707,9 +2707,9 @@ pub struct MetaInterp<M: Clone> {
     /// drains this first.
     pub(crate) back_edge_finish_word: Option<i64>,
     /// Stashed when [`Self::poll_raw_int_finish`] ran the trace and the exit
-    /// was not the int finish singleton. The caller takes it and continues
-    /// with the same `CompileResult` `execute_assembler` would have returned.
-    pub(crate) raw_int_fallback: Option<CompileResult<M>>,
+    /// was not the int finish singleton. The caller takes the deadframe and
+    /// dispatches `fail_descr.handle_fail` (`warmstate.py execute_assembler`).
+    pub(crate) raw_int_fallback: Option<majit_backend::DeadFrame>,
     /// Single-pass tracing: the walk-final scalar state-field values captured
     /// off the still-live sym at the CloseLoop point (scalar state-field index
     /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
@@ -4275,7 +4275,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     #[inline]
-    fn finish_compiled_run_io() {
+    pub(crate) fn finish_compiled_run_io() {
         // Guard exits hand control back to the interpreter or blackhole after
         // the already-executed prefix of the trace. Any traced I/O in that
         // prefix is semantically committed and must survive deoptimization.
@@ -4308,7 +4308,7 @@ impl<M: Clone> MetaInterp<M> {
     /// have patched away once a bridge attached (`compile.py`) — or a fresh
     /// guard inside each new bridge.  `MAX_TRACE_ABORT_COUNT` records the
     /// measurement that made the distinction load-bearing.
-    fn record_guard_failure_event(
+    pub(crate) fn record_guard_failure_event(
         &mut self,
         green_key: u64,
         trace_id: u64,
@@ -14450,7 +14450,7 @@ impl<M: Clone> MetaInterp<M> {
     /// here and pass the value forward. `None` covers the arms `must_compile`
     /// never hashes a value on (TY_NONE, busy) and the backends whose slot
     /// space is the fail-argument vector, which resolve the index later.
-    fn resolve_guard_value_operand(
+    pub(crate) fn resolve_guard_value_operand(
         &self,
         descr: &dyn majit_ir::FailDescr,
         frame: &majit_backend::DeadFrame,
@@ -14587,7 +14587,7 @@ impl<M: Clone> MetaInterp<M> {
     /// every iteration.
     pub fn execute_assembler_at_dispatch_key(
         &mut self,
-        procedure_token: &std::sync::Arc<JitCellToken>,
+        procedure_token: &JitCellToken,
         green_key: u64,
         meta: Option<std::sync::Arc<M>>,
         live_values: &[Value],
@@ -14646,7 +14646,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the one word without building this result. `Err` from
     /// [`Backend::execute_token_done_int`] lands here with the deadframe the
     /// general arm already expected.
-    fn consume_executed_frame(
+    pub(crate) fn consume_executed_frame(
         &mut self,
         green_key: u64,
         meta: Option<std::sync::Arc<M>>,
@@ -14875,12 +14875,13 @@ impl<M: Clone> MetaInterp<M> {
     /// `warmstate.py execute_assembler` int fast path.
     ///
     /// `Some` is `DoneWithThisFrameDescrInt.get_result`: slot 0, frame
-    /// released, no `CompileResult`. `None` means the trace already ran and
-    /// [`Self::raw_int_fallback`] holds the general-case result.
+    /// released. `None` means the trace already ran and
+    /// [`Self::raw_int_fallback`] holds the deadframe; the caller
+    /// dispatches `fail_descr.handle_fail`.
     pub fn poll_raw_int_finish(
         &mut self,
-        procedure_token: &std::sync::Arc<JitCellToken>,
-        green_key: u64,
+        procedure_token: &JitCellToken,
+        _green_key: u64,
         live_values: &[Value],
     ) -> Option<i64> {
         Self::prepare_compiled_run_io();
@@ -14893,8 +14894,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(value)
             }
             Err(frame) => {
-                let result = self.consume_executed_frame(green_key, None, frame);
-                self.raw_int_fallback = Some(result);
+                self.raw_int_fallback = Some(frame);
                 None
             }
         }
@@ -14907,8 +14907,8 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn poll_raw_int_finish_raw(
         &mut self,
-        procedure_token: &std::sync::Arc<JitCellToken>,
-        green_key: u64,
+        procedure_token: &JitCellToken,
+        _green_key: u64,
         raw_reds: &[i64],
     ) -> Option<i64> {
         Self::prepare_compiled_run_io();
@@ -14921,8 +14921,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(value)
             }
             Err(frame) => {
-                let result = self.consume_executed_frame(green_key, None, frame);
-                self.raw_int_fallback = Some(result);
+                self.raw_int_fallback = Some(frame);
                 None
             }
         }
@@ -14931,12 +14930,13 @@ impl<M: Clone> MetaInterp<M> {
     /// `warmstate.py execute_assembler` ref fast path.
     ///
     /// `Some` is `compile.py DoneWithThisFrameDescrRef.get_result`: slot 0,
-    /// frame released, no `CompileResult`. `None` means the trace already ran
-    /// and [`Self::raw_int_fallback`] holds the general-case result.
+    /// frame released. `None` means the trace already ran and
+    /// [`Self::raw_int_fallback`] holds the deadframe; the caller
+    /// dispatches `fail_descr.handle_fail`.
     pub fn poll_raw_ref_finish(
         &mut self,
-        procedure_token: &std::sync::Arc<JitCellToken>,
-        green_key: u64,
+        procedure_token: &JitCellToken,
+        _green_key: u64,
         live_values: &[Value],
     ) -> Option<usize> {
         Self::prepare_compiled_run_io();
@@ -14949,8 +14949,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(value)
             }
             Err(frame) => {
-                let result = self.consume_executed_frame(green_key, None, frame);
-                self.raw_int_fallback = Some(result);
+                self.raw_int_fallback = Some(frame);
                 None
             }
         }
@@ -14960,8 +14959,8 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn poll_raw_ref_finish_raw(
         &mut self,
-        procedure_token: &std::sync::Arc<JitCellToken>,
-        green_key: u64,
+        procedure_token: &JitCellToken,
+        _green_key: u64,
         raw_reds: &[i64],
     ) -> Option<usize> {
         Self::prepare_compiled_run_io();
@@ -14974,8 +14973,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(value)
             }
             Err(frame) => {
-                let result = self.consume_executed_frame(green_key, None, frame);
-                self.raw_int_fallback = Some(result);
+                self.raw_int_fallback = Some(frame);
                 None
             }
         }
@@ -15673,6 +15671,9 @@ impl<M: Clone> MetaInterp<M> {
 
     /// `warmstate.py maybe_compile_and_run` token read on that driver's
     /// cell table. Production pypyjit lookup is driver 0.
+    ///
+    /// `EnterJitAssembler.procedure_token` is a live reference for the run;
+    /// `get_procedure_token` upgrades the cell's weakref to that owner.
     pub fn resolved_entry_procedure_token_on_driver(
         &self,
         jd_no: usize,
@@ -15757,19 +15758,11 @@ impl<M: Clone> MetaInterp<M> {
     /// second reader that can disagree with the decision. This is that step,
     /// spelled in the currency pyre carries across crates.
     ///
-    /// Allocation discipline (the reason this is not simply
-    /// `cell_key_for(&make_key())`): upstream compares against greens already
-    /// sitting in the portal's arguments and builds nothing, while pyre's
-    /// `GreenKey` is a heap object with `values` and `types` vectors, and this
-    /// is the warm-entry path. An unchained bucket has ONE candidate, so
-    /// `sole_cell_key` is exact without a key; the key is built only when the
-    /// bucket is chained, which is the only shape in which the candidates
-    /// differ.
-    ///
-    /// A caller with no structured key on a chained bucket cannot resolve at
-    /// all, and gets the raw hash back. That names the bucket's original
-    /// occupant if it is still there and nothing otherwise — a miss, never a
-    /// guess at which sibling was meant.
+    /// `warmstate.py` `JitCell.get_jitcell` always runs `comparekey`, including
+    /// on a unique occupant. A caller that holds greens therefore always
+    /// supplies them. A caller with no structured key cannot compare, and
+    /// [`WarmEnterState::sole_cell_key`] answers only when this hash owns
+    /// exactly one cell — a miss, never a guess at which sibling was meant.
     ///
     /// Production pypyjit resolve is driver 0.
     #[inline]
@@ -15973,6 +15966,40 @@ impl<M: Clone> MetaInterp<M> {
         majit_gc::gc_id_or_identityhash(root.get().0) as i64
     }
 
+    /// `compile.py` `must_compile`: decode `status` into the jitcounter
+    /// hash. `None` is the `ST_BUSY_FLAG` skip.
+    fn guard_status_hash(
+        status: u64,
+        descr_addr: usize,
+        fail_values: &[i64],
+        guard_value_operand: Option<i64>,
+    ) -> Option<u64> {
+        if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
+            Some(status)
+        } else if status & Self::ST_BUSY_FLAG != 0 {
+            None
+        } else {
+            let index = (status >> Self::ST_SHIFT) as u32;
+            let typetag = status & Self::ST_TYPE_MASK;
+            debug_assert!(
+                matches!(typetag, Self::TY_INT | Self::TY_REF | Self::TY_FLOAT),
+                "unknown typetag {typetag:#x}"
+            );
+            let intval: i64 = guard_value_operand
+                .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
+            let intval = if typetag == Self::TY_REF {
+                Self::ty_ref_jitcounter_intval(intval)
+            } else {
+                intval
+            };
+            Some(
+                (descr_addr as u64)
+                    .wrapping_mul(777767777)
+                    .wrapping_add((intval as u64).wrapping_mul(1442968193)),
+            )
+        }
+    }
+
     pub fn must_compile_with_owning_key(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -15999,9 +16026,9 @@ impl<M: Clone> MetaInterp<M> {
         // `jitcounter.tick`, `start_compiling`'s `ST_BUSY_FLAG` and
         // `_trace_and_compile_from_bridge` — is never entered for one.
         //
-        // Pyre has no descr-keyed `handle_fail` dispatch (`compile.rs`'s
-        // `ResumeGuardForcedDescr` is a tag-only subtype), so the same veto
-        // lands here, at the first shared step upstream skips. It already
+        // `dispatch_handle_fail` sends Forced to `consume_executed_frame`
+        // rather than `ResumeGuardDescr.handle_fail`. The same veto lands
+        // here, at the first shared step upstream skips. It already
         // existed one call deeper, at `call_jit.rs`'s
         // `trace_and_compile_from_bridge` entry; by then the tick was spent
         // and, on the failure that fires the counter, the guard scope and the
@@ -16019,8 +16046,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         // `CompileLoopVersionDescr.handle_fail` is
         // `assert 0, "this guard must never fail"` and never reaches
-        // `must_compile`. Pyre has no descr-keyed `handle_fail`, so every
-        // guard exit arrives here, ahead of `jitcounter.tick`.
+        // `must_compile`. Class dispatch leaves it on `Other`, so every
+        // version-guard exit still arrives here, ahead of `jitcounter.tick`.
         if descr_fd.loop_version() {
             panic!("CompileLoopVersionDescr.handle_fail: this guard must never fail");
         }
@@ -16032,64 +16059,18 @@ impl<M: Clone> MetaInterp<M> {
             crate::mc_diag_bump(83); // terminal-decline skip
             return (false, owning_key);
         }
-        // `compile.py:741` `status = self.status` — direct field read on
-        // the resume-guard descr.  `descr_fd` is the live `FailDescr`
+        // `compile.py` `must_compile` `status = self.status` — direct field
+        // read on the resume-guard descr. `descr_fd` is the live `FailDescr`
         // we already resolved above; no backend round-trip.
         let status = descr_fd.get_status();
-        if crate::majit_log_enabled() && trace_id == 41 {
-            eprintln!(
-                "[jit] must_compile status: key={} trace={} guard={} status={:#x} descr={:#x}",
-                owning_key, trace_id, fail_index, status, descr_addr
-            );
-        }
-        // compile.py: decode status to get hash
-        let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
-            // compile.py:745: common case — TY_NONE, not busy.
-            status
-        } else if status & Self::ST_BUSY_FLAG != 0 {
-            // compile.py:750-751: already busy tracing.
-            crate::mc_diag_bump(3); // status-busy skip
-            return (false, owning_key);
-        } else {
-            // compile.py:753-781: GUARD_VALUE per-value hash.
-            let index = (status >> Self::ST_SHIFT) as u32;
-            let typetag = status & Self::ST_TYPE_MASK;
-            // compile.py:772-773 `else: assert 0, typetag`.
-            debug_assert!(
-                matches!(typetag, Self::TY_INT | Self::TY_REF | Self::TY_FLOAT),
-                "compile.py:772-773 assert 0, typetag: unknown typetag {typetag:#x}"
-            );
-            // compile.py:761-771 turns each tag into an integer before hashing:
-            // `cast_ptr_to_int` for TY_REF, and `longlong.gethash_fast` for
-            // TY_FLOAT, which is `longlong2float.float2longlong` on a 64-bit
-            // host (codewriter/longlong.py:28) — the double's raw bit pattern.
-            // A caller that still held the deadframe performed
-            // `get_value_direct` at the recorded slot. Backends whose slot
-            // space is the dense fail-arg vector resolve the recorded index
-            // from `fail_values` here.
-            let intval: i64 = guard_value_operand
-                .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
-            // compile.py hashes TY_REF with `lltype.cast_ptr_to_int` (the live
-            // address). A nursery heap type that a minor copies young→old
-            // between failures of the same GUARD_VALUE then lands in a second
-            // jitcounter bucket, so the bridge never reaches eagerness
-            // (classmethod_type_dispatch_hot 201+64, inheritance_dispatch
-            // t1/10 and t2/0). `history.py ConstPtr._get_hash_` and
-            // `incminimark.py id_or_identityhash` hash the old-gen shadow
-            // instead; ArgsKey (`optimizeopt/util.rs`) does the same. Old
-            // objects keep identity==address, so the formula matches
-            // compile.py once the type has tenured.
-            let intval = if typetag == Self::TY_REF {
-                Self::ty_ref_jitcounter_intval(intval)
-            } else {
-                intval
+        let hash =
+            match Self::guard_status_hash(status, descr_addr, fail_values, guard_value_operand) {
+                Some(hash) => hash,
+                None => {
+                    crate::mc_diag_bump(3); // status-busy skip
+                    return (false, owning_key);
+                }
             };
-            // compile.py:780-781: current_object_addr_as_int(self) * 777767777
-            //   + intval * 1442968193
-            (descr_addr as u64)
-                .wrapping_mul(777767777)
-                .wrapping_add((intval as u64).wrapping_mul(1442968193))
-        };
         // compile.py must_compile: increment =
         // jitdriver_sd.warmstate.increment_trace_eagerness, then
         // warmrunnerdesc.jitcounter.tick. jitdriver_sd is
@@ -16102,6 +16083,52 @@ impl<M: Clone> MetaInterp<M> {
             crate::mc_diag_bump(4); // jitcounter FIRED
         }
         if fired && crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] must_compile FIRED: key={} trace={} guard={}",
+                owning_key, trace_id, fail_index
+            );
+        }
+        (fired, owning_key)
+    }
+
+    /// `AbstractResumeGuardDescr.must_compile` on the concrete descr:
+    /// `self.status`, then `jitcounter.tick(hash, increment)`.
+    ///
+    /// The plain `handle_fail` path already selected `ResumeGuardDescr` /
+    /// `ResumeAtPositionDescr`. Forced and loop-version descrs override
+    /// `handle_fail` and never enter this function.
+    pub fn must_compile_resume_guard(
+        &mut self,
+        rgd: &crate::compile::ResumeGuardDescr,
+        fail_values: &[i64],
+        guard_value_operand: Option<i64>,
+        owning_key: u64,
+    ) -> (bool, u64) {
+        let descr_addr = rgd as *const crate::compile::ResumeGuardDescr as usize;
+        if rgd.bridge_declined_terminally.load(Ordering::Acquire) {
+            crate::mc_diag_bump(83);
+            return (false, owning_key);
+        }
+        let status = rgd.status.load(Ordering::Acquire);
+        let hash =
+            match Self::guard_status_hash(status, descr_addr, fail_values, guard_value_operand) {
+                Some(hash) => hash,
+                None => {
+                    crate::mc_diag_bump(3);
+                    return (false, owning_key);
+                }
+            };
+        let jct = unsafe { &*rgd.rd_loop_token_clt.get() }
+            .as_ref()
+            .and_then(|clt| clt.upgrade_loop_token());
+        let jd_no = self.jitdriver_index_for_failed_token(jct.as_deref());
+        let fired = self.warm_state_for_driver(jd_no).tick_guard_failure(hash);
+        if fired {
+            crate::mc_diag_bump(4);
+        }
+        if fired && crate::majit_log_enabled() {
+            let trace_id = rgd.trace_id.load(Ordering::Relaxed);
+            let fail_index = rgd.fail_index_per_trace.load(Ordering::Relaxed);
             eprintln!(
                 "[jit] must_compile FIRED: key={} trace={} guard={}",
                 owning_key, trace_id, fail_index
@@ -18055,7 +18082,6 @@ impl<M: Clone> MetaInterp<M> {
         // The layout resolved above already carries them; `get_recovery_slot_
         // types` is `exit_types.to_vec()` off a second resolution of the same
         // key, so re-asking can only lose them.
-        let deadframe_types = exit_layout.exit_types.as_slice();
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let all_liveness_bytes = self.staticdata.liveness_info.snapshot_arc();
@@ -18067,7 +18093,6 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts,
                 all_liveness,
                 fail_values,
-                Some(deadframe_types),
                 rd_virtuals.as_deref(),
                 storage.and_then(|s| s.rd_pendingfields()),
                 Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),

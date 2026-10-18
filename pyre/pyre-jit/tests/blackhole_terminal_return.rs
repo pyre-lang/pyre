@@ -89,7 +89,6 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
                     majit_backend::FailArgSource::from(&[frame_ptr as i64][..]),
                     None,
                     None,
-                    Some(&[Type::Ref]),
                     0,
                     false,
                     None,

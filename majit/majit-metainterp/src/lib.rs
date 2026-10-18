@@ -509,7 +509,8 @@ pub fn closedbg_enabled() -> bool {
 /// `MAJIT_BH_DEBUG`. `setposition` reads this on every resume.
 ///
 /// A `OnceLock` is an acquire load of the cell on every call.
-/// `have_debug_prints` is one relaxed load (`pypy_have_debug_prints & 1`).
+/// Same shape as `have_debug_prints` / `OP_HAVE_DEBUG_PRINTS`
+/// (`pypy_have_debug_prints & 1`).
 static BH_DEBUG_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[inline(always)]

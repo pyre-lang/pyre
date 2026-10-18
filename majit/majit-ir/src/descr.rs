@@ -4769,6 +4769,30 @@ impl FromIterator<u16> for RdLocs {
     }
 }
 
+/// Class of `handle_fail` (`compile.py`). One virtual call selects the
+/// method, matching the Python subclass dispatch at
+/// `fail_descr.handle_fail`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandleFailClass {
+    /// `ResumeGuardDescr.handle_fail` and `ResumeAtPositionDescr`
+    /// (inherits, no override).
+    ResumeGuard,
+    /// `ResumeGuardForcedDescr.handle_fail`.
+    Forced,
+    /// `ResumeGuardExcDescr.handle_fail` / `ResumeGuardCopiedExcDescr`.
+    Exc,
+    /// `ResumeGuardCopiedDescr.handle_fail` (storage on `prev`).
+    Copied,
+    /// `_DoneWithThisFrameDescr` subclasses.
+    DoneWithThisFrame,
+    /// `ExitFrameWithExceptionDescrRef.handle_fail`.
+    ExitFrameWithException,
+    /// `PropagateExceptionDescr.handle_fail`.
+    Propagate,
+    /// Any other `FailDescr` (`CompileLoopVersionDescr`, tests, wasm).
+    Other,
+}
+
 /// Descriptor for guard failures — carries resume information.
 ///
 /// Mirrors rpython/jit/metainterp/history.py AbstractFailDescr.
@@ -4964,6 +4988,20 @@ pub trait FailDescr: Descr {
 
     /// Whether this fail descriptor represents a FINISH exit.
     fn is_finish(&self) -> bool {
+        false
+    }
+
+    /// `compile.py` virtual `handle_fail`. Default `Other`; each descr
+    /// class overrides to a constant so the selector is one vtable call,
+    /// not a chain of `is_finish` / `is_guard_forced` / `as_any` probes.
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::Other
+    }
+
+    /// `ResumeGuardDescr.handle_fail` / `ResumeAtPositionDescr` (inherits).
+    /// Default `false`. `ResumeGuardExcDescr::as_any` returns the inner
+    /// `ResumeGuardDescr`, so a TypeId downcast cannot be the selector.
+    fn handle_fail_is_plain_resume_guard(&self) -> bool {
         false
     }
 

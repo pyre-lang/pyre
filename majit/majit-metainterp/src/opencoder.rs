@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[path = "trace_bufs.rs"]
 mod trace_bufs;
 
+pub(crate) use trace_bufs::{FixedSignedList, ListRootGuard};
+
 /// `GcArray(Char)` length word. `opencoder.py` `FixedSizeListRepr` stores
 /// the list as that one array; the length the collector copies is this word.
 const TRACE_OPS_CHARS: usize = std::mem::size_of::<usize>();
@@ -67,7 +69,6 @@ fn alloc_numbering_bytes(bytes: &[u8]) -> usize {
     let payload = TRACE_OPS_CHARS + len;
     let mut live = majit_ir::GcRef(0);
     let mut needs_write_barrier = false;
-    majit_gc::stress_trace_pool_alloc(&mut live, 1);
     let fresh = unsafe {
         majit_gc::alloc_fast_nursery_collecting_typed_rooted(
             numbering_gc_type_id(),
@@ -160,7 +161,6 @@ impl TraceOpsBuf {
         // (`alloc_with_type_rooted_body`), not at this caller.
         // `malloc_fast` + one live root. The public no-collect entry spills
         // instead of collecting; `Trace._double_ops` has to collect.
-        majit_gc::stress_trace_pool_alloc(&mut live, 1);
         let fresh = unsafe {
             majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                 trace_ops_gc_type_id(),

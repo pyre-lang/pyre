@@ -2223,14 +2223,11 @@ fn jit_blackhole_resume_from_guard(
     // `ResumeGuardDescr.get_resumestorage()` for the `rd_*` pool (shared
     // through `Arc<ResumeStorage>` so blackhole resume reads the same
     // `rd_consts` the GC root walker updates) and the guard's own
-    // `fail_arg_types` for the deadframe slot types. resume.py parity:
-    // deadframe_types tells decode_ref() whether a TAGBOX slot holds a raw
-    // int (needs boxing) or a GcRef (use as-is). Without it, unboxed ints
-    // are treated as pointers → SIGSEGV. Both come off the one descr so
-    // the storage and the types cannot describe different deadframes.
+    // `fail_arg_types` for the deadframe slot types
+    // (`ResumeDeadframeRoots`). Both come off the one descr so the
+    // storage and the types cannot describe different deadframes.
     let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
     if let Some(storage) = exit_layout.storage.clone() {
-        let deadframe_types = exit_layout.exit_types.to_vec();
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
@@ -2271,7 +2268,6 @@ fn jit_blackhole_resume_from_guard(
             majit_backend::FailArgSource::from(&[] as &[i64]),
             storage.rd_pendingfields(),
             storage.rd_virtuals(),
-            Some(deadframe_types.as_slice()),
             guard_exc,
             novable,
             all_virtuals,
@@ -2735,7 +2731,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     deadframe: majit_backend::FailArgSource<'df>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    deadframe_types: Option<&[majit_ir::Type]>,
     guard_exc: i64,
     // compile.py `vinfo = self.jitdriver_sd.virtualizable_info`: a novable
     // jitdriver (jd1 `unpackiterable_driver`) has `vinfo=None`, so its resume
@@ -2903,7 +2898,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             rd_consts,
             &all_liveness,
             deadframe.clone(),
-            deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
             rd_virtuals_slice,      // rd_virtuals
             rd_guard_pendingfields, // rd_guard_pendingfields
             Some(vrefinfo_dyn), // resume.py blackhole_from_resumedata metainterp_sd.virtualref_info
@@ -3410,7 +3404,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                              code[-10..]={bh_code_window:?} \
                              keeps_existing_traceback={keeps_existing_traceback} \
                              guard_exc={guard_exc:x} py_pc={:?} entry_py_pc={:?} \
-                             deadframe_types={deadframe_types:?} deadframe={deadframe_debug} \
+                             deadframe={deadframe_debug} \
                              registers_r={bh_regs_r:x?}",
                             bh_opcode_at,
                             // Which ref registers hold a real
@@ -8071,7 +8065,6 @@ pub fn cranelift_resumedata_deopt(
         rd_consts,
         &all_liveness,
         majit_backend::FailArgSource::Slice(&deadframe),
-        Some(types),
         None,
         &allocator,
     );

@@ -1,8 +1,11 @@
 # pyre-check: jitstats-band=guard_failures=5
-# `guard_failures` depends on the GC nursery size. Measured with
-# MAJIT_STATS=1 and PYPY_GC_NURSERY on main 08b7c10aeb7 and on PR #1996 alike:
-# 1MB 30667 (cranelift 30669), 2MB 30663 (cranelift 30665),
-# 3MB/4MB/8MB/16MB/default 30664. CI's cranelift leg reads 30665.
+# `guard_failures` / `bridges_compiled` follow the minor-collection schedule
+# (`counter.py` `decay_all_counters`, every 32 minors). At PYPY_GC_NURSERY
+# 2MB..16MB (check.py pins 4MB) and on wasm this file reads loops=68
+# bridges=131 guard_failures=27143. 256K/512K/1M compile a different set.
+# The extra `RAISE_WARM` trips through `boom` push the last fail=2 hop past
+# `trace_eagerness` (200 / `increment_trace_eagerness`); without them 4MB
+# sits at 185/200 (130 bridges) while 2MB and wasm compile the hop (131).
 # A frame whose residual call raises must still run its own `finally`, and must
 # contribute exactly one traceback node.
 #
@@ -24,6 +27,7 @@
 import sys
 
 N = 64000
+RAISE_WARM = 50
 _cur = [None]
 
 
@@ -67,9 +71,9 @@ leaked = 0
 reentry = 0
 total = 0
 shapes = set()
-for i in range(N):
+for i in range(N + RAISE_WARM):
     try:
-        if i & 1:
+        if i >= N or i & 1:
             ctx.run(boom, 1, 2, k=3)
         else:
             total += ctx.run(fine, 1, 2, k=3)

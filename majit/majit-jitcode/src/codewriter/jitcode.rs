@@ -1221,35 +1221,56 @@ mod jitcode_handle_serde {
 ///
 /// RPython places this in `rpython/jit/codewriter/jitcode.py` (not in
 /// metainterp). majit follows the same module placement.
-pub fn enumerate_vars(
+///
+/// # Safety
+/// `all_liveness[offset..]` is a complete assembler liveness record: three
+/// count bytes then three `encode_liveness` banks of those lengths.
+/// `jitcode.py` `enumerate_vars` does `ord(all_liveness[offset])`.
+pub unsafe fn enumerate_vars(
     offset: usize,
     all_liveness: &[u8],
     mut callback_i: impl FnMut(u32),
     mut callback_r: impl FnMut(u32),
     mut callback_f: impl FnMut(u32),
 ) {
-    enumerate_vars_by_bank(offset, all_liveness, |bank, index| match bank {
-        majit_ir::Type::Int => callback_i(index),
-        majit_ir::Type::Ref => callback_r(index),
-        majit_ir::Type::Float => callback_f(index),
-        majit_ir::Type::Void => {
-            unreachable!("enumerate_vars walks the int, ref, and float banks only")
-        }
-    });
+    // SAFETY: caller contract is the complete-record contract of
+    // [`enumerate_vars_by_bank`].
+    unsafe {
+        enumerate_vars_by_bank(offset, all_liveness, |bank, index| match bank {
+            majit_ir::Type::Int => callback_i(index),
+            majit_ir::Type::Ref => callback_r(index),
+            majit_ir::Type::Float => callback_f(index),
+            majit_ir::Type::Void => {
+                unreachable!("enumerate_vars walks the int, ref, and float banks only")
+            }
+        });
+    }
 }
 
 /// Same walk as `jitcode.py` `enumerate_vars`, tagging each live index with
 /// its bank (`Int`, `Ref`, `Float`). One callback receives the bank because
 /// Rust cannot hold three `&mut` borrows of one closure at once.
-pub fn enumerate_vars_by_bank(
+///
+/// # Safety
+/// `all_liveness[offset..]` is a complete assembler liveness record: three
+/// count bytes then three `encode_liveness` banks of those lengths.
+/// Resume callers discharge this from `JitCode.get_live_vars_info` on the
+/// assembled `all_liveness` buffer; truncated bytes are a producer bug.
+pub unsafe fn enumerate_vars_by_bank(
     mut offset: usize,
     all_liveness: &[u8],
     mut callback: impl FnMut(majit_ir::Type, u32),
 ) {
     use super::liveness::LivenessIterator;
-    let length_i = all_liveness[offset] as u32;
-    let length_r = all_liveness[offset + 1] as u32;
-    let length_f = all_liveness[offset + 2] as u32;
+    debug_assert!(
+        offset + 2 < all_liveness.len(),
+        "liveness record header past all_liveness"
+    );
+    // SAFETY: complete record starts with three count bytes
+    // (`jitcode.py` `enumerate_vars`).
+    let length_i = unsafe { *all_liveness.get_unchecked(offset) } as u32;
+    let length_r = unsafe { *all_liveness.get_unchecked(offset + 1) } as u32;
+    let length_f = unsafe { *all_liveness.get_unchecked(offset + 2) } as u32;
     offset += 3;
     if length_i != 0 {
         // SAFETY: `all_liveness` bank at `offset` is a complete

@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{
-    AccumInfo, Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type,
+    AccumInfo, Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, HandleFailClass,
+    RdVirtualInfo, Type,
 };
 
 use crate::CompiledLoopToken;
@@ -370,6 +371,12 @@ impl Descr for ResumeGuardDescr {
 }
 
 impl FailDescr for ResumeGuardDescr {
+    fn handle_fail_class(&self) -> HandleFailClass {
+        HandleFailClass::ResumeGuard
+    }
+    fn handle_fail_is_plain_resume_guard(&self) -> bool {
+        true
+    }
     fn fail_index(&self) -> u32 {
         // `assembler.py:227 self.faildescr.index = i` — per-trace key
         // (the global `alloc_fail_index()` value lives in `self.fail_index`

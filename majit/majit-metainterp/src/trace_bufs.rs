@@ -95,9 +95,15 @@ static TRACE_WORD_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
 static TRACE_REFS_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
+static FIXED_LIST_REFS_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Header, plain-word array, and ref array. Char items reuse `Trace._ops`'
 /// `GcArray(Char)` type (`register_trace_ops_gc_type`).
+///
+/// `FixedSignedList` R banks are a separate varsize: blackhole registers
+/// are i64, so `_get_list_of_values` stores each GCREF in that slot
+/// width. `Trace._refs` stays `GcArray(GCREF)` (pointer-sized items).
 pub(crate) fn register_trace_pool_gc_types(gc: &mut dyn majit_gc::GcAllocator) {
     let hdr = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
         std::mem::size_of::<ListHdr>(),
@@ -120,6 +126,18 @@ pub(crate) fn register_trace_pool_gc_types(gc: &mut dyn majit_gc::GcAllocator) {
         Vec::new(),
     ));
     TRACE_REFS_GC_TYPE_ID.store(refs, std::sync::atomic::Ordering::Release);
+    // `_get_list_of_values` R kind: one type for storage and GC layout.
+    // Item width is the blackhole register slot (`i64`); the collector
+    // reads a GCREF at offset 0 of each item (`TypeInfo::varsize`
+    // `items_have_gc_ptrs`). On a 64-bit target this is `GcArray(GCREF)`.
+    let fixed_refs = gc.register_type(majit_gc::trace::TypeInfo::varsize(
+        items_offset::<i64>(),
+        std::mem::size_of::<i64>(),
+        0,
+        true,
+        Vec::new(),
+    ));
+    FIXED_LIST_REFS_GC_TYPE_ID.store(fixed_refs, std::sync::atomic::Ordering::Release);
 }
 
 fn list_hdr_type_id() -> u32 {
@@ -132,6 +150,10 @@ fn word_type_id() -> u32 {
 
 fn refs_type_id() -> u32 {
     type_id(&TRACE_REFS_GC_TYPE_ID, "Trace._refs GcArray")
+}
+
+fn fixed_list_refs_type_id() -> u32 {
+    type_id(&FIXED_LIST_REFS_GC_TYPE_ID, "FixedSignedList R GcArray")
 }
 
 /// `ListRepr` header. `items` is `Ptr(GcArray(Char))`.
@@ -158,7 +180,6 @@ impl CharList {
         let mut scratch = GcRef(0);
         let hdr = unsafe {
             let mut needs = false;
-            majit_gc::stress_trace_pool_alloc(&mut scratch, 1);
             let fresh = majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                 list_hdr_type_id(),
                 std::mem::size_of::<ListHdr>(),
@@ -355,7 +376,6 @@ impl CharList {
         } else {
             let mut live = self.header_ref();
             let mut needs = false;
-            majit_gc::stress_trace_pool_alloc(&mut live, 1);
             let fresh = unsafe {
                 majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                     super::trace_ops_gc_type_id(),
@@ -453,7 +473,6 @@ impl<T: Copy> WordArray<T> {
         let mut scratch = GcRef(0);
         let hdr = unsafe {
             let mut needs = false;
-            majit_gc::stress_trace_pool_alloc(&mut scratch, 1);
             let fresh = majit_gc::alloc_fast_nursery_collecting_typed_rooted(
                 list_hdr_type_id(),
                 std::mem::size_of::<ListHdr>(),
@@ -644,7 +663,6 @@ impl<T: Copy> WordArray<T> {
             0
         } else {
             let mut needs = false;
-            majit_gc::stress_trace_pool_alloc(roots.as_mut_ptr(), root_count);
             let fresh = unsafe {
                 majit_gc::alloc_fast_nursery_collecting_typed_roots(
                     (self.type_id)(),
@@ -765,9 +783,202 @@ pub fn new_snapshot() -> CharList {
     CharList::with_capacity(128)
 }
 
+/// `blackhole.py` `_get_list_of_values` after `make_sure_not_resized`.
+///
+/// `rlist.py` `FixedSizeListRepr` stores the list as one `GcArray`. The
+/// value is that address: `[length, items...]`. I/F items are `Signed`;
+/// R items are `GCREF` (`items_have_gc_ptrs`). Assignment copies the
+/// pointer. Nursery objects have no destructor.
+///
+/// Allocation is `malloc_varsize` (`incminimark.py`): tid + length, no
+/// item clear for Signed. A GCREF array is cleared by
+/// `gct_zero_gc_pointers_inside` / `gen_zero_gc_pointers` because the
+/// GC scans it. `framework.py` `push_roots` is not part of the fast
+/// bump; live previous lists travel as the overflow `livevars` span,
+/// and a [`ListRootGuard`] covers a collecting call.
+///
+/// Whether a GC is installed is a process-wide fact
+/// (`gc_allocator_installed`). Accessors do not branch on host vs GC:
+/// the pointer is the array. Host allocations (no GC in the process)
+/// are owned by the process, matching untranslated `lltype.malloc`.
+#[derive(Copy, Clone)]
+pub struct FixedSignedList {
+    ptr: *mut u8,
+}
+
+/// Host `GcArray` payload when this process has no GC. The list value is
+/// still one address; the process owns the block for its lifetime.
+fn host_fixed_list_alloc(payload: usize) -> *mut u8 {
+    host_alloc_aligned(payload, host_align::<i64>())
+}
+
+/// `framework.py` `push_roots` / `pop_roots` for a handful of list
+/// locals around a collecting call (`shadowstack.py` `incr_stack` /
+/// `decr_stack`).
+pub struct ListRootGuard {
+    slot: majit_gc::shadow_stack::ShadowStackSlot,
+    depth: usize,
+}
+
+impl ListRootGuard {
+    #[inline]
+    pub fn push(refs: &[GcRef]) -> Self {
+        let slot = majit_gc::shadow_stack::shadow_stack_slot();
+        let depth = slot.depth();
+        for &g in refs {
+            if g.0 != 0 {
+                slot.push(g);
+            }
+        }
+        Self { slot, depth }
+    }
+}
+
+impl Drop for ListRootGuard {
+    #[inline]
+    fn drop(&mut self) {
+        self.slot.pop_to(self.depth);
+    }
+}
+
+impl FixedSignedList {
+    /// `gct_fv_gc_malloc` `push_roots(hop)` livevars: registered only
+    /// on `collect_and_reserve`, not on the bump.
+    ///
+    /// `malloc_varsize` (`incminimark.py`, `inline_simple_malloc_varsize`):
+    /// the bump is `#[inline(always)]` at
+    /// `alloc_fast_nursery_collecting_typed_roots`; this wrapper stays
+    /// in the same function so the call site is a bump and a branch.
+    #[inline(always)]
+    pub fn alloc_with_roots(len: usize, gc_ptrs: bool, live: &mut [GcRef]) -> Self {
+        // I/F: `GcArray` of `u64` / FLOATSTORAGE (`word_type_id`).
+        // R: register-width slots (`fixed_list_refs_type_id`). Both kinds
+        // use `items_offset::<i64>()` / `size_of::<i64>()`, matching the
+        // type registered for that kind.
+        let offset = items_offset::<i64>();
+        let payload = offset + len * std::mem::size_of::<i64>();
+        if !gc_installed() {
+            let host = host_fixed_list_alloc(payload);
+            unsafe {
+                *(host as *mut usize) = len;
+            }
+            return Self { ptr: host };
+        }
+        let type_id = if gc_ptrs {
+            fixed_list_refs_type_id()
+        } else {
+            word_type_id()
+        };
+        let mut needs = false;
+        let fresh = unsafe {
+            majit_gc::alloc_fast_nursery_collecting_typed_roots(
+                type_id,
+                payload,
+                live.as_mut_ptr(),
+                live.len(),
+                &mut needs,
+            )
+        };
+        if fresh.0 == 0 {
+            majit_gc::gc_alloc_failed(payload);
+        }
+        // `malloc_varsize` does not zero items. `gct_zero_gc_pointers_inside`
+        // is elided when every GCREF slot is stored before the next
+        // collection point (`_ll_alloc_and_set_nojit`). `fill_from_code`
+        // is that store; this object is not rooted until the caller
+        // finishes filling.
+        unsafe {
+            *(fresh.0 as *mut usize) = len;
+            if needs {
+                majit_gc::gc_write_barrier(fresh);
+            }
+        }
+        Self {
+            ptr: fresh.0 as *mut u8,
+        }
+    }
+
+    /// `framework.py` `push_roots`: a nursery `GcArray` pointer.
+    #[inline(always)]
+    pub fn as_gcref(&self) -> GcRef {
+        GcRef(self.ptr as usize)
+    }
+
+    /// `framework.py` `pop_roots`: store the forwarded address.
+    #[inline(always)]
+    pub fn reload(&mut self, forwarded: GcRef) {
+        if forwarded.0 != 0 {
+            self.ptr = forwarded.0 as *mut u8;
+        }
+    }
+
+    #[inline(always)]
+    fn header_len(&self) -> usize {
+        unsafe { *(self.ptr as *const usize) }
+    }
+
+    #[inline(always)]
+    fn item_ptr(&self) -> *mut i64 {
+        unsafe { self.ptr.add(items_offset::<i64>()) as *mut i64 }
+    }
+
+    /// Fill `0..len` from the bytecode that named that length
+    /// (`ll_setitem_nonneg` without a bounds check). A young nursery
+    /// array does not take a write barrier (`_ll_alloc_and_set_nojit`).
+    #[inline]
+    pub fn fill_from_code(&mut self, regs: &[i64], code: &[u8], start: usize) {
+        let len = self.header_len();
+        let p = self.item_ptr();
+        for i in 0..len {
+            unsafe { *p.add(i) = regs[code[start + i] as usize] };
+        }
+    }
+}
+
+impl std::ops::Deref for FixedSignedList {
+    type Target = [i64];
+    /// `rlist.py` `ll_fixed_getitem_fast` / `ll_fixed_length`: items
+    /// and length both live on the `GcArray`.
+    #[inline(always)]
+    fn deref(&self) -> &[i64] {
+        unsafe { std::slice::from_raw_parts(self.item_ptr(), self.header_len()) }
+    }
+}
+
+impl std::fmt::Debug for FixedSignedList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::items_offset;
+
+    #[test]
+    fn zero_length_fixed_signed_list_has_empty_slice() {
+        let list = super::FixedSignedList::alloc_with_roots(0, false, &mut []);
+        assert!(list.is_empty());
+        assert_eq!(&list[..], &[] as &[i64]);
+    }
+
+    #[test]
+    fn fixed_signed_list_is_one_word() {
+        assert_eq!(
+            std::mem::size_of::<super::FixedSignedList>(),
+            std::mem::size_of::<*mut u8>()
+        );
+    }
+
+    #[test]
+    fn fixed_signed_list_length_lives_in_the_header() {
+        let mut list = super::FixedSignedList::alloc_with_roots(3, false, &mut []);
+        list.fill_from_code(&[1, 2, 3], &[0, 1, 2], 0);
+        assert_eq!(&list[..], &[1, 2, 3]);
+        let copy = list;
+        assert_eq!(&copy[..], &[1, 2, 3]);
+        assert_eq!(copy.as_gcref(), list.as_gcref());
+    }
 
     #[test]
     fn sixty_four_bit_items_clear_their_alignment() {
@@ -776,6 +987,15 @@ mod tests {
         assert_eq!(items_offset::<u64>(), items_offset::<i64>());
         assert!(items_offset::<i64>() >= std::mem::size_of::<usize>());
         assert_eq!(items_offset::<usize>() % std::mem::align_of::<usize>(), 0);
+    }
+
+    #[test]
+    fn fixed_signed_list_r_kind_uses_register_width_not_pointer_width() {
+        // `_get_list_of_values` I/F and R banks share the blackhole
+        // register slot (`i64`). `Trace._refs` is `GcArray(GCREF)` and
+        // may be pointer-sized; the R bank must not reuse that layout.
+        assert_eq!(items_offset::<i64>(), items_offset::<u64>());
+        assert_eq!(std::mem::size_of::<i64>(), std::mem::size_of::<u64>());
     }
 
     #[test]
