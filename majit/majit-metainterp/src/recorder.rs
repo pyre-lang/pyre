@@ -378,7 +378,7 @@ fn snapshot_box_from_tagged<'c>(
     unique_cache: &'c [Option<Operand>],
 ) -> (crate::resume::SnapshotBox, Option<&'c Operand>) {
     let decoded = untag_snapshot_pools(inputargs, value_slots, trb, tagged);
-    let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded, inputargs);
+    let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded);
     // opencoder.py `SnapshotIterator._untag` returns `_cache[i]`, the box
     // object itself. `_cache` is `_index`-keyed.
     let cached = crate::pyjitpl::trace_iter_cached_box(snap_box.opref(), unique_cache);

@@ -741,9 +741,11 @@ impl MIFrame {
 
     /// Side-table counterpart of [`Self::ref_liveness_to_box`].
     ///
-    /// `history.py` `ConstPtr` — the snapshot stores the table index.
-    /// `snapshot_tagged_to_box` resolves at use. A raw `constants_r`
-    /// word is interned when the slot is empty.
+    /// `resume.py` `ResumeDataLoopMemo._number_boxes` keys on box identity:
+    /// a live InputArg / ResOp stays `SnapshotTagged::Box`. `isinstance(box,
+    /// Const)` goes through `getconst` — constants-area slots
+    /// (`copy_constants`) and a Const already in the register stay Const.
+    /// Do not reverse-map a ConstPtr's address onto a live InputArg.
     fn ref_liveness_to_tagged(&self, idx: usize, num_regs_r: usize) -> SnapshotTagged {
         let opref = if idx < num_regs_r {
             match self.ref_regs[idx] {
@@ -757,6 +759,9 @@ impl MIFrame {
                 self.jitcode.constants_r[idx - num_regs_r].get() as usize
             );
         };
+        if opref.is_input_arg() || !opref.is_constant() {
+            return SnapshotTagged::Box(opref, Type::Ref);
+        }
         if let Some(index) = opref.const_ptr_index() {
             SnapshotTagged::Const(i64::from(index), Type::Ref)
         } else if let Some(v) = opref.inline_const_to_value() {

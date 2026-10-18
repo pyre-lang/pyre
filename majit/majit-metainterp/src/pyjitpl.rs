@@ -971,35 +971,14 @@ impl Drop for JitlogAbortGuard {
     }
 }
 
-/// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
-/// must number as TAGBOX. `make_constant_box` already refuses that fold
-/// in the optimizer; the tracer can still snapshot the interned
-/// `ConstPtr` as `SnapshotTagged::Const`. Resume then TAGCONSTs it and
-/// the next `Vm::new` has no failarg to rebind. Map the resolved
-/// address back to the InputArg that already carries those bits.
-fn snapshot_inputarg_for_stack_ptr(
-    inputargs: &[majit_ir::InputArgRc],
-    addr: usize,
-) -> Option<majit_ir::OpRef> {
-    if !crate::optimizeopt::OptContext::ref_addr_is_stack_resident(addr) {
-        return None;
-    }
-    inputargs.iter().find_map(|ia| {
-        (ia.tp.get() == majit_ir::Type::Ref
-            && matches!(ia.get_value(), Some(majit_ir::Value::Ref(g)) if g.0 == addr))
-        .then_some(majit_ir::OpRef::input_arg_typed(
-            ia.index,
-            majit_ir::Type::Ref,
-        ))
-    })
-}
-
-/// Recorder snapshot tag to a resume box. A stack-resident Const Ref
-/// remaps to the InputArg that already carries those bits.
-pub(crate) fn snapshot_tagged_to_box(
-    tagged: &crate::recorder::SnapshotTagged,
-    inputargs: &[majit_ir::InputArgRc],
-) -> SnapshotBox {
+/// Recorder snapshot tag to a resume box.
+///
+/// `resume.py` `ResumeDataLoopMemo._number_boxes` keys on box identity;
+/// `isinstance(box, Const)` goes through `getconst`. A Const whose
+/// bits happen to equal a live InputArg is still that Const — remapping
+/// it back to the InputArg by address numbers the wrong box when two
+/// reds share an address, or when a constant equals a live input.
+pub(crate) fn snapshot_tagged_to_box(tagged: &crate::recorder::SnapshotTagged) -> SnapshotBox {
     match tagged {
         crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
             let tp = opref.ty().unwrap_or(*fallback_tp);
@@ -1012,11 +991,6 @@ pub(crate) fn snapshot_tagged_to_box(
             } else {
                 *val
             };
-            if *tp == majit_ir::Type::Ref
-                && let Some(ia) = snapshot_inputarg_for_stack_ptr(inputargs, bits as usize)
-            {
-                return SnapshotBox::typed(ia, *tp);
-            }
             let value = heap_value_for(*tp, bits);
             let opref = majit_ir::OpRef::const_inline_from_value(&value);
             SnapshotBox::typed(opref, *tp)
@@ -1139,7 +1113,7 @@ fn snapshot_map_from_trace_snapshots(
     // Box's OpRef. SnapshotTagged carries no `Virtual` variant (see the
     // `SnapshotTagged` docstring in `recorder.rs`) so this match is
     // exhaustive over the two recorder-side cases.
-    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| snapshot_tagged_to_box(t, inputargs);
+    let tagged_to_box = |t: &crate::recorder::SnapshotTagged| snapshot_tagged_to_box(t);
     for (i, snap) in trace_snapshots.iter().enumerate() {
         let boxes: crate::optimizeopt::SnapshotBoxList = snap
             .frames
@@ -1246,9 +1220,8 @@ fn snapshot_map_from_byte_recorder(
     let mut frame_pcs_map = SnapshotFramePcs::with_capacity(n, 0);
     frame_pcs_map.reserve_frames(recorder.captured_frame_count());
     let inputargs = recorder.inputargs();
-    let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
-        snapshot_tagged_to_box(&t, inputargs)
-    };
+    let tagged_to_box =
+        |t: crate::recorder::SnapshotTagged| -> SnapshotBox { snapshot_tagged_to_box(&t) };
     recorder.for_each_captured_snapshot_arrays(|offset, it| {
         let n_boxes: usize = it
             .framestack
@@ -30646,6 +30619,24 @@ mod tests {
         assert!(!default_issubclass(0x1000, 0x1100));
         assert!(!default_issubclass(0x2000, 0x1000));
         assert!(default_issubclass(0xdead, 0xdead));
+    }
+
+    /// `resume.py` `ResumeDataLoopMemo._number_boxes` keys on box identity;
+    /// constants go through `getconst`. A Const whose bits equal a live
+    /// InputArg must stay a Const — do not reverse-map by address.
+    #[test]
+    fn snapshot_tagged_const_ref_does_not_remap_to_inputarg_by_address() {
+        let probe = 0usize;
+        let stack_addr = std::ptr::addr_of!(probe) as usize;
+        let ia = majit_ir::InputArgRc::new(InputArg::new_ref(0));
+        ia.set_value(Value::Ref(majit_ir::GcRef(stack_addr)));
+        let tagged = crate::recorder::SnapshotTagged::const_ref(stack_addr);
+        let box_ = snapshot_tagged_to_box(&tagged);
+        assert!(
+            box_.opref().is_constant(),
+            "Const Ref matching an InputArg address must stay Const, got {:?}",
+            box_.opref()
+        );
     }
 
     #[test]
