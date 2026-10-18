@@ -323,51 +323,24 @@ impl<'c> Lowerer<'c> {
     /// JitCode. A sub-JitCode pre-binds the packed declared argument
     /// (`plain_array_ptr_binding_name`); the portal (`lower_dispatch_body`)
     /// keeps the identity slot (`plain_array_ptr_identity_reg`).
-    pub(super) fn plain_array_ptr_reg(&self, array_name: &str) -> Option<u16> {
+    ///
+    /// A sub-JitCode (`in_dispatch_arm_body`) that lacks the packed
+    /// binding must not read the portal identity register number in the
+    /// callee's own file (`MIFrame.setup_call`). It records
+    /// `IdentitySlot` and returns `None`.
+    pub(super) fn plain_array_ptr_reg(
+        &mut self,
+        array_name: &str,
+        span: proc_macro2::Span,
+    ) -> Option<u16> {
         if let Some(binding) = self.bindings.get(&plain_array_ptr_binding_name(array_name)) {
             return Some(binding.reg);
         }
+        if self.in_dispatch_arm_body {
+            self.note_sub_jitcode_identity_slot(array_name, span);
+            return None;
+        }
         self.config?.plain_array_ptr_identity_reg(array_name)
-    }
-
-    /// Length-word register of a plain `[int]`/`[float]` for the current
-    /// JitCode. Same packed-vs-identity split as [`Self::plain_array_ptr_reg`].
-    pub(super) fn plain_array_len_reg(&self, array_name: &str) -> Option<u16> {
-        if let Some(binding) = self.bindings.get(&plain_array_len_binding_name(array_name)) {
-            return Some(binding.reg);
-        }
-        self.config?.plain_array_len_identity_reg(array_name)
-    }
-
-    /// `(parent_reg, callee_packed)` pairs for every plain array, packed
-    /// densely after `callee_int_args`. Parent registers are this frame's
-    /// ptr/len words so a nested `inline_call` copies from the live callee
-    /// numbering (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`).
-    pub(super) fn packed_plain_array_int_args_for_callee(
-        &self,
-        callee_int_args: &[Binding],
-    ) -> Vec<(u16, u16)> {
-        let Some(config) = self.config else {
-            return Vec::new();
-        };
-        let mut callee = callee_int_args
-            .iter()
-            .filter(|binding| matches!(binding.kind, BindingKind::Int))
-            .count() as u16;
-        let mut pairs = Vec::new();
-        for name in config.state_array_names_in_order() {
-            let Some(ptr) = self.plain_array_ptr_reg(name) else {
-                continue;
-            };
-            let Some(len) = self.plain_array_len_reg(name) else {
-                continue;
-            };
-            pairs.push((ptr, callee));
-            callee = callee.saturating_add(1);
-            pairs.push((len, callee));
-            callee = callee.saturating_add(1);
-        }
-        pairs
     }
 
     pub(super) fn alloc_reg(&mut self) -> u16 {

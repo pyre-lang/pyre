@@ -14,7 +14,7 @@ cranelift = ["majit-metainterp/cranelift"]
 dynasm = ["majit-metainterp/dynasm"]
 
 [dependencies]
-syn = { workspace = true, features = ["visit-mut", "extra-traits"] }
+syn = { workspace = true, features = ["visit", "visit-mut", "extra-traits"] }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
 majit-jitcode = { workspace = true }

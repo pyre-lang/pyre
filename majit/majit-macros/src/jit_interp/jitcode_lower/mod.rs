@@ -29,7 +29,7 @@ pub(crate) use helpers::{call_is_null_ptr, classify_param_type};
 // These appear unused in mod.rs itself but are consumed by submodules and tests.
 mod reexports {
     #![allow(unused_imports)]
-    pub(super) use super::api::bind_pre_merge_point_stmts;
+    pub(super) use super::api::{bind_callee_declared_args, bind_pre_merge_point_stmts};
     pub(super) use super::dispatch::{
         collect_arm_caller_locals, collect_pat_bound_idents, dispatch_arm_inline_call_tokens,
         emit_promote_greens, env_array_descr_expr, find_dispatch_loop_body, green_schema,
@@ -3012,6 +3012,129 @@ mod tests {
         );
     }
 
+    /// An arm that never indexes a plain `[int]` must not receive that
+    /// array's `{ptr, len}` as declared arguments (`Transformer.handle_regular_call`
+    /// / `MIFrame.setup_call` copy only `op.args[1:]`).
+    #[test]
+    fn split_arm_that_does_not_touch_the_array_omits_plain_array_args() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(cells),
+                kind: crate::jit_interp::StateFieldKind::Array(syn::parse_quote!(int)),
+            }],
+        };
+        let config = empty_lowerer_config(Some(&state_fields), true, false);
+        let caller_locals = vec![("a".to_string(), binding(10, BindingKind::Int))];
+        let body: Expr = syn::parse_quote!({
+            let _n = a + 1i64;
+        });
+        let (_, layout) = try_generate_jitcode_body_parts_with_caller_bindings(
+            &body,
+            Some(&config),
+            &caller_locals,
+        )
+        .expect("arm that does not index cells must still lower");
+        assert!(
+            layout
+                .iter()
+                .all(|entry| !entry.name.starts_with("__plain_array_")),
+            "unused cells must not become declared ptr/len args: {layout:?}"
+        );
+        let ints: Vec<&CallerLocalLayout> = layout
+            .iter()
+            .filter(|entry| matches!(entry.kind, BindingKind::Int))
+            .collect();
+        assert_eq!(ints.len(), 1, "only the captured int local: {layout:?}");
+        assert_eq!(ints[0].name, "a");
+    }
+
+    /// An index nested in a Tuple (the old hand walker skipped Tuple /
+    /// Return / Match guards / Macro / …) still packs `{ptr, len}`.
+    #[test]
+    fn split_arm_packs_plain_array_indexed_inside_a_tuple() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(cells),
+                kind: crate::jit_interp::StateFieldKind::Array(syn::parse_quote!(int)),
+            }],
+        };
+        let config = empty_lowerer_config(Some(&state_fields), true, false);
+        let caller_locals = vec![("i".to_string(), binding(10, BindingKind::Int))];
+        let body: Expr = syn::parse_quote!({
+            let (_a, _b) = (state.cells[i], 1i64);
+        });
+        let stmts = extract_stmts(&body);
+        let mut lowerer = Lowerer::new(Some(&config));
+        assert_eq!(
+            lowerer.body_used_state_array_names(&stmts),
+            vec!["cells".to_string()],
+            "the visitor must see state.cells[i] inside the tuple"
+        );
+        // Tuple destructure does not lower; packing still runs first
+        // (`bind_callee_declared_args` / `MIFrame.setup_call`).
+        let layout = bind_callee_declared_args(&mut lowerer, &caller_locals, Some(&config), &stmts);
+        assert!(
+            layout
+                .iter()
+                .any(|entry| entry.name == plain_array_ptr_binding_name("cells")),
+            "tuple-nested cells index must pack ptr: {layout:?}"
+        );
+        assert!(
+            layout
+                .iter()
+                .any(|entry| entry.name == plain_array_len_binding_name("cells")),
+            "tuple-nested cells index must pack len: {layout:?}"
+        );
+    }
+
+    #[test]
+    fn helper_inline_call_i_list_is_only_the_declared_arg_when_machine_has_plain_array() {
+        let state_fields = crate::jit_interp::StateFieldsConfig {
+            fields: vec![crate::jit_interp::StateFieldDecl {
+                name: syn::parse_quote!(cells),
+                kind: crate::jit_interp::StateFieldKind::Array(syn::parse_quote!(int)),
+            }],
+        };
+        let mut config = empty_lowerer_config(Some(&state_fields), false, false);
+        config.calls.push((
+            vec!["helper".to_string()],
+            CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlineInt),
+        ));
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("x".into(), binding(0, BindingKind::Int));
+        lowerer.next_reg = 1;
+        let call: Expr = syn::parse_quote!(helper(x));
+        assert!(
+            lowerer.lower_value_expr(&call).is_some(),
+            "helper(x) must lower"
+        );
+        let statements = &lowerer.statements;
+        let body = quote!(#(#statements)*).to_string();
+        assert!(
+            body.contains("inline_call_ir_i"),
+            "declared int arg uses the ir family: {body}"
+        );
+        let helper = parse_fn("fn helper(x: i64) -> i64 { x }");
+        assert_eq!(
+            inline_helper_arg_classes(&helper).expect("arg_classes"),
+            "i"
+        );
+        let i_call = body
+            .split("inline_call_ir_i")
+            .nth(1)
+            .expect("ir_i call")
+            .split(';')
+            .next()
+            .expect("ir_i statement");
+        let i_list_pairs = i_call.matches("as u16").count() / 2;
+        assert_eq!(
+            i_list_pairs, 1,
+            "I-list must be only x, matching arg_classes \"i\": {body}"
+        );
+    }
+
     #[test]
     fn identity_slot_message_names_the_arm_and_field() {
         let msg = SubJitcodeBodyError::identity_slot_message("OP_ADD", "ticks");
@@ -3915,7 +4038,7 @@ mod tests {
     }
 
     fn inline_call_tokens_combined(bindings: &[Binding], result_reg: u16) -> String {
-        let (call_match, post_live) = inline_call_tokens(bindings, result_reg, &[]);
+        let (call_match, post_live) = inline_call_tokens(bindings, result_reg);
         format!("{} {}", call_match, post_live)
     }
 
@@ -4373,7 +4496,7 @@ mod tests {
 
     #[test]
     fn inline_call_tokens_emit_post_call_live_marker() {
-        let (_, post_live) = inline_call_tokens(&[binding(0, BindingKind::Ref)], 7, &[]);
+        let (_, post_live) = inline_call_tokens(&[binding(0, BindingKind::Ref)], 7);
         let post = post_live.to_string();
         assert!(
             post.contains("live_placeholder"),

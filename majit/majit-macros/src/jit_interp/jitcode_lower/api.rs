@@ -172,21 +172,24 @@ fn layout_bank_end(layout: &[CallerLocalLayout], kind: BindingKind) -> u16 {
 /// ordinary declared arguments, packed in the same per-bank numbering
 /// [`assign_caller_local_layout`] uses.
 ///
-/// Parent registers stay the portal identity slots (`int_identity_base` /
-/// `vable_input_ref_reg`); callee registers continue densely after the
-/// caller-locals. `MIFrame.setup_call` / `bhimpl_inline_call_ir_v` copy
-/// only those declared boxes into the callee's own argument registers.
+/// `array_names` are the plain `[int]`/`[float]` fields whose
+/// `state.<name>[...]` the arm body reads or writes. Parent registers stay
+/// the portal identity slots (`int_identity_base` / `vable_input_ref_reg`);
+/// callee registers continue densely after the caller-locals.
+/// `Transformer.handle_regular_call` / `MIFrame.setup_call` copy only
+/// those declared boxes into the callee's own argument registers.
 fn extend_layout_with_callee_declared_args(
     layout: &mut Vec<CallerLocalLayout>,
     config: Option<&LowererConfig>,
+    array_names: &[&str],
 ) {
     let Some(config) = config else {
         return;
     };
     let next_int = layout_bank_end(layout, BindingKind::Int);
-    let array_pairs = plain_array_identity_int_pairs(Some(config), next_int);
+    let array_pairs = plain_array_identity_int_pairs(Some(config), next_int, array_names);
     let mut pair_idx = 0usize;
-    for name in config.state_array_names_in_order() {
+    for name in array_names {
         let (ptr_parent, ptr_callee) = array_pairs[pair_idx];
         pair_idx += 1;
         let (len_parent, len_callee) = array_pairs[pair_idx];
@@ -221,18 +224,22 @@ fn extend_layout_with_callee_declared_args(
 }
 
 /// Pre-bind caller-locals plus packed array `{ptr, len}` / vable-ref
-/// arguments on a sub-JitCode lowerer.
+/// arguments on a sub-JitCode lowerer. Array `{ptr, len}` words are only
+/// those whose `state.<name>[...]` `body_stmts` reads or writes.
 ///
 /// `next_reg` is the packed declared-arg floor, not the portal identity
 /// range: temps must not alias the callee's own argument registers, and
 /// they must not be forced up to `int_identity_base()`.
-fn bind_callee_declared_args(
+pub(super) fn bind_callee_declared_args(
     lowerer: &mut Lowerer<'_>,
     caller_locals: &[(String, Binding)],
     config: Option<&LowererConfig>,
+    body_stmts: &[Stmt],
 ) -> Vec<CallerLocalLayout> {
+    let used = lowerer.body_used_state_array_names(body_stmts);
+    let used_names: Vec<&str> = used.iter().map(String::as_str).collect();
     let (mut layout, _) = assign_caller_local_layout(caller_locals);
-    extend_layout_with_callee_declared_args(&mut layout, config);
+    extend_layout_with_callee_declared_args(&mut layout, config, &used_names);
     for entry in &layout {
         lowerer.bindings.insert(
             entry.name.clone(),
@@ -281,7 +288,7 @@ pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     // (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`). Temps start
     // after those registers; they are not reserved up to the portal
     // identity range.
-    let layout = bind_callee_declared_args(&mut lowerer, caller_locals, config);
+    let layout = bind_callee_declared_args(&mut lowerer, caller_locals, config, &stmts);
 
     for (i, stmt) in stmts.iter().enumerate() {
         if lowerer.lower_stmt(stmt).is_none() {
@@ -362,7 +369,7 @@ pub(crate) fn try_generate_jitcode_pc_return_body_with_caller_bindings(
     let mut lowerer = Lowerer::new(config);
     lowerer.in_dispatch_arm_body = true;
 
-    let layout = bind_callee_declared_args(&mut lowerer, caller_locals, config);
+    let layout = bind_callee_declared_args(&mut lowerer, caller_locals, config, work);
 
     for (i, stmt) in work.iter().enumerate() {
         if lowerer.lower_stmt(stmt).is_none() {

@@ -1879,8 +1879,9 @@ pub(super) fn dispatch_arm_inline_call_tokens(
             })
             .collect()
     };
-    // Dense per-bank packing, including packed array `{ptr, len}` and
-    // the vable ref (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`).
+    // Dense per-bank packing, including packed array `{ptr, len}` for
+    // arrays the arm body uses and the vable ref
+    // (`Transformer.handle_regular_call` / `MIFrame.setup_call`).
     // `inline_call_grouped` requires `callee_dst == index`.
     let args_i_pairs: Vec<(u16, u16)> = layout
         .iter()
@@ -3102,16 +3103,16 @@ pub(super) fn lower_dispatch_chain(
                     //
                     // Dispatch-arm caller-local plumbing: walk the arm
                     // body to collect parent-scope idents (via `collect_arm_caller_locals`),
-                    // pre-bind them plus packed array `{ptr, len}` / vable-ref
+                    // pre-bind them plus the arrays whose `state.<name>[...]`
+                    // the body reads or writes (`{ptr, len}`) / vable-ref
                     // on the sub-Lowerer at fresh per-bank callee regs
                     // (via `try_generate_jitcode_body_parts_with_caller_bindings`), and
                     // emit the typed `inline_call_<types>_v(__sub_idx, args_i, args_r,
                     // args_f)` so the callee receives them as its own declared
-                    // arguments (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`).
-                    // Mirrors `handle_regular_call` `inline_call_<types>(jitcode,
-                    // args...)`. When the arm body has no declared args the
-                    // layout is empty and the emit reduces to the no-arg
-                    // `inline_call_r_v`.
+                    // arguments (`Transformer.handle_regular_call` /
+                    // `MIFrame.setup_call`). When the arm body has no declared
+                    // args the layout is empty and the emit reduces to the
+                    // no-arg `inline_call_r_v`.
                     let mut arm_inline_call_reads: Vec<Register> = Vec::new();
                     let (arm_body_tokens, arm_inline_call_emit): (
                         proc_macro2::TokenStream,

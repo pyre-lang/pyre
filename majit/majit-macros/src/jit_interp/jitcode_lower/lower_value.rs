@@ -2069,10 +2069,8 @@ impl<'c> Lowerer<'c> {
                     let shared_path = inline_shared_path(&call.func)?;
                     let sub_return_kind = jit_arg_kind_tokens(result_kind);
                     let prebuild_path = inline_prebuild_path(&call.func)?;
-                    let identity = self.packed_plain_array_int_args_for_callee(&arg_bindings);
-                    let (inline_call, post_live) =
-                        inline_call_tokens(&arg_bindings, reg, &identity);
-                    let __arg_regs = inline_call_read_regs(&arg_bindings, &identity);
+                    let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
+                    let __arg_regs = inline_call_read_regs(&arg_bindings);
                     // RPython `pyjitpl.py finish_setup` order: the
                     // helper's per-marker `-live-` triples must land in
                     // `asm.all_liveness` before the parent's
@@ -2114,10 +2112,8 @@ impl<'c> Lowerer<'c> {
                         syn::Expr::Path(ep) => ep.path.segments.last().map(|s| s.ident.to_string()),
                         _ => None,
                     }?;
-                    let identity = self.packed_plain_array_int_args_for_callee(&arg_bindings);
-                    let (inline_call, post_live) =
-                        inline_call_tokens(&arg_bindings, reg, &identity);
-                    let __arg_regs = inline_call_read_regs(&arg_bindings, &identity);
+                    let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
+                    let __arg_regs = inline_call_read_regs(&arg_bindings);
                     self.inline_liveness_prebuild.push(quote! {
                         __majit_pipeline_liveness_prebuild(__asm);
                     });
@@ -2161,8 +2157,7 @@ impl<'c> Lowerer<'c> {
             CallPolicySpec::Infer => {
                 let policy_path = helper_policy_path(&call.func)?;
                 let typed_args = typed_call_arg_tokens(&arg_bindings);
-                let identity = self.packed_plain_array_int_args_for_callee(&arg_bindings);
-                let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg, &identity);
+                let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
                 let int_arg_regs = int_arg_regs(&arg_bindings);
                 let unsupported = self.inference_failure_tokens(
                     "inferred helper policy only supports int-return value calls here; use an explicit inline_ref/inline_float or *_ref_wrapped/*_float_wrapped policy",
@@ -2197,7 +2192,7 @@ impl<'c> Lowerer<'c> {
                         #prebuild_path(__asm);
                     });
                 }
-                let __arg_regs = inline_call_read_regs(&arg_bindings, &identity);
+                let __arg_regs = inline_call_read_regs(&arg_bindings);
                 let __slot_tokens = CondCallEffectSlot::slot_from_policy_tokens();
                 if let Some(_arg_regs) = int_arg_regs {
                     // Inferred path: result is Int (the explicit-Inline case is
