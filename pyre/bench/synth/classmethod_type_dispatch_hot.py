@@ -1,3 +1,4 @@
+# pyre-check: requires-modules=gc
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 300000
@@ -15,6 +16,8 @@ Reading `cls.__name__` inside the body keeps a LOAD_ATTR in the inlined callee,
 and the two distinct receiver classes exercise per-site type/version guards.
 """
 
+import gc
+
 
 class Base:
     @classmethod
@@ -27,6 +30,11 @@ class Derived(Base):
 
 
 def main():
+    # `must_compile` keys a failing ref GUARD_VALUE by the object's address
+    # (compile.py `lltype.cast_ptr_to_int`). Promote the receivers before the
+    # loop warms up, so a minor collection does not move them mid-warm-up and
+    # restart their counters at a point set by the nursery size.
+    gc.collect()
     total = 0
     i = 0
     while i < 120000000:

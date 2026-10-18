@@ -1,3 +1,4 @@
+# pyre-check: requires-modules=gc
 # pyre-check: max-pypy-ratio=3.5
 # Local cranelift 2.4x; the ceiling is 3.5.
 # pyre-check: skip-cpython
@@ -5,6 +6,8 @@
 # iterations pypy exec is inside the `?` band, so a ceiling of 40 applied
 # and the floor did not.  48000000 iterations land pypy near 0.11s.
 # cpython cannot run this many inside the reference timeout.
+import gc
+
 N = 48000000
 M = 4000
 
@@ -84,6 +87,11 @@ class Box:
 
 def folded():
     box = Box(4)
+    # `must_compile` keys a failing ref GUARD_VALUE by the object's address
+    # (compile.py `lltype.cast_ptr_to_int`). Promote the receivers before the
+    # loop warms up, so a minor collection does not move them mid-warm-up and
+    # restart their counters at a point set by the nursery size.
+    gc.collect()
     total = 0
     for i in range(N):
         # Three classes down one trace; each must answer with its own name.
