@@ -1804,22 +1804,29 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 /// or that replay starts at the next iteration and drops this one.
 /// `for_mutate` aborts BEFORE the append's effect, so both signal classes are
 /// clear at the abort point — the clean continuation case.
-/// Which stash entry a take removes, given the indices that matched the parked
-/// frame.  `None` only for an empty stash.
+/// Which stash entry a take removes, given the indices of the portal frame's
+/// entries that matched the parked frame and the topmost portal-owned entry.
+/// `None` when the portal frame owns no entry.
 ///
-/// The candidates are the portal frame's own entries
-/// ([`InflightForiterOwner::is_portal`]): `foriter_body_matches_frame` decides
-/// on the frame's CODE and body pc, so an inlined activation of the same code
-/// answers it identically, and only the owner tells the two items apart.  A
-/// second candidate is still possible when one loop was captured under both a
-/// Python-pc and a JitCode coordinate; it falls back to the legacy top entry,
-/// whose header check then refuses and drops.  Wrong-frame delivery is a wrong
-/// VALUE and the drop is only a loss, so never trading one for the other is
-/// what makes reaching past the top safe at all.
-fn inflight_take_index(len: usize, mut matching: impl Iterator<Item = usize>) -> Option<usize> {
+/// Only the portal frame's own entries ([`InflightForiterOwner::is_portal`])
+/// are candidates: `foriter_body_matches_frame` decides on the frame's CODE and
+/// body pc, so an inlined activation of the same code answers it identically,
+/// and only the owner tells the two items apart.  A second candidate is still
+/// possible when one loop was captured under both a Python-pc and a JitCode
+/// coordinate; it falls back to the portal frame's top entry, whose header
+/// check then refuses and drops.  The fallback never reaches an inlined
+/// activation's entry: a recursive callee's item names the same header, so the
+/// header check would pass it and push another activation's VALUE onto the
+/// portal frame.  Wrong-frame delivery is a wrong value and the drop is only a
+/// loss, so never trading one for the other is what makes reaching past the
+/// top safe at all.
+fn inflight_take_index(
+    top_portal: Option<usize>,
+    mut matching: impl Iterator<Item = usize>,
+) -> Option<usize> {
     match (matching.next(), matching.next()) {
         (Some(only), None) => Some(only),
-        _ => len.checked_sub(1),
+        _ => top_portal,
     }
 }
 
@@ -1928,8 +1935,8 @@ pub fn fbw_foriter_inflight_take(
     let census_on = super::foriter_inflight_census_enabled();
     let (stash, dropped) = FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
-        let Some(at) = inflight_take_index(
-            stack.len(),
+        let at = inflight_take_index(
+            stack.iter().rposition(|entry| entry.owner.is_portal()),
             stack
                 .iter()
                 .enumerate()
@@ -1938,10 +1945,8 @@ pub fn fbw_foriter_inflight_take(
                         && foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1)
                 })
                 .map(|(at, _)| at),
-        ) else {
-            return (None, Vec::new());
-        };
-        let picked = stack.remove(at);
+        );
+        let picked = at.map(|at| stack.remove(at));
         // Everything still standing is about to be destroyed by the clear, and
         // each one is an iteration whose consumed item nothing will hand back.
         // Name them before they go: a census that reports only what the take
@@ -1952,8 +1957,17 @@ pub fn fbw_foriter_inflight_take(
             Vec::new()
         };
         stack.clear();
-        (Some(picked), dropped)
+        (picked, dropped)
     });
+    for body in dropped {
+        if let Some((code_ptr, dropped_pc)) = inflight_census_key(fallback_code_ptr, body) {
+            super::census_record_foriter_inflight(
+                code_ptr,
+                dropped_pc,
+                super::ForiterInflightOutcome::DroppedUnmatched,
+            );
+        }
+    }
     let stash = stash?;
     let body_effect = stash.body_effect_since_consume;
     let Some(body_pc) = inflight_foriter_body_pc(stash.body) else {
@@ -1964,15 +1978,6 @@ pub fn fbw_foriter_inflight_take(
         crate::trace::fbw_diag::record_foriter_item_dropped();
         return None;
     };
-    for body in dropped {
-        if let Some((code_ptr, dropped_pc)) = inflight_census_key(fallback_code_ptr, body) {
-            super::census_record_foriter_inflight(
-                code_ptr,
-                dropped_pc,
-                super::ForiterInflightOutcome::DroppedUnmatched,
-            );
-        }
-    }
     let key = if census_on {
         inflight_census_key(fallback_code_ptr, stash.body)
     } else {
@@ -2254,6 +2259,12 @@ mod foriter_delivery_tests {
         // code and body pc, but the live frame is the portal's.
         fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
         assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((caller_item, 6)));
+
+        // With only the callee's item in flight there is nothing the portal
+        // frame owns: the take delivers nothing and still empties the stash.
+        fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), None);
+        assert_eq!(FBW_FORITER_INFLIGHT.with(|c| c.borrow().len()), 0);
         fbw_store_journal_reset();
     }
 
@@ -2281,7 +2292,7 @@ mod foriter_delivery_tests {
     #[test]
     fn an_ambiguous_frame_match_keeps_the_legacy_top_entry() {
         assert_eq!(
-            inflight_take_index(3, [1usize].into_iter()),
+            inflight_take_index(Some(2), [1usize].into_iter()),
             Some(1),
             "one candidate is the frame's entry"
         );
@@ -2289,19 +2300,19 @@ mod foriter_delivery_tests {
         // (index 1) is what a select-by-recency rule does, so only the
         // ambiguity refusal answers 2 here.
         assert_eq!(
-            inflight_take_index(3, [0usize, 1].into_iter()),
+            inflight_take_index(Some(2), [0usize, 1].into_iter()),
             Some(2),
-            "two candidates cannot be told apart, so the legacy top stands"
+            "two candidates cannot be told apart, so the portal's top stands"
         );
         assert_eq!(
-            inflight_take_index(2, std::iter::empty()),
+            inflight_take_index(Some(1), std::iter::empty()),
             Some(1),
-            "no candidate keeps the legacy top"
+            "no candidate keeps the portal's top"
         );
         assert_eq!(
-            inflight_take_index(0, std::iter::empty()),
+            inflight_take_index(None, std::iter::empty()),
             None,
-            "an empty stash has nothing to take"
+            "a stash the portal frame owns nothing in has nothing to take"
         );
     }
 
