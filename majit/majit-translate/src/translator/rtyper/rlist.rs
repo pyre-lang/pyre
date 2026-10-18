@@ -122,6 +122,26 @@ fn list_recast(
         .convertvar(v, item_repr.as_ref(), external_item_repr.as_ref())
 }
 
+/// RPython `AbstractBaseListRepr.convert_const` (`rlist.py`) None arm:
+/// `return self.null_const()`. `lltypesystem/rlist.py`
+/// `BaseListRepr.null_const` is `nullptr(self.LIST)` — a null `_ptr`
+/// of `self.lowleveltype`, which `inputconst` then checks with
+/// `lltype._contains_value` (`Ptr` accepts `_ptr`, not Python `None`).
+fn list_null_const(lltype: &LowLevelType, value: &ConstValue) -> Result<Constant, TyperError> {
+    if matches!(value, ConstValue::None) {
+        let LowLevelType::Ptr(ptr) = lltype else {
+            return Err(TyperError::message(format!(
+                "list null_const: lowleveltype is not Ptr, got {lltype:?}"
+            )));
+        };
+        return Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(ptr.as_ref().clone()._defl())),
+            lltype.clone(),
+        ));
+    }
+    Err(TyperError::message(format!("expected a list: {value:?}")))
+}
+
 impl Repr for FixedSizeListRepr {
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
@@ -137,6 +157,14 @@ impl Repr for FixedSizeListRepr {
 
     fn repr_class_id(&self) -> super::pairtype::ReprClassId {
         super::pairtype::ReprClassId::FixedSizeListRepr
+    }
+
+    /// RPython `AbstractBaseListRepr.convert_const` (`rlist.py`):
+    /// `if listobj is None: return self.null_const()`.
+    /// `lltypesystem/rlist.py` `BaseListRepr.null_const` is
+    /// `nullptr(self.LIST)`.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        list_null_const(&self.lltype, value)
     }
 
     /// RPython `AbstractBaseListRepr.rtype_len(self, hop)`
@@ -1272,6 +1300,14 @@ impl Repr for ListRepr {
 
     fn repr_class_id(&self) -> super::pairtype::ReprClassId {
         super::pairtype::ReprClassId::ListRepr
+    }
+
+    /// RPython `AbstractBaseListRepr.convert_const` (`rlist.py`):
+    /// `if listobj is None: return self.null_const()`.
+    /// `lltypesystem/rlist.py` `BaseListRepr.null_const` is
+    /// `nullptr(self.LIST)`.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        list_null_const(&self.lltype, value)
     }
 
     /// RPython `AbstractBaseListRepr.rtype_len(self, hop)`
@@ -9294,7 +9330,7 @@ mod tests {
     use crate::flowspace::model::Variable;
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rint::{IntegerRepr, signed_repr, unsigned_repr};
-    use crate::translator::rtyper::rmodel::rtyper_makerepr;
+    use crate::translator::rtyper::rmodel::{inputconst, rtyper_makerepr};
     use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
 
     fn fresh_rtyper() -> Rc<RPythonTyper> {
@@ -9337,6 +9373,28 @@ mod tests {
             matches!(items_ptr.TO, PtrTarget::Array(_)),
             "items must point to a GcArray"
         );
+    }
+
+    #[test]
+    fn list_repr_convert_const_none_is_null_ptr() {
+        // `AbstractBaseListRepr.convert_const`: `if listobj is None:
+        // return self.null_const()` (`rlist.py`); `null_const` is
+        // `nullptr(self.LIST)` (`lltypesystem/rlist.py`).
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let repr = ListRepr::new(&rtyper, r_int.clone()).expect("ListRepr::new");
+        let c = inputconst(&repr, &ConstValue::None).expect("None is a null list");
+        assert!(matches!(c.value, ConstValue::LLPtr(_)));
+        assert_eq!(c.concretetype.as_ref(), Some(repr.lowleveltype()));
+        assert!(repr.lowleveltype().contains_value(&c.value));
+        assert!(
+            repr.convert_const(&ConstValue::Int(0)).is_err(),
+            "non-list constants are rejected"
+        );
+        let fixed = FixedSizeListRepr::new(&rtyper, r_int).expect("FixedSizeListRepr::new");
+        let c_fixed = inputconst(&fixed, &ConstValue::None).expect("None is a null fixed list");
+        assert!(matches!(c_fixed.value, ConstValue::LLPtr(_)));
+        assert!(fixed.lowleveltype().contains_value(&c_fixed.value));
     }
 
     #[test]

@@ -422,7 +422,37 @@ impl DictDef {
     /// to re-validate custom eq/hash annotations. Calling
     /// `ListItem::generalize` directly would bypass that path.
     pub fn generalize_key(&self, s_key: &SomeValue) -> Result<bool, UnionError> {
+        // `RDict::get<Q>` (`rordereddict.rs`) takes `Q: Equivalent<K>`.
+        // RPython `getitem_str` wraps to the stored key
+        // (`dictmultiobject.py` `ObjectDictStrategy.getitem_str`) so
+        // `generalize_key` never sees a second key type. A borrowed
+        // probe must not enter the key cell.
+        if is_equivalent_lookup_probe(s_key) {
+            return Ok(false);
+        }
         let li = self.inner.dictkey.borrow().clone();
+        // `BytesKey` is `rstr.py` `STR`. A `[u8]` probe is `STR.chars`
+        // (`Array(Char)` / `rlist.py`), the same Equivalent slice
+        // `Borrow<[u8]>` uses (`dictmultiobject.rs` `BytesKey`). Keep
+        // the stored cell as STR.
+        let current = li.borrow().s_value.clone();
+        if matches!(current, SomeValue::String(_)) && is_rstr_chars_list(s_key) {
+            return Ok(false);
+        }
+        if matches!(s_key, SomeValue::String(_)) && is_rstr_chars_list(&current) {
+            journal_listitem_mutation(&li);
+            let mut li_mut = li.borrow_mut();
+            if li_mut.dont_change_any_more {
+                return Err(UnionError {
+                    lhs: Box::new(current),
+                    rhs: Box::new(s_key.clone()),
+                    msg: "TooLateForChange on generalize()".into(),
+                });
+            }
+            li_mut.s_value = s_key.clone();
+            li_mut.notify_update();
+            return Ok(true);
+        }
         DictKey::generalize(&li, s_key)
     }
 
@@ -433,6 +463,31 @@ impl DictDef {
         let mut li_mut = li.borrow_mut();
         li_mut.generalize(s_value)
     }
+}
+
+/// `StrLookupKey` is `Equivalent<ObjectKey>` (`rordereddict.rs`
+/// `RDict::get`). The stored key cell stays `K`.
+fn is_equivalent_lookup_probe(s_key: &SomeValue) -> bool {
+    let SomeValue::Instance(inst) = s_key else {
+        return false;
+    };
+    let Some(classdef) = inst.classdef.as_ref() else {
+        return false;
+    };
+    let name = &classdef.borrow().name;
+    let leaf = name.rsplit("::").next().unwrap_or(name);
+    let leaf = leaf.rsplit('.').next().unwrap_or(leaf);
+    leaf.ends_with("LookupKey")
+}
+
+/// `[u8]` / `GcArray(Char)` as a dict key: unsigned items, the
+/// `rstr.py` `STR.chars` view (`rlist.py` `Array(Char)`).
+fn is_rstr_chars_list(s: &SomeValue) -> bool {
+    let SomeValue::List(list) = s else {
+        return false;
+    };
+    let item = list.listdef.listitem_rc();
+    matches!(item.borrow().s_value, SomeValue::Integer(ref i) if i.unsigned)
 }
 
 impl PartialEq for DictDef {
@@ -522,6 +577,101 @@ mod tests {
     }
 
     #[test]
+    fn generalize_key_skips_equivalent_lookup_probe() {
+        use super::super::classdesc::ClassDef;
+        use super::super::model::SomeInstance;
+
+        let object_key = ClassDef::new_standalone("dictmultiobject::ObjectKey", None);
+        let probe = ClassDef::new_standalone("dictmultiobject::StrLookupKey", None);
+        let dd = DictDef::new(
+            None,
+            SomeValue::Instance(SomeInstance::new(
+                Some(object_key.clone()),
+                false,
+                Default::default(),
+            )),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let updated = dd
+            .generalize_key(&SomeValue::Instance(SomeInstance::new(
+                Some(probe),
+                false,
+                Default::default(),
+            )))
+            .expect("Equivalent probe must not union into the stored key cell");
+        assert!(!updated);
+        match dd.read_key(None) {
+            SomeValue::Instance(inst) => {
+                let name = inst
+                    .classdef
+                    .expect("stored key keeps ObjectKey")
+                    .borrow()
+                    .name
+                    .clone();
+                assert!(
+                    name.ends_with("ObjectKey"),
+                    "stored key must stay ObjectKey, got {name}"
+                );
+            }
+            other => panic!("stored key must stay ObjectKey instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generalize_key_keeps_str_cell_for_char_array_probe() {
+        use super::super::listdef::ListDef;
+        use super::super::model::SomeList;
+
+        let dd = DictDef::new(
+            None,
+            SomeValue::String(SomeString::default()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let probe = SomeValue::List(SomeList::new(ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::new(true, true)),
+            false,
+            false,
+        )));
+        let updated = dd
+            .generalize_key(&probe)
+            .expect("STR.chars probe must not union into the STR key cell");
+        assert!(!updated);
+        assert!(matches!(dd.read_key(None), SomeValue::String(_)));
+    }
+
+    #[test]
+    fn generalize_key_upgrades_char_array_cell_to_str() {
+        use super::super::listdef::ListDef;
+        use super::super::model::SomeList;
+
+        let bookkeeper = bk();
+        let dd = DictDef::new(
+            Some(bookkeeper.clone()),
+            SomeValue::List(SomeList::new(ListDef::new(
+                Some(bookkeeper),
+                SomeValue::Integer(SomeInteger::new(true, true)),
+                false,
+                false,
+            ))),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let updated = dd
+            .generalize_key(&SomeValue::String(SomeString::default()))
+            .expect("STR must replace the Array(Char) key cell");
+        assert!(updated);
+        assert!(matches!(dd.read_key(None), SomeValue::String(_)));
+    }
+
     fn generalize_key_on_plain_dict_does_not_trip_rdict_stub() {
         // upstream dictdef.py generalize — custom_eq_hash=false path skips
         // emulate_rdict_calls entirely. Same widening on a plain dict

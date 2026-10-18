@@ -16482,6 +16482,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             rhs,
             concrete_rhs,
             w_typ_r.as_ptr(),
+            // Reflected-first swap: speculative.
+            true,
         );
     }
 
@@ -16508,6 +16510,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             rhs,
             concrete_rhs,
             w_typ_r.as_ptr(),
+            // Forward Python dunder: speculative.
+            true,
         );
     }
     // Forward lookup found nothing, or found a slot that is not inlinable
@@ -16545,6 +16549,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         rhs,
         concrete_rhs,
         w_typ_r.as_ptr(),
+        // Settled last arm: not speculative.
+        false,
     );
 }
 
@@ -16553,6 +16559,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
 /// impl cannot run user Python, and when [`binop_reflected_runs_first`] says
 /// the reflected impl runs first — that caller passes no forward method, so
 /// the slot probe below does not sample an impl the language does not call.
+/// `speculative_rewind` is the caller's: the reflected-first swap stays
+/// under [`BinopRewindInlineGuard`]; a settled last arm does not.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -16570,6 +16578,7 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
     rhs: OpRef,
     mut concrete_rhs: pyre_object::PyObjectRef,
     mut w_typ_r: pyre_object::PyObjectRef,
+    speculative_rewind: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     macro_rules! decline {
         ($why:expr) => {{
@@ -16715,12 +16724,24 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
         lhs,
         concrete_lhs,
         w_class_l,
+        speculative_rewind,
     )
 }
 
 /// Shared descent for a resolved Python binop dunder. `receiver` is `self`;
 /// `other` is the remaining operand. The class/version-tag guard pins the
 /// receiver type; the other-operand guard pins the remaining operand's type.
+///
+/// `speculative_rewind` is whether `NotImplemented` still has another
+/// protocol arm to try, so [`BinopRewindInlineGuard`] must refuse a commit
+/// before it runs. `_call_binop_impl` (`descroperation.py`) runs
+/// `_invoke_binop` on the forward impl, then on the reflected impl. After
+/// the forward impl is known not to produce a result (missing, or a builtin
+/// slot that answered NotImplemented), the reflected call is a real
+/// `get_and_call_function` — `perform_call` (`pyjitpl.py`) traces it as an
+/// MIFrame, stores included. The reflected-first swap still has the original
+/// forward impl to try if `__r*__` answers NotImplemented, so that arm stays
+/// speculative.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -16741,6 +16762,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     other: OpRef,
     concrete_other: pyre_object::PyObjectRef,
     w_typ_other: pyre_object::PyObjectRef,
+    speculative_rewind: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     macro_rules! decline {
         ($why:expr) => {{
@@ -16804,7 +16826,11 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     // allocation would fail `obj.raw() >= from` and residualize the dunder.
     let region_from = ctx.trace_ctx.get_trace_position()._index;
     let session = ctx.session;
-    let rewind_guard = BinopRewindInlineGuard::enter(session, region_from);
+    // Last-arm `_invoke_binop` is `perform_call`: do not wrap a rewind
+    // guard, so `fbw_binop_rewind_refuse_commit` is a no-op and
+    // `store_attr_direct` records. Speculative arms still wrap.
+    let rewind_guard =
+        speculative_rewind.then(|| BinopRewindInlineGuard::enter(session, region_from));
     let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -16855,7 +16881,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         other => other,
     };
-    let refused_a_commit = rewind_guard.refused();
+    let refused_a_commit = rewind_guard.as_ref().is_some_and(|guard| guard.refused());
     drop(rewind_guard);
     if refused_a_commit {
         fbw_effect_journal_rollback_since(journal_mark);

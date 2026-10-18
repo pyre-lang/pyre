@@ -1629,6 +1629,13 @@ impl CrateLoweringState {
             // body emits that static as a nullary call. The residual runs
             // `OnceLock::get`.
             "importing::optional_module_hooks",
+            // `llmodel.py` `_store_exception`: `JIT_EXC_RAISER` is a
+            // OnceLock with no static-address lane, same as
+            // `optional_module_hooks`. The residual runs `OnceLock::get`.
+            "runtime_ops::jit_publish_exception",
+            // Residual ABI also writes `BH_LAST_EXC_VALUE` (`rthread.py`
+            // tlref). The residual runs that TLS store.
+            "runtime_ops::jit_publish_residual_error",
             // `external_buffer_view` is an Acquire load of a multi-word
             // aggregate. This caller returns one exception-bridge word.
             "typedef::buffer_as_bytes_like",
@@ -3468,9 +3475,21 @@ fn derive_program_metadata(
                     )
                     .map(|root| ValueType::Ref(Some(root)))
                 });
+                // A by-value transparent newtype is the inner struct
+                // (`ModuleDictStorage` / `RDict`; `celldict.py` `erase({})`).
+                // Flatten those leaves onto this class so getattr of
+                // `num_live_items` resolves (`rordereddict.rtype_len`).
+                let inner_fields = handle_payload
+                    .is_none()
+                    .then(|| transparent_by_value_inner_fields(td, llbc))
+                    .flatten();
+                let row_fields: &[FieldDecl] = inner_fields
+                    .map(|(_, inner)| inner)
+                    .unwrap_or(fields.as_slice());
+                let layout_td = inner_fields.map(|(inner, _)| inner).unwrap_or(td);
                 // A pair-slice field is its pointer word under the field's
                 // own name and its length word under `pair_len_field_name`.
-                let rows: Vec<crate::front::semantic::FieldRow> = fields
+                let rows: Vec<crate::front::semantic::FieldRow> = row_fields
                     .iter()
                     .enumerate()
                     .flat_map(|(i, f)| {
@@ -3523,9 +3542,9 @@ fn derive_program_metadata(
                 // Absent layout (opaque type) leaves the type unrecorded;
                 // the heuristic provider covers it.  Keyed by the identity
                 // token — one entry per type definition.
-                if let Some(layout) = td.layout_for_target(llbc, &target) {
+                if let Some(layout) = layout_td.layout_for_target(llbc, &target) {
                     let mut field_offsets = std::collections::HashMap::new();
-                    for (i, f) in fields.iter().enumerate() {
+                    for (i, f) in row_fields.iter().enumerate() {
                         let fname = f.name.clone().unwrap_or_else(|| {
                             majit_charon_reader::ullbc::positional_field_name(i)
                         });
@@ -3582,7 +3601,7 @@ fn derive_program_metadata(
                 // same-leaf structs in distinct modules stay distinct, and
                 // the spelling matches the def-path convention used by
                 // `STRUCT_ORIGIN_REGISTRY`.
-                let attr_rows: Vec<(String, ValueType)> = fields
+                let attr_rows: Vec<(String, ValueType)> = row_fields
                     .iter()
                     .enumerate()
                     .flat_map(|(i, f)| {
@@ -3611,7 +3630,7 @@ fn derive_program_metadata(
                         } else {
                             tyref_to_attr_value_type_for_struct_field(
                                 &f.ty,
-                                td,
+                                layout_td,
                                 llbc,
                                 gc_struct_ids,
                             )
@@ -6044,7 +6063,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // the `Arguments::new` block, so multi-arg Display chains lower to
         // native `str` + `ll_strconcat` like the single-arg case.
         fmt_collapsed += collapse_fmt_chains_multi(&mut lo.graph);
-        // Fieldless-enum `Debug` (`{:?}`) `format!` chains the `Display`
+        // Fieldless-enum `Debug` (`{:?}`) `format!` chains the string
         // collapsers above decline: a `Debug` render of a fieldless enum has
         // no native rstr counterpart, but each variant's derived `Debug` is
         // the bare variant identifier — a compile-time constant — so the whole
@@ -11563,6 +11582,12 @@ impl<'a> Lowering<'a> {
             decode_constant(self.llbc, value).ok()?,
         ) {
             (ValueType::Int, DecodedConst::Int(n)) => Some(ConstValue::Int(n)),
+            // Charon records a generic integer 0 as unsigned. `intmask`
+            // (`rarithmetic.py`) is the signed word; `allocated: 0` on
+            // `W_ListObject` is `isize` (`rlist.py` `ll_newlist`).
+            (ValueType::Int, DecodedConst::UInt(n)) if n <= i64::MAX as u64 => {
+                Some(ConstValue::Int(n as i64))
+            }
             (ValueType::Int | ValueType::Bool, DecodedConst::Bool(b)) => Some(ConstValue::Bool(b)),
             (ValueType::Float, DecodedConst::Float(bits)) => Some(ConstValue::Float(bits)),
             _ => None,
@@ -11729,6 +11754,12 @@ impl<'a> Lowering<'a> {
         mut value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
+        // `rewrite_op_setfield` drops a void store (`getkind == 'v'`).
+        // `RDict.hash_builder` is `BuildHasherDefault<H>` (`rordereddict.py`
+        // has no hasher field).
+        if tyref_is_void_zst(dest_ty, self.llbc) {
+            return Ok(());
+        }
         // `(*s)[i] = value` over a pair slice, or `a[i] = value` over a
         // raw-buffer array, writes through the item pointer.
         if let ProjectionElem::Tagged(v) = &elem
@@ -12224,6 +12255,8 @@ impl<'a> Lowering<'a> {
                     if let Some(owner) = field.owner_root.as_deref() {
                         value = self.coerce_gcref_null_store(bb_id, owner, &field.name, value);
                     }
+                    value =
+                        self.coerce_signed_int_store(bb_id, &ty, Some(field.name.as_str()), value);
                     OpKind::FieldWrite {
                         base,
                         field,
@@ -13882,6 +13915,94 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Unsigned 0 stored into a signed field is `intmask` (`rarithmetic.py`).
+    /// Charon records a generic integer 0 as `ConstUInt`; `W_ListObject.allocated`
+    /// is `isize` (`rlist.py` `ll_newlist`). Fused boxing FieldWrite can carry
+    /// `Ref(None)` for that store; the field name still intmasks.
+    fn coerce_signed_int_store(
+        &mut self,
+        bb_id: BlockId,
+        dest_kind: &ValueType,
+        field_name: Option<&str>,
+        value: LinkArg,
+    ) -> LinkArg {
+        let signed_dest = matches!(dest_kind, ValueType::Int) || field_name == Some("allocated");
+        if !signed_dest {
+            return value;
+        }
+        let n = match &value {
+            LinkArg::Const(c) => {
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                // Charon may leave `concretetype` unset until a later stamp.
+                // `intmask` is the signed word either way (`ll_newlist`).
+                let already_signed = matches!(
+                    c.concretetype,
+                    Some(LowLevelType::Signed)
+                        | Some(LowLevelType::SignedLongLong)
+                        | Some(LowLevelType::SignedLongLongLong)
+                );
+                match &c.value {
+                    crate::flowspace::model::ConstValue::Int(_) if already_signed => return value,
+                    crate::flowspace::model::ConstValue::Int(n) => *n,
+                    crate::flowspace::model::ConstValue::Int128(v)
+                        if *v >= i64::MIN as i128 && *v <= i64::MAX as i128 =>
+                    {
+                        *v as i64
+                    }
+                    _ => return value,
+                }
+            }
+            LinkArg::Value(var) => {
+                let Some(n) = self
+                    .graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .find_map(|op| {
+                        (op.result.as_ref() == Some(var))
+                            .then_some(match &op.kind {
+                                OpKind::ConstUInt(n) if *n <= i64::MAX as u64 => Some(*n as i64),
+                                OpKind::ConstUInt128(n) if *n <= i64::MAX as u128 => {
+                                    Some(*n as i64)
+                                }
+                                _ => None,
+                            })
+                            .flatten()
+                    })
+                else {
+                    return value;
+                };
+                n
+            }
+        };
+        match self.graph.push_op_var(bb_id, OpKind::ConstInt(n), true) {
+            Some(signed) => LinkArg::Value(signed),
+            None => value,
+        }
+    }
+
+    /// Declared field bank of `dest_ty.name`, after wrapper peel.
+    fn named_field_value_type(&self, dest_ty: &TyRef, field_name: &str) -> Option<ValueType> {
+        let node =
+            tyref_node(dest_ty, self.llbc).and_then(|node| strip_ty_wrappers(node, self.llbc))?;
+        let id = adt_node_def_id(node)?;
+        let td = self.llbc.type_by_id(id)?;
+        let fields = type_decl_struct_fields(td, self.llbc)?;
+        let field = fields.iter().enumerate().find_map(|(i, f)| {
+            let name = f
+                .name
+                .clone()
+                .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
+            (name == field_name).then_some(f)
+        })?;
+        Some(tyref_to_value_type_with(
+            &field.ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        ))
+    }
+
     /// Rust field type-check is the proof needed to narrow that producer
     /// before `setattr`; this is an identity cast for non-null values and a
     /// typed null for null values.
@@ -15198,6 +15319,30 @@ impl<'a> Lowering<'a> {
                                 bb_id,
                                 &ctor.result_owner,
                                 &field.name,
+                                LinkArg::Value(arg.clone()),
+                            );
+                            if let Some(value) = coerced.as_variable() {
+                                *arg = value.clone();
+                            }
+                        }
+                        for (i, arg) in arg_vars.iter_mut().enumerate() {
+                            let Some(field) = ctor.fields.get(i) else {
+                                continue;
+                            };
+                            let Some(field_ty) = self.named_field_value_type(dest_ty, &field.name)
+                            else {
+                                continue;
+                            };
+                            let field_ty =
+                                crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                                    &ctor.result_owner,
+                                    &field.name,
+                                    field_ty,
+                                );
+                            let coerced = self.coerce_signed_int_store(
+                                bb_id,
+                                &field_ty,
+                                Some(field.name.as_str()),
                                 LinkArg::Value(arg.clone()),
                             );
                             if let Some(value) = coerced.as_variable() {
@@ -17379,6 +17524,7 @@ impl<'a> Lowering<'a> {
     ///   on a mut view splits that header with [`Self::pair_of_vec`] and
     ///   uses the same `ll_slice_*` helpers.
     /// - `slice::from_raw_parts(p, n)` is `(p, n)`.
+    /// - `slice::from_ref(p)` / `from_mut(p)` is `(p, 1)`.
     /// - Any other callee returning a pair slice takes the address of a
     ///   one-word length slot as a trailing argument, stores the length
     ///   there and returns the pointer.
@@ -17584,6 +17730,34 @@ impl<'a> Lowering<'a> {
                         arg_is_range_full,
                         true,
                     )?
+                }
+                _ if is_slice_from_ref_name(&name) && args.len() == 1 => {
+                    let ptr_ty = arg_tys[0].as_ref().map(|ty| {
+                        tyref_to_value_type_with(
+                            ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        )
+                    });
+                    let ptr = match ptr_ty {
+                        Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
+                            self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                        }
+                        Some(ValueType::Ref(_)) => {
+                            let bb_id = self.emit_bb(mir_bb);
+                            let (retype, ptr) =
+                                push_ptr_to_unsigned_cast(&mut self.graph, bb_id, args[0].clone());
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(ptr.clone()),
+                                kind: retype,
+                            });
+                            ptr
+                        }
+                        _ => args[0].clone(),
+                    };
+                    let len = self.emit_const_uint(mir_bb, 1);
+                    (ptr, len)
                 }
                 (
                     "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut",
@@ -20318,8 +20492,15 @@ impl<'a> Lowering<'a> {
                     let ty = if w_bytes_object_data_is_char_gcarray(&owner_root, &field_name) {
                         // `*const BytesBlock` would otherwise be `Str` via
                         // `tyref_raw_ptr_pointee_is_string_value`. The
-                        // published field is `[u8]` (`SomeList`).
-                        ValueType::Ref(None)
+                        // published field is `[u8]` (`SomeList`). Bytes-dict
+                        // graphs store `BytesKey` as `rstr.py` `STR`; the
+                        // inlined `w_bytes_data` FieldRead must match that
+                        // cell (`dictmultiobject.py` `BytesDictStrategy`).
+                        if self.graph_unifies_bytes_slice_with_string() {
+                            ValueType::Str
+                        } else {
+                            ValueType::Ref(None)
+                        }
                     } else {
                         crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
                             &owner_root,
@@ -21563,7 +21744,8 @@ impl<'a> Lowering<'a> {
                     // zero-sized field occupies no storage and gets no slot,
                     // so no write is generated for it.
                     void: crate::codewriter::call::get_type_flag(&field_ty).1
-                        == majit_ir::value::Type::Void,
+                        == majit_ir::value::Type::Void
+                        || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc)),
                     narrow_root: self.typed_ref_field_narrow_root(declared_ty),
                 }
             })
@@ -21654,15 +21836,32 @@ impl<'a> Lowering<'a> {
         let owner_path = segments;
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) | (TypeDeclKind::Struct(fields), Some(_)) => {
+                // Substitute dest_ty / head generics so a field whose
+                // declaration is a type variable (`RDict.hash_builder: S`)
+                // sees `BuildHasherDefault<H>` and `_names_without_voids`
+                // can drop the ZST (`rordereddict.py` has no hasher field).
+                let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
+                let inst_adt = match head_adt {
+                    Some(h) if !render_adt_type_args(h, self.llbc, 0).is_empty() => Some(h),
+                    _ => dest_adt.or(head_adt),
+                };
+                let inst_args = inst_adt
+                    .map(|h| render_adt_type_args(h, self.llbc, 0))
+                    .unwrap_or_default();
                 let field_rows: Vec<(String, String, Option<TyRef>)> = fields
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
+                        let field_ty = if inst_args.is_empty() {
+                            tyref_to_ast_string(&f.ty, self.llbc)
+                        } else {
+                            substitute_field_type(&f.ty, &inst_args, self.llbc, self.gc_struct_ids)
+                        };
                         (
                             f.name.clone().unwrap_or_else(|| {
                                 majit_charon_reader::ullbc::positional_field_name(i)
                             }),
-                            tyref_to_ast_string(&f.ty, self.llbc),
+                            field_ty,
                             Some(clone_tyref(&f.ty)),
                         )
                     })
@@ -23734,6 +23933,12 @@ impl<'a> Lowering<'a> {
                 .is_some_and(gc_root_pin_path),
             _ => false,
         };
+        let callee_identity_hash = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(gc_identity_hash_path),
+            _ => false,
+        };
 
         // Destination must be a plain `Local(i)` — projection-typed
         // destinations are not produced for monomorphized calls in any
@@ -23805,10 +24010,9 @@ impl<'a> Lowering<'a> {
         //
         // A `-> ()` callee's graph reports a void result kind (its
         // `Return` lowers via `set_return(None)`, see [`is_unit_type`]),
-        // so the call site must declare the result Void too — otherwise
-        // `tyref_to_value_type`'s `Ref` projection for unit contradicts
-        // the callee's `FUNC.RESULT=Void` and trips `call.rs`
-        // (e.g. `ExecutionContext.force_all_frames`).
+        // and [`tyref_to_value_type`] paints unit `Void` so the call
+        // site's `FUNC.RESULT` matches (`call.rs`,
+        // `ExecutionContext.force_all_frames`).
         //
         // A raw pointer to a non-byte scalar is the address word.
         // `history.py` `getkind` banks every raw `Ptr` as `int`, and
@@ -24373,6 +24577,12 @@ impl<'a> Lowering<'a> {
                         .expect("a materialized GC root stays a Variable")
                         .clone();
                 }
+                // `rarithmetic.r_uint`: the unique graph's `usize` input is
+                // Unsigned. `cast_ptr_to_int` callers otherwise merge
+                // `r_uint ∪ int` (`annrpython.py` `mergeinputargs`).
+                if callee_identity_hash && let Some(arg) = args.first().cloned() {
+                    args[0] = push_r_uint(&mut self.graph, bb_id, arg);
+                }
                 // `core::intrinsics::transmute::<A, B>(x)` is a bitwise
                 // move.  `f64 ↔ i64` is `float2longlong` /
                 // `longlong2float`.  Any other pair of equal-size
@@ -24790,13 +25000,28 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // Pin-free tuple eq and the bytes-dict helpers read
-                // exact-bytes storage as the published `[u8]` `SomeList`
-                // (`rlist.py` `Array(Char)` / `BytesBlock` `[length, chars]`).
+                // Bytes-dict lookup keys are `BytesKey` / `rstr.py` `STR`
+                // (`dictdef.py` `generalize_key`). `w_bytes_data` is that
+                // same STR, not a `[u8]` `SomeList`.
                 if args.len() == 1
                     && (self.is_w_bytes_data(&reg) || self.is_w_bytes_block(&reg))
-                    && (self.graph_is_pin_free_tuple_eq()
-                        || self.graph_unifies_bytes_slice_with_string())
+                    && self.graph_unifies_bytes_slice_with_string()
+                {
+                    let dest = self.emit_w_bytes_data_str_read(bb_id, args[0].clone());
+                    self.local_var[dest_local] = Some(LocalValue::One(dest));
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Pin-free tuple eq reads exact-bytes storage as the
+                // published `[u8]` `SomeList` (`rlist.py` `Array(Char)`).
+                if args.len() == 1
+                    && (self.is_w_bytes_data(&reg) || self.is_w_bytes_block(&reg))
+                    && self.graph_is_pin_free_tuple_eq()
                 {
                     let dest = self.emit_w_bytes_data_list_read(bb_id, args[0].clone());
                     self.local_var[dest_local] = Some(LocalValue::One(dest));
@@ -28319,6 +28544,28 @@ impl<'a> Lowering<'a> {
                 if self.try_lower_i64_to_i32_try_from(
                     mir_bb,
                     &reg.kind,
+                    &segments,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_slice_from_ref(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_vec_try_reserve_exact(
+                    mir_bb,
                     &segments,
                     &args,
                     dest_local,
@@ -34449,17 +34696,21 @@ impl<'a> Lowering<'a> {
     /// published `GcArray(Char)` `[u8]` `SomeList`. The layout is
     /// `[length, chars]`, not STR `[hash, length, chars]`.
     fn graph_unifies_bytes_slice_with_string(&self) -> bool {
+        let leaf = self
+            .graph
+            .name
+            .rsplit("::")
+            .next()
+            .unwrap_or(&self.graph.name);
         matches!(
-            self.graph
-                .name
-                .rsplit("::")
-                .next()
-                .unwrap_or(&self.graph.name),
+            leaf,
             "w_dict_lookup_bytes_strategy"
                 | "w_dict_store_bytes_strategy"
                 | "w_bytes_data"
                 | "w_bytes_block"
-        )
+                | "getitem_str"
+                | "getitem_str_hashed"
+        ) || leaf.contains("bytes_strategy")
     }
 
     fn is_bytes_like_data(&self, reg: &RegularCall) -> bool {
@@ -34485,6 +34736,20 @@ impl<'a> Lowering<'a> {
     /// `W_BytesObject.data` as the published `[u8]` `SomeList`
     /// (`rlist.py` `Array(Char)`), without the `STR` view.
     fn emit_w_bytes_data_list_read(&mut self, bb_id: BlockId, base: Variable) -> Variable {
+        self.emit_w_bytes_data_field_read(bb_id, base, ValueType::Ref(None))
+    }
+
+    /// `W_BytesObject.data` as `rstr.py` `STR` (`BytesKey` is `SomeString`).
+    fn emit_w_bytes_data_str_read(&mut self, bb_id: BlockId, base: Variable) -> Variable {
+        self.emit_w_bytes_data_field_read(bb_id, base, ValueType::Str)
+    }
+
+    fn emit_w_bytes_data_field_read(
+        &mut self,
+        bb_id: BlockId,
+        base: Variable,
+        ty: ValueType,
+    ) -> Variable {
         let narrowed = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -34504,7 +34769,7 @@ impl<'a> Lowering<'a> {
                         "bytesobject::W_BytesObject",
                     )))
                     .with_base_is_deref(true),
-                ty: ValueType::Ref(None),
+                ty,
                 pure: false,
             },
         });
@@ -38959,12 +39224,23 @@ impl<'a> Lowering<'a> {
             result_ok_owner,
             result_err_owner,
             call_once_owner,
-            ok_ty: tyref_enum_payload_value_type(
-                &recv_ok,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-            ),
+            ok_ty: if crate::front::result_exc::tyref_result_ok_is_unit(recv_ty, self.llbc)
+                || is_unit_type(&recv_ok, self.llbc)
+                || tyref_is_void_zst(&recv_ok, self.llbc)
+            {
+                // `()` is `lltype.Void`. `tyref_to_value_type` and
+                // `result_exc` `unit_ok` / `widen_unit_return_to_void`
+                // keep unit Ok as Void (`exceptiontransform.py`).
+                // `tyref_result_ok_is_unit` reads the Ok slot as `"()"`.
+                ValueType::Void
+            } else {
+                tyref_enum_payload_value_type(
+                    &recv_ok,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                )
+            },
             ok_class_root: enum_payload_instance_class_root(
                 &dest_ok,
                 self.llbc,
@@ -41493,19 +41769,21 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Lower the fallible `i32::try_from(i64)` core shell to the checked
+    /// Lower a fallible signed `try_from` core shell to the checked
     /// narrowing shape PyPy writes directly in
     /// `ObjSpace.c_int_w` (`baseobjspace.py`): the value succeeds
-    /// exactly when `INT_MIN <= value <= INT_MAX`. Rust carries the two
-    /// branches in a `Result<i32, TryFromIntError>`, so preserve that source
+    /// exactly when `DST_MIN <= value <= DST_MAX`. Rust carries the two
+    /// branches in a `Result<T, TryFromIntError>`, so preserve that source
     /// CFG by materializing `Ok=0` / `Err=1` and leaving the caller's match
     /// arms untouched.
     ///
-    /// The payload aliases the i64 carrier. Narrow integer widths do not have
-    /// a distinct JIT register bank, and it is read only on the proven-in-range
-    /// Ok arm; this is the same value-preserving representation rule used by
-    /// [`Self::try_lower_usize_try_from`]. Other source/destination pairs stay
-    /// residual until their own bounds and signedness rules are ported.
+    /// `i32::try_from(i64)` aliases the i64 carrier as the payload: narrow
+    /// integer widths do not have a distinct JIT register bank, and it is
+    /// read only on the proven-in-range Ok arm. `i64::try_from(i128)`
+    /// (`w_range_iter` one-past bound) uses `longlongmask`
+    /// (`rbuiltin.py` `rarith_longlongmask`) so the Ok payload is the
+    /// 64-bit signed word. Other source/destination pairs stay residual
+    /// until their own bounds and signedness rules are ported.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -41516,6 +41794,7 @@ impl<'a> Lowering<'a> {
         kind: &CallKind,
         segments: &[String],
         args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
         dest_local: usize,
         dest_ty: &TyRef,
         target: usize,
@@ -41533,25 +41812,51 @@ impl<'a> Lowering<'a> {
         let [arg] = args else {
             return Ok(false);
         };
-        let CallKind::Fun(FunId::Regular { id }) = kind else {
+        // `convert::num::<Impl>::try_from` is a generic FunDecl; the
+        // instantiation's source width is the call-site operand
+        // (`w_range_iter` `i64::try_from(i128)`), not the TypeVar on
+        // the template signature.
+        let src_atom = match kind {
+            CallKind::Fun(FunId::Regular { id }) => self
+                .llbc
+                .fn_by_id(*id)
+                .and_then(|fd| fd.signature.inputs.first())
+                .and_then(|src| self.tyref_literal_int_atom(src)),
+            _ => None,
+        }
+        .or_else(|| first_arg_ty.and_then(|ty| self.tyref_literal_int_atom(ty)));
+        let Some(src_atom) = src_atom else {
             return Ok(false);
         };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
+        let success_ty = self.tyref_adt_type_arg(dest_ty, 0).or_else(|| {
+            self.body
+                .locals
+                .locals
+                .get(dest_local)
+                .and_then(|decl| self.tyref_adt_type_arg(&decl.ty, 0))
+        });
+        let Some(success_ty) = success_ty else {
             return Ok(false);
         };
-        let Some(src) = fd.signature.inputs.first() else {
+        let Some(dst_atom) = self.tyref_literal_int_atom(&success_ty) else {
             return Ok(false);
         };
-        if !matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize")) {
+        let i128_to_i64 = src_atom == "I128" && dst_atom == "I64";
+        let i64_to_i32 = matches!(src_atom, "I64" | "Isize") && dst_atom == "I32";
+        if !i128_to_i64 && !i64_to_i32 {
             return Ok(false);
         }
-        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
-            return Ok(false);
+        let result_ty = if self.tyref_adt_def_id(dest_ty).is_some() {
+            dest_ty
+        } else {
+            self.body
+                .locals
+                .locals
+                .get(dest_local)
+                .map(|decl| &decl.ty)
+                .unwrap_or(dest_ty)
         };
-        if self.tyref_literal_int_atom(&success_ty) != Some("I32") {
-            return Ok(false);
-        }
-        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+        let Some(def_id) = self.tyref_adt_def_id(result_ty) else {
             return Ok(false);
         };
         let Some(td) = self.llbc.type_by_id(def_id) else {
@@ -41560,7 +41865,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(result_ty, self.llbc)
         );
         let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
@@ -41571,7 +41876,17 @@ impl<'a> Lowering<'a> {
             });
             result
         };
-        let min = push_op(&mut self.graph, OpKind::ConstInt(i32::MIN as i64));
+        // Bounds live in the signed word bank (`history.py` `getkind`
+        // refuses `SignedLongLongLong`). `i64::MIN`/`MAX` are that bank;
+        // a `ConstInt128` bound would not project.
+        let min = push_op(
+            &mut self.graph,
+            OpKind::ConstInt(if i128_to_i64 {
+                i64::MIN
+            } else {
+                i32::MIN as i64
+            }),
+        );
         let below = push_op(
             &mut self.graph,
             OpKind::BinOp {
@@ -41581,7 +41896,14 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         );
-        let max = push_op(&mut self.graph, OpKind::ConstInt(i32::MAX as i64));
+        let max = push_op(
+            &mut self.graph,
+            OpKind::ConstInt(if i128_to_i64 {
+                i64::MAX
+            } else {
+                i32::MAX as i64
+            }),
+        );
         let above = push_op(
             &mut self.graph,
             OpKind::BinOp {
@@ -41605,6 +41927,16 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         );
+        // `i64::try_from(i128)` is in range on the Ok arm, so
+        // `longlongmask` is the 64-bit signed word (`rbuiltin.py`).
+        let payload = if i128_to_i64 {
+            push_op(
+                &mut self.graph,
+                rarithmetic_mask("longlongmask", arg.clone(), ValueType::Int),
+            )
+        } else {
+            arg.clone()
+        };
         let payload_owner =
             Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
         self.emit_tagged_pair_aggregate(
@@ -41612,7 +41944,148 @@ impl<'a> Lowering<'a> {
             &owner,
             &payload_owner,
             disc,
-            arg.clone(),
+            payload,
+            dest_local,
+            target,
+        )?;
+        Ok(true)
+    }
+
+    /// `slice::from_ref(&x)` of a GC pointer is `newlist(x)`
+    /// (`rlist.py` `rtype_newlist`). A one-element `&[PyObjectRef]` is
+    /// the length-prefixed object array, the same `Unsize` of `[x; 1]`
+    /// already rewrites.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn try_lower_slice_from_ref(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !is_slice_from_ref_path(segments) {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let dest_is_object_slice =
+            matches!(
+                tyref_object_pointer_slice_mutability(dest_ty, self.llbc),
+                Some("Shared" | "Const")
+            ) || self.body.locals.locals.get(dest_local).is_some_and(|decl| {
+                matches!(
+                    tyref_object_pointer_slice_mutability(&decl.ty, self.llbc),
+                    Some("Shared" | "Const")
+                )
+            });
+        let arg_is_object_ref =
+            first_arg_ty.is_some_and(|ty| tyref_is_shared_ref_to_object_pointer(ty, self.llbc));
+        if !dest_is_object_slice && !arg_is_object_ref {
+            return Ok(false);
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget,
+        };
+        res.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(GCREF.clone())),
+        }))));
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::NewList {
+                args: vec![arg.clone()],
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `Vec::try_reserve_exact(n) -> Result<(), TryReserveError>` is the
+    /// fallible half of `ll_newlist_hint` (`rlist.py`). `newlist_hint`
+    /// (`objectmodel.py`) is an ExtRegistry; `try_pyobject_vec_with_capacity`
+    /// already takes that path. This generic body is inlined, so the std
+    /// call has to become operations: an always-`Ok` Result shell whose
+    /// `map_err(|_| reservation_failed())` arm stays the MemoryError edge
+    /// when a later pass gives the discriminant a runtime value.
+    fn try_lower_vec_try_reserve_exact(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if rust_vec_std_leaf(segments) != Some("try_reserve_exact") {
+            return Ok(false);
+        }
+        if args.len() != 2 {
+            return Ok(false);
+        }
+        let success_ty = self.tyref_adt_type_arg(dest_ty, 0).or_else(|| {
+            self.body
+                .locals
+                .locals
+                .get(dest_local)
+                .and_then(|decl| self.tyref_adt_type_arg(&decl.ty, 0))
+        });
+        let Some(success_ty) = success_ty else {
+            return Ok(false);
+        };
+        if !is_unit_type(&success_ty, self.llbc) {
+            return Ok(false);
+        }
+        let result_ty = if self.tyref_adt_def_id(dest_ty).is_some() {
+            dest_ty
+        } else {
+            self.body
+                .locals
+                .locals
+                .get(dest_local)
+                .map(|decl| &decl.ty)
+                .unwrap_or(dest_ty)
+        };
+        let Some(def_id) = self.tyref_adt_def_id(result_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(result_ty, self.llbc)
+        );
+        let bb_id = self.emit_bb(mir_bb);
+        let disc = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let payload = self.emit_unit(bb_id);
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            payload,
             dest_local,
             target,
         )?;
@@ -42277,15 +42750,21 @@ impl<'a> Lowering<'a> {
     /// (`Option::Some` at disc 1, `Result::Ok` at disc 0).
     ///
     /// Resolution prefers the variant carrying the declared discriminant.
-    /// For a niche-optimised layout where the success variant has no
-    /// explicit discriminant (`discriminant_i64()` is `None`), it falls
-    /// back to the SOLE payload-carrying variant — the `__pos_0` payload
-    /// belongs to it by definition, never to the empty `None`/`Err`
-    /// sibling or the enum root (whose only field after the base/variant
-    /// split is `__discriminant`).  Resolving to the variant keeps the
-    /// write owner in agreement with the variant-qualified read owner
-    /// (`resolve_adt_field`).  `None` only when `td` is not an enum or no
-    /// single payload variant can be identified.
+    /// When that is absent, the variant at `disc` as a source index is
+    /// next: `Result::Ok` / `Option::None` occupy 0, `Result::Err` /
+    /// `Option::Some` occupy 1. A unit Ok (`Result<(), E>`) has no
+    /// payload field, so jumping to the sole payload-carrying sibling
+    /// would attribute Err's `__pos_0` to Ok and merge Tuple ∪ OsError
+    /// (`result_exc` `unit_ok`, `exceptiontransform.py`).
+    ///
+    /// For a niche-optimised layout where even the index is out of
+    /// range, it falls back to the SOLE payload-carrying variant — the
+    /// `__pos_0` payload belongs to it by definition, never to the empty
+    /// `None`/`Err` sibling or the enum root (whose only field after the
+    /// base/variant split is `__discriminant`).  Resolving to the variant
+    /// keeps the write owner in agreement with the variant-qualified
+    /// read owner (`resolve_adt_field`).  `None` only when `td` is not
+    /// an enum or no single payload variant can be identified.
     fn tagged_pair_payload_owner(td: &TypeDecl, owner: &str, disc: i64) -> Option<String> {
         let TypeDeclKind::Enum(variants) = &td.kind else {
             return None;
@@ -42293,6 +42772,10 @@ impl<'a> Lowering<'a> {
         let v = variants
             .iter()
             .find(|v| v.discriminant_i64() == Some(disc))
+            .or_else(|| {
+                let idx = usize::try_from(disc).ok()?;
+                variants.get(idx)
+            })
             .or_else(|| {
                 let mut payload_variants = variants.iter().filter(|v| !v.fields.is_empty());
                 match (payload_variants.next(), payload_variants.next()) {
@@ -45136,6 +45619,14 @@ fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::Call
 fn gc_root_pin_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&"pin_root") && segments.contains(&"gc_roots")
+}
+
+/// `gc_hook::gc_identity_hash` (`framework.py` `gct_gc_identityhash`).
+/// The unique graph's `usize` slot is `r_uint`; callers that pass Signed
+/// (`cast_ptr_to_int`) must retype before `mergeinputargs`.
+fn gc_identity_hash_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&"gc_identity_hash") && segments.contains(&"gc_hook")
 }
 
 /// The root-bracket guard type and the call that closes one.
@@ -59488,6 +59979,13 @@ fn tyref_to_value_type_with(
         return ValueType::Ref(None);
     };
     let value = strip_ty_indirections(resolved, llbc).unwrap_or(resolved);
+    // `()` is `lltype.Void` (`history.py` `getkind`). Charon serializes
+    // it as an empty Tuple ADT; painting that `Ref` interned `SomeTuple`
+    // and `map_err` of `Result<(), E>` joined Tuple ∪ OsError
+    // (`native_result`, `exceptiontransform.py` `unit_ok`).
+    if is_unit_type(ty, llbc) {
+        return ValueType::Void;
+    }
     // Primitive shapes Charon emits inline.  The literal-type schema
     // splits across two forms:
     //
@@ -59495,13 +59993,6 @@ fn tyref_to_value_type_with(
     //   - object: `{"Scalar": {"Integer": {"Signed": "Isize"}}}`,
     //     `{"Scalar": {"Integer": {"Unsigned": "Usize"}}}`,
     //     `{"Scalar": {"Float": "F64"}}`.
-    //
-    // Unit type `()` serializes as `{"Adt": {"id": 0, "builtin": "Tuple",
-    // "generics": {"types": []}}}` and routes through the final `Ref`
-    // fallback here.  A `-> ()` function's *return* is special-cased
-    // separately by [`is_unit_type`] at the `Return` terminator so the
-    // result kind comes out void ('v'); in operand position a unit
-    // value stays Ref like any other transparent-ctor result.
     if let Some(obj) = value.as_object()
         && let Some(scalar) = obj.get("Scalar")
         && let Some(kind) = scalar_value_type(scalar)
@@ -59976,6 +60467,11 @@ fn tyref_adt_def_id_of(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
 }
 
 fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
+    if adt_path_of_tyref(ty, llbc)
+        .is_some_and(|path| crate::codewriter::call::type_str_leaf_is_void_zst(&path))
+    {
+        return true;
+    }
     let target = std::env::var("TARGET").unwrap_or_default();
     tyref_adt_def_id_of(ty, llbc)
         .and_then(|def_id| llbc.type_by_id(def_id))
@@ -61645,6 +62141,45 @@ fn tyref_transparent_nonzst_field(ty: &TyRef, llbc: &Llbc) -> Option<(usize, Str
     transparent_nonzst_field(decl, llbc)
 }
 
+/// Inner struct of a by-value `#[repr(transparent)]` newtype.
+///
+/// `celldict.py` `erase({})` stores the dicttable itself; `ModuleDictStorage`
+/// is a no-op alias of that `RDict` (`heaptracker.py all_fielddescrs` /
+/// `inline_struct_field_leaves`). A pointer-shaped payload is a GC handle
+/// (`PyError.0` is `*mut PyErrorObject`) and keeps the wrapper's own field.
+fn transparent_by_value_inner_fields<'a>(
+    td: &'a TypeDecl,
+    llbc: &'a Llbc,
+) -> Option<(&'a TypeDecl, &'a [FieldDecl])> {
+    let (index, _) = transparent_nonzst_field(td, llbc)?;
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    let field = fields.get(index)?;
+    let field_node = strip_ty_wrappers(tyref_node(&field.ty, llbc)?, llbc)?;
+    if field_node
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("RawPtr"))
+        || type_node_is_mut_ref(field_node, llbc)
+        || type_node_shared_ref_pointee(field_node, llbc).is_some()
+        || type_node_is_fn_ptr(field_node, llbc)
+        || type_node_is_thin_box(field_node, llbc)
+    {
+        return None;
+    }
+    let inner_id = adt_node_def_id(field_node)?;
+    if inner_id == td.def_id {
+        return None;
+    }
+    let inner = llbc.type_by_id(inner_id)?;
+    let owner = type_decl_struct_owner(inner, llbc)?;
+    let inner_fields = match &owner.kind {
+        TypeDeclKind::Struct(fields) => fields.as_slice(),
+        _ => return None,
+    };
+    (!inner_fields.is_empty()).then_some((owner, inner_fields))
+}
+
 fn field_is_zst(ty: &TyRef, llbc: &Llbc) -> bool {
     if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
         return true;
@@ -62425,11 +62960,39 @@ pub(crate) fn type_decl_ref_builtin(tref: &serde_json::Value) -> Option<&str> {
 /// A `repr(transparent)` GC handle keeps the wrapper leaf. The handle
 /// intern's as a subclass of `Deref::Target`, so getattr of the handle's
 /// own fields (`error::PyError`.0) resolves on the wrapper.
+///
+/// A by-value transparent newtype intern's as the inner struct
+/// (`celldict.py` `erase({})` / `ModuleDictStorage` → `RDict`). A
+/// `type T = Struct<…>` alias intern's as that struct
+/// (`ModuleDictEntries` → `RDict`). `tyref_to_value_type` already
+/// peels the same wrappers; unique-graph `mergeinputargs` needs the
+/// intern key to match (`annrpython.py` `mergeinputargs`).
 fn adt_node_class_root_with(
     node: &serde_json::Value,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    // Pointer-shaped payloads stay on the wrapper (`PyError`).
+    if transparent_by_value_inner_fields(td, llbc).is_some()
+        && let Some((index, _)) = transparent_nonzst_field(td, llbc)
+        && let TypeDeclKind::Struct(fields) = &td.kind
+        && let Some(field) = fields.get(index)
+        && let Some(field_node) =
+            tyref_node(&field.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))
+        && adt_node_def_id(field_node) != Some(def_id)
+    {
+        return adt_node_class_root_with(field_node, llbc, tombstoned);
+    }
+    if let TypeDeclKind::Alias(body) = &td.kind {
+        let alias_node = body.get("aliased_ty").unwrap_or(body);
+        if let Some(peeled) = type_node_peel_aliases(alias_node, llbc)
+            && adt_node_def_id(peeled) != Some(def_id)
+        {
+            return adt_node_class_root_with(peeled, llbc, tombstoned);
+        }
+    }
     adt_node_class_root_leaf(node, llbc, tombstoned)
 }
 
@@ -63276,16 +63839,22 @@ fn type_node_peel_aliases<'l>(
 /// Charon keeps a type alias as `TypeDeclKind::Alias` whose body is the
 /// generic struct. Field projections still name those fields.
 fn type_decl_struct_fields<'a>(td: &'a TypeDecl, llbc: &'a Llbc) -> Option<&'a [FieldDecl]> {
-    match &td.kind {
+    match &type_decl_struct_owner(td, llbc)?.kind {
         TypeDeclKind::Struct(fields) => Some(fields.as_slice()),
+        _ => None,
+    }
+}
+
+/// The struct `TypeDecl` that owns `td`'s fields, peeling a
+/// `type T = Struct<…>` alias (`ModuleDictEntries` → `RDict`).
+fn type_decl_struct_owner<'a>(td: &'a TypeDecl, llbc: &'a Llbc) -> Option<&'a TypeDecl> {
+    match &td.kind {
+        TypeDeclKind::Struct(_) => Some(td),
         TypeDeclKind::Alias(body) => {
             let node = body.get("aliased_ty").unwrap_or(body);
             let peeled = type_node_peel_aliases(node, llbc)?;
             let inner = llbc.type_by_id(adt_node_def_id(peeled)?)?;
-            match &inner.kind {
-                TypeDeclKind::Struct(fields) => Some(fields.as_slice()),
-                _ => None,
-            }
+            matches!(&inner.kind, TypeDeclKind::Struct(_)).then_some(inner)
         }
         _ => None,
     }
@@ -64159,14 +64728,18 @@ fn tyref_default_is_unit(ty: &TyRef, llbc: &Llbc) -> bool {
 /// declared void kind and tripping the codewriter cross-check
 /// (`codewriter.rs`).
 fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
-    let value = match ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
-            Some(v) => v,
-            None => return false,
-        },
+    if let Some(value) = tyref_node(ty, llbc)
+        && type_value_is_empty_tuple(value, llbc)
+    {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
+        return false;
     };
+    type_value_is_empty_tuple(node, llbc) || charon_type_value_to_ast_string(node, llbc, 0) == "()"
+}
+
+fn type_value_is_empty_tuple(value: &serde_json::Value, llbc: &Llbc) -> bool {
     let Some(adt) = value
         .as_object()
         .and_then(|m| m.get("Adt"))
@@ -65744,8 +66317,11 @@ fn enum_payload_instance_class_root(
 ///   - `f32` — RPython's `SingleFloat` is int-banked (`getkind(...) == "int"`),
 ///     while the textual field-descriptor path still classifies float atoms
 ///     as float-banked. Defer the split until both paths agree.
-///   - `()` — the unit-`Ok` return widens to a genuine void return
-///     (`widen_unit_return_to_void`) and never materialises a payload field.
+///   - `()` — a unit-only generic (`Option<()>`, `Result<(), ()>`) has
+///     no materialised Ok payload (`widen_unit_return_to_void`). A mixed
+///     `Result<(), E>` still suffixes when `E` splits, so the Err
+///     payload does not share a ClassDef with a sibling `E`
+///     (`native_result` `map_err`, `exceptiontransform.py` unit_ok).
 ///   - `""` — a degenerate/absent type-arg that would render a malformed
 ///     `<>` suffix.
 fn type_arg_splits_per_instantiation(arg: &str) -> bool {
@@ -65753,14 +66329,28 @@ fn type_arg_splits_per_instantiation(arg: &str) -> bool {
     !DEFERRED.contains(&arg)
 }
 
+/// `<…>` spelling for an enum instantiation, or `None` when no type
+/// argument justifies a split. Deferred atoms (`()`, `f32`) stay in the
+/// spelling so `Result<(), PyError>` and `Result<(), (i32, String)>`
+/// do not share `Result::Err.__pos_0` (`native_result` Tuple ∪ OsError).
+fn enum_instantiation_suffix_from_args(type_args: &[String]) -> Option<String> {
+    if type_args.is_empty()
+        || !type_args
+            .iter()
+            .any(|a| type_arg_splits_per_instantiation(a))
+    {
+        return None;
+    }
+    Some(format!("<{}>", type_args.join(",")))
+}
+
 /// The `<…>` generic-argument suffix of an `AggregateKind::Adt` /
 /// type-node head (`<Tuple>` for a `Result<Tuple, PyError>`
 /// instantiation), or `None` when the head is not a reference-payload
 /// `enum` instantiation.  Returned `Some` only when the head names an
-/// `enum` (struct generics keep collapsing to their flat classdef) whose
-/// every type-argument [`type_arg_splits_per_instantiation`] — the scope
-/// under which the per-instantiation variant class carries a sound payload
-/// repr.  Every projection site (receiver type,
+/// `enum` (struct generics keep collapsing to their flat classdef) and
+/// [`enum_instantiation_suffix_from_args`] accepts the rendered
+/// type-arguments.  Every projection site (receiver type,
 /// variant constructor, variant field read, numbering pre-scan) routes
 /// through this one predicate so they all agree on which instantiations
 /// split and how they spell the suffix.
@@ -65781,15 +66371,7 @@ pub(crate) fn adt_head_instantiation_suffix(
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
         return None;
     }
-    let type_args = render_adt_type_args(adt, llbc, 0);
-    if type_args.is_empty()
-        || !type_args
-            .iter()
-            .all(|a| type_arg_splits_per_instantiation(a))
-    {
-        return None;
-    }
-    Some(format!("<{}>", type_args.join(",")))
+    enum_instantiation_suffix_from_args(&render_adt_type_args(adt, llbc, 0))
 }
 
 /// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).
@@ -72506,6 +73088,28 @@ fn is_slice_to_vec(segments: &[String]) -> bool {
         if a == "alloc" && b == "slice" && c == "<Impl>" && d == "to_vec")
 }
 
+/// `core::slice::from_ref` / `from_mut` and the `raw` / `<Impl>`
+/// spellings. rustc `slice::from_ref` is `from_raw_parts(s, 1)`.
+fn is_slice_from_ref_path(segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    if leaf != "from_ref" && leaf != "from_mut" {
+        return false;
+    }
+    let Some(first) = segments.first() else {
+        return false;
+    };
+    (first == "core" || first == "std") && segments.iter().any(|s| s == "slice")
+}
+
+fn is_slice_from_ref_name(name: &str) -> bool {
+    let leaf = name.rsplit("::").next().unwrap_or(name);
+    (leaf == "from_ref" || leaf == "from_mut")
+        && name.contains("::slice::")
+        && (name.starts_with("core::") || name.starts_with("std::"))
+}
+
 fn is_vec_extend_segments(segments: &[String]) -> bool {
     segments == ["vec", "Vec", "extend"]
 }
@@ -72702,6 +73306,29 @@ fn tyref_option_pair_slice_item_kind(
 /// spellings): the length-prefixed object array, one GcArray word.
 fn tyref_is_object_pointer_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_object_pointer_slice_mutability(ty, llbc).is_some()
+}
+
+/// `&T` whose pointee is a `PyObject` pointer — the argument of
+/// `slice::from_ref` that becomes `newlist(x)`.
+fn tyref_is_shared_ref_to_object_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    let Some(arr) = node.get("Ref").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let Some(kind) = arr.get(2).and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if kind != "Shared" && kind != "Const" {
+        return false;
+    }
+    let Some(pointee) = arr.get(1) else {
+        return false;
+    };
+    let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+    json_ty_is_objectptr(pointee, llbc)
+        || object_pointer_item_spelling(&charon_type_value_to_ast_string(pointee, llbc, 0))
 }
 
 /// Mutability of an object-pointer slice: `"Shared"` / `"Const"` for
@@ -74796,27 +75423,80 @@ fn fmt_value_renders_via_rstr(
     ) || matches!(ty, ValueType::Ref(Some(root)) if root.as_str() == "String")
 }
 
+/// `{name:?}` of a string-family value is Display plus quotes
+/// (`Debug for str` / `Debug for String`). Integers and bools share
+/// Display; fieldless enums stay with `collapse_debug_enum_fmt_chains`.
+fn fmt_value_is_rstr_string(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    use crate::model::{OpKind, ValueType};
+    let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    let ty = match &op.kind {
+        OpKind::ConstStr(_) | OpKind::ConstInternedStr(_) => return true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. } => ty,
+        _ => return false,
+    };
+    matches!(ty, ValueType::Str)
+        || matches!(ty, ValueType::Ref(Some(root)) if root.as_str() == "String")
+}
+
+fn quote_debug_string_pieces(pieces: &mut Vec<String>) {
+    if pieces.is_empty() {
+        pieces.push(String::new());
+        pieces.push(String::new());
+    }
+    pieces[0].push_str("\"");
+    if pieces.len() == 1 {
+        pieces.push("\"".to_string());
+    } else {
+        pieces[1].insert_str(0, "\"");
+    }
+}
+
 /// Recognize the single-argument `Display` `format!` chain terminating at
 /// the `alloc::fmt::format` op `(bf, fi)` and collect the rewrite plan, or
 /// `None` for any shape outside the recognized subset so the collapse
 /// leaves the graph untouched.
 fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option<FmtCollapse> {
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
-    if nav.kind != FmtArgKind::Display || !nav.placeholder.is_default() {
-        // `str(value)` renders Display; `{:?}` Debug has no native rstr
-        // counterpart, so leave a Debug chain to `collapse_debug_enum_fmt_chains`.
+    if !nav.placeholder.is_default() {
         return None;
     }
-    // `str` + `ll_strconcat` consume rstr `STR` (or an int `ll_int2dec`).
-    // A rust-heap `String` interpolant is included: collapse emits
-    // `str(value)` first so the concat operands are rstr `STR`.
-    if !fmt_value_renders_via_rstr(graph, &nav.context) {
-        return None;
+    let mut pieces = nav.pieces;
+    match nav.kind {
+        FmtArgKind::Display => {
+            // `str` + `ll_strconcat` consume rstr `STR` (or an int `ll_int2dec`).
+            // A rust-heap `String` interpolant is included: collapse emits
+            // `str(value)` first so the concat operands are rstr `STR`.
+            if !fmt_value_renders_via_rstr(graph, &nav.context) {
+                return None;
+            }
+        }
+        FmtArgKind::Debug => {
+            if !fmt_value_is_rstr_string(graph, &nav.context) {
+                return None;
+            }
+            quote_debug_string_pieces(&mut pieces);
+        }
+        FmtArgKind::LowerHex => return None,
     }
     Some(FmtCollapse {
         format_block: bf,
         format_result: nav.format_result.id(),
-        pieces: nav.pieces,
+        pieces,
         link_rewrites: nav.link_rewrites,
         dead_results: nav.dead_results,
         dead_bases: nav.dead_bases,
@@ -79778,6 +80458,34 @@ mod tests {
     }
 
     #[test]
+    fn enum_suffix_keeps_unit_ok_when_err_splits() {
+        use super::enum_instantiation_suffix_from_args;
+        // `Result<(), PyError>` vs `Result<(), (i32, String)>` must not
+        // share `Result::Err.__pos_0` (`native_result` `map_err`).
+        assert_eq!(
+            enum_instantiation_suffix_from_args(&["()".into(), "OsError".into()]).as_deref(),
+            Some("<(),OsError>")
+        );
+        assert_eq!(
+            enum_instantiation_suffix_from_args(&["()".into(), "(i32, String)".into()]).as_deref(),
+            Some("<(),(i32, String)>")
+        );
+        assert_eq!(
+            enum_instantiation_suffix_from_args(&["i64".into(), "OsError".into()]).as_deref(),
+            Some("<i64,OsError>")
+        );
+        assert_eq!(
+            enum_instantiation_suffix_from_args(&["()".into(), "()".into()]),
+            None
+        );
+        assert_eq!(
+            enum_instantiation_suffix_from_args(&["f32".into(), "f32".into()]),
+            None
+        );
+        assert_eq!(enum_instantiation_suffix_from_args(&["()".into()]), None);
+    }
+
+    #[test]
     fn named_const_harvest_scopes_defining_crate_folds() {
         use super::OpKind;
         let mut folds = std::collections::HashMap::new();
@@ -81630,6 +82338,208 @@ mod tests {
         assert_eq!(b0_exit.args[0].as_variable().unwrap().id(), ctx.id());
         let bp_exit = &bp_block.exits[0];
         assert_eq!(bp_exit.args[0].as_variable().unwrap().id(), arg_in.id());
+    }
+
+    #[test]
+    fn collapse_fmt_chains_quotes_debug_of_str() {
+        use super::collapse_fmt_chains;
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+            ValueType,
+        };
+
+        // `format!("hi{:?}", name)` — Debug of a string-family value is
+        // Display plus quotes (`Debug for str`).
+        let mut graph = FunctionGraph::new("fmt_collapse_debug_str");
+        let b0 = graph.create_block();
+        let bp = graph.create_block();
+        let bf = graph.create_block();
+        let bret = graph.create_block();
+
+        let ctx = Variable::new();
+        graph.block_mut(b0).inputargs = vec![ctx.clone()];
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(ctx.clone()),
+            kind: OpKind::Input {
+                name: "ctx".into(),
+                ty: ValueType::Str,
+                class_root: None,
+            },
+        });
+        let tuple = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(tuple.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Tuple"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Tuple".to_string())),
+            },
+        });
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: tuple.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                value: LinkArg::Value(ctx.clone()),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let arg_ref = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(arg_ref.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple,
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        let new_debug = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(new_debug.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["fmt", "rt", "Argument", "new_debug"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![arg_ref]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let arg_in = Variable::new();
+        graph.block_mut(bp).inputargs = vec![arg_in.clone()];
+        graph.block_mut(b0).exits =
+            vec![Link::from_variables(&graph, vec![new_debug], bp, None).with_prevblock(b0)];
+
+        let args_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(args_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Array"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: args_arr.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
+                value: LinkArg::Value(arg_in.clone()),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let pieces_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(pieces_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Array"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        for (i, byte) in [2i64, 104, 105, 0xC0, 0].iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*byte),
+            });
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: pieces_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        let fmt_args = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(fmt_args.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["fmt", "Arguments", "new"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![pieces_arr, args_arr]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let fmt_args_in = Variable::new();
+        graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
+        graph.block_mut(bp).exits =
+            vec![Link::from_variables(&graph, vec![fmt_args], bf, None).with_prevblock(bp)];
+
+        let formatted = Variable::new();
+        graph.block_mut(bf).operations.push(SpaceOperation {
+            result: Some(formatted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["alloc", "fmt", "format"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![fmt_args_in.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let ret = Variable::new();
+        graph.block_mut(bret).inputargs = vec![ret];
+        graph.block_mut(bf).exits = vec![
+            Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf),
+        ];
+
+        collapse_fmt_chains(&mut graph);
+
+        let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
+        assert_eq!(bf_block.operations.len(), 5);
+        match &bf_block.operations[0].kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                assert_eq!(
+                    segments,
+                    &vec!["__str_const".to_string(), "hi\"".to_string()]
+                );
+            }
+            other => panic!("Bf op[0] not a quoted prefix __str_const: {other:?}"),
+        }
+        match &bf_block.operations[1].kind {
+            OpKind::UnaryOp { op, .. } => assert_eq!(op, "str"),
+            other => panic!("Bf op[1] not a str UnaryOp: {other:?}"),
+        }
+        match &bf_block.operations[2].kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                assert_eq!(segments, &vec!["__str_const".to_string(), "\"".to_string()]);
+            }
+            other => panic!("Bf op[2] not a quote __str_const: {other:?}"),
+        }
+        match &bf_block.operations[3].kind {
+            OpKind::BinOp { op, .. } => assert_eq!(op, "add"),
+            other => panic!("Bf op[3] not an add BinOp: {other:?}"),
+        }
+        match &bf_block.operations[4].kind {
+            OpKind::BinOp { op, .. } => assert_eq!(op, "add"),
+            other => panic!("Bf op[4] not an add BinOp: {other:?}"),
+        }
+        assert_eq!(
+            bf_block.operations[4].result.as_ref().unwrap().id(),
+            formatted.id()
+        );
     }
 
     /// Build the `alloc::fmt::format` block shape a fieldless-enum `{:?}`
@@ -83842,6 +84752,52 @@ mod tests {
                 "{fname}: Result discriminant must remain runtime data"
             );
         }
+    }
+
+    /// `w_range_iter` keeps the word iterator only when
+    /// `start + length * step` still fits i64 (`i64::try_from(i128)`).
+    /// That shell is the same checked Result `c_int_w` writes, with
+    /// `longlongmask` on the Ok payload (`rbuiltin.py`).
+    #[test]
+    fn w_range_iter_i128_try_from_lowers_to_checked_result() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = format!(
+            "{}/../../build/llbc/pyre-object.ullbc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let llbc = Llbc::load(path).unwrap_or_else(|e| panic!("load w_range_iter LLBC: {e}"));
+        let graph = super::lower_function(&llbc, "w_range_iter")
+            .unwrap_or_else(|e| panic!("lower w_range_iter: {e:?}"));
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if super::fmt_path_ends_with(
+                        segments,
+                        &["convert", "num", "<Impl>", "try_from"],
+                    ))
+            }),
+            "w_range_iter: i128 try_from must not remain an opaque core call"
+        );
+        for expected in ["lt", "gt", "or"] {
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == expected) }),
+                "w_range_iter: missing checked-narrowing {expected} op"
+            );
+        }
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("longlongmask"))
+            }),
+            "w_range_iter: Ok payload must go through longlongmask"
+        );
     }
 
     /// Minimal `Llbc` carrying only `trait_impls` — the surface
@@ -87282,6 +88238,10 @@ mod tests {
         ] {
             assert_eq!(super::rust_vec_std_leaf(&p), Some("new"), "{p:?}");
         }
+        assert_eq!(
+            super::rust_vec_std_leaf(&path(&["vec", "Vec", "try_reserve_exact"])),
+            Some("try_reserve_exact")
+        );
         for p in [
             path(&["alloc", "boxed", "<Impl>", "new"]),
             path(&["vec", "VecDeque", "new"]),
@@ -88086,6 +89046,215 @@ mod tests {
     }
 
     #[test]
+    fn slice_from_ref_of_an_object_pointer_is_newlist() {
+        let generics = || {
+            serde_json::json!({
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            })
+        };
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path.iter().map(|segment| serde_json::json!({"Ident": [segment, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let named = |path: &[&str], def_id: u64| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(path, false),
+                "kind": {"Struct": []}
+            })
+        };
+        let obj_adt = serde_json::json!({"Adt": {"id": 0, "generics": generics()}});
+        let objptr = serde_json::json!({"RawPtr": [obj_adt, "Mut"]});
+        let obj_ref = serde_json::json!({"Ref": ["_", objptr.clone(), "Shared"]});
+        let slice_ref = serde_json::json!({
+            "Ref": ["_", {"Slice": [objptr.clone(), null]}, "Shared"]
+        });
+        let unit = serde_json::json!({
+            "Adt": {"id": 1, "builtin": "Tuple", "generics": generics()}
+        });
+        let place =
+            |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "span": span(), "comments_before": []});
+        let assign = |dest: u64, dest_ty: &serde_json::Value, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest, dest_ty), rvalue]}))
+        };
+        let mv = |i: u64, ty: &serde_json::Value| serde_json::json!({"Move": place(i, ty)});
+        let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": place(i, ty)});
+        let call = |fun: u64,
+                    args: serde_json::Value,
+                    dest: u64,
+                    dest_ty: &serde_json::Value,
+                    target: u64| {
+            serde_json::json!({"Call": {"call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": fun},
+                    "generics": generics()
+                }},
+                "args": args,
+                "dest": {"kind": {"Local": dest}, "ty": dest_ty}
+            }, "target": target, "on_unwind": 1}})
+        };
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "pass_object_from_ref"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [objptr.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            local(0, &unit),
+                            local(1, &objptr),
+                            local(2, &obj_ref),
+                            local(3, &slice_ref)
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [
+                                assign(2, &obj_ref, serde_json::json!({
+                                    "Ref": {
+                                        "place": place(1, &objptr),
+                                        "kind": "Shared",
+                                        "ptr_metadata": null
+                                    }
+                                }))
+                            ],
+                            "terminator": {
+                                "span": span(),
+                                "kind": call(1, serde_json::json!([mv(2, &obj_ref)]), 3, &slice_ref, 2)
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": call(2, serde_json::json!([copy(3, &slice_ref)]), 0, &unit, 3)
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let from_ref = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["core", "slice", "raw", "from_ref"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [obj_ref],
+                "output": slice_ref.clone()
+            },
+            "body": "Opaque"
+        });
+        let callee = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "take_object_slice"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [slice_ref],
+                "output": unit
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [named(&["PyObject"], 0)],
+                "fun_decls": [caller, from_ref, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc =
+            Llbc::from_slice(file.to_string().as_bytes()).expect("object from_ref fixture parses");
+        let graph = super::lower_function(&llbc, "pass_object_from_ref")
+            .expect("lower slice::from_ref of a PyObjectRef");
+        let ops = graph_ops(&graph);
+        let newlist = ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::NewList { args } if args.len() == 1));
+        let Some(newlist) = newlist else {
+            panic!("slice::from_ref of a GC pointer must become newlist; ops={ops:?}");
+        };
+        let list = newlist
+            .result
+            .as_ref()
+            .expect("newlist produces a value")
+            .clone();
+        let passed_to_callee = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("take_object_slice")
+                    && args.iter().any(|arg| arg.as_variable() == Some(&list))
+            )
+        });
+        // `from_ref` is a Call terminator, so the slice consumer lives
+        // in the successor. The NewList result is the Goto argument
+        // (`flowspace/model.py` `Link.args`); the callee reads the
+        // successor's `inputargs` slot.
+        let passed_across_edge = graph.blocks.iter().any(|block| {
+            block
+                .exits
+                .iter()
+                .any(|link| link.args.iter().any(|arg| arg.as_variable() == Some(&list)))
+        });
+        assert!(
+            passed_to_callee || passed_across_edge,
+            "the slice parameter must receive the newlist; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("from_ref")
+            )),
+            "from_ref must not remain residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
     fn an_object_array_literal_unsize_mut_is_not_newlist() {
         let generics = || {
             serde_json::json!({
@@ -88836,6 +90005,72 @@ mod tests {
         )
     }
 
+    /// `BuildHasherDefault<H>` is Opaque in std LLBC and has no layout.
+    /// RPython `RDict` has no hasher field (`rordereddict.py`).
+    #[test]
+    fn build_hasher_default_without_layout_is_void_zst() {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": fixture_item_meta(ident_path(&["core", "hash", "BuildHasherDefault"])),
+                    "kind": "Opaque"
+                }],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "Value": [1, {
+                "Adt": {"id": 0, "generics": {"types": []}}
+            }]
+        }))
+        .expect("fixture TyRef parses");
+        assert!(
+            super::tyref_is_zero_sized(&ty, &llbc),
+            "Opaque BuildHasherDefault without layout is Void"
+        );
+        assert!(
+            super::tyref_is_void_zst(&ty, &llbc),
+            "hasher param / field is lltype.Void"
+        );
+    }
+
+    #[test]
+    fn empty_tuple_tyref_is_void() {
+        // `()` is `lltype.Void` (`history.py` `getkind`). Charon emits
+        // an empty Tuple ADT; intern as Void so `Result<(), E>` does
+        // not join Tuple ∪ OsError (`native_result`).
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+        }))
+        .expect("fixture TyRef parses");
+        assert!(super::is_unit_type(&ty, &llbc));
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            crate::model::ValueType::Void
+        );
+    }
+
     fn indexed_rows(rows: Vec<(u64, serde_json::Value)>) -> serde_json::Value {
         let max = rows.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
         let mut slots = vec![serde_json::Value::Null; max + 1];
@@ -89450,6 +90685,82 @@ mod tests {
         )]);
         assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
         assert_handle_class(&llbc, &ty, Some("Word"));
+    }
+
+    /// `celldict.py` `erase({})`: a by-value transparent newtype intern's
+    /// as the inner struct, so unique-graph `mergeinputargs` unifies the
+    /// wrapper with that operand (`rordereddict.rtype_len`).
+    #[test]
+    fn by_value_transparent_newtype_interns_as_inner_struct() {
+        let inner = {
+            let mut decl = struct_decl(1, ident_path(&["fixture", "RDict"]), i64_field(), false);
+            decl["layout"] = serde_json::json!([{
+                "key": "fixture-target",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"repr_algo": "Rust", "transparent": false}
+                }
+            }]);
+            decl
+        };
+        let wrapper_field = serde_json::json!([{
+            "name": null,
+            "ty": {"Adt": {"id": 1, "generics": {"types": []}}},
+            "attr_info": null
+        }]);
+        let wrapper = struct_decl(
+            2,
+            ident_path(&["fixture", "ModuleDictStorage"]),
+            wrapper_field,
+            true,
+        );
+        let alias = serde_json::json!({
+            "def_id": 3,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", "ModuleDictEntries"])),
+            "kind": {"Alias": {
+                "aliased_ty": {"Adt": {"id": 1, "generics": {"types": []}}}
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": indexed_rows(vec![(1, inner), (2, wrapper), (3, alias)]),
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let tomb = no_tombstoned_leaves();
+        let storage = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [2, {"Adt": {"id": 2, "generics": {"types": []}}}]
+        }))
+        .expect("storage TyRef parses");
+        let entries = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [3, {"Adt": {"id": 3, "generics": {"types": []}}}]
+        }))
+        .expect("entries TyRef parses");
+        let dict = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [1, {"Adt": {"id": 1, "generics": {"types": []}}}]
+        }))
+        .expect("dict TyRef parses");
+        assert_eq!(
+            super::tyref_class_root_with(&storage, &llbc, tomb).as_deref(),
+            Some("RDict")
+        );
+        assert_eq!(
+            super::tyref_class_root_with(&entries, &llbc, tomb).as_deref(),
+            Some("RDict")
+        );
+        assert_eq!(
+            super::tyref_class_root_with(&dict, &llbc, tomb).as_deref(),
+            Some("RDict")
+        );
     }
 
     /// A transparent wrapper of `*mut PyObject` stays the wrapper.
