@@ -35207,12 +35207,11 @@ mod tests {
             .lookup_chain_with_key(&profiled)
             .expect("profiled back-edge cell must carry a typed comparekey");
         let stored = cell
-            .comparekey
-            .borrow()
-            .clone()
+            .greens
+            .as_deref()
             .expect("the installed cell must store a comparekey");
         assert_eq!(
-            stored.values[1], 1,
+            stored[1], 1,
             "the profiled green must survive into the cell's comparekey"
         );
     }
@@ -36083,7 +36082,7 @@ mod loop_side_table_tests {
         }
     }
 
-    fn rejecting_confirm_enter_jit(_key: &majit_ir::GreenKey) -> bool {
+    fn rejecting_confirm_enter_jit(_greenargs: &[i64]) -> bool {
         false
     }
 

@@ -1070,29 +1070,38 @@ pub struct RetainedGreens {
 }
 
 impl RetainedGreens {
-    /// Retain every non-null `Ref` green in `key`.  A null slot is skipped:
-    /// `hash_whatever` already folds null to 0 and there is nothing to own.
-    pub fn retain(key: &GreenKey) -> Self {
+    /// Retain every non-null `Ref` green in `values`/`types`.  A null slot is
+    /// skipped: `hash_whatever` already folds null to 0 and there is nothing
+    /// to own.
+    pub fn retain_greenargs(values: &[i64], types: &[GreenType]) -> Self {
         let Some((retain, _, _)) = ref_hooks() else {
             return RetainedGreens::default();
         };
         let mut retained = Vec::new();
-        for (i, &value) in key.values.iter().enumerate() {
-            if key.types.get(i).copied().unwrap_or(GreenType::Int) == GreenType::Ref && value != 0 {
+        for (i, &value) in values.iter().enumerate() {
+            if types.get(i).copied().unwrap_or(GreenType::Int) == GreenType::Ref && value != 0 {
                 retained.push((i, retain(value)));
             }
         }
         RetainedGreens { retained }
     }
 
+    /// Retain every non-null `Ref` green in `key`.  A null slot is skipped:
+    /// `hash_whatever` already folds null to 0 and there is nothing to own.
+    pub fn retain(key: &GreenKey) -> Self {
+        Self::retain_greenargs(&key.values, &key.types)
+    }
+
     /// Number of referents this handle owns.  Feeds the pinned-population
     /// counter: the memory an unbounded cell table now holds live is exactly
     /// the sum of this over all cells, and it must be readable rather than
     /// showing up only as RSS.
+    #[inline]
     pub fn len(&self) -> usize {
         self.retained.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.retained.is_empty()
     }
@@ -1103,6 +1112,7 @@ impl RetainedGreens {
     /// collector rewrites that field. Pyre's cell is Rust-owned; the frontend
     /// root slot is the corresponding owning field and this read supplies its
     /// forwarded value to `JitCell.comparekey`.
+    #[inline]
     pub fn current_value(&self, green_index: usize, fallback: i64) -> i64 {
         let Some((_, handle)) = self
             .retained

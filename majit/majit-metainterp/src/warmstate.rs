@@ -146,27 +146,12 @@ pub struct BaseJitCell {
     ///
     /// Meaningless while `cell_key` is `None`, and read only beside it.
     pub cell_bucket: Cell<u64>,
-    /// warmstate.py `JitCell.__init__` stores the greens on every cell.
-    /// `comparekey` is `None` only between `BaseJitCell::new` and
-    /// `set_comparekey`; `install_new_cell` files no cell without it.
-    /// warmstate.py JitCell — typed green-key carried per-cell so
-    /// `JitCell.comparekey(*greenargs2)` can do per-green typed
-    /// equality across hash collisions:
-    ///
-    /// ```python
-    /// def comparekey(self, *greenargs2):
-    ///     i = 0
-    ///     for attrname, TYPE in green_args_name_spec:
-    ///         item1 = getattr(self, attrname)
-    ///         if not equal_whatever(TYPE, item1, greenargs2[i]):
-    ///             return False
-    ///         i = i + 1
-    ///     return True
-    /// ```
-    ///
-    /// Every installed cell stores one (`JitCell.__init__`). `None` only
-    /// before `set_comparekey`.
-    pub comparekey: RefCell<Option<GreenKey>>,
+    /// `JitCell.__init__` `setattr(self, 'g%d' % i, greenargs[i])`
+    /// (`make_jitcell_subclass`). Green values are plain fields, written
+    /// once in `__init__` and never reassigned. `None` is kept only for the
+    /// legacy hash-only cells that exist today (which upstream does not
+    /// have). Immutable after construction.
+    pub greens: Option<Box<[i64]>>,
     /// Owns the `Ref`-typed referents named by `comparekey`, for exactly this
     /// cell's lifetime — the `setattr` half of `JitCell.__init__`
     /// (warmstate.py), which pyre stored as a bare `i64` and so never
@@ -182,7 +167,7 @@ pub struct BaseJitCell {
     /// is a different and worse hazard, not a smaller one.
     ///
     /// Empty unless a frontend registered `majit_ir::set_ref_resolver`.
-    pub retained_greens: RefCell<RetainedGreens>,
+    pub retained_greens: RetainedGreens,
 }
 
 impl BaseJitCell {
@@ -192,7 +177,7 @@ impl BaseJitCell {
         Self::new_for_driver(0)
     }
 
-    /// `JitCell(*greenargs)` of the driver `jitdriver_sd`'s class.
+    /// Hash-only cell of the driver `jitdriver_sd`'s class (`greens: None`).
     pub(crate) fn new_for_driver(jitdriver_sd: usize) -> Self {
         BaseJitCell {
             jitdriver_sd,
@@ -205,53 +190,69 @@ impl BaseJitCell {
             next: RefCell::new(None),
             cell_key: Cell::new(None),
             cell_bucket: Cell::new(0),
-            comparekey: RefCell::new(None),
-            retained_greens: RefCell::new(RetainedGreens::default()),
+            greens: None,
+            retained_greens: RetainedGreens::default(),
         }
     }
 
-    /// Store `key` as this cell's `comparekey` **and** take ownership of the
-    /// `Ref` referents it names, in one statement.
-    ///
-    /// The two must not be set separately: a `comparekey` without its
-    /// `retained_greens` is exactly the defect this pairing exists to close —
-    /// a stored address the cell does not own. `comparekey` stays `pub` for
-    /// the fixtures that construct chains directly, so this is the invariant
-    /// by convention rather than by type; every production writer goes
-    /// through here.
-    pub fn set_comparekey(&self, key: &GreenKey) {
-        *self.retained_greens.borrow_mut() = RetainedGreens::retain(key);
-        *self.comparekey.borrow_mut() = Some(key.clone());
+    /// `JitCell(*greenargs)` of the driver `jitdriver_sd`'s class.
+    pub fn new_for_driver_with_greens(
+        jitdriver_sd: usize,
+        greenargs: &[i64],
+        types: &[GreenType],
+    ) -> Self {
+        BaseJitCell {
+            greens: Some(Box::from(greenargs)),
+            retained_greens: RetainedGreens::retain_greenargs(greenargs, types),
+            ..Self::new_for_driver(jitdriver_sd)
+        }
     }
 
-    /// warmstate.py `JitCell.comparekey(*greenargs2)`.
+    /// warmstate.py `JitCell.comparekey(*greenargs2)`:
     ///
-    /// Compares this cell's stored greens against values already in hand.
-    /// Builds nothing: the portal's greenargs stay on the stack.
-    /// Cells without a stored comparekey (legacy hash-only path)
-    /// always fail — callers opt in through
-    /// [`WarmEnterState::ensure_cell_for_key`].
+    /// ```python
+    /// def comparekey(self, *greenargs2):
+    ///     i = 0
+    ///     for attrname, TYPE in green_args_name_spec:
+    ///         item1 = getattr(self, attrname)
+    ///         if not equal_whatever(TYPE, item1, greenargs2[i]):
+    ///             return False
+    ///         i = i + 1
+    ///     return True
+    /// ```
+    ///
+    /// `types` is the caller's driver spec (`jitdriver_sd._green_args_spec`),
+    /// used only to pick `equal_whatever`'s TYPE. There is no types
+    /// comparison: every caller has already checked `cell.jitdriver_sd`
+    /// (`isinstance(cell, JitCell)`).
+    #[inline]
     pub fn comparekey(&self, greenargs: &[i64], types: &[GreenType]) -> bool {
-        let stored_key = RefCell::borrow(&self.comparekey);
-        let Some(stored) = stored_key.as_ref() else {
+        debug_assert_eq!(types.len(), greenargs.len());
+        let Some(greens) = self.greens.as_deref() else {
             return false;
         };
-        if stored.values.len() != greenargs.len() || stored.types.as_slice() != types {
+        if greens.len() != greenargs.len() {
             return false;
         }
-        for index in 0..stored.values.len() {
-            let stored_value = self
-                .retained_greens
-                .borrow()
-                .current_value(index, stored.values[index]);
-            if !majit_ir::equal_whatever(stored.types[index], stored_value, greenargs[index]) {
+        if self.retained_greens.is_empty() {
+            for i in 0..greens.len() {
+                if !majit_ir::equal_whatever(types[i], greens[i], greenargs[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        for i in 0..greens.len() {
+            let item1 = self.retained_greens.current_value(i, greens[i]);
+            if !majit_ir::equal_whatever(types[i], item1, greenargs[i]) {
                 return false;
             }
         }
         true
     }
 
-    /// `comparekey(*greenargs2)` against an owned [`GreenKey`].
+    /// Thin wrapper around [`Self::comparekey`] for a stored [`GreenKey`].
+    #[inline]
     pub fn comparekey_matches(&self, other: &GreenKey) -> bool {
         self.comparekey(&other.values, &other.types)
     }
@@ -765,13 +766,13 @@ pub struct WarmEnterState {
     ///
     /// `warmspot.py make_driverhook_graphs` builds this hook with
     /// `onlygreens=False`, so upstream passes every portal green and red.
-    /// This layer now supplies the structured [`GreenKey`], not its
-    /// irreversible hash. It still cannot supply reds: they remain owned by
+    /// This layer supplies the green values (`confirm_enter_jit(*args)`),
+    /// not a key object. It still cannot supply reds: they remain owned by
     /// the interpreter portal (`PyFrame` / execution context in pyre), while
     /// `WarmEnterState` owns only cells and counters. Exact argument parity
     /// therefore requires moving the hook boundary to the portal or threading
     /// an interpreter-defined red-argument carrier into every policy call.
-    confirm_enter_jit_ptr: Rc<Cell<Option<fn(&GreenKey) -> bool>>>,
+    confirm_enter_jit_ptr: Rc<Cell<Option<fn(&[i64]) -> bool>>>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -874,7 +875,7 @@ impl WarmEnterState {
     /// this the one position at which the hook fires exactly once per start,
     /// which is what upstream gets by having a single `bound_reached`.
     fn start_tracing_cell(&mut self, cell_key: u64, green_key: Option<&GreenKey>) -> HotResult {
-        if !self.confirm_enter_jit_if_available(green_key) {
+        if !self.confirm_enter_jit_if_available(green_key.map(|k| k.values.as_slice())) {
             return HotResult::NotHot;
         }
         self.counter.reset(self.bucket_of(cell_key));
@@ -1060,7 +1061,7 @@ impl WarmEnterState {
                 // interpreting rather than entering the machine code. The
                 // matched typed cell retains the structured greens, so the
                 // hash compatibility door can still call the hook for real.
-                if !self.confirm_enter_jit_if_available(cell.comparekey.borrow().as_ref()) {
+                if !self.confirm_enter_jit_if_available(cell.greens.as_deref()) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -1205,7 +1206,7 @@ impl WarmEnterState {
                 if has_compiled_meta(cell_key) {
                     // warmstate.py:501 — see `maybe_compile_decision`, whose
                     // position this is the typed twin of.
-                    if !self.confirm_enter_jit(key) {
+                    if !self.confirm_enter_jit(&key.values) {
                         return HotResult::NotHot;
                     }
                     return HotResult::RunCompiled;
@@ -1277,7 +1278,7 @@ impl WarmEnterState {
         let hash = key.get_uhash();
         // `warmstate.py:427` — see `start_tracing_cell`, whose position this
         // is the typed twin of.
-        if !self.confirm_enter_jit(key) {
+        if !self.confirm_enter_jit(&key.values) {
             return HotResult::NotHot;
         }
         self.counter.reset(hash);
@@ -1325,7 +1326,7 @@ impl WarmEnterState {
             if cell.is_compiled() {
                 // A typed cell retains the structured greens even when this
                 // compatibility entry point was called with its hash.
-                if !self.confirm_enter_jit_if_available(cell.comparekey.borrow().as_ref()) {
+                if !self.confirm_enter_jit_if_available(cell.greens.as_deref()) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -1368,7 +1369,7 @@ impl WarmEnterState {
     pub fn force_start_tracing_for_key(&mut self, key: &GreenKey) -> HotResult {
         if let Some(cell) = self.lookup_chain_with_key(key) {
             if cell.is_compiled() {
-                if !self.confirm_enter_jit(key) {
+                if !self.confirm_enter_jit(&key.values) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -2098,7 +2099,7 @@ impl WarmEnterState {
                 .filter(|token| token.has_compiled_code())
                 && has_compiled_meta()
             {
-                if !self.confirm_enter_jit_if_available(green_key) {
+                if !self.confirm_enter_jit_if_available(green_key.map(|k| k.values.as_slice())) {
                     return FunctionEntryStep::NotHot;
                 }
                 return FunctionEntryStep::RunCompiled(token);
@@ -2515,10 +2516,10 @@ impl WarmEnterState {
     /// [`Self::start_tracing_cell_for_key`] here, and `warmstate.py`
     /// before entering already-compiled machine code.
     #[inline]
-    pub fn confirm_enter_jit(&self, green_key: &GreenKey) -> bool {
+    pub fn confirm_enter_jit(&self, greenargs: &[i64]) -> bool {
         match self.confirm_enter_jit_ptr.get() {
             None => true,
-            Some(hook) => hook(green_key),
+            Some(hook) => hook(greenargs),
         }
     }
 
@@ -2536,10 +2537,10 @@ impl WarmEnterState {
     /// those callers (the production pyre doors already supply raw `(code,
     /// pc)` and take the typed path whenever a hook is installed).
     #[inline]
-    fn confirm_enter_jit_if_available(&self, green_key: Option<&GreenKey>) -> bool {
-        match (self.confirm_enter_jit_ptr.get(), green_key) {
+    fn confirm_enter_jit_if_available(&self, greenargs: Option<&[i64]>) -> bool {
+        match (self.confirm_enter_jit_ptr.get(), greenargs) {
             (None, _) => true,
-            (Some(hook), Some(key)) => hook(key),
+            (Some(hook), Some(values)) => hook(values),
             (Some(_), None) => {
                 crate::mc_diag_bump(95); // confirm_enter_jit_missing_key
                 false
@@ -2557,8 +2558,7 @@ impl WarmEnterState {
             return true;
         }
         let cell = self.cell_by_key(cell_key);
-        let green_key = cell.as_ref().map(|cell| cell.comparekey.borrow());
-        self.confirm_enter_jit_if_available(green_key.as_deref().and_then(Option::as_ref))
+        self.confirm_enter_jit_if_available(cell.as_ref().and_then(|cell| cell.greens.as_deref()))
     }
 
     /// `warmspot.py` `make_driverhook_graphs` —
@@ -2567,7 +2567,7 @@ impl WarmEnterState {
     /// Upstream builds the pointer from the `JitDriver` declaration; nothing
     /// below the declaration can know what it said, so an interpreter installs
     /// its own here. `None` restores the no-hook default.
-    pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(&GreenKey) -> bool>) {
+    pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(&[i64]) -> bool>) {
         self.confirm_enter_jit_ptr.set(hook);
     }
 
@@ -2581,7 +2581,7 @@ impl WarmEnterState {
 
     /// The `make_entry_point` capture of `confirm_enter_jit`. `JitDriver`
     /// holds another handle to this same cell.
-    pub(crate) fn confirm_enter_jit_handle(&self) -> Rc<Cell<Option<fn(&GreenKey) -> bool>>> {
+    pub(crate) fn confirm_enter_jit_handle(&self) -> Rc<Cell<Option<fn(&[i64]) -> bool>>> {
         Rc::clone(&self.confirm_enter_jit_ptr)
     }
 
@@ -2729,7 +2729,7 @@ impl WarmEnterState {
         let mut stats = JitStats::default();
         self.counter.for_each_cell(|cell| {
             stats.num_cells += 1;
-            stats.num_pinned_refs += cell.retained_greens.borrow().len();
+            stats.num_pinned_refs += cell.retained_greens.len();
             let invalidated = cell
                 .loop_token
                 .borrow()
@@ -3220,8 +3220,8 @@ impl WarmEnterState {
         {
             return;
         }
-        let newcell = BaseJitCell::new_for_driver(self.jitdriver_sd);
-        newcell.set_comparekey(key);
+        let newcell =
+            BaseJitCell::new_for_driver_with_greens(self.jitdriver_sd, &key.values, &key.types);
         self.install_new_cell(key.get_uhash(), Some(newcell));
     }
 }
@@ -5085,13 +5085,13 @@ mod tests {
     /// Cells without a comparekey (legacy hash-only path) always fail.
     #[test]
     fn comparekey_matches_only_with_stored_key() {
-        let mut cell = BaseJitCell::new();
+        let cell = BaseJitCell::new();
         let key = GreenKey::new(vec![1, 2, 3]);
         assert!(
             !cell.comparekey_matches(&key),
             "cell without comparekey must not match"
         );
-        *cell.comparekey.borrow_mut() = Some(key.clone());
+        let cell = BaseJitCell::new_for_driver_with_greens(0, &key.values, &key.types);
         assert!(
             cell.comparekey_matches(&key),
             "cell with stored comparekey must match equal probe"
@@ -5240,11 +5240,8 @@ mod tests {
             .lookup_chain_with_key(&key)
             .expect("ensure must install a cell");
         assert_eq!(
-            cell.comparekey
-                .borrow()
-                .as_ref()
-                .expect("comparekey populated"),
-            &key,
+            cell.greens.as_deref().expect("comparekey populated"),
+            &key.values[..],
             "stored comparekey must equal the install key"
         );
     }
@@ -5283,8 +5280,8 @@ mod tests {
             "typed form must set DONT_TRACE_HERE"
         );
         assert_eq!(
-            typed_cell.comparekey.borrow().as_ref(),
-            Some(&key),
+            typed_cell.greens.as_deref(),
+            Some(&key.values[..]),
             "typed form must store the greens it was called with"
         );
 
@@ -5301,7 +5298,7 @@ mod tests {
             "hash form must set DONT_TRACE_HERE — the flag is not the delta"
         );
         assert!(
-            hashed_cell.comparekey.borrow().is_none(),
+            hashed_cell.greens.is_none(),
             "hash form has no greens to store; if this ever becomes Some, the \
              typed/hash split has been closed somewhere else and this test is \
              the wrong guard"
@@ -5330,11 +5327,14 @@ mod tests {
         // install. Stays at the back of the chain after the second
         // install per install_new_cell's "prepend new cell, fold
         // existing keepable cells in front" semantics.
-        let mut cell_first = BaseJitCell::new();
+        let cell_first = BaseJitCell::new_for_driver_with_greens(
+            0,
+            &key_head_after_chain.values,
+            &key_head_after_chain.types,
+        );
         cell_first
             .flags
             .set(cell_first.flags.get() | (JcFlags::JC_TRACING));
-        *cell_first.comparekey.borrow_mut() = Some(key_head_after_chain.clone());
         ws.install_new_cell(bucket, Some(cell_first));
         // Second install — keep predicate doesn't matter for this one,
         // it lands as `keep` and the prior head folds in front, so the
@@ -5342,19 +5342,19 @@ mod tests {
         // Wait — install_new_cell folds the EXISTING chain in front of
         // `keep`. So after the second install: head=cell_first (the
         // existing one, since !should_remove), head.next=cell_chained.
-        let mut cell_chained = BaseJitCell::new();
-        *cell_chained.comparekey.borrow_mut() = Some(key_chained.clone());
+        let cell_chained =
+            BaseJitCell::new_for_driver_with_greens(0, &key_chained.values, &key_chained.types);
         ws.install_new_cell(bucket, Some(cell_chained));
 
         let head = ws
             .lookup_chain(bucket)
             .expect("bucket head exists after install");
         assert_eq!(
-            head.comparekey.borrow().as_ref(),
-            Some(&key_head_after_chain)
+            head.greens.as_deref(),
+            Some(&key_head_after_chain.values[..])
         );
         let next = head.next.borrow().clone().expect("chain has a second cell");
-        assert_eq!(next.comparekey.borrow().as_ref(), Some(&key_chained));
+        assert_eq!(next.greens.as_deref(), Some(&key_chained.values[..]));
 
         // Fast path: lookup_chain_with_key(key_head_after_chain) finds
         // the head's comparekey on first probe.
@@ -5362,8 +5362,8 @@ mod tests {
             .lookup_chain_with_key(&key_head_after_chain)
             .expect("walker must find chain head via comparekey");
         assert_eq!(
-            hit_head.comparekey.borrow().as_ref(),
-            Some(&key_head_after_chain)
+            hit_head.greens.as_deref(),
+            Some(&key_head_after_chain.values[..])
         );
     }
 
@@ -5484,17 +5484,15 @@ mod tests {
     fn chain_decoy_then_target(target: &GreenKey, decoy: &GreenKey) -> WarmEnterState {
         let mut ws = WarmEnterState::new(100);
         let bucket = target.get_uhash();
-        let mut decoy_cell = BaseJitCell::new();
+        let decoy_cell = BaseJitCell::new_for_driver_with_greens(0, &decoy.values, &decoy.types);
         decoy_cell
             .flags
             .set(decoy_cell.flags.get() | (JcFlags::JC_TRACING));
-        *decoy_cell.comparekey.borrow_mut() = Some(decoy.clone());
         ws.install_new_cell(bucket, Some(decoy_cell));
-        let mut target_cell = BaseJitCell::new();
+        let target_cell = BaseJitCell::new_for_driver_with_greens(0, &target.values, &target.types);
         target_cell
             .flags
             .set(target_cell.flags.get() | (JcFlags::JC_TRACING));
-        *target_cell.comparekey.borrow_mut() = Some(target.clone());
         ws.install_new_cell(bucket, Some(target_cell));
         ws
     }
@@ -5506,7 +5504,7 @@ mod tests {
         let mut ws = chain_decoy_then_target(&target, &decoy);
         ws.finish_tracing_for_key(&target);
         let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
-        assert_eq!(head.comparekey.borrow().as_ref(), Some(&decoy));
+        assert_eq!(head.greens.as_deref(), Some(&decoy.values[..]));
         assert!(
             head.flags.get().contains(JcFlags::JC_TRACING),
             "decoy head untouched"
@@ -5516,7 +5514,7 @@ mod tests {
             .borrow()
             .clone()
             .expect("target chained behind decoy");
-        assert_eq!(hit.comparekey.borrow().as_ref(), Some(&target));
+        assert_eq!(hit.greens.as_deref(), Some(&target.values[..]));
         assert!(
             !hit.flags.get().contains(JcFlags::JC_TRACING),
             "target TRACING cleared"
@@ -5761,7 +5759,7 @@ mod tests {
     /// the veto is what the answer turns on here.
     #[test]
     fn a_confirm_enter_jit_veto_stops_the_tracing_start() {
-        fn refuse(_green_key: &GreenKey) -> bool {
+        fn refuse(_greenargs: &[i64]) -> bool {
             false
         }
         let mut ws = WarmEnterState::new(3);
@@ -5787,9 +5785,9 @@ mod tests {
     fn the_confirm_enter_jit_hook_can_inspect_the_greens() {
         static FIRST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
         static SECOND: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-        fn refuse(key: &GreenKey) -> bool {
-            FIRST.store(key.values[0], std::sync::atomic::Ordering::Relaxed);
-            SECOND.store(key.values[1], std::sync::atomic::Ordering::Relaxed);
+        fn refuse(greenargs: &[i64]) -> bool {
+            FIRST.store(greenargs[0], std::sync::atomic::Ordering::Relaxed);
+            SECOND.store(greenargs[1], std::sync::atomic::Ordering::Relaxed);
             false
         }
 
@@ -5806,7 +5804,7 @@ mod tests {
     /// procedure token and `raise EnterJitAssembler`.
     #[test]
     fn a_confirm_enter_jit_veto_stops_entry_into_compiled_code() {
-        fn refuse(_green_key: &GreenKey) -> bool {
+        fn refuse(_greenargs: &[i64]) -> bool {
             false
         }
         let mut ws = WarmEnterState::new(3);
@@ -5837,7 +5835,7 @@ mod tests {
     #[test]
     fn a_permissive_confirm_enter_jit_preserves_hash_compiled_entry() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn allow(_green_key: &GreenKey) -> bool {
+        fn allow(_greenargs: &[i64]) -> bool {
             CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
@@ -5868,7 +5866,7 @@ mod tests {
     /// `NotHot` is the caller's instruction to keep interpreting the frame.
     #[test]
     fn a_confirm_enter_jit_veto_stops_the_function_entry_door() {
-        fn refuse(_green_key: &GreenKey) -> bool {
+        fn refuse(_greenargs: &[i64]) -> bool {
             false
         }
         let mut ws = WarmEnterState::new(3);
@@ -5898,7 +5896,7 @@ mod tests {
     #[test]
     fn the_confirm_enter_jit_hook_fires_once_per_tracing_start() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn allow(_green_key: &GreenKey) -> bool {
+        fn allow(_greenargs: &[i64]) -> bool {
             CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
@@ -5935,8 +5933,8 @@ mod tests {
     #[test]
     fn no_declared_hook_confirms_every_entry() {
         let ws = WarmEnterState::new(3);
-        assert!(ws.confirm_enter_jit(&GreenKey::single(0)));
-        assert!(ws.confirm_enter_jit(&GreenKey::single(i64::MAX)));
+        assert!(ws.confirm_enter_jit(&[0]));
+        assert!(ws.confirm_enter_jit(&[i64::MAX]));
     }
 
     /// warmstate.py — typed variant of `maybe_compile_and_run`.
@@ -5978,8 +5976,8 @@ mod tests {
             .lookup_chain_with_key(&key)
             .expect("cell installed at threshold tick");
         assert_eq!(
-            cell.comparekey.borrow().as_ref(),
-            Some(&key),
+            cell.greens.as_deref(),
+            Some(&key.values[..]),
             "comparekey populated on lazy install (warmstate.py:438-439)",
         );
         assert!(cell.is_tracing(), "JC_TRACING flag set on threshold tick");
@@ -6010,9 +6008,8 @@ mod tests {
 
         // TRACING keeps the head non-removable so the second install chains
         // behind it rather than replacing it (counter.py install_new_cell).
-        let mut head = BaseJitCell::new();
+        let head = BaseJitCell::new_for_driver_with_greens(0, &key_head.values, &key_head.types);
         head.flags.set(head.flags.get() | (JcFlags::JC_TRACING));
-        *head.comparekey.borrow_mut() = Some(key_head.clone());
         ws.install_new_cell(bucket, Some(head));
 
         const CHAINED_TOKEN: i64 = 0x5EED_0003;
@@ -6020,9 +6017,8 @@ mod tests {
         // `alive_loops` is the token's only strong owner once the cell's
         // handle is weak (`warmstate.py:188`, `memmgr.py:9-14`).
         ws.memory_manager.keep_loop_alive(&chained_token);
-        let mut tail = BaseJitCell::new();
+        let tail = BaseJitCell::new_for_driver_with_greens(0, &key_tail.values, &key_tail.types);
         tail.flags.set(tail.flags.get() | (JcFlags::JC_TRACING));
-        *tail.comparekey.borrow_mut() = Some(key_tail.clone());
         *tail.loop_token.borrow_mut() = Some(std::sync::Arc::downgrade(&chained_token));
         ws.install_new_cell(bucket, Some(tail));
 
@@ -6098,15 +6094,13 @@ mod tests {
         // Pre-install A at B's bucket. JC_TRACING keeps A non-removable
         // (counter.py install_new_cell should_remove gate) so the next install
         // chains B behind A.
-        let mut cell_a = BaseJitCell::new();
+        let cell_a = BaseJitCell::new_for_driver_with_greens(0, &key_a.values, &key_a.types);
         cell_a.flags.set(cell_a.flags.get() | (JcFlags::JC_TRACING));
-        *cell_a.comparekey.borrow_mut() = Some(key_a.clone());
         ws.install_new_cell(bucket, Some(cell_a));
 
         // Install B at the same bucket. install_new_cell folds A in
         // front; resulting chain shape: head=A (TRACING) → tail=B.
-        let mut cell_b = BaseJitCell::new();
-        *cell_b.comparekey.borrow_mut() = Some(key_b.clone());
+        let cell_b = BaseJitCell::new_for_driver_with_greens(0, &key_b.values, &key_b.types);
         // A live token keeps B out of the tokenless `cleanup_chain` arm.
         let token_b = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.memory_manager.keep_loop_alive(&token_b);
@@ -6115,14 +6109,14 @@ mod tests {
 
         // Sanity — chain order matches the install_new_cell contract.
         let head = ws.lookup_chain(bucket).expect("bucket has a head");
-        assert_eq!(head.comparekey.borrow().as_ref(), Some(&key_a));
+        assert_eq!(head.greens.as_deref(), Some(&key_a.values[..]));
         assert!(head.is_tracing(), "head A carries the TRACING flag");
         let chained = head
             .next
             .borrow()
             .clone()
             .expect("chained tail exists after second install");
-        assert_eq!(chained.comparekey.borrow().as_ref(), Some(&key_b));
+        assert_eq!(chained.greens.as_deref(), Some(&key_b.values[..]));
         assert!(!chained.is_tracing(), "B is fresh");
 
         // Without the chain-walk fix, `maybe_compile_with_key(&key_b)`
@@ -6145,13 +6139,13 @@ mod tests {
             head_after.is_tracing(),
             "head A's TRACING flag must persist across maybe_compile_with_key(&key_b)",
         );
-        assert_eq!(head_after.comparekey.borrow().as_ref(), Some(&key_a));
+        assert_eq!(head_after.greens.as_deref(), Some(&key_a.values[..]));
         let chained_after = head_after
             .next
             .borrow()
             .clone()
             .expect("chained tail still present");
-        assert_eq!(chained_after.comparekey.borrow().as_ref(), Some(&key_b));
+        assert_eq!(chained_after.greens.as_deref(), Some(&key_b.values[..]));
         assert!(
             !chained_after.is_tracing(),
             "B must not have inherited A's TRACING flag (counter under threshold)",
@@ -6481,14 +6475,14 @@ mod tests {
         // never `should_remove_jitcell`), so `install_new_cell` folds it in
         // front of the second and it ends up HEADING the bucket.
         let head_token = token_with_compiled_code(&mut ws);
-        let mut head_cell = BaseJitCell::new();
-        head_cell.set_comparekey(&head_key);
+        let head_cell =
+            BaseJitCell::new_for_driver_with_greens(0, &head_key.values, &head_key.types);
         head_cell.set_procedure_token(Arc::clone(&head_token), false);
         ws.install_new_cell(bucket, Some(head_cell));
 
         let chained_token = token_with_compiled_code(&mut ws);
-        let mut chained_cell = BaseJitCell::new();
-        chained_cell.set_comparekey(&chained_key);
+        let chained_cell =
+            BaseJitCell::new_for_driver_with_greens(0, &chained_key.values, &chained_key.types);
         chained_cell.set_procedure_token(Arc::clone(&chained_token), false);
         ws.install_new_cell(bucket, Some(chained_cell));
 
@@ -7216,14 +7210,12 @@ mod tests {
 
         // TRACING keeps the tail non-removable so the second install chains
         // it rather than dropping it (counter.py install_new_cell should_remove gate).
-        let mut tail = BaseJitCell::new();
+        let tail = BaseJitCell::new_for_driver_with_greens(0, &key_tail.values, &key_tail.types);
         tail.flags.set(tail.flags.get() | (JcFlags::JC_TRACING));
-        *tail.comparekey.borrow_mut() = Some(key_tail);
         ws.install_new_cell(bucket, Some(tail));
 
-        let mut head = BaseJitCell::new();
+        let head = BaseJitCell::new_for_driver_with_greens(0, &key_head.values, &key_head.types);
         head.flags.set(head.flags.get() | (JcFlags::JC_TRACING));
-        *head.comparekey.borrow_mut() = Some(key_head);
         ws.install_new_cell(bucket, Some(head));
 
         // Precondition: one occupied slot holding a two-cell chain. Without
@@ -7255,9 +7247,8 @@ mod tests {
         let bucket = key_b.get_uhash();
 
         // Head A: must stay non-removable across B's install.
-        let mut cell_a = BaseJitCell::new();
+        let cell_a = BaseJitCell::new_for_driver_with_greens(0, &key_a.values, &key_a.types);
         cell_a.flags.set(cell_a.flags.get() | (JcFlags::JC_TRACING));
-        *cell_a.comparekey.borrow_mut() = Some(key_a.clone());
         ws.install_new_cell(bucket, Some(cell_a));
 
         // Tick #1 — counter not at threshold yet, NotHot.
@@ -7275,7 +7266,7 @@ mod tests {
         // Walk the chain — A still TRACING (its own flag), B now
         // additionally TRACING.
         let head = ws.lookup_chain(bucket).expect("head exists");
-        assert_eq!(head.comparekey.borrow().as_ref(), Some(&key_a));
+        assert_eq!(head.greens.as_deref(), Some(&key_a.values[..]));
         assert!(head.is_tracing(), "A's TRACING flag is its own");
         let b_cell = ws
             .lookup_chain_with_key(&key_b)
