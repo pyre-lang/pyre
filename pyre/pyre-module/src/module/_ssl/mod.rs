@@ -1730,7 +1730,7 @@ mod ssl_socket_methods {
                     }
                     PumpExit::Failed { write, code }
                         if wait_for_transport(transport(), fd, write, code)? => {}
-                    exit => return Err(pump_error(transport(), backend, exit)),
+                    exit => return Err(pump_error(transport(), exit)),
                 }
             }
         }
@@ -1933,51 +1933,13 @@ mod ssl_socket_methods {
     /// interpreter is back.  Every caller answers the exits that are not
     /// failures - and `Rejected`, whose alert has to go out first - before
     /// reaching here.
-    fn pump_error(
-        transport: PyObjectRef,
-        #[cfg_attr(not(windows), allow(unused_variables))]
-        backend: *const pyre_native::ssl::TlsConnection,
-        exit: PumpExit,
-    ) -> pyre_interpreter::PyError {
+    fn pump_error(transport: PyObjectRef, exit: PumpExit) -> pyre_interpreter::PyError {
         match exit {
             PumpExit::Eof => tls_error(
                 pyre_native::ssl::TLS_ERROR_EOF,
                 "EOF occurred in violation of protocol".to_string(),
             ),
             PumpExit::Failed { write, code } => {
-                #[cfg(all(windows, feature = "host_env"))]
-                const WSAECONNABORTED: i32 = rustpython_host_env::socket::WSAECONNABORTED;
-                #[cfg(all(windows, not(feature = "host_env")))]
-                const WSAECONNABORTED: i32 =
-                    windows_sys::Win32::Networking::WinSock::WSAECONNABORTED;
-                #[cfg(all(windows, feature = "host_env"))]
-                const WSAECONNRESET: i32 = rustpython_host_env::socket::WSAECONNRESET;
-                #[cfg(all(windows, not(feature = "host_env")))]
-                const WSAECONNRESET: i32 = windows_sys::Win32::Networking::WinSock::WSAECONNRESET;
-                #[cfg(windows)]
-                if !write
-                    && !unsafe { pyre_native::ssl::connection_is_handshaking(backend) }
-                    && matches!(code, WSAECONNABORTED | WSAECONNRESET)
-                {
-                    // [3.14-spec] `ThreadedTests.test_wrong_cert_tls13`
-                    // accepts a protocol EOF when the server's fatal alert
-                    // races its close.  PyPy `_cffi_ssl.error.pyssl_error`
-                    // normally preserves a WinSock error, but rustls rejects
-                    // the client certificate early enough that `closesocket`
-                    // can replace the queued alert with WSAECONNABORTED or
-                    // WSAECONNRESET when the client's first application
-                    // record is already unread.  Once the handshake has
-                    // completed, that abrupt transport loss is the same
-                    // missing-close-notify protocol EOF.  A reset during the
-                    // handshake is not rewritten: CPython
-                    // `TestPreHandshakeClose` relies on that transport error
-                    // to distinguish pre-authentication data, and raw socket
-                    // operations likewise continue to expose 10053/10054.
-                    return tls_error(
-                        pyre_native::ssl::TLS_ERROR_EOF,
-                        "EOF occurred in violation of protocol".to_string(),
-                    );
-                }
                 if code != 0 {
                     let error = crate::module::_socket::interp_socket::socket_error_for_operation(
                         transport, code,
@@ -2357,7 +2319,7 @@ mod ssl_socket_methods {
                             let _ = flush_transport(self);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport(), self.backend, exit)),
+                        exit => return Err(pump_error(transport(), exit)),
                     }
                 }
                 flush_transport(self)?;
@@ -2516,7 +2478,7 @@ mod ssl_socket_methods {
                             let _ = flush_transport(self);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport(), self.backend, exit)),
+                        exit => return Err(pump_error(transport(), exit)),
                     }
                 }
             } else {
@@ -2786,7 +2748,7 @@ mod ssl_socket_methods {
                             let _ = flush_transport(self);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport(), self.backend, exit)),
+                        exit => return Err(pump_error(transport(), exit)),
                     }
                 }
             } else if unsafe { is_none(self.incoming) } {

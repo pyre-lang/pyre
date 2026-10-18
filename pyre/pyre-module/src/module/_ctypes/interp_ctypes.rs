@@ -479,16 +479,16 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     // "so that we can call CFunction instances" pair, described as debugging
     // only and private; the readline extension `_ctypes` names in that comment
     // is why they are still here.  The two differ by the calling convention
-    // they pass, which x86-64 has one of.
-    for name in ["call_function", "call_cdeclfunction"] {
+    // they pass: no flags, or `FUNCFLAG_CDECL`.
+    let call_entries: [(&str, pyre_interpreter::gateway::BuiltinCodeFn); 2] = [
+        ("call_function", super::funcptr::call_function),
+        ("call_cdeclfunction", super::funcptr::call_cdeclfunction),
+    ];
+    for (name, function) in call_entries {
         pyre_interpreter::__pyre_store!(
             ns,
             name,
-            pyre_interpreter::make_builtin_function_with_arity(
-                name,
-                super::funcptr::call_function,
-                2,
-            )
+            pyre_interpreter::make_builtin_function_with_arity(name, function, 2)
         );
     }
 }
@@ -583,6 +583,11 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
 
     // ── LoadLibrary(name, load_flags=0) → HMODULE ──
     //
+    // [3.14-spec] `lib_pypy/_ctypes/__init__.py` binds `LoadLibrary = dlopen`,
+    // whose second argument is a `dlopen` mode; `lib-python/3/ctypes/__init__.py`
+    // `CDLL._load_library` calls `_LoadLibrary(self._name, winmode)` and
+    // `callproc.c load_library` hands that to `LoadLibraryExW`.
+    //
     // `LoadLibraryExW(name, NULL, load_flags)`.  The flags are not optional
     // decoration: `CDLL._load_library` (`ctypes/__init__.py`) defaults
     // `winmode` to `nt._LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` and adds
@@ -672,6 +677,12 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
     );
 
     // ── FormatError(code=GetLastError()) → str ──
+    //
+    // [3.14-spec] `pypy/module/_rawffi/interp_rawffi.py` `FormatError` is
+    // `@unwrap_spec(code=int)` and requires the code; `callproc.c
+    // format_error` parses `"|i:FormatError"` and reads `GetLastError()` for
+    // a missing or zero code, so `FormatError()` answers there and raises
+    // `TypeError` on PyPy.
     pyre_interpreter::__pyre_store!(
         ns,
         "FormatError",
@@ -761,48 +772,39 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
 
     // ── CopyComPointer(src, dst) → HRESULT ──
     //
-    // `dst` is a `byref()` carrier, so the destination is the address that
-    // carrier already resolved; `src` is a COM interface pointer held in a
-    // cdata buffer.  The `AddRef` before the store is what makes this a copy
-    // rather than a move.
+    // [3.14-spec] `lib_pypy/_ctypes/__init__.py` `CopyComPointer` indexes
+    // `src[0][0].AddRef(src)` and stores through `dst[0]`;
+    // `lib-python/3/test/test_ctypes/test_win32_com_foreign_func.py`
+    // `CopyComPointerTests` passes a `c_void_p` subclass as `src` and
+    // `byref(dst)` as `dst`, neither of which is indexable, and asserts the
+    // `AddRef` through the refcount.  So both arguments go through
+    // `ConvParam` and the copy is the vtable `AddRef` plus the store
+    // (`callproc.c copy_com_pointer`).  The `AddRef` before the store is what
+    // makes this a copy rather than a move.
     pyre_interpreter::__pyre_store!(
         ns,
         "CopyComPointer",
         pyre_interpreter::make_builtin_function_with_arity(
             "CopyComPointer",
             |args| {
-                use super::cdata;
                 if args.len() < 2 {
                     return Err(pyre_interpreter::PyError::type_error(
                         "CopyComPointer() needs (src, dst)",
                     ));
                 }
-                let (src, dst) = (args[0], args[1]);
-                let destination = if is_carg(dst) { carg_ptr(dst) } else { 0 };
-                if destination == 0 {
-                    return Ok(pyre_object::w_int_new(
-                        host_ctypes::HRESULT_E_POINTER as i64,
-                    ));
-                }
-                let source = if unsafe { pyre_object::is_none(src) } {
-                    0
-                } else if cdata::is_cdata_instance(src) {
-                    let (Some(addr), Some(len)) = (cdata::cdata_addr(src), cdata::cdata_len(src))
-                    else {
-                        return Ok(pyre_object::w_int_new(
-                            host_ctypes::HRESULT_E_POINTER as i64,
-                        ));
-                    };
-                    let buffer = unsafe { super::cfield::borrow_memory(addr as *const u8, len) };
-                    super::cfield::read_pointer_from_buffer(buffer)
-                } else {
-                    return Ok(pyre_object::w_int_new(
-                        host_ctypes::HRESULT_E_POINTER as i64,
-                    ));
-                };
-                Ok(pyre_object::w_int_new(
-                    host_ctypes::copy_com_pointer(source, destination) as i64,
-                ))
+                let (src, mut dst) = (args[0], args[1]);
+                let mut keepalive = Vec::new();
+                let source = pyre_object::with_roots!(dst =>
+                    super::funcptr::conv_param_pointer(src, &mut keepalive))?;
+                let destination = super::funcptr::conv_param_pointer(dst, &mut keepalive)?;
+                // A bad address faults in the vtable read, the `AddRef` or
+                // the store; `seh::guard` turns that into the OSError the
+                // other raw-address readers raise.
+                let hr =
+                    super::seh::guard(|| host_ctypes::copy_com_pointer(source, destination));
+                drop(keepalive);
+                let hr = hr?;
+                Ok(pyre_object::w_int_new(hr as i64))
             },
             2,
         )

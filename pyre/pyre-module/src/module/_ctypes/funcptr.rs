@@ -2493,16 +2493,35 @@ fn internal_pyerr_setfromwindowserr(
 
 /// `_ctypes.call_function(address, args)` — call an address that carries no
 /// argtypes, no restype and no flags, so every argument converts by the
-/// default rules and the result is read as a C `int`.  `call_cdeclfunction` is
-/// the same call under `FUNCFLAG_CDECL`, which on this architecture is the
-/// only calling convention there is.
+/// default rules and the result is read as a C `int`.
 pub(super) fn call_function(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    call_function_with_flags(args, "call_function", 0)
+}
+
+/// `_ctypes.call_cdeclfunction(address, args)` — the same call under
+/// `FUNCFLAG_CDECL`.  `clibffi.py get_call_conv` maps flags without it to
+/// `FFI_STDCALL` on 32-bit Windows; other targets have one convention.
+pub(super) fn call_cdeclfunction(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    call_function_with_flags(
+        args,
+        "call_cdeclfunction",
+        i64::from(ctypes_h::FUNCFLAG_CDECL),
+    )
+}
+
+fn call_function_with_flags(
+    args: &[PyObjectRef],
+    name: &str,
+    flags: i64,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let (Some(&addr), Some(&(mut arguments))) = (args.first(), args.get(1)) else {
-        return Err(pyre_interpreter::PyError::type_error(
-            "call_function() takes exactly 2 arguments",
-        ));
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "{name}() takes exactly 2 arguments"
+        )));
     };
     if !unsafe { pyre_object::is_tuple(arguments) } {
         return Err(pyre_interpreter::PyError::type_error(format!(
@@ -2521,7 +2540,11 @@ pub(super) fn call_function(
     let result = {
         let _blocked = pyre_interpreter::module::thread::before_external_block();
         super::seh::guard(|| {
-            callproc::call(addr, &host_args, CallRet::Code("i"), CallOptions::default())
+            let options = CallOptions {
+                flags,
+                ..CallOptions::default()
+            };
+            callproc::call(addr, &host_args, CallRet::Code("i"), options)
         })
     };
     drop(keepalive);
@@ -2894,6 +2917,28 @@ fn marshal_default_arg(
             "Don't know how to convert parameter",
         ))
     }
+}
+
+/// `callproc.c ConvParam` read back through `value.p`: the pointer word a
+/// default-converted argument carries.  `keepalive` holds any buffer the
+/// conversion allocated (`argument.keep`).
+#[cfg(all(windows, feature = "host_env"))]
+pub(super) fn conv_param_pointer(
+    arg: PyObjectRef,
+    keepalive: &mut Vec<Vec<u8>>,
+) -> Result<usize, pyre_interpreter::PyError> {
+    let word_of = |buf: &[u8]| {
+        let mut word = [0u8; core::mem::size_of::<usize>()];
+        let n = buf.len().min(word.len());
+        word[..n].copy_from_slice(&buf[..n]);
+        usize::from_ne_bytes(word)
+    };
+    Ok(match marshal_default_arg(arg, keepalive)? {
+        OwnedArg::Pointer(addr) => addr,
+        OwnedArg::Typed(_, buf) | OwnedArg::Aggregate(_, buf) => word_of(&buf),
+        OwnedArg::Int(value) => value as isize as usize,
+        OwnedArg::Double(value) => value.to_bits() as usize,
+    })
 }
 
 /// The address a pointer-kind argtype takes its argument as.

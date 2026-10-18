@@ -87,15 +87,15 @@ impl crate::lltype::GcType for W_ArrayUser {
 pub const TYPECODES: &str = "bBuwhHiIlLqQfd";
 
 /// `itemsize` (bytes per element) for a typecode, or `None` if the code is
-/// not one of the supported `bBuwhHiIlLqQfd` (`interp_array.py:885-899`,
-/// 64-bit `l`/`L` = 8).
+/// not one of the supported `bBuwhHiIlLqQfd` (`interp_array.py` `types`;
+/// `l`/`L` are `rffi.LONG`/`rffi.ULONG`, so 4 bytes on Windows).
 pub fn typecode_itemsize(tc: u8) -> Option<u8> {
     Some(match tc {
         b'b' | b'B' => 1,
         b'u' | b'w' => 4,
         b'h' | b'H' => 2,
         b'i' | b'I' => 4,
-        b'l' | b'L' => 8,
+        b'l' | b'L' => std::mem::size_of::<std::ffi::c_long>() as u8,
         b'q' | b'Q' => 8,
         b'f' => 4,
         b'd' => 8,
@@ -325,15 +325,12 @@ fn unpack_exact(typecode: u8, buf: &[u8]) -> Option<PyObjectRef> {
         b'H' => crate::intobject::w_int_new(u16::from_ne_bytes(buf.try_into().ok()?) as i64),
         b'i' => crate::intobject::w_int_new(i32::from_ne_bytes(buf.try_into().ok()?) as i64),
         b'I' => crate::intobject::w_int_new(u32::from_ne_bytes(buf.try_into().ok()?) as i64),
-        b'l' | b'q' => crate::intobject::w_int_new(i64::from_ne_bytes(buf.try_into().ok()?)),
-        b'L' | b'Q' => {
-            let v = u64::from_ne_bytes(buf.try_into().ok()?);
-            if v <= i64::MAX as u64 {
-                crate::intobject::w_int_new(v as i64)
-            } else {
-                crate::longobject::w_long_new(BigInt::from(v))
-            }
+        b'l' => {
+            crate::intobject::w_int_new(std::ffi::c_long::from_ne_bytes(buf.try_into().ok()?) as i64)
         }
+        b'q' => crate::intobject::w_int_new(i64::from_ne_bytes(buf.try_into().ok()?)),
+        b'L' => w_unsigned_new(std::ffi::c_ulong::from_ne_bytes(buf.try_into().ok()?) as u64),
+        b'Q' => w_unsigned_new(u64::from_ne_bytes(buf.try_into().ok()?)),
         b'f' => crate::floatobject::w_float_new(f32::from_ne_bytes(buf.try_into().ok()?) as f64),
         b'd' => crate::floatobject::w_float_new(f64::from_ne_bytes(buf.try_into().ok()?)),
         b'u' | b'w' => {
@@ -353,6 +350,14 @@ fn unpack_exact(typecode: u8, buf: &[u8]) -> Option<PyObjectRef> {
         }
         _ => return None,
     })
+}
+
+fn w_unsigned_new(v: u64) -> PyObjectRef {
+    if v <= i64::MAX as u64 {
+        crate::intobject::w_int_new(v as i64)
+    } else {
+        crate::longobject::w_long_new(BigInt::from(v))
+    }
 }
 
 #[cfg(test)]
@@ -419,8 +424,8 @@ mod tests {
             (b'H', 2),
             (b'i', 4),
             (b'I', 4),
-            (b'l', 8),
-            (b'L', 8),
+            (b'l', std::mem::size_of::<std::ffi::c_long>() as u8),
+            (b'L', std::mem::size_of::<std::ffi::c_ulong>() as u8),
             (b'q', 8),
             (b'Q', 8),
             (b'f', 4),

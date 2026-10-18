@@ -56,14 +56,6 @@ fn main() {
         if let Some(msc_ver) = msc_ver() {
             println!("cargo:rustc-env=PYRE_MSC_VER={msc_ver}");
         }
-        // `msvcrt.CRT_ASSEMBLY_VERSION` names the C runtime assembly the build
-        // links against, and the toolset spells its four fields as one macro
-        // each in `<crtversion.h>`.  A toolset that carries no such header
-        // leaves the constant off the module, which is the state a build whose
-        // `_CRT_ASSEMBLY_VERSION` is undefined publishes.
-        if let Some(version) = crt_assembly_version() {
-            println!("cargo:rustc-env=PYRE_CRT_ASSEMBLY_VERSION={version}");
-        }
     }
 }
 
@@ -91,27 +83,4 @@ fn msc_ver() -> Option<String> {
     let expanded = expand("pyre_msc_ver", "_MSC_VER\n")?;
     let digits: String = expanded.chars().filter(char::is_ascii_digit).collect();
     (!digits.is_empty()).then_some(digits)
-}
-
-/// The C runtime assembly version as `major.minor.build.rbuild`.  `None` when
-/// the toolset answers with anything other than four numbers -- an unexpanded
-/// identifier is what a missing `<crtversion.h>` leaves behind.
-fn crt_assembly_version() -> Option<String> {
-    let expanded = expand(
-        "pyre_crt_version",
-        "#include <crtversion.h>\n\
-         _VC_CRT_MAJOR_VERSION,_VC_CRT_MINOR_VERSION,\
-         _VC_CRT_BUILD_VERSION,_VC_CRT_RBUILD_VERSION\n",
-    )?;
-    // The header itself expands to blank lines, so the probe's own line is the
-    // last one carrying text.
-    let fields: Vec<&str> = expanded
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())?
-        .split(',')
-        .map(str::trim)
-        .collect();
-    (fields.len() == 4 && fields.iter().all(|field| field.parse::<u32>().is_ok()))
-        .then(|| fields.join("."))
 }

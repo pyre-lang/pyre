@@ -27,6 +27,19 @@ crate::pyre_module_init!(interp_posix_wasm);
 
 use pyre_object::PyObjectRef;
 
+/// `interp_posix.urandom`, which `_random.W_Random.seed` calls directly.
+#[cfg(not(target_arch = "wasm32"))]
+pub use interp_posix::urandom;
+#[cfg(all(target_arch = "wasm32", feature = "host_env"))]
+pub use interp_posix_wasm::urandom;
+
+/// A wasm32 build without `host_env` registers no posix module and has no
+/// entropy source, which is the OSError `W_Random.seed` falls back on.
+#[cfg(all(target_arch = "wasm32", not(feature = "host_env")))]
+pub fn urandom(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::os_error("urandom unavailable"))
+}
+
 /// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
 /// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
 /// `posixmodule.c` `stat_result_desc`.  The 10 sequence slots hold the

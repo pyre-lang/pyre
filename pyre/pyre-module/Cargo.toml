@@ -59,6 +59,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
+    "Win32_System_Memory",
 ] }
 # `_overlapped.CreateEvent` builds the `WideCString` name
 # `rustpython_host_env::winapi::create_event_w` takes.

@@ -207,17 +207,19 @@ impl W_Random {
         &mut self,
         #[default(pyre_object::w_none())] w_n: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
-        // None: seed from os.urandom(8); fall back to a time-based int only
-        // when urandom raises (interp_random.py). Under sandbox the entropy
-        // comes from the trusted controller, not host getrandom.
+        // None: seed from `interp_posix.urandom(space, 8)`; fall back to a
+        // time-based int only when that raises OSError (interp_random.py).
         let w_n = if unsafe { is_none(w_n) } {
-            #[cfg(not(feature = "sandbox"))]
-            let entropy = pyre_interpreter::importing::host::os::urandom(8).ok();
-            #[cfg(feature = "sandbox")]
-            let entropy = pyre_interpreter::host_seam::ops::urandom(8).ok();
-            match entropy {
-                Some(buf) => w_bytes_from_bytes(&buf),
-                None => w_int_new(seed_from_time() as i64),
+            match posix_urandom(8) {
+                Ok(w_bytes) => w_bytes,
+                Err(mut error) => {
+                    let w_oserror = pyre_interpreter::builtins::lookup_exc_class("OSError")
+                        .expect("OSError is installed");
+                    if !error.match_(PY_NULL, w_oserror) {
+                        return Err(error);
+                    }
+                    w_int_new(seed_from_time() as i64)
+                }
             }
         } else {
             w_n
@@ -341,6 +343,14 @@ impl W_Random {
         let result = BigInt::from_bytes_le(Sign::Plus, &bytes);
         Ok(w_long_new(result))
     }
+}
+
+/// `interp_posix.urandom(space, size)`, called directly as `W_Random.seed`
+/// does: it owns the entropy source on every host (`rurandom.urandom`, the
+/// Windows CSPRNG, or the sandbox controller), whatever `posix.urandom` has
+/// been rebound to.
+fn posix_urandom(size: i64) -> pyre_interpreter::PyResult {
+    pyre_interpreter::module::posix::urandom(&[w_int_new(size)])
 }
 
 /// Time-based fallback seed — `int(time.time() * 256)`.

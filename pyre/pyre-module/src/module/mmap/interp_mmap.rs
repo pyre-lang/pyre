@@ -85,7 +85,117 @@ enum MappedObj {
     #[cfg(windows)]
     Mapped(host_mmap::MappedFile),
     #[cfg(windows)]
-    Named(host_mmap::NamedMmap),
+    Named(NamedMmap),
+}
+
+/// A tagged or file-backed Windows mapping: `rmmap.py`
+/// `CreateFileMapping(m.file_handle, NULL, flProtect, size_hi, size_lo,
+/// m.tagname)` and the `MapViewOfFile` over it.  The tag reaches
+/// `CreateFileMappingW` as the UTF-16 units of the text, so a lone surrogate
+/// passes through; `host_mmap::create_named_mapping` takes the tag as a
+/// `&str`, which cannot carry one.
+#[cfg(windows)]
+struct NamedMmap {
+    map_handle: windows_sys::Win32::Foundation::HANDLE,
+    view_ptr: *mut u8,
+    len: usize,
+    /// `GetLastError() == ERROR_ALREADY_EXISTS` read straight after
+    /// `CreateFileMappingW`, before `MapViewOfFile` can overwrite it: the
+    /// name was already held by another live mapping.
+    already_exists: bool,
+}
+
+#[cfg(windows)]
+impl NamedMmap {
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.view_ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.view_ptr, self.len) }
+    }
+
+    fn flush_range(&self, offset: usize, size: usize) -> std::io::Result<()> {
+        host_mmap::flush_view(unsafe { self.view_ptr.add(offset) }.cast(), size)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NamedMmap {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.view_ptr.cast(),
+            });
+            windows_sys::Win32::Foundation::CloseHandle(self.map_handle);
+        }
+    }
+}
+
+/// `CreateFileMappingW(file_handle, NULL, flProtect, size_hi, size_lo, tag)`
+/// for a maximum size of `offset + map_size`, then `MapViewOfFile` at
+/// `offset`.  `tag` is the name's UTF-16 units without a terminator; an empty
+/// one is no name.
+#[cfg(windows)]
+fn create_named_mapping(
+    file_handle: host_mmap::Handle,
+    tag: &[u16],
+    access: host_mmap::AccessMode,
+    offset: i64,
+    map_size: usize,
+) -> std::io::Result<NamedMmap> {
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_COPY, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile,
+        PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    let (fl_protect, desired_access) = match access {
+        host_mmap::AccessMode::Default | host_mmap::AccessMode::Write => {
+            (PAGE_READWRITE, FILE_MAP_WRITE)
+        }
+        host_mmap::AccessMode::Read => (PAGE_READONLY, FILE_MAP_READ),
+        host_mmap::AccessMode::Copy => (PAGE_WRITECOPY, FILE_MAP_COPY),
+    };
+    let total_size = (offset as u64)
+        .checked_add(map_size as u64)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    let tag_wide: Vec<u16> = tag.iter().copied().chain(std::iter::once(0)).collect();
+    let map_handle = unsafe {
+        CreateFileMappingW(
+            file_handle,
+            std::ptr::null(),
+            fl_protect,
+            (total_size >> 32) as u32,
+            total_size as u32,
+            tag_wide.as_ptr(),
+        )
+    };
+    if map_handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let already_exists =
+        unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
+    let view = unsafe {
+        MapViewOfFile(
+            map_handle,
+            desired_access,
+            (offset as u64 >> 32) as u32,
+            offset as u32,
+            map_size,
+        )
+    };
+    if view.Value.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(map_handle) };
+        return Err(error);
+    }
+    Ok(NamedMmap {
+        map_handle,
+        view_ptr: view.Value.cast(),
+        len: map_size,
+        already_exists,
+    })
 }
 
 #[cfg(any(unix, windows))]
@@ -159,7 +269,7 @@ struct NativeMMap {
     /// mapping object under, empty for an untagged mapping.  `resize` recreates
     /// the mapping object under the same name.
     #[cfg(windows)]
-    tagname: String,
+    tagname: Vec<u16>,
     trackfd: bool,
 }
 
@@ -1838,7 +1948,10 @@ fn mmap_resize_mapping(
 ) -> Result<(), pyre_interpreter::PyError> {
     let fd = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_fd")) as libc::c_int;
     let offset = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_offset"));
-    // `mmap_resize_method`: shared anonymous maps cannot grow.
+    // [3.14-spec] `rmmap.MMap.resize` remaps a shared anonymous mapping with
+    // `mremap`; `mmap_resize_method` refuses to grow it, and
+    // `lib-python/3/test/test_mmap.py` `test_resize_up_anonymous_mapping`
+    // asserts the ValueError on Linux.
     //   if (self->fd == -1 && !(self->flags & MAP_PRIVATE) && new_size > self->size)
     if fd < 0 && mmap_native(obj)?.flags & rmmap::MAP_PRIVATE == 0 && newsize > old_len {
         return Err(pyre_interpreter::PyError::value_error(
@@ -1899,6 +2012,14 @@ fn mmap_resize_mapping(
 /// ERROR_USER_MAPPED_FILE while any view of the file is open.  An anonymous
 /// mapping has no file to extend, so it is remade and the surviving bytes
 /// copied, as on Linux.
+///
+/// [3.14-spec] For a mapping with no file, `rmmap.MMap.resize` runs the same
+/// `SetFilePointer`/`SetEndOfFile` on `INVALID_HANDLE_VALUE` and recreates the
+/// mapping without the old bytes (MEASURED with PyPy 7.3.22: a tagged
+/// pagefile resize answers zeros); `mmapmodule.c mmap_mmap_resize_impl` at
+/// v3.14.6 recreates the paging-file mapping and `memcpy`s the old view into
+/// it, and `lib-python/3/test/test_mmap.py`
+/// `test_resize_up_anonymous_mapping` asserts the old bytes survive.
 #[cfg(windows)]
 fn mmap_resize_mapping(
     obj: pyre_object::PyObjectRef,
@@ -1977,22 +2098,28 @@ fn mmap_resize_mapping(
 
 /// Recreate the Windows mapping object under the name it already had, matching
 /// `rmmap.py:635-636`, which passes `self.tagname` whether or not one was
-/// given.  `CreateFileMappingW` reports ERROR_ALREADY_EXISTS when another
-/// mapping still owns the name; a resize surfaces that OS error, while the
-/// recovery remap is allowed to reopen the existing object.  An untagged
-/// mapping cannot reach it — a zero-length name is not a name.
+/// given.  An untagged mapping cannot reach ERROR_ALREADY_EXISTS — a
+/// zero-length name is not a name.
+///
+/// [3.14-spec] `rmmap.MMap.resize` accepts the handle `CreateFileMapping`
+/// returns with ERROR_ALREADY_EXISTS; `mmapmodule.c mmap_mmap_resize_impl` at
+/// v3.14.6 closes it and raises that error, and
+/// `lib-python/3/test/test_mmap.py`
+/// `test_resize_succeeds_with_error_for_second_named_mapping` asserts the
+/// OSError with the original mapping intact.  So a resize surfaces it, while
+/// the recovery remap is allowed to reopen the existing object.
 #[cfg(windows)]
 fn mmap_remap_named(
     handle: host_mmap::Handle,
     offset: i64,
     access: host_mmap::AccessMode,
     size: usize,
-    tagname: &str,
+    tagname: &[u16],
     reject_existing: bool,
 ) -> std::io::Result<MappedObj> {
-    let named = host_mmap::create_named_mapping(handle, tagname, access, offset, size)?;
+    let named = create_named_mapping(handle, tagname, access, offset, size)?;
     const ERROR_ALREADY_EXISTS: i32 = 183;
-    if reject_existing && host_mmap::last_error() as i32 == ERROR_ALREADY_EXISTS {
+    if reject_existing && named.already_exists {
         drop(named);
         return Err(std::io::Error::from_raw_os_error(ERROR_ALREADY_EXISTS));
     }
@@ -2116,7 +2243,12 @@ fn mmap_new_object(
     )
 }
 
-// `interp_mmap.py:55-130 mmap_new` / CPython 3.14's `trackfd` addition.
+// `interp_mmap.py mmap_new`.
+//
+// [3.14-spec] `trackfd`: `rmmap.mmap` has no such parameter and always keeps
+// the `dup`ed descriptor; `lib-python/3/test/test_mmap.py`
+// `test_trackfd_parameter` / `test_trackfd_neg1` pass `trackfd=False` and
+// assert `size()`/`resize()` refuse while the mapping itself works.
 #[cfg(unix)]
 fn mmap_construct(
     mut cls: pyre_object::PyObjectRef,
@@ -2331,8 +2463,8 @@ fn mmap_construct(
             "memory mapped size must be positive",
         ));
     }
-    let tagname = match bound[2] {
-        a if a.is_null() || unsafe { pyre_object::is_none(a) } => "",
+    let tagname: Vec<u16> = match bound[2] {
+        a if a.is_null() || unsafe { pyre_object::is_none(a) } => Vec::new(),
         a => {
             if !unsafe { pyre_object::is_str(a) } {
                 return Err(pyre_interpreter::PyError::type_error(format!(
@@ -2340,14 +2472,21 @@ fn mmap_construct(
                     pyre_interpreter::type_methods::arg_type_name(a)
                 )));
             }
-            // The name reaches Win32 as UTF-16, which host_env builds from a
-            // `&str`, so a tag carrying a lone surrogate has no route through.
-            let Some(tag) = (unsafe { pyre_object::w_str_get_value_opt(a) }) else {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "mmap() tagname must not contain lone surrogates",
-                ));
-            };
-            if tag.contains('\0') {
+            // The name reaches `CreateFileMappingW` as UTF-16 straight from
+            // the WTF-8 text, so a lone surrogate is one unit like any other.
+            //
+            // [3.14-spec] `interp_mmap.py mmap` takes the tag through
+            // `space.text_w`, which refuses a lone surrogate with
+            // UnicodeEncodeError, and `rmmap.py` hands the UTF-8 bytes to
+            // `CreateFileMappingA`; `mmapmodule.c new_mmap_object` at
+            // v3.14.6 converts it with `PyUnicode_AsWideCharString`, which
+            // keeps a lone surrogate, and passes the `wchar_t` name to
+            // `CreateFileMappingW`, so `mmap.mmap(-1, 8, tagname='\udc80')`
+            // maps there.  Evidence is the C source at the tag.
+            let tag: Vec<u16> = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(a) }
+                .encode_wide()
+                .collect();
+            if tag.contains(&0) {
                 return Err(pyre_interpreter::PyError::value_error(
                     "embedded null character",
                 ));
@@ -2401,7 +2540,7 @@ fn mmap_construct(
                         "cannot mmap an empty file",
                     ));
                 }
-                // `rmmap.py:943-945` rejects only offset > size, so an
+                // [3.14-spec] `rmmap.py:943-945` rejects only offset > size, so an
                 // offset landing exactly on EOF resolves to a zero-length
                 // mapping and asks `MapViewOfFile` for an empty view, which
                 // fails with a Win32 error instead.  `mmapmodule.c
@@ -2422,7 +2561,7 @@ fn mmap_construct(
                     ));
                 }
             }
-            // A given length is not measured against the file at all here.
+            // [3.14-spec] A given length is not measured against the file at all here.
             // `CreateFileMapping` is asked for `offset + length` and grows the
             // file to it, so a length past EOF is how the mapping is extended
             // on this platform.  `rmmap.py` rejects it with "mmap
@@ -2453,14 +2592,9 @@ fn mmap_construct(
     // extend it, and because it rounds the offset down to the allocation
     // granularity instead of letting `MapViewOfFile` reject an unaligned one.
     let (mapped, owned_handle) = if file_handle.is_some() || !tagname.is_empty() {
-        let named = host_mmap::create_named_mapping(
-            handle,
-            tagname,
-            mmap_access_mode(access),
-            offset,
-            map_size,
-        )
-        .map_err(|e| mmap_io_err(e, "CreateFileMapping"))?;
+        let named =
+            create_named_mapping(handle, &tagname, mmap_access_mode(access), offset, map_size)
+                .map_err(|e| mmap_io_err(e, "CreateFileMapping"))?;
         // The mapping object holds its own reference to the file, but the
         // handle stays with the mmap so `size()` can still stat that file.
         (
@@ -2476,7 +2610,7 @@ fn mmap_construct(
         NativeMMap {
             mapped: Some(mapped),
             handle: owned_handle,
-            tagname: tagname.to_owned(),
+            tagname,
             // No `trackfd` parameter on Windows; the object always owns the
             // handle it duplicated, so `resize()` is never disarmed.
             trackfd: true,

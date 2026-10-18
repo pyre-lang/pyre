@@ -2014,7 +2014,7 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
 /// `random.Random()` and `secrets` are both this call, so a guest without it
 /// cannot import either; the bytes are the host's, not a stream the guest
 /// generates, because that is what the callers are asking for.
-fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::gateway::check_declared_arity("urandom", 1, args.len())?;
     let n = crate::builtins::space_index_w(args[0])?;
     if n < 0 {

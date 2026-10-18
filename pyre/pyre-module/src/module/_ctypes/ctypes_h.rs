@@ -11,6 +11,10 @@ pub(super) const FUNCFLAG_STDCALL: u32 = 0x0;
 /// `ctypes.h FUNCFLAG_CDECL`.
 pub(super) const FUNCFLAG_CDECL: u32 = 0x1;
 /// `ctypes.h FUNCFLAG_HRESULT`.
+///
+/// [3.14-spec] `_rawffi` (`pypy/module/_rawffi/moduledef.py`) exports no
+/// `FUNCFLAG_HRESULT`; `_ctypes.c` publishes it on Windows
+/// (`MOD_ADD("FUNCFLAG_HRESULT", ...)`).
 #[cfg(windows)]
 pub(super) const FUNCFLAG_HRESULT: u32 = 0x2;
 /// `ctypes.h FUNCFLAG_PYTHONAPI`.
@@ -38,6 +42,11 @@ pub(super) const RTLD_LOCAL: i32 = majit_rlib::rdynload::RTLD_LOCAL;
 #[cfg(unix)]
 pub(super) const RTLD_GLOBAL: i32 = majit_rlib::rdynload::RTLD_GLOBAL;
 
+// [3.14-spec] `lib_pypy/_ctypes/__init__.py` sets `RTLD_LOCAL = 0` and
+// `RTLD_GLOBAL = 256` on every platform; `_ctypes.c` (`_ctypes_add_objects`
+// tail) defines `RTLD_LOCAL` as 0 where `dlfcn.h` does not declare it and
+// `RTLD_GLOBAL` as `RTLD_LOCAL` where it is undeclared too, so both are 0
+// on Windows.
 #[cfg(not(unix))]
 pub(super) const RTLD_LOCAL: i32 = 0;
 #[cfg(not(unix))]

@@ -209,7 +209,7 @@ fn overlapped_getbuffer(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 /// simply nothing left to cancel.
 fn overlapped_cancel(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let obj = arg(args, 0, "cancel")?;
-    let state = native(obj)?.lock();
+    let mut state = native(obj)?.lock();
     if !state.pending {
         return Ok(pyre_object::w_none());
     }
@@ -226,6 +226,7 @@ fn overlapped_cancel(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     if let Err(error) = result {
         return Err(win32_err(error));
     }
+    state.pending = false;
     Ok(pyre_object::w_none())
 }
 

@@ -16,6 +16,18 @@ fn msvcrt_err(error: std::io::Error) -> pyre_interpreter::PyError {
     )
 }
 
+/// The one item of a length-1 argument; `TypeError` for any other length
+/// (`msvcrt.py` `ord(ch)` / the `len(ch) != 1` checks in `ungetch`).
+fn single_item<T>(
+    mut items: impl Iterator<Item = T>,
+    msg: &str,
+) -> Result<T, pyre_interpreter::PyError> {
+    match (items.next(), items.next()) {
+        (Some(item), None) => Ok(item),
+        _ => Err(pyre_interpreter::PyError::type_error(msg)),
+    }
+}
+
 pyre_interpreter::py_module! {
     "msvcrt",
     int_constants: {
@@ -43,33 +55,38 @@ pyre_interpreter::py_module! {
             host_msvcrt::getwche()
         }
         fn putch(char_: &[u8]) -> Result<(), pyre_interpreter::PyError> {
-            let byte = *char_.first().ok_or_else(|| {
-                pyre_interpreter::PyError::type_error("putch() argument must be a byte string of length 1")
-            })?;
+            let byte = single_item(
+                char_.iter().copied(),
+                "putch() argument must be a byte string of length 1",
+            )?;
             host_msvcrt::putch(byte);
             Ok(())
         }
         fn putwch(unicode_char: &str) -> Result<(), pyre_interpreter::PyError> {
-            let ch = unicode_char.chars().next().ok_or_else(|| {
-                pyre_interpreter::PyError::type_error("putwch() argument must be a unicode character")
-            })?;
+            let ch = single_item(
+                unicode_char.chars(),
+                "putwch() argument must be a unicode character",
+            )?;
             host_msvcrt::putwch(ch);
             Ok(())
         }
         fn ungetch(char_: &[u8]) -> Result<(), pyre_interpreter::PyError> {
-            let byte = *char_.first().ok_or_else(|| {
-                pyre_interpreter::PyError::type_error("ungetch() argument must be a byte string of length 1")
-            })?;
+            let byte = single_item(
+                char_.iter().copied(),
+                "ungetch() argument must be a byte string of length 1",
+            )?;
             host_msvcrt::ungetch(byte).map_err(msvcrt_err)
         }
         fn ungetwch(unicode_char: &str) -> Result<(), pyre_interpreter::PyError> {
-            let ch = unicode_char.chars().next().ok_or_else(|| {
-                pyre_interpreter::PyError::type_error("ungetwch() argument must be a unicode character")
-            })?;
+            let ch = single_item(
+                unicode_char.chars(),
+                "ungetwch() argument must be a unicode character",
+            )?;
             host_msvcrt::ungetwch(ch).map_err(msvcrt_err)
         }
-        fn kbhit() -> bool {
-            host_msvcrt::kbhit() != 0
+        // `kbhit = _lib._kbhit`: the C int, unchanged.
+        fn kbhit() -> i32 {
+            host_msvcrt::kbhit()
         }
         fn locking(fd: i32, mode: i32, nbytes: i64) -> Result<(), pyre_interpreter::PyError> {
             host_msvcrt::locking(fd, mode, nbytes).map_err(msvcrt_err)
@@ -89,6 +106,10 @@ pyre_interpreter::py_module! {
             }
             Ok(handle as isize as i64)
         }
+        // [3.14-spec] `lib_pypy/msvcrt.py` binds no `heapmin`;
+        // `lib-python/3/test/test_msvcrt.py` `TestOther.test_heap_min` calls
+        // `msvcrt.heapmin()` and tolerates only `OSError`, so the attribute
+        // must exist (`msvcrtmodule.c` `msvcrt_heapmin_impl`).
         fn heapmin() -> Result<(), pyre_interpreter::PyError> {
             host_msvcrt::heapmin().map_err(msvcrt_err)
         }
@@ -102,11 +123,4 @@ pyre_interpreter::py_module! {
             host_msvcrt::get_error_mode()
         }
     },
-    extra_init: |ns| {
-        // The C runtime assembly version the build's own toolset named; the
-        // build script leaves it unset when no toolset header answered.
-        if let Some(version) = option_env!("PYRE_CRT_ASSEMBLY_VERSION") {
-            pyre_interpreter::__pyre_store!(ns, "CRT_ASSEMBLY_VERSION", pyre_object::w_str_new(version));
-        }
-    }
 }

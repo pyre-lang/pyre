@@ -1640,6 +1640,77 @@ fn fsencode_path_then_attribute(
     Ok((roots, path, attribute))
 }
 
+/// `interp_posix.urandom(space, size)`: the entry point `posix.urandom`
+/// publishes, and the one `_random.W_Random.seed` calls directly.
+pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::gateway::check_declared_arity("urandom", 1, args.len())?;
+    // `__index__` conversion, so a non-integer is a TypeError
+    // instead of a raw field read that asks for an arbitrary
+    // number of bytes.
+    let mut w_n = args[0];
+    let n = pyre_object::with_roots!(w_n => crate::builtins::space_index_w(w_n))?;
+    if n < 0 {
+        return Err(crate::PyError::value_error("negative argument not allowed"));
+    }
+    // A 32-bit target's `usize` is narrower than the `__index__`
+    // result, so a size it cannot hold is reported rather than
+    // wrapped to a smaller request.
+    let n = usize::try_from(n)
+        .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
+    // `interp_posix.urandom` calls `rurandom.urandom`. A size the
+    // allocator cannot meet is refused rather than reaching the
+    // entropy source.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    let buf = {
+        let _ = crate::builtins::try_vec_zeroed(n)?;
+        // `interp_posix.urandom` / `_signal_checker`. Invoked
+        // from `rurandom._getrandom` on Linux `EINTR`.
+        let mut signal_error: Option<crate::PyError> = None;
+        let outcome = {
+            let mut checker =
+                || match crate::module::signal::interp_signal::checksignals_now() {
+                    Ok(()) => true,
+                    Err(err) => {
+                        signal_error = Some(err);
+                        false
+                    }
+                };
+            pyre_object::with_roots!(w_n => {
+                majit_rlib::rurandom::urandom(n, Some(&mut checker))
+            })
+        };
+        match outcome {
+            Ok(buf) => buf,
+            Err(errno) => {
+                if let Some(err) = signal_error.take() {
+                    return Err(err);
+                }
+                // `wrap_oserror(..., w_exception_class=NotImplementedError)`.
+                return Err(crate::PyError::not_implemented(
+                    std::io::Error::from_raw_os_error(errno).to_string(),
+                ));
+            }
+        }
+    };
+    #[cfg(all(not(unix), not(feature = "sandbox")))]
+    let buf = {
+        let mut buf = crate::builtins::try_vec_zeroed(n)?;
+        getrandom::fill(&mut buf).map_err(|e| {
+            let errno = crate::builtins::io_error_posix_errno(&std::io::Error::from(e), 0);
+            crate::PyError::os_error_syscall(errno, pyre_object::PY_NULL)
+        })?;
+        buf
+    };
+    // Route host entropy through the trusted controller instead of
+    // reaching host getrandom directly.
+    #[cfg(feature = "sandbox")]
+    let buf = crate::host_seam::ops::urandom(n as i64)
+        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+    let block = pyre_object::bytesobject::try_alloc_bytes_block(&buf)
+        .ok_or_else(crate::builtins::reservation_failed)?;
+    Ok(pyre_object::bytesobject::w_bytes_from_block(block))
+}
+
 /// posix stub — PyPy: pypy/module/posix/ interp_posix.py
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
@@ -5225,75 +5296,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(
         ns_slot,
         "urandom",
-        crate::make_builtin_function_with_arity(
-            "urandom",
-            |args| {
-                crate::gateway::check_declared_arity("urandom", 1, args.len())?;
-                // `__index__` conversion, so a non-integer is a TypeError
-                // instead of a raw field read that asks for an arbitrary
-                // number of bytes.
-                let mut w_n = args[0];
-                let n = pyre_object::with_roots!(w_n => crate::builtins::space_index_w(w_n))?;
-                if n < 0 {
-                    return Err(crate::PyError::value_error("negative argument not allowed"));
-                }
-                // A 32-bit target's `usize` is narrower than the `__index__`
-                // result, so a size it cannot hold is reported rather than
-                // wrapped to a smaller request.
-                let n = usize::try_from(n)
-                    .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
-                // `interp_posix.urandom` calls `rurandom.urandom`. A size the
-                // allocator cannot meet is refused rather than reaching the
-                // entropy source.
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                let buf = {
-                    let _ = crate::builtins::try_vec_zeroed(n)?;
-                    // `interp_posix.urandom` / `_signal_checker`. Invoked
-                    // from `rurandom._getrandom` on Linux `EINTR`.
-                    let mut signal_error: Option<crate::PyError> = None;
-                    let outcome = {
-                        let mut checker =
-                            || match crate::module::signal::interp_signal::checksignals_now() {
-                                Ok(()) => true,
-                                Err(err) => {
-                                    signal_error = Some(err);
-                                    false
-                                }
-                            };
-                        pyre_object::with_roots!(w_n => {
-                            majit_rlib::rurandom::urandom(n, Some(&mut checker))
-                        })
-                    };
-                    match outcome {
-                        Ok(buf) => buf,
-                        Err(errno) => {
-                            if let Some(err) = signal_error.take() {
-                                return Err(err);
-                            }
-                            // `wrap_oserror(..., w_exception_class=NotImplementedError)`.
-                            return Err(crate::PyError::not_implemented(
-                                std::io::Error::from_raw_os_error(errno).to_string(),
-                            ));
-                        }
-                    }
-                };
-                #[cfg(all(not(unix), not(feature = "sandbox")))]
-                let buf = {
-                    let mut buf = crate::builtins::try_vec_zeroed(n)?;
-                    getrandom::fill(&mut buf).map_err(|e| io_err(std::io::Error::from(e), ""))?;
-                    buf
-                };
-                // Route host entropy through the trusted controller instead of
-                // reaching host getrandom directly.
-                #[cfg(feature = "sandbox")]
-                let buf = crate::host_seam::ops::urandom(n as i64)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                let block = pyre_object::bytesobject::try_alloc_bytes_block(&buf)
-                    .ok_or_else(crate::builtins::reservation_failed)?;
-                Ok(pyre_object::bytesobject::w_bytes_from_block(block))
-            },
-            1,
-        )
+        crate::make_builtin_function_with_arity("urandom", urandom, 1)
     );
     // os.terminal_size — structseq (columns, lines).
     fn make_terminal_size(cols: i64, lines: i64) -> pyre_object::PyObjectRef {

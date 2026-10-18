@@ -1272,7 +1272,9 @@ fn memoryview_native_fmtchar(fmt: &str) -> Option<(u8, i64)> {
             b'c' | b'b' | b'B' | b'?' => 1,
             b'h' | b'H' | b'e' => 2,
             b'i' | b'I' | b'f' => 4,
-            b'l' | b'L' | b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
+            // `sizeof(long)`: 4 on Windows.
+            b'l' | b'L' => size_of::<std::ffi::c_long>() as i64,
+            b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
             _ => return None,
         },
     ))
