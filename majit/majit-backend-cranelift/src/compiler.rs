@@ -11554,6 +11554,11 @@ pub struct CraneliftBackend {
     failure_recovery: [Option<usize>; 2],
     module: JITModule,
     func_ctx: FunctionBuilderContext,
+    /// Cranelift `Context` reused across `do_compile` and
+    /// `_build_failure_recovery` compiles. `Context::new` documents that
+    /// the CFG/domtree/regalloc scratch should live across functions
+    /// instead of being allocated per `define_function`.
+    clif_ctx: Context,
     /// Constant pool keyed by OpRef raw index. Each `Const` carries its
     /// own value and type (`rewrite.py:930` `v.type`), so codegen reads
     /// the raw `i64` via `as_raw_i64()` and the GC rewriter reads the
@@ -11699,7 +11704,21 @@ impl CraneliftBackend {
 
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
-        flag_builder.set("opt_level", "speed").unwrap();
+        // `optimizer.py` already ran before `assemble_loop` /
+        // `assemble_bridge`. Cranelift's egraph midend is gated on
+        // `OptLevel::Speed` (`Context::optimize`) and is a second
+        // optimizer RPython's assembler does not run. It dominates
+        // `do_compile` on the merged recompile `compile_bridge`
+        // publishes after every attach. `none` keeps lowering +
+        // register allocation.
+        flag_builder.set("opt_level", "none").unwrap();
+        // Cranelift's `unwind_info` default is on and "increases
+        // metadata size and compile time". Traces return through the
+        // host wrapper (`llmodel.py` `make_execute_token`); they do
+        // not unwind. Windows still needs unwind records for the ABI.
+        if !cfg!(windows) {
+            flag_builder.set("unwind_info", "false").unwrap();
+        }
         // Cranelift's IR verifier defaults to on and re-checks every function we
         // hand it, which is 25% of this backend's compile time (measured on the
         // cel nested-loop shape: 3719 -> 2783 us, steady-state unchanged).
@@ -11781,6 +11800,7 @@ impl CraneliftBackend {
         }));
         let module = JITModule::new(jit_builder);
         let func_ctx = FunctionBuilderContext::new();
+        let clif_ctx = Context::new();
 
         CraneliftBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
@@ -11788,6 +11808,7 @@ impl CraneliftBackend {
             failure_recovery: [None, None],
             module,
             func_ctx,
+            clif_ctx,
             constants: majit_ir::ConstMap::default(),
             callinfocollection: None,
             func_counter: 0,
@@ -11809,6 +11830,21 @@ impl CraneliftBackend {
             #[cfg(test)]
             fail_after_pending_trampolines: false,
         }
+    }
+
+    /// Take the reused Cranelift `Context` for one `define_function`.
+    /// Recursive compile replaces the field with a fresh `Context`, matching
+    /// the `func_ctx` borrow split.
+    fn take_clif_context(&mut self, func: Function) -> Context {
+        let mut ctx = std::mem::replace(&mut self.clif_ctx, Context::new());
+        ctx.clear();
+        ctx.func = func;
+        ctx
+    }
+
+    fn restore_clif_context(&mut self, mut ctx: Context) {
+        self.module.clear_context(&mut ctx);
+        self.clif_ctx = ctx;
     }
 
     /// Pin the metainterp descr Arcs referenced by this compiled trace
@@ -12397,11 +12433,10 @@ impl CraneliftBackend {
             builder.finalize(frontend_config);
             self.func_ctx = func_ctx;
         }
-        let mut ctx = Context::for_function(func);
-        self.module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| BackendError::CompilationFailed(format!("{e}\n{e:?}")))?;
-        self.module.clear_context(&mut ctx);
+        let mut ctx = self.take_clif_context(func);
+        let defined = self.module.define_function(func_id, &mut ctx);
+        self.restore_clif_context(ctx);
+        defined.map_err(|e| BackendError::CompilationFailed(format!("{e}\n{e:?}")))?;
         self.module
             .finalize_definitions()
             .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
@@ -20332,7 +20367,7 @@ impl CraneliftBackend {
         propagate_cold_blocks(&mut func, &merge_entry_blocks);
 
         // Compile
-        let mut ctx = Context::for_function(func);
+        let mut ctx = self.take_clif_context(func);
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
             // Emitted-code text alongside the IR below. Two dumps that agree on
             // the IR can still disagree on the code: register allocation runs
@@ -20361,7 +20396,7 @@ impl CraneliftBackend {
                     majit_ir::debug::debug_print(line);
                 }
             }
-            self.module.clear_context(&mut ctx);
+            self.restore_clif_context(ctx);
             return Err(BackendError::CompilationFailed(format!("{e}\n{e:?}")));
         }
         // `asmmemmgr.py` counts the block a `materialize` handed out, so
@@ -20459,30 +20494,27 @@ impl CraneliftBackend {
             wb.finalize(frontend_config);
             self.func_ctx = wrapper_ctx;
         }
-        let mut wrapper_compile_ctx = Context::for_function(wrapper_func);
+        ctx.func = wrapper_func;
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
             // The body's dump above shows what the trace costs; this one shows
             // what reaching it costs. The wrapper's own conv is the host's, and
             // the body's is `Tail`, so whatever the two conventions disagree
             // about is emitted HERE and is paid once per compiled entry.
-            wrapper_compile_ctx.set_disasm(true);
+            ctx.set_disasm(true);
         }
-        if let Err(e) = self
-            .module
-            .define_function(entry_id, &mut wrapper_compile_ctx)
-        {
+        if let Err(e) = self.module.define_function(entry_id, &mut ctx) {
             if majit_log_enabled() {
                 eprintln!(
                     "[jit][clif-error] wrapper {e}\nCLIF IR:\n{}",
-                    wrapper_compile_ctx.func.display()
+                    ctx.func.display()
                 );
             }
-            self.module.clear_context(&mut wrapper_compile_ctx);
+            self.restore_clif_context(ctx);
             return Err(BackendError::CompilationFailed(format!(
                 "wrapper: {e}\n{e:?}"
             )));
         }
-        let wrapper_code_bytes = wrapper_compile_ctx
+        let wrapper_code_bytes = ctx
             .compiled_code()
             .map(|code| code.code_info().total_size as usize)
             .unwrap_or(0);
@@ -20491,14 +20523,11 @@ impl CraneliftBackend {
             // size IS the instruction count, so the entry price of the ABI hop
             // is readable without parsing the disassembly.
             eprintln!("[jit][code-size] trace_id={trace_id} wrapper_bytes={wrapper_code_bytes}");
-            if let Some(text) = wrapper_compile_ctx
-                .compiled_code()
-                .and_then(|code| code.vcode.as_deref())
-            {
+            if let Some(text) = ctx.compiled_code().and_then(|code| code.vcode.as_deref()) {
                 eprintln!("[jit][disasm-entry] trace_id={trace_id}\n{text}");
             }
         }
-        self.module.clear_context(&mut wrapper_compile_ctx);
+        self.restore_clif_context(ctx);
 
         self.module.finalize_definitions().unwrap();
         let code_bytes = body_code_bytes + wrapper_code_bytes;
