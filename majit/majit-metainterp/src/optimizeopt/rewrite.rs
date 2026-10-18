@@ -7,7 +7,7 @@ use majit_ir::operand::Operand;
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Const, Op, OpCode, OpRc, OpRef, Value};
 
-use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
+use crate::optimizeopt::info::{PreambleOp, PtrInfo, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
 
 /// rewrite.py: loop_invariant_results value.
@@ -919,7 +919,12 @@ impl OptRewrite {
     /// `optimize_GUARD_NONNULL_CLASS` (rewrite.py) delegates to
     /// `optimize_GUARD_CLASS` after the null check, so both opcodes go
     /// through the same known-class / strengthening / postprocess logic.
-    fn optimize_guard_class(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_guard_class(
+        &self,
+        op: &Op,
+        _op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         // rewrite.py:402: info = self.ensure_ptr_info_arg0(op) — installs
         // an InstancePtrInfo on arg0 when one is missing. Discard the
         // EnsuredPtrInfo borrow; downstream lookups re-acquire via
@@ -942,7 +947,10 @@ impl OptRewrite {
             let expected = ctx.get_constant_int_box(&op.arg(1));
             if let Some(expected) = expected {
                 if known_class == expected {
-                    // rewrite.py:403-404: known class matches — drop the guard.
+                    // `rewrite.py` `optimize_GUARD_CLASS`: known class matches — drop the
+                    // guard. TRACE-level GUARD_CLASS is VOID
+                    // (`resoperation.py` `'GUARD_CLASS/2d/n'`); there is
+                    // no result box to forward.
                     return OptimizationResult::Remove;
                 }
                 // rewrite.py:404-407: known class mismatch is a
@@ -1825,7 +1833,7 @@ impl Optimization for OptRewrite {
                 // so the null the trace was specialized on was never re-checked.
                 OptimizationResult::PassOn
             }
-            OpCode::GuardClass => self.optimize_guard_class(op, ctx),
+            OpCode::GuardClass => self.optimize_guard_class(op, op_rc, ctx),
             OpCode::GuardNonnullClass => {
                 // rewrite.py optimize_GUARD_NONNULL_CLASS:
                 //     info = getptrinfo(op.getarg(0))
@@ -1841,7 +1849,7 @@ impl Optimization for OptRewrite {
                         ctx,
                     );
                 }
-                self.optimize_guard_class(op, ctx)
+                self.optimize_guard_class(op, op_rc, ctx)
             }
             OpCode::GuardIsObject => {
                 // rewrite.py optimize_GUARD_IS_OBJECT.

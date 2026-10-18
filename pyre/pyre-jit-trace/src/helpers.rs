@@ -1870,6 +1870,10 @@ pub fn emit_new_pyframe_inline_with_params(
     let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
 
+    // The virtualizable token is a GCREF row of `gc_fielddescrs`
+    // (`VirtualizableInstanceRepr._setup_repr_llfields`), so
+    // `clear_gc_fields` zeroes it.
+
     // pyframe.py `f_generator_wref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (dead_ref/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
@@ -2014,6 +2018,10 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // dispatch on this frame run a full non-moving old-gen collection.
     let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
+
+    // The virtualizable token is a GCREF row of `gc_fielddescrs`
+    // (`VirtualizableInstanceRepr._setup_repr_llfields`), so
+    // `clear_gc_fields` zeroes it.
 
     // pyframe.py `f_generator_wref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (dead_ref/None/vref_None), never assigned in the

@@ -8,7 +8,7 @@ pub use crate::optimizeopt::rawbuffer::{
 /// Each operation can have associated analysis info (e.g., known integer bounds,
 /// pointer info, virtual object state).
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{DescrRef, FieldDescr, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
 
 fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<DescrRef> {
     field_descrs.get(field_idx as usize).cloned()

@@ -6394,15 +6394,9 @@ impl<'a> Transformer<'a> {
     ///   getfield_*_pure]` — `jtransform.py`.
     /// * mutable                  → keep as-is.
     ///
-    /// Three upstream branches of `rewrite_op_getfield` are absent because
+    /// Two upstream branches of `rewrite_op_getfield` are absent because
     /// nothing in pyre produces the op shape they test for:
     ///
-    /// * `is_typeptr_getset` → `handle_getfield_typeptr`, which replaces the
-    ///   read with `[-live-, guard_class]`.  Pyre never reads the class word
-    ///   through a field access — the header words are folded into
-    ///   `new_with_vtable` on the store side, and `heaptracker::is_header_word`
-    ///   keeps `typeptr` / `ob_type` / `PyObject::w_class` out of the
-    ///   field-descriptor census entirely, so no descriptor exists to match.
     /// * the `rstr.STR` / `rstr.UNICODE` hash check that rewrites to
     ///   `strhash` / `unicodehash`.  Those are not pyre opcodes: the
     ///   `bh_strhash` / `bh_unicodehash` helpers exist at the backend layer
@@ -6443,8 +6437,12 @@ impl<'a> Transformer<'a> {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: getfield({}) → guard_class", field.name),
             });
-            // `jtransform.py handle_getfield_typeptr`: `-live-` first, the guard is a
-            // resume point.
+            // `jtransform.py handle_getfield_typeptr`: every
+            // `getfield(x, 'typeptr')` becomes `[-live-, guard_class(x)]`,
+            // whatever produced `x` — parameters, loads, calls, residual
+            // `new`.  The class word is the object's runtime type; the
+            // guard publishes it.  A Constant base folds to a Constant
+            // class upstream; pyre's receivers here are SSA variables.
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
@@ -6915,6 +6913,54 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(ops)
     }
 
+    /// Whether `var` is a `new_with_vtable` result
+    /// (`jtransform.py rewrite_op_malloc` → `heaptracker.get_vtable_for_gcstruct`).
+    /// Walk through `__cast_instance_intrinsic`. A plain `new` does not stamp
+    /// the typeptr (that op is the no-vtable arm); a residual nursery bump
+    /// does not either, so the matching setfield must stay. The matching
+    /// getfield is `handle_getfield_typeptr` and is unconditional.
+    fn allocation_stamps_typeptr(
+        graph: &FunctionGraph,
+        var: &crate::flowspace::model::Variable,
+    ) -> bool {
+        let mut cur = var.clone();
+        for _ in 0..8 {
+            let Some(producer) = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find(|candidate| candidate.result.as_ref() == Some(&cur))
+            else {
+                return false;
+            };
+            match &producer.kind {
+                OpKind::NewWithVtable { .. } => return true,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.first().map(String::as_str)
+                    == Some(crate::runtime_names::shims::CAST_INSTANCE) =>
+                {
+                    let Some(inner) = args.first().and_then(LinkArg::as_variable) else {
+                        return false;
+                    };
+                    cur = inner.clone();
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Whether `op`'s FieldWrite base is a `new_with_vtable` result.
+    fn field_write_base_stamps_typeptr(graph: &FunctionGraph, op: &SpaceOperation) -> bool {
+        let OpKind::FieldWrite { base, .. } = &op.kind else {
+            return false;
+        };
+        Self::allocation_stamps_typeptr(graph, base)
+    }
+
     /// RPython: rewrite_op_setfield
     fn rewrite_op_setfield(
         &mut self,
@@ -6929,9 +6975,40 @@ impl<'a> Transformer<'a> {
         // # ignore the operation completely -- instead, it's done by 'new';
         // return` — checked before anything else, as on the read side.  The
         // class word is stamped by the allocation, so a write to it emits no
-        // op at all.
+        // op at all.  Dropping it is sound only after `rewrite_op_malloc`
+        // turned the allocation into `new_with_vtable`
+        // (`heaptracker.get_vtable_for_gcstruct`).
+        //
+        // `alloc_instance_object` does not become that op. Three stacked
+        // gaps, each required:
+        // 1. `fuse_boxing_alloc` `gc_malloc_flavor` matches only
+        //    `lltype::{malloc,malloc_typed,malloc_typed_managed,malloc_typed_stable}`.
+        //    The body calls `try_gc_alloc_nursery_raw(tid, size)`;
+        //    `lower_struct_ptr_writes` then turns `ptr::write` into
+        //    FieldWrites, so the residual is nursery Call + `ob_type` store.
+        // 2. `instance_typeptr_for` chooses `INSTANCE_TYPE` vs
+        //    `INSTANCE_USER_TYPE` at runtime. `resolve_header_plan` refuses a
+        //    non-constant `ob_type` (`ob_type-not-a-constant-address`) rather
+        //    than emitting plain `new`.
+        // 3. One Rust STRUCT (`W_ObjectObject`) carries two vtables: tid 53 /
+        //    `INSTANCE_TYPE` for exact `object()`, tid 217 /
+        //    `INSTANCE_USER_TYPE` for `_getusercls`. Upstream
+        //    `get_vtable_for_gcstruct` answers one vtable per STRUCT.
+        //    `NewWithVtable { owner: "W_ObjectObject", vtable: 0 }` would
+        //    stamp the published exact-object group, the wrong tid/typeptr
+        //    for user carriers. The user size descr already lives under
+        //    `objectobject::W_ObjectObjectUser`
+        //    (`W_OBJECT_OBJECT_USER_SIZE_DESCR`); there is no Rust STRUCT of
+        //    that name for `rclass.new_instance` to malloc.
+        // Convergence is `typedef.py _getusercls` as its own interp class
+        // (`W_ObjectObjectUserDictWeakrefable`), two specialized
+        // `new_instance` graphs with constant vtables, then this drop is
+        // unconditional. Teaching fuse the nursery spelling, or splitting
+        // only the typeptr without that STRUCT, still stamps the wrong GC
+        // tid on user instances. The store stays until that landing.
         if matches!(&op.kind, OpKind::FieldWrite { .. })
             && crate::codewriter::heaptracker::is_typeptr_field(field)
+            && Self::field_write_base_stamps_typeptr(graph, op)
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -27597,6 +27674,283 @@ mod tests {
                 .iter()
                 .all(|op| !matches!(op.kind, OpKind::FieldWrite { .. }))
         }));
+    }
+
+    /// `jtransform.py rewrite_op_setfield` drops typeptr only because
+    /// `rewrite_op_malloc` already emitted `new_with_vtable`. A residual
+    /// `try_gc_alloc_nursery_raw` is not that op (`gc_malloc_flavor` does
+    /// not match it; see `rewrite_op_setfield`), so the store stays even
+    /// after `__cast_instance_intrinsic`.
+    #[test]
+    fn rewrite_op_setfield_keeps_typeptr_on_residual_nursery_alloc() {
+        let mut graph = FunctionGraph::new("alloc_instance_object");
+        let bb = graph.startblock;
+        let tid = graph.push_op_var(bb, OpKind::ConstInt(217), true).unwrap();
+        let size = graph.push_op_var(bb, OpKind::ConstInt(32), true).unwrap();
+        let raw = graph
+            .push_op_var(
+                bb,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "gc_hook".into(),
+                            "try_gc_alloc_nursery_raw".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![tid, size]),
+                    result_ty: ValueType::Ref(Some("W_ObjectObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let dest = graph
+            .push_op_var(
+                bb,
+                crate::model::cast_instance_call("W_ObjectObject", raw.clone()),
+                true,
+            )
+            .unwrap();
+        let typeptr = graph
+            .push_op_var(bb, OpKind::ConstRefAddr(0x1000), true)
+            .unwrap();
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base: dest,
+                field: crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into())),
+                value: LinkArg::Value(typeptr),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(bb, Some(raw));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. } if field.name == "ob_type"
+                    )
+                })
+            }),
+            "typeptr store on a residual nursery bump must stay"
+        );
+    }
+
+    /// The matching drop: a `new_with_vtable` result stamps the class word,
+    /// so `is_typeptr_getset` still ignores the setfield.
+    #[test]
+    fn rewrite_op_setfield_drops_typeptr_on_new_with_vtable() {
+        let mut graph = FunctionGraph::new("w_float_new");
+        let bb = graph.startblock;
+        let obj = graph
+            .push_op_var(
+                bb,
+                OpKind::NewWithVtable {
+                    owner: "W_FloatObject".into(),
+                    vtable: 0x1000,
+                },
+                true,
+            )
+            .unwrap();
+        let typeptr = graph
+            .push_op_var(bb, OpKind::ConstRefAddr(0x1000), true)
+            .unwrap();
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base: obj.clone(),
+                field: crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into())),
+                value: LinkArg::Value(typeptr),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(bb, Some(obj));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block.operations.iter().all(|op| {
+                    !matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. } if field.name == "ob_type"
+                    )
+                })
+            }),
+            "typeptr store on new_with_vtable must drop"
+        );
+    }
+
+    /// Plain `new` is the no-vtable arm of `rewrite_op_malloc`. It does not
+    /// stamp the typeptr, so the store stays.
+    #[test]
+    fn rewrite_op_setfield_keeps_typeptr_on_plain_new() {
+        let mut graph = FunctionGraph::new("stack_pyobject");
+        let bb = graph.startblock;
+        let obj = graph
+            .push_op_var(
+                bb,
+                OpKind::New {
+                    owner: "PyObject".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let typeptr = graph
+            .push_op_var(bb, OpKind::ConstRefAddr(0x1000), true)
+            .unwrap();
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base: obj.clone(),
+                field: crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into())),
+                value: LinkArg::Value(typeptr),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(bb, Some(obj));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. } if field.name == "ob_type"
+                    )
+                })
+            }),
+            "typeptr store on plain new must stay"
+        );
+    }
+
+    /// `jtransform.py handle_getfield_typeptr` / `test_getfield_typeptr`:
+    /// every typeptr getfield becomes `[-live-, guard_class]`.
+    #[test]
+    fn rewrite_op_getfield_typeptr_on_new_with_vtable_is_guard_class() {
+        let mut graph = FunctionGraph::new("w_float_class");
+        let bb = graph.startblock;
+        let obj = graph
+            .push_op_var(
+                bb,
+                OpKind::NewWithVtable {
+                    owner: "W_FloatObject".into(),
+                    vtable: 0x1000,
+                },
+                true,
+            )
+            .unwrap();
+        graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base: obj.clone(),
+                    field: crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(bb, Some(obj));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
+            }),
+            "typeptr getfield of new_with_vtable must become guard_class"
+        );
+    }
+
+    /// `handle_getfield_typeptr` is unconditional: a typeptr load off a
+    /// plain `new`, a parameter, or a call result is still `guard_class`.
+    #[test]
+    fn rewrite_op_getfield_typeptr_on_plain_new_is_guard_class() {
+        let mut graph = FunctionGraph::new("stack_pyobject_read");
+        let bb = graph.startblock;
+        let obj = graph
+            .push_op_var(
+                bb,
+                OpKind::New {
+                    owner: "PyObject".into(),
+                },
+                true,
+            )
+            .unwrap();
+        graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base: obj.clone(),
+                    field: crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(bb, Some(obj));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
+            }),
+            "typeptr getfield of plain new must become guard_class"
+        );
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block.operations.iter().all(|op| {
+                    !matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. } if field.name == "ob_type"
+                    )
+                })
+            }),
+            "typeptr getfield of plain new must not stay a getfield"
+        );
+    }
+
+    /// Same rewrite on a parameter: `handle_getfield_typeptr` does not
+    /// inspect the producer.
+    #[test]
+    fn rewrite_op_getfield_typeptr_on_parameter_is_guard_class() {
+        let mut graph = FunctionGraph::new("type_of_arg");
+        let bb = graph.startblock;
+        let obj =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(obj.clone());
+        graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base: obj.clone(),
+                    field: crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(bb, Some(obj));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::GuardClass { .. }))
+            }),
+            "typeptr getfield of a parameter must become guard_class"
+        );
     }
 
     /// `rewrite_op_getfield` drops a void result (`RESULT is lltype.Void`),

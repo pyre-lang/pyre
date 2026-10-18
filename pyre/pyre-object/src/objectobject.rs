@@ -121,10 +121,13 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// `self.setfield(vptr, '__class__', ...)` and one `setfield` per default).
 /// This function is not that shape: it still builds a whole
 /// `W_ObjectObject` and `ptr::write`s it into raw bytes obtained from
-/// `try_gc_alloc_stable_raw(id, size)`, which carries no `malloc(STRUCT)`
+/// `try_gc_alloc_nursery_raw(id, size)`, which carries no `malloc(STRUCT)`
 /// operand for `heaptracker.get_vtable_for_gcstruct` to read. Converging
-/// means allocating zeroed and storing `ob_type`, `w_class`, `map` and
-/// `storage` individually, in `new_instance`'s order.
+/// means two specialized `new_instance` graphs — exact `object()` vs
+/// `typedef.py _getusercls` (`W_ObjectObjectUserDictWeakrefable`) — each
+/// with a constant vtable, matching the two size descrs already published
+/// as `W_ObjectObject` and `objectobject::W_ObjectObjectUser`. One STRUCT
+/// with a runtime `instance_typeptr_for` cannot become `new_with_vtable`.
 ///
 /// Allocate a `W_ObjectObject` through the GC. The header tid is the one
 /// [`instance_typeptr_for`] chooses — [`W_OBJECT_OBJECT_GC_TYPE_ID`] for
