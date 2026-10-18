@@ -2378,14 +2378,16 @@ where
         );
         // pyjitpl.py `_create_segmented_trace_and_blackhole`:
         // `exception_box = ConstInt(ptr2int(llexception.typeptr))` from
-        // `jitexc.get_llexception` / `jitexc._get_standard_error`.
+        // `jitexc.get_llexception` / `jitexc._get_standard_error`. Every
+        // RPython program has the standard AssertionError; a majit host
+        // without an exception hierarchy installs no hook, and the FINISH
+        // is the unreachable one upstream records, so its ConstInt(0) is
+        // never read.
         let typeptr = ctx
             .metainterp_sd()
             .host
             .assertion_error_typeptr
-            .expect(
-                "pyjitpl.py _create_segmented_trace_and_blackhole always gets a real AssertionError typeptr",
-            )();
+            .map_or(0, |f| f());
         let exception_box = ctx.const_int(typeptr);
         // pyjitpl.py:1639-1640 `if (metainterp.current_merge_points and
         // isinstance(metainterp.resumekey, compile.ResumeFromInterpDescr)):`
