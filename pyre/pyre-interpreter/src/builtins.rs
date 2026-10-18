@@ -21596,8 +21596,8 @@ pub(crate) fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     "ord() expected a character, but string of length {count} found"
                 )));
             }
-            let cp = w_str_get_wtf8(obj).code_points().next().unwrap();
-            return Ok(w_int_new(cp.to_u32() as i64));
+            let cp = pyre_object::unicodeobject::w_str_codepoint_at_pos_dont_look_inside(obj, 0);
+            return Ok(w_int_new(cp));
         }
         // bytesobject.py:473 names bytes "bytes"; bytearrayobject.py:213
         // names bytearray "string".
@@ -21623,32 +21623,23 @@ pub(crate) fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     )))
 }
 
-/// `ord` on an exact one-code-point `str`: the code point, or -1.
-#[majit_macros::elidable_cannot_raise]
-pub fn ord_exact_str_char(w_obj: PyObjectRef) -> i64 {
-    unsafe {
-        if !(is_exact_builtin_instance(w_obj) && is_str(w_obj)) || w_str_len(w_obj) != 1 {
-            return -1;
-        }
-        w_str_get_wtf8(w_obj)
-            .code_points()
-            .next()
-            .map_or(-1, |cp| cp.to_u32() as i64)
-    }
-}
-
 #[majit_macros::dont_look_inside]
 fn builtin_ord_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     builtin_ord(args)
 }
 
-/// operation.py `ord` → `space.ord`.  An exact one-code-point `str` answers
-/// through [`ord_exact_str_char`]; every other shape runs `builtin_ord`.
+/// operation.py `ord` → `space.ord`.  A one-code-point `str` answers
+/// through `W_UnicodeObject.ord`; every other shape, and the `TypeError`,
+/// runs `builtin_ord`.
 pub fn __majit_wrap_builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 1 {
-        let code_point = ord_exact_str_char(args[0]);
-        if code_point >= 0 {
-            return Ok(w_int_new(code_point));
+        let w_obj = args[0];
+        unsafe {
+            if is_str(w_obj) && w_str_len(w_obj) == 1 {
+                let cp =
+                    pyre_object::unicodeobject::w_str_codepoint_at_pos_dont_look_inside(w_obj, 0);
+                return Ok(w_int_new(cp));
+            }
         }
     }
     builtin_ord_slow(args)

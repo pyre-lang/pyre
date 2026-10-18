@@ -3315,6 +3315,11 @@ pub fn set_active_alloc_nursery_collecting_typed(hook: Option<AllocNurseryCollec
     ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.set(hook);
 }
 
+/// Whether a backend installed the collecting nursery allocator.
+pub fn alloc_nursery_collecting_typed_installed() -> bool {
+    ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED.get().is_some()
+}
+
 /// Allocate through the active backend's collecting nursery allocator. Returns
 /// `GcRef(0)` when no backend (or no collecting hook) is installed (callers
 /// treat this as null and fall back to the no-collect path).

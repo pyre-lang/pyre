@@ -127,16 +127,6 @@ extern "C" fn w_list_pop_end_inner_word(obj: i64) -> i64 {
         as usize as i64
 }
 
-/// One-word residual ABI for `w_str_getitem`. Out of range is NULL; the
-/// descended `getitem_str` graph still owns the IndexError.
-/// `Option<PyObjectRef>` is two words, as for `w_list_pop_end_word`.
-extern "C" fn w_str_getitem_word(obj: i64, index: i64) -> i64 {
-    unsafe {
-        pyre_object::unicodeobject::w_str_getitem(obj as usize as pyre_object::PyObjectRef, index)
-    }
-    .unwrap_or(pyre_object::PY_NULL) as usize as i64
-}
-
 /// One-word residual ABI for `w_dict_lookup_int_strategy`. A miss is NULL.
 /// `Option<PyObjectRef>` is two words with no pointer niche, so the Rust
 /// item would return the `Some` discriminant; `llmodel.py bh_call_r` reads
@@ -939,6 +929,9 @@ macro_rules! residual_word_addr {
     };
     (fn 1, $f:path $(,)?) => {
         $crate::residual_word_addr!(@apply rust_addr1, $f, a0)
+    };
+    (fn 3, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply rust_addr3, $f, a0, a1, a2)
     };
     (unsafe 1, $f:path $(,)?) => {
         $crate::residual_word_addr!(@unsafe_extern extern_addr1, $f, a0)
@@ -4216,12 +4209,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_list_pop_end",
         w_list_pop_end_word,
     );
-    cpa2!(
-        &mut entries,
-        "pyre_object::unicodeobject::w_str_getitem",
-        "pyre_object::w_str_getitem",
-        w_str_getitem_word,
-    );
     upa1!(
         &mut entries,
         "pyre_object::listobject::w_list_len",
@@ -6899,7 +6886,7 @@ mod tests {
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
         w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
         w_dict_lookup_int_strategy_word, w_list_pop_end_inner_word, w_list_pop_end_word,
-        w_module_dict_lookup_object_entries_word, w_str_getitem_word,
+        w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -7208,14 +7195,6 @@ mod tests {
             (
                 "pyre_object::w_list_pop_end_inner",
                 w_list_pop_end_inner_word as *const () as usize as i64,
-            ),
-            (
-                "pyre_object::unicodeobject::w_str_getitem",
-                w_str_getitem_word as *const () as usize as i64,
-            ),
-            (
-                "pyre_object::w_str_getitem",
-                w_str_getitem_word as *const () as usize as i64,
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");

@@ -91,6 +91,40 @@ pub fn bh_alloc_str_nofill(length: usize) -> i64 {
     alloc_lowlevel_string(length, LOWLEVEL_STR_BASE_SIZE, 1, false)
 }
 
+/// `rstr.mallocstr`: `malloc(STR, length)` is `malloc_varsize`, which can
+/// collect -- a minor when the nursery is full, and
+/// `minor_collection_with_major_progress` from `external_malloc` once a large
+/// young string reaches the major threshold.  The caller fills `chars` and
+/// holds every GC pointer it reads afterwards on the shadow stack.
+/// [`bh_alloc_str_nofill`] is the non-collecting twin for callers that cannot.
+///
+/// Returns 0 on overflow / allocation failure.
+pub fn mallocstr(length: usize) -> i64 {
+    let tid = lowlevel_str_gc_type_id();
+    // No collecting allocator installed (no backend, as in a unit test).
+    if tid == 0 || !majit_gc::alloc_nursery_collecting_typed_installed() {
+        return bh_alloc_str_nofill(length);
+    }
+    let Some(total_size) = LOWLEVEL_STR_BASE_SIZE.checked_add(length) else {
+        return 0;
+    };
+    // `majit_gc::alloc_nursery_collecting_typed` is how a graph spells the
+    // `malloc_varsize` operation: the codewriter's collect analysis marks it
+    // `canmallocgc`, so a JIT residual call to a caller carries a gcmap.
+    let ptr = majit_gc::alloc_nursery_collecting_typed(tid, total_size).0 as *mut u8;
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe {
+        // `rstr.mallocstr` stores `r.hash = 0` (`malloc_zero_filled` is
+        // false); the extra base byte is the trailing NUL.
+        (ptr as *mut usize).write(0);
+        ptr.add(LOWLEVEL_STRING_CHARS_OFFSET + length).write(0);
+        (ptr.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(length);
+    }
+    ptr as i64
+}
+
 fn alloc_lowlevel_string(
     length: usize,
     base_size: usize,
@@ -306,7 +340,9 @@ pub extern "C" fn jit_ll_strconcat(
     // matching the GC transform around `LLHelpers.ll_strconcat`.
     let roots = crate::gc_roots::push_roots();
     let base = roots.pin_roots(&[s1 as crate::PyObjectRef, s2 as crate::PyObjectRef]);
-    let out = bh_alloc_lowlevel_string(total, LOWLEVEL_STR_BASE_SIZE, 1);
+    // `s2.malloc(len1 + len2)` is `mallocstr`: the two copies below fill
+    // every char, so the block is not cleared first.
+    let out = mallocstr(total);
     assert!(
         out != 0,
         "ll_strconcat failed to allocate {total} bytes; MemoryError propagation is not ported yet"
@@ -512,7 +548,8 @@ pub extern "C" fn jit_ll_str_mul(
     let roots = crate::gc_roots::push_roots();
     let s_slot = roots.base();
     let _ = roots.pin_root(s as crate::PyObjectRef);
-    let out = bh_alloc_lowlevel_string(size, LOWLEVEL_STR_BASE_SIZE, 1);
+    // `s.malloc(size)` is `mallocstr`; the doubling copy fills every char.
+    let out = mallocstr(size);
     assert!(
         out != 0,
         "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
@@ -561,7 +598,8 @@ pub fn _ll_stringslice(
         return empty as *mut crate::unicodeobject::Utf8Str;
     }
     let lgt = lgt as usize;
-    let out = bh_alloc_lowlevel_string(lgt, LOWLEVEL_STR_BASE_SIZE, 1);
+    // `s1.malloc(lgt)` is `mallocstr`; the copy below fills every char.
+    let out = mallocstr(lgt);
     if out == 0 {
         return std::ptr::null_mut();
     }
@@ -655,7 +693,9 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str
         i /= 10;
     }
     let total_len = sign + len + usize::from(is_zero);
-    let out = bh_alloc_lowlevel_string(total_len, LOWLEVEL_STR_BASE_SIZE, 1);
+    // `mallocstr(total_len)`; the sign or `'0'` and the digit loop fill every
+    // char.
+    let out = mallocstr(total_len);
     // `descr_str` wraps the payload unchecked, as `ll_strconcat`'s callers do.
     assert!(
         out != 0,

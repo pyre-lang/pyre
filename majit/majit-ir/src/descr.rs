@@ -8561,9 +8561,9 @@ impl CallDescr for SimpleCallDescr {
 unsafe extern "C" {
     // llsupport/memcpy.py:3-5 — the host `memcpy` symbol that
     // `gc.py self.memcpy_fn = memcpy_fn` binds via `rffi.llexternal`.
-    // Spelled with `c_void` to match the runtime symbol's own signature;
-    // only its address is ever taken (`memcpy_fn_addr`), never a call
-    // through this declaration.
+    // Spelled with `c_void` to match the runtime symbol's own signature.
+    // Native backends take its address (`memcpy_fn_addr`); only the wasm32
+    // word shim `memcpy_word` calls through this declaration.
     fn memcpy(
         dest: *mut core::ffi::c_void,
         src: *const core::ffi::c_void,
@@ -8579,7 +8579,29 @@ unsafe extern "C" {
 /// a stable ConstInt argument across rewrites — matching upstream where
 /// the address is read once into `self.memcpy_fn` per CPU.
 pub fn memcpy_fn_addr() -> i64 {
-    memcpy as *const () as i64
+    #[cfg(target_arch = "wasm32")]
+    {
+        memcpy_word as *const () as i64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        memcpy as *const () as i64
+    }
+}
+
+/// `memcpy.py`'s `rffi.llexternal('memcpy', [Address, Address, SIZE_T],
+/// Void)` in the word ABI `memcpy_descr` names. On wasm32 the C symbol takes
+/// i32 words, so the trace would otherwise reach it through the host
+/// trampoline instead of a direct `call_indirect`.
+#[cfg(target_arch = "wasm32")]
+extern "C" fn memcpy_word(dest: i64, src: i64, n: i64) {
+    unsafe {
+        memcpy(
+            dest as usize as *mut core::ffi::c_void,
+            src as usize as *const core::ffi::c_void,
+            n as usize,
+        );
+    }
 }
 
 /// llsupport/gc.py `GcLLDescr_framework.memcpy_descr`.

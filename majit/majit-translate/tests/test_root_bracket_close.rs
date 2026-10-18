@@ -741,6 +741,34 @@ fn ll_listslice_new_int_list_bracket_is_scalar_replaced() {
     }
 }
 
+/// `format_int_decimal` roots the fill, the sign and the digits across the
+/// collecting `mallocstr` helpers. The FORMAT_WITH_SPEC int fold descends its
+/// body, so the bracket must be scalar-replaced rather than left as residual
+/// shadow-stack calls the sub-walk cannot trace.
+#[test]
+fn format_int_decimal_bracket_is_scalar_replaced() {
+    let Some(llbc) = object_llbc() else { return };
+    let graph = lower_named(llbc, "format_int_decimal");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "pin_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "base",
+        "get",
+        "set",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "format_int_decimal still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
 /// `int_ll_newlist` is `@oopspec("newlist(length)")`. After jtransform the
 /// call in `ll_listslice_new_int_list` is `new_array` of
 /// `LIST_INT_ITEMS_ARRAY`, not a residual Call.

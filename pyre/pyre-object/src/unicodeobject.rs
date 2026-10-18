@@ -358,11 +358,12 @@ pub fn w_str_from_storage_and_length(
     value: *mut UnicodeValueStorage,
     length: usize,
 ) -> *mut PyObject {
-    // `len(utf8str)`: the rstr `STR` `len` word (`LLHelpers.ll_strlen`).
+    // `len(utf8str)` (`LLHelpers.ll_strlen`): read through the byte view so
+    // it records `strlen`, which a virtual slice answers without forcing.
     let byte_len = if value.is_null() {
         0
     } else {
-        unsafe { (*value).length }
+        unsafe { utf8_payload_bytes(value) }.len()
     };
     crate::lltype::malloc_typed_managed(W_UnicodeObject {
         ob_header: PyObject {
@@ -478,12 +479,14 @@ pub unsafe fn w_str_slice_codepoints(
 /// `a` and `b` must point to valid `W_UnicodeObject`s.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    // `W_UnicodeObject(self._utf8 + w_other._utf8, self._len() + w_other._len())`.
+    // The lengths are read first: `ll_strconcat` can collect, and neither
+    // `a` nor `b` is rooted across it.
+    let length =
+        unsafe { (*(a as *const W_UnicodeObject)).len + (*(b as *const W_UnicodeObject)).len };
     let sa = unsafe { w_str_storage(a) };
     let sb = unsafe { w_str_storage(b) };
     let payload = crate::lowlevel_string::jit_ll_strconcat(sa, sb);
-    // `W_UnicodeObject(self._utf8 + w_other._utf8, self._len() + w_other._len())`
-    let length =
-        unsafe { (*(a as *const W_UnicodeObject)).len + (*(b as *const W_UnicodeObject)).len };
     w_str_from_storage_and_length(payload, length)
 }
 
@@ -1977,6 +1980,25 @@ pub fn next_codepoint_pos_dont_look_inside(utf8: *mut Utf8Str, p: usize) -> usiz
     unsafe { crate::rutf8::next_codepoint_pos(utf8_payload_wtf8(utf8), p) }
 }
 
+/// `unicodeobject.py codepoint_at_pos_dont_look_inside` — `@jit.elidable`.
+#[majit_macros::elidable]
+pub fn codepoint_at_pos_dont_look_inside(utf8: *mut Utf8Str, p: usize) -> i64 {
+    unsafe { crate::rutf8::codepoint_at_pos(utf8_payload_wtf8(utf8), p) }
+}
+
+/// `W_UnicodeObject.codepoint_at_pos_dont_look_inside`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject` and `pos` must be a
+/// code-point boundary inside it.
+pub unsafe fn w_str_codepoint_at_pos_dont_look_inside(obj: PyObjectRef, pos: usize) -> i64 {
+    if unsafe { w_str_is_ascii(obj) } {
+        unsafe { w_str_get_wtf8(obj) }.as_bytes()[pos] as i64
+    } else {
+        codepoint_at_pos_dont_look_inside(unsafe { w_str_storage(obj) }, pos)
+    }
+}
+
 /// `W_UnicodeObject.next_codepoint_pos_dont_look_inside`.
 ///
 /// # Safety
@@ -2000,14 +2022,9 @@ pub unsafe fn w_str_next_codepoint_pos_dont_look_inside(obj: PyObjectRef, pos: u
 /// `ll_stringslice_startstop` (`@jit.oopspec('stroruni.slice')`); the
 /// wrap is `space.newutf8`.
 ///
-/// Residual (through the one-word `w_str_getitem_word` bridge): looking
-/// inside this body currently hits `stroruni.slice` with a first argument
-/// whose concretetype is not `rpy_string`.  Unseal with the wrap helper.
-///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_str_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let len = unsafe { w_str_len(obj) } as i64;
     let idx = if index < 0 { index + len } else { index };

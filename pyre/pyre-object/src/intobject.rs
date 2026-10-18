@@ -381,53 +381,103 @@ pub unsafe fn format_int_decimal(
     align: i64,
     forced_sign: *mut crate::unicodeobject::Utf8Str,
 ) -> PyObjectRef {
+    type Str = crate::unicodeobject::Utf8Str;
+    // `ll_int2dec`, `ll_stringslice_startstop`, `ll_str_mul` and
+    // `ll_strconcat` allocate through `mallocstr`, which can collect. The
+    // fill, the sign and the digits each outlive one of those calls, so they
+    // sit in this bracket and are read back from it after every call. Every
+    // slot is claimed up front: `base` holds the fill and then the padding
+    // once `ll_str_mul` has read it, `base + 1` the sign, `base + 2` the
+    // digits and each concatenation.
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(fill as PyObjectRef);
+    let _ = roots.pin_root(forced_sign as PyObjectRef);
+    let _ = roots.pin_root(std::ptr::null_mut());
     let payload = crate::lowlevel_string::jit_ll_int2dec(value);
     let length = unsafe { (*payload).length } as i64;
-    let mut digits = payload;
+    roots.set(base + 2, payload as PyObjectRef);
     let mut n_digits = length;
-    let mut sign: *mut crate::unicodeobject::Utf8Str = std::ptr::null_mut();
     let mut sign_len = 0i64;
     if value < 0 {
-        sign = crate::lowlevel_string::ll_stringslice_startstop(payload, 0, 1);
-        digits = crate::lowlevel_string::ll_stringslice_startstop(payload, 1, length);
+        let sign = crate::lowlevel_string::ll_stringslice_startstop(payload, 0, 1);
+        roots.set(base + 1, sign as PyObjectRef);
+        let digits = crate::lowlevel_string::ll_stringslice_startstop(
+            roots.get(base + 2) as *mut Str,
+            1,
+            length,
+        );
+        roots.set(base + 2, digits as PyObjectRef);
         n_digits = length - 1;
         sign_len = 1;
-    } else if !forced_sign.is_null() {
-        sign = forced_sign;
+    } else if !roots.get(base + 1).is_null() {
         sign_len = 1;
     }
-    let mut storage = digits;
     let mut out_len = n_digits;
     let n_padding = width - (sign_len + n_digits);
     if n_padding > 0 {
-        let pad = crate::lowlevel_string::jit_ll_str_mul(fill, n_padding);
+        let pad = crate::lowlevel_string::jit_ll_str_mul(roots.get(base) as *mut Str, n_padding);
+        roots.set(base, pad as PyObjectRef);
         if align == FORMAT_INT_ALIGN_LEFT {
             if sign_len > 0 {
-                storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+                let joined = crate::lowlevel_string::jit_ll_strconcat(
+                    roots.get(base + 1) as *mut Str,
+                    roots.get(base + 2) as *mut Str,
+                );
+                roots.set(base + 2, joined as PyObjectRef);
                 out_len += sign_len;
             }
-            storage = crate::lowlevel_string::jit_ll_strconcat(storage, pad);
+            let joined = crate::lowlevel_string::jit_ll_strconcat(
+                roots.get(base + 2) as *mut Str,
+                roots.get(base) as *mut Str,
+            );
+            roots.set(base + 2, joined as PyObjectRef);
             out_len += n_padding;
         } else if align == FORMAT_INT_ALIGN_SIGN {
-            storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            let joined = crate::lowlevel_string::jit_ll_strconcat(
+                roots.get(base) as *mut Str,
+                roots.get(base + 2) as *mut Str,
+            );
+            roots.set(base + 2, joined as PyObjectRef);
             out_len += n_padding;
             if sign_len > 0 {
-                storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+                let joined = crate::lowlevel_string::jit_ll_strconcat(
+                    roots.get(base + 1) as *mut Str,
+                    roots.get(base + 2) as *mut Str,
+                );
+                roots.set(base + 2, joined as PyObjectRef);
                 out_len += sign_len;
             }
         } else if sign_len > 0 {
-            storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+            let joined = crate::lowlevel_string::jit_ll_strconcat(
+                roots.get(base + 1) as *mut Str,
+                roots.get(base + 2) as *mut Str,
+            );
+            roots.set(base + 2, joined as PyObjectRef);
             out_len += sign_len;
-            storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            let joined = crate::lowlevel_string::jit_ll_strconcat(
+                roots.get(base) as *mut Str,
+                roots.get(base + 2) as *mut Str,
+            );
+            roots.set(base + 2, joined as PyObjectRef);
             out_len += n_padding;
         } else {
-            storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            let joined = crate::lowlevel_string::jit_ll_strconcat(
+                roots.get(base) as *mut Str,
+                roots.get(base + 2) as *mut Str,
+            );
+            roots.set(base + 2, joined as PyObjectRef);
             out_len += n_padding;
         }
     } else if sign_len > 0 {
-        storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+        let joined = crate::lowlevel_string::jit_ll_strconcat(
+            roots.get(base + 1) as *mut Str,
+            roots.get(base + 2) as *mut Str,
+        );
+        roots.set(base + 2, joined as PyObjectRef);
         out_len += sign_len;
     }
+    let storage = roots.get(base + 2) as *mut Str;
     crate::unicodeobject::w_str_from_storage_and_length(storage, out_len as usize)
 }
 

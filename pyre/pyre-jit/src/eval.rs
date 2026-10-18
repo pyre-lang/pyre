@@ -6103,6 +6103,26 @@ fn build_jit_driver_pair() -> JitDriverPair {
             pyre_interpreter::residual_word_addr!(2, pyre_object::lowlevel_string::jit_ll_strconcat,) as u64,
             "jit_ll_strconcat",
         );
+        // `stroruni.slice` on `_ll_stringslice` adds `OS_STR_SLICE` the same
+        // way; `resume.py slice_string` calls it to rebuild a virtual slice.
+        let descr = majit_metainterp::make_call_descr_with_effect(
+            &[
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+            ],
+            majit_ir::Type::Ref,
+            majit_ir::EffectInfo::const_new(
+                majit_ir::ExtraEffect::ElidableOrMemoryError,
+                majit_ir::OopSpecIndex::StrSlice,
+            ),
+        );
+        d.meta_interp_mut().ensure_oopspec_callinfo(
+            majit_ir::OopSpecIndex::StrSlice,
+            descr,
+            pyre_interpreter::residual_word_addr!(fn 3, pyre_object::lowlevel_string::_ll_stringslice,) as u64,
+            "_ll_stringslice",
+        );
     }
     // `jtransform.py _handle_stroruni_call` registers the `OS_STREQ_*`
     // helpers beside `stroruni.equal` (`_register_extra_helper`); vstring's

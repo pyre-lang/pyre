@@ -3401,15 +3401,17 @@ impl MiniMarkGC {
             total_size - GcHeader::SIZE,
             crate::BH_PROBE_ORIGIN_BORN_YOUNG_RAW,
         );
-        // `external_malloc` asks the threshold question for this arm as well;
-        // `finish_alloc_in_oldgen` records why pyre can only defer the answer.
+        // `external_malloc` asks the threshold question before this birth, and
+        // a collecting caller has already answered it with
+        // `minor_collection_with_major_progress`. Asking it again here would
+        // arm the safepoint's major one allocation ahead of the minor that
+        // frees the dead young blocks; the no-collect caller raises its own
+        // deferred request instead.
         //
         // `bytes_made_old_since_cycle` is deliberately NOT bumped here: nothing
         // was made old. `visit_young_rawmalloced_object` bumps it at promotion,
         // where upstream bumps `size_objects_made_old`.
-        if self.threshold_reached(total_size) && deferred_major_request_wanted() {
-            majit_ir::eval_breaker_word::set_gc();
-        }
+        //
         // `malloc_fixedsize`'s tail runs for both arms: the large arm falls out
         // of the `if` into the same `if needs_finalizer:
         // self.young_objects_with_destructors.append(obj)`. A young rawmalloced
@@ -10801,9 +10803,13 @@ impl GcAllocator for MiniMarkGC {
         // reason `alloc_oldgen_typed` gives: the host callers this entry
         // exists for hold the fields they are about to store on the Rust
         // stack, where a collection run here would leave them stale. The
-        // threshold question is still asked — `finish_alloc_young_nonmoving`
-        // raises the deferred major request, and the interpreter safepoint
-        // answers it where the root set is known.
+        // threshold question is still asked — this raises the deferred major
+        // request, and the interpreter safepoint answers it where the root set
+        // is known; `finish_alloc_in_oldgen` records why pyre can only defer
+        // the answer.
+        if self.threshold_reached(total_size) && deferred_major_request_wanted() {
+            majit_ir::eval_breaker_word::set_gc();
+        }
         if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
             return obj;
         }
@@ -12460,8 +12466,13 @@ mod tests {
     /// fails continuously and the guard grows a bridge chain that stops
     /// returning to the dispatch loop, starving the rest of the eval-breaker
     /// word — signals included.
+    /// The deferred-major tests install the process-global request probe and
+    /// read the process-global eval-breaker bit, so they run one at a time.
+    static DEFERRED_MAJOR_PROBE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn born_old_allocation_past_the_threshold_asks_the_consumer_every_time() {
+        let _guard = DEFERRED_MAJOR_PROBE_TEST_LOCK.lock();
         fn refuse() -> bool {
             false
         }
@@ -12498,6 +12509,37 @@ mod tests {
 
         set_deferred_major_request_probe(None);
         majit_ir::eval_breaker_word::take_gc();
+    }
+
+    /// `external_malloc(..., alloc_young=True)` on the collecting path: the
+    /// threshold is answered before the birth by a minor, which frees the dead
+    /// young blocks, so no major starts and no deferred request is armed.
+    #[test]
+    fn collecting_young_large_births_past_the_threshold_run_minors_not_majors() {
+        let _guard = DEFERRED_MAJOR_PROBE_TEST_LOCK.lock();
+        fn accept() -> bool {
+            true
+        }
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::object(64));
+        let payload = gc.config.large_object_threshold;
+        let block = GcHeader::SIZE + payload;
+        // Room for three dead blocks before the threshold is reached.
+        gc.next_major_collection_threshold =
+            (gc.get_total_memory_used() + 3 * block + gc.config.nursery_size / 2) as f64;
+        majit_ir::eval_breaker_word::take_gc();
+        set_deferred_major_request_probe(Some(accept));
+        for _ in 0..16 {
+            assert!(!gc.alloc_with_type(tid, payload).is_null());
+            assert!(
+                !majit_ir::eval_breaker_word::take_gc(),
+                "a collecting young birth must not arm the safepoint's major"
+            );
+        }
+        set_deferred_major_request_probe(None);
+        assert!(gc.minor_collections > 0);
+        assert_eq!(gc.major_collections, 0);
+        assert_eq!(gc.gc_state, GcState::Scanning);
     }
 
     #[test]
