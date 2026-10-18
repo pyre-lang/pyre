@@ -1331,6 +1331,21 @@ pub struct ProducedShortOp {
     pub label_arg_idx: Option<usize>,
 }
 
+/// shortpreamble.py `HeapOp.produce_op` `ensure_ptr_info_arg0(g)`.
+///
+/// `g` in RPython uses the original heap args for the heap-cache write;
+/// pyre already does that via `source_getfield_op`. `use_box` `make_guards`
+/// reads the replay GETFIELD/GETARRAYITEM arg 0, which `produce_arg`
+/// renamed (`short_inputargs[i]`). Upgrade that renamed receiver so
+/// `InstancePtrInfo.make_guards` emits `GUARD_SUBCLASS` of it
+/// (`test_guards_before_getfields_in_short_preamble`). Do not
+/// rematerialize arg 0 from an OpRef: `OpRc::clone` is the same ResOp,
+/// and `materialize_operand_at` would replace the renamed box with a
+/// different InputArg Rc at the same position.
+fn ensure_replay_heap_receiver(ctx: &mut crate::optimizeopt::OptContext, replay: &OpRc) {
+    ctx.with_ensured_ptr_info_arg0(replay, |_| {});
+}
+
 impl ProducedShortOp {
     /// shortpreamble.py `ProducedShortOp.produce_op` + per-kind dispatch:
     /// - `PureOp.produce_op`
@@ -1616,6 +1631,10 @@ impl ProducedShortOp {
                     OpRc::new(getfield_op.clone())
                 }
             });
+        // shortpreamble.py `HeapOp.produce_op` `ensure_ptr_info_arg0(g)`
+        // on the replay GETFIELD's renamed receiver. `use_box` make_guards
+        // names this arg, not `source_op.arg(0)`.
+        ensure_replay_heap_receiver(ctx, &replay_rc);
         let pop = crate::optimizeopt::info::PreambleOp {
             // shortpreamble.py `PreambleOp(self.res, preamble_op, invented_name)`:
             // the carried Box itself. An invented alias entry
@@ -1737,6 +1756,10 @@ impl ProducedShortOp {
                     OpRc::new(getarrayitem_op.clone())
                 }
             });
+        // shortpreamble.py `HeapOp.produce_op` `ensure_ptr_info_arg0(g)` on
+        // the replay GETARRAYITEM's renamed receiver, same as the GETFIELD
+        // arm: `use_box` make_guards names this arg, not `source_op.arg(0)`.
+        ensure_replay_heap_receiver(ctx, &replay_rc);
         let pop = crate::optimizeopt::info::PreambleOp {
             // shortpreamble.py `PreambleOp(self.res, preamble_op, invented_name)`:
             // the carried Box itself. An invented alias entry

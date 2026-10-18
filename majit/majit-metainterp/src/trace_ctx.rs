@@ -3496,6 +3496,28 @@ impl TraceCtx {
         self.close_typed_key = Some(key);
     }
 
+    /// pyjitpl.py `get_procedure_token(greenboxes)`: the merge point
+    /// being closed, its own greens and guest pc. The
+    /// `already_compiled_here` arm already publishes these; walker
+    /// `CloseLoop` must too so `close_header_pc` does not fall back to
+    /// the session header (mc_diag slot 56).
+    pub fn publish_close_from_merge_point(
+        &mut self,
+        greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>)>,
+        pc: i64,
+    ) {
+        if let Some(g) = greens {
+            self.close_greens = Some(g);
+        }
+        self.close_green_pc = Some(pc);
+    }
+
+    /// Guest pc of the merge point being closed, when greens were
+    /// already published or only the pc is known.
+    pub fn set_close_green_pc(&mut self, pc: i64) {
+        self.close_green_pc = Some(pc);
+    }
+
     pub fn close_green_key(&self) -> Option<GreenKey> {
         if let Some(key) = &self.close_typed_key {
             return Some(key.clone());
@@ -9123,6 +9145,70 @@ mod tests {
         assert_eq!(boxes[1].ty, Type::Ref);
         assert_eq!(boxes[0].opref, OpRef::input_arg_typed(0, Type::Int));
         assert_eq!(boxes[1].opref, OpRef::input_arg_typed(1, Type::Ref));
+    }
+
+    #[test]
+    fn find_merge_point_same_greenkey_skips_bridge_position_zero_seed() {
+        // pyjitpl.py handle_guard_failure: current_merge_points = [].
+        // The position-0 seed is compile_and_run_once, not a
+        // reached_loop_header append. A leftover seed must not close a
+        // bridge (`same_constant` / typed-only same_greenkey).
+        let mut recorder = Trace::new();
+        let i0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0xABCD,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.is_bridge_trace = true;
+        ctx.set_green_key_values(crate::test_greens::gk(0));
+        ctx.seed_compile_and_run_once_merge_point();
+        assert_eq!(ctx.current_merge_points.len(), 1);
+        assert!(
+            !ctx.current_merge_points[0]
+                .position
+                .has_prefix_ops(ctx.num_inputargs())
+        );
+
+        let live = majit_ir::pypyjit_greenkey(23, false, 0x1000);
+        assert!(
+            ctx.find_merge_point_same_greenkey(&live).is_none(),
+            "bridge seed must not match a typed live close"
+        );
+
+        // A later header visit (has_prefix_ops) still matches.
+        let _ = ctx.record_op(OpCode::IntAdd, &[i0, i0]);
+        let typed = majit_ir::pypyjit_greenkey(23, false, 0x1000);
+        ctx.add_merge_point_with_key(
+            typed.get_uhash(),
+            typed.clone(),
+            vec![GreenBox::new(i0, Type::Int)],
+            23,
+        );
+        assert!(
+            ctx.find_merge_point_same_greenkey(&typed).is_some(),
+            "a reached_loop_header append still matches"
+        );
+    }
+
+    #[test]
+    fn find_merge_point_same_greenkey_typed_live_does_not_match_seed() {
+        // Typed-only same_greenkey (`#2478`): a live close that is not
+        // `same_constant` with the seed does not match it.
+        let mut recorder = Trace::new();
+        let _i0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0xABCD,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_green_key_values(crate::test_greens::gk(0));
+        ctx.seed_compile_and_run_once_merge_point();
+        let live = majit_ir::pypyjit_greenkey(23, false, 0x1000);
+        assert!(
+            ctx.find_merge_point_same_greenkey(&live).is_none(),
+            "typed live close does not same_constant-match the seed"
+        );
     }
 
     #[test]

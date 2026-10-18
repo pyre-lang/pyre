@@ -8789,6 +8789,40 @@ pub(crate) fn resume_frame_is_translated_helper(jitcode_index: i32) -> bool {
         .is_some_and(|pjc| !pjc.jitcode.code.is_empty() && !jitcode_owns_python_frame(&pjc.jitcode))
 }
 
+/// Drop the in-flight call dest from its liveness bank and return its index
+/// in encoder order `[int | ref | float]`. `MIFrame.get_list_of_active_boxes`
+/// (`pyjitpl.py`) clears that dest; `resume.py consume_boxes` then fills the
+/// remaining boxes.
+fn take_pending_dest_from_liveness(
+    bank: char,
+    color: usize,
+    reg_indices: &mut FrameLivenessRegIndices,
+) -> Option<usize> {
+    match bank {
+        'i' => {
+            let pos = reg_indices.int.iter().position(|&c| c as usize == color)?;
+            reg_indices.int.remove(pos);
+            Some(pos)
+        }
+        'r' => {
+            let pos = reg_indices.ref_.iter().position(|&c| c as usize == color)?;
+            let idx = reg_indices.int.len() + pos;
+            reg_indices.ref_.remove(pos);
+            Some(idx)
+        }
+        'f' => {
+            let pos = reg_indices
+                .float
+                .iter()
+                .position(|&c| c as usize == color)?;
+            let idx = reg_indices.int.len() + reg_indices.ref_.len() + pos;
+            reg_indices.float.remove(pos);
+            Some(idx)
+        }
+        _ => None,
+    }
+}
+
 /// `resume.py consume_boxes` into a helper MIFrame: color-indexed banks,
 /// no Python `locals_cells_stack_w` inversion.
 #[allow(clippy::too_many_arguments)]
@@ -8816,24 +8850,31 @@ fn reconstruct_helper_section_recipe(
     let Some(pjc) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
         decline!("HelperNoPayload");
     };
-    // `get_list_of_active_boxes(in_a_call=True)` keeps dest in the list as
-    // CONST_NULL/0. `consume_boxes` writes that box into its color so
-    // `_setup_return_value_*` can overwrite it. A paused caller whose
-    // resume pc is not a call has no dest to fill.
+    let mut reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
+    let mut pending_value_index: Option<usize> = None;
     if in_a_call {
         use crate::jitcode_dispatch::CallResultRegister;
         match crate::jitcode_dispatch::call_result_register_in(pjc.jitcode.code.as_slice(), pc) {
-            CallResultRegister::Reg('i', _)
-            | CallResultRegister::Reg('r', _)
-            | CallResultRegister::Reg('f', _)
-            | CallResultRegister::Void => {}
+            CallResultRegister::Reg(bank, color) if matches!(bank, 'i' | 'r' | 'f') => {
+                pending_value_index =
+                    take_pending_dest_from_liveness(bank, color, &mut reg_indices);
+            }
+            CallResultRegister::Void => {}
             CallResultRegister::Unknown | CallResultRegister::Reg(..) => {
                 decline!("HelperPendingDest");
             }
         }
     }
-    let reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
-    if reg_indices.total_len() != frame.values.len() {
+    let values: Vec<&majit_ir::resumedata::RebuiltValue> = match pending_value_index {
+        Some(idx) => frame
+            .values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| if i == idx { None } else { Some(v) })
+            .collect(),
+        None => frame.values.iter().collect(),
+    };
+    if reg_indices.total_len() != values.len() {
         decline!("HelperLivenessValueCountMismatch");
     }
     let int_len = reg_indices.int.len();
@@ -8841,7 +8882,7 @@ fn reconstruct_helper_section_recipe(
     for (pos, &reg_idx) in reg_indices.int.iter().enumerate() {
         let (op, val) = bridge_decode_box(
             ctx,
-            &frame.values[pos],
+            values[pos],
             Type::Int,
             rd_virtuals,
             resume_data,
@@ -8863,7 +8904,7 @@ fn reconstruct_helper_section_recipe(
     for (pos, &reg_idx) in reg_indices.ref_.iter().enumerate() {
         let (op, val) = bridge_decode_box(
             ctx,
-            &frame.values[int_len + pos],
+            values[int_len + pos],
             Type::Ref,
             rd_virtuals,
             resume_data,
@@ -8885,7 +8926,7 @@ fn reconstruct_helper_section_recipe(
     for (pos, &reg_idx) in reg_indices.float.iter().enumerate() {
         let (op, val) = bridge_decode_box(
             ctx,
-            &frame.values[float_base + pos],
+            values[float_base + pos],
             Type::Float,
             rd_virtuals,
             resume_data,
@@ -9152,7 +9193,7 @@ pub(crate) fn reconstruct_inline_recipe(
     // result at all; `call_result_register_in` returns Void for that
     // merge-point coordinate (the marker itself, the op3 `-live-` before
     // it, or the op2 `-live-` after it). Any other miss declines.
-    let pending_result_color = if in_a_call {
+    let pending_result = if in_a_call {
         let Some(pc) = usize::try_from(frame.pc).ok() else {
             decline!("NoPendingResultColor");
         };
@@ -9161,10 +9202,13 @@ pub(crate) fn reconstruct_inline_recipe(
         };
         use crate::jitcode_dispatch::CallResultRegister;
         match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
-            CallResultRegister::Reg('r', color) => Some(color),
-            CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
+            CallResultRegister::Reg(bank, color) if matches!(bank, 'i' | 'r' | 'f') => {
+                Some((bank, color))
+            }
             CallResultRegister::Void => None,
-            CallResultRegister::Unknown => decline!("NoPendingResultColor"),
+            CallResultRegister::Unknown | CallResultRegister::Reg(..) => {
+                decline!("NoPendingResultColor")
+            }
         }
     } else {
         None
@@ -9190,14 +9234,16 @@ pub(crate) fn reconstruct_inline_recipe(
     // `CONST_FZERO`. That color's semantic `locals_cells_stack_w` slot is
     // delivered by `make_result_of_lastop`; every other live color holds a
     // real box. A register colour is not a semantic slot index.
-    let pending_result_abs_slot = match pending_result_color {
-        Some(color) => {
+    // An int/float dest lives in `registers_i`/`registers_f`, never in the
+    // W_Root `locals_cells_stack_w` array, so only a Ref dest names a slot.
+    let pending_result_abs_slot = match pending_result {
+        Some(('r', color)) => {
             match semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color) {
                 Some(slot) => Some(slot),
                 None => decline!("PendingResultColorUnmapped"),
             }
         }
-        None => None,
+        _ => None,
     };
     // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
     // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
@@ -9212,11 +9258,14 @@ pub(crate) fn reconstruct_inline_recipe(
     // callable and the arguments demanded, so every argument-taking inlined
     // call declined and its guard was blacklisted.  A void call consumes its
     // operands the same way, so the exemption follows `in_a_call`; only a
-    // result-bank call's result occupies the topmost post-call slot, so a void
-    // call's floor stays at the post-call depth and keeps every slot below it
+    // Ref dest occupies the topmost post-call slot, so a void or int/float
+    // dest's floor stays at the post-call depth and keeps every slot below it
     // demanded.
     let unreconstructable_operand_floor = if in_a_call {
-        let result_slots = usize::from(pending_result_color.is_some());
+        // result_slots=1 only for a Ref dest; int/float uses 0 because
+        // `get_list_of_active_boxes` parks that dest in `registers_i`/`registers_f`,
+        // and the floor only exempts W_Root slots the mandatory-operand loop reads.
+        let result_slots = usize::from(matches!(pending_result, Some(('r', _))));
         liveness
             .stack_depth_at(py_pc + 1)
             .map(|post| nlocals + post.saturating_sub(result_slots))
@@ -9225,18 +9274,15 @@ pub(crate) fn reconstruct_inline_recipe(
     };
     let mut reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
     // The encoder enumerates live boxes in bank order [int | ref | float] and
-    // `frame.values` mirrors that order. A pending call-result color (the dst of
-    // an in-flight residual call) is removed from the ref bank below because the
+    // `frame.values` mirrors that order. A pending call-result dest (the dst of
+    // an in-flight residual call) is removed from its bank below because the
     // framestack walk delivers that value via `make_result_of_lastop`, not from
     // resumedata. Drop its encoded value from the SAME position so the liveness
     // enumeration and the consumed value section stay aligned
     // (resume.py consume_boxes).
     let mut pending_value_index: Option<usize> = None;
-    if let Some(color) = pending_result_color {
-        if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
-            pending_value_index = Some(reg_indices.int.len() + ref_pos);
-            reg_indices.ref_.remove(ref_pos);
-        }
+    if let Some((bank, color)) = pending_result {
+        pending_value_index = take_pending_dest_from_liveness(bank, color, &mut reg_indices);
     }
     let values: Vec<&majit_ir::resumedata::RebuiltValue> = match pending_value_index {
         Some(idx) => frame
@@ -9332,14 +9378,15 @@ pub(crate) fn reconstruct_inline_recipe(
     // array, so recover them from that array here.
     //
     // An `in_a_call` callee suspended at one of its own CALL sites carries a
-    // pending result whose register was already dropped from the ref bank above
-    // (`pending_value_index`). When that pending-result color coincides with the
-    // `ec` portal red, the removal leaves only `[frame]` live — a one-ref
-    // reduced form of the SAME portal-callee shape. `pec_reg` is consumed only
+    // pending result whose register was already dropped from that dest's bank
+    // above (`pending_value_index`). When the dest is Ref and its color
+    // coincides with the `ec` portal red, the removal leaves only `[frame]`
+    // live — a one-ref reduced form of the SAME portal-callee shape. An
+    // int/float dest leaves the ref bank untouched. `pec_reg` is consumed only
     // by this classifier gate; the reconstruction body threads
     // `pframe_reg` -> `frame_vidx` -> the `locals_cells_stack_w` array and never
     // reads `ec`, so `[frame]` alone is still faithfully reconstructable (the
-    // pending call-result slot is delivered by `make_result_of_lastop`, not from
+    // pending Ref call-result slot is delivered by `make_result_of_lastop`, not from
     // resumedata, and is skipped by `pending_result_abs_slot`).
     let (pframe_reg, pec_reg) = portal_red_regs_at(frame.jitcode_index);
     let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);

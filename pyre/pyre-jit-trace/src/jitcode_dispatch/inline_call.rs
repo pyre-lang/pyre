@@ -3658,35 +3658,6 @@ pub(crate) fn overlay_callee_vstack_on_ref_regs(
     }
 }
 
-/// Whether a loop-carried operand parked below the call keeps the fold
-/// worthwhile.
-///
-/// A numeric accumulator (`a` in `a += r(d)`) does: the fold's resume rebuilds
-/// it from the caller's own register writeback, and folding the call is what
-/// turns a residual recursion back into an assembler-to-assembler jump.
-///
-/// A live iterator does not, for a recursive callee.  Folding a self-call that
-/// sits under a `FOR_ITER` iterator costs the caller a compiled loop and a
-/// bridge — measured on
-/// `recursive_call_frame_relocation` (`for k in range(n): r += cat(n - 1)`) as
-/// `loops_compiled 3 -> 2`.  The residual path keeps that loop, so leave the
-/// iterator-bearing shape to it.  `do_recursive_call(..., assembler_call=True)`
-/// (`pyjitpl.py`) is the inlined callee's own header, keyed at `next_instr`,
-/// not this CALL-site fold's `pc = 0` token.
-fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    slot: OpRef,
-) -> bool {
-    match ctx.trace_ctx.box_value(slot) {
-        Some(majit_ir::Value::Int(_)) | Some(majit_ir::Value::Float(_)) => true,
-        Some(majit_ir::Value::Ref(r)) => {
-            let obj = r.as_usize();
-            obj != 0 && unsafe { pyre_object::is_int(obj as pyre_object::PyObjectRef) }
-        }
-        _ => false,
-    }
-}
-
 /// Whether a callee that is not the walk's own code may take `CALL_ASSEMBLER`.
 ///
 /// `_opimpl_recursive_call` (`pyjitpl.py`) falls through to
@@ -3996,40 +3967,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    // The operand stack below the call's own operands (`r_args = [callable,
-    // null_or_self, arg0..]`) may hold loop-carried input args: the enclosing
-    // loop's `FOR_ITER` iterator, or an accumulator reloaded for `+=`.  Only
-    // the iterator disqualifies the fold — see
-    // `loop_carried_slot_keeps_fold_profitable`.  Declining every loop-carried
-    // operand instead kept a recursion called from a `while` body on the
-    // residual path permanently.
-    //
-    // The screen is about a recursion re-entering through the loop it sits
-    // in.  A foreign, non-recursive callee called from a `for` body is the
-    // shape `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) folds for
-    // any callee with its own loop token; declining it left the whole callee
-    // as a residual call per iteration.
-    let recursive_callee = w_code as usize == caller_code as usize
-        || ctx
-            .session
-            .borrow()
-            .framestack
-            .iter()
-            .any(|f| f.w_code == w_code as usize);
-    if recursive_callee && ctx.vstack_valid {
-        let kept_below = ctx
-            .frame_state
-            .borrow()
-            .vstack_boxes
-            .len()
-            .saturating_sub(r_args.len());
-        if ctx.frame_state.borrow().vstack_boxes[..kept_below]
-            .iter()
-            .any(|slot| slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot))
-        {
-            return Ok(None);
-        }
-    }
+    // `_opimpl_recursive_call` (`pyjitpl.py`) has no value-stack profitability
+    // screen on leftover loop-carried slots below the call. Once inlining is
+    // on and the call is not inlined, `assembler_call` is true regardless of a
+    // `FOR_ITER` iterator or numeric accumulator parked there.
+
     // Branch A frame shape only: `ncells == 0`, non-global-storing callee.
     let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {

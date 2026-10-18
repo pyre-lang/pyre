@@ -817,44 +817,62 @@ fn host_fixed_list_alloc(payload: usize) -> *mut u8 {
     host_alloc_aligned(payload, host_align::<i64>())
 }
 
-/// `framework.py` `push_roots` / `pop_roots` for a handful of list
-/// locals around a collecting call (`shadowstack.py` `incr_stack` /
-/// `decr_stack`).
+/// Roots blackhole argument-list locals (`blackhole.py`
+/// `_get_list_of_values`) off the FrameAnchor index space.
 ///
-/// The shadow stack holds the livevars. A collection rewrites those
-/// slots. The `FixedSignedList` copies in `IrfLists` / `IrLists` /
-/// `RList` are not the slots, so a later use reloads through [`Self::get`]
-/// (`gc_pop_roots` writing livevars back).
+/// RPython keeps those lists as GC locals of the blackhole function,
+/// rooted by `framework.py` `push_roots` / `shadowstack.py` `incr_stack`
+/// on that function's root frame. pyre's `FrameAnchor` returns a
+/// `SHADOW_STACK` index that must outlive the caller's `pop_roots`, so
+/// each list is rooted on `OWNER_ROOTS` through
+/// [`majit_gc::shadow_stack::OwnerRootGuard`] instead of `SHADOW_STACK`.
+/// Drop releases the guards in reverse order.
+///
+/// `OWNER_ROOTS` holds the livevars. A collection rewrites those slots.
+/// The `FixedSignedList` copies in `IrfLists` / `IrLists` / `RList` are
+/// not the slots, so a later use reloads through [`Self::get`]
+/// (`gc_pop_roots` writing livevars back). Null slots are kept so
+/// `get(i)` matches `refs[i]`; `walk_stack_root` skips a null content
+/// the same way `if content:` does.
 pub struct ListRootGuard {
-    slot: majit_gc::shadow_stack::ShadowStackSlot,
-    depth: usize,
+    roots: Vec<Option<majit_gc::shadow_stack::OwnerRootGuard>>,
 }
 
 impl ListRootGuard {
     #[inline]
     pub fn push(refs: &[GcRef]) -> Self {
-        let slot = majit_gc::shadow_stack::shadow_stack_slot();
-        let depth = slot.depth();
+        let mut roots = Vec::with_capacity(refs.len());
         for &g in refs {
-            // Include nulls so `get(i)` matches `refs[i]`. `walk_stack_root`
-            // skips a null content the same way `if content:` does.
-            slot.push(g);
+            // Include nulls so `get(i)` matches `refs[i]`.
+            if g.0 != 0 {
+                roots.push(Some(majit_gc::shadow_stack::OwnerRootGuard::new(g)));
+            } else {
+                roots.push(None);
+            }
         }
-        Self { slot, depth }
+        Self { roots }
     }
 
     /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`: the
     /// forwarded livevar after a collecting call.
     #[inline]
     pub fn get(&self, i: usize) -> GcRef {
-        self.slot.get(self.depth + i)
+        self.roots
+            .get(i)
+            .and_then(|root| {
+                root.as_ref()
+                    .map(majit_gc::shadow_stack::OwnerRootGuard::get)
+            })
+            .unwrap_or(GcRef(0))
     }
 }
 
 impl Drop for ListRootGuard {
     #[inline]
     fn drop(&mut self) {
-        self.slot.pop_to(self.depth);
+        while let Some(root) = self.roots.pop() {
+            drop(root);
+        }
     }
 }
 
