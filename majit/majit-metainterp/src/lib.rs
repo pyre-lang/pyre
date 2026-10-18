@@ -90,6 +90,13 @@ pub fn __majit_struct_gc_type_id<T: HasGcTypeId>() -> u32 {
     T::GC_TYPE_ID
 }
 
+/// Serializes the unit tests that claim `const_ptr_table` slots. The
+/// table's wave id is process-global: a whole-table `walk` in one test
+/// thread marks every slot with the current wave, and a `trace_index` in
+/// another test under that wave then skips the slot it meant to forward.
+#[cfg(test)]
+pub(crate) static CONST_PTR_TABLE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 pub mod blackhole;
 pub mod box_trace;
 pub(crate) mod call_descr;

@@ -2652,6 +2652,7 @@ mod tests {
     /// intern once in `_refs_dict`, and a moving collection re-keys it.
     #[test]
     fn const_ptr_operands_share_the_trace_ref_pool_and_rekey_after_gc() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Ref);
         let (old, _restore) = intern_const_ptr(GcRef(0x98_0000_1000));
@@ -2682,6 +2683,7 @@ mod tests {
 
     #[test]
     fn ref_pool_gc_visits_each_box_once_and_rekeys_overlapping_addresses() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Ref);
         let base = 0x99_0000_0000usize;
@@ -3290,6 +3292,7 @@ mod tests {
 
     #[test]
     fn byte_mode_walk_forwards_trb_refs() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Ref);
         rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
