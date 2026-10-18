@@ -5993,7 +5993,8 @@ impl<S: JitState> JitDriver<S> {
             let Some(ctx) = self.meta.trace_ctx() else {
                 return false;
             };
-            ctx.find_merge_point_same_greenkey(&key_typed).is_some()
+            ctx.find_merge_point_same_greenkey(close.as_ref().unwrap_or(&key_typed))
+                .is_some()
         };
         if already {
             return false;
