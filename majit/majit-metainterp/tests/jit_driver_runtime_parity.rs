@@ -1349,7 +1349,8 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
         driver
             .back_edge_structured(
                 green_key.hash_u64(),
-                || green_key.clone(),
+                &green_key.values,
+                &green_key.types,
                 7,
                 &mut state,
                 &(),
@@ -1364,7 +1365,8 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
         driver
             .back_edge_structured(
                 green_key.hash_u64(),
-                || green_key.clone(),
+                &green_key.values,
+                &green_key.types,
                 7,
                 &mut state,
                 &(),

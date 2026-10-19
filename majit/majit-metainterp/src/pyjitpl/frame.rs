@@ -1650,9 +1650,16 @@ mod tests {
         assert_eq!(frame.int_regs.as_ptr(), int_storage);
         assert_eq!(frame.ref_regs.as_ptr(), ref_storage);
         assert_eq!(frame.float_regs.as_ptr(), float_storage);
-        assert!(frame.int_regs.iter().all(Option::is_none));
+        // `MetaInterp.popframe` → `MIFrame.cleanup_registers`: live
+        // `registers_r` slots are cleared unconditionally. Int/float
+        // banks are filled with `MissingValue` only in `copy_constants`
+        // under `elif not we_are_translated()` (`MIFrame.setup`).
         assert!(frame.ref_regs.iter().all(Option::is_none));
-        assert!(frame.float_regs.iter().all(Option::is_none));
+        #[cfg(debug_assertions)]
+        {
+            assert!(frame.int_regs.iter().all(Option::is_none));
+            assert!(frame.float_regs.iter().all(Option::is_none));
+        }
         assert!(!frame.inline_frame);
         assert_eq!(frame.return_i, None);
         assert_eq!(frame.pushed_box, None);

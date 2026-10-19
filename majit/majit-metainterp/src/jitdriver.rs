@@ -1798,6 +1798,15 @@ pub struct EntryPoint {
     pub schema: Vec<GreenType>,
 }
 
+/// `warmstate.py make_entry_point` closure captures.
+struct PortalEntryCaptures {
+    /// `confirm_enter_jit`; a hook installed after `register_descriptor`
+    /// stays visible because this is another handle to the WarmEnterState cell.
+    confirm_enter_jit_ptr: std::rc::Rc<std::cell::Cell<Option<fn(&GreenKey) -> bool>>>,
+    /// `jitdriver_sd.index` — `isinstance(cell, JitCell)` operand.
+    jd_index: usize,
+}
+
 /// High-level JIT driver that automates the tracing lifecycle.
 ///
 /// Wraps [`MetaInterp`] and manages symbolic state, replacing ~80 lines
@@ -1921,6 +1930,8 @@ pub struct JitDriver<S: JitState> {
     /// `ll_portal_runner` prefix does not mint a second artifact for the same
     /// activation. Taken, not read: a skipped door must not stay skipped.
     function_entry_suppressed: bool,
+    /// `warmstate.py make_entry_point` closure captures.
+    portal_entry: PortalEntryCaptures,
     /// Reusable buffers for the compiled-entry argument walk.
     ///
     /// `warmstate.py execute_assembler` builds the entry arguments
@@ -2250,6 +2261,10 @@ impl<S: JitState> JitDriver<S> {
             portal_jd_index: None,
             state_field_fvc: None,
             function_entry_suppressed: false,
+            portal_entry: PortalEntryCaptures {
+                confirm_enter_jit_ptr: std::rc::Rc::new(std::cell::Cell::new(None)),
+                jd_index: 0,
+            },
             entry_scratch: Some(Box::default()),
             exit_raw_scratch: Some(Vec::new()),
             #[expect(
@@ -2815,6 +2830,15 @@ impl<S: JitState> JitDriver<S> {
         // warmspot.py `make_enter_functions`: the driver's `warmstate`
         // exists from registration on.
         self.meta.make_enter_function(idx);
+        // `make_entry_point` captures `confirm_enter_jit` off that state.
+        if let Some(confirm) = self
+            .meta
+            .warm_state_ref_for_driver(idx)
+            .map(|warm| warm.confirm_enter_jit_handle())
+        {
+            self.portal_entry.confirm_enter_jit_ptr = confirm;
+        }
+        self.portal_entry.jd_index = idx;
         idx
     }
 
@@ -5780,20 +5804,17 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
-    /// Takes the green key's hash eagerly and the key itself lazily.
+    /// Takes the green key's hash and the greens already in hand.
     ///
     /// Only the hash is needed unconditionally — it selects the cell and
-    /// answers `has_compiled_loop`. The typed [`GreenKey`] is read only by the
-    /// cell-resolution/decision path and, on a tracing start, by the tracing
-    /// commit. Both are reached only after `back_edge_internal`'s early returns
-    /// (already tracing, `!can_trace`, cross-loop-cut decline, and the whole
-    /// `has_compiled_loop` branch — i.e. every entry into compiled code).
-    /// Building it eagerly spent the key's `values` / `types` vectors on those
-    /// paths and dropped them unread.
+    /// answers `has_compiled_loop`. Comparison is
+    /// `JitCell.comparekey(*greenargs2)` against these slices, so a compiled
+    /// back edge never builds a [`GreenKey`]. An owned key is built from the
+    /// same slices only when a cell is installed (`JitCell(*greenargs)`).
     ///
     /// This is upstream's split: `get_uhash(*greenargs)` hashes the greens in
     /// place on every back edge, and the greens are stored on the cell only
-    /// when one is installed (warmstate.py).
+    /// when one is installed (`warmstate.py`).
     ///
     /// Not `#[cold]`: this is the interpreter's per-iteration door, and the
     /// empty-chain arm (`warmstate.py`) is the common path. The
@@ -5803,20 +5824,22 @@ impl<S: JitState> JitDriver<S> {
     pub fn back_edge_structured(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
+        let greenargs = Some((green_values, green_types));
         if let Some(handled) =
-            self.try_empty_chain_tick(green_key_hash, Some(&make_green_key), target_pc, state, env)
+            self.try_empty_chain_tick(green_key_hash, greenargs, target_pc, state, env)
         {
             return handled.map(continue_at_pc);
         }
         self.back_edge_internal(
             green_key_hash,
-            Some(&make_green_key),
+            greenargs,
             None,
             target_pc,
             state,
@@ -5998,7 +6021,8 @@ impl<S: JitState> JitDriver<S> {
         Ok(self
             .back_edge_structured(
                 green_key.hash_u64(),
-                || green_key.clone(),
+                &green_key.values,
+                &green_key.types,
                 target_pc,
                 state,
                 env,
@@ -6715,7 +6739,7 @@ impl<S: JitState> JitDriver<S> {
     fn try_empty_chain_tick(
         &mut self,
         green_key_hash: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -6773,13 +6797,7 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .warm_state_for_driver(jd_no)
             .tick_empty_chain(green_key_hash)
-            && self.commit_start_tracing(
-                green_key_hash,
-                structured_green_key,
-                target_pc,
-                state,
-                env,
-            )
+            && self.commit_start_tracing(green_key_hash, greenargs, target_pc, state, env)
         {
             return Some(Some(target_pc));
         }
@@ -6800,7 +6818,7 @@ impl<S: JitState> JitDriver<S> {
     fn back_edge_internal(
         &mut self,
         green_key_hash: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         carried_procedure_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
         target_pc: usize,
         state: &mut S,
@@ -6818,9 +6836,9 @@ impl<S: JitState> JitDriver<S> {
         // `compiled_loops` meta the runner executes, the invalidation on a
         // shape mismatch and the front-target tables all read through this one
         // number, so they cannot name different cells the way a bucket hash
-        // let them (`warmstate.py:458-464` resolves once and :483/:511 carries
-        // the resolved token onward for the same reason). Identity for every
-        // unchained bucket, so the collision-free path is unchanged.
+        // let them (`warmstate.py maybe_compile_and_run` resolves once and
+        // carries the resolved token onward for the same reason). Identity for
+        // every unchained bucket, so the collision-free path is unchanged.
         //
         // A caller arriving with `carried_procedure_token` has already done
         // this step and read its token from the result, so `green_key_hash` is
@@ -6847,7 +6865,7 @@ impl<S: JitState> JitDriver<S> {
         // run (`maybe_compile_and_run`). Carry the upgraded Arc the same way.
         let (green_key, entry_procedure_token) = match carried_procedure_token {
             Some(token) => (green_key_hash, Some(token)),
-            None => self.resolved_entry_procedure_token(green_key_hash, structured_green_key),
+            None => self.resolved_entry_procedure_token(green_key_hash, greenargs),
         };
         // Single-pass label handoff must stay ahead of the counter so a
         // CloseLoop arm's pending LABEL entry is consumed on the next back
@@ -7320,7 +7338,7 @@ impl<S: JitState> JitDriver<S> {
         // Occupied bucket, no enterable token: the typed comparekey walk
         // (`on_back_edge_typed_decision`) ticks the cell the greens own.
         // Frontend snapshot work stays behind `StartTracing`.
-        if self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env) {
+        if self.maybe_start_tracing(green_key, greenargs, target_pc, state, env) {
             return Some(continue_at_pc(target_pc));
         }
         None
@@ -8331,7 +8349,7 @@ impl<S: JitState> JitDriver<S> {
     fn back_edge_or_run_compiled_internal(
         &mut self,
         green_key: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -8341,7 +8359,7 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
         if let Some(handled) =
-            self.try_empty_chain_tick(green_key, structured_green_key, target_pc, state, env)
+            self.try_empty_chain_tick(green_key, greenargs, target_pc, state, env)
         {
             let _ = handled;
             return None;
@@ -8372,7 +8390,7 @@ impl<S: JitState> JitDriver<S> {
             ));
         }
 
-        self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env);
+        self.maybe_start_tracing(green_key, greenargs, target_pc, state, env);
         None
     }
 
@@ -8380,10 +8398,13 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// Bypasses the WarmEnterState hot counter (the caller already did its own
     /// counting). Used for function-entry JIT where the threshold is
-    /// controlled externally.
+    /// controlled externally. `greenargs` is `*greenargs` already in hand
+    /// (`warmstate.py bound_reached` `JitCell(*greenargs)`); the owned
+    /// `GreenKey` is built only at the cell-install site.
     pub fn force_start_tracing(
         &mut self,
         green_key: u64,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -8433,6 +8454,7 @@ impl<S: JitState> JitDriver<S> {
         if let BackEdgeAction::StartedTracing = self.meta.force_start_tracing(
             green_key,
             (state.code_ptr(), target_pc),
+            greenargs,
             descriptor.map(|d| (*d).clone()),
             &live_values,
         ) {
@@ -8503,7 +8525,7 @@ impl<S: JitState> JitDriver<S> {
     fn maybe_start_tracing(
         &mut self,
         green_key: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -8518,7 +8540,7 @@ impl<S: JitState> JitDriver<S> {
             (state.code_ptr(), target_pc),
         ) {
             HotResult::StartTracing => {
-                self.commit_start_tracing(green_key, structured_green_key, target_pc, state, env)
+                self.commit_start_tracing(green_key, greenargs, target_pc, state, env)
             }
             _ => false,
         }
@@ -8581,12 +8603,19 @@ impl<S: JitState> JitDriver<S> {
     pub fn commit_back_edge_trace(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
     ) -> bool {
-        self.commit_start_tracing(green_key_hash, Some(&make_green_key), target_pc, state, env)
+        self.commit_start_tracing(
+            green_key_hash,
+            Some((green_values, green_types)),
+            target_pc,
+            state,
+            env,
+        )
     }
 
     /// `warmstate.py bound_reached`: the tick has already fired, so build
@@ -8598,7 +8627,7 @@ impl<S: JitState> JitDriver<S> {
     fn commit_start_tracing(
         &mut self,
         green_key: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -8667,9 +8696,8 @@ impl<S: JitState> JitDriver<S> {
             (state.code_ptr(), target_pc),
             // Neither the typed key nor the descriptor is built before the
             // counter decision. Both are consumed only while committing its
-            // `StartTracing` answer, so the factory and a borrow avoid a deep
-            // clone until this cold arm.
-            structured_green_key,
+            // `StartTracing` answer (`JitCell(*greenargs)` store).
+            greenargs.map(|(values, types)| GreenKey::from_greenargs(values, types)),
             descriptor.as_deref(),
             &live_values,
         ) {
@@ -9848,16 +9876,21 @@ impl<S: JitState> JitDriver<S> {
     /// travels back so the caller can take it: a door that goes on to run needs
     /// that map's VALUE, so a presence test here would probe it twice for one
     /// entry, and a door that declines is answered by the walk alone.
+    ///
+    /// `greenargs` is `*greenargs` already in hand
+    /// (`JitCell.comparekey(*greenargs2)`). Comparison never builds a
+    /// `GreenKey`. A unique-hash occupant is still accepted only after
+    /// `comparekey` matches.
     #[inline]
     pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
-        make_green_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
     ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
         self.meta.resolved_entry_procedure_token_on_driver(
             self.index().unwrap_or(0),
             green_key_hash,
-            make_green_key,
+            greenargs,
         )
     }
 
@@ -9992,12 +10025,20 @@ impl<S: JitState> JitDriver<S> {
     pub fn function_entry_structured(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
     ) -> Option<usize> {
-        match self.function_entry_runner(green_key_hash, make_green_key, target_pc, state, env) {
+        match self.function_entry_runner(
+            green_key_hash,
+            green_values,
+            green_types,
+            target_pc,
+            state,
+            env,
+        ) {
             FunctionEntryRunner::Finished(value) => {
                 self.meta.back_edge_finish_word = Some(value);
                 Some(target_pc)
@@ -10020,7 +10061,8 @@ impl<S: JitState> JitDriver<S> {
     pub fn function_entry_runner(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -10057,7 +10099,8 @@ impl<S: JitState> JitDriver<S> {
             SteadyCompiledEntry::NeedsInternal => {
                 return map_runner_resume(self.function_entry_internal(
                     green_key_hash,
-                    make_green_key,
+                    green_values,
+                    green_types,
                     target_pc,
                     state,
                     env,
@@ -10068,7 +10111,8 @@ impl<S: JitState> JitDriver<S> {
         }
         if let Some(handled) = self.try_function_entry_cold_tick(
             green_key_hash,
-            &make_green_key,
+            green_values,
+            green_types,
             target_pc,
             state,
             env,
@@ -10077,7 +10121,8 @@ impl<S: JitState> JitDriver<S> {
         }
         map_runner_resume(self.function_entry_internal(
             green_key_hash,
-            make_green_key,
+            green_values,
+            green_types,
             target_pc,
             state,
             env,
@@ -10087,33 +10132,45 @@ impl<S: JitState> JitDriver<S> {
 
     /// Sole compiled cell for `hash`, when no confirm hook is installed.
     ///
-    /// `warmstate.py maybe_compile_and_run` walks `lookup_chain` once.
-    /// `:473` declines `JC_TRACING | JC_TEMPORARY`. `:483` reads
-    /// `get_procedure_token` once. A confirm hook stays on the occupied
-    /// door (`:501`).
-    #[inline]
+    /// `warmstate.py maybe_compile_and_run` is a closure over
+    /// `jitcounter = self.warmrunnerdesc.jitcounter` and
+    /// `confirm_enter_jit`; it does `cell = jitcounter.lookup_chain(hash)`
+    /// then `isinstance(cell, JitCell)` (`cell.jitdriver_sd` of this
+    /// driver). Tracing / temporary flags decline. A confirm hook stays
+    /// on the occupied door.
+    #[inline(always)]
     fn compiled_function_token(
         &self,
         hash: u64,
     ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
-        let jd_no = self.index().unwrap_or(0);
-        let Some(warm) = self.meta.warm_state_ref_for_driver(jd_no) else {
+        let entry = &self.portal_entry;
+        if entry.confirm_enter_jit_ptr.get().is_some() {
             return None;
+        }
+        // The table `Ref` lives only for the cell-field reads and
+        // `get_procedure_token` (`warmstate.py`); `has_compiled_code` is
+        // on the owned token.
+        let (cell_key, token) = {
+            // `maybe_compile_and_run` reads `warmrunnerdesc.jitcounter`
+            // (`MetaInterp.jitcounter`), not `jitdrivers_sd[jd_no].warmstate`.
+            let cell = self.meta.jitcounter.lookup_chain(hash)?;
+            let cell = std::cell::Ref::map(cell, std::rc::Rc::as_ref);
+            // `isinstance(cell, JitCell)` — one subclass per driver.
+            if cell.jitdriver_sd != entry.jd_index {
+                return None;
+            }
+            if cell.next.borrow().is_some() || cell.cell_bucket.get() != hash {
+                return None;
+            }
+            if cell.flags.get().contains(JcFlags::JC_TRACING)
+                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+            {
+                return None;
+            }
+            let cell_key = cell.cell_key.get()?;
+            let token = cell.get_procedure_token()?;
+            (cell_key, token)
         };
-        if warm.has_confirm_enter_jit() {
-            return None;
-        }
-        let cell = warm.lookup_chain(hash)?;
-        if cell.next.borrow().is_some() || cell.cell_bucket.get() != hash {
-            return None;
-        }
-        if cell.flags.get().contains(JcFlags::JC_TRACING)
-            || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
-        {
-            return None;
-        }
-        let cell_key = cell.cell_key.get()?;
-        let token = cell.get_procedure_token()?;
         if !token.has_compiled_code() {
             return None;
         }
@@ -10470,7 +10527,8 @@ impl<S: JitState> JitDriver<S> {
     fn try_function_entry_cold_tick(
         &mut self,
         green_key_hash: u64,
-        make_green_key: &impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -10522,7 +10580,8 @@ impl<S: JitState> JitDriver<S> {
         {
             return Some(self.function_entry_internal(
                 green_key_hash,
-                make_green_key,
+                green_values,
+                green_types,
                 target_pc,
                 state,
                 env,
@@ -10543,13 +10602,16 @@ impl<S: JitState> JitDriver<S> {
     fn function_entry_internal(
         &mut self,
         green_key_hash: u64,
-        make_green_key: impl Fn() -> GreenKey,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         already_ticked: bool,
     ) -> Option<usize> {
-        let cell_key = self.resolve_cell_key(green_key_hash, make_green_key);
+        let cell_key = self.resolve_cell_key(green_key_hash, || {
+            GreenKey::from_greenargs(green_values, green_types)
+        });
         let step = if already_ticked {
             FunctionEntryStep::Proceed
         } else {
@@ -10570,7 +10632,13 @@ impl<S: JitState> JitDriver<S> {
                 if majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full() {
                     return None;
                 }
-                self.force_start_tracing(cell_key, target_pc, state, env);
+                self.force_start_tracing(
+                    cell_key,
+                    Some((green_values, green_types)),
+                    target_pc,
+                    state,
+                    env,
+                );
                 None
             }
             FunctionEntryStep::NotHot => None,
@@ -12317,14 +12385,10 @@ mod tests {
             .set_confirm_enter_jit(Some(refuse));
         let mut pre_ran = false;
 
-        let outcome = driver.back_edge_structured(
-            hash,
-            || key.clone(),
-            19,
-            &mut state,
-            &(),
-            || pre_ran = true,
-        );
+        let outcome =
+            driver.back_edge_structured(hash, &key.values, &key.types, 19, &mut state, &(), || {
+                pre_ran = true
+            });
 
         assert_eq!(outcome, None);
         assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -12359,14 +12423,10 @@ mod tests {
             .set_confirm_enter_jit(Some(allow));
         let mut pre_ran = false;
 
-        let outcome = driver.back_edge_structured(
-            hash,
-            || key.clone(),
-            19,
-            &mut state,
-            &(),
-            || pre_ran = true,
-        );
+        let outcome =
+            driver.back_edge_structured(hash, &key.values, &key.types, 19, &mut state, &(), || {
+                pre_ran = true
+            });
 
         assert!(outcome.is_some(), "the permissive door executes the loop");
         assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -12694,7 +12754,8 @@ mod tests {
             .warm_state_for_driver(0)
             .set_function_threshold(2);
         let hash = 0xA11u64;
-        let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
+        let values = [hash as i64];
+        let types = [GreenType::Int];
         let mut state = CountingDoorState {
             build_meta_calls: std::cell::Cell::new(0),
             extract_live_values_calls: std::cell::Cell::new(0),
@@ -12702,7 +12763,7 @@ mod tests {
         };
         assert!(
             driver
-                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -12711,12 +12772,79 @@ mod tests {
         );
         assert!(
             driver
-                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
                 .is_none()
         );
         assert!(
             driver.is_tracing(),
             "the function-entry door must arm tracing when the function threshold fires"
+        );
+    }
+
+    #[test]
+    fn function_entry_force_start_installs_comparekey_from_portal_greens() {
+        // warmstate.py bound_reached: `cell = JitCell(*greenargs)`.
+        // CountingDoorState::code_ptr is 0, so `with_typed_decision_key`
+        // declines; the portal greens are what must `set_comparekey`.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_function_threshold(2);
+        let values = [0i64, 0xabc0];
+        let types = [GreenType::Int, GreenType::Ref];
+        let hash = GreenKey::from_greenargs(&values, &types).get_uhash();
+        let mut state = CountingDoorState {
+            build_meta_calls: std::cell::Cell::new(0),
+            extract_live_values_calls: std::cell::Cell::new(0),
+            code_ptr: 0,
+        };
+        assert!(
+            driver
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            driver
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "the function-entry door must start tracing"
+        );
+        {
+            let cell = driver
+                .meta
+                .warm_state_for_driver(0)
+                .lookup_chain(hash)
+                .expect("function-entry force-start installs a cell");
+            assert!(
+                cell.comparekey(&values, &types),
+                "JitCell(*greenargs) stores comparekey"
+            );
+            assert!(cell.next.borrow().is_none(), "these greens own one cell");
+        }
+
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(101));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .attach_procedure_to_interp(hash, std::sync::Arc::clone(&token));
+        let (_cell_key, found) = driver
+            .meta
+            .warm_state_for_driver(0)
+            .resolved_cell_procedure_token(hash, Some((&values, &types)));
+        assert!(
+            found.is_some_and(|got| std::sync::Arc::ptr_eq(&got, &token)),
+            "resolved_cell_procedure_token(hash, Some(greens)) names the function-entry cell"
         );
     }
 
@@ -12766,6 +12894,110 @@ mod tests {
                 .get_compiled(key)
                 .is_none(),
             "portal slot 0 does not hold jd1's compiled cell"
+        );
+
+        // `isinstance(cell, JitCell)`: a lone cell filed by jd0 is the
+        // table-slot head `lookup_chain` returns, and is not this driver's.
+        // `0x7e14` indexes slot 0 (`(hash as u32) >> shift`); a second
+        // cell in that slot would become `cell.next` and the miss would be
+        // the chain check, not `jitdriver_sd`. Slot 1 keeps the head lone.
+        let foreign = 1u64 << 21;
+        assert_ne!(
+            driver.meta.jitcounter._get_index(key),
+            driver.meta.jitcounter._get_index(foreign),
+            "jd0's cell must be the lone head of a different slot"
+        );
+        let foreign_token = std::sync::Arc::new(majit_backend::JitCellToken::new(75));
+        foreign_token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx0)
+            .memory_manager
+            .keep_loop_alive(&foreign_token);
+        driver
+            .meta
+            .warm_state_for_driver(idx0)
+            .attach_procedure_to_interp(foreign, std::sync::Arc::clone(&foreign_token));
+        {
+            let cell = driver
+                .meta
+                .jitcounter
+                .lookup_chain(foreign)
+                .expect("jd0 filed the slot head");
+            assert_eq!(cell.jitdriver_sd, idx0);
+            assert!(
+                cell.next.borrow().is_none(),
+                "the isinstance miss is a lone head, not a chain"
+            );
+            assert!(
+                cell.get_procedure_token()
+                    .is_some_and(|got| std::sync::Arc::ptr_eq(&got, &foreign_token)),
+                "the slot holds jd0's compiled procedure"
+            );
+        }
+        assert!(
+            driver.compiled_function_token(key).is_some(),
+            "jd1's own slot still answers after jd0 files a different slot"
+        );
+        assert!(
+            driver.compiled_function_token(foreign).is_none(),
+            "function-entry compiled lookup on jd1 skips jd0's cell at that slot"
+        );
+    }
+
+    #[test]
+    fn compiled_function_token_declines_a_confirm_hook_installed_after_register() {
+        // `set_confirm_enter_jit` after `register_descriptor` must still
+        // keep the compiled portal on the occupied door: the capture is
+        // another handle to the same cell, not a registration-time copy.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut jd = JitDriverStaticData::new(vec![], vec![]);
+        jd.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx = driver.register_descriptor(jd);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        fn refuse(_key: &GreenKey) -> bool {
+            false
+        }
+
+        let key = 0xC0F1_u64;
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(76));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+
+        assert!(
+            driver.compiled_function_token(key).is_some(),
+            "the procedure is attached before the confirm hook"
+        );
+
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .set_confirm_enter_jit(Some(refuse));
+
+        assert!(
+            driver.compiled_function_token(key).is_none(),
+            "a confirm hook installed after register_descriptor stays on the occupied door"
+        );
+
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .set_confirm_enter_jit(None);
+        assert!(
+            driver.compiled_function_token(key).is_some(),
+            "clearing the hook restores the compiled token"
         );
     }
 
@@ -13379,7 +13611,8 @@ mod tests {
             .warm_state_for_driver(0)
             .set_function_threshold(1);
         let hash = 0xB0Du64;
-        let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
+        let values = [hash as i64];
+        let types = [GreenType::Int];
         let mut state = CountingDoorState {
             build_meta_calls: std::cell::Cell::new(0),
             extract_live_values_calls: std::cell::Cell::new(0),
@@ -13388,7 +13621,7 @@ mod tests {
         driver.suppress_function_entry();
         assert!(
             driver
-                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -13397,7 +13630,7 @@ mod tests {
         );
         assert!(
             driver
-                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -13890,7 +14123,7 @@ mod tests {
             .set_param("max_unroll_loops", 1);
         let mut state = AcceptCloseState::default();
         let key = 42u64;
-        driver.force_start_tracing(key, 0, &mut state, &());
+        driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         let start = driver.meta.trace_ctx().unwrap().current_merge_points[0].position;
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(9));
@@ -13949,7 +14182,7 @@ mod tests {
             .set_param_enable_opts("intbounds:heap");
         let mut state = AcceptCloseState::default();
         let key = 42u64;
-        driver.force_start_tracing(key, 0, &mut state, &());
+        driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         assert!(
             driver.cell_is_tracing(key),
@@ -14006,7 +14239,7 @@ mod tests {
             );
         }
         assert!(!driver.meta.take_keep_tracing_after_close());
-        driver.force_start_tracing(key, 0, &mut state, &());
+        driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(
             driver.is_tracing(),
             "a later trace must be able to start on the same key"
@@ -14029,7 +14262,7 @@ mod tests {
         let mut state = AcceptCloseState::default();
         let key_a = 42u64;
         let key_b = 99u64;
-        driver.force_start_tracing(key_a, 0, &mut state, &());
+        driver.force_start_tracing(key_a, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         assert!(
             driver.cell_is_tracing(key_a),
@@ -14076,7 +14309,7 @@ mod tests {
             "retargeted B was never marked tracing"
         );
         assert!(!driver.meta.take_keep_tracing_after_close());
-        driver.force_start_tracing(key_a, 0, &mut state, &());
+        driver.force_start_tracing(key_a, None, 0, &mut state, &());
         assert!(
             driver.is_tracing(),
             "a later trace must be able to start on A"
@@ -14104,7 +14337,7 @@ mod tests {
             selected: 0,
             code_ptr,
         };
-        driver.force_start_tracing(key, target_pc, &mut state, &());
+        driver.force_start_tracing(key, None, target_pc, &mut state, &());
         assert!(driver.is_tracing());
         assert!(
             driver.cell_is_tracing(key),
@@ -14143,7 +14376,7 @@ mod tests {
             "WarmEnterState.finish_tracing must clear JC_TRACING on a Ref-green cell"
         );
         assert!(!driver.meta.take_keep_tracing_after_close());
-        driver.force_start_tracing(key, target_pc, &mut state, &());
+        driver.force_start_tracing(key, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
             "a later trace must be able to start on the same key"
@@ -14175,7 +14408,7 @@ mod tests {
 
         // Start a real trace: this seeds `driver.sym` via create_sym +
         // initialize_sym (sym.selected == 3) and installs the trace session.
-        driver.force_start_tracing(key, target_pc, &mut state, &());
+        driver.force_start_tracing(key, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
             "force_start_tracing must start a trace"
@@ -14246,7 +14479,7 @@ mod tests {
             writeback_applied: None,
         };
         let target_pc = 7usize;
-        driver.force_start_tracing(target_pc as u64, target_pc, &mut state, &());
+        driver.force_start_tracing(target_pc as u64, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
             "force_start_tracing must start a trace"
@@ -14283,7 +14516,7 @@ mod tests {
         let mut driver = JitDriver::<ScalarWalkState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let mut state = ScalarWalkState::default();
-        driver.force_start_tracing(A, A as usize, &mut state, &());
+        driver.force_start_tracing(A, None, A as usize, &mut state, &());
         assert!(driver.is_tracing());
         assert!(driver.cell_is_tracing(A));
         assert!(!driver.cell_is_tracing(B));
@@ -14296,7 +14529,7 @@ mod tests {
         let mut driver = JitDriver::<ScalarWalkState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let mut state = ScalarWalkState::default();
-        driver.force_start_tracing(ROOT, ROOT as usize, &mut state, &());
+        driver.force_start_tracing(ROOT, None, ROOT as usize, &mut state, &());
         assert!(driver.is_tracing());
 
         driver.merge_point(|meta, _sym| {
@@ -14328,7 +14561,7 @@ mod tests {
             assert!(!warmstate.should_force_finish_tracing(ROOT));
         }
         // A fresh attempt must remain possible after the callee is disabled.
-        driver.force_start_tracing(ROOT, ROOT as usize, &mut state, &());
+        driver.force_start_tracing(ROOT, None, ROOT as usize, &mut state, &());
         assert!(driver.is_tracing());
         assert_eq!(
             driver.meta.portal_trace_positions.as_ref().map(Vec::len),
@@ -14358,7 +14591,7 @@ mod tests {
 
         let primary_pc = 7usize;
         let primary_key = primary_pc as u64;
-        driver.force_start_tracing(primary_key, primary_pc, &mut state, &());
+        driver.force_start_tracing(primary_key, None, primary_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the primary trace started");
         driver.merge_point(|_meta, _sym| TraceAction::AbortPermanent);
         assert!(
@@ -14371,7 +14604,7 @@ mod tests {
 
         let bridge_pc = 11usize;
         let bridge_key = bridge_pc as u64;
-        driver.force_start_tracing(bridge_key, bridge_pc, &mut state, &());
+        driver.force_start_tracing(bridge_key, None, bridge_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the bridge trace started");
         driver
             .meta
@@ -14415,7 +14648,7 @@ mod tests {
 
         let primary_pc = 7usize;
         let primary_key = primary_pc as u64;
-        driver.force_start_tracing(primary_key, primary_pc, &mut state, &());
+        driver.force_start_tracing(primary_key, None, primary_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the primary trace started");
         assert!(
             driver
@@ -15043,9 +15276,13 @@ mod tests {
         let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
         let green_key = 406;
         assert!(matches!(
-            driver
-                .meta
-                .force_start_tracing(green_key, (0, 0), Some(descriptor), &[Value::Int(0)],),
+            driver.meta.force_start_tracing(
+                green_key,
+                (0, 0),
+                None,
+                Some(descriptor),
+                &[Value::Int(0)]
+            ),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -15129,9 +15366,13 @@ mod tests {
         let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
         let green_key = 407;
         assert!(matches!(
-            driver
-                .meta
-                .force_start_tracing(green_key, (0, 0), Some(descriptor), &[Value::Int(0)],),
+            driver.meta.force_start_tracing(
+                green_key,
+                (0, 0),
+                None,
+                Some(descriptor),
+                &[Value::Int(0)]
+            ),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -15296,7 +15537,7 @@ mod tests {
         assert!(matches!(
             driver
                 .meta
-                .force_start_tracing(green_key, (0, 0), None, &[Value::Int(0)]),
+                .force_start_tracing(green_key, (0, 0), None, None, &[Value::Int(0)]),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -15937,7 +16178,7 @@ mod cross_loop_cut_close_tests {
     /// and record one op into it.
     fn start_outer_trace(driver: &mut JitDriver<CutCloseState>, outer_key: u64) {
         let mut state = CutCloseState;
-        driver.force_start_tracing(outer_key, outer_key as usize, &mut state, &());
+        driver.force_start_tracing(outer_key, None, outer_key as usize, &mut state, &());
         assert!(driver.is_tracing(), "outer trace must start");
         assert!(
             driver.meta.bridge_info().is_none(),

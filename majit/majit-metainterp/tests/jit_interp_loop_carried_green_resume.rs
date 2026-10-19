@@ -404,7 +404,7 @@ fn a_header_revisit_after_continue_rereads_kind() {
             .build_meta(0, &program)
             .install_canonical_liveness(&mut driver);
     }
-    driver.force_start_tracing(0, 0, &mut state, &program[..]);
+    driver.force_start_tracing(0, None, 0, &mut state, &program[..]);
     assert!(
         driver.is_tracing(),
         "force_start_tracing must start a trace"
@@ -472,7 +472,7 @@ fn a_header_revisit_close_matches_label_arity() {
             .build_meta(0, &program)
             .install_canonical_liveness(&mut driver);
     }
-    driver.force_start_tracing(0, 0, &mut state, &program[..]);
+    driver.force_start_tracing(0, None, 0, &mut state, &program[..]);
     assert!(
         driver.is_tracing(),
         "force_start_tracing must start a trace"

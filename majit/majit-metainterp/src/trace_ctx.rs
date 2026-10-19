@@ -9617,6 +9617,7 @@ mod tests {
         let fd = info.static_field_descr(0);
 
         let mut storage = [0usize; 8];
+        let ptr = storage.as_mut_ptr();
         let token = 0x1234_0000usize;
         let cpu = SanityTestCpu {
             int_value: 0,
@@ -9633,14 +9634,12 @@ mod tests {
         );
         ctx.install_virtualizable_info(info);
         ctx.set_cpu(Some(&cpu));
-        ctx.set_opref_concrete(
-            vable,
-            Value::Ref(majit_ir::GcRef(storage.as_ptr() as usize)),
-        );
+        ctx.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(ptr as usize)));
         ctx.emit_force_virtualizable(&fd, vable);
 
         assert_eq!(
-            storage[1], 0xF0CED,
+            unsafe { ptr.add(1).read() },
+            0xF0CED,
             "do_cond_call must invoke clear_vable_ptr when the token is non-null",
         );
         let condbox = OpRef::int_op(2);
@@ -9666,6 +9665,7 @@ mod tests {
         let fd = info.static_field_descr(0);
 
         let mut storage = [0usize; 8];
+        let ptr = storage.as_mut_ptr();
         let cpu = SanityTestCpu {
             int_value: 0,
             ref_value: majit_ir::GcRef::NULL,
@@ -9681,14 +9681,12 @@ mod tests {
         );
         ctx.install_virtualizable_info(info);
         ctx.set_cpu(Some(&cpu));
-        ctx.set_opref_concrete(
-            vable,
-            Value::Ref(majit_ir::GcRef(storage.as_ptr() as usize)),
-        );
+        ctx.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(ptr as usize)));
         ctx.emit_force_virtualizable(&fd, vable);
 
         assert_eq!(
-            storage[1], 0,
+            unsafe { ptr.add(1).read() },
+            0,
             "do_cond_call must not invoke clear_vable_ptr when the token is null",
         );
         let condbox = OpRef::int_op(2);

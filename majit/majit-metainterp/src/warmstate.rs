@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_backend::JitCellToken;
-use majit_ir::{GreenKey, RetainedGreens, Type};
+use majit_ir::{GreenKey, GreenType, RetainedGreens, Type};
 use std::sync::Arc;
 
 use crate::counter::{DEFAULT_SIZE, JitCounter};
@@ -226,19 +226,17 @@ impl BaseJitCell {
 
     /// warmstate.py `JitCell.comparekey(*greenargs2)`.
     ///
-    /// Returns `true` iff this cell's stored typed greens match
-    /// `other` per `GreenKey::eq` (which dispatches via
-    /// `equal_whatever(TYPE, ...)` for STR/UNICODE/Float/Ref/Int).
+    /// Compares this cell's stored greens against values already in hand.
+    /// Builds nothing: the portal's greenargs stay on the stack.
     /// Cells without a stored comparekey (legacy hash-only path)
-    /// always fail comparison — callers must explicitly opt in by
-    /// inserting cells through the typed-key path
-    /// (`WarmEnterState::ensure_cell_for_key`).
-    pub fn comparekey_matches(&self, other: &GreenKey) -> bool {
-        let comparekey = self.comparekey.borrow();
-        let Some(stored) = comparekey.as_ref() else {
+    /// always fail — callers opt in through
+    /// [`WarmEnterState::ensure_cell_for_key`].
+    pub fn comparekey(&self, greenargs: &[i64], types: &[GreenType]) -> bool {
+        let stored_key = RefCell::borrow(&self.comparekey);
+        let Some(stored) = stored_key.as_ref() else {
             return false;
         };
-        if stored.values.len() != other.values.len() || stored.types != other.types {
+        if stored.values.len() != greenargs.len() || stored.types.as_slice() != types {
             return false;
         }
         for index in 0..stored.values.len() {
@@ -246,11 +244,16 @@ impl BaseJitCell {
                 .retained_greens
                 .borrow()
                 .current_value(index, stored.values[index]);
-            if !majit_ir::equal_whatever(stored.types[index], stored_value, other.values[index]) {
+            if !majit_ir::equal_whatever(stored.types[index], stored_value, greenargs[index]) {
                 return false;
             }
         }
         true
+    }
+
+    /// `comparekey(*greenargs2)` against an owned [`GreenKey`].
+    pub fn comparekey_matches(&self, other: &GreenKey) -> bool {
+        self.comparekey(&other.values, &other.types)
     }
 
     pub fn is_tracing(&self) -> bool {
@@ -315,6 +318,10 @@ impl BaseJitCell {
     /// invalidated one, and returns an OWNED handle: a caller that got a token
     /// out of here keeps it alive for as long as it holds it, which is what
     /// upstream's Python reference does too.
+    ///
+    /// Outlined so `Weak::upgrade`'s `casa` stays in this body. Inlining it
+    /// into `enter_compiled_function_entry` residualizes `upgrade` as a call.
+    #[inline(never)]
     pub fn get_procedure_token(&self) -> Option<Arc<JitCellToken>> {
         // The three conditions above, in order: the slot is set, the weakref
         // still resolves, and the token it resolves to is not invalidated.
@@ -751,6 +758,11 @@ pub struct WarmEnterState {
     /// `return True` closure when it is absent, which is what `None` means
     /// here; [`Self::confirm_enter_jit`] is that substitution.
     ///
+    /// `warmstate.py make_entry_point` captures `confirm_enter_jit` as a
+    /// closure constant. The `Rc<Cell>` is that capture: `JitDriver` holds
+    /// another handle to the same cell so the compiled portal can read it
+    /// without borrowing this state.
+    ///
     /// `warmspot.py make_driverhook_graphs` builds this hook with
     /// `onlygreens=False`, so upstream passes every portal green and red.
     /// This layer now supplies the structured [`GreenKey`], not its
@@ -759,7 +771,7 @@ pub struct WarmEnterState {
     /// `WarmEnterState` owns only cells and counters. Exact argument parity
     /// therefore requires moving the hook boundary to the portal or threading
     /// an interpreter-defined red-argument carrier into every policy call.
-    confirm_enter_jit_ptr: Option<fn(&GreenKey) -> bool>,
+    confirm_enter_jit_ptr: Rc<Cell<Option<fn(&GreenKey) -> bool>>>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -911,7 +923,7 @@ impl WarmEnterState {
             memory_manager,
             cell_generation: 0,
             jitdriver_sd,
-            confirm_enter_jit_ptr: None,
+            confirm_enter_jit_ptr: Rc::new(Cell::new(None)),
         }
     }
 
@@ -2455,7 +2467,7 @@ impl WarmEnterState {
     /// before entering already-compiled machine code.
     #[inline]
     pub fn confirm_enter_jit(&self, green_key: &GreenKey) -> bool {
-        match self.confirm_enter_jit_ptr {
+        match self.confirm_enter_jit_ptr.get() {
             None => true,
             Some(hook) => hook(green_key),
         }
@@ -2476,7 +2488,7 @@ impl WarmEnterState {
     /// pc)` and take the typed path whenever a hook is installed).
     #[inline]
     fn confirm_enter_jit_if_available(&self, green_key: Option<&GreenKey>) -> bool {
-        match (self.confirm_enter_jit_ptr, green_key) {
+        match (self.confirm_enter_jit_ptr.get(), green_key) {
             (None, _) => true,
             (Some(hook), Some(key)) => hook(key),
             (Some(_), None) => {
@@ -2492,7 +2504,7 @@ impl WarmEnterState {
     /// admissible substitute.
     #[inline]
     pub(crate) fn confirm_compiled_entry_for_cell_key(&self, cell_key: u64) -> bool {
-        if self.confirm_enter_jit_ptr.is_none() {
+        if self.confirm_enter_jit_ptr.get().is_none() {
             return true;
         }
         let cell = self.cell_by_key(cell_key);
@@ -2507,7 +2519,7 @@ impl WarmEnterState {
     /// below the declaration can know what it said, so an interpreter installs
     /// its own here. `None` restores the no-hook default.
     pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(&GreenKey) -> bool>) {
-        self.confirm_enter_jit_ptr = hook;
+        self.confirm_enter_jit_ptr.set(hook);
     }
 
     /// Whether an interpreter installed the optional entry veto. Entry doors
@@ -2515,7 +2527,13 @@ impl WarmEnterState {
     /// always-allow case.
     #[inline]
     pub fn has_confirm_enter_jit(&self) -> bool {
-        self.confirm_enter_jit_ptr.is_some()
+        self.confirm_enter_jit_ptr.get().is_some()
+    }
+
+    /// The `make_entry_point` capture of `confirm_enter_jit`. `JitDriver`
+    /// holds another handle to this same cell.
+    pub(crate) fn confirm_enter_jit_handle(&self) -> Rc<Cell<Option<fn(&GreenKey) -> bool>>> {
+        Rc::clone(&self.confirm_enter_jit_ptr)
     }
 
     /// warmstate.py: get_location(greenkey)
@@ -2774,13 +2792,7 @@ impl WarmEnterState {
     /// that names this key's (absent) cell. Readers must treat it as a miss;
     /// writers call [`Self::ensure_cell_key`], which mints.
     pub fn cell_key_for(&self, key: &GreenKey) -> Option<u64> {
-        if let Some(cell) = self.lookup_chain_with_key(key) {
-            return cell.cell_key.get();
-        }
-        let hash = key.get_uhash();
-        // Nothing holds the raw hash, so it is the key this green key's cell
-        // would be installed under, and it names no other cell meanwhile.
-        self.cell_by_key(hash).is_none().then_some(hash)
+        self.cell_key_for_greenargs(key.get_uhash(), &key.values, &key.types)
     }
 
     /// Resolve greens to their cell key, installing the cell (with its
@@ -2811,6 +2823,22 @@ impl WarmEnterState {
             .unwrap_or(hash)
     }
 
+    /// [`Self::cell_key_for`] against greens already in hand.
+    ///
+    /// `JitCell.get_jitcell(*greenargs)`: walk the chain with `comparekey`
+    /// and report the matching cell's key. Builds no `GreenKey`.
+    fn cell_key_for_greenargs(
+        &self,
+        hash: u64,
+        greenargs: &[i64],
+        types: &[GreenType],
+    ) -> Option<u64> {
+        if let Some(cell) = self.lookup_chain_with_greenargs(hash, greenargs, types) {
+            return cell.cell_key.get();
+        }
+        self.cell_by_key(hash).is_none().then_some(hash)
+    }
+
     /// [`Self::resolve_cell_key`] and the resolved cell's ENTRY TOKEN answered
     /// from ONE walk of the bucket.
     ///
@@ -2833,17 +2861,22 @@ impl WarmEnterState {
     /// later install would take is `hash`, but `hash` may itself be a minted
     /// key filed under a different bucket, so the cell has to be looked up
     /// through [`Self::cell_by_key`], which maps it. On an ambiguous bucket the
-    /// greens are what settle it, exactly as [`Self::resolve_cell_key`] says —
-    /// and a caller that cannot build them (`make_key` is `None`) gets the raw
-    /// hash back, naming that bucket's original occupant or nothing, which is
-    /// the same answer [`Self::sole_cell_key`] gives such a caller.
+    /// greens are what settle it — and a caller that holds none (`greenargs`
+    /// is `None`) gets the raw hash back, naming that bucket's original
+    /// occupant or nothing, which is the same answer [`Self::sole_cell_key`]
+    /// gives such a caller.
+    ///
+    /// `greenargs` is `*greenargs` already in hand
+    /// (`JitCell.comparekey(*greenargs2)`). Comparison never builds a
+    /// `GreenKey`. A unique-hash occupant is still accepted only after
+    /// `comparekey` matches (`JitCell.get_jitcell`).
     ///
     /// The resolve is unaffected by the token: the key comes back whether or
     /// not one is found, because every consumer downstream is keyed by it.
     pub fn resolved_cell_procedure_token(
         &self,
         hash: u64,
-        make_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
     ) -> (u64, Option<Arc<JitCellToken>>) {
         // `maybe_compile_and_run`: `cell = get_jitcell(*greenargs)`;
         // `if cell.flags & (JC_TRACING | JC_TEMPORARY)`; `procedure_token =
@@ -2857,18 +2890,18 @@ impl WarmEnterState {
             && cell.jitdriver_sd == self.jitdriver_sd
         {
             // `JitCell.get_jitcell`: unique occupant still needs comparekey.
-            // `make_key is None` is an identity lookup by cell key (hash-only
+            // `greenargs` is None is an identity lookup by cell key (hash-only
             // cells, already-resolved keys); greens-holding doors pass the
             // comparator `maybe_compile_and_run` already has.
-            if let Some(mk) = make_key
-                && !cell.comparekey_matches(&mk())
+            if let Some((values, types)) = greenargs
+                && !cell.comparekey(values, types)
             {
                 return (hash, None);
             }
             let cell_key = cell.cell_key.get().unwrap_or(hash);
             return (cell_key, Self::cell_entry_procedure_token(&cell));
         }
-        let (cell_key, cell) = self.resolved_cell(hash, make_key);
+        let (cell_key, cell) = self.resolved_cell(hash, greenargs);
         let token = cell.and_then(|cell| Self::cell_entry_procedure_token(&cell));
         (cell_key, token)
     }
@@ -2893,13 +2926,13 @@ impl WarmEnterState {
     fn resolved_cell(
         &self,
         hash: u64,
-        make_key: Option<&dyn Fn() -> GreenKey>,
+        greenargs: Option<(&[i64], &[GreenType])>,
     ) -> (u64, Option<Rc<BaseJitCell>>) {
         // `JitCell.get_jitcell`: walk this hash's chain and accept only
         // after `comparekey`. A typed miss must not recover a minted
         // cell from another bucket via `cell_named_by_hash`.
-        if let Some(make_key) = make_key {
-            return match self.lookup_chain_with_key(&make_key()) {
+        if let Some((values, types)) = greenargs {
+            return match self.lookup_chain_with_greenargs(hash, values, types) {
                 Some(cell) => (cell.cell_key.get().unwrap_or(hash), Some(cell)),
                 None => (hash, None),
             };
@@ -3029,7 +3062,7 @@ impl WarmEnterState {
     /// `comparekey`; this one hands back the slot as upstream does.
     #[inline]
     pub fn lookup_chain(&self, hash: u64) -> Option<Rc<BaseJitCell>> {
-        self.counter.lookup_chain(hash)
+        self.counter.lookup_chain(hash).map(|cell| Rc::clone(&cell))
     }
 
     /// `jitcounter.install_new_cell(hash, newcell)` (counter.py), reached
@@ -3088,10 +3121,20 @@ impl WarmEnterState {
     /// property the `u64` currency previously lacked: it named a bucket, and a
     /// bucket is not a cell.
     pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<Rc<BaseJitCell>> {
-        let hash = key.get_uhash();
+        self.lookup_chain_with_greenargs(key.get_uhash(), &key.values, &key.types)
+    }
+
+    /// `JitCell.get_jitcell(*greenargs)`: walk `lookup_chain(hash)` and
+    /// accept the first cell whose `comparekey(*greenargs)` matches.
+    fn lookup_chain_with_greenargs(
+        &self,
+        hash: u64,
+        greenargs: &[i64],
+        types: &[GreenType],
+    ) -> Option<Rc<BaseJitCell>> {
         let mut cell = self.lookup_chain(hash);
         while let Some(c) = cell {
-            if c.jitdriver_sd == self.jitdriver_sd && c.comparekey_matches(key) {
+            if c.jitdriver_sd == self.jitdriver_sd && c.comparekey(greenargs, types) {
                 return Some(c);
             }
             cell = c.next.borrow().clone();
@@ -5010,11 +5053,16 @@ mod tests {
             cell.comparekey_matches(&key),
             "cell with stored comparekey must match equal probe"
         );
+        assert!(
+            cell.comparekey(&key.values, &key.types),
+            "slice comparekey is the same body as comparekey_matches"
+        );
         let other = GreenKey::new(vec![1, 2, 4]);
         assert!(
             !cell.comparekey_matches(&other),
             "cell with stored comparekey must not match unequal probe"
         );
+        assert!(!cell.comparekey(&other.values, &other.types));
     }
 
     // Sentinel-tagged retain/release log for the ownership test below.
@@ -5307,8 +5355,10 @@ mod tests {
                 .is_none(),
             "test needs a unique occupant"
         );
+        let miss = (key_miss.values.as_slice(), key_miss.types.as_slice());
+        let hit = (key_hit.values.as_slice(), key_hit.types.as_slice());
         assert!(
-            ws.resolved_cell_procedure_token(hash, Some(&|| key_hit.clone()))
+            ws.resolved_cell_procedure_token(hash, Some(hit))
                 .1
                 .is_some(),
             "occupant holds an executable token"
@@ -5328,20 +5378,20 @@ mod tests {
             "JitCell.get_jitcell returns None; do not hand back the occupant's key"
         );
 
-        let (_cell_key, cell) = ws.resolved_cell(hash, Some(&|| key_miss.clone()));
+        let (_cell_key, cell) = ws.resolved_cell(hash, Some(miss));
         assert!(
             cell.is_none(),
             "unique hash occupant must not win without comparekey"
         );
 
-        let (_cell_key, cell_hit) = ws.resolved_cell(hash, Some(&|| key_hit.clone()));
+        let (_cell_key, cell_hit) = ws.resolved_cell(hash, Some(hit));
         assert!(
             cell_hit
                 .expect("matching greens must hit")
                 .comparekey_matches(&key_hit)
         );
 
-        let (_cell_key, token) = ws.resolved_cell_procedure_token(hash, Some(&|| key_miss.clone()));
+        let (_cell_key, token) = ws.resolved_cell_procedure_token(hash, Some(miss));
         assert!(
             token.is_none(),
             "comparekey miss must not recover the occupant's token"
@@ -5365,13 +5415,14 @@ mod tests {
         let arriving = green_key_hashing_to(minted, 8100);
         assert_eq!(arriving.get_uhash(), minted);
         assert_ne!(arriving, parked);
-        let (_cell_key, minted_cell) = minted_ws.resolved_cell(minted, Some(&|| arriving.clone()));
+        let arriving_args = (arriving.values.as_slice(), arriving.types.as_slice());
+        let (_cell_key, minted_cell) = minted_ws.resolved_cell(minted, Some(arriving_args));
         assert!(
             minted_cell.is_none(),
             "typed miss must not recover a minted cell from another bucket"
         );
         let (_cell_key, minted_token) =
-            minted_ws.resolved_cell_procedure_token(minted, Some(&|| arriving.clone()));
+            minted_ws.resolved_cell_procedure_token(minted, Some(arriving_args));
         assert!(
             minted_token.is_none(),
             "typed miss must not return the minted cell's token"
@@ -6569,7 +6620,7 @@ mod tests {
     ///
     /// [`WarmEnterState::resolved_cell`] folds
     /// [`WarmEnterState::cell_keys_at`] and [`WarmEnterState::cell_by_key`]
-    /// into a single traversal, and its `(count > 1, make_key: None)` arm is
+    /// into a single traversal, and its `(count > 1, greenargs: None)` arm is
     /// the one that cannot be checked against a caller's greens: it reports the
     /// raw hash and whatever cell that hash names. That arm reaches the cell
     /// through `by_key`, a candidate noted DURING the walk, where the readers

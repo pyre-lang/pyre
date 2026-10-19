@@ -57,7 +57,7 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 7;
-    let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let live_arg = OpRef::input_arg_int(0);
@@ -116,7 +116,7 @@ fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 0x_dead_beef;
-    let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let live_arg = OpRef::input_arg_int(0);
@@ -169,7 +169,7 @@ fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_p
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 0x_0bad_cafe_dead_beef;
-    let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Int(live_x)]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[Value::Int(live_x)]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let live_arg = OpRef::input_arg_int(0);
@@ -210,7 +210,7 @@ fn elidable_int_bit_count_macro_advertises_extern_c_trampoline_and_traces_call_p
 fn elidable_helper_all_const_args_fold_to_const_and_cut_call() {
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
-    let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let const_x: i64 = 3;
@@ -287,7 +287,7 @@ fn emit_ref_lookup_shape_routes_to_call_pure_r_when_type_not_const() {
 
     // Seed a live Ref inputarg in slot 0 = w_type (the receiver type).
     let live_type: usize = 0x710E_0000;
-    let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_type))]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[Value::Ref(GcRef(live_type))]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, lookup_where_shape_canary);
@@ -348,7 +348,7 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
     // the cross-iteration fold the getattr inline delivers.
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
-    let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, lookup_where_shape_canary);
@@ -431,7 +431,7 @@ fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
     // Live (non-const) w_type Ref in slot 0 — the shape before the
     // version_tag guard promotes the receiver type to a constant.
     let live_type: usize = 0x710E_2222;
-    let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_type))]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[Value::Ref(GcRef(live_type))]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, jit_lookup_where_with_method_cache);
@@ -488,7 +488,7 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
     // ConstPtr (Value::Ref), the cross-iteration fold the getattr inline delivers.
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
-    let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, jit_lookup_where_with_method_cache);
@@ -576,7 +576,7 @@ fn instance_getdictvalue_records_residual_call_r_not_pure() {
     // shadowing check the LOAD_METHOD fast path needs.
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
-    let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+    let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(2, jit_instance_getdictvalue);

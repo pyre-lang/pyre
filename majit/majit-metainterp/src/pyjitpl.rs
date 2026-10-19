@@ -6595,31 +6595,37 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
+        greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
-        // Kept aside: the arm below rebinds `green_key` to the cell's minted
-        // identity, which does not bucket to `make_green_key(green_key_raw)`.
-        let entry_hash = green_key;
         // warmstate.py maybe_compile_and_run is bound on this driver's
         // WarmEnterState; elect before the cell lookup.
         let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
 
-        // Force-start via the typed greenkey when the raw (code, pc) is
-        // present so the function-entry cell carries a `comparekey`;
-        // synthetic (0, 0) call sites keep the legacy u64 path.
-        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            self.warm_state_for_driver(jd_no)
-                .force_start_tracing_for_key(key)
-        }) {
-            Some(h) => h,
-            None => self
-                .warm_state_for_driver(jd_no)
-                .force_start_tracing(green_key),
+        // warmstate.py bound_reached: `cell = JitCell(*greenargs)`. Portal
+        // greens from the function-entry door come first; without them the
+        // typed greenkey is rebuilt from the raw (code, pc)
+        // (`with_typed_decision_key` / `pypyjit_greenkey`), and synthetic
+        // (0, 0) call sites keep the legacy u64 path. A cell installed from
+        // the hash alone is one no typed lookup can match.
+        let typed_values = match greenargs {
+            Some((values, types)) => Some(majit_ir::GreenKey::from_greenargs(values, types)),
+            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone()),
         };
+        let hot = typed_values
+            .as_ref()
+            .map(|key| {
+                self.warm_state_for_driver(jd_no)
+                    .force_start_tracing_for_key(key)
+            })
+            .unwrap_or_else(|| {
+                self.warm_state_for_driver(jd_no)
+                    .force_start_tracing(green_key)
+            });
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6629,10 +6635,10 @@ impl<M: Clone> MetaInterp<M> {
                 // finally-clear instead of falling back to the bucket hash.
                 // This is the function-entry twin of on_back_edge_typed's
                 // resolve-once step below (`warmstate.py maybe_compile_and_run`).
-                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                    self.warm_state_for_driver(jd_no).cell_key_for(key)
-                })
-                .flatten()
+                let green_key = match typed_values.as_ref() {
+                    Some(key) => self.warm_state_for_driver(jd_no).cell_key_for(key),
+                    None => None,
+                }
                 .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
                 // warmstate.py bound_reached / function-entry: MetaInterp(...)
@@ -6685,24 +6691,24 @@ impl<M: Clone> MetaInterp<M> {
                 // comparekey-less cell `should_force_finish_tracing_for_key`
                 // never reads, and the next attempt retraces instead of
                 // segmenting (`debug_merge_point`).
-                if let Some(key) =
-                    Self::with_typed_decision_key(entry_hash, green_key_raw, |key| key.clone())
-                {
+                if let Some(key) = typed_values.clone() {
                     ctx.set_green_key_values(key);
                 }
                 // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
                 // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
                 // matched. The typed door is that cell; the hash read misses it
                 // when the bucket has two owners.
-                let force_finish = {
-                    let hashed = self
-                        .warm_state_for_driver(jd_no)
-                        .should_force_finish_tracing(green_key);
-                    let typed = Self::with_typed_decision_key(entry_hash, green_key_raw, |key| {
+                let force_finish = match typed_values.as_ref() {
+                    Some(key) => {
                         self.warm_state_for_driver(jd_no)
                             .should_force_finish_tracing_for_key(key)
-                    });
-                    typed.unwrap_or(false) || hashed
+                            || self
+                                .warm_state_for_driver(jd_no)
+                                .should_force_finish_tracing(green_key)
+                    }
+                    None => self
+                        .warm_state_for_driver(jd_no)
+                        .should_force_finish_tracing(green_key),
                 };
                 // Store the ctx before `initialize_virtualizable`.
                 // `clear_vable_token` can minor-collect, and
@@ -6918,14 +6924,14 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
-        green_key_values: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         self.bound_reached(
             green_key,
             green_key_raw,
-            green_key_values.map(|make_key| make_key()),
+            green_key_values,
             driver_descriptor.cloned(),
             live_values,
         )
@@ -6933,13 +6939,14 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Compatibility wrapper that performs both halves in one call.
     ///
-    /// `green_key_values` and `driver_descriptor` still arrive as a factory
-    /// and a borrow because only the `StartTracing` arm consumes them.
+    /// `green_key_values` and `driver_descriptor` still arrive as an owned
+    /// key and a borrow because only the `StartTracing` arm consumes them
+    /// (`JitCell(*greenargs)` store).
     pub fn on_back_edge_typed(
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
-        green_key_values: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        green_key_values: Option<majit_ir::GreenKey>,
         driver_descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
@@ -15650,15 +15657,16 @@ impl<M: Clone> MetaInterp<M> {
     /// wants the metadata's VALUE, so testing its presence separately would
     /// probe the same map twice for one entry.
     ///
-    /// `make_green_key` is consulted only on an ambiguous bucket, and a caller
-    /// that holds no structured key passes `None` — see
-    /// [`Self::resolve_cell_key`], whose key this reports.
+    /// `greenargs` is `*greenargs` already in hand
+    /// (`JitCell.comparekey(*greenargs2)`). A caller that holds no structured
+    /// greens passes `None` — see [`Self::resolve_cell_key`], whose key this
+    /// reports. Comparison never builds a `GreenKey`.
     pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
-        make_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
     ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
-        self.resolved_entry_procedure_token_on_driver(0, green_key_hash, make_green_key)
+        self.resolved_entry_procedure_token_on_driver(0, green_key_hash, greenargs)
     }
 
     /// `warmstate.py maybe_compile_and_run` token read on that driver's
@@ -15670,12 +15678,12 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         jd_no: usize,
         green_key_hash: u64,
-        make_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
     ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
         let Some(warm) = self.warm_state_ref_for_driver(jd_no) else {
             return (green_key_hash, None);
         };
-        let (cell_key, token) = warm.resolved_cell_procedure_token(green_key_hash, make_green_key);
+        let (cell_key, token) = warm.resolved_cell_procedure_token(green_key_hash, greenargs);
         (cell_key, token.filter(|token| token.has_compiled_code()))
     }
 
@@ -25082,6 +25090,7 @@ mod metainterp_static_data_tests {
             0,
             (0, 0),
             None,
+            None,
             &[Value::Ref(majit_ir::GcRef(fnaddr as usize))],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -25140,7 +25149,7 @@ mod metainterp_static_data_tests {
         meta.warm_state_for_driver(0)
             .disable_noninlinable_function_for_key(&typed);
 
-        let action = meta.force_start_tracing(green_key, (code_ptr, pc), None, &[]);
+        let action = meta.force_start_tracing(green_key, (code_ptr, pc), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let marked = meta
@@ -25179,7 +25188,7 @@ mod metainterp_static_data_tests {
         assert_eq!(idx1, 1);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.active_jitdriver_sd = Some(idx1);
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
         assert_eq!(
             meta.active_jitdriver_sd,
@@ -25203,7 +25212,7 @@ mod metainterp_static_data_tests {
         let idx0 = meta.register_jitdriver_sd(first);
         assert_eq!(idx0, 0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
         let key = meta
             .starting_green_key()
@@ -25379,7 +25388,7 @@ mod metainterp_static_data_tests {
         std::sync::Arc::get_mut(&mut meta.staticdata)
             .unwrap()
             .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(fnaddr)]);
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let funcbox_ref = meta
             .trace_ctx()
@@ -25413,8 +25422,13 @@ mod metainterp_static_data_tests {
         std::sync::Arc::get_mut(&mut meta.staticdata)
             .unwrap()
             .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(fnaddr)]);
-        let action =
-            meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(majit_ir::GcRef(fnaddr))]);
+        let action = meta.force_start_tracing(
+            0,
+            (0, 0),
+            None,
+            None,
+            &[Value::Ref(majit_ir::GcRef(fnaddr))],
+        );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
         let funcbox = (JitArgKind::Ref, OpRef::input_arg_ref(0), fnaddr as i64); // non-Const
@@ -25434,7 +25448,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let mut real_object = 0_u64;
@@ -25494,7 +25508,7 @@ mod metainterp_static_data_tests {
         let mut jd = JitDriverStaticData::new(vec![], vec![]);
         jd.result_type = Type::Int;
         meta.register_jitdriver_sd(jd);
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let resultbox_ref = meta.trace_ctx().expect("active trace").const_int(0xc0ffee);
         let result = meta.finishframe(Some((JitArgKind::Int, 0, resultbox_ref, 0xc0ffee)), true);
@@ -25739,6 +25753,7 @@ mod metainterp_static_data_tests {
             0,
             (0, 0),
             None,
+            None,
             &[Value::Int(100), Value::Int(40), Value::Int(1)],
         );
         meta.initialize_state_from_start(
@@ -25803,7 +25818,7 @@ mod metainterp_static_data_tests {
             // `jitdrivers_sd[0]` for the portal jitcode stamped above.
             meta.ensure_default_driver_sd();
             meta.finish_setup_descrs_for_jitdrivers();
-            meta.force_start_tracing(0, (0, 0), None, &[Value::Int(40), Value::Int(2)]);
+            meta.force_start_tracing(0, (0, 0), None, None, &[Value::Int(40), Value::Int(2)]);
             meta.initialize_state_from_start(
                 Arc::new(portal),
                 &[
@@ -25878,6 +25893,7 @@ mod metainterp_static_data_tests {
         meta.force_start_tracing(
             0,
             (0, 0),
+            None,
             None,
             &[Value::Int(100), Value::Int(40), Value::Int(1)],
         );
@@ -26071,7 +26087,7 @@ mod metainterp_static_data_tests {
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         meta.seed_root_portal_frame(
             jitcode,
@@ -26111,7 +26127,7 @@ mod metainterp_static_data_tests {
         ));
         let idx = meta.register_jitdriver_sd(jd);
         meta.active_jitdriver_sd = Some(idx);
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
         let box_ref = OpRef::ref_op(3);
         meta.initialize_withgreenfields(&[(JitArgKind::Ref, box_ref, 0xabc)]);
@@ -26187,7 +26203,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr = StubCallDescr {
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Ref],
@@ -26219,7 +26235,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr = StubCallDescr {
             arg_types: vec![majit_ir::Type::Int],
@@ -26252,7 +26268,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         // descr declares [Int, Ref, Int, Ref] (declaration order).
         let descr = StubCallDescr {
@@ -26300,7 +26316,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr = StubCallDescr {
             arg_types: vec![
@@ -26378,7 +26394,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr = StubCallDescr {
@@ -26431,7 +26447,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr = StubCallDescr {
@@ -26700,7 +26716,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -26836,7 +26852,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let mut portal = JitCodeBuilder::new().finish();
@@ -26858,7 +26874,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        meta.force_start_tracing(0, (0, 0), None, &[]);
+        meta.force_start_tracing(0, (0, 0), None, None, &[]);
 
         let jitcode = std::sync::Arc::new(JitCodeBuilder::new().finish());
         meta.perform_call(jitcode, &[], None).unwrap_err();
@@ -26880,7 +26896,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -27217,12 +27233,12 @@ mod metainterp_static_data_tests {
             "maybe_compile_and_run on jd1 reads jd1's cell"
         );
 
-        let primary_entry = meta.force_start_tracing(key, (0, 0), Some(first), &[]);
+        let primary_entry = meta.force_start_tracing(key, (0, 0), None, Some(first), &[]);
         assert!(
             matches!(primary_entry, BackEdgeAction::RunCompiled),
             "a leftover secondary active_jitdriver_sd must not hide the primary compiled cell"
         );
-        let secondary_entry = meta.force_start_tracing(key, (0, 0), Some(second), &[]);
+        let secondary_entry = meta.force_start_tracing(key, (0, 0), None, Some(second), &[]);
         assert!(
             matches!(secondary_entry, BackEdgeAction::RunCompiled),
             "a secondary descriptor must find the token attached on that warmstate"
@@ -27295,7 +27311,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = 0xab07_u64;
-        let action = meta.force_start_tracing(key, (0, 0), Some(second.clone()), &[]);
+        let action = meta.force_start_tracing(key, (0, 0), None, Some(second.clone()), &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(meta.active_jitdriver_sd, Some(idx1));
         assert!(
@@ -27318,7 +27334,7 @@ mod metainterp_static_data_tests {
                 .is_none_or(|cell| !cell.is_tracing()),
             "bound_reached finally cleared JC_TRACING on that cell"
         );
-        let retry = meta.force_start_tracing(key, (0, 0), Some(second), &[]);
+        let retry = meta.force_start_tracing(key, (0, 0), None, Some(second), &[]);
         assert!(
             matches!(retry, BackEdgeAction::StartedTracing),
             "a cleared secondary cell must be retryable, not AlreadyTracing"
@@ -27348,7 +27364,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = 0x5e9_u64;
-        let action = meta.force_start_tracing(key, (0, 0), Some(second), &[]);
+        let action = meta.force_start_tracing(key, (0, 0), None, Some(second), &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(meta.active_jitdriver_sd, Some(idx1));
 
@@ -28302,7 +28318,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr_view = StubCallDescr {
             arg_types: vec![],
@@ -28333,7 +28349,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr_view = StubCallDescr {
             arg_types: vec![majit_ir::Type::Int],
@@ -28371,7 +28387,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -28419,7 +28435,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -28482,6 +28498,7 @@ mod metainterp_static_data_tests {
             0,
             (0, 0),
             None,
+            None,
             &[Value::Ref(majit_ir::GcRef(fnaddr as usize))],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -28542,7 +28559,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let mut effect = majit_ir::EffectInfo::default();
@@ -28587,7 +28604,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -28642,7 +28659,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -28702,7 +28719,7 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -28759,8 +28776,8 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitCodeBuilder;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        meta.force_start_tracing(0, (0, 0), None, &[]);
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        meta.force_start_tracing(0, (0, 0), None, None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         // Already tracing returns AlreadyTracing — that's fine, the
         // first call already started the trace.
         let _ = action;
@@ -28792,7 +28809,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.ovf_flag = false;
@@ -28817,7 +28834,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.last_exc_value = 0;
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let result = meta.handle_possible_exception();
         assert!(matches!(result, Ok(())));
@@ -28858,7 +28875,7 @@ mod metainterp_static_data_tests {
         // dereferencing a raw pointer.
         meta.cpu = crate::cpu::cpu_from_bh_classof_fn(|_| 0xc1a55);
 
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         // Attempt fields belong to this MetaInterp instance, so they
         // are written after `__init__` / `begin_attempt`.
@@ -28914,7 +28931,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         meta.cpu = crate::cpu::cpu_from_bh_classof_fn(|_| 0xc1a55);
 
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         meta.last_exc_value = 0xfeed;
         meta.class_of_last_exc_is_const = true;
@@ -29210,7 +29227,7 @@ mod metainterp_static_data_tests {
             sd.liveness_info.set(vec![0, 0, 0]);
         }
 
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         meta.last_exc_value = 0xbeef;
 
@@ -29459,7 +29476,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.enter_portal_frame(3, 0xfeed);
@@ -29521,7 +29538,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.leave_portal_frame(7);
@@ -29552,7 +29569,7 @@ mod metainterp_static_data_tests {
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let mut jc = JitCodeBuilder::new().finish();
@@ -29618,7 +29635,7 @@ mod metainterp_static_data_tests {
         jc.replace_jitdriver_sd(Some(idx));
         let jc = std::sync::Arc::new(jc);
 
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let typed = majit_ir::GreenKey::new(vec![0xcafe, 0xbeef]);
@@ -29696,7 +29713,7 @@ mod metainterp_static_data_tests {
         jc.replace_jitdriver_sd(Some(idx));
         let jc = std::sync::Arc::new(jc);
 
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.perform_call(jc, &[], Some((0xbabe, None)))
@@ -29736,7 +29753,7 @@ mod metainterp_static_data_tests {
     }
 
     fn start_tracing(meta: &mut MetaInterp<()>) {
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
         assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
     }
 
@@ -33175,7 +33192,7 @@ mod tests {
         meta.set_vable_ptr(vable_ptr.cast());
         meta.set_virtualizable_info(std::sync::Arc::new(info));
         meta.set_vable_array_lengths(array_lengths);
-        let action = meta.force_start_tracing(777, (0, 0), None, &live_values);
+        let action = meta.force_start_tracing(777, (0, 0), None, None, &live_values);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         vable
     }
@@ -33202,7 +33219,7 @@ mod tests {
     fn finish_trace_for_parity_preserves_captured_snapshots() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(777, (0, 0), None, &[Value::Int(17)]);
+        let action = meta.force_start_tracing(777, (0, 0), None, None, &[Value::Int(17)]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let snapshot_id = {
@@ -33287,7 +33304,7 @@ mod tests {
         let frame = Value::Ref(majit_ir::GcRef(
             (&mut obj as *mut ResidualCallVableObj) as usize,
         ));
-        let action = meta.force_start_tracing(777, (0, 0), Some(descriptor), &[frame]);
+        let action = meta.force_start_tracing(777, (0, 0), None, Some(descriptor), &[frame]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let ctx = meta.trace_ctx().expect("expected active trace context");
@@ -33322,7 +33339,7 @@ mod tests {
             (&mut obj as *mut ResidualCallVableObj) as usize,
         ));
 
-        let action = meta.force_start_tracing(778, (0, 0), Some(descriptor), &[frame]);
+        let action = meta.force_start_tracing(778, (0, 0), None, Some(descriptor), &[frame]);
 
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(obj.token, 0);
@@ -33370,7 +33387,7 @@ mod tests {
         );
         let frame = Value::Ref(majit_ir::GcRef(old as usize));
 
-        let action = meta.force_start_tracing(779, (0, 0), Some(descriptor), &[frame]);
+        let action = meta.force_start_tracing(779, (0, 0), None, Some(descriptor), &[frame]);
 
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(obj.token, 0);
@@ -33415,7 +33432,7 @@ mod tests {
         let frame = Value::Ref(majit_ir::GcRef(
             (&mut obj as *mut ResidualCallVableObj) as usize,
         ));
-        let action = meta.force_start_tracing(780, (0, 0), Some(descriptor), &[frame]);
+        let action = meta.force_start_tracing(780, (0, 0), None, Some(descriptor), &[frame]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let ctx = meta.trace_ctx().expect("expected active trace context");
@@ -33725,7 +33742,7 @@ mod tests {
                 front_target: None,
             },
         );
-        let action = meta.force_start_tracing(777, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(777, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let frame_box = {
             let ctx = meta.trace_ctx().unwrap();
@@ -33783,7 +33800,7 @@ mod tests {
         jd.portal_runner_adr = dummy_portal_runner as *const () as usize as i64;
         meta.register_jitdriver_sd(jd);
 
-        let action = meta.force_start_tracing(888, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(888, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let frame_box = {
@@ -33882,7 +33899,7 @@ mod tests {
         meta.warm_state_for_driver(idx1)
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&target_token));
 
-        let action = meta.force_start_tracing(777, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(777, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let frame_box = {
             let ctx = meta.trace_ctx().unwrap();
@@ -33966,7 +33983,7 @@ mod tests {
         meta.warm_state_for_driver(idx1)
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&target_token));
 
-        let action = meta.force_start_tracing(778, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(778, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let resolved = meta
             .with_trace_ctx_and_token_resolver(
@@ -34004,7 +34021,7 @@ mod tests {
             staticdata.finish_setup_descrs_for_jitdrivers(&mut meta.backend);
         }
         assert_eq!(meta.staticdata.jitdrivers_sd[0].portal_runner_adr, 0);
-        let action = meta.force_start_tracing(889, (0, 0), None, &[]);
+        let action = meta.force_start_tracing(889, (0, 0), None, None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let target = meta
@@ -34323,7 +34340,8 @@ mod tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let green_key = 0x7e1b_u64;
-        let action = meta.force_start_tracing(green_key, (0, 0), Some(second), &[Value::Int(0)]);
+        let action =
+            meta.force_start_tracing(green_key, (0, 0), None, Some(second), &[Value::Int(0)]);
         assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
         assert_eq!(meta.active_jitdriver_sd, Some(idx1));
         if let Some(ctx) = meta.trace_ctx() {
@@ -35217,7 +35235,7 @@ mod tests {
         meta.warm_state_for_driver(0)
             .disable_noninlinable_function_for_key(&key);
         assert!(matches!(
-            meta.force_start_tracing(bucket, (code, pc), None, &[Value::Int(0)]),
+            meta.force_start_tracing(bucket, (code, pc), None, None, &[Value::Int(0)]),
             BackEdgeAction::StartedTracing
         ));
 
