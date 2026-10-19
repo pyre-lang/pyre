@@ -33766,9 +33766,10 @@ impl<'a> Lowering<'a> {
                 let mut spans = Vec::with_capacity(fields.len());
                 for (i, field) in fields.iter().enumerate() {
                     let offset = layout.struct_field_offset(i)?;
-                    let node = tyref_node(&field.ty, self.llbc)?;
-                    let (_item_ty, itemsize, _is_signed) =
-                        json_ty_raw_store_descr(node, self.llbc)?;
+                    // Same width rule as the Enum payload arm: a thin
+                    // pointer, a Scalar, a `core::sync::atomic::Atomic<T>`
+                    // inner word, or a size-`<= 8` ADT (`span_raw_for_ty`).
+                    let (_, itemsize, _) = self.span_raw_for_ty(&field.ty)?;
                     if itemsize == 0 || itemsize > 8 {
                         return None;
                     }
@@ -34048,10 +34049,15 @@ impl<'a> Lowering<'a> {
         result
     }
 
-    /// Byte width of one enum field for a whole-value move. A literal uses
+    /// Byte width of one field for a whole-value move. A literal uses
     /// its Charon size. A thin pointer or a small ADT (a `Box`, a C-like
     /// tag) is that many bytes, so a 16-byte `Union` still moves field by
     /// field when a payload is not an integer.
+    ///
+    /// `core::sync::atomic::Atomic<T>` is Opaque and carries no Charon
+    /// layout; the stored word is `T` (`tyref_atomic_arg`), classified
+    /// with the same `json_ty_raw_store_descr` the Scalar arm uses
+    /// (`tyref_atomic_inner_value_type` paints the FieldWrite that way).
     fn span_raw_for_ty(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
         if let Some(node) = tyref_node(ty, self.llbc)
             && let Some(descr) = json_ty_raw_store_descr(node, self.llbc)
@@ -34064,6 +34070,11 @@ impl<'a> Lowering<'a> {
                 crate::layout::target_word_size(),
                 false,
             ));
+        }
+        if let Some(inner) = tyref_atomic_arg(ty, self.llbc)
+            && let Some(descr) = json_ty_raw_store_descr(inner, self.llbc)
+        {
+            return Some(descr);
         }
         let id = self.tyref_adt_def_id(ty)?;
         let td = self.llbc.type_by_id(id)?;
@@ -111923,6 +111934,93 @@ mod tests {
             !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
             "ops={ops:?}"
         );
+    }
+
+    /// `*self = fresh` through `&mut Self` is the field-wise structcopy
+    /// (`rffi.py` `_get_structcopy_fn`) even when a field is
+    /// `Atomic<usize>` (`tyref_atomic_inner_value_type`).
+    #[test]
+    fn deref_store_of_mut_self_emits_field_writes() {
+        let s_ty = interior_adt(0);
+        let t_ty = interior_adt(1);
+        let usize_ty = interior_usize();
+        let p_ty = interior_raw_mut(t_ty);
+        let atomic_ty = serde_json::json!({
+            "Adt": {
+                "id": 2,
+                "generics": {
+                    "regions": [],
+                    "types": [usize_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let mut_self = serde_json::json!({"Ref": [null, s_ty.clone(), "Mut"]});
+        let unit = serde_json::json!({
+            "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+        });
+        let s_decl = interior_struct(
+            0,
+            &["fixture", "S"],
+            &[("p", p_ty), ("n", atomic_ty)],
+            16,
+            &[0, 8],
+            false,
+        );
+        let t_decl = interior_struct(1, &["fixture", "T"], &[], 0, &[], false);
+        // Charon emits `Atomic<T>` as Opaque with no layout; the stored
+        // word is the type argument (`tyref_atomic_arg`).
+        let atomic_decl = serde_json::json!({
+            "def_id": 2,
+            "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+            "kind": "Opaque",
+            "layout": null
+        });
+        let caller = interior_caller(
+            "f",
+            2,
+            vec![mut_self.clone(), s_ty.clone()],
+            unit.clone(),
+            vec![
+                interior_local(0, None, &unit),
+                interior_local(1, Some("self"), &mut_self),
+                interior_local(2, Some("fresh"), &s_ty),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_deref(1, &mut_self, &s_ty),
+                    serde_json::json!({
+                        "Use": [{"Move": interior_place(2, &s_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            )],
+        );
+        let llbc = llbc_with_types("fixture", vec![s_decl, t_decl, atomic_decl], vec![caller]);
+        let graph = lower_interior(&llbc, "f");
+        let ops = graph_ops(&graph);
+        let write_names: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => Some(field.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let read_names: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(field.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(write_names, ["p", "n"], "ops={ops:?}");
+        assert_eq!(read_names, ["p", "n"], "ops={ops:?}");
+        let atomic_write_ty = ops.iter().find_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, ty, .. } if field.name == "n" => Some(ty),
+            _ => None,
+        });
+        assert_eq!(atomic_write_ty, Some(&ValueType::Unsigned), "ops={ops:?}");
     }
 
     /// A signed field constant stays a pooled int. `field_write_inline_const`
