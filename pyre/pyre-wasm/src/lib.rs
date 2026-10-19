@@ -855,20 +855,13 @@ fn run_python_impl(source: &str) -> String {
                 pyre_interpreter::importing::set_runtime_flags(&flags);
             }
             Err(e) => {
-                // `preconfig_init_utf8_mode` is fatal before the interpreter
+                // A configuration error is fatal before the interpreter
                 // exists; the guest cannot exit a process, so it reports the
                 // same banner on fd 2 and returns the same status.
                 install_wasm_print_hook();
                 OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
                 ERR_BUF.with(|buf| buf.borrow_mut().clear());
-                pyre_interpreter::host_seam::emit_stderr(
-                    format!(
-                        "Fatal Python error: preconfig_init_utf8_mode: {}\n\
-                         Python runtime state: preinitializing\n\n",
-                        e.0
-                    )
-                    .as_bytes(),
-                );
+                pyre_interpreter::host_seam::emit_stderr(e.banner().as_bytes());
                 EXIT_CODE.with(|c| c.set(1));
                 return String::new();
             }

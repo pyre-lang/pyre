@@ -157,8 +157,8 @@ pub(crate) fn fspath(
     {
         let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(fspath_descr);
-        // PyPy's `interp_posix._fspath` binds `__fspath__` before calling it;
-        // a non-descriptor is its own value.
+        // `interp_posix.py fspath` binds `__fspath__` before calling it
+        // (`space.get_and_call_function`); a non-descriptor is its own value.
         let fspath_fn = unsafe {
             crate::baseobjspace::get(
                 pyre_object::gc_roots::shadow_stack_get(fspath_slot),
@@ -170,8 +170,14 @@ pub(crate) fn fspath(
         let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
         // A `None` left on the type switches the protocol off the way
         // `__hash__ = None` does, so the object is turned away as not
-        // path-like and named by its own type.  `_fspath` instead calls what
-        // it found, which reports `NoneType` as not callable.
+        // path-like and named by its own type.
+        //
+        // [3.14-spec] `interp_posix.py fspath` only refuses a missing
+        // `__fspath__` and calls the `None` it found, reporting `NoneType` as
+        // not callable; `posixmodule.c PyOS_FSPath` tests `func == Py_None`
+        // first. Evidence: `lib-python/3/test/test_os.py`
+        // `test_fspath_set_to_None` asserts "expected str, bytes or
+        // os.PathLike object, not Foo" (and `Baz`) for `__fspath__ = None`.
         if unsafe { pyre_object::is_none(fspath_fn) } {
             return Err(crate::PyError::type_error(format!(
                 "expected str, bytes or os.PathLike object, not {}",
@@ -259,6 +265,11 @@ pub(crate) fn statvfs_result_seq_type() -> PyObjectRef {
 /// "nt.times_result(...)" on the host whose module is spelled that way.  The
 /// name is the one `pickle` imports to resolve the type, so it has to be the
 /// module the host actually has.
+///
+/// [3.14-spec] `app_posix.py times_result` fixes `name = "posix.times_result"`
+/// on every host; `posixmodule.c` sets `times_result_desc.name = MODNAME
+/// ".times_result"`, with `MODNAME` `"nt"` under `MS_WINDOWS`. Windows only;
+/// evidence is the C source at v3.14.6.
 pub(crate) fn times_result_seq_type() -> PyObjectRef {
     static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     T.get_or_init(|| {

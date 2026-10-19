@@ -174,11 +174,14 @@ fn fatal_utf8_config_error(detail: &str) -> ! {
 
 /// Fold the process environment over the parsed options. The launcher owns a
 /// real environment, so `launch_env` reads `std::env` directly here; an invalid
-/// PYTHONUTF8 is fatal during pre-init config, as it is for `-X utf8`.
+/// PYTHONUTF8 or cpu count is fatal during config, as it is for `-X utf8`.
 fn finalize_flags(flags: LaunchFlags) -> LaunchFlags {
     match pyre_interpreter::launch_env::finalize(flags) {
         Ok(flags) => flags,
-        Err(e) => fatal_utf8_config_error(e.0),
+        Err(e) => {
+            eprint!("{}", e.banner());
+            std::process::exit(1);
+        }
     }
 }
 

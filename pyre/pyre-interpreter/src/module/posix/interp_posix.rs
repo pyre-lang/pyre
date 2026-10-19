@@ -153,6 +153,62 @@ pub(crate) unsafe fn reinit_fork_tables_after_fork() {
 // `_in_next` and is refused as interp_scandir.py requires.
 static SCANDIR_IN_NEXT_SERIALIZER: Mutex<()> = Mutex::new(());
 
+/// os.cpu_count() -> int | None — `interp_posix.cpu_count` answers None when
+/// `rposix._cpu_count() <= 0`.
+///
+/// [3.14-spec] `os_cpu_count_impl` at v3.14.6 answers `config->cpu_count`
+/// first when it is positive (`-X cpu_count=N`, `PYTHON_CPU_COUNT=N`); PyPy
+/// has no such configuration.  Measured with python3.14: `-X cpu_count=3`
+/// makes `os.cpu_count()` and `os.process_cpu_count()` answer 3.
+#[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+fn cpu_count() -> crate::PyResult {
+    let configured = crate::importing::cpu_count_config();
+    if configured > 0 {
+        return Ok(pyre_object::w_int_new(configured));
+    }
+    let n = unsafe { majit_rlib::rposix::_cpu_count() };
+    if n <= 0 {
+        Ok(pyre_object::w_none())
+    } else {
+        Ok(pyre_object::w_int_new(n as i64))
+    }
+}
+
+/// `interp_posix.execv`'s `space.unpackiterable(w_argv)`.
+///
+/// [3.14-spec] `interp_posix.execv` takes any iterable and reports every
+/// `TypeError` raised while unpacking or converting it as `execv() arg 2
+/// must be an iterable of strings`; `os_execv_impl` at v3.14.6 refuses
+/// anything but a list or tuple (`execv() arg 2 must be a tuple or list`)
+/// and `parse_arglist` lets `fsconvert_strdup`'s error through for an
+/// element. Measured with python3.14 and pypy3 on `os.execv(exe, 5)`,
+/// `iter([1])` and `[1]`.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+fn execv_argv_items(w_argv: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    if unsafe { !pyre_object::is_list(w_argv) && !pyre_object::is_tuple(w_argv) } {
+        return Err(crate::PyError::type_error(
+            "execv() arg 2 must be a tuple or list",
+        ));
+    }
+    crate::baseobjspace::unpackiterable(w_argv, -1)
+}
+
+/// `interp_posix.execve`: `argv` is a list or a tuple, checked before any
+/// element is converted, and an element that cannot be converted reports
+/// for itself.
+///
+/// [3.14-spec] `interp_posix.execve` says `argv must be a tuple or a list`;
+/// `os_execve_impl` at v3.14.6 says `execve: argv must be a tuple or list`.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+fn execve_argv_items(w_argv: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    if unsafe { !pyre_object::is_list(w_argv) && !pyre_object::is_tuple(w_argv) } {
+        return Err(crate::PyError::type_error(
+            "execve: argv must be a tuple or list",
+        ));
+    }
+    crate::baseobjspace::unpackiterable(w_argv, -1)
+}
+
 fn require_env_mapping(
     mapping: PyObjectRef,
     function: &str,
@@ -499,9 +555,14 @@ fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 /// `posix.waitid_result` structseq — the five `siginfo_t` fields `waitid`
-/// fills (`posixmodule.c waitid_result_fields`). The call is one
-/// `interp_posix.py:1722` names and does not carry, so the shape here is the
-/// one CPython 3.14 publishes.
+/// fills (`posixmodule.c waitid_result_fields`).
+///
+/// [3.14-spec] `interp_posix.py` carries no `waitid` (its "# missing:
+/// waitid()" note), so `hasattr(os, 'waitid')` is False there;
+/// `posixmodule.c os_waitid_impl` publishes it with this result type.
+/// Evidence: `lib-python/3/test/test_posix.py` `test_waitid` asserts
+/// `self.assertEqual(pid, res.si_pid)`, and `test_cld_xxxx_constants` is
+/// gated on `hasattr(os, 'waitid_result')`.
 #[cfg(all(unix, not(feature = "sandbox")))]
 fn waitid_result_seq_type() -> PyObjectRef {
     static T: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
@@ -1422,7 +1483,21 @@ mod win_nt {
     /// `DLL_DIRECTORY_COOKIE` back inside a capsule and os.py only round-trips
     /// that object into `_remove_dll_directory`.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (path, _, resolved) = arg_path(args, "_add_dll_directory")?;
+        // `interp_posix.py _add_dll_directory` audits the argument as given,
+        // before the path conversion.  A hook runs Python, so the arguments
+        // are read back from the shadow stack afterwards.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let args_base = pyre_object::gc_roots::pin_roots(args);
+        if !args.is_empty() {
+            crate::module::sys::vm::audit(
+                "os.add_dll_directory",
+                &[pyre_object::gc_roots::shadow_stack_get(args_base)],
+            )?;
+        }
+        let args: Vec<PyObjectRef> = (0..args.len())
+            .map(|index| pyre_object::gc_roots::shadow_stack_get(args_base + index))
+            .collect();
+        let (path, _, resolved) = arg_path(&args, "_add_dll_directory")?;
         // `arg_path` keeps the code units it decoded the path into; going back
         // through a `str` would have no spelling for a lone surrogate and would
         // address a different directory.
@@ -4821,6 +4896,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // of the one name. This is `ntpath.splitroot` and `posixpath.splitroot`
     // themselves: both import it and fall back to their own Python split only
     // where a build does not carry it.
+    //
+    // [3.14-spec] `moduledef.py` registers only the win32 `_path_splitroot`
+    // and neither helper here, so PyPy's `os.path.splitroot`/`normpath` are
+    // the Python fallbacks; `posixmodule.c os__path_splitroot_ex_impl` /
+    // `os__path_normpath_impl` are what `os.path` binds. Evidence:
+    // `lib-python/3/posixpath.py` and `ntpath.py` `from posix|nt import
+    // _path_splitroot_ex as splitroot`, and `test_posixpath.py` /
+    // `test_ntpath.py` `test_fast_paths_in_use` (`@cpython_only`) assert
+    // `os.path.splitroot is posix._path_splitroot_ex`.
     crate::__pyre_put_new!(
         ns_slot,
         "_path_splitroot_ex",
@@ -5277,6 +5361,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // Nothing in pyre publishes that seam, so the answers are the ones the
     // calls give with no hook installed: `False`, and the 0 the absent hook
     // would have returned.
+    //
+    // [3.14-spec] PyPy's `moduledef.py` has neither name; its own
+    // `lib_pypy/pyrepl/unix_console.py input_hook` returns None ("not
+    // supported on pypy") before reaching them. `posixmodule.c
+    // os__inputhook_impl` / `os__is_inputhook_installed_impl` publish both.
+    // Evidence: `lib-python/3/_pyrepl/unix_console.py` `input_hook` calls
+    // `posix._is_inputhook_installed()` unguarded (`windows_console.py`
+    // likewise with `nt`).
     crate::__pyre_put_new!(
         ns_slot,
         "_inputhook",
@@ -5484,6 +5576,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// `_pystat_l128_from_l64_l64` -- Windows reports a 128-bit file id, whose
     /// upper half is the only part some volumes fill in, so `st_ino` is an int
     /// of whatever width the id needs rather than the low word alone.
+    ///
+    /// [3.14-spec] `rposix_stat.py win32_by_handle_info_to_stat` builds
+    /// `st_ino` with `make_longlong(nFileIndexHigh, nFileIndexLow)`, a signed
+    /// 64-bit id; `posixmodule.c _pystat_fromstructstat` sets it through
+    /// `_pystat_l128_from_l64_l64(st->st_ino, st->st_ino_high)`. Windows only;
+    /// evidence is the C source at v3.14.6.
     fn w_ino(ino: u128) -> pyre_object::PyObjectRef {
         match i64::try_from(ino) {
             Ok(n) => pyre_object::w_int_new(n),
@@ -5593,6 +5691,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         put_extra("st_flags", pyre_object::w_int_new(st_flags as i64));
         #[cfg(not(target_os = "macos"))]
         let _ = st_flags;
+        // [3.14-spec] `rposix_stat.py ALL_STAT_FIELDS` leaves `st_birthtime`
+        // out ("not implemented"), so PyPy has neither attribute;
+        // `posixmodule.c _pystat_fromstructstat` fills `ST_BIRTHTIME_IDX` /
+        // `ST_BIRTHTIME_NS_IDX` under `MS_WINDOWS` via `fill_time`. Windows
+        // only; evidence is the C source at v3.14.6.
         #[cfg(windows)]
         {
             let birthtime_f =
@@ -6572,6 +6675,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // returning to the name, which is what keeps a removed entry
         // answering. The build waits until here so a listing nobody stats
         // never pays for one.
+        //
+        // [3.14-spec] `interp_scandir.py get_lstat` (win32) re-stats the path
+        // with `rposix_stat.lstat`; `posixmodule.c DirEntry_get_lstat` builds
+        // from `self->win32_lstat` under `MS_WINDOWS`. Windows only; evidence:
+        // `lib-python/3/test/test_os.py` `test_removed_file` unlinks the file
+        // and then calls `entry.stat(follow_symlinks=False)` under "# don't
+        // fail" when `os.name == 'nt'`.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             let found = W_DirEntry::from_obj(self_obj)
@@ -6940,6 +7050,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             Ok(repr) => format!("unclosed scandir iterator {}", repr.to_string_lossy()),
             Err(_) => "unclosed scandir iterator".to_string(),
         };
+        // [3.14-spec] `W_ScandirIterator._finalize_` warns through
+        // `space.warn(..., space.w_ResourceWarning)` with no source;
+        // `posixmodule.c ScandirIterator_finalize` calls
+        // `PyErr_ResourceWarning(op, 1, ...)`, so `WarningMessage.source` is
+        // the iterator. Evidence is the C source at v3.14.6.
         if let Err(mut error) = pyre_object::with_roots!(self_obj => crate::warn::warn_category_source(&message, "ResourceWarning", 1, self_obj))
         {
             // `W_ScandirIterator._finalize_` reports a warning promoted to an
@@ -6973,12 +7088,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         ("__enter__", scandir_iter_self),
                         ("__exit__", scandir_iter_close),
                         ("close", scandir_iter_close),
-                        // `interp_scandir.py:172-180` keeps finalization on the
-                        // RPython-internal `_finalize_` and publishes no
-                        // `__del__`.  3.14 makes `__del__` a real entry in
-                        // `posix.ScandirIterator`'s type dict, so it is
-                        // published here, with the arity-1 binding below that
-                        // makes it callable as an ordinary method.
+                        // [3.14-spec] `interp_scandir.py
+                        // W_ScandirIterator._finalize_` keeps finalization
+                        // RPython-internal and publishes no `__del__`.
+                        // `posixmodule.c ScandirIteratorType_slots` sets
+                        // `Py_tp_finalize`, which `typeobject.c slotdefs`
+                        // (`TPSLOT(__del__, tp_finalize, ...)`) exposes as a
+                        // `__del__` entry in the type dict; evidence is the C
+                        // source at v3.14.6. The arity-1 binding below makes
+                        // it callable as an ordinary method.
                         ("__del__", scandir_iter_del),
                     ] {
                         let function = if name == "__del__" {
@@ -7645,21 +7763,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         static PIPE_INHCACHE: majit_rlib::rposix::SetNonInheritableCache =
             majit_rlib::rposix::SetNonInheritableCache::new();
 
-        fn exec_argv(
-            w_argv: PyObjectRef,
+        fn exec_argv_items(
+            items: Vec<PyObjectRef>,
             function: &str,
         ) -> Result<Vec<std::ffi::CString>, crate::PyError> {
-            // PyPy interp_posix.execv: `space.unpackiterable(w_argv)` followed
-            // by `space.fsencode_w` for every argument.
-            let items = crate::baseobjspace::unpackiterable(w_argv, -1).map_err(|error| {
-                if error.kind == crate::PyErrorKind::TypeError {
-                    crate::PyError::type_error(format!(
-                        "{function}() arg 2 must be an iterable of strings"
-                    ))
-                } else {
-                    error
-                }
-            })?;
             if items.is_empty() {
                 return Err(crate::PyError::value_error(format!(
                     "{function}() arg 2 must not be empty"
@@ -7711,8 +7818,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execv() path contains an embedded null byte")
                     })?;
-                    let argv =
-                        pyre_object::with_roots!(w_path, w_argv => exec_argv(w_argv, "execv"))?;
+                    let argv = pyre_object::with_roots!(w_path, w_argv =>
+                        execv_argv_items(w_argv).and_then(|items| exec_argv_items(items, "execv")))?;
                     let argv_ptrs = exec_pointer_array(&argv);
                     // `rposix.c_execv` releases the GIL and saves errno.
                     // The call returns only on failure.
@@ -7746,7 +7853,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::PyError::value_error("execve() path contains an embedded null byte")
                     })?;
                     let argv = pyre_object::with_roots!(w_path, w_argv, w_env =>
-                        exec_argv(w_argv, "execve"))?;
+                        execve_argv_items(w_argv).and_then(|items| exec_argv_items(items, "execve")))?;
                     let argv_ptrs = exec_pointer_array(&argv);
 
                     let env = pyre_object::with_roots!(w_path, w_argv, w_env => {
@@ -11215,24 +11322,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // os.cpu_count() -> int | None — `interp_posix.cpu_count` answers
-        // None when `rposix._cpu_count() <= 0`.
         #[cfg(not(feature = "sandbox"))]
         crate::__pyre_put_new!(
             ns_slot,
             "cpu_count",
-            crate::make_builtin_function_with_arity(
-                "cpu_count",
-                |_| {
-                    let n = unsafe { majit_rlib::rposix::_cpu_count() };
-                    if n <= 0 {
-                        Ok(pyre_object::w_none())
-                    } else {
-                        Ok(pyre_object::w_int_new(n as i64))
-                    }
-                },
-                0,
-            )
+            crate::make_builtin_function_with_arity("cpu_count", |_| cpu_count(), 0)
         );
         // _cpu_count alias — newer CPython exposes both.
         #[cfg(not(feature = "sandbox"))]
@@ -14466,19 +14560,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `_wexecv` / `_wexecve` are the wide forms `os_execv_impl` reaches
         // for; they return only on failure, because on success the calling
         // process is gone by the time they would.
-        fn exec_argv_wide(
-            w_argv: PyObjectRef,
+        fn exec_argv_items_wide(
+            items: Vec<PyObjectRef>,
             function: &str,
         ) -> Result<Vec<widestring::WideCString>, crate::PyError> {
-            let items = crate::baseobjspace::unpackiterable(w_argv, -1).map_err(|error| {
-                if error.kind == crate::PyErrorKind::TypeError {
-                    crate::PyError::type_error(format!(
-                        "{function}() arg 2 must be an iterable of strings"
-                    ))
-                } else {
-                    error
-                }
-            })?;
             if items.is_empty() {
                 return Err(crate::PyError::value_error(format!(
                     "{function}() arg 2 must not be empty"
@@ -14528,7 +14613,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let path = pyre_object::with_roots!(w_path, w_argv =>
                         crate::gateway::fsencode_path_named_w(w_path, "execv", "path"))?;
                     let command_w = wide_path(&path.as_bytes)?;
-                    let argv = pyre_object::with_roots!(w_path, w_argv => exec_argv_wide(w_argv, "execv"))?;
+                    let argv = pyre_object::with_roots!(w_path, w_argv =>
+                        execv_argv_items(w_argv).and_then(|items| exec_argv_items_wide(items, "execv")))?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
                     rustpython_host_env::os::ensure_drive_current_directory();
                     // The runtime's invalid parameter handler is silenced
@@ -14563,7 +14649,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::gateway::fsencode_path_named_w(w_path, "execve", "path"))?;
                     let command_w = wide_path(&path.as_bytes)?;
                     let argv = pyre_object::with_roots!(w_path, w_argv, w_env =>
-                        exec_argv_wide(w_argv, "execve"))?;
+                        execve_argv_items(w_argv).and_then(|items| exec_argv_items_wide(items, "execve")))?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
 
                     let env = pyre_object::with_roots!(w_path, w_argv, w_env => {
@@ -14909,10 +14995,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         // os.link(src, dst) -> None.  `CreateHardLinkW` names the new link
         // first and the file it points at second.
-        crate::__pyre_put_new!(
-            ns_slot,
-            "link",
-            posix_builtin(
+        crate::__pyre_put_new!(ns_slot, "link", {
+            let function = posix_builtin(
                 "link",
                 |args| {
                     let (bound, kwargs, kwonly) = bind_path_args(
@@ -14964,8 +15048,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["src", "dst"],
                 &["src_dir_fd", "dst_dir_fd", "follow_symlinks"],
-            )
-        );
+            );
+            // `os_link` declares `follow_symlinks: bool = True` with
+            // `c_default="-1"`, so an omitted argument reaches
+            // `os_link_impl` as -1 and only an explicit true one is refused
+            // (`follow_symlinks == 1`); `interp_posix.link` refuses neither.
+            // The binder fills an omitted kw-only name from `w_kw_defs`, so
+            // the stored default here is None: falsy like -1, and like an
+            // explicit `follow_symlinks=None` it is not refused.  A builtin
+            // publishes no `__kwdefaults__`, so the stored word is not
+            // observable.
+            let roots = pyre_object::gc_roots::push_roots();
+            let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(function);
+            crate::gateway::function_set_kwonly_default_pair(
+                fn_slot,
+                "follow_symlinks",
+                pyre_object::w_none(),
+            );
+            roots.get(fn_slot)
+        });
 
         // os.symlink(src, dst, target_is_directory=False) -> None.
         // `CreateSymbolicLinkW` names the link first and its target second,
@@ -15216,25 +15318,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // os.cpu_count() -> int | None
-        //
-        // `rposix.py` reads `GetSystemInfo().dwNumberOfProcessors`
-        // here, which counts the processors in the caller's processor group;
-        // `available_parallelism` answers the process affinity mask instead, so
-        // the two part company on a host that has restricted one. Left as it is
-        // because no Windows oracle is reachable from this host to measure
-        // which the surface should report — see the follow-up task.
         crate::__pyre_put_new!(
             ns_slot,
             "cpu_count",
-            crate::make_builtin_function_with_arity(
-                "cpu_count",
-                |_| match std::thread::available_parallelism() {
-                    Ok(n) => Ok(pyre_object::w_int_new(n.get() as i64)),
-                    Err(_) => Ok(pyre_object::w_none()),
-                },
-                0,
-            )
+            crate::make_builtin_function_with_arity("cpu_count", |_| cpu_count(), 0)
         );
 
         // os.system(command) -> the command interpreter's exit status.  The
@@ -15313,6 +15400,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `os_waitstatus_to_exitcode_impl` under `MS_WINDOWS`: `os.waitpid`
         // shifted the child's exit code up by a byte to spell it the way a
         // POSIX wait status does, and this shifts it back down.
+        //
+        // [3.14-spec] `app_posix.py waitstatus_to_exitcode` answers
+        // `status >> 8` on win32 for any int, negative or past 32 bits;
+        // `os_waitstatus_to_exitcode_impl` refuses both. Windows only;
+        // evidence: `lib-python/3/test/test_os.py`
+        // `test_waitstatus_to_exitcode_windows` asserts `ValueError` for
+        // `(max_exitcode + 1) << 8` and `OverflowError` for `-1`.
 
         /// `PyLong_AsUnsignedLongLong` -- an `int` and nothing else, so an
         /// object carrying `__index__` is turned away rather than converted.

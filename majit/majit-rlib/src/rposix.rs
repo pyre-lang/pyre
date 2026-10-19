@@ -2354,8 +2354,34 @@ unsafe fn rpy_cpu_count() -> libc::c_int {
     }
 }
 
+// win32: `GetSystemInfo(&sysinfo)`, then `sysinfo.dwNumberOfProcessors`.
+#[cfg(windows)]
+unsafe fn rpy_cpu_count() -> libc::c_int {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct SYSTEM_INFO {
+        wProcessorArchitecture: u16,
+        wReserved: u16,
+        dwPageSize: u32,
+        lpMinimumApplicationAddress: *mut core::ffi::c_void,
+        lpMaximumApplicationAddress: *mut core::ffi::c_void,
+        dwActiveProcessorMask: usize,
+        dwNumberOfProcessors: u32,
+        dwProcessorType: u32,
+        dwAllocationGranularity: u32,
+        wProcessorLevel: u16,
+        wProcessorRevision: u16,
+    }
+    unsafe extern "system" {
+        fn GetSystemInfo(lpSystemInfo: *mut SYSTEM_INFO);
+    }
+    let mut sysinfo = core::mem::MaybeUninit::<SYSTEM_INFO>::zeroed();
+    unsafe { GetSystemInfo(sysinfo.as_mut_ptr()) };
+    unsafe { sysinfo.assume_init() }.dwNumberOfProcessors as libc::c_int
+}
+
 /// `rposix._cpu_count`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[inline(never)]
 pub unsafe fn _cpu_count() -> crate::rffi::INT {
     let __guard = majit_gc::gc_sync::before_external_block();

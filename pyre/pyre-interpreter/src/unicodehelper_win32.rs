@@ -153,6 +153,16 @@ fn decode_fail_code(err: u32) -> CodePageFail {
 
 /// `decode_code_page_errors` — one character at a time, so the error handler
 /// sees the byte that failed rather than the whole buffer.
+///
+/// [3.14-spec] `unicodehelper_win32.py _decode_cp_error` hands the failing
+/// span to `_str_decode_utf8_slowpath` and reports the span's `end` as
+/// consumed, so the handler sees positions within that slice, the walk always
+/// steps past it, and an incomplete tail is never held back. `unicodeobject.c decode_code_page_errors`
+/// stops at a trailing span when `!final`, raises strict over `(0, 0)` and
+/// resumes at the handler's position. Windows only; evidence:
+/// `lib-python/3/test/test_codecs.py` `CodePageTest.test_incremental` asserts
+/// `code_page_decode(932, b'\xe9\x80\xe9', 'strict', False) == ('騾', 2)`;
+/// the `(0, 0)` range and the resume rest on the C source at v3.14.6.
 fn decode_errors(
     code_page: u32,
     data: &[u8],
@@ -333,6 +343,16 @@ fn encode_one(
 
 /// `encode_code_page_errors` — one character at a time, so the error handler
 /// sees the character that failed.
+///
+/// [3.14-spec] `unicodehelper_win32.py utf8_encode_code_page` appends whatever
+/// the handler returns and steps `pos += 1`; `unicodeobject.c
+/// encode_code_page_errors` raises strict over `(0, 0)`, refuses a non-ASCII
+/// `str` replacement with "unable to encode error handler result to ASCII" at
+/// `(pos, pos + 1)` and resumes at `newpos`. Windows only; evidence:
+/// `lib-python/3/test/test_codeccallbacks.py` `test_encodehelper_bug36819`
+/// asserts `exc.start == 4`/`exc.end == 5` from `code_page_encode(437, ...)`
+/// for the "\udcff" replacement and `"abcdx" * 51` for a handler that keeps
+/// returning position 0; the `(0, 0)` range rests on the C source at v3.14.6.
 fn encode_errors(
     code_page: u32,
     w_unicode: PyObjectRef,

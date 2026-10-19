@@ -3533,6 +3533,11 @@ impl UserDelAction {
             iter.release_export();
             return;
         }
+        #[cfg(all(windows, feature = "host_env"))]
+        if let Some(w_hkey) = crate::module::_winreg::interp_winreg::W_HKEY::from_obj(current()) {
+            w_hkey._finalize_();
+            return;
+        }
         if unsafe { pyre_object::interp_sre::is_sre_scanner(current()) } {
             unsafe {
                 crate::module::_sre::interp_sre::sre_scanner_release_export(current());

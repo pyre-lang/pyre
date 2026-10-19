@@ -592,10 +592,21 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
                 // class: the class-body rows lead the namespace in source
                 // order.  CPython 3.14 contributes the additional observable
                 // slots below, but does not replace that storage owner.
-                // [3.14-spec] `PyNamespace_Type`'s docs/signatures and rich
-                // slots ↔ `lib_pypy._structseq.SimpleNamespace`'s smaller
-                // class body — callers observe the former metadata while the
-                // instance dict and control-flow shape remain the latter's.
+                // [3.14-spec] `_structseq.py SimpleNamespace` takes
+                // `**kwargs` only, sorts its repr and has no `__replace__`
+                // or `__reduce__`; `namespaceobject.c namespace_init` /
+                // `namespace_repr` / `namespace_replace` /
+                // `namespace_reduce` (`PyNamespace_Type`) take one
+                // positional mapping or iterable, keep insertion order and
+                // publish both. Evidence: `lib-python/3/test/test_types.py`
+                // `SimpleNamespaceTests.test_constructor`
+                // (`SimpleNamespace({'x': 1, 'y': 2}, x=4, z=3)`),
+                // `test_repr` ("namespace(x=1, y=2, w=3)") and
+                // `test_replace`. `__reduce__`, and the `__lt__`/`__le__`/
+                // `__gt__`/`__ge__` entries `typeobject.c slotdefs` derives
+                // from `namespace_richcompare`, rest on the C source at
+                // v3.14.6. The instance dict and control-flow shape remain
+                // PyPy's.
                 install!("__module__", w_str_new("types"));
                 install!("__doc__", w_str_new("A simple attribute-based namespace."));
                 install!("__new__", simple_namespace_new_descr());
@@ -1815,9 +1826,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         w_list_new(items.take())
     };
     crate::__pyre_store!(ns, "orig_argv", w_orig_argv);
-    // pypy/interpreter/app_main.py:785-786:
+    // `app_main.py _parse_command_line`:
     //   sys._xoptions = dict(x.split('=', 1) if '=' in x else (x, True)
     //                        for x in options['_xoptions'])
+    //
+    // [3.14-spec] `app_main.py` then adds `sys._xoptions['no_debug_ranges']
+    // = True` when PYTHONNODEBUGRANGES is set; `initconfig.c
+    // config_read_complex_options` turns that variable into
+    // `config->code_debug_ranges = 0` only, and `sysmodule.c` builds
+    // `_xoptions` from `config->xoptions` (`_PyConfig_CreateXOptionsDict`),
+    // so the key appears only for `-X no_debug_ranges`. Evidence is the C
+    // source at v3.14.6.
     // `fsdecode_os_str*` reaches `call_registered_decode_error_handler`, which
     // calls app-level Python, so a decode is a collection point.  The dict is
     // filled across every one of them and a dict moves, so it lives in a root
@@ -1872,6 +1891,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // reads it back out of `sys.version` to answer `win-amd64`/`win-arm64`,
     // and pip turns that answer into the wheel platform tag. Elsewhere the
     // compiler string carries no architecture, so neither does this one.
+    //
+    // [3.14-spec] `version.py _make_version_template` writes
+    // "X.Y.Z (rev, date, time)\n[PyPy V with %s]", and `compilerinfo.py`
+    // hard-codes " 64 bit (AMD64)" for every x64 MSVC build and " 32 bit"
+    // otherwise, so an ARM64 host is reported as AMD64; `getversion.c
+    // Py_GetVersion` writes "%.80s (%.80s) %.80s" with the real processor.
+    // Evidence: `lib-python/3/sysconfig/__init__.py` `get_platform` tests
+    // `'(arm64)' in sys.version.lower()`, and `platform.py _sys_version`
+    // parses the bracketed `[compiler]` after `(buildinfo)`.
     //
     // The name itself is the compiler that built the C the interpreter
     // carries, which is what `compilerinfo.py:20-27` publishes: `MSC v.` and
@@ -1935,6 +1963,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `sys._is_gil_enabled()`, which reports whether the lock is on right now.
     // `venv.EnvBuilder.setup_python` reads the same config var to name
     // `python3.14t.exe`.
+    //
+    // [3.14-spec] `version.py get_winver` answers "%d.%d" with no ABI tag;
+    // `dl_nt.c PyWin_DLLVersionString` is `MS_DLL_ID`, which
+    // `PCbuild/python.props` sets to `FreethreadedSysWinVer` ("3.14t") for a
+    // free-threaded build. Windows only; evidence is the build source at
+    // v3.14.6, and `lib-python/3/site.py _get_path` builds the user site
+    // directory from `sys.winver.replace('.', '')`.
     #[cfg(windows)]
     module_ns_store(roots.get(ns_slot), "winver", w_str_new("3.14t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
@@ -2126,6 +2161,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // tuple)` both hold.  `gil`, `thread_inherit_context` and
     // `context_aware_warnings` sit past the sequence as named-only extras,
     // which is what makes `n_fields` (21) exceed `len()` (18).
+    //
+    // [3.14-spec] `app.py sysflags` ends `int_max_str_digits` (16),
+    // `safe_path` (17) and has none of the three extras; `sysmodule.c
+    // flags_fields` orders `safe_path` before `int_max_str_digits`
+    // (`SYS_FLAGS_INT_MAX_STR_DIGITS 17`) and `set_flags_from_config` fills
+    // `gil`, `thread_inherit_context`, `context_aware_warnings`. Evidence:
+    // `lib-python/3/test/test_cmd_line.py` `test_python_gil` prints
+    // `sys.flags.gil`, and `test_sys.py` `test_pythontypes` sizes
+    // `sys.flags` as "+3 for the 'gil', 'thread_inherit_context' and
+    // 'context_aware_warnings' flags".
     {
         let flags_type = crate::_structseq::disallow_instantiation(
             crate::_structseq::make_struct_seq_with_extra(
@@ -2164,6 +2209,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `initconfig.c PYCONFIG_SPEC` declares `parser_debug` BOOL
         // while `verbose` is UINT, so `-dd` reports 1 here and 2
         // there.  Both count in the config; only this one saturates.
+        // [3.14-spec] `app_main.py simple_option` counts `-d` unsaturated
+        // (`options[name] += 1`). Evidence: `lib-python/3/test/test_cmd_line.py`
+        // `test_sys_flags_set` with `PYTHONDEBUG=2` asserts
+        // `sys.flags.debug == ... == {expected_bool}` beside `verbose == 2`.
         fields.push(w_int_new(i64::from(crate::importing::debug_flag() != 0)));
         // `-i` sets both.
         fields.push(w_int_new(i64::from(crate::importing::inspect_flag())));
@@ -2229,6 +2278,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // is kernel32's own file version
     // (`_sys_getwindowsversion_from_kernel32`), which is a different number on
     // a release shipped as an enablement package over the previous build.
+    //
+    // [3.14-spec] `vm.py getwindowsversion` leaves `platform_version` None
+    // ("platform.py will use the main version numbers above");
+    // `sysmodule.c sys_getwindowsversion_impl` stores the kernel32 triple.
+    // Windows only; evidence is the C source at v3.14.6 (`platform.py
+    // _win32_ver` reads `winver.platform_version or winver[:3]`).
     #[cfg(windows)]
     module_ns_store(
         roots.get(ns_slot),
@@ -2315,18 +2370,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ),
     );
     // sys._get_cpu_count_config() — the cpu count the interpreter was
-    // configured with, or -1 where none was. `os.py:1180` asks before it
-    // decides whether `process_cpu_count` counts the affinity mask or aliases
-    // `cpu_count`, so a `posix` that publishes `sched_getaffinity` and a `sys`
-    // that does not answer this makes `import os` raise.
-    //
-    // -1 is the answer here rather than a placeholder: the value is set by
-    // `-X cpu_count` and `PYTHON_CPU_COUNT`, and this interpreter reads
-    // neither, so there is no configured count to report.
+    // configured with (`-X cpu_count`, PYTHON_CPU_COUNT), or -1 where none
+    // was. `os.py` asks before it decides whether `process_cpu_count` counts
+    // the affinity mask or aliases `cpu_count`, so a `posix` that publishes
+    // `sched_getaffinity` and a `sys` that does not answer this makes
+    // `import os` raise.
     module_ns_store(
         roots.get(ns_slot),
         "_get_cpu_count_config",
-        make_builtin_function_with_arity("_get_cpu_count_config", |_| Ok(w_int_new(-1)), 0),
+        make_builtin_function_with_arity(
+            "_get_cpu_count_config",
+            |_| Ok(w_int_new(crate::importing::cpu_count_config())),
+            0,
+        ),
     );
     // sys.getrecursionlimit / setrecursionlimit — pypy/module/sys/vm.py.
     // The runtime stack budget lives in `crate::stack_check`; both
@@ -2529,6 +2585,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // is not a `str` at all is refused by the argument and
                     // never reaches `sys_intern_impl`; only a `str` subclass
                     // does, and that is the refusal the body itself states.
+                    // [3.14-spec] `vm.py intern` raises one "intern()
+                    // argument must be string." for both; the messages
+                    // here are `sysmodule.c sys_intern_impl` ("can't intern
+                    // %.400s") and the clinic `string as s: unicode`
+                    // converter's `_PyArg_BadArgument`, which spells `None`
+                    // as "None" (`getargs.c`). Evidence is the C source at
+                    // v3.14.6; `test_sys.py` `test_intern` asserts only the
+                    // `TypeError`.
                     let name = crate::type_methods::clinic_arg_type_name(s);
                     let message = if unsafe { is_str(s) } {
                         format!("can't intern {name}")
@@ -2575,6 +2639,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "cache_tag", cache_tag);
         // PEP 734. pyre runs one interpreter per process, so the answer is
         // false; `sys.implementation` carries the name either way from 3.14 on.
+        // [3.14-spec] `app.py implementation_dict` has no such key;
+        // `sysmodule.c make_impl_info` sets it. Evidence:
+        // `lib-python/3/test/test_sys.py` `test_implementation` asserts
+        // `assertHasAttr(sys.implementation, 'supports_isolated_interpreters')`
+        // and `assertIsInstance(sii, bool)`; the True it expects is gated on
+        // `check_impl_detail(cpython=True)`.
         let supports = w_bool_from(false);
         crate::baseobjspace::setdictvalue_native(
             roots.get(impl_slot),
@@ -2900,6 +2970,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `site.addsitepackages` build install paths from: "lib" on POSIX, and
     // "DLLs" on Windows, where the extension modules sit beside the interpreter
     // instead of under a versioned lib directory.
+    //
+    // [3.14-spec] `moduledef.py` publishes `space.config.objspace.platlibdir`,
+    // whose `pypyoption.py` default is "lib" on every host; the Windows build
+    // compiles `PLATLIBDIR="DLLs"` (`PCbuild/pythoncore.vcxproj` at v3.14.6),
+    // which `sysmodule.c` copies into `sys.platlibdir`. Windows only;
+    // `lib-python/3/test/test_sysconfig.py` `test_get_path` overrides "the
+    // native platlibdir name" with 'lib' when `os.name == 'nt'`.
     module_ns_store(
         roots.get(ns_slot),
         "platlibdir",
@@ -2913,6 +2990,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // Interpreting the code (None → 0, int() coercion,
     // print-non-integral-and-exit-1) is the launcher's job
     // (`app_main.py handle_sys_exit`).
+    //
+    // [3.14-spec] `app.py exit(exitcode=None)` also accepts the argument by
+    // keyword; `sysmodule.c` declares `sys.exit` with `status: object = None`
+    // followed by `/`, so `sys.exit(exitcode=1)` is a TypeError. Evidence is
+    // the clinic input in `Python/sysmodule.c` at v3.14.6.
     module_ns_store(
         roots.get(ns_slot),
         "exit",
@@ -2942,10 +3024,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             &[w_none()],
         ),
     );
-    // `init_sys_streams`: Windows has no `sys.abiflags`; its ABI tag
-    // belongs to `sys.winver`.  Absence is observable through `hasattr` and is
-    // relied on by the 3.14 Windows sys tests, so do not publish an empty
-    // stand-in.
+    // Windows has no `sys.abiflags`; its ABI tag belongs to `sys.winver`.
+    //
+    // [3.14-spec] `moduledef.py` publishes `'abiflags': space.wrap("")` on
+    // every host; `sysmodule.c _PySys_InitCore` sets it only `#ifdef
+    // ABIFLAGS`, which the Windows build leaves undefined. Evidence:
+    // `lib-python/3/test/test_sys.py` `test_attributes` asserts
+    // `self.assertFalse(hasattr(sys, 'abiflags'))` on win, and
+    // `test_disable_gil_abi` asserts `'t' in sys.abiflags` equals
+    // `support.Py_GIL_DISABLED` elsewhere.
     #[cfg(not(windows))]
     module_ns_store(roots.get(ns_slot), "abiflags", w_str_new("t"));
     // sys.argv — pick up pending argv from set_sys_argv if available.
@@ -2982,6 +3069,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `traceback.TracebackException` for "did you forget to import" hints and
     // by the module shadowing check for the stronger stdlib rename hint.  The
     // list is the full set regardless of platform, as upstream ships it.
+    //
+    // [3.14-spec] `moduledef.py` publishes `'stdlib_module_names':
+    // 'space.w_None'`; `sysmodule.c list_stdlib_module_names` builds a
+    // frozenset from `_Py_stdlib_module_names`. Evidence: `lib-python/3/test/test_sys.py`
+    // `test_module_names` asserts `assertIsInstance(sys.stdlib_module_names,
+    // frozenset)`, and `traceback.py TracebackException.__init__` evaluates
+    // `wrong_name in sys.stdlib_module_names` unguarded.
     const STDLIB_MODULE_NAMES: &[&str] = &[
         "__future__",
         "_abc",
@@ -3304,6 +3398,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         make_builtin_function_with_arity(
             "call_tracing",
             |args| {
+                // [3.14-spec] `vm.py call_tracing` hands `w_args` straight to
+                // `ExecutionContext.call_tracing` unchecked; the clinic
+                // `args as funcargs: object(subclass_of='&PyTuple_Type')` in
+                // `sysmodule.c` refuses a non-tuple through
+                // `_PyArg_BadArgument` ("None" for `None`). Evidence is the C
+                // source at v3.14.6; `test_sys.py` `test_call_tracing` asserts
+                // only `TypeError` for `(type, 2)`.
                 if !unsafe { pyre_object::is_tuple(args[1]) } {
                     return Err(crate::PyError::type_error(format!(
                         "call_tracing() argument 2 must be tuple, not {}",
@@ -3686,9 +3787,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // `gateway::fs_arg_bytes` for a path spelled as `bytes` and
                 // `gateway::fs_result_bytes` for a name reported back as one.
                 // A `str` path is untouched, as `path_converter` keeps the
-                // wide string it was given and asks no codec for it — measured
-                // at 3.14: `os.stat` still finds a name the code page cannot
-                // spell, while `os.listdir(b'.')` reports it as `b'?'`.
+                // wide string it was given and asks no codec for it: `os.stat`
+                // still finds a name the code page cannot spell, while
+                // `os.listdir(b'.')` reports it as `b'?'`.
+                //
+                // [3.14-spec] PyPy has no such entry point and
+                // `interp_encoding.py getfilesystemencoding` stays at
+                // `utf-8`/`surrogatepass` (PEP 529) for the process lifetime;
+                // `unicodeobject.c _PyUnicode_EnableLegacyWindowsFSEncoding`
+                // at v3.14.6 stores `mbcs`/`replace` into the config and
+                // re-runs `init_fs_codec`, so the reported codec and the
+                // conversion it names switch together.  Windows only;
+                // evidence is the C source at the tag.
                 crate::typedef::LEGACY_WINDOWS_FS_ENCODING
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(w_none())
@@ -4112,6 +4222,14 @@ fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// new hook, and it is dropped rather than added.  A `BaseException` outside
 /// `Exception` propagates.  The new hook is not installed yet when the event
 /// fires, so it never gets to refuse its own installation.
+///
+/// [3.14-spec] `vm.py addaudithook` swallows only `RuntimeError` (`if not
+/// e.match(space, space.w_RuntimeError): raise`), so a `ValueError` escapes;
+/// `sysmodule.c sys_addaudithook_impl` swallows anything matching
+/// `PyExc_Exception` ("We do not report errors derived from Exception").
+/// Evidence is the C source at v3.14.6; `lib-python/3/test/audit-tests.py`
+/// `test_block_add_hook` / `test_block_add_hook_baseexception` pin only the
+/// `RuntimeError` and `BaseException` ends, on which both agree.
 fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let Some(&w_hook) = args.first() else {
         return Err(crate::PyError::type_error(
@@ -4168,9 +4286,9 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// interpreter-level kind or a materialised exception object.
 ///
 /// The C-level `PySys_AddAuditHook` reads a refusal as `RuntimeError`, but the
-/// `sys.addaudithook` a Python caller reaches widens it to `Exception`.
-/// Measured against 3.14 with a refusing hook already installed: `RuntimeError`,
-/// `ValueError` and `Exception` all leave the call returning `None`, and only a
+/// `sys.addaudithook` a Python caller reaches widens it to `Exception`
+/// (`sys_addaudithook_impl`, read at v3.14.6): `RuntimeError`, `ValueError`
+/// and `Exception` all leave the call returning `None`, and only a
 /// `BaseException` outside `Exception` — `KeyboardInterrupt`, bare
 /// `BaseException` — comes back out.
 fn error_is_exception(err: &crate::PyError) -> bool {
@@ -4236,10 +4354,12 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
 /// Windows answers yes outright. `initstdio` reaches that through UTF-8 mode,
 /// which PyPy runs the whole platform in -- `sys.flags.utf8_mode` reads 1 there
 /// -- and pyre does not, because 3.14 reports 0 unless `-X utf8` asked for it;
-/// `config_get_stdio_errors` states the same answer as its own `MS_WINDOWS`
-/// arm instead of deriving it. Measured, both interpreters answer
-/// `surrogateescape` on this platform. The locale test could not stand in for
-/// it either: the MSVC runtime's `setlocale(LC_CTYPE, "")` reads the user's
+/// `initconfig.c config_get_stdio_errors` states the same answer as its own
+/// `MS_WINDOWS` arm ("On Windows, always use surrogateescape by default", read
+/// at v3.14.6) instead of deriving it. Both upstreams therefore answer
+/// `surrogateescape` here, so this is not a spec split; only the route
+/// differs, and the route is what keeps `sys.flags.utf8_mode` at 0. The
+/// locale test could not stand in for it either: the MSVC runtime's `setlocale(LC_CTYPE, "")` reads the user's
 /// ANSI locale and ignores `LC_ALL`, so it never sees C there.
 fn locale_asks_for_surrogateescape() -> bool {
     #[cfg(windows)]
@@ -4258,10 +4378,11 @@ fn locale_asks_for_surrogateescape() -> bool {
             // took rather than the variables that asked for it.
             let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
             let effective = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None).ok();
-            // [3.14-spec] CPython `config_get_stdio_errors` also consults
-            // `_Py_IsLocaleCoercionTarget`; its target table is C.UTF-8,
-            // C.utf8 and UTF-8.  PyPy `app_main.initstdio` owns the control
-            // flow here, while those observable stdio errors follow 3.14.
+            // `app_main.py initstdio`'s `is_c_locale` tuple names C, POSIX,
+            // C.UTF-8, C.utf8 and UTF-8, the same set `initconfig.c
+            // config_get_stdio_errors` reaches through `_Py_IsLocaleCoercionTarget`
+            // (`pylifecycle.c _TARGET_LOCALES`), so both upstreams agree and
+            // this is plain parity, not a spec split.
             matches!(
                 effective.as_deref(),
                 None | Some(b"C")
@@ -4505,6 +4626,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             return w_none();
         }
     }
+    // [3.14-spec] `app_main.py` never reads PYTHONLEGACYWINDOWSSTDIO, so
+    // `create_stdio`'s `io.open` picks the console layer regardless;
+    // `initconfig.c` reads it into `config->legacy_windows_stdio`, which keeps
+    // a console stream on `FileIO`. Windows only; evidence:
+    // `lib-python/3/test/test_cmd_line.py` `test_python_legacy_windows_stdio`
+    // asserts `type(sys.stdout.buffer.raw).__name__` is 'FileIO' with it set
+    // to "1" and '_WindowsConsoleIO' with it empty.
     let allow_windows_console = !crate::importing::legacy_windows_stdio_flag();
     let buffer = crate::builtins::builtin_open_stdio(
         &[

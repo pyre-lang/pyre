@@ -11,12 +11,13 @@ use crate::{
     builtin_code_name, function_get_name, function_get_qualname,
 };
 
-/// Spell `addr` the way `PyUnicode_FromFormat`'s `%p` does.
+/// Address half of `W_Root.getaddrstring`: `2 * HUGEVAL_BYTES` lower-case
+/// hex digits, zero-padded to the pointer width, after a literal `0x`.
 ///
-/// That conversion hands the pointer to the platform's own `printf` and
-/// normalizes only the prefix — guaranteed to start with the literal `0x`.
-/// The MSVC runtime pads to the pointer width and uppercases; glibc does
-/// neither, and Rust's `{:p}` is only ever the second spelling.
+/// `PyUnicode_FromFormat`'s `%p` hands the pointer to the platform `printf`
+/// instead, which pads and uppercases on MSVC and does neither on glibc; no
+/// `lib-python/3` assertion pins either spelling (the repr tests match
+/// `0x[0-9a-fA-F]+`), so the text follows `getaddrstring` on every host.
 ///
 /// The bits are whatever the caller already computed. A Rust struct that is
 /// not a moving GC object — `PyFrame` (born with `try_gc_alloc_stable_raw`)
@@ -25,11 +26,7 @@ use crate::{
 /// [`repr_gc_addr`] instead, so the text is `getaddrstring`'s id rather than
 /// the nursery address it currently occupies.
 pub fn repr_addr(addr: usize) -> String {
-    if cfg!(windows) {
-        format!("0x{addr:0width$X}", width = size_of::<usize>() * 2)
-    } else {
-        format!("0x{addr:x}")
-    }
+    format!("0x{addr:0width$x}", width = size_of::<usize>() * 2)
 }
 
 /// Address half of `W_Root.getaddrstring` for a GC object.
@@ -1790,75 +1787,14 @@ pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, _fallback: &str) -> String 
     out
 }
 
-/// The encoded length of the character a WTF-8 lead byte opens.
+/// Index `my_basename` slices from: past the last `SEP`, which is `/`, or
+/// `\` on Windows.
 ///
-/// A stray continuation byte answers 1: the buffer is malformed, and stepping
-/// one byte keeps the scan in bounds.
-#[cfg(test)]
-fn wtf8_sequence_len(lead: u8) -> usize {
-    match lead {
-        0x00..=0x7f => 1,
-        0xc0..=0xdf => 2,
-        0xe0..=0xef => 3,
-        0xf0..=0xf7 => 4,
-        _ => 1,
-    }
-}
-
-/// `ntpath.splitroot`'s drive, as a byte length.
-///
-/// `ntpath.py splitroot` normalizes `/` to `\` first and then recognizes three
-/// shapes. Two leading separators open a UNC or device root that runs to the
-/// second separator after its prefix — `\\?\UNC\`, matched case-insensitively,
-/// where present, and the two leading separators otherwise — or to the end of
-/// a path holding fewer separators than that. One leading separator is a
-/// rooted relative path with no drive. Otherwise a colon as the SECOND
-/// CHARACTER makes those two characters the drive, which is not two bytes
-/// unless the first character is single-byte.
-#[cfg(test)]
-fn nt_drive_len(path: &[u8]) -> usize {
-    const UNC_PREFIX: &[u8] = br"\\?\UNC\";
-    let is_sep = |b: u8| b == b'/' || b == b'\\';
-    let Some(&lead) = path.first() else {
-        return 0;
-    };
-    if !is_sep(lead) {
-        let head = wtf8_sequence_len(lead);
-        return if path.get(head) == Some(&b':') {
-            head + 1
-        } else {
-            0
-        };
-    }
-    if !path.get(1).is_some_and(|&b| is_sep(b)) {
-        return 0;
-    }
-    let device = path.len() >= UNC_PREFIX.len()
-        && path.iter().zip(UNC_PREFIX).all(|(&b, &want)| {
-            if is_sep(want) {
-                is_sep(b)
-            } else {
-                b.to_ascii_uppercase() == want
-            }
-        });
-    let start = if device { UNC_PREFIX.len() } else { 2 };
-    let mut seen = 0;
-    for (i, &b) in path.iter().enumerate().skip(start) {
-        if is_sep(b) {
-            seen += 1;
-            if seen == 2 {
-                return i;
-            }
-        }
-    }
-    path.len()
-}
-
-/// Index `my_basename` slices from.
-///
-/// `SEP` is `/`, or `\` on Windows. `/` is not a separator on Windows
-/// and a drive prefix is left in place. `os.path.basename` splits on
-/// both and strips the drive; `W_SyntaxError.descr_str` calls that.
+/// [3.14-spec] `W_SyntaxError.descr_str` calls app-level
+/// `os.path.basename`, which on Windows also splits on `/` and strips a
+/// drive; `exceptions.c my_basename` at v3.14.6 scans for `SEP` alone, so
+/// `str(SyntaxError('m', ('C:/a/b.py', 1, 0, '')))` keeps the whole name on
+/// Windows. Off Windows the two agree. Evidence is the C source at the tag.
 fn syntax_error_basename_start(path: &[u8]) -> usize {
     let sep = if cfg!(windows) { b'\\' } else { b'/' };
     let mut offset = 0;
@@ -1870,33 +1806,6 @@ fn syntax_error_basename_start(path: &[u8]) -> usize {
         index += 1;
     }
     offset
-}
-
-/// Where `os.path.basename` starts its result.
-///
-/// `interp_exceptions.py` calls `os.path.basename`, so the split is the
-/// platform's. `ntpath` peels [`nt_drive_len`] off first and takes what
-/// follows the last `\` or `/` in the remainder — which is empty for a bare
-/// UNC root; `posixpath` takes what follows the last `/`, with no drive.
-///
-/// A separator is ASCII and no continuation byte can collide with one, so the
-/// remainder scan is safe over encoded bytes.
-#[cfg(test)]
-fn basename_start(path: &[u8]) -> usize {
-    let windows = cfg!(windows);
-    let drive = if windows { nt_drive_len(path) } else { 0 };
-    // `os.path.basename` bottoms out at the last separator search. Spell the
-    // same reverse index walk directly, as RPython's string `rfind` does,
-    // rather than introducing Rust's closure-bearing `Iter::rposition` graph.
-    let mut i = path.len();
-    while i > drive {
-        i -= 1;
-        let b = path[i];
-        if b == b'/' || (windows && b == b'\\') {
-            return i + 1;
-        }
-    }
-    drive
 }
 
 /// The WTF-8 carrying subset of `W_BaseException.descr_str`: a base
@@ -1936,14 +1845,17 @@ unsafe fn exception_descr_str_wtf8(
         // print `None (a.py, line 1)` / `5 (a.py, line 1)`.
         // `W_SyntaxError.descr_str` returns `str(msg)` immediately when
         // `type(msg) is not str`, and it only treats an exact str as a
-        // filename. That method has no `@jit` hint. The line is `line N`
-        // from `lineno` alone — `descr_str` prints `lines N-M` when
-        // `end_lineno` is larger. `PyLong_AsLongAndOverflow`'s overflow
-        // flag is ignored, so a number too wide for a C long prints as
-        // `-1`. The tail is `my_basename`: the text after the last `SEP`
-        // (`/`, or `\` on Windows). `descr_str` calls
-        // `os.path.basename` and substitutes `???` for a falsy filename;
-        // an empty name here stays empty.
+        // filename. That method has no `@jit` hint.
+        // `PyLong_AsLongAndOverflow`'s overflow flag is ignored, so a number
+        // too wide for a C long prints as `-1`. The tail is `my_basename`:
+        // the text after the last `SEP` (`/`, or `\` on Windows).
+        //
+        // [3.14-spec] `W_SyntaxError.descr_str` substitutes `???` for a
+        // falsy filename (`self.filename or "???"`) and prints
+        // `lines N-M` when `end_lineno` is larger; `exceptions.c
+        // SyntaxError_str` at v3.14.6 passes the empty name through
+        // `my_basename` unchanged and formats `line %ld` from `lineno`
+        // alone. Evidence is the C source at the tag.
         if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
             let mut w_msg = crate::baseobjspace::syntax_error_attr(obj, "msg");
             let w_lineno = crate::baseobjspace::syntax_error_attr(obj, "lineno");
@@ -1953,7 +1865,10 @@ unsafe fn exception_descr_str_wtf8(
             let lineno = if pyre_object::pyobject::is_exact_type(w_lineno, &INT_TYPE) {
                 let roots = pyre_object::gc_roots::push_roots();
                 let base = roots.pin_roots(&[obj, w_msg, w_filename, w_lineno]);
-                let lineno = crate::baseobjspace::int_w(roots.get(base + 3)).unwrap_or(-1);
+                let lineno = crate::baseobjspace::int_w(roots.get(base + 3))
+                    .ok()
+                    .and_then(|lineno| core::ffi::c_long::try_from(lineno).ok())
+                    .map_or(-1, i64::from);
                 obj = roots.get(base);
                 w_msg = roots.get(base + 1);
                 w_filename = roots.get(base + 2);
@@ -2465,8 +2380,8 @@ impl fmt::Display for PyDisplay {
 #[cfg(test)]
 mod tests {
     use super::{
-        basename_start, bytes_repr_string, format_float_repr, format_wtf8_repr,
-        jit_format_float_repr_rstr, nt_drive_len, syntax_error_basename_start,
+        bytes_repr_string, format_float_repr, format_wtf8_repr, jit_format_float_repr_rstr,
+        syntax_error_basename_start,
     };
     use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -2504,49 +2419,6 @@ mod tests {
         }
     }
 
-    /// Every expectation is `len(ntpath.splitdrive(p)[0].encode())` for the
-    /// same input.
-    #[test]
-    fn nt_drive_len_matches_ntpath_splitroot() {
-        // `X:` drives, absolute and drive-relative.
-        assert_eq!(nt_drive_len(br"C:\dir\enc.py"), 2);
-        assert_eq!(nt_drive_len(b"C:enc.py"), 2);
-        assert_eq!(nt_drive_len(b"C:"), 2);
-        // The colon must follow the first CHARACTER, not the first byte.
-        assert_eq!(nt_drive_len("\u{e9}:foo.py".as_bytes()), 3);
-        assert_eq!(nt_drive_len(b"\xed\xb3\xbf:f.py"), 4); // lone surrogate
-        assert_eq!(nt_drive_len(b":"), 0);
-        assert_eq!(nt_drive_len(b"ab:c.py"), 0);
-        // A UNC root is the whole `\\server\share`, so a bare one basenames
-        // to the empty string rather than to the share.
-        assert_eq!(nt_drive_len(br"\\server\share"), 14);
-        assert_eq!(nt_drive_len(br"\\server\share\enc.py"), 14);
-        assert_eq!(nt_drive_len(b"//server/share/enc.py"), 14);
-        // Fewer components than a share: the root is the whole path.
-        assert_eq!(nt_drive_len(br"\\server"), 8);
-        assert_eq!(nt_drive_len(br"\\server\"), 9);
-        assert_eq!(nt_drive_len(br"\\"), 2);
-        // `\\?\UNC\` shifts the two-separator count past the prefix, and is
-        // matched case-insensitively and through `/`.
-        assert_eq!(nt_drive_len(br"\\?\UNC\server\share"), 20);
-        assert_eq!(nt_drive_len(br"\\?\UNC\server\share\f.py"), 20);
-        assert_eq!(nt_drive_len(br"\\?\unc\server\share"), 20);
-        assert_eq!(nt_drive_len(b"//?/UNC/server/share"), 20);
-        assert_eq!(nt_drive_len(br"\\?\UNC\server"), 14);
-        assert_eq!(nt_drive_len(br"\\?\UNC\a\b\c.py"), 11);
-        assert_eq!(nt_drive_len(br"\\?\UNC"), 7);
-        // A prefix that only looks like it: `UNCX` is an ordinary device name.
-        assert_eq!(nt_drive_len(br"\\?\UNCX\server\share"), 8);
-        // Other device roots take the plain two-separator count.
-        assert_eq!(nt_drive_len(br"\\?\C:\dir\f.py"), 6);
-        assert_eq!(nt_drive_len(br"\\.\PhysicalDrive0"), 18);
-        assert_eq!(nt_drive_len(br"\\?\"), 4);
-        // One leading separator is a rooted relative path: no drive.
-        assert_eq!(nt_drive_len(br"\dir\enc.py"), 0);
-        assert_eq!(nt_drive_len(b"enc.py"), 0);
-        assert_eq!(nt_drive_len(b""), 0);
-    }
-
     #[test]
     fn syntax_error_basename_splits_on_sep_only() {
         assert_eq!(syntax_error_basename_start(b""), 0);
@@ -2564,15 +2436,5 @@ mod tests {
             assert_eq!(syntax_error_basename_start(br"dir\enc.py"), 4);
             assert_eq!(syntax_error_basename_start(br"dir\"), 4);
         }
-    }
-
-    #[test]
-    fn basename_start_matches_platform_separator_search() {
-        assert_eq!(basename_start(b"dir/enc.py"), 4);
-        assert_eq!(basename_start(b"enc.py"), 0);
-        assert_eq!(basename_start(b"dir/"), 4);
-        assert_eq!(basename_start(b""), 0);
-        #[cfg(not(windows))]
-        assert_eq!(basename_start(br"dir\enc.py"), 0);
     }
 }

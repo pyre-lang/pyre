@@ -82,6 +82,9 @@ pub struct LaunchFlags {
     /// Every raw `-X` value stays in a list until sys module initialization
     /// turns it into `sys._xoptions`.
     pub xoptions: Vec<std::ffi::OsString>,
+    /// `config->cpu_count`: the count `-X cpu_count` or PYTHON_CPU_COUNT
+    /// named, resolved by [`finalize`]; `None` is `-1`, no configured count.
+    pub cpu_count: Option<i32>,
 }
 
 /// Environment the launcher options resolve against, when the process
@@ -128,6 +131,7 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONLEGACYWINDOWSSTDIO",
     "PYTHONWARNINGS",
     "PYTHONIOENCODING",
+    "PYTHON_CPU_COUNT",
     "PYTHONNODEBUGRANGES",
     "LC_ALL",
     "LC_CTYPE",
@@ -211,9 +215,33 @@ fn locale_implies_utf8_mode() -> bool {
     matches!(locale.as_deref(), None | Some("C") | Some("POSIX"))
 }
 
-/// Detail of a `preconfig_init_utf8_mode` failure, for the caller to report the
-/// way its embedding reports a fatal pre-init error.
-pub struct PreConfigError(pub &'static str);
+/// A configuration failure that ends the process before the interpreter
+/// exists, for the caller to report the way its embedding reports one.
+pub struct PreConfigError {
+    /// The `_PyStatus_ERR` function the banner names.
+    pub func: &'static str,
+    pub detail: &'static str,
+    /// The `Python runtime state` the banner reports.
+    pub state: &'static str,
+}
+
+impl PreConfigError {
+    fn utf8_mode(detail: &'static str) -> Self {
+        PreConfigError {
+            func: "preconfig_init_utf8_mode",
+            detail,
+            state: "preinitializing",
+        }
+    }
+
+    /// The `Fatal Python error` banner `fatal_error` writes to stderr.
+    pub fn banner(&self) -> String {
+        format!(
+            "Fatal Python error: {}: {}\nPython runtime state: {}\n\n",
+            self.func, self.detail, self.state
+        )
+    }
+}
 
 fn resolve_utf8_mode(flags: &LaunchFlags) -> Result<i64, PreConfigError> {
     // `preconfig_init_utf8_mode` opens with this, ahead of every other source:
@@ -234,7 +262,7 @@ fn resolve_utf8_mode(flags: &LaunchFlags) -> Result<i64, PreConfigError> {
             return match value.as_slice() {
                 b"0" => Ok(0),
                 b"1" => Ok(1),
-                _ => Err(PreConfigError(
+                _ => Err(PreConfigError::utf8_mode(
                     "invalid PYTHONUTF8 environment variable value",
                 )),
             };
@@ -320,6 +348,70 @@ fn resolve_pycache_prefix(flags: &LaunchFlags) -> Option<std::ffi::OsString> {
         None => os_string_from_bytes(&read_raw("PYTHONPYCACHEPREFIX")?),
     };
     (!named.is_empty()).then_some(named)
+}
+
+/// `config_wstr_to_int` / `_Py_str_to_int`: a C `int` in base 10, where
+/// `strtol` steps over leading `isspace` but nothing may trail the digits.
+fn config_str_to_int(value: &[u8]) -> Option<i32> {
+    let value = std::str::from_utf8(value).ok()?;
+    let value = value.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    // `strtol` consumes an empty digit run as 0 rather than failing.
+    if value.is_empty() {
+        return Some(0);
+    }
+    value.parse::<i32>().ok()
+}
+
+/// `config_init_cpu_count`: PYTHON_CPU_COUNT, then the first `-X cpu_count`,
+/// each `default` or a count of at least 1.  An invalid value from either
+/// source is fatal, the variable's included.
+fn resolve_cpu_count(flags: &LaunchFlags) -> Result<Option<i32>, PreConfigError> {
+    let parse = |value: Option<&[u8]>| match value {
+        Some(b"default") => Ok(None),
+        Some(value) => match config_str_to_int(value) {
+            Some(count) if count >= 1 => Ok(Some(count)),
+            _ => Err(()),
+        },
+        None => Err(()),
+    };
+    let mut cpu_count = None;
+    let mut resolved = Ok(());
+    if !flags.ignore_environment
+        && let Some(value) = read_raw("PYTHON_CPU_COUNT")
+        && !value.is_empty()
+    {
+        match parse(Some(&value)) {
+            Ok(count) => cpu_count = count,
+            Err(()) => resolved = Err(()),
+        }
+    }
+    // `_Py_get_xoption` answers the first option whose key matches; a key
+    // with no `=` has no count.
+    let xoption = flags.xoptions.iter().find_map(|option| {
+        let bytes = option.as_encoded_bytes();
+        let (key, value) = match bytes.iter().position(|b| *b == b'=') {
+            Some(at) => (&bytes[..at], Some(&bytes[at + 1..])),
+            None => (bytes, None),
+        };
+        (key == b"cpu_count").then_some(value)
+    });
+    if resolved.is_ok()
+        && let Some(value) = xoption
+    {
+        match parse(value) {
+            Ok(count) => cpu_count = count,
+            Err(()) => resolved = Err(()),
+        }
+    }
+    resolved.map_err(|()| PreConfigError {
+        func: "config_init_cpu_count",
+        detail: concat!(
+            "-X cpu_count=n option: n is missing or an invalid number, ",
+            "n must be greater than 0"
+        ),
+        state: "preinitialized",
+    })?;
+    Ok(cpu_count)
 }
 
 /// Fold the environment over the options a command line named. An embedding
@@ -412,5 +504,6 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         });
     }
     flags.warnoptions = warnoptions;
+    flags.cpu_count = resolve_cpu_count(&flags)?;
     Ok(flags)
 }

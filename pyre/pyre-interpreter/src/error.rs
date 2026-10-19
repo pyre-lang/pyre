@@ -1957,6 +1957,13 @@ impl PyError {
     /// The message a Win32 error code names, with the trailing newline and
     /// full stop `FormatMessageW` appends removed.  Reporting the bare code is
     /// the answer for a code the system cannot describe.
+    ///
+    /// [3.14-spec] `rwin32.FormatErrorW` and `_wrap_oserror2_impl` spell that
+    /// fallback `'Windows Error %d'`; `errors.c
+    /// PyErr_SetExcFromWindowsErrWithFilenameObjects` at v3.14.6 spells it
+    /// `"Windows Error 0x%x"`, and also tests the length before trimming, so a
+    /// message of only blanks and dots stays empty there.  Windows only;
+    /// evidence is the C source at the tag.
     #[cfg(windows)]
     pub fn win32_strerror(winerror: i32) -> String {
         #[cfg(feature = "host_env")]
@@ -6019,10 +6026,14 @@ pub fn new_exception_class(
 ///
 /// The `eintr_retry` half of the double API has no caller here, so this is the
 /// `eintr_retry=False` arm: EINTR still runs `checksignals`, and the error is
-/// returned rather than raised.  `w_winerror` stays `None` — the Windows arm
-/// keys on `rwin32.WIN32 and isinstance(e, WindowsError)`, and this build
-/// resolves a host error to its POSIX errno through `io_error_posix_errno` on
-/// every platform.
+/// returned rather than raised.
+///
+/// The `rwin32.WIN32 and isinstance(e, WindowsError)` arm is a host error
+/// that carries a raw OS code on Windows: that code is what `GetLastError`
+/// reported, while a C runtime failure carries its errno as the payload and
+/// leaves the code empty (`io_error_posix_errno`).  Such an error becomes
+/// `WindowsError` whatever class the caller named, with `winerror` set, the
+/// errno derived from it, and the system's message for it.
 pub fn wrap_oserror2(
     space: PyObjectRef,
     error: &(dyn std::error::Error + 'static),
@@ -6036,6 +6047,17 @@ pub fn wrap_oserror2(
     let Some(io_error) = error.downcast_ref::<std::io::Error>() else {
         return PyError::os_error(error.to_string());
     };
+    #[cfg(windows)]
+    if let Some(winerror) = io_error.raw_os_error() {
+        // `w_exc = space.w_WindowsError`, called with `(None, msg, filename,
+        // winerror, filename2)`: the constructor derives the errno and its
+        // subclass from the code, which is what this builder does.
+        return PyError::os_error_win32_syscall2(
+            winerror,
+            w_filename.unwrap_or(pyre_object::PY_NULL),
+            w_filename2.unwrap_or(pyre_object::PY_NULL),
+        );
+    }
     let errno = crate::builtins::io_error_posix_errno(io_error, 0);
     // wasm32 has neither `libc::EINTR` nor the `signal` module
     // (`module/mod.rs` gates `pub mod signal` off), so there is no handler for

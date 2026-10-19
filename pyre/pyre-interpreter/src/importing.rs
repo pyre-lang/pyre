@@ -3901,6 +3901,7 @@ static SYS_PYCACHE_PREFIX: LazyLock<Mutex<Option<std::ffi::OsString>>> =
     LazyLock::new(|| Mutex::new(None));
 static SYS_WARN_DEFAULT_ENCODING: AtomicBool = AtomicBool::new(false);
 static SYS_CODE_DEBUG_RANGES: AtomicBool = AtomicBool::new(true);
+static SYS_CPU_COUNT: AtomicI64 = AtomicI64::new(-1);
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
 /// `sys.flags.no_site` field built during sys module init reflects it. Set
@@ -3948,6 +3949,13 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     *SYS_XOPTIONS.lock() = flags.xoptions.clone();
     *SYS_WARNOPTIONS.lock() = flags.warnoptions.clone();
     *SYS_STDIO_ENCODING.lock() = flags.stdio_encoding.clone();
+    SYS_CPU_COUNT.store(flags.cpu_count.map_or(-1, i64::from), Ordering::Relaxed);
+}
+
+/// `config->cpu_count`: what `-X cpu_count` / PYTHON_CPU_COUNT configured,
+/// or -1 where neither named a count.
+pub fn cpu_count_config() -> i64 {
+    SYS_CPU_COUNT.load(Ordering::Relaxed)
 }
 
 /// Whether the launcher resolved `-X faulthandler` / `-X dev` /

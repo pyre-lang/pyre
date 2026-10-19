@@ -8741,9 +8741,15 @@ fn os_error_build(
     pyre_object::gc_roots::shadow_stack_get(exc_slot)
 }
 
-/// `Py_IS_TYPE(self, BlockingIOError)` — the exact-type test `_init_error`
-/// uses to read a numeric third argument as `characters_written` rather than
-/// a filename.
+/// `Py_IS_TYPE(self, BlockingIOError)` — the exact-type test that reads a
+/// numeric third argument as `characters_written` rather than a filename.
+///
+/// [3.14-spec] `W_OSError._init_error` tests
+/// `space.isinstance_w(self, W_BlockingIOError)`, so a subclass also takes
+/// the number; `exceptions.c oserror_init` at v3.14.6 tests the exact type,
+/// so `class B(BlockingIOError): pass; B(1, 'x', 3)` keeps `3` as the
+/// filename. Evidence is the C source at the tag. The JIT constructor fold
+/// (`specialize.rs`) keys on the same exact class.
 fn exc_is_blocking_io_error(exc: PyObjectRef) -> bool {
     matches!(
         (crate::typedef::r#type(exc), lookup_exc_class("BlockingIOError")),
@@ -8841,14 +8847,23 @@ const DEFAULT_WIN32_ERRNO: i64 = 22;
 /// fourth argument of any other shape (including `None`) is kept as the
 /// `winerror` attribute and leaves `errno` alone, which is what
 /// `str(e)` then reports as `[WinError <that object>]`.
+///
+/// [3.14-spec] `_parse_init_args` converts a present fourth argument with
+/// `space.int_w` and drops one it refuses (`winerror` then reads `None`);
+/// `exceptions.c oserror_parse_args` at v3.14.6 derives the errno only from
+/// a `PyLong_Check` value, converts it with `PyLong_AsLong` and propagates
+/// the overflow, and `oserror_init` stores whatever fourth argument was
+/// given. python3.14 raises `OverflowError` for `OSError(1, 's', None,
+/// 2**31)`. Windows only; evidence is the C source at the tag and that run.
 #[cfg(windows)]
-fn winerror_derived_errno(w_winerror: PyObjectRef) -> Option<i64> {
-    if !unsafe { pyre_object::is_int(w_winerror) } {
-        return None;
+fn winerror_derived_errno(w_winerror: PyObjectRef) -> Result<Option<i64>, crate::PyError> {
+    if !unsafe { pyre_object::is_int(w_winerror) || pyre_object::is_long(w_winerror) } {
+        return Ok(None);
     }
-    Some(winerror_to_errno(unsafe {
-        pyre_object::w_int_get_value(w_winerror)
-    }))
+    let overflow = || crate::PyError::overflow_error("Python int too large to convert to C long");
+    let code = crate::baseobjspace::int_w(w_winerror).map_err(|_| overflow())?;
+    let code = core::ffi::c_long::try_from(code).map_err(|_| overflow())?;
+    Ok(Some(winerror_to_errno(i64::from(code))))
 }
 
 /// The POSIX errno a Win32 error code maps to.
@@ -8881,17 +8896,17 @@ pub(crate) fn winerror_to_errno(code: i64) -> i64 {
 /// Windows error code in the fourth replaced it.  `descr_new` picks the
 /// errno-specific subclass from this value, and `_init_error` stores it, so
 /// both read the same parse.
-fn os_error_parsed_errno(args: &[PyObjectRef]) -> Option<PyObjectRef> {
+fn os_error_parsed_errno(args: &[PyObjectRef]) -> Result<Option<PyObjectRef>, crate::PyError> {
     if !(2..=5).contains(&args.len()) {
-        return None;
+        return Ok(None);
     }
     #[cfg(windows)]
     if let Some(w_winerror) = args.get(3).copied() {
-        if let Some(errno) = winerror_derived_errno(w_winerror) {
-            return Some(pyre_object::w_int_new(errno));
+        if let Some(errno) = winerror_derived_errno(w_winerror)? {
+            return Ok(Some(pyre_object::w_int_new(errno)));
         }
     }
-    Some(args[0])
+    Ok(Some(args[0]))
 }
 
 /// `_parse_init_args` + `_init_error` slot assignment shared by `__new__`
@@ -8926,7 +8941,7 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
     for index in 0..nargs {
         live_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + index));
     }
-    let errno_slot = os_error_parsed_errno(&live_args).map(|w_errno| {
+    let errno_slot = os_error_parsed_errno(&live_args)?.map(|w_errno| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_errno);
         slot
@@ -8947,14 +8962,19 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
             // idx 2 = filename, idx 3 = winerror (unread off Windows),
             // idx 4 = filename2.
             let w_filename = arg_opt(2).filter(|&f| !pyre_object::is_none(f));
-            // `_init_error` line 636-643: for an exact `BlockingIOError`, a
-            // numeric third argument is `characters_written`, not a filename —
-            // it stays in `args_w` and the tuple is not trimmed.
-            // `exceptions.c oserror_init` picks that branch on
-            // `PyNumber_Check` and only then converts, so a failed conversion
-            // propagates instead of falling back here.  PyPy catches
-            // (`_init_error` 637-643), consistent there because it never trims
-            // `args_w`; pyre does, so the fallback lands on neither.  gh#1150.
+            // For an exact `BlockingIOError` a numeric third argument is
+            // `characters_written`, not a filename — it stays in `args_w`
+            // and the tuple is not trimmed.
+            //
+            // [3.14-spec] `W_OSError._init_error` tries `space.int_w` and
+            // falls back to the filename when it raises, so `3.0` or an
+            // `__int__`-only object becomes the filename; `exceptions.c
+            // oserror_init` at v3.14.6 picks the branch on `PyNumber_Check`
+            // and then converts with `PyNumber_AsSsize_t(filename,
+            // PyExc_ValueError)`, so such a value raises out of the
+            // constructor. Evidence is the C source at the tag. The fallback
+            // is consistent upstream only because `_init_error` never trims
+            // `args_w` on that branch.
             let is_written_arg = exc_is_blocking_io_error(exc())
                 && w_filename.is_some_and(|f| crate::baseobjspace::number_check(f));
             if is_written_arg {
@@ -9326,12 +9346,18 @@ pub fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
 /// Windows error code in the fourth argument has already replaced that errno
 /// (`os_error_parsed_errno`), so `OSError(22, 'm', 'f', 5)` lands on the
 /// subclass its *derived* `EACCES` names rather than the one it was passed.
-fn os_error_errno_subclass_for(args: &[PyObjectRef]) -> Option<&'static str> {
-    let w_errno = os_error_parsed_errno(args)?;
+fn os_error_errno_subclass_for(
+    args: &[PyObjectRef],
+) -> Result<Option<&'static str>, crate::PyError> {
+    let Some(w_errno) = os_error_parsed_errno(args)? else {
+        return Ok(None);
+    };
     if !unsafe { pyre_object::is_int(w_errno) } {
-        return None;
+        return Ok(None);
     }
-    os_error_errno_subclass(unsafe { pyre_object::w_int_get_value(w_errno) })
+    Ok(os_error_errno_subclass(unsafe {
+        pyre_object::w_int_get_value(w_errno)
+    }))
 }
 
 /// `W_OSError._use_init` (`interp_exceptions.py`): the slots are
@@ -10207,7 +10233,7 @@ fn os_error_family_construct(
     // Only the exact OSError type remaps the errno to a subclass. Resolve it
     // before allocation so the user layout is chosen from that class.
     let w_target = if is_exact_os_error {
-        os_error_errno_subclass_for(&positional)
+        os_error_errno_subclass_for(&positional)?
             .and_then(lookup_exc_class)
             .or(cls)
     } else {
