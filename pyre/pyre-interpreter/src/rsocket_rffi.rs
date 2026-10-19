@@ -11,21 +11,13 @@
 #[cfg(unix)]
 pub use libc::{addrinfo, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage};
 
+/// `rsocket.py`'s `_c`: the WinSock half of `_rsocket_rffi`.
 #[cfg(windows)]
-use windows_sys::Win32::Networking::WinSock as ws;
-
-/// Integer names the shared body compares against.  `host_env` is the owner
-/// when present; `ws` is only the `not(host_env)` fallback.  Types and the
-/// WinSock entry points stay on `ws` — host_env does not wrap those 1:1.
-#[cfg(all(windows, feature = "host_env"))]
-use rustpython_host_env::socket as win_c;
-#[cfg(all(windows, not(feature = "host_env")))]
-use ws as win_c;
+use majit_rlib::_rsocket_rffi as _c;
 
 #[cfg(windows)]
-pub use ws::{
-    ADDRINFOA as addrinfo, SOCKADDR as sockaddr, SOCKADDR_IN as sockaddr_in,
-    SOCKADDR_IN6 as sockaddr_in6, SOCKADDR_STORAGE as sockaddr_storage,
+pub use majit_rlib::_rsocket_rffi::{
+    addrinfo, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage,
 };
 
 /// The descriptor a socket call takes.  POSIX numbers sockets alongside every
@@ -34,20 +26,20 @@ pub use ws::{
 #[cfg(unix)]
 pub type Socket = libc::c_int;
 #[cfg(windows)]
-pub type Socket = ws::SOCKET;
+pub type Socket = _c::socketfd_type;
 
 /// `getsockname`'s length argument.  `socklen_t` on POSIX, a plain `int` in
 /// WinSock's prototypes.
 #[cfg(unix)]
 pub type SockLen = libc::socklen_t;
 #[cfg(windows)]
-pub type SockLen = i32;
+pub type SockLen = _c::socklen_t;
 
 /// The width `sockaddr.sa_family` is written through.
 #[cfg(unix)]
 pub type SaFamily = libc::sa_family_t;
 #[cfg(windows)]
-pub type SaFamily = ws::ADDRESS_FAMILY;
+pub type SaFamily = u16;
 
 /// Whether a descriptor names no socket.  POSIX reserves every negative value.
 /// Windows reserves only `INVALID_SOCKET` — `(SOCKET)~0` — and every handle it
@@ -59,7 +51,7 @@ pub fn is_invalid(s: Socket) -> bool {
 }
 #[cfg(windows)]
 pub fn is_invalid(s: Socket) -> bool {
-    s == win_c::INVALID_SOCKET
+    _c::invalid_socket(s)
 }
 
 /// `fileno()` reports the descriptor as a Python int, and `_fd` stores it as
@@ -94,56 +86,37 @@ pub const AI_PASSIVE: libc::c_int = libc::AI_PASSIVE;
 pub const INADDR_BROADCAST: u32 = libc::INADDR_BROADCAST;
 
 #[cfg(windows)]
-pub const AF_UNSPEC: libc::c_int = win_c::AF_UNSPEC as libc::c_int;
-#[cfg(windows)]
-pub const AF_INET: libc::c_int = win_c::AF_INET as libc::c_int;
-#[cfg(windows)]
-pub const AF_INET6: libc::c_int = win_c::AF_INET6 as libc::c_int;
-#[cfg(windows)]
-pub const SOCK_STREAM: libc::c_int = win_c::SOCK_STREAM;
-#[cfg(windows)]
-pub const SOCK_DGRAM: libc::c_int = win_c::SOCK_DGRAM;
-#[cfg(windows)]
-pub const SOL_SOCKET: libc::c_int = win_c::SOL_SOCKET;
-#[cfg(windows)]
-pub const SO_TYPE: libc::c_int = win_c::SO_TYPE;
-#[cfg(windows)]
-pub const SO_ERROR: libc::c_int = win_c::SO_ERROR;
+pub use majit_rlib::_rsocket_rffi::{
+    AF_INET, AF_INET6, AF_UNSPEC, INADDR_ANY, INADDR_BROADCAST, SO_ERROR, SO_TYPE, SOCK_DGRAM,
+    SOCK_STREAM, SOL_SOCKET,
+};
 /// The code a call about a descriptor that is not a socket comes back with.
 #[cfg(windows)]
-pub const WSAENOTSOCK: i32 = win_c::WSAENOTSOCK;
+pub const WSAENOTSOCK: i32 = _c::WSAENOTSOCK;
 /// The code a send that would have blocked comes back with — a buffer with no
 /// room left, which is the one failure a caller may choose to drop.
 #[cfg(windows)]
-pub const WSAEWOULDBLOCK: i32 = win_c::WSAEWOULDBLOCK;
+pub const WSAEWOULDBLOCK: i32 = _c::WSAEWOULDBLOCK;
 #[cfg(windows)]
-pub const NI_MAXHOST: usize = win_c::NI_MAXHOST as usize;
+pub const NI_MAXHOST: usize = _c::NI_MAXHOST as usize;
 #[cfg(windows)]
-pub const INADDR_ANY: u32 = win_c::INADDR_ANY;
+pub const AI_NUMERICHOST: libc::c_int = _c::AI_NUMERICHOST;
 #[cfg(windows)]
-pub const AI_NUMERICHOST: libc::c_int = win_c::AI_NUMERICHOST as libc::c_int;
-#[cfg(windows)]
-pub const AI_PASSIVE: libc::c_int = win_c::AI_PASSIVE as libc::c_int;
-#[cfg(windows)]
-pub const INADDR_BROADCAST: u32 = win_c::INADDR_BROADCAST;
+pub const AI_PASSIVE: libc::c_int = _c::AI_PASSIVE;
 
 // ── WinSock initialisation ──
 
-/// `WSAStartup`.  Every WinSock entry point fails with `WSANOTINITIALISED`
-/// until the process has made this call, and the only other things that make
-/// it are the standard library's own socket code and socket2 — neither of
-/// which this module goes through.  Idempotent, so the entry points below can
-/// each open with it rather than depend on an initialisation order.
+/// `rsocket.rsocket_startup` (`WSAStartup`).  Every WinSock entry point fails
+/// with `WSANOTINITIALISED` until the process has made this call, and the
+/// only other things that make it are the standard library's own socket code
+/// and socket2 — neither of which this module goes through.  Idempotent, so
+/// the entry points below can each open with it rather than depend on an
+/// initialisation order.  The process keeps the library loaded for its whole
+/// life, so no `WSACleanup` pairs with it.
 #[cfg(windows)]
 pub fn init() {
     static STARTUP: std::sync::Once = std::sync::Once::new();
-    STARTUP.call_once(|| {
-        let mut data: ws::WSADATA = unsafe { core::mem::zeroed() };
-        // 2.2 is the version every supported Windows implements; the process
-        // keeps the library loaded for its whole life, so no WSACleanup pairs
-        // with it.
-        unsafe { ws::WSAStartup(0x0202, &mut data) };
-    });
+    STARTUP.call_once(majit_rlib::rsocket::rsocket_startup);
 }
 
 #[cfg(unix)]
@@ -151,23 +124,18 @@ pub fn init() {}
 
 // ── error reporting ──
 
-/// The code the last socket call failed with.  POSIX `llexternal`s with
-/// `save_err` store it before the interpreter is taken back, so this reads
-/// that slot.  WinSock reports through `WSAGetLastError` and never touches
-/// the C runtime's `errno`.
+/// `_rsocket_rffi.geterrno`: the code the last socket call failed with.  The
+/// `llexternal`s with `save_err` store it before the interpreter is taken
+/// back, so this reads that slot — `errno` on POSIX, `WSAGetLastError` on
+/// Windows (`RFFI_SAVE_WSALASTERROR`), which never touches the C runtime's
+/// `errno`.
 #[cfg(unix)]
 pub fn last_error_code() -> i32 {
     majit_rlib::rposix::get_saved_errno()
 }
-#[cfg(all(windows, feature = "host_env"))]
+#[cfg(windows)]
 pub fn last_error_code() -> i32 {
-    rustpython_host_env::socket::last_socket_error()
-        .raw_os_error()
-        .unwrap_or(0)
-}
-#[cfg(all(windows, not(feature = "host_env")))]
-pub fn last_error_code() -> i32 {
-    unsafe { ws::WSAGetLastError() }
+    _c::geterrno()
 }
 
 pub fn last_error() -> std::io::Error {
@@ -182,7 +150,7 @@ pub fn error_is_interrupted(code: i32) -> bool {
 }
 #[cfg(windows)]
 pub fn error_is_interrupted(code: i32) -> bool {
-    code == win_c::WSAEINTR
+    code == _c::WSAEINTR
 }
 
 /// Whether a code means the operation would have blocked.  PyPy keeps every
@@ -195,7 +163,7 @@ pub fn error_is_would_block(code: i32) -> bool {
 }
 #[cfg(windows)]
 pub fn error_is_would_block(code: i32) -> bool {
-    code == win_c::WSAEWOULDBLOCK
+    code == _c::WSAEWOULDBLOCK
 }
 
 /// `rsocket.py HAVE_SOCK_CLOEXEC` / `HAVE_SOCK_NONBLOCK`: the two creation
@@ -219,7 +187,7 @@ pub fn error_is_connect_in_progress(code: i32) -> bool {
 }
 #[cfg(windows)]
 pub fn error_is_connect_in_progress(code: i32) -> bool {
-    code == win_c::WSAEWOULDBLOCK
+    code == _c::WSAEWOULDBLOCK
 }
 
 /// `gai_strerror`.  Unix only: the symbol is a header-level inline over the
@@ -253,10 +221,80 @@ pub fn sethostname(name: &[u8]) -> std::io::Result<()> {
     majit_rlib::rsocket::sethostname(name)
         .map_err(|error| std::io::Error::from_raw_os_error(error.errno))
 }
+/// `GetComputerNameExW`, which the Windows `hostname` asks instead of
+/// `_c.gethostname`.
+#[cfg(all(windows, feature = "host_env"))]
+mod computer_name {
+    use majit_rlib::rffi::{CWCHARP, INT, RFFI_SAVE_LASTERROR};
+    use majit_rlib::rwin32::{BOOL, LPDWORD};
+
+    majit_rlib::rffi::external_compilation_info! {
+        const ECI = {
+            includes: ["windows.h"],
+            libraries: ["kernel32"],
+        };
+    }
+
+    majit_rlib::rffi::llexternal!(
+        pub(super) GetComputerNameExW = "GetComputerNameExW",
+        [INT, CWCHARP, LPDWORD],
+        BOOL,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_LASTERROR
+    );
+
+    /// `ComputerNamePhysicalDnsHostname` (`COMPUTER_NAME_FORMAT`).
+    pub(super) const COMPUTER_NAME_PHYSICAL_DNS_HOSTNAME: INT = 5;
+    /// `MAX_COMPUTERNAME_LENGTH`.
+    pub(super) const MAX_COMPUTERNAME_LENGTH: usize = 15;
+    /// `ERROR_MORE_DATA`.
+    pub(super) const ERROR_MORE_DATA: i64 = 234;
+}
+
+/// [3.14-spec] `GetComputerNameExW(ComputerNamePhysicalDnsHostname)` <->
+/// PyPy's `rsocket.gethostname` (`_c.gethostname`, the ANSI code page's
+/// bytes) — a host name the code page cannot spell comes back as its UTF-16
+/// text instead of as replacement bytes; evidence: `socketmodule.c
+/// socket_gethostname`'s `MS_WINDOWS` branch at v3.14.6.
 #[cfg(all(windows, feature = "host_env"))]
 pub fn hostname() -> std::io::Result<std::ffi::OsString> {
-    init();
-    Ok(rustpython_host_env::socket::hostname())
+    use computer_name::*;
+    use std::os::windows::ffi::OsStringExt;
+    let last_error =
+        || std::io::Error::from_raw_os_error(majit_rlib::rwin32::GetLastError_saved() as i32);
+    let mut buf = [0u16; MAX_COMPUTERNAME_LENGTH + 1];
+    let mut size = buf.len() as u32;
+    if unsafe {
+        GetComputerNameExW(
+            COMPUTER_NAME_PHYSICAL_DNS_HOSTNAME,
+            buf.as_mut_ptr(),
+            &raw mut size,
+        )
+    } != 0
+    {
+        return Ok(std::ffi::OsString::from_wide(&buf[..size as usize]));
+    }
+    if majit_rlib::rwin32::GetLastError_saved() != ERROR_MORE_DATA {
+        return Err(last_error());
+    }
+    if size == 0 {
+        return Ok(std::ffi::OsString::new());
+    }
+    // DNS allows a longer name than the fixed buffer holds.
+    let mut name = vec![0u16; size as usize];
+    if unsafe {
+        GetComputerNameExW(
+            COMPUTER_NAME_PHYSICAL_DNS_HOSTNAME,
+            name.as_mut_ptr(),
+            &raw mut size,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    name.truncate(size as usize);
+    Ok(std::ffi::OsString::from_wide(&name))
 }
 #[cfg(all(windows, not(feature = "host_env")))]
 pub fn hostname() -> std::io::Result<std::ffi::OsString> {
@@ -274,7 +312,7 @@ pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
 #[cfg(windows)]
 pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {
     init();
-    let entry = unsafe { ws::getprotobyname(name.as_ptr() as *const u8) };
+    let entry = unsafe { _c::getprotobyname(name.as_ptr()) };
     (!entry.is_null()).then(|| unsafe { (*entry).p_proto as libc::c_int })
 }
 
@@ -313,7 +351,24 @@ pub fn set_cloexec(s: Socket) {
 }
 #[cfg(all(windows, feature = "host_env"))]
 pub fn set_cloexec(s: Socket) {
-    let _ = rustpython_host_env::socket::set_socket_inheritable(s, false);
+    let _ = sock_set_inheritable(s, false);
+}
+
+/// `rsocket.sock_set_inheritable` / `sock_get_inheritable` on Windows: the
+/// socket is a kernel handle, so `rwin32` answers for it directly.
+#[cfg(all(windows, feature = "host_env"))]
+fn sock_set_inheritable(fd: Socket, inheritable: bool) -> std::io::Result<()> {
+    let handle = core::ptr::without_provenance_mut(fd);
+    majit_rlib::rwin32::set_handle_inheritable(handle, inheritable).map_err(winerror_to_io)
+}
+#[cfg(all(windows, feature = "host_env"))]
+fn sock_get_inheritable(fd: Socket) -> std::io::Result<bool> {
+    let handle = core::ptr::without_provenance_mut(fd);
+    majit_rlib::rwin32::get_handle_inheritable(handle).map_err(winerror_to_io)
+}
+#[cfg(all(windows, feature = "host_env"))]
+fn winerror_to_io(e: majit_rlib::rwin32::WindowsError) -> std::io::Error {
+    std::io::Error::from_raw_os_error(e.winerror as i32)
 }
 #[cfg(all(windows, not(feature = "host_env")))]
 pub fn set_cloexec(_s: Socket) {}
@@ -332,7 +387,7 @@ pub fn get_inheritable(s: Socket) -> std::io::Result<bool> {
 }
 #[cfg(all(windows, feature = "host_env"))]
 pub fn get_inheritable(s: Socket) -> std::io::Result<bool> {
-    rustpython_host_env::nt::get_handle_inheritable(s as _)
+    sock_get_inheritable(s)
 }
 #[cfg(all(windows, not(feature = "host_env")))]
 pub fn get_inheritable(_s: Socket) -> std::io::Result<bool> {
@@ -362,7 +417,7 @@ pub fn set_inheritable(s: Socket, inheritable: bool) -> std::io::Result<()> {
 }
 #[cfg(all(windows, feature = "host_env"))]
 pub fn set_inheritable(s: Socket, inheritable: bool) -> std::io::Result<()> {
-    rustpython_host_env::socket::set_socket_inheritable(s, inheritable)
+    sock_set_inheritable(s, inheritable)
 }
 #[cfg(all(windows, not(feature = "host_env")))]
 pub fn set_inheritable(_s: Socket, _inheritable: bool) -> std::io::Result<()> {
@@ -404,10 +459,11 @@ pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `RSocket._setblocking` on Windows (`ioctlsocket(FIONBIO)`).
 #[cfg(windows)]
 pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
-    let mut nonblocking: u32 = u32::from(timeout >= 0.0);
-    if unsafe { ws::ioctlsocket(s, win_c::FIONBIO, &mut nonblocking) } == win_c::SOCKET_ERROR {
+    let mut nonblocking: std::ffi::c_ulong = std::ffi::c_ulong::from(timeout >= 0.0);
+    if unsafe { _c::ioctlsocket(s, _c::FIONBIO, &raw mut nonblocking) } == _c::SOCKET_ERROR {
         return Err(last_error());
     }
     Ok(())
@@ -441,173 +497,133 @@ pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
     let ready = unsafe { majit_rlib::_rsocket_rffi::poll(&mut pollfd, 1, timeout_ms) };
     (ready, majit_rlib::rposix::get_saved_errno())
 }
-#[cfg(windows)]
-pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
-    poll_one(s, win_c::POLLIN as i16, timeout_ms)
+
+/// The wait in `RSocket._connect`, which off win32 is `_select(True)`.
+#[cfg(unix)]
+pub fn poll_connect(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
+    poll_writable(s, timeout_ms)
 }
 
-/// The other half of `RSocket._select`, which `internal_connect` waits on: a
-/// connection started in non-blocking mode reports its outcome by making the
-/// socket writable.
-///
-/// `select` with the socket in `exceptfds` as well as `writefds`, which is how
-/// `internal_select(connect=1)` waits: a refused connection makes the socket
-/// readable and exceptional rather than writable, and `WSAPoll` did not wake
-/// for one at all before Windows 10 version 2004 — the caller would read
-/// `WSAETIMEDOUT` where the connection error belongs.
+/// `RSocket._select(False)` without `poll()`: `select` over a read set.
 #[cfg(windows)]
-pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
-    let mut writefds = ws::FD_SET {
-        fd_count: 1,
-        ..Default::default()
-    };
-    writefds.fd_array[0] = s;
-    let mut exceptfds = writefds;
-    let timeout = ws::TIMEVAL {
-        tv_sec: timeout_ms / 1000,
-        tv_usec: (timeout_ms % 1000) * 1000,
-    };
-    let _blocked = crate::module::thread::before_external_block();
+pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
+    let mut readfds = one_socket_set(s);
+    let mut timeout = select_timeout(timeout_ms);
+    let timeout = timeout_ptr(timeout_ms, &mut timeout);
     // WinSock ignores `nfds`: its fd_set is a counted SOCKET array, not a
     // descriptor-indexed bitmap.
     let ready = unsafe {
-        ws::select(
+        _c::select(
             0,
-            std::ptr::null_mut(),
-            &mut writefds,
-            &mut exceptfds,
-            &timeout,
+            &raw mut readfds,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            timeout,
         )
     };
     (ready, last_error_code())
 }
 
+/// `RSocket._select(True)` without `poll()`: `select` over a write set.
 #[cfg(windows)]
-fn poll_one(s: Socket, events: i16, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
-    let mut pollfd = ws::WSAPOLLFD {
-        fd: s,
-        events,
-        revents: 0,
+pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
+    let mut writefds = one_socket_set(s);
+    let mut timeout = select_timeout(timeout_ms);
+    let timeout = timeout_ptr(timeout_ms, &mut timeout);
+    let ready = unsafe {
+        _c::select(
+            0,
+            core::ptr::null_mut(),
+            &raw mut writefds,
+            core::ptr::null_mut(),
+            timeout,
+        )
     };
-    let _blocked = crate::module::thread::before_external_block();
-    let ready = unsafe { ws::WSAPoll(&mut pollfd, 1, timeout_ms) };
     (ready, last_error_code())
+}
+
+/// The wait in `RSocket._connect`.  The win32 `_connect` selects with the
+/// socket in `fds_exc` as well as the write set: a refused connection makes
+/// the socket exceptional rather than writable, and `SO_ERROR` then carries
+/// the error.
+#[cfg(windows)]
+pub fn poll_connect(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
+    let mut writefds = one_socket_set(s);
+    let mut exceptfds = one_socket_set(s);
+    let mut timeout = select_timeout(timeout_ms);
+    let timeout = timeout_ptr(timeout_ms, &mut timeout);
+    let ready = unsafe {
+        _c::select(
+            0,
+            core::ptr::null_mut(),
+            &raw mut writefds,
+            &raw mut exceptfds,
+            timeout,
+        )
+    };
+    (ready, last_error_code())
+}
+
+/// `FD_ZERO` + `FD_SET(fd)`.  The handle is stored at its full width: a
+/// WinSock `SOCKET` may exceed the `int` `FD_SET` takes.
+#[cfg(windows)]
+fn one_socket_set(s: Socket) -> _c::fd_set {
+    let mut set = _c::fd_set {
+        fd_count: 1,
+        fd_array: [0; _c::FD_SETSIZE],
+    };
+    set.fd_array[0] = s;
+    set
+}
+
+/// A negative `timeout_ms` waits indefinitely, as `poll()` reads it on the
+/// unix side: `select` takes a null timeout for that.
+#[cfg(windows)]
+fn timeout_ptr(timeout_ms: libc::c_int, timeout: &mut _c::timeval) -> *mut _c::timeval {
+    if timeout_ms < 0 {
+        core::ptr::null_mut()
+    } else {
+        timeout
+    }
+}
+
+#[cfg(windows)]
+fn select_timeout(timeout_ms: libc::c_int) -> _c::timeval {
+    _c::timeval {
+        tv_sec: timeout_ms / 1000,
+        tv_usec: (timeout_ms % 1000) * 1000,
+    }
 }
 
 // ── address-structure accessors ──
 //
-// The fields these reach are the ones the two platforms spell differently.
 // `_rsocket_rffi.py` `CConfig.in_addr` is `s_addr`, `CConfig.in6_addr` is
-// `s6_addr`, and `CConfig.sockaddr_in6` carries `sin6_scope_id`. WinSock
-// stores those in anonymous unions (`IN_ADDR_0`, `IN6_ADDR_0`,
-// `SOCKADDR_IN6_0`). A union has no field-offset row, so projecting
-// `sin6_scope_id` out of it collapses to the union and the codewriter
-// reports a ref against the accessor's `u32` result. The views below are
-// those plain fields at the `SOCKADDR_IN` / `SOCKADDR_IN6` offsets.
+// `s6_addr`, and `CConfig.sockaddr_in6` carries `sin6_scope_id`, as plain
+// fields on both platforms.
 
-#[cfg(windows)]
-#[repr(C)]
-#[allow(dead_code)]
-struct SockaddrInPlain {
-    sin_family: u16,
-    sin_port: u16,
-    s_addr: u32,
-    sin_zero: [i8; 8],
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[allow(dead_code)]
-struct SockaddrIn6Plain {
-    sin6_family: u16,
-    sin6_port: u16,
-    sin6_flowinfo: u32,
-    s6_addr: [u8; 16],
-    sin6_scope_id: u32,
-}
-
-#[cfg(windows)]
-const _: () = {
-    use std::mem::{align_of, offset_of, size_of};
-    assert!(size_of::<SockaddrInPlain>() == size_of::<sockaddr_in>());
-    assert!(align_of::<SockaddrInPlain>() == align_of::<sockaddr_in>());
-    assert!(offset_of!(SockaddrInPlain, s_addr) == 4);
-    assert!(size_of::<SockaddrIn6Plain>() == size_of::<sockaddr_in6>());
-    assert!(align_of::<SockaddrIn6Plain>() == align_of::<sockaddr_in6>());
-    assert!(offset_of!(SockaddrIn6Plain, s6_addr) == 8);
-    assert!(offset_of!(SockaddrIn6Plain, sin6_scope_id) == 24);
-};
-
-#[cfg(windows)]
-fn sockaddr_in_plain(sin: &sockaddr_in) -> &SockaddrInPlain {
-    unsafe { &*std::ptr::from_ref(sin).cast::<SockaddrInPlain>() }
-}
-#[cfg(windows)]
-fn sockaddr_in_plain_mut(sin: &mut sockaddr_in) -> &mut SockaddrInPlain {
-    unsafe { &mut *std::ptr::from_mut(sin).cast::<SockaddrInPlain>() }
-}
-#[cfg(windows)]
-fn sockaddr_in6_plain(sin6: &sockaddr_in6) -> &SockaddrIn6Plain {
-    unsafe { &*std::ptr::from_ref(sin6).cast::<SockaddrIn6Plain>() }
-}
-#[cfg(windows)]
-fn sockaddr_in6_plain_mut(sin6: &mut sockaddr_in6) -> &mut SockaddrIn6Plain {
-    unsafe { &mut *std::ptr::from_mut(sin6).cast::<SockaddrIn6Plain>() }
-}
-
-#[cfg(unix)]
 pub fn sockaddr_in_get_addr(sin: &sockaddr_in) -> u32 {
     sin.sin_addr.s_addr
 }
-#[cfg(windows)]
-pub fn sockaddr_in_get_addr(sin: &sockaddr_in) -> u32 {
-    sockaddr_in_plain(sin).s_addr
-}
 
 /// The IPv4 address in network byte order, as `inet_pton` writes it.
-#[cfg(unix)]
 pub fn sockaddr_in_set_addr(sin: &mut sockaddr_in, addr: u32) {
     sin.sin_addr.s_addr = addr;
 }
-#[cfg(windows)]
-pub fn sockaddr_in_set_addr(sin: &mut sockaddr_in, addr: u32) {
-    sockaddr_in_plain_mut(sin).s_addr = addr;
-}
 
-#[cfg(unix)]
 pub fn sockaddr_in6_get_addr(sin6: &sockaddr_in6) -> [u8; 16] {
     sin6.sin6_addr.s6_addr
 }
-#[cfg(windows)]
-pub fn sockaddr_in6_get_addr(sin6: &sockaddr_in6) -> [u8; 16] {
-    sockaddr_in6_plain(sin6).s6_addr
-}
 
-#[cfg(unix)]
 pub fn sockaddr_in6_set_addr(sin6: &mut sockaddr_in6, addr: [u8; 16]) {
     sin6.sin6_addr.s6_addr = addr;
 }
-#[cfg(windows)]
-pub fn sockaddr_in6_set_addr(sin6: &mut sockaddr_in6, addr: [u8; 16]) {
-    sockaddr_in6_plain_mut(sin6).s6_addr = addr;
-}
 
-#[cfg(unix)]
 pub fn sockaddr_in6_get_scope_id(sin6: &sockaddr_in6) -> u32 {
     sin6.sin6_scope_id
 }
-#[cfg(windows)]
-pub fn sockaddr_in6_get_scope_id(sin6: &sockaddr_in6) -> u32 {
-    sockaddr_in6_plain(sin6).sin6_scope_id
-}
 
-#[cfg(unix)]
 pub fn sockaddr_in6_set_scope_id(sin6: &mut sockaddr_in6, scope_id: u32) {
     sin6.sin6_scope_id = scope_id;
-}
-#[cfg(windows)]
-pub fn sockaddr_in6_set_scope_id(sin6: &mut sockaddr_in6, scope_id: u32) {
-    sockaddr_in6_plain_mut(sin6).sin6_scope_id = scope_id;
 }
 
 // ── the calls themselves ──
@@ -631,52 +647,27 @@ pub unsafe fn socket(family: libc::c_int, ty: libc::c_int, proto: libc::c_int) -
 #[cfg(windows)]
 pub unsafe fn socket(family: libc::c_int, ty: libc::c_int, proto: libc::c_int) -> Socket {
     init();
-    unsafe { ws::socket(family, ty, proto) }
+    unsafe { _c::socket(family, ty, proto) }
 }
 
-#[cfg(unix)]
 pub unsafe fn close(s: Socket) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketclose(s) }
 }
-#[cfg(windows)]
-pub unsafe fn close(s: Socket) -> libc::c_int {
-    unsafe { ws::closesocket(s) }
-}
 
-#[cfg(unix)]
 pub unsafe fn bind(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketbind(s, addr, len) }
 }
-#[cfg(windows)]
-pub unsafe fn bind(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_int {
-    unsafe { ws::bind(s, addr, len) }
-}
 
-#[cfg(unix)]
 pub unsafe fn connect(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketconnect(s, addr, len) }
 }
-#[cfg(windows)]
-pub unsafe fn connect(s: Socket, addr: *const sockaddr, len: SockLen) -> libc::c_int {
-    unsafe { ws::connect(s, addr, len) }
-}
 
-#[cfg(unix)]
 pub unsafe fn listen(s: Socket, backlog: libc::c_int) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketlisten(s, backlog) }
 }
-#[cfg(windows)]
-pub unsafe fn listen(s: Socket, backlog: libc::c_int) -> libc::c_int {
-    unsafe { ws::listen(s, backlog) }
-}
 
-#[cfg(unix)]
 pub unsafe fn accept(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> Socket {
     unsafe { majit_rlib::_rsocket_rffi::socketaccept(s, addr, len) }
-}
-#[cfg(windows)]
-pub unsafe fn accept(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> Socket {
-    unsafe { ws::accept(s, addr, len) }
 }
 
 #[cfg(unix)]
@@ -695,7 +686,7 @@ pub unsafe fn send(
     len: usize,
     flags: libc::c_int,
 ) -> isize {
-    unsafe { ws::send(s, buf.cast(), clamp_transfer_len(len), flags) as isize }
+    unsafe { _c::send(s, buf, clamp_transfer_len(len), flags) as isize }
 }
 
 #[cfg(unix)]
@@ -714,7 +705,7 @@ pub unsafe fn recv(
     len: usize,
     flags: libc::c_int,
 ) -> isize {
-    unsafe { ws::recv(s, buf.cast(), clamp_transfer_len(len), flags) as isize }
+    unsafe { _c::socketrecv(s, buf, clamp_transfer_len(len), flags) as isize }
 }
 
 #[cfg(unix)]
@@ -737,7 +728,7 @@ pub unsafe fn sendto(
     addr: *const sockaddr,
     addrlen: SockLen,
 ) -> isize {
-    unsafe { ws::sendto(s, buf.cast(), clamp_transfer_len(len), flags, addr, addrlen) as isize }
+    unsafe { _c::sendto(s, buf, clamp_transfer_len(len), flags, addr, addrlen) as isize }
 }
 
 #[cfg(unix)]
@@ -760,28 +751,17 @@ pub unsafe fn recvfrom(
     addr: *mut sockaddr,
     addrlen: *mut SockLen,
 ) -> isize {
-    unsafe { ws::recvfrom(s, buf.cast(), clamp_transfer_len(len), flags, addr, addrlen) as isize }
+    unsafe { _c::recvfrom(s, buf, clamp_transfer_len(len), flags, addr, addrlen) as isize }
 }
 
-#[cfg(unix)]
 pub unsafe fn getsockname(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketgetsockname(s, addr, len) }
 }
-#[cfg(windows)]
-pub unsafe fn getsockname(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> libc::c_int {
-    unsafe { ws::getsockname(s, addr, len) }
-}
 
-#[cfg(unix)]
 pub unsafe fn getpeername(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketgetpeername(s, addr, len) }
 }
-#[cfg(windows)]
-pub unsafe fn getpeername(s: Socket, addr: *mut sockaddr, len: *mut SockLen) -> libc::c_int {
-    unsafe { ws::getpeername(s, addr, len) }
-}
 
-#[cfg(unix)]
 pub unsafe fn getsockopt(
     s: Socket,
     level: libc::c_int,
@@ -790,16 +770,6 @@ pub unsafe fn getsockopt(
     len: *mut SockLen,
 ) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketgetsockopt(s, level, option, value, len) }
-}
-#[cfg(windows)]
-pub unsafe fn getsockopt(
-    s: Socket,
-    level: libc::c_int,
-    option: libc::c_int,
-    value: *mut core::ffi::c_void,
-    len: *mut SockLen,
-) -> libc::c_int {
-    unsafe { ws::getsockopt(s, level, option, value.cast(), len) }
 }
 
 /// `WSAIoctl` with an input value and no output buffer, which is the shape
@@ -817,19 +787,19 @@ pub unsafe fn wsa_ioctl(
 ) -> Option<u32> {
     let mut returned: u32 = 0;
     let result = unsafe {
-        ws::WSAIoctl(
+        _c::WSAIoctl(
             s,
             code,
-            value,
+            value.cast_mut(),
             len,
             core::ptr::null_mut(),
             0,
-            &mut returned,
+            &raw mut returned,
             core::ptr::null_mut(),
-            None,
+            core::ptr::null_mut(),
         )
     };
-    (result != win_c::SOCKET_ERROR).then_some(returned)
+    (result != _c::SOCKET_ERROR).then_some(returned)
 }
 
 /// `SIO_TCP_SET_ACK_FREQUENCY`, which is what `TCP_QUICKACK` names here.
@@ -838,7 +808,7 @@ pub unsafe fn wsa_ioctl(
 /// Nothing reads it back: WinSock exposes no query for the current setting.
 #[cfg(windows)]
 pub unsafe fn set_ack_frequency(s: Socket, flag: libc::c_int) -> libc::c_int {
-    let code = win_c::SIO_TCP_SET_ACK_FREQUENCY as u32;
+    let code = _c::SIO_TCP_SET_ACK_FREQUENCY;
     let sent = unsafe {
         wsa_ioctl(
             s,
@@ -847,14 +817,9 @@ pub unsafe fn set_ack_frequency(s: Socket, flag: libc::c_int) -> libc::c_int {
             core::mem::size_of::<libc::c_int>() as u32,
         )
     };
-    if sent.is_some() {
-        0
-    } else {
-        win_c::SOCKET_ERROR
-    }
+    if sent.is_some() { 0 } else { _c::SOCKET_ERROR }
 }
 
-#[cfg(unix)]
 pub unsafe fn setsockopt(
     s: Socket,
     level: libc::c_int,
@@ -864,24 +829,9 @@ pub unsafe fn setsockopt(
 ) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketsetsockopt(s, level, option, value, len) }
 }
-#[cfg(windows)]
-pub unsafe fn setsockopt(
-    s: Socket,
-    level: libc::c_int,
-    option: libc::c_int,
-    value: *const core::ffi::c_void,
-    len: SockLen,
-) -> libc::c_int {
-    unsafe { ws::setsockopt(s, level, option, value.cast(), len) }
-}
 
-#[cfg(unix)]
 pub unsafe fn shutdown(s: Socket, how: libc::c_int) -> libc::c_int {
     unsafe { majit_rlib::_rsocket_rffi::socketshutdown(s, how) }
-}
-#[cfg(windows)]
-pub unsafe fn shutdown(s: Socket, how: libc::c_int) -> libc::c_int {
-    unsafe { ws::shutdown(s, how) }
 }
 
 #[cfg(unix)]
@@ -901,19 +851,11 @@ pub unsafe fn getaddrinfo(
     res: *mut *mut addrinfo,
 ) -> libc::c_int {
     init();
-    // The unix body releases the interpreter inside its `llexternal`. This
-    // one does not, so the release stays here and the call sites stay shared.
-    let _blocked = crate::module::thread::before_external_block();
-    unsafe { ws::getaddrinfo(node as *const u8, service as *const u8, hints, res) }
+    unsafe { _c::getaddrinfo(node, service, hints, res) }
 }
 
-#[cfg(unix)]
 pub unsafe fn freeaddrinfo(res: *mut addrinfo) {
     unsafe { majit_rlib::_rsocket_rffi::freeaddrinfo(res) }
-}
-#[cfg(windows)]
-pub unsafe fn freeaddrinfo(res: *mut addrinfo) {
-    unsafe { ws::freeaddrinfo(res) }
 }
 
 #[cfg(unix)]
@@ -943,14 +885,13 @@ pub unsafe fn getnameinfo(
     flags: libc::c_int,
 ) -> libc::c_int {
     init();
-    let _blocked = crate::module::thread::before_external_block();
     unsafe {
-        ws::getnameinfo(
+        _c::getnameinfo(
             addr,
             addrlen,
-            host as *mut u8,
+            host,
             hostlen as u32,
-            service as *mut u8,
+            service,
             servicelen as u32,
             flags,
         )
@@ -972,7 +913,7 @@ pub unsafe fn inet_pton(
     dst: *mut core::ffi::c_void,
 ) -> libc::c_int {
     init();
-    unsafe { ws::inet_pton(family, src as *const u8, dst) }
+    unsafe { _c::inet_pton(family, src, dst) }
 }
 
 #[cfg(unix)]
@@ -992,7 +933,7 @@ pub unsafe fn inet_ntop(
     size: SockLen,
 ) -> *const libc::c_char {
     init();
-    unsafe { ws::inet_ntop(family, src, dst as *mut u8, size as usize) as *const libc::c_char }
+    unsafe { _c::inet_ntop(family, src, dst, size as usize) }
 }
 
 /// `inet_pton`'s two failures, which it reports through different channels: a
@@ -1046,7 +987,7 @@ pub struct Hostent {
     h_addr_list: *mut *mut libc::c_char,
 }
 #[cfg(windows)]
-pub type Hostent = ws::HOSTENT;
+pub type Hostent = _c::hostent;
 
 /// The resolver's `servent` record, held on the same terms as [`Hostent`].
 #[cfg(unix)]
@@ -1059,7 +1000,7 @@ pub struct Servent {
     s_proto: *const libc::c_char,
 }
 #[cfg(windows)]
-pub type Servent = ws::SERVENT;
+pub type Servent = _c::servent;
 
 /// `rsocket._get_netdb_lock_thread`: the lookups below answer with a pointer
 /// into one process-global record, so a second lookup on another thread
@@ -1092,7 +1033,7 @@ pub unsafe fn host_by_name(name: *const libc::c_char) -> *mut Hostent {
     #[cfg(windows)]
     {
         init();
-        unsafe { ws::gethostbyname(name as *const u8) }
+        unsafe { _c::gethostbyname(name) }
     }
 }
 
@@ -1111,7 +1052,7 @@ pub unsafe fn host_by_addr(
     #[cfg(windows)]
     {
         init();
-        unsafe { ws::gethostbyaddr(addr as *const u8, len, family) }
+        unsafe { _c::gethostbyaddr(addr.cast(), len, family) }
     }
 }
 
@@ -1170,7 +1111,7 @@ pub unsafe fn serv_by_name(name: *const libc::c_char, proto: *const libc::c_char
     #[cfg(windows)]
     {
         init();
-        unsafe { ws::getservbyname(name as *const u8, proto as *const u8) }
+        unsafe { _c::getservbyname(name, proto) }
     }
 }
 
@@ -1185,7 +1126,7 @@ pub unsafe fn serv_by_port(port: libc::c_int, proto: *const libc::c_char) -> *mu
     #[cfg(windows)]
     {
         init();
-        unsafe { ws::getservbyport(port, proto as *const u8) }
+        unsafe { _c::getservbyport(port, proto) }
     }
 }
 

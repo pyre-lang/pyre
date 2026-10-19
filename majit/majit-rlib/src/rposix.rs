@@ -143,7 +143,7 @@ pub fn _errno_after(save_err: i64) {
             // We must read it first, before the errno handling.
             Some(unsafe { rwin32::_GetLastError() } as i32)
         } else if save_err & RFFI_SAVE_WSALASTERROR != 0 {
-            Some(unsafe { _rsocket_rffi::_WSAGetLastError() })
+            Some(unsafe { _rsocket_rffi::_WSAGetLastError() } as i32)
         } else {
             None
         };
@@ -165,6 +165,84 @@ pub fn _errno_after(save_err: i64) {
             rthread::TLFIELD_RPY_ERRNO_OFS
         };
         rthread::tlfield_setraw_int(ofs, _get_errno());
+    }
+}
+
+// `rposix.c_enter_suppress_iph` / `c_exit_suppress_iph`: the
+// `errno_eci` helpers `enter_suppress_iph` / `exit_suppress_iph` swap this
+// thread's CRT invalid parameter handler for the empty
+// `_Py_silent_invalid_parameter_handler` and back.
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+mod suppress_iph {
+    use crate::rffi::VOIDP;
+
+    /// `_Py_silent_invalid_parameter_handler`.
+    unsafe extern "C" fn _Py_silent_invalid_parameter_handler(
+        _expression: *const u16,
+        _function: *const u16,
+        _file: *const u16,
+        _line: u32,
+        _p_reserved: usize,
+    ) {
+    }
+
+    crate::rffi::llexternal!(
+        _set_thread_local_invalid_parameter_handler = "_set_thread_local_invalid_parameter_handler",
+        [VOIDP],
+        VOIDP
+    );
+
+    /// `rposix.c_enter_suppress_iph` (`jit.dont_look_inside`).
+    #[majit_macros::dont_look_inside]
+    pub fn c_enter_suppress_iph() -> VOIDP {
+        let handler = _Py_silent_invalid_parameter_handler as VOIDP;
+        unsafe { _set_thread_local_invalid_parameter_handler(handler) }
+    }
+
+    /// `rposix.c_exit_suppress_iph` (`jit.dont_look_inside`).
+    #[majit_macros::dont_look_inside]
+    pub fn c_exit_suppress_iph(handle: VOIDP) {
+        unsafe { _set_thread_local_invalid_parameter_handler(handle) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub use suppress_iph::{c_enter_suppress_iph, c_exit_suppress_iph};
+
+/// `rposix.SuppressIPH`. [`SuppressIPH::new`] is `__enter__`, [`Drop`] is
+/// `__exit__`.
+#[cfg(target_os = "windows")]
+pub struct SuppressIPH {
+    invalid_param_hndlr: crate::rffi::VOIDP,
+}
+
+#[cfg(target_os = "windows")]
+impl SuppressIPH {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            invalid_param_hndlr: c_enter_suppress_iph(),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for SuppressIPH {
+    fn drop(&mut self) {
+        c_exit_suppress_iph(self.invalid_param_hndlr);
+    }
+}
+
+/// `rposix.SuppressIPH` off Windows: an empty context manager.
+#[cfg(not(target_os = "windows"))]
+pub struct SuppressIPH;
+
+#[cfg(not(target_os = "windows"))]
+impl SuppressIPH {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        SuppressIPH
     }
 }
 

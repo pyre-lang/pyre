@@ -3155,7 +3155,7 @@ fn socket_connect_wait(
             return Err(SocketConnectFailure::Timeout(rffi::WSAEWOULDBLOCK));
         }
         let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
-        let (ready, poll_errno) = rffi::poll_writable(fd, timeout_ms);
+        let (ready, poll_errno) = rffi::poll_connect(fd, timeout_ms);
         if ready > 0 {
             break;
         }

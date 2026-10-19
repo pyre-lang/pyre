@@ -9,13 +9,19 @@
 //!
 //! `rlocale.external` sets `sandboxsafe=True`.
 
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg(all(
+    any(all(unix, not(target_arch = "wasm32")), windows),
+    feature = "host_env"
+))]
 use crate::rffi::{CCHARP, INT};
 
 /// `rlocale.py LocaleError`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocaleError {
-    /// `setlocale` returned a null pointer.
+    /// `setlocale`: the category is outside `LC_MIN..=LC_MAX`
+    /// ("invalid locale category").
+    InvalidCategory,
+    /// `setlocale` returned a null pointer ("unsupported locale setting").
     Unsupported,
 }
 
@@ -53,18 +59,79 @@ crate::rffi::external_compilation_info! {
     };
 }
 
+// `CConfig._compilation_info_` on win32: no `langinfo.h` (`HAVE_LANGINFO`)
+// or `libintl.h` (`HAVE_LIBINTL`), and `windows.h` for `GetLocaleInfo`.
+#[cfg(windows)]
+crate::rffi::external_compilation_info! {
+    const LOCALE_ECI = {
+        includes: ["locale.h", "limits.h", "ctype.h", "wchar.h", "windows.h"],
+    };
+}
+
+/// `CConfig.lconv` (`struct lconv`).
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[allow(non_camel_case_types)]
+pub type lconv = libc::lconv;
+
+/// `CConfig.lconv` (`struct lconv`), as the MSVC `locale.h` lays it out:
+/// the C fields, then the wide copies of the strings.
+#[cfg(windows)]
+#[allow(non_camel_case_types, non_snake_case)]
+#[repr(C)]
+pub struct lconv {
+    pub decimal_point: *mut core::ffi::c_char,
+    pub thousands_sep: *mut core::ffi::c_char,
+    pub grouping: *mut core::ffi::c_char,
+    pub int_curr_symbol: *mut core::ffi::c_char,
+    pub currency_symbol: *mut core::ffi::c_char,
+    pub mon_decimal_point: *mut core::ffi::c_char,
+    pub mon_thousands_sep: *mut core::ffi::c_char,
+    pub mon_grouping: *mut core::ffi::c_char,
+    pub positive_sign: *mut core::ffi::c_char,
+    pub negative_sign: *mut core::ffi::c_char,
+    pub int_frac_digits: core::ffi::c_char,
+    pub frac_digits: core::ffi::c_char,
+    pub p_cs_precedes: core::ffi::c_char,
+    pub p_sep_by_space: core::ffi::c_char,
+    pub n_cs_precedes: core::ffi::c_char,
+    pub n_sep_by_space: core::ffi::c_char,
+    pub p_sign_posn: core::ffi::c_char,
+    pub n_sign_posn: core::ffi::c_char,
+    pub _W_decimal_point: crate::rffi::CWCHARP,
+    pub _W_thousands_sep: crate::rffi::CWCHARP,
+    pub _W_int_curr_symbol: crate::rffi::CWCHARP,
+    pub _W_currency_symbol: crate::rffi::CWCHARP,
+    pub _W_mon_decimal_point: crate::rffi::CWCHARP,
+    pub _W_mon_thousands_sep: crate::rffi::CWCHARP,
+    pub _W_positive_sign: crate::rffi::CWCHARP,
+    pub _W_negative_sign: crate::rffi::CWCHARP,
+}
+
+/// `cConfig.LC_MIN` / `cConfig.LC_MAX`. Only the MSVC `locale.h` defines
+/// them (`LC_ALL` / `LC_TIME`); elsewhere they are `None`.
+#[cfg(windows)]
+pub const LC_MIN: crate::rffi::INT = libc::LC_ALL;
+#[cfg(windows)]
+pub const LC_MAX: crate::rffi::INT = libc::LC_TIME;
+
 // `rlocale.localeconv` (`sandboxsafe=True`).
-#[cfg(all(unix, not(target_arch = "wasm32"), feature = "host_env"))]
+#[cfg(all(
+    any(all(unix, not(target_arch = "wasm32")), windows),
+    feature = "host_env"
+))]
 crate::rffi::llexternal!(
     pub localeconv = "localeconv",
     [],
-    *mut libc::lconv,
+    *mut lconv,
     compilation_info = LOCALE_ECI,
     sandboxsafe = true
 );
 
 // `rlocale._setlocale` (`sandboxsafe=True`).
-#[cfg(all(unix, not(target_arch = "wasm32"), feature = "host_env"))]
+#[cfg(all(
+    any(all(unix, not(target_arch = "wasm32")), windows),
+    feature = "host_env"
+))]
 crate::rffi::llexternal!(
     pub _setlocale = "setlocale",
     [INT, CCHARP],
@@ -78,7 +145,7 @@ crate::rffi::llexternal!(
     unix,
     not(target_arch = "wasm32"),
     feature = "host_env",
-    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+    not(any(target_os = "android", target_os = "redox"))
 ))]
 crate::rffi::llexternal!(
     pub _nl_langinfo = "nl_langinfo",
@@ -88,8 +155,11 @@ crate::rffi::llexternal!(
     sandboxsafe = true
 );
 
-#[cfg(all(unix, not(target_arch = "wasm32"), feature = "host_env"))]
-unsafe fn charp_to_bytes(ptr: *mut libc::c_char) -> Vec<u8> {
+#[cfg(all(
+    any(all(unix, not(target_arch = "wasm32")), windows),
+    feature = "host_env"
+))]
+unsafe fn charp_to_bytes(ptr: *mut core::ffi::c_char) -> Vec<u8> {
     if ptr.is_null() {
         Vec::new()
     } else {
@@ -97,8 +167,11 @@ unsafe fn charp_to_bytes(ptr: *mut libc::c_char) -> Vec<u8> {
     }
 }
 
-#[cfg(all(unix, not(target_arch = "wasm32"), feature = "host_env"))]
-fn localeconv_from_lconv(lp: *mut libc::lconv) -> LocaleConv {
+#[cfg(all(
+    any(all(unix, not(target_arch = "wasm32")), windows),
+    feature = "host_env"
+))]
+fn localeconv_from_lconv(lp: *mut lconv) -> LocaleConv {
     if lp.is_null() {
         return LocaleConv {
             decimal_point: b".".to_vec(),
@@ -152,7 +225,10 @@ fn localeconv_from_lconv(lp: *mut libc::lconv) -> LocaleConv {
 /// separator, empty grouping). `rlocale.py` marks `localeconv`
 /// `sandboxsafe`, so a `host_env` build reads the host even under sandbox.
 pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    #[cfg(all(unix, not(target_arch = "wasm32"), feature = "host_env"))]
+    #[cfg(all(
+        any(all(unix, not(target_arch = "wasm32")), windows),
+        feature = "host_env"
+    ))]
     {
         // `numeric_formatting_impl` reads only these three `lconv` fields.
         let lp = unsafe { localeconv() };
@@ -167,10 +243,6 @@ pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             )
         }
     }
-    #[cfg(all(windows, feature = "host_env"))]
-    {
-        return rustpython_host_env::locale::localeconv_numeric();
-    }
     #[cfg(not(all(
         any(all(unix, not(target_arch = "wasm32")), windows),
         feature = "host_env"
@@ -178,14 +250,19 @@ pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (b".".to_vec(), Vec::new(), Vec::new())
 }
 
-/// `rlocale.py setlocale`. A null host result is [`LocaleError::Unsupported`].
-///
-/// The Windows category-range check and the encoding-length check stay with
-/// the `_locale` builtin: they raise `locale.Error` before this call, and
-/// the CRT invalid-parameter handler would abort on a category outside
-/// `LC_ALL..=LC_TIME`.
+/// `rlocale.py setlocale`. A category outside `LC_MIN..=LC_MAX` is
+/// [`LocaleError::InvalidCategory`] (the MSVC runtime's invalid-parameter
+/// handler would end the process on one); a null host result is
+/// [`LocaleError::Unsupported`].
 pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u8>, LocaleError> {
-    #[cfg(all(unix, not(target_arch = "wasm32"), feature = "host_env"))]
+    #[cfg(windows)]
+    if !(LC_MIN..=LC_MAX).contains(&category) {
+        return Err(LocaleError::InvalidCategory);
+    }
+    #[cfg(all(
+        any(all(unix, not(target_arch = "wasm32")), windows),
+        feature = "host_env"
+    ))]
     {
         let ptr = match locale {
             None => unsafe { _setlocale(category, std::ptr::null_mut()) },
@@ -195,11 +272,6 @@ pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u
             return Err(LocaleError::Unsupported);
         }
         Ok(unsafe { crate::rffi::charp2str(ptr) })
-    }
-    #[cfg(all(windows, feature = "host_env"))]
-    {
-        return rustpython_host_env::locale::setlocale(category, locale)
-            .ok_or(LocaleError::Unsupported);
     }
     #[cfg(not(all(
         any(all(unix, not(target_arch = "wasm32")), windows),
@@ -217,34 +289,7 @@ pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u
     feature = "host_env"
 ))]
 pub fn localeconv_data() -> LocaleConv {
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    {
-        localeconv_from_lconv(unsafe { localeconv() })
-    }
-    #[cfg(windows)]
-    {
-        let lc = rustpython_host_env::locale::localeconv_data();
-        LocaleConv {
-            decimal_point: lc.decimal_point,
-            thousands_sep: lc.thousands_sep,
-            grouping: lc.grouping.iter().map(|&size| size as u8).collect(),
-            int_curr_symbol: lc.int_curr_symbol,
-            currency_symbol: lc.currency_symbol,
-            mon_decimal_point: lc.mon_decimal_point,
-            mon_thousands_sep: lc.mon_thousands_sep,
-            mon_grouping: lc.mon_grouping.iter().map(|&size| size as u8).collect(),
-            positive_sign: lc.positive_sign,
-            negative_sign: lc.negative_sign,
-            int_frac_digits: lc.int_frac_digits,
-            frac_digits: lc.frac_digits,
-            p_cs_precedes: lc.p_cs_precedes,
-            p_sep_by_space: lc.p_sep_by_space,
-            n_cs_precedes: lc.n_cs_precedes,
-            n_sep_by_space: lc.n_sep_by_space,
-            p_sign_posn: lc.p_sign_posn,
-            n_sign_posn: lc.n_sign_posn,
-        }
-    }
+    localeconv_from_lconv(unsafe { localeconv() })
 }
 
 /// `nl_langinfo(CODESET)`.
@@ -252,7 +297,7 @@ pub fn localeconv_data() -> LocaleConv {
     unix,
     not(target_arch = "wasm32"),
     feature = "host_env",
-    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+    not(any(target_os = "android", target_os = "redox"))
 ))]
 pub fn nl_langinfo_codeset() -> Option<Vec<u8>> {
     nl_langinfo(libc::CODESET)
@@ -263,7 +308,7 @@ pub fn nl_langinfo_codeset() -> Option<Vec<u8>> {
     unix,
     not(target_arch = "wasm32"),
     feature = "host_env",
-    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+    not(any(target_os = "android", target_os = "redox"))
 ))]
 pub fn nl_langinfo(item: libc::nl_item) -> Option<Vec<u8>> {
     let ptr = unsafe { _nl_langinfo(item as INT) };
@@ -274,22 +319,95 @@ pub fn nl_langinfo(item: libc::nl_item) -> Option<Vec<u8>> {
     }
 }
 
-/// `GetACP`, as the integer the `cp<n>` encoding name is built from.
-#[cfg(all(windows, feature = "host_env"))]
-pub fn acp() -> u32 {
-    rustpython_host_env::locale::acp()
-}
+// `getdefaultlocale()` implementation for Windows.
 
-/// `rlocale.py getdefaultlocale` language or territory component.
-///
-/// `lctype` is `LOCALE_SISO639LANGNAME` or `LOCALE_SISO3166CTRYNAME`. The
-/// `cp<n>` encoding half stays with the builtin that formats [`acp`].
+/// `rlocale.LCID`.
+#[cfg(windows)]
+pub type LCID = crate::rwin32::DWORD;
+/// `rlocale.LCTYPE`.
+#[cfg(windows)]
+pub type LCTYPE = crate::rwin32::DWORD;
+
+/// `cConfig.LOCALE_USER_DEFAULT` — `MAKELCID(LANG_USER_DEFAULT, SORT_DEFAULT)`.
+#[cfg(windows)]
+pub const LOCALE_USER_DEFAULT: LCID = 0x0400;
+/// `cConfig.LOCALE_SISO639LANGNAME`.
+#[cfg(windows)]
+pub const LOCALE_SISO639LANGNAME: LCTYPE = 0x0059;
+/// `cConfig.LOCALE_SISO3166CTRYNAME`.
+#[cfg(windows)]
+pub const LOCALE_SISO3166CTRYNAME: LCTYPE = 0x005A;
+/// `cConfig.LOCALE_IDEFAULTLANGUAGE`.
+#[cfg(windows)]
+pub const LOCALE_IDEFAULTLANGUAGE: LCTYPE = 0x0009;
+
+// `rlocale.GetACP` (`calling_conv='win'`).
 #[cfg(all(windows, feature = "host_env"))]
-pub fn user_default_locale_component(lctype: u32) -> Option<String> {
-    rustpython_host_env::locale::locale_info(
-        rustpython_host_env::locale::user_default_lcid(),
-        lctype,
-    )
+crate::rffi::llexternal!(
+    pub GetACP = "GetACP",
+    [],
+    INT,
+    compilation_info = LOCALE_ECI,
+    calling_conv = "win",
+    sandboxsafe = true
+);
+
+// `rlocale.GetLocaleInfo` (`calling_conv='win'`).
+#[cfg(all(windows, feature = "host_env"))]
+crate::rffi::llexternal!(
+    pub GetLocaleInfo = "GetLocaleInfoA",
+    [LCID, LCTYPE, crate::rwin32::LPSTR, INT],
+    INT,
+    compilation_info = LOCALE_ECI,
+    calling_conv = "win",
+    sandboxsafe = true
+);
+
+/// `rlocale.py getdefaultlocale` — `(language, encoding)`; `language` is
+/// `None` when no locale name can be built.
+#[cfg(all(windows, feature = "host_env"))]
+pub fn getdefaultlocale() -> (Option<Vec<u8>>, Vec<u8>) {
+    let encoding = format!("cp{}", unsafe { GetACP() }).into_bytes();
+
+    const BUFSIZE: usize = 50;
+    let mut buf_lang = [0u8; BUFSIZE];
+    let mut buf_country = [0u8; BUFSIZE];
+
+    let language = if unsafe {
+        GetLocaleInfo(
+            LOCALE_USER_DEFAULT,
+            LOCALE_SISO639LANGNAME,
+            buf_lang.as_mut_ptr(),
+            BUFSIZE as INT,
+        ) != 0
+            && GetLocaleInfo(
+                LOCALE_USER_DEFAULT,
+                LOCALE_SISO3166CTRYNAME,
+                buf_country.as_mut_ptr(),
+                BUFSIZE as INT,
+            ) != 0
+    } {
+        let lang = unsafe { crate::rffi::charp2str(buf_lang.as_mut_ptr()) };
+        let country = unsafe { crate::rffi::charp2str(buf_country.as_mut_ptr()) };
+        Some([&lang[..], b"_", &country[..]].concat())
+    } else if unsafe {
+        // If we end up here, this windows version didn't know about
+        // ISO639/ISO3166 names (it's probably Windows 95).  Return the
+        // Windows language identifier instead (a hexadecimal number)
+        GetLocaleInfo(
+            LOCALE_USER_DEFAULT,
+            LOCALE_IDEFAULTLANGUAGE,
+            buf_lang.as_mut_ptr(),
+            BUFSIZE as INT,
+        ) != 0
+    } {
+        let lang = unsafe { crate::rffi::charp2str(buf_lang.as_mut_ptr()) };
+        Some([&b"0x"[..], &lang[..]].concat())
+    } else {
+        None
+    };
+
+    (language, encoding)
 }
 
 /// `rlocale.py isalpha`.
@@ -345,6 +463,22 @@ mod tests {
         assert_eq!(decimal, b".");
         assert!(sep.is_empty());
         assert!(grouping.is_empty());
+    }
+
+    #[cfg(all(windows, feature = "host_env"))]
+    #[test]
+    fn windows_lconv_getdefaultlocale_and_category_range() {
+        let (language, encoding) = super::getdefaultlocale();
+        assert!(encoding.starts_with(b"cp"));
+        assert!(language.is_some_and(|name| !name.is_empty()));
+        // The process starts in the "C" locale.
+        let lc = super::localeconv_data();
+        assert_eq!(lc.decimal_point, b".");
+        assert_eq!(super::numeric_formatting().0, b".");
+        assert_eq!(
+            super::setlocale(super::LC_MAX + 1, None).unwrap_err(),
+            super::LocaleError::InvalidCategory
+        );
     }
 
     #[test]

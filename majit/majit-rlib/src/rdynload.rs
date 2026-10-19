@@ -1,23 +1,28 @@
-//! `rpython/rlib/rdynload.py` — Unix `dlopen` / `dlsym` / `dlclose`.
+//! `rpython/rlib/rdynload.py` — Various rpython-level functions for dlopen.
 //!
-//! windows half not ported
-
-#![cfg(unix)]
+//! Unix is `dlopen` / `dlsym` / `dlclose`; Windows is the `rwin32`
+//! `LoadLibraryW` / `GetProcAddress` / `FreeLibrary` half over `DLLHANDLE =
+//! rwin32.HMODULE`.
 
 use crate::rffi::{self, CCHARP, VOIDP};
 
 pub use crate::rffi::INT;
 
 /// `rdynload.DLLHANDLE`.
+#[cfg(unix)]
 pub type DLLHANDLE = VOIDP;
 
 /// `rdynload.RTLD_LOCAL`.
+#[cfg(unix)]
 pub const RTLD_LOCAL: INT = libc::RTLD_LOCAL;
 /// `rdynload.RTLD_GLOBAL`.
+#[cfg(unix)]
 pub const RTLD_GLOBAL: INT = libc::RTLD_GLOBAL;
 /// `rdynload.RTLD_NOW`.
+#[cfg(unix)]
 pub const RTLD_NOW: INT = libc::RTLD_NOW;
 /// `rdynload.RTLD_LAZY`.
+#[cfg(unix)]
 pub const RTLD_LAZY: INT = libc::RTLD_LAZY;
 
 /// `rdynload.cConfig.RTLD_NODELETE`.
@@ -56,6 +61,7 @@ crate::rffi::external_compilation_info! {
 }
 
 #[cfg(all(
+    unix,
     not(target_vendor = "apple"),
     not(any(target_os = "freebsd", target_os = "netbsd"))
 ))]
@@ -74,6 +80,7 @@ crate::rffi::external_compilation_info! {
 }
 
 // `rdynload.c_dlopen`. `rdynload.external` does not set sandboxsafe.
+#[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_dlopen = "dlopen",
     [CCHARP, INT],
@@ -82,6 +89,7 @@ crate::rffi::llexternal!(
 );
 
 // `rdynload.c_dlclose` (`releasegil=False`).
+#[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_dlclose = "dlclose",
     [VOIDP],
@@ -91,6 +99,7 @@ crate::rffi::llexternal!(
 );
 
 // `rdynload.c_dlerror`.
+#[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_dlerror = "dlerror",
     [],
@@ -99,6 +108,7 @@ crate::rffi::llexternal!(
 );
 
 // `rdynload.c_dlsym`.
+#[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_dlsym = "dlsym",
     [VOIDP, CCHARP],
@@ -106,9 +116,9 @@ crate::rffi::llexternal!(
     compilation_info = ECI
 );
 
-/// `rdynload.DLOpenError`. `Message` is `dlerror`'s raw bytes;
-/// `OsError` is an `os.open`/`read`/`close` failure `_retry_as_ldscript`
-/// lets escape as `OSError`.
+/// `rdynload.DLOpenError`. `Message` is `dlerror`'s raw bytes (the
+/// `FormatErrorW` utf-8 on Windows); `OsError` is an `os.open`/`read`/`close`
+/// failure `_retry_as_ldscript` lets escape as `OSError`.
 #[derive(Debug, Clone)]
 pub enum DLOpenError {
     Message(Vec<u8>),
@@ -127,6 +137,7 @@ impl std::fmt::Display for DLOpenError {
 }
 
 /// `rdynload.dlerror`. Raw bytes: `charp2str` does not decode.
+#[cfg(unix)]
 pub fn dlerror() -> Vec<u8> {
     let res = unsafe { c_dlerror() };
     if res.is_null() {
@@ -213,6 +224,7 @@ fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<DLLHANDLE, i32> {
 }
 
 /// `rdynload._dlopen_default_mode`.
+#[cfg(unix)]
 pub fn _dlopen_default_mode() -> INT {
     let mut mode = RTLD_NOW;
     mode |= RTLD_LOCAL;
@@ -220,6 +232,7 @@ pub fn _dlopen_default_mode() -> INT {
 }
 
 /// `rdynload.dlopen`.
+#[cfg(unix)]
 pub fn dlopen(name: Option<&[u8]>, mut mode: INT) -> Result<DLLHANDLE, DLOpenError> {
     if mode == -1 {
         mode = _dlopen_default_mode();
@@ -246,11 +259,13 @@ pub fn dlopen(name: Option<&[u8]>, mut mode: INT) -> Result<DLLHANDLE, DLOpenErr
 }
 
 /// `rdynload.dlclose`.
+#[cfg(unix)]
 pub unsafe fn dlclose(handle: DLLHANDLE) -> INT {
     unsafe { c_dlclose(handle) }
 }
 
 /// `rdynload.dlsym`.
+#[cfg(unix)]
 pub fn dlsym(libhandle: DLLHANDLE, name: &[u8]) -> Result<VOIDP, Vec<u8>> {
     let ll_name = rffi::scoped_str2charp::new(Some(name));
     let res = unsafe { c_dlsym(libhandle, ll_name.buf) };
@@ -262,12 +277,108 @@ pub fn dlsym(libhandle: DLLHANDLE, name: &[u8]) -> Result<VOIDP, Vec<u8>> {
 }
 
 /// `rdynload.dlsym_byordinal`. Never called on Unix.
+#[cfg(unix)]
 pub fn dlsym_byordinal(_handle: DLLHANDLE, index: INT) -> Result<VOIDP, INT> {
     Err(index)
 }
 
+/// `rdynload.DLLHANDLE` on Windows (`rwin32.HMODULE`).
+#[cfg(windows)]
+pub type DLLHANDLE = crate::rwin32::HMODULE;
+
+// `rdynload.eci` on Windows: `windows.h`, no `libraries`.
+#[cfg(windows)]
+crate::rffi::external_compilation_info! {
+    const ECI = {
+        includes: ["windows.h"],
+    };
+}
+
+/// `rdynload._dlopen_default_mode` on Windows.
+#[cfg(windows)]
+pub fn _dlopen_default_mode() -> INT {
+    0
+}
+
+/// `rdynload.dlopen` on Windows. `mode` is unused, but a consistent signature.
+#[cfg(windows)]
+pub fn dlopen(name: Option<&[u8]>, mode: INT) -> Result<DLLHANDLE, DLOpenError> {
+    let _ = mode;
+    let Some(name) = name.filter(|name| !name.is_empty()) else {
+        return Err(DLOpenError::Message(b"cannot use None".to_vec()));
+    };
+    let res = {
+        let buf = rffi::scoped_utf82wcharp::new(Some(name), -1);
+        unsafe { crate::rwin32::LoadLibraryW(buf.buf) }
+    };
+    if res.is_null() {
+        let err = crate::rwin32::GetLastError_saved();
+        let (ustr, _lgt) = crate::rwin32::FormatErrorW(err);
+        return Err(DLOpenError::Message(ustr));
+    }
+    Ok(res)
+}
+
+/// `rdynload.dlopenex`. Don't display a message box when Python can't load
+/// a DLL.
+#[cfg(windows)]
+pub fn dlopenex(
+    name: Option<&[u8]>,
+    flags: crate::rwin32::DWORD,
+) -> Result<DLLHANDLE, DLOpenError> {
+    let Some(name) = name.filter(|name| !name.is_empty()) else {
+        return Err(DLOpenError::Message(b"cannot use None".to_vec()));
+    };
+    let old_mode = unsafe { crate::rwin32::SetErrorMode(crate::rwin32::SEM_FAILCRITICALERRORS) };
+    let res = {
+        let buf = rffi::scoped_utf82wcharp::new(Some(name), -1);
+        unsafe { crate::rwin32::LoadLibraryExW(buf.buf, flags) }
+    };
+    unsafe { crate::rwin32::SetErrorMode(old_mode) };
+    if res.is_null() {
+        let err = crate::rwin32::GetLastError_saved();
+        let (ustr, _lgt) = crate::rwin32::FormatErrorW(err);
+        return Err(DLOpenError::Message(ustr));
+    }
+    Ok(res)
+}
+
+/// `rdynload.dlclose` on Windows: `FreeLibrary`, `0` on success and `-1` on
+/// error.
+#[cfg(windows)]
+pub unsafe fn dlclose(handle: DLLHANDLE) -> INT {
+    let res = unsafe { crate::rwin32::FreeLibrary(handle) };
+    if res != 0 { 0 } else { -1 }
+}
+
+/// `rdynload.dlsym` on Windows.
+#[cfg(windows)]
+pub fn dlsym(handle: DLLHANDLE, name: &[u8]) -> Result<VOIDP, Vec<u8>> {
+    let ll_name = rffi::scoped_str2charp::new(Some(name));
+    let res = unsafe { crate::rwin32::GetProcAddress(handle, ll_name.buf) };
+    if res.is_null() {
+        Err(name.to_vec())
+    } else {
+        Ok(res)
+    }
+}
+
+/// `rdynload.dlsym_byordinal` on Windows.
+#[cfg(windows)]
+pub fn dlsym_byordinal(handle: DLLHANDLE, index: INT) -> Result<VOIDP, INT> {
+    // equivalent to MAKEINTRESOURCEA
+    let intresource = core::ptr::without_provenance_mut::<u8>((index as u32 & 0xFFFF) as usize);
+    let res = unsafe { crate::rwin32::GetProcAddress(handle, intresource as CCHARP) };
+    if res.is_null() { Err(index) } else { Ok(res) }
+}
+
+/// `rdynload.GetModuleHandle` (`rwin32.GetModuleHandle`).
+#[cfg(windows)]
+pub use crate::rwin32::GetModuleHandle;
+
 #[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
+    #[cfg(unix)]
     #[test]
     fn dlopen_self_and_dlsym_malloc() {
         let handle = super::dlopen(None, -1).expect("dlopen(None)");
@@ -279,6 +390,7 @@ mod tests {
         assert_eq!(rc, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn default_mode_includes_now() {
         let mode = super::_dlopen_default_mode();
@@ -297,5 +409,32 @@ mod tests {
             b"x: invalid ELF header",
             b"invalid ELF header"
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loadlibrary_kernel32_and_getprocaddress() {
+        assert_eq!(super::_dlopen_default_mode(), 0);
+        let handle = super::dlopen(Some(b"kernel32.dll"), -1).expect("dlopen kernel32");
+        let getpid = super::dlsym(handle, b"GetCurrentProcessId").expect("dlsym");
+        let getpid: unsafe extern "system" fn() -> u32 = unsafe { core::mem::transmute(getpid) };
+        assert_eq!(unsafe { getpid() }, std::process::id());
+        assert!(super::dlsym(handle, b"pyre_rdynload_no_such_symbol").is_err());
+        let module = unsafe { super::GetModuleHandle(c"kernel32.dll".as_ptr().cast_mut().cast()) };
+        assert_eq!(module, handle);
+        assert_eq!(unsafe { super::dlclose(handle) }, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dlopen_reports_none_and_missing_library() {
+        match super::dlopen(None, -1) {
+            Err(super::DLOpenError::Message(msg)) => assert_eq!(msg, b"cannot use None"),
+            other => panic!("dlopen(None) = {other:?}"),
+        }
+        match super::dlopenex(Some(b"pyre_rdynload_no_such_library.dll"), 0) {
+            Err(super::DLOpenError::Message(msg)) => assert!(!msg.is_empty()),
+            other => panic!("dlopenex(missing) = {other:?}"),
+        }
     }
 }

@@ -74,3 +74,37 @@ fn link_name_keeps_call_aroundstate_target() {
     assert_eq!(plain_save_err, majit_rlib::rffi::RFFI_ERR_NONE);
     same_funcptr(plain_funcptr, __rffi_fp_c_plain_strlen);
 }
+
+// `calling_conv = "win"` declares the funcptr `extern "system"`, and the
+// `call_aroundstate_target` marker carries the same ABI.
+#[cfg(windows)]
+llexternal! {
+    c_win_getpid = "GetCurrentProcessId",
+    [],
+    u32,
+    sandboxsafe = true,
+    releasegil = true,
+    calling_conv = "win",
+}
+
+#[cfg(windows)]
+llexternal! {
+    c_win_getpid_nowrapper = "GetCurrentProcessId",
+    [],
+    u32,
+    sandboxsafe = true,
+    _nowrapper = true,
+    calling_conv = "win",
+}
+
+#[cfg(windows)]
+#[test]
+fn win_calling_conv_is_extern_system() {
+    let marker: (unsafe extern "system" fn() -> u32, i64) =
+        _call_aroundstate_target_ccall_c_win_getpid;
+    let funcptr: unsafe extern "system" fn() -> u32 = __rffi_fp_c_win_getpid;
+    assert_eq!(marker.0 as *const (), funcptr as *const ());
+    let nowrapper: unsafe extern "system" fn() -> u32 = c_win_getpid_nowrapper;
+    assert_eq!(unsafe { c_win_getpid() }, std::process::id());
+    assert_eq!(unsafe { nowrapper() }, std::process::id());
+}

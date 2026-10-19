@@ -371,7 +371,7 @@ impl LlexternalInput {
         // (`rffi.py` `_safe_not_sandboxed`). `_nowrapper=True` returns the C
         // funcptr (`rffi.py` `llexternal`); a Rust stub body is Transparent in
         // LLBC and `CallControl.getcalldescr` then disagrees with the host_env
-        // caller. Keep that opaque `extern "C"` shape everywhere too.
+        // caller. Keep that opaque `extern` shape everywhere too.
         if self.sandboxsafe || self.nowrapper {
             return quote! {
                 #deriv
@@ -437,8 +437,9 @@ impl LlexternalInput {
                     .to_compile_error());
             };
             let fp = self.funcptr_path();
+            let abi = self.extern_abi();
             (
-                quote! { #[::majit_macros::call_aroundstate_target(funcptr = #fp, save_err = #lit)] },
+                quote! { #[::majit_macros::call_aroundstate_target(funcptr = #fp, save_err = #lit, abi = #abi)] },
                 quote! { const _: () = assert!(#lit == #save_err); },
             )
         } else {
@@ -556,7 +557,7 @@ impl LlexternalInput {
 
     /// `rsandbox.py` `get_sandbox_stub`: rustc path panics; residual `ccall_`
     /// publishes and returns the zero of `R`. `fnname` is `fnobj._name`.
-    /// `_nowrapper=True` real expansion is `extern "C" { fn name }`; the stub
+    /// `_nowrapper=True` real expansion is `extern <abi> { fn name }`; the stub
     /// uses that ABI so `CallControl.getcalldescr` sees one `FUNC.ARGS`.
     fn expand_stub(&self, register_funcptr: bool) -> TokenStream {
         let vis = &self.vis;
@@ -575,7 +576,8 @@ impl LlexternalInput {
             quote! {}
         };
         let abi = if self.nowrapper && self.macro_path.is_none() {
-            quote! { extern "C" }
+            let abi = self.extern_abi();
+            quote! { extern #abi }
         } else {
             quote! {}
         };
@@ -787,12 +789,26 @@ impl LlexternalInput {
             quote! { #vis fn #rust_name(#(#fixed),*) -> #result; }
         };
         let link_attrs = self.extern_link_attrs();
+        let abi = self.extern_abi();
         quote! {
-            unsafe extern "C" {
+            unsafe extern #abi {
                 #link_attrs
                 #decl
             }
         }
+    }
+
+    /// The ABI string of the funcptr declaration. `calling_conv="win"` is
+    /// `__stdcall` (`ll2ctypes` picks `ctypes.WinDLL`, `genc` emits
+    /// `__stdcall`), which Rust spells `"system"`; every other convention is
+    /// the C one.
+    fn extern_abi(&self) -> LitStr {
+        let abi = if self.calling_conv.as_deref() == Some("win") {
+            "system"
+        } else {
+            "C"
+        };
+        LitStr::new(abi, Span::call_site())
     }
 
     /// An unconditional `#[link_name]` replaces `c_name`. Each `cfg_attr`
@@ -1009,18 +1025,21 @@ pub fn expand_call_aroundstate_target(attr: TokenStream, item: TokenStream) -> T
 struct AroundStateAttr {
     funcptr: syn::Path,
     save_err: LitInt,
+    abi: Option<LitStr>,
 }
 
 impl Parse for AroundStateAttr {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut funcptr = None;
         let mut save_err = None;
+        let mut abi = None;
         while !input.is_empty() {
             let key = Ident::parse_any(input)?;
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "funcptr" => funcptr = Some(input.parse()?),
                 "save_err" => save_err = Some(input.parse()?),
+                "abi" => abi = Some(input.parse()?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -1033,6 +1052,7 @@ impl Parse for AroundStateAttr {
         Ok(AroundStateAttr {
             funcptr: funcptr.ok_or_else(|| input.error("missing funcptr"))?,
             save_err: save_err.ok_or_else(|| input.error("missing save_err"))?,
+            abi,
         })
     }
 }
@@ -1069,13 +1089,16 @@ fn aroundstate_marker(attr: TokenStream, item: TokenStream) -> syn::Result<Token
     };
     let funcptr = &args.funcptr;
     let save_err = &args.save_err;
+    let abi = args
+        .abi
+        .unwrap_or_else(|| LitStr::new("C", Span::call_site()));
     let cfg_attrs = item_cfg_attrs(func);
     Ok(quote! {
         #file
         #(#cfg_attrs)*
         #[doc(hidden)]
         #[allow(non_upper_case_globals, dead_code)]
-        #vis const #marker: (unsafe extern "C" fn(#(#tys),*) -> #ret, i64) =
+        #vis const #marker: (unsafe extern #abi fn(#(#tys),*) -> #ret, i64) =
             (#funcptr, #save_err);
     })
 }

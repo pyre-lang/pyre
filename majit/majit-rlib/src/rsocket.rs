@@ -18,6 +18,18 @@ pub fn last_error() -> CSocketError {
     }
 }
 
+/// `rsocket_startup`.
+#[cfg(windows)]
+pub fn rsocket_startup() {
+    let mut wsadata: crate::_rsocket_rffi::WSAData = unsafe { std::mem::zeroed() };
+    let res = unsafe { crate::_rsocket_rffi::WSAStartup(0x0101, &raw mut wsadata) };
+    assert_eq!(res, 0);
+}
+
+/// `rsocket_startup` off Windows.
+#[cfg(not(windows))]
+pub fn rsocket_startup() {}
+
 #[cfg(unix)]
 type Fd = INT;
 #[cfg(windows)]

@@ -37,6 +37,10 @@ pub const FFI_DEFAULT_ABI: FFI_ABI = libffi_sys::ffi_abi_FFI_DEFAULT_ABI;
 /// `cConfig.FFI_TYPE_STRUCT`.
 pub const FFI_TYPE_STRUCT: u16 = libffi_sys::FFI_TYPE_STRUCT;
 
+/// `clibffi.LoadLibrary` (`rwin32.LoadLibrary`).
+#[cfg(windows)]
+pub use crate::rwin32::LoadLibrary;
+
 /// `cConfig.FFI_STDCALL`.
 #[cfg(all(windows, target_arch = "x86"))]
 pub const FFI_STDCALL: FFI_ABI = libffi_sys::ffi_abi_FFI_STDCALL;

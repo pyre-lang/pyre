@@ -26,9 +26,10 @@ pub mod lltypesystem;
 pub mod nonconst;
 pub mod rarithmetic;
 pub mod rbigint;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod rdynload;
 pub mod rffi;
+#[allow(non_snake_case)]
 pub mod rlocale;
 #[cfg(unix)]
 pub mod rmmap;

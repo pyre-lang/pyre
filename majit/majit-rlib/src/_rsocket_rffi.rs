@@ -10,13 +10,6 @@
 
 #![allow(non_snake_case, non_camel_case_types)]
 
-#[cfg(target_os = "windows")]
-#[link(name = "ws2_32")]
-unsafe extern "system" {
-    #[link_name = "WSAGetLastError"]
-    pub fn _WSAGetLastError() -> i32;
-}
-
 #[cfg(unix)]
 mod posix {
     use crate::rffi::{INT, RFFI_SAVE_ERRNO, UINT, USHORT};
@@ -279,14 +272,15 @@ mod posix {
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO
     );
-    // `htons` / `ntohs` / `htonl` / `ntohl`. Darwin and OpenBSD publish
-    // these as macros; the libc crate exposes the same functions on every
-    // unix target.
+    // `htons` / `ntohs` / `htonl` / `ntohl` (`releasegil=False`). Darwin and
+    // OpenBSD publish these as macros; the libc crate exposes the same
+    // functions on every unix target.
     crate::rffi::llexternal!(
         pub htons = "htons",
         [USHORT],
         USHORT,
         compilation_info = ECI,
+        releasegil = false,
         macro = libc::htons
     );
     crate::rffi::llexternal!(
@@ -294,6 +288,7 @@ mod posix {
         [USHORT],
         USHORT,
         compilation_info = ECI,
+        releasegil = false,
         macro = libc::ntohs
     );
     crate::rffi::llexternal!(
@@ -301,6 +296,7 @@ mod posix {
         [UINT],
         UINT,
         compilation_info = ECI,
+        releasegil = false,
         macro = libc::htonl
     );
     crate::rffi::llexternal!(
@@ -308,6 +304,7 @@ mod posix {
         [UINT],
         UINT,
         compilation_info = ECI,
+        releasegil = false,
         macro = libc::ntohl
     );
     crate::rffi::llexternal!(
@@ -645,6 +642,23 @@ pub use posix::*;
 #[cfg(windows)]
 mod winsock {
     use crate::rffi::{INT, RFFI_SAVE_WSALASTERROR, UINT, USHORT};
+    use crate::rwin32::{DWORD, LPDWORD, WORD};
+    use std::ffi::{c_char, c_long, c_ulong, c_void};
+
+    /// `socketfd_type`: `lltype.Unsigned` under `_MSVC` (`SOCKET`).
+    pub type socketfd_type = usize;
+    /// `socklen_t`. `ws2tcpip.h` typedefs it as `int`.
+    pub type socklen_t = INT;
+
+    /// `INVALID_SOCKET` (`(SOCKET)(~0)`).
+    pub const INVALID_SOCKET: socketfd_type = !0;
+    /// `SOCKET_ERROR`.
+    pub const SOCKET_ERROR: INT = -1;
+
+    /// `_rsocket_rffi.invalid_socket` under `_MSVC`.
+    pub fn invalid_socket(fd: socketfd_type) -> bool {
+        fd == INVALID_SOCKET
+    }
 
     /// WinSock `FD_SETSIZE`. `constants_w_defaults` uses 64 when the header
     /// does not override it, and the SDK default is 64.
@@ -682,13 +696,127 @@ mod winsock {
         pub __ss_pad2: [u8; 112],
     }
 
-    pub type fd_set_p = *mut fd_set;
-
-    /// `_rsocket_rffi.geterrno` on Windows (`rwin32.GetLastError_saved`).
-    /// `select` saves `WSAGetLastError` into that slot.
-    pub fn geterrno() -> i32 {
-        crate::rwin32::GetLastError_saved() as i32
+    /// `struct in6_addr` (`s6_addr`).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct in6_addr {
+        pub s6_addr: [u8; 16],
     }
+
+    /// `struct sockaddr_in`. `sin_addr` is the `S_un` union, read as its
+    /// `S_addr` member.
+    #[repr(C)]
+    pub struct sockaddr_in {
+        pub sin_family: u16,
+        pub sin_port: u16,
+        pub sin_addr: in_addr,
+        pub sin_zero: [c_char; 8],
+    }
+
+    /// `struct sockaddr_in6`. `sin6_scope_id` is the union's `ULONG` member.
+    #[repr(C)]
+    pub struct sockaddr_in6 {
+        pub sin6_family: u16,
+        pub sin6_port: u16,
+        pub sin6_flowinfo: u32,
+        pub sin6_addr: in6_addr,
+        pub sin6_scope_id: u32,
+    }
+
+    /// `struct addrinfo` (`ADDRINFOA`). WinSock orders `ai_canonname` before
+    /// `ai_addr` and counts `ai_addrlen` in a `size_t`.
+    #[repr(C)]
+    pub struct addrinfo {
+        pub ai_flags: INT,
+        pub ai_family: INT,
+        pub ai_socktype: INT,
+        pub ai_protocol: INT,
+        pub ai_addrlen: usize,
+        pub ai_canonname: *mut c_char,
+        pub ai_addr: *mut sockaddr,
+        pub ai_next: *mut addrinfo,
+    }
+
+    /// `struct hostent`. `h_addrtype` and `h_length` are `short`.
+    #[repr(C)]
+    pub struct hostent {
+        pub h_name: *mut c_char,
+        pub h_aliases: *mut *mut c_char,
+        pub h_addrtype: i16,
+        pub h_length: i16,
+        pub h_addr_list: *mut *mut c_char,
+    }
+
+    /// `struct servent`. Win64 orders `s_proto` before `s_port`.
+    #[repr(C)]
+    pub struct servent {
+        pub s_name: *mut c_char,
+        pub s_aliases: *mut *mut c_char,
+        #[cfg(target_pointer_width = "64")]
+        pub s_proto: *mut c_char,
+        pub s_port: i16,
+        #[cfg(not(target_pointer_width = "64"))]
+        pub s_proto: *mut c_char,
+    }
+
+    /// `struct protoent`.
+    #[repr(C)]
+    pub struct protoent {
+        pub p_name: *mut c_char,
+        pub p_aliases: *mut *mut c_char,
+        pub p_proto: i16,
+    }
+
+    /// `WSADESCRIPTION_LEN + 1` / `WSASYS_STATUS_LEN + 1`.
+    const WSADESCRIPTION_LEN_1: usize = 257;
+    const WSASYS_STATUS_LEN_1: usize = 129;
+
+    /// `struct WSAData`. Win64 moves the two counters and `lpVendorInfo`
+    /// ahead of the strings.
+    #[repr(C)]
+    pub struct WSAData {
+        pub wVersion: WORD,
+        pub wHighVersion: WORD,
+        #[cfg(target_pointer_width = "64")]
+        pub iMaxSockets: USHORT,
+        #[cfg(target_pointer_width = "64")]
+        pub iMaxUdpDg: USHORT,
+        #[cfg(target_pointer_width = "64")]
+        pub lpVendorInfo: *mut c_char,
+        pub szDescription: [c_char; WSADESCRIPTION_LEN_1],
+        pub szSystemStatus: [c_char; WSASYS_STATUS_LEN_1],
+        #[cfg(not(target_pointer_width = "64"))]
+        pub iMaxSockets: USHORT,
+        #[cfg(not(target_pointer_width = "64"))]
+        pub iMaxUdpDg: USHORT,
+        #[cfg(not(target_pointer_width = "64"))]
+        pub lpVendorInfo: *mut c_char,
+    }
+
+    // `constant_names` / `constants_w_defaults`, at their `winsock2.h` /
+    // `ws2def.h` / `ws2tcpip.h` values.
+    pub const AF_UNSPEC: INT = 0;
+    pub const SOCK_STREAM: INT = 1;
+    pub const SOCK_DGRAM: INT = 2;
+    pub const SOL_SOCKET: INT = 0xffff;
+    pub const SO_ERROR: INT = 0x1007;
+    pub const SO_TYPE: INT = 0x1008;
+    pub const INADDR_ANY: u32 = 0;
+    pub const INADDR_BROADCAST: u32 = 0xffff_ffff;
+    pub const AI_PASSIVE: INT = 0x01;
+    pub const AI_NUMERICHOST: INT = 0x04;
+    /// `cConfig.NI_MAXHOST`.
+    pub const NI_MAXHOST: INT = 1025;
+    /// `cConfig.FIONBIO` (`_IOW('f', 126, u_long)`).
+    pub const FIONBIO: c_long = 0x8004_667E_u32 as c_long;
+    /// `SIO_TCP_SET_ACK_FREQUENCY` (`_WSAIOW(IOC_VENDOR, 23)`, `mstcpip.h`).
+    pub const SIO_TCP_SET_ACK_FREQUENCY: DWORD = 0x9800_0017;
+    /// `cConfig.WSAEINTR` / `WSAEWOULDBLOCK` / `WSAENOTSOCK`.
+    pub const WSAEINTR: INT = 10004;
+    pub const WSAEWOULDBLOCK: INT = 10035;
+    pub const WSAENOTSOCK: INT = 10038;
+
+    pub type fd_set_p = *mut fd_set;
 
     crate::rffi::external_compilation_info! {
         const ECI = {
@@ -697,9 +825,31 @@ mod winsock {
         };
     }
 
-    unsafe extern "system" {
-        fn __WSAFDIsSet(fd: usize, set: fd_set_p) -> i32;
+    crate::rffi::llexternal!(
+        pub _WSAGetLastError = "WSAGetLastError",
+        [],
+        crate::rwin32::DWORD,
+        compilation_info = ECI,
+        calling_conv = "win",
+        _nowrapper = true,
+        sandboxsafe = true
+    );
+
+    /// `_rsocket_rffi.geterrno` on Windows (`rwin32.GetLastError_saved`).
+    /// `select` saves `WSAGetLastError` into that slot.
+    pub fn geterrno() -> i32 {
+        crate::rwin32::GetLastError_saved() as i32
     }
+
+    // `winsock2.h` spells `FD_ISSET` as this call.
+    crate::rffi::llexternal!(
+        __WSAFDIsSet = "__WSAFDIsSet",
+        [usize, fd_set_p],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        _nowrapper = true
+    );
 
     // `external_c` `FD_ZERO` / `FD_SET` / `FD_ISSET` / `FD_CLR` is `macro=True`.
     // The bodies match
@@ -804,34 +954,286 @@ mod winsock {
         calling_conv = "win",
         save_err = RFFI_SAVE_WSALASTERROR
     );
-    // `htons` / `ntohs` / `htonl` / `ntohl` (`external`, not the Darwin macro).
+    crate::rffi::llexternal!(
+        pub socket = "socket",
+        [INT, INT, INT],
+        socketfd_type,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    // `socketclosename` is `closesocket` on Windows.
+    crate::rffi::llexternal!(
+        pub socketclose = "closesocket",
+        [socketfd_type],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        releasegil = false,
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub socketclose_no_errno = "closesocket",
+        [socketfd_type],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        releasegil = false
+    );
+    crate::rffi::llexternal!(
+        pub socketconnect = "connect",
+        [socketfd_type, *const sockaddr, socklen_t],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub getaddrinfo = "getaddrinfo",
+        [*const c_char, *const c_char, *const addrinfo, *mut *mut addrinfo],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub freeaddrinfo = "freeaddrinfo",
+        [*mut addrinfo],
+        (),
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    // The two buffer lengths are `size_t` upstream; the WinSock prototype
+    // takes `DWORD`.
+    crate::rffi::llexternal!(
+        pub getnameinfo = "getnameinfo",
+        [
+            *const sockaddr,
+            socklen_t,
+            *mut c_char,
+            DWORD,
+            *mut c_char,
+            DWORD,
+            INT
+        ],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub socketaccept = "accept",
+        [socketfd_type, *mut sockaddr, *mut socklen_t],
+        socketfd_type,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub socketbind = "bind",
+        [socketfd_type, *const sockaddr, socklen_t],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub socketlisten = "listen",
+        [socketfd_type, INT],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub socketgetpeername = "getpeername",
+        [socketfd_type, *mut sockaddr, *mut socklen_t],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub socketsetsockopt = "setsockopt",
+        [socketfd_type, INT, INT, *const c_void, socklen_t],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    // `if WIN32: socketrecv = external('recv', [..., rffi.INT, rffi.INT],
+    // rffi.INT)`.  `send` / `sendto` / `recvfrom` take the same `int` length
+    // and answer an `int` in the WinSock prototypes.
+    crate::rffi::llexternal!(
+        pub socketrecv = "recv",
+        [socketfd_type, *mut c_void, INT, INT],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub recvfrom = "recvfrom",
+        [
+            socketfd_type,
+            *mut c_void,
+            INT,
+            INT,
+            *mut sockaddr,
+            *mut socklen_t
+        ],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub send = "send",
+        [socketfd_type, *const c_void, INT, INT],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub sendto = "sendto",
+        [
+            socketfd_type,
+            *const c_void,
+            INT,
+            INT,
+            *const sockaddr,
+            socklen_t
+        ],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub socketshutdown = "shutdown",
+        [socketfd_type, INT],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub gethostname = "gethostname",
+        [*mut c_char, INT],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    // [3.14-spec] `_rsocket_rffi.py` saves nothing for the two lookups, and
+    // `rsocket.gethost_common` raises `HSocketError(host)`;
+    // `socketmodule.c gethost_common` at v3.14.6 raises
+    // `set_herror(state, h_errno)`, and WinSock's `h_errno` is
+    // `WSAGetLastError()`, so `socket.herror` carries that code.  The callers
+    // read it from the saved slot.  Windows only; evidence is the C source at
+    // the tag.
+    crate::rffi::llexternal!(
+        pub gethostbyname = "gethostbyname",
+        [*const c_char],
+        *mut hostent,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub gethostbyaddr = "gethostbyaddr",
+        [*const c_char, INT, INT],
+        *mut hostent,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub getservbyname = "getservbyname",
+        [*const c_char, *const c_char],
+        *mut servent,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub getservbyport = "getservbyport",
+        [INT, *const c_char],
+        *mut servent,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub getprotobyname = "getprotobyname",
+        [*const c_char],
+        *mut protoent,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    crate::rffi::llexternal!(
+        pub ioctlsocket = "ioctlsocket",
+        [socketfd_type, c_long, *mut c_ulong],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub WSAIoctl = "WSAIoctl",
+        [
+            socketfd_type,
+            DWORD,
+            *mut c_void,
+            DWORD,
+            *mut c_void,
+            DWORD,
+            LPDWORD,
+            *mut c_void,
+            *mut c_void
+        ],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win",
+        save_err = RFFI_SAVE_WSALASTERROR
+    );
+    crate::rffi::llexternal!(
+        pub WSAStartup = "WSAStartup",
+        [WORD, *mut WSAData],
+        INT,
+        compilation_info = ECI,
+        calling_conv = "win"
+    );
+    // `htons` / `ntohs` / `htonl` / `ntohl` (`external`, `releasegil=False`,
+    // not the Darwin macro).
     crate::rffi::llexternal!(
         pub htons = "htons",
         [USHORT],
         USHORT,
         compilation_info = ECI,
-        calling_conv = "win"
+        calling_conv = "win",
+        releasegil = false
     );
     crate::rffi::llexternal!(
         pub ntohs = "ntohs",
         [USHORT],
         USHORT,
         compilation_info = ECI,
-        calling_conv = "win"
+        calling_conv = "win",
+        releasegil = false
     );
     crate::rffi::llexternal!(
         pub htonl = "htonl",
         [UINT],
         UINT,
         compilation_info = ECI,
-        calling_conv = "win"
+        calling_conv = "win",
+        releasegil = false
     );
     crate::rffi::llexternal!(
         pub ntohl = "ntohl",
         [UINT],
         UINT,
         compilation_info = ECI,
-        calling_conv = "win"
+        calling_conv = "win",
+        releasegil = false
     );
 
     /// `struct in_addr`. `S_addr` is the first field of `S_un`.
@@ -877,6 +1279,76 @@ mod winsock {
         calling_conv = "win",
         save_err = RFFI_SAVE_WSALASTERROR
     );
+
+    // The `CConfig` structs at their SDK sizes (`platform.configure` measures
+    // them; these are written out by hand).
+    #[cfg(target_pointer_width = "64")]
+    const _: () = {
+        use std::mem::{offset_of, size_of};
+        assert!(size_of::<sockaddr>() == 16);
+        assert!(size_of::<sockaddr_in>() == 16);
+        assert!(size_of::<sockaddr_in6>() == 28);
+        assert!(offset_of!(sockaddr_in6, sin6_scope_id) == 24);
+        assert!(size_of::<sockaddr_storage>() == 128);
+        assert!(size_of::<addrinfo>() == 48);
+        assert!(offset_of!(addrinfo, ai_canonname) == 24);
+        assert!(size_of::<hostent>() == 32);
+        assert!(offset_of!(servent, s_port) == 24);
+        assert!(size_of::<protoent>() == 24);
+        assert!(size_of::<WSAData>() == 408);
+        assert!(offset_of!(WSAData, szDescription) == 16);
+        assert!(size_of::<fd_set>() == 8 + 8 * FD_SETSIZE);
+    };
+
+    #[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn loopback_bind_getsockname_close() {
+            crate::rsocket::rsocket_startup();
+            unsafe {
+                let fd = socket(AF_INET, SOCK_STREAM, 0);
+                assert!(!invalid_socket(fd), "socket error {}", geterrno());
+                let mut addr: sockaddr_in = std::mem::zeroed();
+                addr.sin_family = AF_INET as u16;
+                addr.sin_addr.s_addr = htonl(0x7f00_0001);
+                let len = std::mem::size_of::<sockaddr_in>() as socklen_t;
+                let rc = socketbind(fd, (&raw const addr).cast(), len);
+                assert_eq!(rc, 0, "bind error {}", geterrno());
+                let mut bound: sockaddr_in = std::mem::zeroed();
+                let mut bound_len = len;
+                let rc = socketgetsockname(fd, (&raw mut bound).cast(), &raw mut bound_len);
+                assert_eq!(rc, 0, "getsockname error {}", geterrno());
+                assert_eq!(ntohl(bound.sin_addr.s_addr), 0x7f00_0001);
+                assert_ne!(bound.sin_port, 0);
+                assert_eq!(socketclose(fd), 0);
+                // A handle that is no socket answers WSAENOTSOCK through the
+                // saved slot.  INVALID_SOCKET rather than the closed `fd`: a
+                // parallel test may already have been handed that value.
+                assert_eq!(socketclose(INVALID_SOCKET), SOCKET_ERROR);
+                assert_eq!(geterrno(), WSAENOTSOCK);
+            }
+        }
+
+        #[test]
+        fn getaddrinfo_numeric_host() {
+            crate::rsocket::rsocket_startup();
+            unsafe {
+                let mut hints: addrinfo = std::mem::zeroed();
+                hints.ai_family = AF_INET;
+                hints.ai_flags = AI_NUMERICHOST;
+                let mut res: *mut addrinfo = std::ptr::null_mut();
+                let rc = getaddrinfo(c"127.0.0.1".as_ptr(), std::ptr::null(), &hints, &mut res);
+                assert_eq!(rc, 0);
+                assert!(!res.is_null());
+                assert_eq!((*res).ai_family, AF_INET);
+                let sin = (*res).ai_addr.cast::<sockaddr_in>();
+                assert_eq!(ntohl((*sin).sin_addr.s_addr), 0x7f00_0001);
+                freeaddrinfo(res);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
