@@ -12298,6 +12298,61 @@ impl JitState for PyreJitState {
         })
     }
 
+    /// pyjitpl.py `handle_guard_failure` → `_prepare_resume_from_failure` →
+    /// `interpret()` from the rebuilt resume framestack (`resume.py`
+    /// `rebuild_from_resumedata`, one MIFrame per jitcode header). Generated
+    /// `#[jit_interp]` states already forward this to
+    /// `trace_jitcode_at_resume_framestack`; the portal frontend was still
+    /// on the trait default (`None`).
+    fn trace_from_guard_resume_position<R: majit_metainterp::JitCodeRuntime>(
+        ctx: &mut TraceCtx,
+        _sym: &mut Self::Sym,
+        frames: &[majit_metainterp::GuardResumeFrame],
+        outer_program_pc: usize,
+        runtime: &R,
+    ) -> Option<TraceAction> {
+        struct PortalResumeSym {
+            header_pc: usize,
+            redboxes: Vec<(OpRef, Type)>,
+        }
+        impl majit_metainterp::JitCodeSym for PortalResumeSym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                self.header_pc
+            }
+            fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+                // pyjitpl.py `opimpl_jit_merge_point` → `reached_loop_header(greenboxes, redboxes)`.
+                self.redboxes = redboxes.to_vec();
+            }
+            fn loop_carried_boxes(
+                &self,
+                vable_boxes: &[(OpRef, Type)],
+            ) -> Option<Vec<(OpRef, Type)>> {
+                // pyjitpl.py `reached_loop_header`:
+                //   live_arg_boxes = greenboxes + redboxes
+                //   live_arg_boxes += self.virtualizable_boxes
+                //   live_arg_boxes.pop()
+                let mut boxes = self.redboxes.clone();
+                let n = vable_boxes.len().saturating_sub(1);
+                boxes.extend_from_slice(&vable_boxes[..n]);
+                if boxes.is_empty() { None } else { Some(boxes) }
+            }
+        }
+        let mut portal_sym = PortalResumeSym {
+            header_pc: outer_program_pc,
+            redboxes: Vec::new(),
+        };
+        Some(majit_metainterp::trace_jitcode_at_resume_framestack(
+            ctx,
+            &mut portal_sym,
+            frames,
+            outer_program_pc,
+            runtime,
+        ))
+    }
+
     /// pyjitpl.py get_procedure_token: compute green key for a PC.
     fn green_key_for_pc(&self, pc: usize) -> Option<u64> {
         let frame_ptr = self.frame as *const pyre_interpreter::pyframe::PyFrame;
@@ -15864,6 +15919,57 @@ mod tests {
 
         // A null frame cannot answer either.
         assert_eq!(merge_point_stack_depth_to_recover(0, deep_pc), None);
+    }
+
+    /// The portal `JitState` override must hand the rebuilt framestack to
+    /// `trace_jitcode_at_resume_framestack` (`pyjitpl.py handle_guard_failure`
+    /// → `interpret()`). The trait default returns `None` without walking.
+    #[test]
+    fn portal_guard_resume_hands_framestack_to_trace_walk() {
+        use majit_metainterp::{GuardResumeFrame, JitCodeBuilder, JitCodeRuntime};
+
+        struct LabelOnlyRuntime;
+        impl JitCodeRuntime for LabelOnlyRuntime {
+            fn label_at(&self, pc: usize) -> usize {
+                pc
+            }
+        }
+
+        let mut builder = JitCodeBuilder::new();
+        builder.void_return();
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let frames = [GuardResumeFrame {
+            jitcode,
+            pc: 0,
+            regs: Vec::new(),
+            result_slot: None,
+            sub_idx: None,
+        }];
+        let mut ctx = crate::trace_ctx_for_test(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        let action = PyreJitState::trace_from_guard_resume_position(
+            &mut ctx,
+            &mut sym,
+            &frames,
+            0,
+            &LabelOnlyRuntime,
+        );
+        assert!(
+            action.is_some(),
+            "portal frontend must not sit on the JitState default (None)"
+        );
+        match action {
+            Some(TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+                ..
+            }) => {
+                assert!(finish_args.is_empty());
+                assert!(finish_arg_types.is_empty());
+            }
+            other => panic!("void_return resume walk expected Finish, got {other:?}"),
+        }
     }
 }
 
