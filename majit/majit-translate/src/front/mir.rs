@@ -5521,6 +5521,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         if !lo.result_exc_call_results.is_empty()
             || !lo.option_ok_or_else_try_sites.is_empty()
+            || !lo.result_unwrap_or_sites.is_empty()
             || !lo.result_map_err_sites.is_empty()
             || result_exc_callee
             || !lo.next_call_results.is_empty()
@@ -5584,6 +5585,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             );
         }
+        // Carrier `unwrap_or` fuses onto the call's `LastException` join
+        // (`try/except OperationError`) before [`catch_and_rewrap`] can
+        // rebuild a Result shell around the same call.
+        let result_unwrap_or_rewritten = if lo.result_unwrap_or_sites.is_empty() {
+            0
+        } else {
+            crate::front::result_exc::rewire_result_unwrap_or_sites(
+                &mut lo.graph,
+                &lo.result_unwrap_or_sites,
+            )
+        };
         if !lo.result_exc_call_results.is_empty() {
             let carrier = static_addrs.error_carrier;
             let foreign_sites =
@@ -5793,6 +5805,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.layout_accessor_sites,
             );
         }
+        // Plain-error `Result::ok` (`front::result_ok`) — Opaque core
+        // `match self { Ok(x) => Some(x), Err(_) => None }` — splits the
+        // residual `ok` call into a `__discriminant` diamond, the same
+        // value-select `unwrap_or` synthesizes.  Runs before `option_try` so
+        // `i32::try_from(value).ok()?` (`longlong2float.py` `can_encode_int32`)
+        // joins a real Option into the `?` continuation, the multi-pred
+        // Some/None join `option_try` already accepts from `checked_*`.
+        let result_ok_rewritten = if lo.result_ok_sites.is_empty() {
+            0
+        } else {
+            crate::front::result_ok::rewire_result_ok_call_sites(&mut lo.graph, &lo.result_ok_sites)
+        };
         // The `Option` `?` rewrite (`front::option_try`) consumes the same
         // `Try::branch` / `ControlFlow` diamond as `result_exc`, but its break
         // arm returns a freshly-built `None` to this graph's returnblock.  It
@@ -6069,6 +6093,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || option_ok_or_else_try_rewritten > 0
+            || result_unwrap_or_rewritten > 0
             || result_map_err_rewritten > 0
             || next_rewritten > 0
             || checked_arith_rewritten.total > 0
@@ -6076,6 +6101,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || from_size_align_call_rewritten > 0
             || from_size_align_rewritten > 0
             || from_size_align_expect_rewritten > 0
+            || result_ok_rewritten > 0
             || option_try_stats.rewritten > 0
             || result_try_stats.rewritten > 0
             || !lo.result_try_sites.is_empty()
@@ -9089,6 +9115,11 @@ struct Lowering<'a> {
     /// not itself a translated scoped callee, so its `Result` shell must be
     /// removed together with the Option select.
     option_ok_or_else_try_sites: Vec<crate::front::result_exc::OptionOkOrElseTrySite>,
+    /// Carrier `Result<T, PyError>::unwrap_or(r, default)` sites fused by
+    /// [`crate::front::result_exc::rewire_result_unwrap_or_sites`] into the
+    /// call's `LastException` join (`except OperationError`) before the
+    /// caller rule can catch-and-rewrap the call.
+    result_unwrap_or_sites: Vec<crate::front::result_exc::ResultUnwrapOrSite>,
     /// `Result::map_err(result, closure)` sites lowered to an explicit
     /// Ok/Err closure-select before the exception-link pass consumes the
     /// newly built result shells.
@@ -9199,6 +9230,14 @@ struct Lowering<'a> {
     /// resolved `Option` owners the arms' field reads need (see
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`]).
     unwrap_or_sites: Vec<crate::front::option_unwrap_or::UnwrapOrSite>,
+    /// Plain-error `Result::ok(res)` call sites recorded for the
+    /// discriminant value-select the `front::result_ok` post-pass synthesizes
+    /// (`Ok(x) => Some(x), Err(_) => None`).  Same lifetime as
+    /// `unwrap_or_sites`.  The Layout-only `from_size_align` `.ok()` capture
+    /// keeps priority.  Includes `listobject::int_or_float_encode_int`
+    /// (`i32::try_from(value).ok()?`), the Rust spelling of
+    /// `longlong2float.py` `can_encode_int32`.
+    result_ok_sites: Vec<crate::front::result_ok::ResultOkSite>,
     /// `Option::unwrap(opt)` call sites recorded for the discriminant guard the
     /// `front::option_unwrap` post-pass synthesizes (see
     /// [`crate::front::option_unwrap::UnwrapSite`]).
@@ -10007,6 +10046,7 @@ impl<'a> Lowering<'a> {
             numeric_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
+            result_unwrap_or_sites: Vec::new(),
             result_map_err_sites: Vec::new(),
             result_as_ref_sites: Vec::new(),
             result_expect_sites: Vec::new(),
@@ -10033,6 +10073,7 @@ impl<'a> Lowering<'a> {
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
+            result_ok_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             expect_sites: Vec::new(),
             map_or_sites: Vec::new(),
@@ -31276,9 +31317,17 @@ impl<'a> Lowering<'a> {
             && args.len() == 1
             && crate::front::slice_get::is_result_ok_call_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
-            && let Some(site) = self.recognize_from_size_align_ok_site(&call.dest.ty, &result_var)
         {
-            self.from_size_align_sites.push(site);
+            if let Some(site) = self.recognize_from_size_align_ok_site(&call.dest.ty, &result_var) {
+                self.from_size_align_sites.push(site);
+            } else if let Some(site) =
+                self.recognize_result_ok_site(first_arg_ty.as_ref(), &call.dest.ty, &result_var)
+            {
+                // Layout `.ok()` kept priority above.  Remaining plain-error
+                // `Result::ok` (including `int_or_float_encode_int`,
+                // `longlong2float.py` `can_encode_int32`) records here.
+                self.result_ok_sites.push(site);
+            }
         }
         // Capture `Result::expect(res, msg)` results whose payload is `Layout`
         // (the by-value `Layout`) for the `from_size_align` bound-check rewiring
@@ -31495,8 +31544,12 @@ impl<'a> Lowering<'a> {
         // the enum field owners needs the receiver's type (`first_arg_ty`), in
         // hand here; `recognize_unwrap_or_site` classifies `Option` vs `Result`
         // (their `Some`=1 / `Ok`=0 payload tags differ) and records the
-        // polarity.  A resolution miss leaves the residual call — an
-        // unregistered callee the rtyper census Skips, so no graph regresses.
+        // polarity.  The exception-carrier Result is recorded as a
+        // `ResultUnwrapOrSite` instead — `front::result_exc` fuses that
+        // combinator onto `LastException` (`except OperationError`) rather
+        // than a value-select.  A resolution miss leaves the residual call —
+        // an unregistered callee the rtyper census Skips, so no graph
+        // regresses.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -31504,9 +31557,16 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && name == "unwrap_or"
-            && let Some(site) = self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
         {
-            self.unwrap_or_sites.push(site);
+            if let Some(site) =
+                self.recognize_result_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
+            {
+                self.result_unwrap_or_sites.push(site);
+            } else if let Some(site) =
+                self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
+            {
+                self.unwrap_or_sites.push(site);
+            }
         }
         // Capture `Option::unwrap(opt)` / plain-error `Result::unwrap(res)`
         // sites for the discriminant guard `front::option_unwrap` synthesizes.
@@ -38148,6 +38208,36 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Resolve a recognized carrier `Result<T, PyError>::unwrap_or(r, default)`
+    /// call into a [`crate::front::result_exc::ResultUnwrapOrSite`].  `None`
+    /// when the receiver is not the exception-carrier Result — those sites
+    /// go to [`Self::recognize_unwrap_or_site`] for the value-select.
+    fn recognize_result_unwrap_or_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::result_exc::ResultUnwrapOrSite> {
+        let recv_ty = recv_ty?;
+        let peeled = self.peel_to_option_or_result(recv_ty);
+        let recv_ty = peeled.as_ref().unwrap_or(recv_ty);
+        if !crate::front::result_exc::tyref_is_result_of_carrier(
+            recv_ty,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        ) {
+            return None;
+        }
+        let payload_ty = if crate::front::result_exc::tyref_result_ok_is_unit(recv_ty, self.llbc) {
+            ValueType::Void
+        } else {
+            self.tyref_option_payload_value_type(recv_ty)?
+        };
+        Some(crate::front::result_exc::ResultUnwrapOrSite {
+            result_var: result_var.clone(),
+            payload_ty,
+        })
+    }
+
     /// Resolve a recognized `Option::unwrap_or(opt, default)` /
     /// `Result::unwrap_or(res, default)` call into an
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the enum root +
@@ -38165,11 +38255,11 @@ impl<'a> Lowering<'a> {
         // The payload variant discriminant (`Some`=1 / `Ok`=0) both classifies
         // the receiver enum and picks the value-select polarity.  `Result<_,
         // PyError>` is excluded — that instantiation is the exception-transform's
-        // domain (`front::result_exc` rewrites its `Ok`/`Err` into exception
-        // edges, not a switchable discriminant value), so its `unwrap_or` is
-        // left residual (Skip) rather than risk a value-select on an
-        // exception-form value.  Only `Option` and plain-error `Result` (e.g.
-        // `io::Result`) select here.
+        // domain (`front::result_exc` `rewire_result_unwrap_or_sites` fuses
+        // its `unwrap_or` onto `LastException` edges, not a switchable
+        // discriminant value).  The capture site records a `ResultUnwrapOrSite`
+        // for that receiver instead.  Only `Option` and plain-error `Result`
+        // (e.g. `io::Result`) select here.
         let is_option = crate::front::result_exc::tyref_is_option(recv_ty, self.llbc);
         let (payload_disc, payload_on_disc_true) = if is_option {
             (1, true)
@@ -38221,6 +38311,58 @@ impl<'a> Lowering<'a> {
             int_null: self.option_niche_int_null(recv_ty),
             niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
+        })
+    }
+
+    /// Resolve a recognized plain-error `Result::ok(res)` call into a
+    /// [`crate::front::result_ok::ResultOkSite`] — the Result enum root + `Ok`
+    /// variant owners for the `__discriminant` / `__pos_0` reads, the payload
+    /// type, and the destination `Option<T>` owners the `Some`/`None`
+    /// aggregates need.  `None` (leaving the residual call) when the receiver
+    /// is not a resolvable Result, or is the exception-carrier Result
+    /// (`tyref_is_result_of_carrier`) owned by `front::result_exc`.  Only
+    /// plain-error Result records, matching [`Self::recognize_unwrap_or_site`].
+    /// `listobject::int_or_float_encode_int` is `i32::try_from(value).ok()?`,
+    /// the Rust spelling of `longlong2float.py` `can_encode_int32`.
+    fn recognize_result_ok_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::result_ok::ResultOkSite> {
+        let recv_ty = recv_ty?;
+        let peeled = self.peel_to_option_or_result(recv_ty);
+        let recv_ty = peeled.as_ref().unwrap_or(recv_ty);
+        let is_result = crate::front::result_exc::tyref_is_result(recv_ty, self.llbc);
+        let is_carrier = is_result
+            && crate::front::result_exc::tyref_is_result_of_carrier(
+                recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            );
+        if !crate::front::result_ok::admits_result_ok_receiver(is_result, is_carrier) {
+            return None;
+        }
+        if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
+            return None;
+        }
+        let (enum_owner, payload_owner, _err_owner, payload_ty, _, _) =
+            self.resolve_result_owners(recv_ty)?;
+        let (option_owner, some_owner, _dest_payload_ty) =
+            self.resolve_option_consumer_owners(dest_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let scalar_niche = !niche && tyref_option_nonzero_scalar(dest_ty, self.llbc);
+        Some(crate::front::result_ok::ResultOkSite {
+            result_var: result_var.clone(),
+            enum_owner,
+            payload_owner,
+            payload_ty,
+            option_owner,
+            some_owner,
+            niche,
+            int_null: self.option_niche_int_null(dest_ty),
+            scalar_niche,
+            niche_null_cast: self.option_niche_null_cast(dest_ty),
         })
     }
 
