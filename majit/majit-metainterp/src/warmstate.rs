@@ -225,7 +225,7 @@ impl BaseJitCell {
     /// used only to pick `equal_whatever`'s TYPE. There is no types
     /// comparison: every caller has already checked `cell.jitdriver_sd`
     /// (`isinstance(cell, JitCell)`).
-    #[inline]
+    #[inline(always)]
     pub fn comparekey(&self, greenargs: &[i64], types: &[GreenType]) -> bool {
         debug_assert_eq!(types.len(), greenargs.len());
         let Some(greens) = self.greens.as_deref() else {
@@ -2957,7 +2957,8 @@ impl WarmEnterState {
 
     /// `maybe_compile_and_run` flag-first then `cell.get_procedure_token()`.
     /// `EnterJitAssembler` holds that owned token for the run.
-    fn cell_entry_procedure_token(cell: &BaseJitCell) -> Option<Arc<JitCellToken>> {
+    #[inline(always)]
+    pub(crate) fn cell_entry_procedure_token(cell: &BaseJitCell) -> Option<Arc<JitCellToken>> {
         if cell.flags.get().contains(JcFlags::JC_TRACING)
             || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
         {

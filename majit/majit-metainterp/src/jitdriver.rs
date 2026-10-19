@@ -919,7 +919,7 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
-use crate::warmstate::{FunctionEntryStep, HotResult, JcFlags};
+use crate::warmstate::{BaseJitCell, FunctionEntryStep, HotResult, JcFlags, WarmEnterState};
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
@@ -10105,6 +10105,8 @@ impl<S: JitState> JitDriver<S> {
         let mut direct_word = None;
         let entry = self.enter_compiled_function_entry(
             green_key_hash,
+            green_values,
+            green_types,
             target_pc,
             state,
             env,
@@ -10158,10 +10160,25 @@ impl<S: JitState> JitDriver<S> {
     /// then `isinstance(cell, JitCell)` (`cell.jitdriver_sd` of this
     /// driver). Tracing / temporary flags decline. A confirm hook stays
     /// on the occupied door.
+    ///
+    /// ```python
+    /// cell = jitcounter.lookup_chain(hash)
+    /// while cell is not None:
+    ///     if isinstance(cell, JitCell) and cell.comparekey(*greenargs):
+    ///         break    # found
+    ///     cell = cell.next
+    /// else:
+    ///     ... # not found: tick / return
+    /// if cell.flags & (JC_TRACING | JC_TEMPORARY):
+    ///     return
+    /// procedure_token = cell.get_procedure_token()
+    /// ```
     #[inline(always)]
     fn compiled_function_token(
         &self,
         hash: u64,
+        green_values: &[i64],
+        green_types: &[GreenType],
     ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
         let entry = &self.portal_entry;
         if entry.confirm_enter_jit_ptr.get().is_some() {
@@ -10173,28 +10190,51 @@ impl<S: JitState> JitDriver<S> {
         let (cell_key, token) = {
             // `maybe_compile_and_run` reads `warmrunnerdesc.jitcounter`
             // (`MetaInterp.jitcounter`), not `jitdrivers_sd[jd_no].warmstate`.
-            let cell = self.meta.jitcounter.lookup_chain(hash)?;
-            let cell = std::cell::Ref::map(cell, std::rc::Rc::as_ref);
+            let head = self.meta.jitcounter.lookup_chain(hash)?;
+            let cell = std::cell::Ref::map(head, std::rc::Rc::as_ref);
             // `isinstance(cell, JitCell)` — one subclass per driver.
-            if cell.jitdriver_sd != entry.jd_index {
-                return None;
+            if cell.jitdriver_sd == entry.jd_index && cell.comparekey(green_values, green_types) {
+                Self::found_cell_entry(&cell)?
+            } else {
+                let next = cell.next.borrow().clone()?;
+                drop(cell);
+                let cell = self.compiled_function_token_chain(next, green_values, green_types)?;
+                Self::found_cell_entry(&cell)?
             }
-            if cell.next.borrow().is_some() || cell.cell_bucket.get() != hash {
-                return None;
-            }
-            if cell.flags.get().contains(JcFlags::JC_TRACING)
-                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
-            {
-                return None;
-            }
-            let cell_key = cell.cell_key.get()?;
-            let token = cell.get_procedure_token()?;
-            (cell_key, token)
         };
         if !token.has_compiled_code() {
             return None;
         }
         Some((cell_key, token))
+    }
+
+    #[inline(always)]
+    fn found_cell_entry(
+        cell: &BaseJitCell,
+    ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
+        let token = WarmEnterState::cell_entry_procedure_token(cell)?;
+        Some((cell.cell_key.get()?, token))
+    }
+
+    /// `maybe_compile_and_run`'s `cell = cell.next` walk after the head missed
+    /// `isinstance` / `comparekey(*greenargs)`.
+    #[cold]
+    #[inline(never)]
+    fn compiled_function_token_chain(
+        &self,
+        next: std::rc::Rc<BaseJitCell>,
+        green_values: &[i64],
+        green_types: &[GreenType],
+    ) -> Option<std::rc::Rc<BaseJitCell>> {
+        let jd_index = self.portal_entry.jd_index;
+        let mut cell = Some(next);
+        while let Some(c) = cell {
+            if c.jitdriver_sd == jd_index && c.comparekey(green_values, green_types) {
+                return Some(c);
+            }
+            cell = c.next.borrow().clone();
+        }
+        None
     }
 
     /// `warmstate.py maybe_compile_and_run` then `execute_assembler` for a
@@ -10211,12 +10251,16 @@ impl<S: JitState> JitDriver<S> {
     fn enter_compiled_function_entry(
         &mut self,
         green_key_hash: u64,
+        green_values: &[i64],
+        green_types: &[GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         direct_word: &mut Option<i64>,
     ) -> SteadyCompiledEntry {
-        let Some((cell_key, token)) = self.compiled_function_token(green_key_hash) else {
+        let Some((cell_key, token)) =
+            self.compiled_function_token(green_key_hash, green_values, green_types)
+        else {
             return SteadyCompiledEntry::Miss;
         };
         if !state.can_trace() {
@@ -10553,7 +10597,9 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> Option<Option<usize>> {
-        if let Some((cell_key, token)) = self.compiled_function_token(green_key_hash) {
+        if let Some((cell_key, token)) =
+            self.compiled_function_token(green_key_hash, green_values, green_types)
+        {
             return Some(
                 self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
                     .and_then(|resume| self.resume_pc_recycling(resume)),
@@ -12888,7 +12934,8 @@ mod tests {
         assert_eq!(driver.index(), Some(1));
         driver.meta.finish_setup_descrs_for_jitdrivers();
 
-        let key = 0x7e14_u64;
+        let key = GreenKey::new(vec![0x7e14]);
+        let hash = key.get_uhash();
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(74));
         token.set_compiled(Box::new(()));
         driver
@@ -12899,12 +12946,12 @@ mod tests {
         driver
             .meta
             .warm_state_for_driver(idx1)
-            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+            .attach_procedure_to_interp_for_key(&key, std::sync::Arc::clone(&token));
 
-        let found = driver.compiled_function_token(key);
+        let found = driver.compiled_function_token(hash, &key.values, &key.types);
         assert!(
             found.is_some_and(
-                |(cell_key, got)| cell_key == key && std::sync::Arc::ptr_eq(&got, &token)
+                |(cell_key, got)| cell_key == hash && std::sync::Arc::ptr_eq(&got, &token)
             ),
             "function-entry compiled lookup on jd1 reads that driver's cell"
         );
@@ -12912,20 +12959,28 @@ mod tests {
             driver
                 .meta
                 .warm_state_for_driver(0)
-                .get_compiled(key)
+                .get_compiled(hash)
                 .is_none(),
             "portal slot 0 does not hold jd1's compiled cell"
         );
 
         // `isinstance(cell, JitCell)`: a lone cell filed by jd0 is the
         // table-slot head `lookup_chain` returns, and is not this driver's.
-        // `0x7e14` indexes slot 0 (`(hash as u32) >> shift`); a second
-        // cell in that slot would become `cell.next` and the miss would be
-        // the chain check, not `jitdriver_sd`. Slot 1 keeps the head lone.
-        let foreign = 1u64 << 21;
+        // A second cell in that slot would become `cell.next` and the miss
+        // would be the chain check, not `jitdriver_sd`. A different slot
+        // keeps the head lone.
+        let mut foreign_val = 1i64 << 21;
+        let mut foreign = GreenKey::new(vec![foreign_val]);
+        while driver.meta.jitcounter._get_index(hash)
+            == driver.meta.jitcounter._get_index(foreign.get_uhash())
+        {
+            foreign_val += 1;
+            foreign = GreenKey::new(vec![foreign_val]);
+        }
+        let foreign_hash = foreign.get_uhash();
         assert_ne!(
-            driver.meta.jitcounter._get_index(key),
-            driver.meta.jitcounter._get_index(foreign),
+            driver.meta.jitcounter._get_index(hash),
+            driver.meta.jitcounter._get_index(foreign_hash),
             "jd0's cell must be the lone head of a different slot"
         );
         let foreign_token = std::sync::Arc::new(majit_backend::JitCellToken::new(75));
@@ -12938,12 +12993,12 @@ mod tests {
         driver
             .meta
             .warm_state_for_driver(idx0)
-            .attach_procedure_to_interp(foreign, std::sync::Arc::clone(&foreign_token));
+            .attach_procedure_to_interp_for_key(&foreign, std::sync::Arc::clone(&foreign_token));
         {
             let cell = driver
                 .meta
                 .jitcounter
-                .lookup_chain(foreign)
+                .lookup_chain(foreign_hash)
                 .expect("jd0 filed the slot head");
             assert_eq!(cell.jitdriver_sd, idx0);
             assert!(
@@ -12957,11 +13012,15 @@ mod tests {
             );
         }
         assert!(
-            driver.compiled_function_token(key).is_some(),
+            driver
+                .compiled_function_token(hash, &key.values, &key.types)
+                .is_some(),
             "jd1's own slot still answers after jd0 files a different slot"
         );
         assert!(
-            driver.compiled_function_token(foreign).is_none(),
+            driver
+                .compiled_function_token(foreign_hash, &foreign.values, &foreign.types)
+                .is_none(),
             "function-entry compiled lookup on jd1 skips jd0's cell at that slot"
         );
     }
@@ -12984,7 +13043,8 @@ mod tests {
             false
         }
 
-        let key = 0xC0F1_u64;
+        let key = GreenKey::new(vec![0xC0F1]);
+        let hash = key.get_uhash();
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(76));
         token.set_compiled(Box::new(()));
         driver
@@ -12995,10 +13055,12 @@ mod tests {
         driver
             .meta
             .warm_state_for_driver(idx)
-            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+            .attach_procedure_to_interp_for_key(&key, std::sync::Arc::clone(&token));
 
         assert!(
-            driver.compiled_function_token(key).is_some(),
+            driver
+                .compiled_function_token(hash, &key.values, &key.types)
+                .is_some(),
             "the procedure is attached before the confirm hook"
         );
 
@@ -13008,7 +13070,9 @@ mod tests {
             .set_confirm_enter_jit(Some(refuse));
 
         assert!(
-            driver.compiled_function_token(key).is_none(),
+            driver
+                .compiled_function_token(hash, &key.values, &key.types)
+                .is_none(),
             "a confirm hook installed after register_descriptor stays on the occupied door"
         );
 
@@ -13017,8 +13081,87 @@ mod tests {
             .warm_state_for_driver(idx)
             .set_confirm_enter_jit(None);
         assert!(
-            driver.compiled_function_token(key).is_some(),
+            driver
+                .compiled_function_token(hash, &key.values, &key.types)
+                .is_some(),
             "clearing the hook restores the compiled token"
+        );
+    }
+
+    #[test]
+    fn compiled_function_token_walks_a_comparekey_chain() {
+        // warmstate.py maybe_compile_and_run: walk lookup_chain until
+        // isinstance + comparekey(*greenargs). Closed-form get_uhash
+        // collision: Int greens [1, 0] and [2, 13080698639].
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut jd = JitDriverStaticData::new(vec![], vec![]);
+        jd.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx = driver.register_descriptor(jd);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key_a = GreenKey::new(vec![1, 0]);
+        let key_b = GreenKey::new(vec![2, 13080698639]);
+        let hash = key_a.get_uhash();
+        assert_eq!(hash, key_b.get_uhash(), "fixture is a full-hash collision");
+        assert_eq!(
+            driver.meta.jitcounter._get_index(hash),
+            driver.meta.jitcounter._get_index(key_b.get_uhash()),
+            "the two keys share one lookup_chain slot"
+        );
+
+        let token_a = std::sync::Arc::new(majit_backend::JitCellToken::new(201));
+        token_a.set_compiled(Box::new(()));
+        let token_b = std::sync::Arc::new(majit_backend::JitCellToken::new(202));
+        token_b.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .memory_manager
+            .keep_loop_alive(&token_a);
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .memory_manager
+            .keep_loop_alive(&token_b);
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .attach_procedure_to_interp_for_key(&key_a, std::sync::Arc::clone(&token_a));
+        driver
+            .meta
+            .warm_state_for_driver(idx)
+            .attach_procedure_to_interp_for_key(&key_b, std::sync::Arc::clone(&token_b));
+        {
+            let cell = driver
+                .meta
+                .jitcounter
+                .lookup_chain(hash)
+                .expect("slot occupied");
+            assert!(
+                cell.next.borrow().is_some(),
+                "the two keys share one lookup_chain slot"
+            );
+        }
+
+        let found_a = driver.compiled_function_token(hash, &key_a.values, &key_a.types);
+        assert!(
+            found_a.is_some_and(|(_, got)| std::sync::Arc::ptr_eq(&got, &token_a)),
+            "comparekey selects key_a's token"
+        );
+        let found_b = driver.compiled_function_token(hash, &key_b.values, &key_b.types);
+        assert!(
+            found_b.is_some_and(|(_, got)| std::sync::Arc::ptr_eq(&got, &token_b)),
+            "comparekey walk selects key_b's token on the same slot"
+        );
+        let key_c = GreenKey::new(vec![3, 4]);
+        assert!(
+            driver
+                .compiled_function_token(hash, &key_c.values, &key_c.types)
+                .is_none(),
+            "a third key's greens match neither cell on the chain"
         );
     }
 
