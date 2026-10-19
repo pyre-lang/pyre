@@ -24448,6 +24448,12 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Function-item identity of arg #2, captured before `call.args` is
+        // consumed.  `Option::map_or(opt, default, named_fn)` passes a `FnDef`
+        // constant (or a Copy/Move of a `FnDef`-typed local); that shape has
+        // no closure ADT, so `third_arg_ty` alone cannot name the callee.
+        let third_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(2));
+        let third_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.get(2));
         // A literal scalar index (`slice.get(1)`) has no Place type to retain
         // in `second_arg_ty`.  Charon still records the method's `I` type in
         // the regular-call generics, so classify the `get` before consuming
@@ -31512,17 +31518,19 @@ impl<'a> Lowering<'a> {
         {
             self.expect_sites.push(site);
         }
-        // Capture `Option::map_or(opt, default, closure)` sites for the
+        // Capture `Option::map_or(opt, default, callable)` sites for the
         // discriminant closure-select `front::option_map_or` synthesizes.
         // Like `unwrap_or`, `map_or`'s body is Opaque (foreign `core`) and its
         // receiver is the `Option` ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver `args[0]`, default `args[1]`, closure
-        // env `args[2]`).  Resolving the `Option` field owners + closure
-        // `call_once` owner needs the receiver's `Option` type (`first_arg_ty`)
-        // and the env type (`third_arg_ty`), both in hand here;
-        // `recognize_map_or_site` also confirms the receiver is an `Option`.  A
-        // resolution miss leaves the residual call — an unregistered callee the
-        // rtyper census Skips, so no graph regresses.
+        // `CallTarget::Method` (receiver `args[0]`, default `args[1]`, callable
+        // `args[2]`).  The callable is a closure ADT (`third_arg_ty` →
+        // `call_once`) or a function item (`third_arg_fn_item` → a direct
+        // `Call(FunctionPath)`).  Resolving the `Option` field owners plus
+        // the callable needs the receiver type, the env type or `FnDef`
+        // path, and the result type (`call.dest.ty`), all in hand here;
+        // `recognize_map_or_site` also confirms the receiver is an `Option`.
+        // A resolution miss leaves the residual call — an unregistered callee
+        // the rtyper census Skips, so no graph regresses.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -31530,13 +31538,39 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 3
             && name == "map_or"
-            && let Some(site) = self.recognize_map_or_site(
+            && let Some(mut site) = self.recognize_map_or_site(
                 first_arg_ty.as_ref(),
                 third_arg_ty.as_ref(),
+                third_arg_fn_item.clone(),
+                third_arg_fn_decl,
                 &call.dest.ty,
                 &result_var,
             )
         {
+            // Reflexive `From` / same-width integer `From` is identity on the
+            // payload (`is_reflexive_from` / `is_widening_int_from`).  Applied
+            // here with a RegularCall of the FunDecl the FnDef names — the
+            // same predicates the ordinary call-lowering arm uses — so
+            // `recognize_map_or_site` itself does not special-case `From`.
+            if site.fn_item_segments.is_some()
+                && let Some(fd) = third_arg_fn_decl
+            {
+                let reg = RegularCall {
+                    kind: CallKind::Fun(FunId::Regular { id: fd.def_id }),
+                    generics: serde_json::json!({
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }),
+                };
+                if self.is_reflexive_from(&reg) || self.is_widening_int_from(&reg) {
+                    site.fn_item_ctor = Some(AggregateShape::Operand {
+                        index: 0,
+                        transparent: true,
+                    });
+                }
+            }
             self.map_or_sites.push(site);
         }
         // Capture `Option::is_none(opt)` / `Option::is_some(opt)` sites for the
@@ -39310,18 +39344,21 @@ impl<'a> Lowering<'a> {
         Some(site)
     }
 
-    /// Resolve a recognized `Option::map_or(opt, default, closure)` call into a
+    /// Resolve a recognized `Option::map_or(opt, default, callable)` call into a
     /// [`crate::front::option_map_or::MapOrSite`] — the `Option` enum root +
-    /// `Some` variant owners, the closure env's `call_once` owner, the payload
-    /// type `T` (the `Some::__pos_0` read the closure consumes), and the result
-    /// type `U` (the `call_once` / select result).  `None` (leaving the residual
-    /// call) when the receiver is not a resolvable `Option` — guarding on
-    /// `Option` since `Result::map_or` shares the name but has different tags —
-    /// or the closure env type does not resolve to an ADT.
+    /// `Some` variant owners, the closure env's `call_once` owner or the
+    /// function-item path, the payload type `T` (the `Some::__pos_0` read the
+    /// callable consumes), and the result type `U` (the `call_once` / select
+    /// result).  `None` (leaving the residual call) when the receiver is not a
+    /// resolvable `Option` — guarding on `Option` since `Result::map_or` shares
+    /// the name but has different tags — or the callable is neither a closure
+    /// ADT nor a named function item.
     fn recognize_map_or_site(
         &self,
         recv_ty: Option<&TyRef>,
         env_ty: Option<&TyRef>,
+        fn_item_segments: Option<Vec<String>>,
+        fn_item_decl: Option<&FunDecl>,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::option_map_or::MapOrSite> {
@@ -39342,22 +39379,36 @@ impl<'a> Lowering<'a> {
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         let payload_class_root = self.option_payload_instance_class_root(recv_ty);
-        // Closure env ADT → its `name_path` is the `call_once` inherent method
-        // owner (`resolve_impl_owner_adt_def_id_free` records the same spelling
-        // for the closure's transparent `call_once` body).
-        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
-        let env_td = self.llbc.type_by_id(env_def_id)?;
-        let call_once_owner = closure_env_call_once_owner(env_td);
+        // Prefer a closure ADT (`call_once(env, (x,))`).  A function item has
+        // no ADT def id — `tyref_ref_adt_def_id` misses — so fall through to
+        // the `FnDef` path captured from the operand (or from `env_ty` when
+        // the item was spilled to a local).
+        let fn_item_segments = fn_item_segments
+            .or_else(|| env_ty.and_then(|ty| tyref_fn_def_call_segments(ty, self.llbc)));
+        let (call_once_owner, args_tuple_suffix, fn_item_segments) =
+            if let Some(env_def_id) = env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
+                let env_td = self.llbc.type_by_id(env_def_id)?;
+                (
+                    closure_env_call_once_owner(env_td),
+                    option_payload_tuple_suffix(recv_ty, self.llbc),
+                    None,
+                )
+            } else {
+                let segments = fn_item_segments.filter(|s| !s.is_empty())?;
+                (String::new(), String::new(), Some(segments))
+            };
+        let fn_item_ctor = match fn_item_decl {
+            Some(fd) if fn_item_segments.is_some() && fd.is_adt_constructor() => {
+                Some(self.constructor_fn_item_shape(fd, dest_ty)?)
+            }
+            _ => None,
+        };
         let result_ty = tyref_to_value_type_with(
             dest_ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
         );
-        // The single-element closure-`Args` tuple `(payload,)` the extracted
-        // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
-        // the read side derives at `resolve_place`.
-        let args_tuple_suffix = option_payload_tuple_suffix(recv_ty, self.llbc);
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         let scalar_kind = if niche {
             None
@@ -39371,6 +39422,8 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             call_once_owner,
+            fn_item_segments,
+            fn_item_ctor,
             payload_ty,
             payload_class_root,
             result_ty,
@@ -97990,6 +98043,232 @@ mod tests {
             crate::model::ValueType::Ref(Some("Option<i64>".into()))
         );
         assert_ne!(usize_ty, i64_ty);
+    }
+
+    fn option_i64_ty() -> serde_json::Value {
+        option_adt_node(0, option_int_arg(true))
+    }
+
+    fn option_impl_seg() -> serde_json::Value {
+        serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": {"Value": [0, option_i64_ty()]},
+            "kind": "InherentImplBlock"
+        }}})
+    }
+
+    fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
+        let i64_ty = interior_i64();
+        let opt_ty = option_i64_ty();
+        let fn_id = fn_item
+            .get("def_id")
+            .and_then(serde_json::Value::as_u64)
+            .expect("fn item def_id");
+        let fn_ty = serde_json::json!({
+            "FnDef": {
+                "kind": {"Fun": fn_id},
+                "generics": empty_generics()
+            }
+        });
+        let map_or = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["option", 0]},
+                    option_impl_seg(),
+                    {"Ident": ["map_or", 0]}
+                ],
+                "span": interior_span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [opt_ty.clone(), i64_ty.clone(), fn_ty.clone()],
+                "output": i64_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let caller = interior_caller(
+            "map_or_fn_item",
+            1,
+            vec![opt_ty.clone()],
+            i64_ty.clone(),
+            vec![
+                interior_local(0, None, &i64_ty),
+                interior_local(1, Some("opt"), &opt_ty),
+            ],
+            vec![
+                interior_bb(
+                    vec![],
+                    interior_call(
+                        1,
+                        vec![
+                            interior_copy(interior_place(1, &opt_ty)),
+                            interior_const_i64("-1", &i64_ty),
+                            serde_json::json!({"Const": [{
+                                "FnDef": {
+                                    "kind": {"Fun": fn_id},
+                                    "generics": empty_generics()
+                                }
+                            }, fn_ty]}),
+                        ],
+                        interior_place(0, &i64_ty),
+                        2,
+                        1,
+                    ),
+                ),
+                interior_bb(vec![], interior_unwind()),
+                interior_bb(vec![], interior_return()),
+            ],
+        );
+        llbc_with_types(
+            "fixture",
+            vec![option_enum(0)],
+            vec![caller, map_or, fn_item],
+        )
+    }
+
+    fn graph_has_map_or(graph: &FunctionGraph) -> bool {
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "map_or"
+            ) || matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("map_or")
+            )
+        })
+    }
+
+    fn graph_has_fn_const(graph: &FunctionGraph) -> bool {
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if crate::model::fn_const_segments(target).is_some()
+            )
+        })
+    }
+
+    /// `opt.map_or(-1, i64::from)` with reflexive `From<i64> for i64`: residual
+    /// `map_or` and the 0-arg `__fn_const` define are gone; the Some arm is
+    /// identity on the payload (ordinary `is_reflexive_from`).
+    #[test]
+    fn map_or_i64_from_fn_item_is_identity_select() {
+        let from = interior_opaque(
+            2,
+            &["core", "convert", "<Impl>", "from"],
+            vec![interior_i64()],
+            interior_i64(),
+        );
+        let llbc = option_map_or_fn_item_llbc(from);
+        let graph = lower_interior(&llbc, "map_or_fn_item");
+        assert!(
+            !graph_has_map_or(&graph),
+            "residual map_or must be rewritten; ops={:?}",
+            graph_ops(&graph)
+        );
+        assert!(
+            !graph_has_fn_const(&graph),
+            "function-item define must not survive; ops={:?}",
+            graph_ops(&graph)
+        );
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("from")
+                )),
+            "reflexive From is identity, not a residual from call; ops={:?}",
+            graph_ops(&graph)
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+                )),
+            "the Some arm still reads the payload"
+        );
+        assert_eq!(
+            graph.blocks[graph.startblock.0].exits.len(),
+            2,
+            "A branches to Some/None arms"
+        );
+    }
+
+    /// `opt.map_or(-1, plus_one)` with a local function item: residual `map_or`
+    /// and `__fn_const` are gone; the Some arm calls `plus_one` directly.
+    #[test]
+    fn map_or_plus_one_fn_item_calls_the_function() {
+        let plus_one = interior_opaque(
+            2,
+            &["fixture", "plus_one"],
+            vec![interior_i64()],
+            interior_i64(),
+        );
+        let llbc = option_map_or_fn_item_llbc(plus_one);
+        let graph = lower_interior(&llbc, "map_or_fn_item");
+        assert!(
+            !graph_has_map_or(&graph),
+            "residual map_or must be rewritten; ops={:?}",
+            graph_ops(&graph)
+        );
+        assert!(
+            !graph_has_fn_const(&graph),
+            "function-item define must not survive; ops={:?}",
+            graph_ops(&graph)
+        );
+        let named: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("plus_one")
+                )
+            })
+            .collect();
+        assert_eq!(
+            named.len(),
+            1,
+            "the Some arm calls plus_one; ops={:?}",
+            graph_ops(&graph)
+        );
+        let OpKind::Call { args, .. } = &named[0].kind else {
+            panic!("plus_one call");
+        };
+        assert_eq!(args.len(), 1, "the Some arm calls plus_one(payload)");
+        assert_eq!(
+            graph.blocks[graph.startblock.0].exits.len(),
+            2,
+            "A branches to Some/None arms"
+        );
     }
 
     /// Two `Code` declarations in one LLBC. `fixture::Code` strips to the
