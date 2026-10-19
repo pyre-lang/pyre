@@ -442,6 +442,10 @@ fn pyre_object_gc_write_barrier_trampoline(obj: majit_gc::GCREF) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
 
+fn pyre_object_gc_write_barrier_from_array_trampoline(obj: majit_gc::GCREF, index: usize) {
+    majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(obj as usize), index);
+}
+
 fn pyre_object_gc_write_barrier_before_move_trampoline(obj: majit_gc::GCREF) {
     majit_gc::gc_write_barrier_before_move(majit_ir::GcRef(obj as usize));
 }
@@ -5764,6 +5768,9 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::register_gc_owns_object_hook(pyre_object_gc_owns_object_trampoline);
     pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
+    pyre_object::register_gc_write_barrier_from_array_hook(
+        pyre_object_gc_write_barrier_from_array_trampoline,
+    );
     pyre_object::register_gc_write_barrier_before_move_hook(
         pyre_object_gc_write_barrier_before_move_trampoline,
     );
@@ -16617,6 +16624,18 @@ mod tests {
 
         assert_eq!(hash, make_green_key(w_code.cast(), 17, false));
         assert_eq!(typed.get_uhash(), hash);
+    }
+
+    /// A store into a collector-unowned cell (the prebuilt/bootstrap family)
+    /// dirties the prebuilt-root walk through the per-site helper.
+    #[test]
+    fn try_gc_write_barrier_prebuilt_on_non_owned_address_dirties_prebuilt_roots() {
+        init_gc_subsystem();
+        let obj = Box::leak(Box::new(0u8)) as *mut u8 as pyre_object::gc_hook::GCREF;
+        assert!(!majit_gc::gc_owns_object(obj as usize));
+        gc_roots::clear_prebuilt_roots_dirty();
+        pyre_object::gc_hook::try_gc_write_barrier_prebuilt(obj);
+        assert!(gc_roots::prebuilt_roots_dirty());
     }
 
     /// Read a global by name from the frame's canonical `w_globals` object.

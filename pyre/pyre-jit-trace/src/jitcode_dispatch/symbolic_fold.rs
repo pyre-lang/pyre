@@ -22,10 +22,15 @@ fn execute_box_str_constant(args: &[Value]) -> Option<Value> {
     let Value::Ref(GcRef(ptr)) = args[0] else {
         return None;
     };
-    // Wrapper header (`is_str`) or the `_utf8` storage pointer prebuilt STR
-    // constants materialize as (`runtime_fnaddr_patch.rs`
-    // `materialize_prebuilt_str`). Untrusted non-str Refs decline.
-    let result = pyre_object::unicodeobject::interned_str_from_const_ptr(ptr)?;
+    // `box_str_constant`'s source is `&Wtf8` — rstr `Ptr(STR)`
+    // (`OpKind::ConstStr`, `StrConstDescriptor.as_unicode_object = false`).
+    // Intern by chars (`WeakValueDictRepr.ll_get`). A wrapper-kind operand
+    // (`OpKind::ConstInternedStr`) is `interned_str_from_typed_const` with
+    // `BoxStrConstKind::InternedUnicode`; this residual's argument is STR.
+    let result = pyre_object::unicodeobject::interned_str_from_typed_const(
+        ptr,
+        pyre_object::unicodeobject::BoxStrConstKind::Str,
+    )?;
     Some(Value::Ref(GcRef(result as usize)))
 }
 

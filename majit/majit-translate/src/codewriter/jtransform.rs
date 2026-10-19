@@ -911,27 +911,27 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
     matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
 }
 
-/// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` —
-/// the interpreter's spelling of `llop.gc_writebarrier`, which
-/// [`drop_guarded_gc_write_barriers`] drops when the store it guards
-/// follows. `try_gc_write_barrier_before_move` is a different op
+/// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` /
+/// `try_gc_write_barrier_prebuilt` — the interpreter's spelling of
+/// `llop.gc_writebarrier`, which [`drop_guarded_gc_write_barriers`]
+/// drops when the store it guards follows.
+/// `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
+/// `try_gc_write_barrier_from_array` is `write_barrier_from_array` and
+/// stays residual (`framework.py transform_generic_set`).
 ///
-/// Source-level helpers (`typeobject::type_write_barrier`,
-/// `celldict::object_mutable_cell_write_barrier`) are erased in
-/// `front/mir.rs` `is_source_write_barrier_call`, the same point the
-/// LLBC call becomes a unit constant before the following `setfield`.
+/// `typeobject::type_write_barrier` is erased in `front/mir.rs` `is_source_write_barrier_call`.
 fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     let [.., module, leaf] = segments else {
         return false;
     };
-    matches!(
-        (module.as_str(), leaf.as_str()),
-        (
-            "gc_hook",
-            "try_gc_write_barrier" | "try_gc_write_barrier_managed"
+    module == "gc_hook"
+        && matches!(
+            leaf.as_str(),
+            "try_gc_write_barrier"
+                | "try_gc_write_barrier_managed"
+                | "try_gc_write_barrier_prebuilt"
         )
-    )
 }
 
 /// Unary ops `optimize_block` drops as `same_as`.
@@ -1048,18 +1048,92 @@ fn canonical_gc_base(
     cur
 }
 
+/// A `setfield_gc` / `setarrayitem_gc` of a GC pointer and the stored
+/// value. `rewrite.py handle_write_barrier_setfield` /
+/// `handle_write_barrier_setarrayitem` emit `COND_CALL_GC_WB[_ARRAY]` on
+/// this store only when the value is a non-null ref.
+fn gc_ref_store_base_and_value(
+    kind: &OpKind,
+) -> Option<(&crate::flowspace::model::Variable, &LinkArg)> {
+    match kind {
+        OpKind::FieldWrite {
+            base, ty, value, ..
+        } if value_type_is_gc_ref(ty) => Some((base, value)),
+        OpKind::ArrayWrite {
+            base,
+            item_ty,
+            value,
+            ..
+        } if value_type_is_gc_ref(item_ty) => Some((base, value)),
+        _ => None,
+    }
+}
+
+/// `jtransform.py _rewrite_cmp_ptrs`: a NULL is `ConstRefNull` or the
+/// `ptr::null[_mut]()` / `PY_NULL` builtin the `rtype_ptr_null` arm has
+/// not yet folded. `rewrite.py handle_write_barrier_setarrayitem` skips
+/// `COND_CALL_GC_WB` for `is_null_constant`.
+fn link_arg_is_null_ref(graph: &FunctionGraph, arg: &LinkArg) -> bool {
+    let LinkArg::Value(variable) = arg else {
+        return false;
+    };
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|def| {
+            def.result.as_ref() == Some(variable)
+                && match &def.kind {
+                    OpKind::ConstRefNull => true,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        result_ty,
+                    } => {
+                        args.is_empty()
+                            && is_null_ptr_result(result_ty)
+                            && resolves_to_null_ptr_builtin(segments)
+                    }
+                    _ => false,
+                }
+        })
+    })
+}
+
+/// Ops `rewrite_op_direct_call` / `optimize_block` drop as `same_as` —
+/// they are not the store the barrier guards and they cannot collect.
+fn is_drop_guard_identity_op(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::UnaryOp { op, .. } if is_same_as_identity_unary(op) => true,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if is_same_as_identity_call_path(segments) => true,
+        _ => false,
+    }
+}
+
 /// `framework.py gct_gc_writebarrier` turns `llop.gc_writebarrier` into a
 /// call the JIT rewriter does not keep: `rewrite.py
 /// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
-/// `SETFIELD_GC` / `SETARRAYITEM_GC` of a pointer. The interpreter spells
-/// that barrier as an explicit `try_gc_write_barrier(obj)` right
-/// before the store it guards, so the call is dropped only when a GC
-/// `FieldWrite` / `ArrayWrite` of the same base follows it in the same
-/// block: that store lowers to the op the backend barriers. Any other
+/// `SETFIELD_GC` of a pointer. The interpreter spells that barrier as an
+/// explicit `try_gc_write_barrier(obj)` /
+/// `try_gc_write_barrier_prebuilt(obj)` right before the store it guards,
+/// so the one-arg call is dropped only when the next non-identity op is a
+/// non-null GC `FieldWrite` / `ArrayWrite` of the same base: that store
+/// lowers to the op the backend barriers.
+///
+/// `try_gc_write_barrier_from_array` stays residual.
+/// `framework.py transform_generic_set` emits it as `direct_call` and
+/// `jtransform.py` does not drop it. `rewrite.py
+/// handle_write_barrier_setarrayitem` emits `COND_CALL_GC_WB` only when
+/// the stored value is `Type::Ref`; dropping the residual when that gate
+/// disagrees with the MIR item type leaves the `setarrayitem` unbarred.
+///
+/// A later-anywhere store is not enough — `alloc_list_items_block_gc`
+/// barriers, then `memcpy`s young refs, then NULL-fills spare slots, and
+/// `handle_write_barrier_setarrayitem` skips WB on a null store. Any other
 /// barrier stays residual.
 ///
-/// The bool-returning `gc_hook` result becomes `true`: the hook is
-/// installed before any compiled code runs.
+/// The result becomes `true`: the hook is installed before any compiled
+/// code runs.
 fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     let aliases = std::collections::HashMap::new();
     let mut drops: Vec<(usize, usize)> = Vec::new();
@@ -1080,17 +1154,19 @@ fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
                 continue;
             };
             let canon = canonical_gc_base(graph, &aliases, arg);
-            let guarded = block.operations[oi + 1..].iter().any(|next| {
-                let base = match &next.kind {
-                    OpKind::FieldWrite { base, ty, .. } if value_type_is_gc_ref(ty) => base,
-                    OpKind::ArrayWrite { base, item_ty, .. } if value_type_is_gc_ref(item_ty) => {
-                        base
-                    }
-                    _ => return false,
-                };
-                base == arg || canonical_gc_base(graph, &aliases, base) == canon
-            });
-            if guarded {
+            let Some(next) = block.operations[oi + 1..]
+                .iter()
+                .find(|next| !is_drop_guard_identity_op(&next.kind))
+            else {
+                continue;
+            };
+            let Some((base, value)) = gc_ref_store_base_and_value(&next.kind) else {
+                continue;
+            };
+            if link_arg_is_null_ref(graph, value) {
+                continue;
+            }
+            if base == arg || canonical_gc_base(graph, &aliases, base) == canon {
                 drops.push((bi, oi));
             }
         }
@@ -24731,6 +24807,36 @@ mod tests {
         }
     }
 
+    fn wb_from_array_call(
+        obj: &crate::flowspace::model::Variable,
+        index: &crate::flowspace::model::Variable,
+    ) -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path([
+                "pyre_object",
+                "gc_hook",
+                "try_gc_write_barrier_from_array",
+            ]),
+            args: crate::model::call_args(vec![obj.clone(), index.clone()]),
+            result_ty: ValueType::Bool,
+        }
+    }
+
+    fn wb_array_store(
+        obj: &crate::flowspace::model::Variable,
+        index: &crate::flowspace::model::Variable,
+        stored: &crate::flowspace::model::Variable,
+    ) -> OpKind {
+        OpKind::ArrayWrite {
+            base: obj.clone(),
+            index: index.clone(),
+            value: crate::model::LinkArg::Value(stored.clone()),
+            item_ty: ValueType::Ref(None),
+            array_type_id: None,
+            nolength: false,
+        }
+    }
+
     fn is_wb_call(kind: &OpKind) -> bool {
         matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
             if is_gc_write_barrier_path(segments))
@@ -24775,10 +24881,78 @@ mod tests {
         assert!(is_wb_call(&graph.blocks[entry.0].operations[0].kind));
     }
 
+    /// `rewrite.py handle_write_barrier_setarrayitem` skips a null store.
+    /// A later NULL `ArrayWrite` of the same base is not the store the
+    /// barrier guards (`alloc_list_items_block_gc` memcpy then NULL-fill).
+    #[test]
+    fn gc_write_barrier_before_null_array_write_stays_residual() {
+        let mut graph = FunctionGraph::new("wb_keep_null");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let entry = graph.startblock;
+        let nullv = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        graph.push_op_var(entry, wb_array_store(&obj, &index, &nullv), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[1].kind));
+    }
+
+    /// A memcpy between the barrier and a later GC store is not identity;
+    /// dropping the barrier would leave the copy unbarred.
+    #[test]
+    fn gc_write_barrier_before_memcpy_then_store_stays_residual() {
+        let mut graph = FunctionGraph::new("wb_keep_memcpy");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["core", "ptr", "copy"]),
+                args: crate::model::call_args(vec![obj.clone(), obj.clone(), index.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.push_op_var(entry, wb_array_store(&obj, &index, &stored), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[0].kind));
+    }
+
+    /// `write_barrier_from_array` is the `setarrayitem` form:
+    /// `framework.py transform_generic_set` leaves it as a residual
+    /// `direct_call`, and `jtransform.py` does not drop it.
+    #[test]
+    fn gc_write_barrier_from_array_before_its_store_stays_residual() {
+        let mut graph = FunctionGraph::new("wb_from_array_keep");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_from_array_call(&obj, &index), false);
+        graph.push_op_var(entry, wb_array_store(&obj, &index, &stored), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        let ops = &graph.blocks[entry.0].operations;
+        match &ops[0].kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => assert_eq!(
+                segments.last().map(String::as_str),
+                Some("try_gc_write_barrier_from_array")
+            ),
+            other => panic!("from_array barrier was not residual: {other:?}"),
+        }
+        assert!(matches!(ops[1].kind, OpKind::ArrayWrite { .. }));
+    }
+
     /// Only the `gc_hook` barrier is this op: a same-named leaf in another
-    /// module is an ordinary call. Source-level helpers such as
-    /// `celldict::object_mutable_cell_write_barrier` are erased in
-    /// `front/mir.rs` `is_source_write_barrier_call`.
+    /// module is an ordinary call. `write_cell` spells
+    /// `try_gc_write_barrier_prebuilt`.
     #[test]
     fn gc_write_barrier_path_requires_gc_hook_module() {
         let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -24786,6 +24960,16 @@ mod tests {
             "pyre_object",
             "gc_hook",
             "try_gc_write_barrier"
+        ])));
+        assert!(is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "gc_hook",
+            "try_gc_write_barrier_prebuilt"
+        ])));
+        assert!(!is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "gc_hook",
+            "try_gc_write_barrier_from_array"
         ])));
         assert!(!is_gc_write_barrier_path(&path(&[
             "pyre_object",

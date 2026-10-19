@@ -5907,7 +5907,7 @@ fn flush_walk_end_state_to_frame_inner(
             .map(|pin| pin.get().0 as PyObjectRef)
             .unwrap_or(item);
         unsafe {
-            (*arr_ptr).as_mut_slice()[end_vsd] = item;
+            (*arr_ptr).set_ref(end_vsd, item);
             let pf = &mut *(frame as *mut PyFrame);
             pf.valuestackdepth = end_vsd + 1;
             pf.last_instr = body_pc as isize - 1;
@@ -6107,7 +6107,7 @@ fn write_frame_local_word(frame_now: usize, abs: usize, word: PyObjectRef) -> bo
         return false;
     }
     unsafe {
-        (*arr_ptr).as_mut_slice()[abs] = word;
+        (*arr_ptr).set_ref(abs, word);
     }
     frame_array_write_barrier(frame_now as *mut u8, arr_ptr);
     true
@@ -6311,7 +6311,7 @@ pub(crate) fn restore_frame_locals(frame: usize, saved: &[i64]) {
     let len = unsafe { &*arr_ptr }.as_slice().len();
     for (abs, &value) in saved.iter().enumerate().take(len) {
         unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = value as usize as PyObjectRef;
+            (*arr_ptr).set_ref(abs, value as usize as PyObjectRef);
         }
     }
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
@@ -6495,9 +6495,8 @@ pub(crate) fn publish_captured_frame_stack(
         return false;
     }
     unsafe {
-        let slots = (*live_arr).as_mut_slice();
         for (offset, &value) in captured.roots.iter().enumerate() {
-            slots[live_base + offset] = value as usize as PyObjectRef;
+            (*live_arr).set_ref(live_base + offset, value as usize as PyObjectRef);
         }
     }
     restore_frame_scalars(live_frame, captured.scalars);
@@ -6644,12 +6643,13 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
     // `write_back_outer_locals` boxes locals (an allocation that can
     // collect the just-stored refs if the array is not remembered).
     unsafe {
-        let slots = (*arr_ptr).as_mut_slice();
-        if slots.len() < nlocals + below.len() + 1 {
+        if (*arr_ptr).as_slice().len() < nlocals + below.len() + 1 {
             return false;
         }
-        slots[nlocals..nlocals + below.len()].copy_from_slice(below);
-        slots[nlocals + below.len()] = retval;
+        for (i, &value) in below.iter().enumerate() {
+            (*arr_ptr).set_ref(nlocals + i, value);
+        }
+        (*arr_ptr).set_ref(nlocals + below.len(), retval);
     }
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
     if !write_back_outer_locals(ctx, frame) {
@@ -7978,10 +7978,10 @@ impl PyreJitState {
             return false;
         };
         let arr_ptr = arr as *mut pyre_object::FixedObjectArray;
-        let Some(slot) = arr.as_mut_slice().get_mut(abs) else {
+        if abs >= arr.len() {
             return false;
-        };
-        *slot = value;
+        }
+        arr.set_ref(abs, value);
         frame_array_write_barrier(frame, arr_ptr);
         true
     }
@@ -8215,8 +8215,12 @@ impl PyreJitState {
         if frame_arr.len() != unified.len() {
             return false;
         }
-        for (dst, &src) in frame_arr.as_mut_slice().iter_mut().zip(unified) {
-            *dst = src as PyObjectRef;
+        for (i, &src) in unified.iter().enumerate() {
+            // `virtualizable.py write_from_resume_data_partial` stores through
+            // `lst[j] = ...`, which is `setarrayitem_gc` and the array write
+            // barrier. A raw `as_mut_slice` assign skips
+            // `FixedObjectArray::set_ref`.
+            frame_arr.set_ref(i, src as PyObjectRef);
         }
         true
     }
@@ -10010,10 +10014,13 @@ fn materialize_resumed_pyframe_block(
         return None;
     }
     unsafe {
-        std::ptr::write_bytes(raw, 0, size);
+        // `GCREF` is `*mut GCREFOpaque` (`size_of` 0); `write_bytes` /
+        // `add` on the GCREF itself move no bytes. Address through `*mut u8`.
+        let bytes = raw as *mut u8;
+        std::ptr::write_bytes(bytes, 0, size);
         // `llmodel.py bh_new_with_vtable`: the vtable word at
         // `vtable_offset`, which pyre's backends set to `OB_TYPE_OFFSET`.
-        *(raw.add(pyre_object::pyobject::OB_TYPE_OFFSET) as *mut usize) = vtable;
+        *(bytes.add(pyre_object::pyobject::OB_TYPE_OFFSET) as *mut usize) = vtable;
     }
     Some(raw as i64)
 }

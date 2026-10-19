@@ -207,6 +207,10 @@ pub fn try_gc_alloc_with_placement(
     payload_size: usize,
     needs_write_barrier: &mut bool,
 ) -> Option<GCREF> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return None;
+    }
     if let Some(f) = GC_ALLOC_WITH_PLACEMENT_HOOK.get() {
         return Some(unsafe { f(type_id, payload_size, needs_write_barrier as *mut bool) });
     }
@@ -260,6 +264,10 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<GCREF> {
 /// discriminant to erase, unlike the `Option<GCREF>` accessor.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> GCREF {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return core::ptr::null_mut();
+    }
     GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
         .allocated_or_abort(payload_size)
         .unwrap_or(core::ptr::null_mut())
@@ -295,6 +303,10 @@ pub fn clear_gc_alloc_young_nonmoving_hook() {
 /// With no young hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> GCREF {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return core::ptr::null_mut();
+    }
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
@@ -328,6 +340,10 @@ pub fn clear_gc_alloc_young_nonmoving_no_collect_hook() {
 /// With no such hook installed this answers exactly as the stable twin.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: usize) -> GCREF {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return core::ptr::null_mut();
+    }
     let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_NO_COLLECT_HOOK.get() else {
         return try_gc_alloc_stable_raw(type_id, payload_size);
     };
@@ -365,6 +381,10 @@ pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: u
 /// recording.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_nursery_raw(type_id: u32, payload_size: usize) -> GCREF {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return core::ptr::null_mut();
+    }
     GcAllocOutcome::from_hook(try_gc_alloc(type_id, payload_size))
         .allocated_or_abort(payload_size)
         .unwrap_or(core::ptr::null_mut())
@@ -429,6 +449,10 @@ pub unsafe fn try_gc_alloc_collecting_rooted(
     root: *mut GCREF,
     needs_write_barrier: *mut bool,
 ) -> Option<GCREF> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !hook_test_effects_visible() {
+        return None;
+    }
     if let Some(f) = GC_ALLOC_COLLECTING_ROOTED_HOOK.get() {
         return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
     }
@@ -822,6 +846,22 @@ pub extern "C" fn try_gc_owns_object(addr: GCREF) -> bool {
     }
 }
 
+/// Stamp `init_gc_object_immortal`'s `GCFLAG_NO_HEAP_PTRS` on a collector-owned
+/// old-gen object that already has `GCFLAG_TRACK_YOUNG_PTRS`
+/// (`finish_alloc_in_oldgen`). The next [`try_gc_write_barrier_managed`]
+/// enrolls it in `prebuilt_root_objects` (`remember_young_pointer`).
+///
+/// # Safety
+/// `obj` must be a payload pointer returned by a collector allocation
+/// ([`try_gc_alloc_stable_raw`]) that wrote a `GcHeader` immediately before it.
+pub unsafe fn stamp_gc_no_heap_ptrs(obj: GCREF) {
+    debug_assert!(!obj.is_null());
+    unsafe {
+        let hdr = majit_gc::header::header_of(obj as usize);
+        (*hdr).set_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS);
+    }
+}
+
 /// Return the current address for `addr` without registering it as a root.
 /// When the active GC does not know the object, the address is unchanged.
 ///
@@ -875,13 +915,25 @@ pub fn gc_identity_hash(obj_addr: usize) -> usize {
 /// remembering.
 pub type GcWriteBarrierHookFn = fn(obj: GCREF);
 
+/// `incminimark.py` `write_barrier_from_array(addr_array, index)`.
+/// `framework.py` `transform_generic_set` emits this for a
+/// `setarrayitem` / `setinteriorfield` into a GC array part
+/// (`_set_into_gc_array_part`).
+pub type GcWriteBarrierFromArrayHookFn = fn(obj: GCREF, index: usize);
+
 majit_gc::global_hook!(static GC_WRITE_BARRIER_HOOK: GcWriteBarrierHookFn);
+majit_gc::global_hook!(static GC_WRITE_BARRIER_FROM_ARRAY_HOOK: GcWriteBarrierFromArrayHookFn);
 majit_gc::global_hook!(static GC_WRITE_BARRIER_MANAGED_HOOK: GcWriteBarrierHookFn);
 majit_gc::global_hook!(static GC_WRITE_BARRIER_BEFORE_MOVE_HOOK: GcWriteBarrierHookFn);
 
 /// Install the write-barrier callback.
 pub fn register_gc_write_barrier_hook(hook: GcWriteBarrierHookFn) {
     GC_WRITE_BARRIER_HOOK.set(Some(hook));
+}
+
+/// Install the array write-barrier callback.
+pub fn register_gc_write_barrier_from_array_hook(hook: GcWriteBarrierFromArrayHookFn) {
+    GC_WRITE_BARRIER_FROM_ARRAY_HOOK.set(Some(hook));
 }
 
 /// Install the callback run before an object's items are permuted in place.
@@ -899,6 +951,11 @@ pub fn clear_gc_write_barrier_hook() {
     GC_WRITE_BARRIER_HOOK.set(None);
 }
 
+/// Remove the array write-barrier callback.
+pub fn clear_gc_write_barrier_from_array_hook() {
+    GC_WRITE_BARRIER_FROM_ARRAY_HOOK.set(None);
+}
+
 /// Remove the before-move barrier callback.
 pub fn clear_gc_write_barrier_before_move_hook() {
     GC_WRITE_BARRIER_BEFORE_MOVE_HOOK.set(None);
@@ -908,20 +965,147 @@ pub fn clear_gc_write_barrier_managed_hook() {
     GC_WRITE_BARRIER_MANAGED_HOOK.set(None);
 }
 
+/// Clear-`GCFLAG_TRACK_YOUNG_PTRS` half of `incminimark.py write_barrier`.
+/// Young objects never have the bit, so this is also the nursery skip.
+/// [`try_gc_write_barrier_managed`] callers have a live barrier hook and a
+/// collector-owned object, the same family `do_write_barrier` reads a
+/// header from. The flag is mutable; callers that the codewriter traces
+/// must not inline this (`dont_look_inside` on
+/// [`try_gc_write_barrier_managed`]).
+#[inline]
+fn write_barrier_flag_clear(obj: GCREF) -> bool {
+    let addr = obj as usize;
+    addr.is_multiple_of(majit_gc::header::GcHeader::ALIGN)
+        && unsafe {
+            !(*majit_gc::header::header_of(addr))
+                .has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS)
+        }
+}
+
 /// Run the active GC write barrier for `obj` when one is installed.
+///
+/// `incminimark.py write_barrier` tests `GCFLAG_TRACK_YOUNG_PTRS` then
+/// calls `remember_young_pointer`. Young objects never have that bit, so a
+/// nursery object (`gc_is_nursery_object`) returns false without the hook —
+/// the cheap fast exit, and a nursery address is always collector-owned.
+/// Every non-nursery address reaches the installed hook, including a
+/// prebuilt / bootstrap object the collector does not own: those have no
+/// header (or a `registered_external_header`), so this path does not read
+/// one. The hook's `remember_young_pointer` analog enrolls them.
+///
+/// The TRACK bit is mutable. An inlined test in a traced `setfield_gc` /
+/// `setarrayitem_gc` body can fold a clear bit from a young birth and skip
+/// the barrier after promotion; this hook is `dont_look_inside` so the
+/// tests stay residual (`framework.py` `transform_generic_set`). Host
+/// inlining is the C backend's (`#[inline]`; Charon still records the call).
 // `dont_look_inside`: host hook dispatch (a process-global
 // atomic fn-pointer cell) stays opaque to the JIT — traces never look inside a
 // write barrier (the backend GC rewrite owns that concern); calls
 // residualize via the registered fnaddr.
+#[inline]
 #[majit_macros::dont_look_inside]
 pub extern "C" fn try_gc_write_barrier(obj: GCREF) -> bool {
+    if obj.is_null() {
+        return false;
+    }
     match GC_WRITE_BARRIER_HOOK.get() {
         Some(f) => {
+            if majit_gc::gc_is_nursery_object(obj as usize) {
+                return false;
+            }
             f(obj);
             true
         }
         None => false,
     }
+}
+
+/// Write barrier for a store into an object that may belong to the
+/// prebuilt family.
+///
+/// A collector-owned object takes [`try_gc_write_barrier`]. An object the
+/// collector does not own is reached only by the prebuilt root walk, so
+/// the store dirties that walk instead (`incminimark.py`
+/// `remember_young_pointer` enrolls a prebuilt object on its first
+/// store; the JIT write barrier does not take `newvalue`). The address is
+/// not dereferenced on the unowned arm.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn try_gc_write_barrier_prebuilt(obj: GCREF) {
+    if try_gc_owns_object(obj) {
+        try_gc_write_barrier(obj);
+    } else {
+        crate::gc_roots::mark_prebuilt_roots_dirty();
+    }
+}
+
+/// Run `write_barrier_from_array(addr_array, index)`.
+///
+/// `incminimark.py write_barrier_from_array` tests `GCFLAG_TRACK_YOUNG_PTRS`,
+/// then `remember_young_pointer_from_array2` / `remember_young_pointer`. A
+/// nursery array never has TRACK, so it returns false without the hook. A
+/// non-owned array has no GC header, so this falls back to
+/// [`try_gc_write_barrier`] as `remember_young_pointer` enrolls a prebuilt
+/// object. A collector-owned old array keeps the TRACK test and the
+/// forwarded-header `stale_array_abort` before the hook.
+///
+/// The TRACK bit is mutable. The codewriter traces host `setarrayitem_gc`
+/// bodies (`items_block_set_ref`, `ll_list_ascii_setitem_fast`,
+/// `barrier_entries`); an inlined flag test there can fold a clear bit from
+/// a young birth and skip the barrier after promotion. This hook is
+/// `dont_look_inside` so the tests stay residual: `framework.py
+/// transform_generic_set` emits `write_barrier_from_array` as `direct_call`
+/// and `jtransform.py` does not drop it. Host inlining is the C backend's.
+// `dont_look_inside`: host hook dispatch, as for `try_gc_write_barrier`.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub extern "C" fn try_gc_write_barrier_from_array(obj: GCREF, index: usize) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if majit_gc::gc_is_nursery_object(obj as usize) {
+        return false;
+    }
+    if !try_gc_owns_object(obj) {
+        return try_gc_write_barrier(obj);
+    }
+    match GC_WRITE_BARRIER_FROM_ARRAY_HOOK.get() {
+        Some(f) => {
+            let header = unsafe { majit_gc::header::header_of(obj as usize) };
+            if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
+                return false;
+            }
+            if unsafe { (*header).is_forwarded() } {
+                stale_array_abort(obj as usize, index);
+            }
+            f(obj, index);
+            true
+        }
+        None => try_gc_write_barrier(obj),
+    }
+}
+
+/// Out-of-line half of [`try_gc_write_barrier_from_array`]'s forwarded-header
+/// check. `FORWARDED_MARKER` sets every flag bit, so the flag test cannot tell
+/// a nursery corpse from a live old array that still needs remembering.
+#[cold]
+#[inline(never)]
+fn stale_array_abort(array_addr: usize, index: usize) -> ! {
+    let header = unsafe { majit_gc::header::header_of(array_addr) };
+    let moved_to = unsafe { majit_gc::header::GcHeader::forwarding_address(header) };
+    eprintln!(
+        "STALE ARRAY: write_barrier_from_array(index={index}) reached {array_addr:#x}, \
+         already moved to {moved_to:#x}"
+    );
+    eprintln!(
+        "STALE ARRAY backtrace:\n{}",
+        std::backtrace::Backtrace::force_capture()
+    );
+    let named = report_stale_array_holder(array_addr);
+    panic!(
+        "write_barrier_from_array on {array_addr:#x} at index {index}: a minor collection \
+         moved this array to {moved_to:#x} and its holder kept the pre-collection pointer \
+         (holder named: {named})"
+    );
 }
 
 /// Generalize `obj`'s cards before its items are permuted in place.
@@ -944,10 +1128,18 @@ pub extern "C" fn try_gc_write_barrier_before_move(obj: GCREF) -> bool {
 
 /// Run the active barrier for a pointer returned by a managed allocation
 /// hook.  The backend may omit the general hybrid-heap ownership lookup.
+/// TRACK-clear skip is valid here: the pointer is collector-owned.
+#[inline]
 #[majit_macros::dont_look_inside]
 pub extern "C" fn try_gc_write_barrier_managed(obj: GCREF) -> bool {
+    if obj.is_null() {
+        return false;
+    }
     match GC_WRITE_BARRIER_MANAGED_HOOK.get() {
         Some(f) => {
+            if write_barrier_flag_clear(obj) {
+                return false;
+            }
             f(obj);
             true
         }
@@ -1173,6 +1365,41 @@ mod tests {
 
     fn mock_write_barrier(_obj: GCREF) {}
 
+    fn mock_write_barrier_from_array(_obj: GCREF, _index: usize) {}
+
+    /// Stack stand-in for a collector-owned old array:
+    /// [`try_gc_write_barrier_from_array`] reads `GCFLAG_TRACK_YOUNG_PTRS`
+    /// only after [`try_gc_owns_object`], so a synthetic address such as
+    /// `0x1000` is not a headered object.
+    #[repr(C)]
+    struct HeaderedProbe {
+        header: majit_gc::header::GcHeader,
+        payload: usize,
+    }
+
+    impl HeaderedProbe {
+        fn with_track_young() -> Self {
+            Self {
+                header: majit_gc::header::GcHeader::with_flags(
+                    1,
+                    majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
+                ),
+                payload: 0,
+            }
+        }
+
+        fn gcref(&mut self) -> GCREF {
+            (&mut self.payload as *mut usize) as GCREF
+        }
+    }
+
+    static OWNED_PROBE_ADDR: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn mock_owns_probe(addr: usize) -> bool {
+        addr == OWNED_PROBE_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[test]
     fn root_hooks_register_and_remove_round_trip() {
         let _hook_lock = hook_test_guard();
@@ -1271,10 +1498,14 @@ mod tests {
     fn write_barrier_hook_registers_invokes_and_clears() {
         let _hook_lock = hook_test_guard();
         clear_gc_write_barrier_hook();
-        let obj = 0x1000usize as GCREF;
+        clear_gc_write_barrier_from_array_hook();
+        let mut probe = HeaderedProbe::with_track_young();
+        let obj = probe.gcref();
         assert!(!try_gc_write_barrier(obj));
+        assert!(!try_gc_write_barrier_from_array(obj, 0));
 
         register_gc_write_barrier_hook(mock_write_barrier);
+        register_gc_write_barrier_from_array_hook(mock_write_barrier_from_array);
         // `try_gc_write_barrier` returns true iff it dispatched to the installed
         // hook, so the return value alone proves invocation. We deliberately do
         // NOT assert on a shared call counter: the write-barrier hook cell is
@@ -1282,8 +1513,39 @@ mod tests {
         // dict / descriptor / …) fire the same hook from concurrent tests, which
         // would perturb any global counter and reintroduce a parallel-test flake.
         assert!(try_gc_write_barrier(obj));
+        assert!(try_gc_write_barrier_from_array(obj, 3));
 
         clear_gc_write_barrier_hook();
+        clear_gc_write_barrier_from_array_hook();
         assert!(!try_gc_write_barrier(obj));
+        assert!(!try_gc_write_barrier_from_array(obj, 3));
+    }
+
+    #[test]
+    fn write_barrier_from_array_hook_registers_invokes_and_clears() {
+        let _hook_lock = hook_test_guard();
+        clear_gc_write_barrier_hook();
+        clear_gc_write_barrier_from_array_hook();
+        clear_gc_owns_object_hook();
+        let mut probe = HeaderedProbe::with_track_young();
+        let obj = probe.gcref();
+        OWNED_PROBE_ADDR.store(obj as usize, std::sync::atomic::Ordering::Relaxed);
+        let immortal = 0x2000usize as GCREF;
+        assert!(!try_gc_write_barrier_from_array(obj, 0));
+
+        register_gc_write_barrier_from_array_hook(mock_write_barrier_from_array);
+        register_gc_owns_object_hook(mock_owns_probe);
+        assert!(try_gc_write_barrier_from_array(obj, 3));
+        // Pre-hook immortal: not collector-owned, so the array form is not
+        // taken. The plain hook is also unregistered.
+        assert!(!try_gc_write_barrier_from_array(immortal, 3));
+
+        register_gc_write_barrier_hook(mock_write_barrier);
+        assert!(try_gc_write_barrier_from_array(immortal, 3));
+
+        clear_gc_write_barrier_from_array_hook();
+        clear_gc_write_barrier_hook();
+        clear_gc_owns_object_hook();
+        assert!(!try_gc_write_barrier_from_array(obj, 3));
     }
 }

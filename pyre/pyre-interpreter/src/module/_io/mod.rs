@@ -1575,6 +1575,7 @@ fn text_iobase_none_get(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn init_text_iobase_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let mut ns = pyre_object::gc_roots::pin_root(ns);
     crate::__pyre_store!(
         ns,
@@ -1596,6 +1597,7 @@ fn init_text_iobase_type(ns: PyObjectRef) {
         crate::__pyre_store!(ns, name, crate::make_builtin_function(name, function));
     }
     for name in ["encoding", "newlines", "errors"] {
+        ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         let getter = crate::make_builtin_function_with_arity(name, text_iobase_none_get, 2);
         let getter_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(getter);

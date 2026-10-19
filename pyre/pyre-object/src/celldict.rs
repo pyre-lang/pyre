@@ -267,22 +267,6 @@ pub unsafe fn walk_module_value_slot(
     }
 }
 
-/// Write barrier for an in-place `ObjectMutableCell.w_value` store.
-///
-/// A collector-owned cell takes the ordinary barrier. A cell outside the
-/// heap is reached only by the prebuilt-family root walk. `incminimark.py`
-/// `remember_young_pointer` records that walk independently of the stored
-/// pointer: the incremental collector relies on the first prebuilt write
-/// registering the object, and the JIT write barrier does not take `newvalue`.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub fn object_mutable_cell_write_barrier(cell: crate::gc_hook::GCREF) {
-    if crate::gc_hook::try_gc_owns_object(cell) {
-        crate::gc_hook::try_gc_write_barrier(cell);
-    } else {
-        crate::gc_roots::mark_prebuilt_roots_dirty();
-    }
-}
-
 /// `typeobject.py write_cell`:
 ///
 /// ```python
@@ -325,9 +309,10 @@ pub unsafe fn write_cell(
     match write {
         CellWrite::InPlaceObject(_) => {
             let cell = w_cell_word;
-            // Barrier before the store, the `remember_young_pointer` order.
-            // An in-place int store writes no `PyObjectRef` and needs none.
-            object_mutable_cell_write_barrier(cell as crate::gc_hook::GCREF);
+            // Barrier before the store, the `remember_young_pointer` order. A
+            // cell the collector does not own dirties the prebuilt walk. An
+            // in-place int store writes no `PyObjectRef` and needs none.
+            crate::gc_hook::try_gc_write_barrier_prebuilt(cell as crate::gc_hook::GCREF);
             (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }
@@ -1670,7 +1655,7 @@ mod tests {
             assert!(crate::gc_roots::prebuilt_roots_dirty());
             let cell = crate::w_str_new("cell") as crate::gc_hook::GCREF;
             crate::gc_roots::clear_prebuilt_roots_dirty();
-            object_mutable_cell_write_barrier(cell);
+            crate::gc_hook::try_gc_write_barrier_prebuilt(cell);
             assert!(crate::gc_roots::prebuilt_roots_dirty());
         }
         {

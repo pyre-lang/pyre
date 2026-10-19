@@ -2570,12 +2570,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     pa1!(
         &mut entries,
-        "pyre_object::celldict::object_mutable_cell_write_barrier",
-        "pyre_object::object_mutable_cell_write_barrier",
-        pyre_object::celldict::object_mutable_cell_write_barrier,
-    );
-    pa1!(
-        &mut entries,
         "pyre_object::unicodeobject::w_str_from_codepoint",
         "pyre_object::w_str_from_codepoint",
         pyre_object::unicodeobject::w_str_from_codepoint,

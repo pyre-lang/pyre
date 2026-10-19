@@ -911,6 +911,43 @@ mod jit_module {
         assert_eq!(oopspec_marked_not_in_trace, "jit.not_in_trace()");
         assert_eq!(LookupDict.lookup(1, &2), None);
     }
+
+    mod look_inside_iff_oopspec_move_module {
+        use majit_macros::{look_inside_iff, oopspec};
+
+        pub fn lookup_iff(_d: i64, _key: i64, _hash: i64) -> bool {
+            false
+        }
+
+        /// `#[oopspec]` outside `#[look_inside_iff]` — the stacking
+        /// `rweakvaldict.rs` `ll_dict_lookup` uses.
+        #[oopspec("dict.lookup")]
+        #[look_inside_iff(lookup_iff)]
+        pub fn lookup_outer(d: i64, key: i64, hash: i64) -> i64 {
+            d + key + hash
+        }
+
+        /// `@look_inside_iff` outside `@oopspec` — `rlib/jit.py` decorator
+        /// order, so `look_inside_iff.inner` sees `func.oopspec`.
+        #[look_inside_iff(lookup_iff)]
+        #[oopspec("dict.lookup")]
+        pub fn lookup_inner(d: i64, key: i64, hash: i64) -> i64 {
+            d + key + hash
+        }
+    }
+
+    /// `rlib/jit.py look_inside_iff` moves `func.oopspec` onto the
+    /// dont_look_inside trampoline. Both attribute stackings compile to
+    /// that shape, and the interpreter dispatch still calls the orig body.
+    #[test]
+    fn test_look_inside_iff_moves_oopspec_onto_trampoline() {
+        use look_inside_iff_oopspec_move_module::*;
+
+        assert_eq!(lookup_outer(1, 2, 3), 6);
+        assert_eq!(lookup_inner(1, 2, 3), 6);
+        assert_eq!(oopspec_lookup_outer_trampoline, "dict.lookup");
+        assert_eq!(oopspec_lookup_inner_trampoline, "dict.lookup");
+    }
 }
 
 mod jit_struct {
