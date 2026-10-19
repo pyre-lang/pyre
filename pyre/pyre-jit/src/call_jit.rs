@@ -1546,19 +1546,17 @@ pub struct ResumedFrame {
     /// Some(pc): snapshot guard — orgpc known, liveness-based filling.
     ///   pc=0 is valid (function start / loop header at bytecode 0).
     /// None: no-snapshot guard (rd_numb pc=-1), positional fallback.
-    /// CHAIN virtualizable pointer (same value on every section).
-    /// RPython parity: there is ONE virtualizable per jitdriver_sd for the
-    /// whole blackhole chain; inner sections do not own a separate PyFrame.
-    /// Carried on every `ResumedFrame` only because pyre pre-decodes the
-    /// rd_numb stream into a `Vec<ResumedFrame>` instead of streaming it
-    /// like RPython's `blackhole_from_resumedata` — the value MUST be
-    /// identical across sections (enforced by `build_resumed_frames`).
+    /// This section's own PyFrame. Outermost is the jitdriver virtualizable
+    /// (`consume_vable_info`). An inlined callee is that section's frame red
+    /// (`interp_jit.py` `reds = ['frame', 'ec']`), materialized from
+    /// TAGVIRTUAL by the reader (`rebuild_from_resumedata` /
+    /// `blackhole_from_resumedata`, one `BlackholeInterpreter` per jitcode
+    /// section).
     pub frame_ptr: *mut PyFrame,
-    /// valuestackdepth extracted from vable_values (snapshot).
+    /// valuestackdepth: outermost from `consume_vable_info`, inner from
+    /// this section's own materialized frame.
     pub vsd: usize,
-    /// interp_jit.py:31 w_globals — namespace pointer from vable_values.
-    /// virtualizable.py write_from_resume_data_partial:
-    /// ALL static fields come from resume data, not from the heap.
+    /// `pyframe.py` `get_w_globals` on this section's own frame.
     pub namespace: *const (),
     /// resume.py consume_one_section: resolved values.
     /// Structure: [live_registers...] — no scalar inputarg header.
@@ -3026,18 +3024,23 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         }
     }
 
-    // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py:67
+    // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py
     // reds = ['frame', 'ec']`) are filled per-frame by
-    // `consume_one_section` from each section's `-live-` op (resume.py
-    // :1381 / `_prepare_next_section` resume.py). RPython's vable
-    // bytecodes use that live frame red directly. Pyre's blackhole vable
-    // handlers instead address `BlackholeInterpreter::virtualizable_ptr`,
-    // so bind that Pyre-only cache from EACH frame's own red register.
+    // `consume_one_section` from each section's `-live-` op
+    // (`_prepare_next_section`). RPython's vable bytecodes use that live
+    // frame red directly. Pyre's blackhole vable handlers address
+    // `BlackholeInterpreter::virtualizable_ptr`, so bind that cache from
+    // EACH frame's own red. An inlined callee (`nextblackholeinterp` is
+    // the caller) must have its own PyFrame. A codeless continuation
+    // (`ctor_continuation`, `OperatorTail`) is `from_core_degenerate`
+    // and keeps `portal_frame_reg` at `u16::MAX` — `convert_and_run_from_pyjitpl`
+    // copies that level with no virtualizable. The outermost keeps the
+    // jitdriver virtualizable when the red is absent.
     {
-        let multi_frame = bh.nextblackholeinterp.is_some();
         let mut current = Some(&mut *bh);
         let mut frame_index = 0usize;
         while let Some(frame) = current {
+            let has_caller = frame.nextblackholeinterp.is_some();
             if majit_metainterp::bh_debug_enabled() {
                 let raw_code =
                     pyre_jit_trace::state::raw_code_for_jitcode_index(frame.jitcode.index() as i32);
@@ -3054,28 +3057,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                     frame.position,
                 );
             }
-            // The outer/root frame's standard virtualizable identity comes
-            // from `consume_vable_info` above. Preserve it for a single-frame
-            // resume. In a multi-frame snapshot that one vable section names
-            // only the outer portal frame, so even the innermost blackhole
-            // must instead bind its own frame red.
-            if (multi_frame || frame.virtualizable_ptr == 0)
-                && let Some(jitcode_index) = frame.jitcode.try_index()
-            {
+            if let Some(jitcode_index) = frame.jitcode.try_index() {
                 let (frame_reg, _) =
                     pyre_jit_trace::state::portal_red_regs_at(jitcode_index as i32);
-                // #1311: the admission below is a bare `!= 0`, and a word that
-                // is neither zero nor a frame has reached it — one dump held an
-                // aligned heap address that was not a `PyFrame`, another the
-                // tagged word `2`, and `record_application_traceback` then
-                // dereferenced it.  Which frame of the chain contributes the bad
-                // red, and whether the register is the wrong one for this
-                // jitcode or was simply never filled, are questions the whole
-                // bank answers and the admitted value alone does not, so report
-                // it beside the index read from it.  A report and not a test:
-                // rejecting the word here would exchange the fault for a
-                // silently missing traceback node while the wrong word kept
-                // flowing.
                 if majit_metainterp::bh_debug_enabled() {
                     eprintln!(
                         "[bh-chain] frame={frame_index} jitcode={jitcode_index} \
@@ -3083,12 +3067,30 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                         frame.registers_r,
                     );
                 }
-                if frame_reg != u16::MAX {
-                    if let Some(&frame_ptr) = frame.registers_r.get(frame_reg as usize) {
-                        if frame_ptr != 0 {
-                            frame.virtualizable_ptr = frame_ptr;
-                        }
+                let own = if frame_reg != u16::MAX {
+                    frame
+                        .registers_r
+                        .get(frame_reg as usize)
+                        .copied()
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                if has_caller {
+                    if frame_reg == u16::MAX {
+                        // Codeless continuation: no Python frame red.
+                    } else if own == 0 {
+                        panic!(
+                            "blackhole inner section jitcode={jitcode_index} \
+                             has no callee frame red at portal_frame_reg={frame_reg}; \
+                             consume_one_section (resume.py) writes that register \
+                             from the section -live- R-bank"
+                        );
+                    } else {
+                        frame.virtualizable_ptr = own;
                     }
+                } else if own != 0 {
+                    frame.virtualizable_ptr = own;
                 }
             }
             current = frame.nextblackholeinterp.as_deref_mut();
@@ -6209,17 +6211,13 @@ pub extern "C" fn bh_call_function_ex_fn(
     }
 }
 
-/// `_load_global` residual (pyopcode.py).  Resolves the namespace via
-/// the executing frame's `get_w_globals_storage()` when the live frame OWNS this
-/// `w_code` (`frame.pycode == w_code`) — honoring an `exec(code, ns)`
-/// frame-specific namespace — and falls back to the callee's own promoted
-/// `w_code` globals otherwise (an inlined / chained callee's frame register
-/// aliases an outer frame, so it is not this code's frame).  The
-/// `namespace_ptr` operand is ignored for the same aliasing reason; it
-/// survives only as the cell-fold recogniser's hint.  The live frame is also
-/// passed so `self.get_builtin()` works in compiled residual-call paths as
-/// well as blackhole.  namei is the raw oparg from LOAD_GLOBAL:
-/// name_idx = namei >> 1.
+/// `_load_global` residual (pyopcode.py). Resolves the namespace via
+/// this jitcode's own frame (`portal_frame_reg`): `pyframe.py
+/// get_w_globals` answers `debugdata.w_globals` for `exec(code, ns)` and
+/// `promote(pycode).w_globals` otherwise. The `namespace_ptr` operand is
+/// the cell-fold recogniser's hint; the residual re-resolves from the
+/// live frame. `self.get_builtin()` uses the same frame. namei is the
+/// raw oparg from LOAD_GLOBAL: name_idx = namei >> 1.
 pub extern "C" fn bh_load_global_fn(
     namespace_ptr: PyObjectRef,
     w_code_ptr: PyObjectRef,
@@ -6244,31 +6242,15 @@ pub extern "C" fn bh_load_global_fn(
     // and re-read at each use instead of carrying the operand across.
     let frame_anchor = unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr) };
     let parent_frame_ptr = frame_anchor.live();
-    // pypy/interpreter/pyopcode.py `_load_global`:
+    // pyopcode.py `_load_global`:
     //   w_value = self.space.finditem_str(self.get_w_globals_storage(), varname)
     //   if w_value is None:
     //       w_value = self.get_builtin().getdictvalue(self.space, varname)
     //       if w_value is None:
     //           self._load_global_failed(w_varname)
     //
-    // `self.get_w_globals()` (pyframe.py) is the executing frame's own
-    // globals object: the per-frame globals an `exec(code, ns)` installs,
-    // falling back to the code's bound globals when there is no override.
-    // Use it whenever the live frame OWNS this `w_code`
-    // (`frame.pycode == w_code`), so a compiled `LOAD_GLOBAL` resolves
-    // against the executing frame's globals — not the code's original module
-    // dict — exactly as the interpreter does.
-    //
-    // A frame that does NOT own this `w_code` is an aliased OUTER frame on a
-    // chained blackhole / inlined-callee resume (the same aliasing makes the
-    // `namespace_ptr` operand unusable, hence ignored above).  Resolve from
-    // the callee's own promoted `w_code` constant: reading `w_globals`
-    // from it yields the current module dict object the const-folding
-    // `frontend_global_flow_value` resolved statically, but live, so a
-    // relocated dict (a growing `memo`) is followed instead of dangling.
-    let w_globals = if !parent_frame_ptr.is_null()
-        && unsafe { (*parent_frame_ptr).pycode } as usize == w_code_ptr as usize
-    {
+    // `get_w_globals` (pyframe.py) on this jitcode's own frame.
+    let w_globals = if !parent_frame_ptr.is_null() {
         unsafe { (*parent_frame_ptr).get_w_globals() }
     } else {
         unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
@@ -6285,8 +6267,8 @@ pub extern "C" fn bh_load_global_fn(
         }
     }
 
-    // Residual helper adaptation: `self` is the live portal frame passed as
-    // an explicit Ref argument, so `self.get_builtin()` maps to
+    // Residual helper: `self` is this jitcode's own frame, passed as an
+    // explicit Ref argument, so `self.get_builtin()` maps to
     // PyFrame::get_builtin() without relying on blackhole-only TLS.
     let parent_frame_ptr = frame_anchor.live();
     if !parent_frame_ptr.is_null() {
@@ -6323,8 +6305,8 @@ pub extern "C" fn bh_load_global_fn(
 /// back to the live frame's globals, else NameError.  `namei` is a direct
 /// `code.names` index (no LOAD_GLOBAL push-null low-bit shift).
 ///
-/// GC-safety: the globals are read from the LIVE frame when it owns this
-/// `w_code` (`frame.pycode == w_code`), matching `bh_load_global_fn`, so a
+/// GC-safety: the globals are `get_w_globals()` on this jitcode's own
+/// frame (`portal_frame_reg`), matching `bh_load_global_fn`, so a
 /// relocated module dict is followed rather than a const-folded dangling
 /// pointer.  A user `__getattr__`/`__getitem__` on the mapping may run
 /// Python (`MayForce`).
@@ -6365,8 +6347,7 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
         }
     }
 
-    // Fall back to the live frame's globals (GC-safe when the frame owns
-    // this w_code; else the promoted w_code's own globals).
+    // Fall back to this jitcode's own frame (`get_w_globals`).
     //
     // The globals lookup below reaches a user `__getitem__` on a non-dict
     // mapping, and the builtins leg after it reads both the frame and the
@@ -6376,7 +6357,7 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     // move — so neither is carried across the lookup.
     let frame_anchor = unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr) };
     let live_globals = |frame: *mut PyFrame| unsafe {
-        if !frame.is_null() && (*frame).pycode as usize == w_code_ptr as usize {
+        if !frame.is_null() {
             (*frame).get_w_globals()
         } else {
             pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef)

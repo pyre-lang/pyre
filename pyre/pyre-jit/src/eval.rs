@@ -14833,46 +14833,24 @@ pub(crate) fn decode_and_restore_guard_failure(
         } else {
             innermost.map(|f| f.py_pc).unwrap_or(ni)
         };
-        // When the resume pc is overridden to the innermost section's
-        // `py_pc` (a multi-frame inlined-callee guard), the positional
-        // `write_from_resume_data_partial` has left the physical frame's
-        // `valuestackdepth` at the CHAIN frame's depth (the outer
-        // section's).  Correct it to the innermost section's depth so the
-        // interpreter does not resume at the inner pc carrying the outer
-        // depth — an over-count that materializes a stray operand slot and
-        // shifts every subsequent push by one (`PyFrame::push` overflow at
-        // the function's peak stack use).  `last_instr` is already handled
-        // via `resume_pc`; only the vsd lags.  Clear the slots above the
-        // corrected depth so a GC scan before the first re-executed push
-        // does not see a stale operand pointer.
-        //
-        // The correction must also run when a deeper inlined-callee frame is
-        // present (`resumed_frames.len() > 1`) even if the innermost
-        // section's `py_pc` numerically coincides with `ni`: the positional
-        // vsd left by `write_from_resume_data_partial` is still the CHAIN
-        // (outer) frame's depth, and the matching pc value does not make it
-        // correct.  Single-frame guards keep the prior `resume_pc != ni`
-        // behavior.
-        //
-        // It addresses the PHYSICAL frame, so it applies only while the
-        // innermost section belongs to that frame's OWN code object.
-        // `consume_vable_info` (resume.py) writes the virtualizable
-        // from its own resume section and nothing re-points it at an inlined
-        // callee: a callee frame is a separate object the rebuild
-        // materializes, and its depth does not index the portal frame's
-        // `locals_cells_stack_w`.  Writing a foreign code object's depth here
-        // left the live frame BELOW its own stack base (`_Unframer.read`'s 3
-        // on `_Unpickler.load`, base 5), and the paired `clear_stack_above`
-        // then nulled two live locals.
+        // `write_from_resume_data_partial` / `consume_vable_info` write the
+        // virtualizable (outermost) frame. An inlined callee is a separate
+        // object this rebuild materializes; its depth does not index the
+        // portal `locals_cells_stack_w`. Correct vsd only when the innermost
+        // section IS that physical frame.
+        let outermost_ptr = resumed_frames.first().map(|f| f.frame_ptr);
         if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(code) = innermost
-                .map(|f| f.code as usize)
-                .filter(|&code| code == jit_state.pycode_as_usize())
-            {
-                if let Some(corrected_vsd) =
-                    pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)
-                {
-                    jit_state.set_valuestackdepth(corrected_vsd);
+            if let Some(inner) = innermost {
+                let same_physical = outermost_ptr.is_some_and(|outer| {
+                    !inner.frame_ptr.is_null() && std::ptr::eq(inner.frame_ptr, outer)
+                });
+                if same_physical {
+                    if let Some(corrected_vsd) = pyre_jit_trace::state::depth_based_vsd_for_wcode(
+                        inner.code as usize,
+                        resume_pc,
+                    ) {
+                        jit_state.set_valuestackdepth(corrected_vsd);
+                    }
                 }
             }
         }
@@ -15244,10 +15222,43 @@ fn sync_virtualizable_after_guard_failure(
     }
 }
 
+/// resume.py `consume_one_section` / `enumerate_vars`: the live Ref at
+/// `portal_frame_reg` (`interp_jit.py` `reds = ['frame', 'ec']`) is this
+/// section's own PyFrame. A virtual is already materialized into `values`
+/// by `_prepare_next_section`.
+fn section_frame_red_from_values(
+    jitcode_index: i32,
+    jitcode_pc: i32,
+    values: &[Value],
+) -> *mut pyre_interpreter::pyframe::PyFrame {
+    let (frame_reg, _) = pyre_jit_trace::state::portal_red_regs_at(jitcode_index);
+    if frame_reg == u16::MAX {
+        return std::ptr::null_mut();
+    }
+    let banks =
+        pyre_jit_trace::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, jitcode_pc);
+    if banks.total_len() != values.len() {
+        panic!(
+            "section_frame_red_from_values: liveness bank len {} != section values {} \
+             (jitcode_index={jitcode_index} pc={jitcode_pc} frame_reg={frame_reg})",
+            banks.total_len(),
+            values.len(),
+        );
+    }
+    let Some(ref_pos) = banks.ref_.iter().position(|&c| c == u32::from(frame_reg)) else {
+        return std::ptr::null_mut();
+    };
+    match values.get(banks.int.len() + ref_pos) {
+        Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+        _ => std::ptr::null_mut(),
+    }
+}
+
 /// Decode rd_numb into per-frame ResumedFrame chain via
 /// `majit_ir::resumedata::rebuild_from_numbering`.
-/// Single-frame only (RPython's blackhole_from_resumedata uses
-/// per-jitcode liveness for multi-frame decode).
+/// One `ResumedFrame` per encoded jitcode section (`rebuild_from_resumedata` /
+/// `blackhole_from_resumedata`): outermost keeps the jitdriver virtualizable,
+/// inner sections carry that section's own frame red.
 fn build_resumed_frames(
     raw_values: &[i64],
     rd_numb: &[u8],
@@ -15510,6 +15521,42 @@ fn build_resumed_frames(
         // outermost (caller / JIT-driver) frame and the last entry is the
         // innermost (deepest callee).
         let is_outermost = idx == 0;
+        // `blackhole_from_resumedata` / `rebuild_from_resumedata`: each
+        // section's registers hold that level's own reds. The outermost
+        // red is the jitdriver virtualizable (`consume_vable_info`). An
+        // inlined callee's PyFrame is that section's `portal_frame_reg`
+        // (`interp_jit.py` `reds = ['frame', 'ec']`), a virtual the reader
+        // materializes from TAGVIRTUAL.
+        let frame_ptr = if is_outermost {
+            vable_frame_ptr
+        } else {
+            let (frame_reg, _) = pyre_jit_trace::state::portal_red_regs_at(frame.jitcode_index);
+            if frame_reg == u16::MAX {
+                // Codeless continuation (`ctor_continuation`, `OperatorTail`):
+                // `from_core_degenerate` leaves `portal_frame_reg` at
+                // `u16::MAX`. No Python frame red exists for this section.
+                std::ptr::null_mut()
+            } else {
+                let own = section_frame_red_from_values(frame.jitcode_index, frame.pc, &values);
+                if own.is_null() {
+                    panic!(
+                        "build_resumed_frames: inlined section {idx} \
+                         (jitcode_index={} pc={}) has no frame red \
+                         (portal_frame_reg={frame_reg}); \
+                         consume_one_section (resume.py) writes that register \
+                         from the section -live- R-bank",
+                        frame.jitcode_index, frame.pc,
+                    );
+                }
+                own
+            }
+        };
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[dynasm-debug] frame_ptr={:?} py_pc={} idx={}",
+                frame_ptr, py_pc, idx
+            );
+        }
         let w_code = if is_outermost {
             // virtualizable.py read_boxes: code from resume data, not heap.
             if !vable_pycode.is_null() {
@@ -15519,68 +15566,31 @@ fn build_resumed_frames(
             } else {
                 std::ptr::null()
             }
+        } else if !frame_ptr.is_null() {
+            unsafe { (*frame_ptr).pycode }
         } else {
             pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
                 .unwrap_or(std::ptr::null())
         };
-        let raw_code = if !w_code.is_null() {
+        // `dispatch_bytecode` (pyopcode.py) stamps `last_instr` on this
+        // frame before the opcode; resume py_pc is that coordinate.
+        if !is_outermost && !frame_ptr.is_null() {
             unsafe {
-                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
+                (*frame_ptr).last_instr = py_pc as isize;
             }
-        } else {
-            std::ptr::null()
-        };
-        // resume.py:1095/1067 parity: virtualizable_ptr is the JIT driver's
-        // PyFrame, shared across the entire blackhole chain. RPython's
-        // newframe(jitcode) creates a fresh MIFrame for each inner section
-        // (inlined call) but the virtualizable on the JIT driver is the same.
-        // pyre's BlackholeInterpreter holds its own register state per
-        // section, so inner frames don't need a PyFrame — they only need
-        // virtualizable_ptr to write back to the outermost frame at the
-        // merge point. Use vable_frame_ptr for ALL sections.
-        let frame_ptr = vable_frame_ptr;
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[dynasm-debug] frame_ptr={:?} py_pc={} idx={}",
-                frame_ptr, py_pc, idx
-            );
         }
-        // Per-frame VSD: outermost uses vable_vsd, inner frames derive
-        // from their code's nlocals + snapshot stack depth.
+        // consume_vable_info writes the outermost vsd; an inlined
+        // callee answers from its own materialized frame.
         let vsd = if is_outermost {
-            // resume.py consume_vable_info parity: outermost frame's vsd comes directly
-            // from the virtualizable. RPython does not sentinel-check 0.
             vable_vsd
-        } else if !raw_code.is_null() {
-            let nlocals = unsafe { &*raw_code }.varnames.len();
-            nlocals + values.len().saturating_sub(nlocals)
+        } else if !frame_ptr.is_null() {
+            unsafe { (*frame_ptr).valuestackdepth }
         } else {
             values.len()
         };
-        // PyFrame.get_w_globals: namespace comes from this frame's restored
-        // pycode/debugdata pair; it is not a physical virtualizable scalar.
-        let namespace = if is_outermost {
-            if !vable_frame_ptr.is_null() {
-                unsafe { (*vable_frame_ptr).get_w_globals() as *const () }
-            } else {
-                std::ptr::null()
-            }
-        } else if !w_code.is_null() {
-            // get_w_globals: each inlined-callee section resolves LOAD_GLOBAL
-            // in its own module namespace, taken from its own code — not the
-            // chain virtualizable's (mirrors recover_inline_callee_globals).
-            // Fall back to the chain namespace only when the callee code
-            // carries no globals yet.
-            let callee_ns = unsafe {
-                pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef)
-                    as *const ()
-            };
-            if !callee_ns.is_null() {
-                callee_ns
-            } else {
-                std::ptr::null()
-            }
+        // pyframe.py get_w_globals: this section's own frame.
+        let namespace = if !frame_ptr.is_null() {
+            unsafe { (*frame_ptr).get_w_globals() as *const () }
         } else {
             std::ptr::null()
         };

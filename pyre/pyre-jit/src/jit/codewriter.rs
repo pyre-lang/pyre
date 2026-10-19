@@ -846,7 +846,6 @@ fn derive_pc_live_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,
     code: &CodeObject,
-    is_true_portal: bool,
 ) -> Vec<Option<usize>> {
     // py_pc -> the stream position whose nearest-`-live-`-at-or-before is
     // the PC's resume marker.  Default = the PC's own first insn position
@@ -876,15 +875,17 @@ fn derive_pc_live_indices_from_sparse(
             .map(|k| pc_pos[k].1)
     };
     // Unconditional control-transfer target of `pc` (`JUMP_FORWARD`,
-    // `JUMP_BACKWARD_NO_INTERRUPT`, and non-portal `JUMP_BACKWARD`), or
-    // `None` for any other opcode.  Those jumps still emit no
-    // resume-relevant jitcode of their own: the blackhole steps them and
-    // lands at the target, so their resume liveness IS the target block's.
-    // True-portal `JUMP_BACKWARD` carries the jitted `bytecode_trace` poll
-    // (`emit_jump_absolute_tick`) before `loop_header` + `goto`, so it is
-    // no longer an empty uncond jump — a branch whose not-taken arm is
+    // `JUMP_BACKWARD_NO_INTERRUPT`), or `None` for any other opcode.
+    // Those jumps still emit no resume-relevant jitcode of their own: the
+    // blackhole steps them and lands at the target, so their resume
+    // liveness IS the target block's.
+    // `JUMP_BACKWARD` carries the jitted `bytecode_trace` poll
+    // (`emit_jump_absolute_tick`; `interp_jit.py` `jump_absolute` runs
+    // it on every frame) before `loop_header` + `goto`, so it is no
+    // longer an empty uncond jump — a branch whose not-taken arm is
     // that back-edge must resume at the poll, not skip to the jump target.
-    // Used by the break-arm re-key below.
+    // `loop_header` stays true-portal only. Used by the break-arm re-key
+    // below.
     let uncond_jump_target = |pc: usize| -> Option<usize> {
         let (instr, op_arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
         match instr {
@@ -894,13 +895,9 @@ fn derive_pc_live_indices_from_sparse(
                 delta.get(op_arg).as_usize(),
             )),
             // `JUMP_BACKWARD_NO_INTERRUPT` still emits no resume-relevant
-            // jitcode (no tick).  Non-portal `JUMP_BACKWARD` is the same:
-            // the tick is true-portal only.  `backward_jump_target` keeps
-            // the skip_caches vs direct `pc + 1` base distinction.
+            // jitcode (no tick). `backward_jump_target` keeps the
+            // skip_caches vs direct `pc + 1` base distinction.
             Instruction::JumpBackwardNoInterrupt { .. } => {
-                pyre_interpreter::backward_jump_target(code, pc, instr, op_arg)
-            }
-            Instruction::JumpBackward { .. } if !is_true_portal => {
                 pyre_interpreter::backward_jump_target(code, pc, instr, op_arg)
             }
             _ => None,
@@ -2285,9 +2282,8 @@ const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
 /// the loop.  The pyre-only breaker bits stay armed for `eval_loop_jit`
 /// (`bh_bytecode_trace_jitted_slow`).
 ///
-/// `emit_tick` is the true-portal `JUMP_BACKWARD` gate: a non-portal jitcode
-/// aliases `frame_var` to the outermost frame (same gap as ReturnValue's
-/// `last_instr` store).  `eb_addr == 0` also takes the no-tick shape.
+/// Every frame runs the `bytecode_trace` poll (`interp_jit.py`
+/// `jump_absolute`). `eb_addr == 0` takes the no-tick shape.
 fn emit_jump_absolute_tick(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -2300,7 +2296,6 @@ fn emit_jump_absolute_tick(
     ec_var: super::flow::Variable,
     bytecode_trace_slow_fn_idx: u16,
     bytecode_trace_slow_flavor: CallFlavor,
-    emit_tick: bool,
     emit_header: bool,
     jdindex: usize,
     catch_for_pc: &[Option<u16>],
@@ -2310,7 +2305,7 @@ fn emit_jump_absolute_tick(
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) {
     let eb_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
-    let header_block = if !emit_tick || eb_addr == 0 {
+    let header_block = if eb_addr == 0 {
         current_block.clone()
     } else {
         // interp_jit.py jump_absolute: `self.last_instr = intmask(jumpto)`
@@ -2321,9 +2316,6 @@ fn emit_jump_absolute_tick(
         // `jump_absolute` shim uses `set_last_instr_from_next_instr(jumpto)`
         // (`last_instr = jumpto - 1`), which is the f_lasti store and not
         // the live convention.
-        //
-        // Portal jitcode only (`emit_tick`): in a non-portal callee
-        // `frame_var` aliases the outermost frame (ReturnValue arm).
         //
         // Split a new graph block for the poll.  JUMP_BACKWARD falls
         // through from STORE_FAST in the same CFG block; appending the
@@ -9703,13 +9695,9 @@ impl CodeWriter {
                                 if target_py_pc < num_instrs {
                                     // interp_jit.py `jump_absolute`: jitted
                                     // `bytecode_trace` then `can_enter_jit`.
-                                    // pyre-adaptation (inlined callee's own
-                                    // frame is unpublished — same gap as
-                                    // ReturnValue's last_instr store): the
-                                    // whole tick is true-portal only;
-                                    // `loop_header` stays under the existing
-                                    // true-portal && !handler-only condition.
-                                    let emit_tick = is_true_portal;
+                                    // Every frame runs the tick; `loop_header`
+                                    // stays true-portal only — the jitdriver
+                                    // merge point.
                                     let emit_header = !backward_jump_is_handler_only_target(
                                         code,
                                         py_pc,
@@ -9727,7 +9715,6 @@ impl CodeWriter {
                                         ec_var,
                                         bytecode_trace_jitted_slow_fn_idx,
                                         bytecode_trace_jitted_slow_fn_flavor,
-                                        emit_tick,
                                         emit_header,
                                         PYTHON_PORTAL_JD_INDEX,
                                         &catch_for_pc,
@@ -9757,23 +9744,9 @@ impl CodeWriter {
                             // raises and catches, the raise.  Store `py_pc`, not the
                             // `py_pc - 1` of the resume-at sites (`emit_abort_permanent!`)
                             // — this opcode is dispatched here, not resumed at.
-                            //
-                            // Portal jitcode only.  In a non-portal callee
-                            // `frame_var` aliases the OUTERMOST frame rather
-                            // than naming that callee's own (the same aliasing
-                            // the `LoadGlobal` register-form namespace declines
-                            // for below), so the store would stamp the callee's
-                            // coordinate into its caller and the caller would
-                            // then resolve it against its own line table.  A
-                            // frame observed after an inlined callee returned —
-                            // through `sys._getframe(1)` or a retained traceback
-                            // — would report an unrelated line, which is the
-                            // very failure this store exists to remove.
-                            // Declining leaves the caller's own coordinate
-                            // intact.  The inlined callee's own frame stays
-                            // unpublished during a resume that aliases
-                            // `frame_var` to the outermost frame.
-                            if is_true_portal {
+                            // `frame_var` is this jitcode's own frame, including an
+                            // inlined callee.
+                            {
                                 let v_li: super::flow::FlowValue =
                                     super::flow::Constant::signed(py_pc as i64).into();
                                 record_graph_op(
@@ -9885,9 +9858,8 @@ impl CodeWriter {
                             // global becomes a constant call target through
                             // that fold, not through a baked pointer.  The
                             // `bh_load_global_fn` residual never reads the
-                            // placeholder: it re-resolves from the live frame
-                            // when that frame owns this `w_code`, else from
-                            // the code's live `w_globals`.  pycode (r1) is this
+                            // placeholder: it re-resolves from this jitcode's
+                            // own frame (`get_w_globals`).  pycode (r1) is this
                             // jitcode's promoted `W_Code`; frame (r2) is this
                             // jitcode's own red (`get_builtin()`).
                             //
@@ -15108,8 +15080,7 @@ impl CodeWriter {
             .iter()
             .position(|i| i.is_live())
             .expect("canonical splice stream carries no -live- marker");
-        let derived =
-            derive_pc_live_indices_from_sparse(&spliced, num_instrs, code, is_true_portal);
+        let derived = derive_pc_live_indices_from_sparse(&spliced, num_instrs, code);
         let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
         let mut last = first_live;
         for entry in &derived {
@@ -16466,13 +16437,11 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 ///     `inline_callee_consts` inside an inlined callee — so a
 ///     cross-module inlined `LOAD_GLOBAL` reads its own module's
 ///     globals rather than the caller's.  `bh_load_global_fn` never
-///     reads the operand at all: it resolves `w_globals` from the live
-///     frame when that frame owns this `w_code` and from the `w_code`'s
-///     own `w_globals` otherwise.  What is still declined rather than
-///     compiled is a callee whose code object was rebound to a second
-///     namespace (`frame_stores_global`), because this inline-frame
-///     encoder does not put `FrameDebugData.w_globals` into resume
-///     data.
+///     reads the operand at all: it resolves `w_globals` from this
+///     jitcode's own frame (`get_w_globals`).  A callee whose code object
+///     was rebound to a second namespace (`frame_stores_global`) is still
+///     declined by the inliner, because the inline-frame encoder does not
+///     put `FrameDebugData.w_globals` into resume data.
 ///   * `bh_call_fn` / `bh_call_fn_N(callable, null_or_self, args...)` —
 ///     frame-less residual call ABI matching RPython
 ///     `bhimpl_residual_call_r_r` (`cpu.bh_call_r(func, None, args_r,
