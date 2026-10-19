@@ -689,6 +689,66 @@ pub(crate) fn discard_staged_abort(session: &std::cell::RefCell<WalkSession>) {
     }
 }
 
+/// Complete-framestack latch, or nothing.
+///
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every
+/// `metainterp.framestack` level. An image that is missing ancestor helper
+/// frames resumes the innermost helper and returns into the wrong frame, so a
+/// failed ancestor splice is not a latch: discard the staged image and let
+/// the caller apply [`helper_too_long_decision`].
+pub(crate) fn finish_helper_abort_latch(
+    session: &std::cell::RefCell<WalkSession>,
+    splice_ok: bool,
+) -> bool {
+    if abort_blackhole_latched() && splice_ok {
+        return true;
+    }
+    if abort_blackhole_latched() {
+        discard_staged_abort(session);
+    }
+    false
+}
+
+/// After `run_one_step`, `blackhole_if_trace_too_long` (`pyjitpl.py`
+/// `_interpret`). A SubReturn / SubRaise is `finishframe` /
+/// `finishframe_exception` first. A complete helper+ancestor image raises
+/// `SwitchToBlackhole(ABORT_TOO_LONG)`. A declined latch with nothing
+/// executed lets the enclosing Python CALL latch. An effectful walk without
+/// an image keeps executing (`execute_varargs`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HelperTooLongDecision {
+    DeliverOutcome,
+    Abort,
+    KeepExecuting,
+}
+
+pub(crate) fn helper_too_long_decision(
+    snapshot_safe: bool,
+    latched_complete: bool,
+    executed_effects: usize,
+) -> HelperTooLongDecision {
+    if !snapshot_safe {
+        HelperTooLongDecision::DeliverOutcome
+    } else if latched_complete || executed_effects == 0 {
+        HelperTooLongDecision::Abort
+    } else {
+        HelperTooLongDecision::KeepExecuting
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn stage_test_helper_abort_image() {
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+            framestack: majit_metainterp::MIFrameStack::empty(),
+            last_exc_value: 0,
+            raising_exception: false,
+            mirror_stack: None,
+            origin: "test-splice-fail",
+        });
+    });
+}
+
 /// Name each decline under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_
 /// miframe`'s `s2dbg!` and `try_adopt_multi_frame_blackhole`'s `mfdbg!` name
 /// theirs: an unlatched abort and a latch that was never reached both end in the
@@ -874,6 +934,177 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     })
 }
 
+/// Runtime `JitCode` for a translated helper at `MetaInterpStaticData.jitcodes[index]`.
+///
+/// Build-time helpers live in the charon table (`get_runtime_jitcode_by_index`).
+/// A test-installed payload sits above that range and resolves through
+/// `pyjitcode_for_jitcode_index`. Either Arc is a real `MIFrame.jitcode`
+/// (`blackhole.py` `_copy_data_from_miframe` / `setposition`).
+pub(crate) fn helper_jitcode_arc(
+    index: usize,
+) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+    crate::jitcode_runtime::get_runtime_jitcode_by_index(index).or_else(|| {
+        crate::state::pyjitcode_for_jitcode_index(index as i32).map(|pjc| pjc.jitcode.clone())
+    })
+}
+
+/// Jitcode index of the helper body about to be walked.
+///
+/// `SubJitCodeBody.jitcode_index` is `JitCode.index` (`MIFrame.jitcode`).
+/// A synthetic test body has no table slot. The splice reads
+/// `transparent_helper_jitcode_index.or(body.jitcode_index)` and does
+/// not scan by code pointer.
+pub(crate) fn helper_index_for_sub_body(sub_body: &SubJitCodeBody) -> Option<usize> {
+    sub_body.jitcode_index
+}
+
+/// Operand-stack image of the Python portal paused under a helper.
+///
+/// `capture_root_parent_resume_stack` needs `first_inline()`; a helper
+/// entered from the portal has only `framestack[0]` (`InlineFrame::portal`)
+/// plus `bind_paused_caller_regs` live banks.
+fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    origin: &'static str,
+) -> Option<MirrorStackImage> {
+    let paused = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .last()
+            .and_then(|frame| frame.paused_live())
+    }?;
+    let py_pc = ctx.fbw_mode.inline_caller_py_pc.unwrap_or(0) as usize;
+    let boxes = paused.frame_state().borrow().vstack_boxes.clone();
+    let mut slots = Vec::with_capacity(boxes.len());
+    for &opref in &boxes {
+        match ctx.trace_ctx.concrete_of_opref(opref) {
+            Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
+                slots.push(value.as_usize() as pyre_object::PyObjectRef);
+            }
+            other => {
+                latchdbg!(
+                    "origin={origin} paused-portal-mirror slot {}/{} unresolved \
+                     opref={opref:?} concrete={other:?}",
+                    slots.len(),
+                    boxes.len(),
+                );
+                return None;
+            }
+        }
+    }
+    Some(MirrorStackImage { py_pc, slots })
+}
+
+/// Portal `MIFrame` sitting at the CALL that entered a root helper.
+///
+/// `_setup_return_value_*` (`blackhole.py`) writes `code[position-1]`, so
+/// this frame resumes at the CALL's `next_pc` with that dest color unset.
+fn build_paused_portal_miframe<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    paused: Option<&LiveFrameRegs>,
+    origin: &'static str,
+) -> Option<majit_metainterp::MIFrame> {
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        latchdbg!("origin={origin} paused-portal no-snapshot-sym");
+        return None;
+    }
+    let jitcode = unsafe {
+        let sym = &*ctx.fbw_mode.snapshot_sym;
+        if sym.jitcode().is_null() {
+            latchdbg!("origin={origin} paused-portal snapshot jitcode null");
+            return None;
+        }
+        (&(*sym.jitcode()).payload).jitcode.clone()
+    };
+    let call_jit_pc = match ctx.entry_py_pc {
+        EntryPyPc::Jit(pc) => Some(pc),
+        EntryPyPc::Py(_) => None,
+    };
+    // `_setup_return_value_*` writes `code[position-1]`. The Python-opcode
+    // resume marker is the CALL's enclosing instruction, not the CALL end.
+    let resume_pc =
+        paused_parent_resume_pc(call_jit_pc, ctx.outer_resume_marker_jit_pc, &jitcode.code)?;
+    if !instruction_starts_at(&jitcode, resume_pc) {
+        latchdbg!("origin={origin} paused-portal resume_pc={resume_pc} not an instruction start");
+        return None;
+    }
+    let paused = paused?;
+    let skip_result = call_jit_pc.and_then(|pc| {
+        let index = i32::try_from(jitcode.index()).ok()?;
+        crate::state::pyjitcode_for_jitcode_index(index)
+            .and_then(|pjc| parent_call_result_color(&pjc, pc))
+    });
+    let mut miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    fill_abort_miframe_register_banks(
+        ctx.trace_ctx,
+        &mut miframe,
+        &paused.registers_i,
+        &paused.registers_r,
+        &paused.registers_f,
+        &[],
+        paused.frame_state(),
+        skip_result,
+    )
+    .then_some(miframe)
+}
+
+/// Insert ancestor helper frames immediately below the latched innermost.
+///
+/// `convert_and_run_from_pyjitpl` copies every `MIFrame` outermost-first.
+/// The innermost walk latches `[python…, grandchild]`; this restores the
+/// helpers that `SubWalkDriver` still holds between them.
+pub(crate) fn splice_helper_frames_before_innermost(
+    helpers: Vec<majit_metainterp::MIFrame>,
+) -> bool {
+    if helpers.is_empty() {
+        return true;
+    }
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        let Some(latched) = borrow.as_mut() else {
+            return false;
+        };
+        let Some(innermost) = latched.framestack.pop() else {
+            return false;
+        };
+        for frame in helpers {
+            latched.framestack.push(frame);
+        }
+        latched.framestack.push(innermost);
+        true
+    })
+}
+
+/// Paused helper `MIFrame` at the CALL that entered its child.
+pub(crate) fn build_helper_parent_miframe(
+    trace_ctx: &TraceCtx,
+    jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+    resume_pc: usize,
+    registers_i: &RegisterBank,
+    registers_r: &RegisterBank,
+    registers_f: &RegisterBank,
+    concrete_registers_i: &[ConcreteValue],
+    frame_state: &WalkFrameState,
+    skip_result: Option<(char, usize)>,
+) -> Option<majit_metainterp::MIFrame> {
+    if !instruction_starts_at(&jitcode, resume_pc) {
+        return None;
+    }
+    let mut miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    fill_abort_miframe_register_banks(
+        trace_ctx,
+        &mut miframe,
+        registers_i,
+        registers_r,
+        registers_f,
+        concrete_registers_i,
+        frame_state,
+        skip_result,
+    )
+    .then_some(miframe)
+}
+
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
@@ -888,7 +1119,10 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         _ => 0,
     };
 
-    if ctx.session.borrow().at_portal() && !ctx.fbw_mode.inline_subwalk {
+    if ctx.session.borrow().at_portal()
+        && !ctx.fbw_mode.inline_subwalk
+        && !ctx.fbw_mode.transparent_helper_subwalk
+    {
         let Some((jitcode, cf_addr, live_root_addr)) = (unsafe {
             if ctx.fbw_mode.snapshot_sym.is_null() {
                 None
@@ -982,7 +1216,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             });
         });
         true
-    } else if ctx.fbw_mode.inline_subwalk {
+    } else if ctx.fbw_mode.inline_subwalk || ctx.fbw_mode.transparent_helper_subwalk {
         let Some(framestack) =
             build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong, origin)
         else {
@@ -996,14 +1230,34 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // `ctx` is the innermost callee, so its ordinary vstack mirror names
         // the wrong frame.  Reconstruct frame 0 from the paused caller image
         // captured at the outermost inline push, exactly where RPython keeps
-        // that root MIFrame's register bank.  An incomplete image is not a
-        // latch: `ABORT_TOO_LONG` with effects cannot decline into replay
-        // (`trace_too_long_abort_safe`), so refuse here and keep recording
-        // until a later step can hand off (`latch_abort_blackhole`).
-        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
+        // that root MIFrame's register bank.  A helper entered from the
+        // portal has no `first_inline()`; use the paused portal banks
+        // `bind_paused_caller_regs` stored instead.
+        // An incomplete image is not a latch: `ABORT_TOO_LONG` with effects
+        // cannot decline into replay (`trace_too_long_abort_safe`), so refuse
+        // here and keep recording until a later step can hand off.
+        let Some(mirror_stack) = (if ctx.session.borrow().at_portal() {
+            capture_paused_portal_mirror_stack(ctx, origin)
+        } else {
+            capture_root_parent_resume_stack(ctx)
+        }) else {
             latchdbg!("origin={origin} mf-root-parent-stack");
             return false;
         };
+        if fbw_debug_abort_enabled() {
+            let names: Vec<&str> = framestack
+                .frames
+                .iter()
+                .map(|frame| frame.jitcode.name())
+                .collect();
+            eprintln!(
+                "[latch-accept] origin={origin} multi-frame depth={} helper={} \
+                 pc={} names={names:?}",
+                framestack.frames.len(),
+                ctx.fbw_mode.transparent_helper_subwalk,
+                resume_pc,
+            );
+        }
         FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
             *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
                 framestack,
@@ -1022,6 +1276,23 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         );
         false
     }
+}
+
+/// Helper crossed `trace_limit` with a Continue snapshot, no latched
+/// image, and zero executed effects across the walk.
+///
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies the live helper
+/// frame; unit tests and a declined preflight cannot. Returning
+/// `TraceTooLong` lets the enclosing Python CALL latch at that CALL
+/// (`latch_abort_blackhole`, origin `mod2730-too-long`). Journals stay
+/// applied: the leftover is only the 0-effect case, so there is no suffix
+/// to undo and no CALL to restart.
+pub(crate) fn helper_too_long_result<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> DispatchError {
+    let ops = ctx.trace_ctx.num_recorded_ops();
+    DispatchError::TraceTooLong { pc, ops }
 }
 
 /// Prepare a quasi-immutable abort raised at `resume_pc`.
@@ -1333,7 +1604,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
 /// `run_one_step`. Requiring marker liveness here would make an effectful
 /// straight-line tail unbounded again whenever the limit lands between
 /// markers.
-pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
+pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
     resume_pc: usize,
@@ -1348,8 +1619,9 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     // spanning pc 8..19, and no build emits byte 5 as an opcode at all.
     //
     // `build_multi_frame_miframe` already declines this class for its own
-    // innermost frame. Declining is the supported outcome: every caller falls
-    // back to the rollback/replay path.
+    // innermost frame. A declined fill is not a rollback: the walk either
+    // keeps executing (`mc_diag_bump(26)`) or, with zero effects, lets the
+    // enclosing CALL latch.
     if !instruction_starts_at(&jitcode, resume_pc) {
         if fbw_debug_abort_enabled() {
             eprintln!(
@@ -1417,6 +1689,56 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     miframe: &mut majit_metainterp::MIFrame,
 ) -> bool {
+    fill_abort_miframe_register_banks(
+        ctx.trace_ctx,
+        miframe,
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        ctx.concrete_registers_i,
+        &ctx.frame_state,
+        None,
+    )
+}
+
+/// Fill every currently-known register color, matching
+/// `blackhole.py:_copy_data_from_miframe`.
+///
+/// The vable-escape latch above only needs the resume marker's live set: it
+/// resumes immediately after one forcing residual whose result is supplied
+/// separately. `ABORT_TOO_LONG` is different — the blackhole can follow
+/// arbitrary control flow from a post-step pc before reaching a terminal, so
+/// colors outside that marker-local live set may be read later. RPython copies
+/// all three complete MIFrame banks; do the same for this abort instead of
+/// relying on the narrower resume-liveness cache.
+///
+/// `_copy_data_from_miframe` (`blackhole.py`) guards every bank entry
+/// with `if box is not None` and has no failing path — but there, a `None`
+/// register is a **dead** one the jitcode's liveness already cleared, and every
+/// register that survives holds a box with a value.  "Live, but the walk knows
+/// no value" has no upstream counterpart, and skipping such a color would leave
+/// its pre-sized blackhole register at zero for a resume that can follow
+/// arbitrary control flow to an instruction that reads it.  So `OpRef::NONE`
+/// (dead, upstream's `box is None`) is skipped, and a live color with no
+/// concrete refuses the whole frame.
+///
+/// One live Ref color carries a value neither concrete lookup can express: the
+/// dead-`box_bool` marker holds a comparison's raw truth Int in a Ref register.
+/// It is unfillable by construction rather than unknown, so the Ref bank
+/// reconstructs the singleton instead of refusing — see there.
+///
+/// `skip_result` is the dest of a CALL this paused parent sits on:
+/// `_setup_return_value_*` writes that color when the callee finishes.
+fn fill_abort_miframe_register_banks(
+    trace_ctx: &TraceCtx,
+    miframe: &mut majit_metainterp::MIFrame,
+    registers_i: &RegisterBank,
+    registers_r: &RegisterBank,
+    registers_f: &RegisterBank,
+    concrete_registers_i: &[ConcreteValue],
+    frame_state: &WalkFrameState,
+    skip_result: Option<(char, usize)>,
+) -> bool {
     // Name the declining bank and color under `PYRE_FBW_DEBUG_ABORT`, the way
     // `build_multi_frame_miframe` names its own: "innermost declined" alone
     // does not say which register had no concrete.
@@ -1428,27 +1750,30 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
         };
     }
     for color in 0..miframe.int_regs.len() {
-        if let Some(value) = ctx
-            .concrete_registers_i
-            .get(color)
-            .copied()
-            .and_then(|value| match value {
-                ConcreteValue::Int(value) => Some(value),
-                ConcreteValue::Bool(value) => Some(i64::from(value)),
-                _ => None,
-            })
+        if skip_result == Some(('i', color)) {
+            continue;
+        }
+        if let Some(value) =
+            concrete_registers_i
+                .get(color)
+                .copied()
+                .and_then(|value| match value {
+                    ConcreteValue::Int(value) => Some(value),
+                    ConcreteValue::Bool(value) => Some(i64::from(value)),
+                    _ => None,
+                })
         {
             miframe.int_regs[color] = Some(OpRef::const_int(value));
             continue;
         }
         if miframe.int_regs[color].is_none() {
-            let Some(opref) = ctx.registers_i.get(color) else {
+            let Some(opref) = registers_i.get(color) else {
                 continue;
             };
             if opref == OpRef::NONE {
                 continue;
             }
-            let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            let Some(majit_ir::Value::Int(value)) = trace_ctx.concrete_of_opref(opref) else {
                 s2dbg!("int color={color} opref={opref:?} has no concrete");
                 return false;
             };
@@ -1457,21 +1782,23 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     }
 
     for color in 0..miframe.ref_regs.len() {
-        let opref = ctx.registers_r.get(color);
-        let forwarded = opref
-            .filter(|&value| value != OpRef::NONE)
-            .and_then(|value| {
-                match ctx
-                    .trace_ctx
-                    .lookup_opref_concrete(value)
-                    .or_else(|| ctx.trace_ctx.recover_ref_value(value, 8))
-                {
-                    Some(majit_ir::Value::Ref(value)) => Some(value.0 as i64),
-                    _ => None,
-                }
-            });
-        let from_shadow = ctx
-            .frame_state
+        if skip_result == Some(('r', color)) {
+            continue;
+        }
+        let opref = registers_r.get(color);
+        let forwarded =
+            opref
+                .filter(|&value| value != OpRef::NONE)
+                .and_then(|value| {
+                    match trace_ctx
+                        .lookup_opref_concrete(value)
+                        .or_else(|| trace_ctx.recover_ref_value(value, 8))
+                    {
+                        Some(majit_ir::Value::Ref(value)) => Some(value.0 as i64),
+                        _ => None,
+                    }
+                });
+        let from_shadow = frame_state
             .borrow()
             .concrete_registers_r
             .get(color)
@@ -1496,22 +1823,41 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     }
 
     for color in 0..miframe.float_regs.len() {
+        if skip_result == Some(('f', color)) {
+            continue;
+        }
         if miframe.float_regs[color].is_some() {
             continue;
         }
-        let Some(opref) = ctx.registers_f.get(color) else {
+        let Some(opref) = registers_f.get(color) else {
             continue;
         };
         if opref == OpRef::NONE {
             continue;
         }
-        let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+        let Some(majit_ir::Value::Float(value)) = trace_ctx.concrete_of_opref(opref) else {
             s2dbg!("float color={color} opref={opref:?} has no concrete");
             return false;
         };
         miframe.float_regs[color] = Some(OpRef::const_float(value));
     }
     true
+}
+
+/// Resume pc of a paused parent sitting on a CALL.
+///
+/// `_setup_return_value_*` (`blackhole.py`) writes `code[position-1]`, so
+/// the parent must sit at the CALL's `next_pc`. The Python-opcode resume
+/// marker is only the fallback when this frame has no CALL coordinate
+/// (`descr_call` / operator tails).
+pub(crate) fn paused_parent_resume_pc(
+    call_jit_pc: Option<usize>,
+    outer_resume_marker_jit_pc: Option<usize>,
+    code: &[u8],
+) -> Option<usize> {
+    call_jit_pc
+        .and_then(|pc| decode_op_at(code, pc).map(|op| op.next_pc))
+        .or(outer_resume_marker_jit_pc)
 }
 
 /// Result-register of the CALL this paused parent sits on, if the op returns
@@ -1537,11 +1883,11 @@ fn parent_resume_pc(
     if let Some(concrete) = parent.blackhole.as_ref() {
         return Some(concrete.resume_pc);
     }
-    if parent.call_jitcode_pc.is_none() {
-        return parent.resume_marker_jit_pc;
-    }
-    let call_jit_pc = parent.call_jitcode_pc?;
-    decode_op_at(&pjc.jitcode.code, call_jit_pc).map(|call| call.next_pc)
+    paused_parent_resume_pc(
+        parent.call_jitcode_pc,
+        parent.resume_marker_jit_pc,
+        &pjc.jitcode.code,
+    )
 }
 
 /// One paused caller as an `MIFrame`. Prefer the CALL-site blackhole capture;
@@ -2012,26 +2358,39 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         };
     }
     let session = ctx.session.borrow();
-    if session.at_portal() {
-        s2dbg!(
-            "origin={origin} framestack empty depth={} transparent_helper_subwalk={}",
-            session.framestack.len(),
-            ctx.fbw_mode.transparent_helper_subwalk
-        );
-        return None;
-    }
     let mut frames = majit_metainterp::MIFrameStack::empty();
-
-    for (index, parent) in session
-        .framestack
-        .iter()
-        .flat_map(|inline| inline.parents.iter())
-        .enumerate()
-    {
-        let Some(miframe) = build_parent_miframe(ctx, parent, origin, index) else {
+    if session.at_portal() {
+        if !ctx.fbw_mode.transparent_helper_subwalk {
+            s2dbg!(
+                "origin={origin} framestack empty depth={} transparent_helper_subwalk={}",
+                session.framestack.len(),
+                ctx.fbw_mode.transparent_helper_subwalk
+            );
+            return None;
+        }
+        let paused = session
+            .framestack
+            .last()
+            .and_then(|frame| frame.paused_live());
+        drop(session);
+        let Some(portal) = build_paused_portal_miframe(ctx, paused.as_ref(), origin) else {
+            s2dbg!("origin={origin} paused-portal declined");
             return None;
         };
-        frames.push(miframe);
+        frames.push(portal);
+    } else {
+        for (index, parent) in session
+            .framestack
+            .iter()
+            .flat_map(|inline| inline.parents.iter())
+            .enumerate()
+        {
+            let Some(miframe) = build_parent_miframe(ctx, parent, origin, index) else {
+                return None;
+            };
+            frames.push(miframe);
+        }
+        drop(session);
     }
 
     // The innermost frame is the callee `ctx` is actively sub-walking. In a
@@ -2040,8 +2399,21 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     // pins the OUTER jitcode while `resume_pc` and the concrete banks are the
     // callee's, landing the resume mid-op in the wrong code. Resolve the
     // callee's own jitcode so all three share its coordinate space; fall back
-    // to `snapshot_sym` for a top-level (non-sub-walk) abort.
-    let innermost_jitcode = if let Some(consts) = ctx.inline_callee_consts {
+    // to `snapshot_sym` for a top-level (non-sub-walk) abort. A translated
+    // helper is its own `MIFrame` (`pyjitpl.py` `_interpret` /
+    // `blackhole.py` `convert_and_run_from_pyjitpl`): use that helper's
+    // jitcode, not the enclosing Python one.
+    let innermost_jitcode = if ctx.fbw_mode.transparent_helper_subwalk {
+        let Some(index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
+            s2dbg!("origin={origin} innermost: helper has no jitcode index");
+            return None;
+        };
+        let Some(jc) = helper_jitcode_arc(index) else {
+            s2dbg!("origin={origin} innermost: helper jitcode {index} unresolved");
+            return None;
+        };
+        jc
+    } else if let Some(consts) = ctx.inline_callee_consts {
         let Some(jc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
             s2dbg!(
                 "origin={origin} innermost: no pyjitcode for callee jitcode_index={}",
@@ -4392,6 +4764,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // across the back edge and make a later linear `catch_exception/L` look like
     // it is handling a fresh raise.
     clear_walk_exception(ctx);
+
+    // `_interpret` runs `run_one_step` (this residual) and only then
+    // `blackhole_if_trace_too_long`. A previous Continue that already
+    // crossed the limit either latched and raised, or is still executing
+    // every call until a later post-step can hand off
+    // (`helper_too_long_decision`). Do not residualize the CALL here
+    // (`declined_symbolic`): that leaves subsequent steps without the
+    // concrete result `execute_varargs` would have produced.
 
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
     // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`

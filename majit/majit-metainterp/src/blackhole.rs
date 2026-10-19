@@ -13585,31 +13585,66 @@ fn read_inline_call_jitcode(
     p: usize,
 ) -> (usize, i64, CallDescrHandle, usize) {
     let idx = (code[p] as usize) | ((code[p + 1] as usize) << 8);
-    let entry = bh
-        .jitcode
-        .descr_at(idx)
-        .unwrap_or_else(|| panic!("inline_call: descrs[{idx}] is absent from both descr pools"));
-    if let Some(jitcode) = entry.as_jitcode_owned() {
-        return (
-            jitcode.try_index().unwrap_or(0),
-            jitcode.fnaddr,
-            CallDescrHandle::InCalleeJitCode(jitcode),
-            p + 2,
-        );
+    // Same two-pool order as `read_descr`: `descr_at` (per-jitcode then
+    // `GLOBAL_BUILD_DESCR_POOL`), then the builder table `bh.descrs`.
+    // A helper `from_canonical` has empty `exec.descrs`; the `j` index
+    // names the shared assembler pool (`BlackholeInterpBuilder._get_method`
+    // `'d'`/`'j'` arm, `value = self.descrs[index]`).
+    if let Some(entry) = bh.jitcode.descr_at(idx) {
+        if let Some(jitcode) = entry.as_jitcode_owned() {
+            return (
+                jitcode.try_index().unwrap_or(0),
+                jitcode.fnaddr,
+                CallDescrHandle::InCalleeJitCode(jitcode),
+                p + 2,
+            );
+        }
+        match entry.as_bh_descr() {
+            Some(BhDescr::JitCode {
+                jitcode_index,
+                fnaddr,
+                ..
+            }) => {
+                return (
+                    *jitcode_index,
+                    *fnaddr,
+                    CallDescrHandle::InJitCode(bh.jitcode.clone(), idx),
+                    p + 2,
+                );
+            }
+            _ => panic!("inline_call: descrs[{idx}] is not a JitCode entry: {entry:?}"),
+        }
     }
-    // A runtime-built pool may still hold the flattened form.
-    match entry.as_bh_descr() {
-        Some(BhDescr::JitCode {
+    let descr = bh.descrs.get(idx).unwrap_or_else(|| {
+        panic!(
+            "inline_call: descrs[{idx}] is out of range for {} entries",
+            bh.descrs.len()
+        )
+    });
+    match descr {
+        BhDescr::JitCode {
             jitcode_index,
             fnaddr,
             ..
-        }) => (
-            *jitcode_index,
-            *fnaddr,
-            CallDescrHandle::InJitCode(bh.jitcode.clone(), idx),
-            p + 2,
-        ),
-        _ => panic!("inline_call: descrs[{idx}] is not a JitCode entry: {entry:?}"),
+        } => {
+            if let Some(jitcode) = crate::jitcode::global_build_descr_pool()
+                .and_then(|pool| pool.jitcode_at(*jitcode_index))
+            {
+                return (
+                    *jitcode_index,
+                    jitcode.fnaddr,
+                    CallDescrHandle::InCalleeJitCode(jitcode),
+                    p + 2,
+                );
+            }
+            (
+                *jitcode_index,
+                *fnaddr,
+                CallDescrHandle::InBuilderTable(descr),
+                p + 2,
+            )
+        }
+        _ => panic!("inline_call: descrs[{idx}] is not a JitCode entry: {descr:?}"),
     }
 }
 

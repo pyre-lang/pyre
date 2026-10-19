@@ -3246,6 +3246,8 @@ mod tests {
             }
         }
 
+        // recorder-owned 0x96E2_4/5/6000 intern keys. A sibling intern of
+        // the same word `stamp_reuse`s the process-lifetime slot.
         let original_a = GcRef(0x96E2_4000);
         let original_b = GcRef(0x96E2_5000);
         let forwarded_b = GcRef(0x96E2_6000);

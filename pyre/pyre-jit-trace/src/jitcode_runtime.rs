@@ -144,6 +144,12 @@ pub(crate) fn get_jitcode_ref_by_index(index: usize) -> Option<&'static Arc<JitC
     Some(&cell.get_or_init(|| FrozenJitCode(load_jitcode(index))).0)
 }
 
+/// Already-published body at `index`, or `None` if that cell was never
+/// decoded. Does not run [`load_jitcode`].
+pub(crate) fn peek_jitcode_ref_by_index(index: usize) -> Option<&'static Arc<JitCode>> {
+    JITCODE_CELLS.get(index)?.get().map(|frozen| &frozen.0)
+}
+
 fn load_compiled_jit_drivers() -> Vec<CompiledJitDriver> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jit_drivers.bin"));
     let vec: Vec<CompiledJitDriver> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
@@ -2802,6 +2808,13 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     // blackhole.py order: setup_insns, then setup_descrs.
     builder.setup_insns(insns_opname_to_byte());
     builder.setup_descrs(descr_table());
+    // Helper JitCodes (`from_canonical`) carry an empty `exec.descrs` and
+    // resolve `d`/`j` through `JitCode::descr_at` →
+    // `GLOBAL_BUILD_DESCR_POOL` (`assembler.py` `Assembler.descrs`).
+    // FBW abort (`trace.rs` `drive_multi_frame_blackhole`) uses this
+    // builder; without the pool, `inline_call` panics on the first helper
+    // `j` operand even though `setup_descrs` filled `bh.descrs`.
+    install_global_build_descr_pool();
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired: Vec<String> = builder
         .unwired_opnames()
@@ -2828,6 +2841,9 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// keys are registered by `build_inline_call_only_bh_builder`.
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
+    // Same `JitCode::descr_at` pool the FBW abort builder installs.
+    // Guard-failure resume (`eval.rs`) walks helper `inline_call` too.
+    install_global_build_descr_pool();
     // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys
     // take the byte this build's assembler gave them.
     // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`
@@ -4297,6 +4313,21 @@ mod tests {
         assert_eq!(jitcode_count(), count);
         assert!(get_jitcode_by_index(0).is_some());
         assert!(JITCODE_CELLS[0].get().is_some());
+    }
+
+    #[test]
+    fn peek_jitcode_ref_does_not_decode_an_unpublished_cell() {
+        let Some(index) = (0..jitcode_count())
+            .rev()
+            .find(|&i| peek_jitcode_ref_by_index(i).is_none())
+        else {
+            return;
+        };
+        assert!(peek_jitcode_ref_by_index(index).is_none());
+        assert!(
+            peek_jitcode_ref_by_index(index).is_none(),
+            "peek must not publish cell {index}"
+        );
     }
 
     #[test]

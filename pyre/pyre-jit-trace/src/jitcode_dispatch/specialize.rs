@@ -11880,7 +11880,7 @@ fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
     }
     let latched = residual_call::latch_abort_blackhole(ctx, pc, "locals-expansion");
     if !latched && super::fbw_state::fbw_executed_effect_count() != 0 {
-        majit_metainterp::mc_diag_bump(26);
+        super::bump_keep_recording_too_long_once(ctx.session);
         return Ok(());
     }
     let ops = ctx.trace_ctx.num_recorded_ops();

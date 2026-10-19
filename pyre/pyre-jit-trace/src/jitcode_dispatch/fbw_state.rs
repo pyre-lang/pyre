@@ -2737,6 +2737,24 @@ pub(crate) fn fbw_journaled_effect_lens() -> (usize, usize, usize) {
     )
 }
 
+/// How many odometer-bumping journal entries were pushed after `mark`.
+pub(crate) fn fbw_journaled_effect_delta_since(mark: FbwEffectJournalMark) -> usize {
+    let now = fbw_effect_journal_mark();
+    now.stores.saturating_sub(mark.stores)
+        + now.list_effects.saturating_sub(mark.list_effects)
+        + now.cells.saturating_sub(mark.cells)
+}
+
+/// Drop the recorded-but-unexecuted residual flags.  A helper walk that
+/// set them and then cut back to a residual CALL no longer owes those
+/// writes — the recorded declined ops were discarded with the cut.
+pub(crate) fn fbw_unjournaled_restore(had: bool) {
+    if !had {
+        FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
+        FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(false));
+    }
+}
+
 /// Mark the walk as carrying a recorded-but-unexecuted side effect only
 /// the legacy replay applies.
 ///
@@ -2792,6 +2810,14 @@ pub(crate) fn fbw_mark_unjournaled_effect(cause: ResidualDecline) {
 /// gh#467 executed-effect odometer read (see [`FBW_EXECUTED_EFFECT_COUNT`]).
 pub(crate) fn fbw_executed_effect_count() -> usize {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.get())
+}
+
+pub(crate) fn bump_keep_recording_too_long_once(session: &std::cell::RefCell<WalkSession>) {
+    let mut session = session.borrow_mut();
+    if !session.keep_recording_too_long_tallied {
+        session.keep_recording_too_long_tallied = true;
+        majit_metainterp::mc_diag_bump(26);
+    }
 }
 
 pub(crate) fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
