@@ -61,92 +61,338 @@ pyre_interpreter::py_module! {
             use libc as host_errno;
             #[cfg(windows)]
             use rustpython_host_env::errno::errors as host_errno;
-            let entries: &[(&str, i32)] = &[
-                ("EPERM", host_errno::EPERM),
-                ("ENOENT", host_errno::ENOENT),
-                ("ESRCH", host_errno::ESRCH),
-                ("EINTR", host_errno::EINTR),
-                ("EIO", host_errno::EIO),
-                ("ENXIO", host_errno::ENXIO),
-                ("E2BIG", host_errno::E2BIG),
-                ("ENOEXEC", host_errno::ENOEXEC),
-                ("EBADF", host_errno::EBADF),
-                ("ECHILD", host_errno::ECHILD),
-                ("EAGAIN", host_errno::EAGAIN),
-                ("EWOULDBLOCK", host_errno::EWOULDBLOCK),
-                ("ENOMEM", host_errno::ENOMEM),
-                ("EACCES", host_errno::EACCES),
-                ("EFAULT", host_errno::EFAULT),
-                ("EBUSY", host_errno::EBUSY),
-                ("EEXIST", host_errno::EEXIST),
-                ("EXDEV", host_errno::EXDEV),
-                ("ENODEV", host_errno::ENODEV),
-                ("ENOTDIR", host_errno::ENOTDIR),
-                ("EISDIR", host_errno::EISDIR),
-                ("EINVAL", host_errno::EINVAL),
-                ("ENFILE", host_errno::ENFILE),
-                ("EMFILE", host_errno::EMFILE),
-                ("ENOTTY", host_errno::ENOTTY),
-                ("EFBIG", host_errno::EFBIG),
-                ("ENOSPC", host_errno::ENOSPC),
-                ("ESPIPE", host_errno::ESPIPE),
-                ("EROFS", host_errno::EROFS),
-                ("EMLINK", host_errno::EMLINK),
-                ("EPIPE", host_errno::EPIPE),
-                ("EDOM", host_errno::EDOM),
-                ("ERANGE", host_errno::ERANGE),
-                ("EDEADLK", host_errno::EDEADLK),
-                ("ENAMETOOLONG", host_errno::ENAMETOOLONG),
-                ("ENOLCK", host_errno::ENOLCK),
-                ("ENOSYS", host_errno::ENOSYS),
-                ("ENOTEMPTY", host_errno::ENOTEMPTY),
-                ("ELOOP", host_errno::ELOOP),
-                ("EOVERFLOW", host_errno::EOVERFLOW),
-                ("EPROTO", host_errno::EPROTO),
-                ("EDESTADDRREQ", host_errno::EDESTADDRREQ),
-                ("EAFNOSUPPORT", host_errno::EAFNOSUPPORT),
-                ("EALREADY", host_errno::EALREADY),
-                ("EDQUOT", host_errno::EDQUOT),
-                // socket / network errnos (used by ftplib, ssl, socket,
-                // asyncio, logging.handlers, …)
-                ("EINPROGRESS", host_errno::EINPROGRESS),
-                ("ENOTSOCK", host_errno::ENOTSOCK),
-                ("EMSGSIZE", host_errno::EMSGSIZE),
-                ("EPROTOTYPE", host_errno::EPROTOTYPE),
-                ("ENOPROTOOPT", host_errno::ENOPROTOOPT),
-                ("EPROTONOSUPPORT", host_errno::EPROTONOSUPPORT),
-                ("EOPNOTSUPP", host_errno::EOPNOTSUPP),
-                ("EADDRINUSE", host_errno::EADDRINUSE),
-                ("EADDRNOTAVAIL", host_errno::EADDRNOTAVAIL),
-                ("ENETDOWN", host_errno::ENETDOWN),
-                ("ENETUNREACH", host_errno::ENETUNREACH),
-                ("ENETRESET", host_errno::ENETRESET),
-                ("ECONNABORTED", host_errno::ECONNABORTED),
-                ("ECONNRESET", host_errno::ECONNRESET),
-                ("ENOBUFS", host_errno::ENOBUFS),
-                ("EISCONN", host_errno::EISCONN),
-                ("ENOTCONN", host_errno::ENOTCONN),
-                ("ESHUTDOWN", host_errno::ESHUTDOWN),
-                ("ETIMEDOUT", host_errno::ETIMEDOUT),
-                ("ECONNREFUSED", host_errno::ECONNREFUSED),
-                ("EHOSTDOWN", host_errno::EHOSTDOWN),
-                ("EHOSTUNREACH", host_errno::EHOSTUNREACH),
-                // `interp_errno.py` declares these in the same list, and
-                // every platform pyre builds for defines them in its own
-                // `errno.h`.
-                ("EILSEQ", host_errno::EILSEQ),
-                ("ECANCELED", host_errno::ECANCELED),
-                ("ENOTSUP", host_errno::ENOTSUP),
-                ("EOWNERDEAD", host_errno::EOWNERDEAD),
-                ("ENOTRECOVERABLE", host_errno::ENOTRECOVERABLE),
-            ];
-            for (name, value) in entries {
-                store(name, *value as i64);
-            }
-            // The MSVC runtime carries these under the same names, so they
-            // are not the Unix-only set they were grouped with.
-            #[cfg(any(unix, windows))]
+            // `interp_errno.py` stores `errors`, then `more_errors`, in list
+            // order, and a later name takes `errorcode[code]` over an earlier
+            // one with the same value: `EAGAIN` over `EWOULDBLOCK`, `EDEADLOCK`
+            // over `EDEADLK`, `ENOTSUP` over `EOPNOTSUPP`.  `more_errors` names
+            // some codes twice; storing one again changes nothing.
+            // `DefinedConstantInteger` drops a name the host `errno.h` lacks;
+            // the equivalent here is the target gate, since `libc` declares
+            // the Linux-only and Apple-only names for those targets alone.
+            // The Solaris pair (`ELOCKUNMAPPED`, `ENOTACTIVE`) is on no target
+            // pyre builds for.  `EQFULL` comes last: `interp_errno.py`'s
+            // "MacOSX specific errnos" omit it, and `errno.EQFULL` read 106
+            // under 3.14.6 on darwin when that omission was checked.
+            // `extra_tests/snippets/errno_platform_names.py` asserts that every
+            // Apple name here is exported and reaches `errorcode`, on the
+            // reference interpreter as well as on pyre.
+            #[cfg(unix)]
             {
+                let entries: &[(&str, i32)] = &[
+                    ("ENODEV", host_errno::ENODEV),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENOCSI", host_errno::ENOCSI),
+                    ("EHOSTUNREACH", host_errno::EHOSTUNREACH),
+                    ("ENOMSG", host_errno::ENOMSG),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EUCLEAN", host_errno::EUCLEAN),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EL2NSYNC", host_errno::EL2NSYNC),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EL2HLT", host_errno::EL2HLT),
+                    ("ENODATA", host_errno::ENODATA),
+                    ("ENOTBLK", host_errno::ENOTBLK),
+                    ("ENOSYS", host_errno::ENOSYS),
+                    ("EPIPE", host_errno::EPIPE),
+                    ("EINVAL", host_errno::EINVAL),
+                    ("EOVERFLOW", host_errno::EOVERFLOW),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EADV", host_errno::EADV),
+                    ("EINTR", host_errno::EINTR),
+                    ("EUSERS", host_errno::EUSERS),
+                    ("ENOTEMPTY", host_errno::ENOTEMPTY),
+                    ("ENOBUFS", host_errno::ENOBUFS),
+                    ("EPROTO", host_errno::EPROTO),
+                    ("EREMOTE", host_errno::EREMOTE),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENAVAIL", host_errno::ENAVAIL),
+                    ("ECHILD", host_errno::ECHILD),
+                    ("ELOOP", host_errno::ELOOP),
+                    ("EXDEV", host_errno::EXDEV),
+                    ("E2BIG", host_errno::E2BIG),
+                    ("ESRCH", host_errno::ESRCH),
+                    ("EMSGSIZE", host_errno::EMSGSIZE),
+                    ("EAFNOSUPPORT", host_errno::EAFNOSUPPORT),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EBADR", host_errno::EBADR),
+                    ("EHOSTDOWN", host_errno::EHOSTDOWN),
+                    ("EPFNOSUPPORT", host_errno::EPFNOSUPPORT),
+                    ("ENOPROTOOPT", host_errno::ENOPROTOOPT),
+                    ("EBUSY", host_errno::EBUSY),
+                    ("EWOULDBLOCK", host_errno::EWOULDBLOCK),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EBADFD", host_errno::EBADFD),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EDOTDOT", host_errno::EDOTDOT),
+                    ("EISCONN", host_errno::EISCONN),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENOANO", host_errno::ENOANO),
+                    ("ESHUTDOWN", host_errno::ESHUTDOWN),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ECHRNG", host_errno::ECHRNG),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ELIBBAD", host_errno::ELIBBAD),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENONET", host_errno::ENONET),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EBADE", host_errno::EBADE),
+                    ("EBADF", host_errno::EBADF),
+                    ("EMULTIHOP", host_errno::EMULTIHOP),
+                    ("EIO", host_errno::EIO),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EUNATCH", host_errno::EUNATCH),
+                    ("EPROTOTYPE", host_errno::EPROTOTYPE),
+                    ("ENOSPC", host_errno::ENOSPC),
+                    ("ENOEXEC", host_errno::ENOEXEC),
+                    ("EALREADY", host_errno::EALREADY),
+                    ("ENETDOWN", host_errno::ENETDOWN),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENOTNAM", host_errno::ENOTNAM),
+                    ("EACCES", host_errno::EACCES),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ELNRNG", host_errno::ELNRNG),
+                    ("EILSEQ", host_errno::EILSEQ),
+                    ("ENOTDIR", host_errno::ENOTDIR),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENOTUNIQ", host_errno::ENOTUNIQ),
+                    ("EPERM", host_errno::EPERM),
+                    ("EDOM", host_errno::EDOM),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EXFULL", host_errno::EXFULL),
+                    ("ECONNREFUSED", host_errno::ECONNREFUSED),
+                    ("EISDIR", host_errno::EISDIR),
+                    ("EPROTONOSUPPORT", host_errno::EPROTONOSUPPORT),
+                    ("EROFS", host_errno::EROFS),
+                    ("EADDRNOTAVAIL", host_errno::EADDRNOTAVAIL),
+                    ("EIDRM", host_errno::EIDRM),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ECOMM", host_errno::ECOMM),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ESRMNT", host_errno::ESRMNT),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EREMOTEIO", host_errno::EREMOTEIO),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EL3RST", host_errno::EL3RST),
+                    ("EBADMSG", host_errno::EBADMSG),
+                    ("ENFILE", host_errno::ENFILE),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ELIBMAX", host_errno::ELIBMAX),
+                    ("ESPIPE", host_errno::ESPIPE),
+                    ("ENOLINK", host_errno::ENOLINK),
+                    ("ENETRESET", host_errno::ENETRESET),
+                    ("ETIMEDOUT", host_errno::ETIMEDOUT),
+                    ("ENOENT", host_errno::ENOENT),
+                    ("EEXIST", host_errno::EEXIST),
+                    ("EDQUOT", host_errno::EDQUOT),
+                    ("ENOSTR", host_errno::ENOSTR),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EBADSLT", host_errno::EBADSLT),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EBADRQC", host_errno::EBADRQC),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ELIBACC", host_errno::ELIBACC),
+                    ("EFAULT", host_errno::EFAULT),
+                    ("EFBIG", host_errno::EFBIG),
+                    ("EDEADLK", host_errno::EDEADLK),
+                    ("ENOTCONN", host_errno::ENOTCONN),
+                    ("EDESTADDRREQ", host_errno::EDESTADDRREQ),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ELIBSCN", host_errno::ELIBSCN),
+                    ("ENOLCK", host_errno::ENOLCK),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EISNAM", host_errno::EISNAM),
+                    ("ECONNABORTED", host_errno::ECONNABORTED),
+                    ("ENETUNREACH", host_errno::ENETUNREACH),
+                    ("ESTALE", host_errno::ESTALE),
+                    ("ENOSR", host_errno::ENOSR),
+                    ("ENOMEM", host_errno::ENOMEM),
+                    ("ENOTSOCK", host_errno::ENOTSOCK),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ESTRPIPE", host_errno::ESTRPIPE),
+                    ("EMLINK", host_errno::EMLINK),
+                    ("ERANGE", host_errno::ERANGE),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ELIBEXEC", host_errno::ELIBEXEC),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EL3HLT", host_errno::EL3HLT),
+                    ("ECONNRESET", host_errno::ECONNRESET),
+                    ("EADDRINUSE", host_errno::EADDRINUSE),
+                    ("EOPNOTSUPP", host_errno::EOPNOTSUPP),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EREMCHG", host_errno::EREMCHG),
+                    ("EAGAIN", host_errno::EAGAIN),
+                    ("ENAMETOOLONG", host_errno::ENAMETOOLONG),
+                    ("ENOTTY", host_errno::ENOTTY),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ERESTART", host_errno::ERESTART),
+                    ("ESOCKTNOSUPPORT", host_errno::ESOCKTNOSUPPORT),
+                    ("ETIME", host_errno::ETIME),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EBFONT", host_errno::EBFONT),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EDEADLOCK", host_errno::EDEADLOCK),
+                    ("ETOOMANYREFS", host_errno::ETOOMANYREFS),
+                    ("EMFILE", host_errno::EMFILE),
+                    ("ETXTBSY", host_errno::ETXTBSY),
+                    ("EINPROGRESS", host_errno::EINPROGRESS),
+                    ("ENXIO", host_errno::ENXIO),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENOPKG", host_errno::ENOPKG),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENOMEDIUM", host_errno::ENOMEDIUM),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EMEDIUMTYPE", host_errno::EMEDIUMTYPE),
+                    ("ECANCELED", host_errno::ECANCELED),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ENOKEY", host_errno::ENOKEY),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EKEYEXPIRED", host_errno::EKEYEXPIRED),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EKEYREVOKED", host_errno::EKEYREVOKED),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("EKEYREJECTED", host_errno::EKEYREJECTED),
+                    ("EOWNERDEAD", host_errno::EOWNERDEAD),
+                    ("ENOTRECOVERABLE", host_errno::ENOTRECOVERABLE),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    ("ERFKILL", host_errno::ERFKILL),
+                    ("ECANCELED", host_errno::ECANCELED),
+                    ("ENOTSUP", host_errno::ENOTSUP),
+                    ("EOWNERDEAD", host_errno::EOWNERDEAD),
+                    ("ENOTRECOVERABLE", host_errno::ENOTRECOVERABLE),
+                    #[cfg(target_vendor = "apple")]
+                    ("EAUTH", host_errno::EAUTH),
+                    #[cfg(target_vendor = "apple")]
+                    ("EBADARCH", host_errno::EBADARCH),
+                    #[cfg(target_vendor = "apple")]
+                    ("EBADEXEC", host_errno::EBADEXEC),
+                    #[cfg(target_vendor = "apple")]
+                    ("EBADMACHO", host_errno::EBADMACHO),
+                    #[cfg(target_vendor = "apple")]
+                    ("EBADRPC", host_errno::EBADRPC),
+                    #[cfg(target_vendor = "apple")]
+                    ("EDEVERR", host_errno::EDEVERR),
+                    #[cfg(target_vendor = "apple")]
+                    ("EFTYPE", host_errno::EFTYPE),
+                    #[cfg(target_vendor = "apple")]
+                    ("ENEEDAUTH", host_errno::ENEEDAUTH),
+                    #[cfg(target_vendor = "apple")]
+                    ("ENOATTR", host_errno::ENOATTR),
+                    #[cfg(target_vendor = "apple")]
+                    ("ENOPOLICY", host_errno::ENOPOLICY),
+                    #[cfg(target_vendor = "apple")]
+                    ("EPROCLIM", host_errno::EPROCLIM),
+                    #[cfg(target_vendor = "apple")]
+                    ("EPROCUNAVAIL", host_errno::EPROCUNAVAIL),
+                    #[cfg(target_vendor = "apple")]
+                    ("EPROGMISMATCH", host_errno::EPROGMISMATCH),
+                    #[cfg(target_vendor = "apple")]
+                    ("EPROGUNAVAIL", host_errno::EPROGUNAVAIL),
+                    #[cfg(target_vendor = "apple")]
+                    ("EPWROFF", host_errno::EPWROFF),
+                    #[cfg(target_vendor = "apple")]
+                    ("ERPCMISMATCH", host_errno::ERPCMISMATCH),
+                    #[cfg(target_vendor = "apple")]
+                    ("ESHLIBVERS", host_errno::ESHLIBVERS),
+                    #[cfg(target_vendor = "apple")]
+                    ("EQFULL", host_errno::EQFULL),
+                ];
+                for (name, value) in entries {
+                    store(name, *value as i64);
+                }
+            }
+            // Windows: the runtime's own set, then the Winsock codes.
+            //
+            // A socket reports the Winsock code, so the classic socket names
+            // already resolve to those and the `WSAE*` spellings share their
+            // values.  They are stored second on purpose: `errorcode` is keyed
+            // by the number, and the name it answers with for a shared one is
+            // the Winsock spelling.
+            #[cfg(windows)]
+            {
+                let entries: &[(&str, i32)] = &[
+                    ("EPERM", host_errno::EPERM),
+                    ("ENOENT", host_errno::ENOENT),
+                    ("ESRCH", host_errno::ESRCH),
+                    ("EINTR", host_errno::EINTR),
+                    ("EIO", host_errno::EIO),
+                    ("ENXIO", host_errno::ENXIO),
+                    ("E2BIG", host_errno::E2BIG),
+                    ("ENOEXEC", host_errno::ENOEXEC),
+                    ("EBADF", host_errno::EBADF),
+                    ("ECHILD", host_errno::ECHILD),
+                    ("EAGAIN", host_errno::EAGAIN),
+                    ("EWOULDBLOCK", host_errno::EWOULDBLOCK),
+                    ("ENOMEM", host_errno::ENOMEM),
+                    ("EACCES", host_errno::EACCES),
+                    ("EFAULT", host_errno::EFAULT),
+                    ("EBUSY", host_errno::EBUSY),
+                    ("EEXIST", host_errno::EEXIST),
+                    ("EXDEV", host_errno::EXDEV),
+                    ("ENODEV", host_errno::ENODEV),
+                    ("ENOTDIR", host_errno::ENOTDIR),
+                    ("EISDIR", host_errno::EISDIR),
+                    ("EINVAL", host_errno::EINVAL),
+                    ("ENFILE", host_errno::ENFILE),
+                    ("EMFILE", host_errno::EMFILE),
+                    ("ENOTTY", host_errno::ENOTTY),
+                    ("EFBIG", host_errno::EFBIG),
+                    ("ENOSPC", host_errno::ENOSPC),
+                    ("ESPIPE", host_errno::ESPIPE),
+                    ("EROFS", host_errno::EROFS),
+                    ("EMLINK", host_errno::EMLINK),
+                    ("EPIPE", host_errno::EPIPE),
+                    ("EDOM", host_errno::EDOM),
+                    ("ERANGE", host_errno::ERANGE),
+                    ("EDEADLK", host_errno::EDEADLK),
+                    ("ENAMETOOLONG", host_errno::ENAMETOOLONG),
+                    ("ENOLCK", host_errno::ENOLCK),
+                    ("ENOSYS", host_errno::ENOSYS),
+                    ("ENOTEMPTY", host_errno::ENOTEMPTY),
+                    ("ELOOP", host_errno::ELOOP),
+                    ("EOVERFLOW", host_errno::EOVERFLOW),
+                    ("EPROTO", host_errno::EPROTO),
+                    ("EDESTADDRREQ", host_errno::EDESTADDRREQ),
+                    ("EAFNOSUPPORT", host_errno::EAFNOSUPPORT),
+                    ("EALREADY", host_errno::EALREADY),
+                    ("EDQUOT", host_errno::EDQUOT),
+                    // socket / network errnos (used by ftplib, ssl, socket,
+                    // asyncio, logging.handlers, …)
+                    ("EINPROGRESS", host_errno::EINPROGRESS),
+                    ("ENOTSOCK", host_errno::ENOTSOCK),
+                    ("EMSGSIZE", host_errno::EMSGSIZE),
+                    ("EPROTOTYPE", host_errno::EPROTOTYPE),
+                    ("ENOPROTOOPT", host_errno::ENOPROTOOPT),
+                    ("EPROTONOSUPPORT", host_errno::EPROTONOSUPPORT),
+                    ("EOPNOTSUPP", host_errno::EOPNOTSUPP),
+                    ("EADDRINUSE", host_errno::EADDRINUSE),
+                    ("EADDRNOTAVAIL", host_errno::EADDRNOTAVAIL),
+                    ("ENETDOWN", host_errno::ENETDOWN),
+                    ("ENETUNREACH", host_errno::ENETUNREACH),
+                    ("ENETRESET", host_errno::ENETRESET),
+                    ("ECONNABORTED", host_errno::ECONNABORTED),
+                    ("ECONNRESET", host_errno::ECONNRESET),
+                    ("ENOBUFS", host_errno::ENOBUFS),
+                    ("EISCONN", host_errno::EISCONN),
+                    ("ENOTCONN", host_errno::ENOTCONN),
+                    ("ESHUTDOWN", host_errno::ESHUTDOWN),
+                    ("ETIMEDOUT", host_errno::ETIMEDOUT),
+                    ("ECONNREFUSED", host_errno::ECONNREFUSED),
+                    ("EHOSTDOWN", host_errno::EHOSTDOWN),
+                    ("EHOSTUNREACH", host_errno::EHOSTUNREACH),
+                    // `interp_errno.py` declares these in the same list, and
+                    // every platform pyre builds for defines them in its own
+                    // `errno.h`.
+                    ("EILSEQ", host_errno::EILSEQ),
+                    ("ECANCELED", host_errno::ECANCELED),
+                    ("ENOTSUP", host_errno::ENOTSUP),
+                    ("EOWNERDEAD", host_errno::EOWNERDEAD),
+                    ("ENOTRECOVERABLE", host_errno::ENOTRECOVERABLE),
+                ];
+                for (name, value) in entries {
+                    store(name, *value as i64);
+                }
+                // The MSVC runtime carries these under the same names, so
+                // they are not a Unix-only set.
                 let posix_entries: &[(&str, i32)] = &[
                     ("ETXTBSY", host_errno::ETXTBSY),
                     ("ENOMSG", host_errno::ENOMSG),
@@ -161,74 +407,6 @@ pyre_interpreter::py_module! {
                 for (name, value) in posix_entries {
                     store(name, *value as i64);
                 }
-            }
-            #[cfg(unix)]
-            {
-                let unix_entries: &[(&str, i32)] = &[
-                    // Declared in the same list, and supplied by `libc` here.
-                    // Windows reaches the first six through `win_errors`
-                    // (`interp_errno.py`), which registers the `WSA`
-                    // spelling and adds the stripped name as a second binding
-                    // -- the windows block below stores them in that order, so
-                    // the reverse mapping names the `WSA` one there.
-                    ("ESTALE", host_errno::ESTALE),
-                    ("EUSERS", host_errno::EUSERS),
-                    ("EREMOTE", host_errno::EREMOTE),
-                    ("ETOOMANYREFS", host_errno::ETOOMANYREFS),
-                    ("EPFNOSUPPORT", host_errno::EPFNOSUPPORT),
-                    ("ESOCKTNOSUPPORT", host_errno::ESOCKTNOSUPPORT),
-                    ("ENOTBLK", host_errno::ENOTBLK),
-                    ("EMULTIHOP", host_errno::EMULTIHOP),
-                ];
-                for (name, value) in unix_entries {
-                    store(name, *value as i64);
-                }
-            }
-            // `interp_errno.py`'s "MacOSX specific errnos" block, plus
-            // `EQFULL`, which that list omits.  Nothing here writes a number
-            // down -- `libc` supplies each one, and `errno.EQFULL` read 106
-            // under 3.14.6 on darwin when that omission was checked.
-            // `extra_tests/snippets/errno_platform_names.py` asserts that
-            // every name in this block is exported and reaches `errorcode`,
-            // on the reference interpreter as well as on pyre.
-            // `DefinedConstantInteger` drops each of these on a platform whose
-            // `errno.h` lacks it; the equivalent here is the target gate,
-            // since `libc` declares them for apple targets only.
-            #[cfg(target_vendor = "apple")]
-            {
-                let apple_entries: &[(&str, i32)] = &[
-                    ("ENOATTR", host_errno::ENOATTR),
-                    ("EAUTH", host_errno::EAUTH),
-                    ("EBADARCH", host_errno::EBADARCH),
-                    ("EBADEXEC", host_errno::EBADEXEC),
-                    ("EBADMACHO", host_errno::EBADMACHO),
-                    ("EBADRPC", host_errno::EBADRPC),
-                    ("EDEVERR", host_errno::EDEVERR),
-                    ("EFTYPE", host_errno::EFTYPE),
-                    ("ENEEDAUTH", host_errno::ENEEDAUTH),
-                    ("ENOPOLICY", host_errno::ENOPOLICY),
-                    ("EPROCLIM", host_errno::EPROCLIM),
-                    ("EPROCUNAVAIL", host_errno::EPROCUNAVAIL),
-                    ("EPROGMISMATCH", host_errno::EPROGMISMATCH),
-                    ("EPROGUNAVAIL", host_errno::EPROGUNAVAIL),
-                    ("EPWROFF", host_errno::EPWROFF),
-                    ("EQFULL", host_errno::EQFULL),
-                    ("ERPCMISMATCH", host_errno::ERPCMISMATCH),
-                    ("ESHLIBVERS", host_errno::ESHLIBVERS),
-                ];
-                for (name, value) in apple_entries {
-                    store(name, *value as i64);
-                }
-            }
-            // The rest of the runtime's own set, then the Winsock codes.
-            //
-            // A socket reports the Winsock code, so the classic socket names
-            // above already resolve to those and the `WSAE*` spellings share
-            // their values.  They are stored second on purpose: `errorcode`
-            // is keyed by the number, and the name it answers with for a
-            // shared one is the Winsock spelling.
-            #[cfg(windows)]
-            {
                 let windows_entries: &[(&str, i32)] = &[
                     ("EDEADLOCK", host_errno::EDEADLOCK),
                     ("ESOCKTNOSUPPORT", host_errno::ESOCKTNOSUPPORT),

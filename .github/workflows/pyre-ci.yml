@@ -874,7 +874,12 @@ jobs:
     # crates either way — 628s on the longest job in the workflow. The only
     # thing it needs from the rest of CI is the extracted LLBC, which is an
     # artifact download.
-    timeout-minutes: 60
+    #
+    # The job is the acceptance test (19-34 min), the GC root bracket gate
+    # (1-2 min) and the skip-subject ratchet (15-23 min): 36-53 min on the
+    # runs of 2026-10-19, and one run whose acceptance test took 34 min was
+    # cancelled at 60 inside the ratchet.
+    timeout-minutes: 75
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:

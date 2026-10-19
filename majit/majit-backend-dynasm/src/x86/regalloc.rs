@@ -388,17 +388,21 @@ impl<'a> RegAlloc<'a> {
                 &mut self.longevity,
                 &mut self.fm,
             ));
-            let mut len_itemsize_loc = Loc::immed(1);
-            let length_loc;
-            let mut bytes_loc;
-            if constbytes >= 0 {
-                length_loc = Loc::immed(constbytes);
-                bytes_loc = length_loc;
+            self.flush_moves(asm);
+            asm.regalloc_lea_scaled_addr(
+                dstaddr_loc,
+                &startindex_loc,
+                start_itemsize,
+                &base_loc,
+                baseofs,
+            );
+            //
+            let length_loc = if constbytes >= 0 {
+                Loc::immed(constbytes)
             } else {
                 // load length_loc in a register different than dstaddr_loc
-                length_loc =
+                let mut length_loc =
                     self.make_sure_var_in_reg(length_box, Type::Int, &[dstaddr_box], None, false);
-                bytes_loc = length_loc;
                 if len_itemsize > 1 {
                     // we need a register that is different from dstaddr_loc,
                     // but which can be identical to length_loc (as usual,
@@ -406,7 +410,7 @@ impl<'a> RegAlloc<'a> {
                     let bytes_box = self.fresh_temp_var();
                     self.longevity
                         .set(bytes_box, Lifetime::new(self.rm.position, self.rm.position));
-                    bytes_loc = Loc::Reg(self.rm.force_allocate_reg(
+                    let bytes_loc = Loc::Reg(self.rm.force_allocate_reg(
                         bytes_box,
                         &[dstaddr_box],
                         None,
@@ -414,27 +418,23 @@ impl<'a> RegAlloc<'a> {
                         &mut self.longevity,
                         &mut self.fm,
                     ));
-                    len_itemsize_loc = Loc::immed(len_itemsize);
+                    self.flush_moves(asm);
+                    asm.regalloc_lea_scaled_addr(
+                        bytes_loc,
+                        &length_loc,
+                        len_itemsize,
+                        &Loc::immed(0),
+                        0,
+                    );
                     length_box = bytes_box;
+                    length_loc = bytes_loc;
                 }
-            }
+                length_loc
+            };
             //
             // call memset()
             self.preserve_for_zero_array_memset();
-            self.perform_discard(
-                i,
-                vec![
-                    base_loc,
-                    startindex_loc,
-                    Loc::immed(start_itemsize),
-                    Loc::immed(baseofs),
-                    dstaddr_loc,
-                    length_loc,
-                    len_itemsize_loc,
-                    bytes_loc,
-                ],
-                asm,
-            );
+            self.perform_discard(i, vec![dstaddr_loc, length_loc], asm);
             self.rm
                 .possibly_free_var(length_box, &mut self.longevity, &mut self.fm, Type::Int);
             self.rm
@@ -961,7 +961,6 @@ impl<'a> RegAlloc<'a> {
                 self.consider_call_malloc_nursery_varsize(dst, args, i, asm);
             }
             OpCode::CheckMemoryError => self.consider_check_memory_error(args, i, asm),
-            OpCode::RecordKnownResult => {}
             OpCode::New
             | OpCode::NewWithVtable
             | OpCode::NewArray
@@ -970,7 +969,7 @@ impl<'a> RegAlloc<'a> {
             | OpCode::Newunicode => {
                 self.consider_raw_call_like(dst, args, op, i, asm, SAVE_DEFAULT_REGS);
             }
-            _ => {}
+            _ => self.not_implemented_op(opcode),
         }
     }
 
@@ -1142,22 +1141,39 @@ impl<'a> RegAlloc<'a> {
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.consider_cond_call_gc_wb(args, i, asm);
             }
-            OpCode::JitDebug
-            | OpCode::DebugMergePoint
-            | OpCode::RecordExactClass
-            | OpCode::RecordExactValueR
-            | OpCode::RecordExactValueI
-            | OpCode::RecordKnownResult
-            | OpCode::QuasiimmutField
-            | OpCode::AssertNotNone
-            | OpCode::Keepalive
-            | OpCode::EnterPortalFrame
-            | OpCode::LeavePortalFrame
-            | OpCode::IncrementDebugCounter
-            | OpCode::VirtualRefFinish
-            | OpCode::ForceSpill => {}
-            _ => {}
+            OpCode::JitDebug | OpCode::Keepalive => {}
+            // `consider_enter_portal_frame` / `consider_leave_portal_frame`
+            // hand the op to llsupport/assembler.py `enter_portal_frame` /
+            // `leave_portal_frame`, which only feed the codemap
+            // (`HAS_CODEMAP`); dynasm keeps no codemap.
+            OpCode::EnterPortalFrame | OpCode::LeavePortalFrame => {}
+            OpCode::IncrementDebugCounter => self.consider_increment_debug_counter(args, i, asm),
+            OpCode::ForceSpill => self._consider_force_spill(args),
+            _ => self.not_implemented_op(opcode),
         }
+    }
+
+    /// x86/regalloc.py `consider_increment_debug_counter`.
+    pub(crate) fn consider_increment_debug_counter(
+        &mut self,
+        args: &[OpRef],
+        i: usize,
+        asm: &mut dyn RegAllocAssembler,
+    ) {
+        let base_loc = self.loc(args[0], Type::Int);
+        self.perform_discard(i, vec![base_loc], asm);
+    }
+
+    /// x86/regalloc.py `_consider_force_spill`: used only for testing.
+    pub(crate) fn _consider_force_spill(&mut self, args: &[OpRef]) {
+        let v = args[0];
+        let tp = self.tp(v);
+        self.force_spill_var(v, tp);
+    }
+
+    /// x86/regalloc.py `not_implemented_op`, the `oplist` default.
+    pub(crate) fn not_implemented_op(&self, opcode: OpCode) -> ! {
+        crate::regalloc::not_implemented(&format!("not implemented operation: {opcode:?}"))
     }
 
     pub(crate) fn _consider_compop(

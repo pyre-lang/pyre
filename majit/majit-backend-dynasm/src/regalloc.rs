@@ -713,6 +713,12 @@ impl FrameManager {
 ///
 /// Here `JITFRAME_FIXED_SIZE` is the arch-specific managed-register area
 /// reserved at the start of `jf_frame`, not the object-header byte size.
+/// llsupport/regalloc.py `not_implemented`.  `compile_loop` catches the
+/// panic and declines the trace, as `NotImplementedError` does upstream.
+pub fn not_implemented(msg: &str) -> ! {
+    panic!("[llsupport/regalloc] {msg}")
+}
+
 pub fn get_ebp_ofs(base_ofs: i32, position: usize) -> i32 {
     base_ofs + WORD as i32 * (position as i32 + JITFRAME_FIXED_SIZE as i32)
 }
@@ -1737,6 +1743,17 @@ pub(crate) trait RegAllocAssembler: RegallocMoves {
         arglocs: &[Loc],
         result_loc: Option<Loc>,
         frame_depth: usize,
+    );
+    /// x86/regalloc.py `consider_zero_array`'s `self.assembler.mc.LEA(loc,
+    /// self._scaled_addr(index_loc, itemsize_loc, base_loc, ofs_loc))`,
+    /// emitted from the allocator before its later loads and spills.
+    fn regalloc_lea_scaled_addr(
+        &mut self,
+        dst: Loc,
+        index_loc: &Loc,
+        itemsize: i64,
+        base_loc: &Loc,
+        ofs: i64,
     );
 }
 
@@ -2802,6 +2819,11 @@ mod tests {
             arglocs: Vec<Loc>,
             faillocs: Vec<Option<Loc>>,
         },
+        Lea {
+            dst: Loc,
+            index_loc: Loc,
+            base_loc: Loc,
+        },
     }
 
     #[derive(Default)]
@@ -2866,6 +2888,20 @@ mod tests {
                 op_index,
                 arglocs: arglocs.to_vec(),
                 faillocs: faillocs.to_vec(),
+            });
+        }
+        fn regalloc_lea_scaled_addr(
+            &mut self,
+            dst: Loc,
+            index_loc: &Loc,
+            _itemsize: i64,
+            base_loc: &Loc,
+            _ofs: i64,
+        ) {
+            self.emitted.push(Emitted::Lea {
+                dst,
+                index_loc: *index_loc,
+                base_loc: *base_loc,
             });
         }
     }
@@ -3137,6 +3173,94 @@ mod tests {
     #[test]
     fn loc_size() {
         assert!(std::mem::size_of::<Loc>() <= 16);
+    }
+
+    /// x86/regalloc.py `consider_zero_array`: the destination `LEA` is
+    /// emitted right after `dstaddr_loc` is allocated, before the length is
+    /// loaded and before `before_call`, so a later load or spill cannot
+    /// overwrite a register the address still reads.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_zero_array_lea_precedes_length_load() {
+        let base = OpRef::input_arg_ref(0);
+        let start = OpRef::input_arg_int(1);
+        let length = OpRef::input_arg_int(2);
+        let inputargs = vec![
+            InputArg::from_type_rc(Type::Ref, base.raw()),
+            InputArg::from_type_rc(Type::Int, start.raw()),
+            InputArg::from_type_rc(Type::Int, length.raw()),
+        ];
+        let zero = Op::new(
+            OpCode::ZeroArray,
+            &[
+                rb(base),
+                rb(start),
+                rb(length),
+                rb(OpRef::const_int(8)),
+                rb(OpRef::const_int(8)),
+            ],
+        );
+        zero.pos().set(OpRef::void_op(3));
+        zero.setdescr(std::sync::Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+            0,
+            16,
+            8,
+            1,
+            Type::Int,
+        )));
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos().set(OpRef::void_op(4));
+        finish.setfailargs(vec![].into());
+        finish.set_fail_arg_types(vec![]);
+
+        let ops = rcs(vec![zero, finish]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let emitted = walk(&mut ra);
+        let leas: Vec<usize> = emitted
+            .iter()
+            .enumerate()
+            .filter_map(|(k, e)| matches!(e, Emitted::Lea { .. }).then_some(k))
+            .collect();
+        let discard = emitted
+            .iter()
+            .position(|e| matches!(e, Emitted::PerformDiscard { op_index: 0, .. }))
+            .expect("ZERO_ARRAY is a discard op");
+        assert_eq!(
+            leas.len(),
+            2,
+            "destination and byte-count LEAs: {emitted:#?}"
+        );
+        assert!(leas[1] < discard);
+        let Emitted::PerformDiscard { arglocs, .. } = &emitted[discard] else {
+            unreachable!()
+        };
+        let (
+            Emitted::Lea { dst: dstaddr, .. },
+            Emitted::Lea {
+                dst: bytes,
+                index_loc,
+                ..
+            },
+        ) = (&emitted[leas[0]], &emitted[leas[1]])
+        else {
+            unreachable!()
+        };
+        assert!(
+            arglocs.len() == 2 && loc_eq(&arglocs[0], dstaddr) && loc_eq(&arglocs[1], bytes),
+            "memset takes the LEA results: {arglocs:?}"
+        );
+        assert!(
+            !loc_eq(index_loc, dstaddr),
+            "the length must not sit in dstaddr_loc"
+        );
+        // The length is loaded after the destination LEA, not before it.
+        if let Some(load) = emitted
+            .iter()
+            .position(|e| matches!(e, Emitted::Move { dst, .. } if loc_eq(dst, index_loc)))
+        {
+            assert!(leas[0] < load && load < leas[1], "{emitted:#?}");
+        }
     }
 
     #[test]

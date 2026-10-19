@@ -338,10 +338,13 @@ pub unsafe fn wcharp2utf8n(w: CWCHARP, maxlen: usize) -> Result<(Vec<u8>, usize)
 ///
 /// Allocates `utf8len + 2` units (`utf82wcharp`: one for the terminator, one
 /// for a trailing incomplete sequence). `utf8len` is the code-point count, not
-/// the byte length. Writes stop at `utf8len` so a short count cannot walk off
-/// the block. `track_allocation` is the same debug-tracker flag as [`str2charp`].
+/// the byte length; upstream asserts it against `codepoints_in_utf8` before
+/// walking the whole string. The check stays on outside tests too, because a
+/// short count would make the walk write past the block. `track_allocation`
+/// is the same debug-tracker flag as [`str2charp`].
 pub fn utf82wcharp(utf8: &[u8], utf8len: usize, track_allocation: bool) -> CWCHARP {
     let _ = track_allocation;
+    assert_eq!(utf8len, codepoint_len(utf8));
     let chars = utf8len.checked_add(2).expect("utf82wcharp length overflow");
     let bytes = chars
         .checked_mul(core::mem::size_of::<Wchar>())
@@ -350,10 +353,7 @@ pub fn utf82wcharp(utf8: &[u8], utf8len: usize, track_allocation: bool) -> CWCHA
         let w = raw_malloc(bytes).cast::<Wchar>();
         let mut index = 0;
         let mut pos = 0;
-        while index < utf8len {
-            let Some(ch) = next_codepoint(utf8, &mut pos) else {
-                break;
-            };
+        while let Some(ch) = next_codepoint(utf8, &mut pos) {
             *w.add(index) = ch as Wchar;
             index += 1;
         }

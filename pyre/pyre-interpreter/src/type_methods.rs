@@ -7059,16 +7059,19 @@ fn dict_update1_dict_dict(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<()
 /// blocks (`merged continue branch block N is shared`).
 fn dict_update1_dict_dict_store(
     dict: PyObjectRef,
-    k: PyObjectRef,
+    mut k: PyObjectRef,
     v: PyObjectRef,
     hashed: Option<pyre_object::dictmultiobject::ObjectKey>,
 ) -> Result<(), crate::PyError> {
     unsafe {
         match hashed {
-            Some(key) => {
+            // A key `__eq__` run by the store can collect, so the key the
+            // error path names is the rooted word read back after it, as in
+            // `dict_store_checked`.
+            Some(key) => pyre_object::with_roots!(k =>
                 pyre_object::dictmultiobject::w_dict_store_hashed_checked(dict, k, v, key.hash)
-                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))
-            }
+            )
+            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k)),
             None => dict_store_checked(dict, k, v),
         }
     }

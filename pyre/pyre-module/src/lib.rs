@@ -53,7 +53,9 @@ pub fn install_optional_modules() {
         "_cffi_backend",
         module::_cffi_backend::init,
     );
-    #[cfg(all(not(feature = "sandbox")))]
+    // `lib_pypy/_ctypes` sits on `_rawffi`, which needs the host's dynamic
+    // linker and libffi; without them `import _ctypes` is an ImportError.
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::bz2::init);
     pyre_interpreter::importing::register_builtin_module("_pickle", module::_pickle::init);

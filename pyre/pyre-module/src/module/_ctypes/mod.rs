@@ -5,8 +5,8 @@
 //! machinery is split across the submodules — `stginfo` carries a ctypes type's
 //! layout, `metaclass` builds the types and their fields, `cdata` holds the
 //! scalar instance buffer, and `funcptr` marshals and performs the foreign
-//! call.  The submodules need `host_env`; without it the module is limited to
-//! the placeholder surface at the foot of `interp_ctypes`.
+//! call.  The module needs `host_env`; without it `_ctypes` is not registered,
+//! as PyPy has no `_ctypes` without `_rawffi`.
 
 pyre_interpreter::pyre_module_init!(interp_ctypes);
 

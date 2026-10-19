@@ -4081,6 +4081,19 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 self.emit_propagate_memory_error_if_null(reg);
             }
+            // aarch64/opassembler.py `emit_op_increment_debug_counter`.
+            OpCode::IncrementDebugCounter => {
+                let (base, value) = match arglocs {
+                    [Loc::Reg(b), Loc::Reg(v)] if !b.is_xmm && !v.is_xmm => (b.value, v.value),
+                    _ => panic!("IncrementDebugCounter arglocs {arglocs:?}"),
+                };
+                dynasm!(self.mc
+                    ; .arch aarch64
+                    ; ldr X(value), [X(base)]
+                    ; add XSP(value), XSP(value), 1
+                    ; str X(value), [X(base)]
+                );
+            }
             // aarch64/opassembler.py _write_barrier_fastpath parity.
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.emit_write_barrier_fastpath(regalloc, op, arglocs);
@@ -8699,5 +8712,16 @@ impl RegAllocAssembler for AssemblerARM64<'_> {
             frame_depth,
         );
         self.fail_index += 1;
+    }
+
+    fn regalloc_lea_scaled_addr(
+        &mut self,
+        _dst: Loc,
+        _index_loc: &Loc,
+        _itemsize: i64,
+        _base_loc: &Loc,
+        _ofs: i64,
+    ) {
+        unreachable!("the LEA of x86 `consider_zero_array`; aarch64 has no such step")
     }
 }

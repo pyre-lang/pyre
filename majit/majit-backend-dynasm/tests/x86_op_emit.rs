@@ -6035,3 +6035,57 @@ fn uint_mul_high_with_every_operand_register() {
         }
     }
 }
+
+/// `consider_increment_debug_counter` / `genop_discard_increment_debug_counter`:
+/// the argument is an immediate address and the op is one `INC` of that word.
+#[test]
+fn increment_debug_counter_increments_the_word() {
+    static COUNTER: AtomicI64 = AtomicI64::new(0);
+    let addr = &COUNTER as *const AtomicI64 as i64;
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(911);
+    let inputargs: Vec<InputArgRc> = vec![];
+    let mut ops = Vec::new();
+    for pos in 1..=2 {
+        let op = Op::new(OpCode::IncrementDebugCounter, &[rb(OpRef::const_int(addr))]);
+        op.pos().set(OpRef::void_op(pos));
+        ops.push(op);
+    }
+    ops.push(finish(3));
+    let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile increment_debug_counter: {err:?}"));
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
+}
+
+/// x86/regalloc.py `oplist = [RegAlloc.not_implemented_op] * rop._LAST`: an
+/// operation the optimizer removes before the backend is refused, not
+/// silently dropped.
+#[test]
+fn removed_operation_reaching_the_backend_is_not_implemented() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(912);
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let r0 = inputargs[0].opref();
+    let op = Op::new(OpCode::AssertNotNone, &[rb(r0)]);
+    op.pos().set(OpRef::void_op(1));
+    let ops: Vec<OpRc> = vec![op, finish(2)].into_iter().map(OpRc::new).collect();
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        backend.compile_loop(&inputargs, &ops, &token)
+    }))
+    .expect_err("ASSERT_NOT_NONE must not compile");
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(
+        msg.contains("not implemented operation: AssertNotNone"),
+        "panic message: {msg}"
+    );
+}

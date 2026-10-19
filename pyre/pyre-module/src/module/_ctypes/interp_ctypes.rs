@@ -14,10 +14,7 @@
 //! Windows `LoadLibrary` is `LoadLibraryExW`.
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    #[cfg(all(any(unix, windows), feature = "host_env"))]
     register_host_ctypes(ns);
-    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
-    register_stub_ctypes(ns);
     Ok(())
 }
 
@@ -1111,31 +1108,3 @@ pub(super) fn carg_ptr(carg: pyre_object::PyObjectRef) -> usize {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Stub surface (non-unix or no host_env) — keeps names importable.
-// ──────────────────────────────────────────────────────────────────────
-
-#[cfg(not(all(any(unix, windows), feature = "host_env")))]
-fn register_stub_ctypes(ns: pyre_object::PyObjectRef) {
-    let _root_scope = pyre_object::gc_roots::push_roots();
-    let mut ns = pyre_object::gc_roots::pin_root(ns);
-    pyre_interpreter::__pyre_store!(ns, "ArgumentError", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "_Pointer", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "Structure", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "Union", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "Array", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "CField", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "CFuncPtr", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "_SimpleCData", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "sizeof", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "alignment", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "addressof", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "byref", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "resize", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(ns, "call_function", pyre_interpreter::typedef::w_object());
-    pyre_interpreter::__pyre_store!(
-        ns,
-        "call_cdeclfunction",
-        pyre_interpreter::typedef::w_object()
-    );
-}

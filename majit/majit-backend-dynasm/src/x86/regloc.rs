@@ -247,6 +247,7 @@ impl BinOp {
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnOp {
+    INC,
     NEG,
     NOT,
     MUL,
@@ -431,6 +432,9 @@ impl LocationCodeBuilder {
 
     // ── _unaryop / _relative_unaryop ──
 
+    pub(crate) fn INC(&mut self, loc: impl Into<Operand>) {
+        self.INSN_unary(UnOp::INC, loc.into());
+    }
     pub(crate) fn NEG(&mut self, loc: impl Into<Operand>) {
         self.INSN_unary(UnOp::NEG, loc.into());
     }
@@ -767,6 +771,8 @@ impl LocationCodeBuilder {
         use UnOp::*;
         let mc = &mut self.mc;
         match (name, loc) {
+            (INC, M(b, o)) => rx86::inc_m(mc, mem32(b, o)),
+            (INC, J(addr)) => rx86::inc_j(mc, addr as i32),
             (NEG, R(r)) => dynasm!(mc ; .arch x64 ; neg Rq(r)),
             (NOT, R(r)) => dynasm!(mc ; .arch x64 ; not Rq(r)),
             (NOT, B(o)) => rx86::not_b(mc, o),

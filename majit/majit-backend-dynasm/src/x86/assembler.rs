@@ -4870,6 +4870,22 @@ impl<'a> Assembler386<'a> {
                 };
                 self.emit_propagate_exception_if_zero(reg);
             }
+            // `genop_discard_increment_debug_counter`: the argument should be
+            // an immediate address; x86's from-memory-to-memory increment
+            // stands for GETFIELD_RAW, ADD(1) and SETFIELD_RAW.
+            OpCode::IncrementDebugCounter => {
+                let [base_loc] = &arglocs[..] else {
+                    panic!("IncrementDebugCounter takes one argloc, got {arglocs:?}");
+                };
+                // regloc.py `mem(base_loc, 0)` of the `ImmedLoc`: the word at
+                // that absolute address.
+                let Loc::Immed(addr) = base_loc else {
+                    panic!(
+                        "IncrementDebugCounter base must be an immediate address, got {base_loc:?}"
+                    );
+                };
+                self.mc.INC(Operand::J(addr.value));
+            }
             // x86/assembler.py genop_discard_cond_call_gc_wb
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.emit_write_barrier_fastpath(regalloc, op, &arglocs);
@@ -9003,30 +9019,11 @@ impl<'a> Assembler386<'a> {
     }
 
     /// `genop_discard_zero_array`: the unrolled `XORPS` + `MOVUPS` /
-    /// `save_into_mem(imm0)` stores through `addr_add`. An eight-loc
-    /// `arglocs` is `consider_zero_array`'s memset() path.
+    /// `save_into_mem(imm0)` stores through `addr_add`. A two-loc `arglocs`
+    /// is `consider_zero_array`'s memset() path.
     fn genop_discard_zero_array(&mut self, arglocs: &[Loc]) {
-        if let [
-            base_loc,
-            startindex_loc,
-            itemsize_loc,
-            baseofs_loc,
-            dstaddr_loc,
-            length_loc,
-            len_itemsize_loc,
-            bytes_loc,
-        ] = arglocs
-        {
-            return self.zero_array_memset(
-                base_loc,
-                startindex_loc,
-                itemsize_loc,
-                baseofs_loc,
-                dstaddr_loc,
-                length_loc,
-                len_itemsize_loc,
-                bytes_loc,
-            );
+        if let [dstaddr_loc, length_loc] = arglocs {
+            return self.zero_array_memset(dstaddr_loc, length_loc);
         }
         let [
             base_loc,
@@ -9072,55 +9069,15 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// The memset() half of `consider_zero_array`: `LEA(dstaddr_loc,
-    /// _scaled_addr(startindex_loc, itemsize_loc, base_loc, imm(baseofs)))`,
-    /// the `LEA` of the byte length when `len_itemsize > 1`, then
+    /// The memset() half of `consider_zero_array`:
     /// `simple_call_no_collect(imm(memset_addr), [dstaddr_loc, imm0,
-    /// length_loc])`. Regalloc has already run `before_call`.
-    #[allow(clippy::too_many_arguments)]
-    fn zero_array_memset(
-        &mut self,
-        base_loc: &Loc,
-        startindex_loc: &Loc,
-        itemsize_loc: &Loc,
-        baseofs_loc: &Loc,
-        dstaddr_loc: &Loc,
-        length_loc: &Loc,
-        len_itemsize_loc: &Loc,
-        bytes_loc: &Loc,
-    ) {
-        let (
-            Loc::Immed(itemsize),
-            Loc::Immed(baseofs),
-            Loc::Reg(dstaddr),
-            Loc::Immed(len_itemsize),
-        ) = (itemsize_loc, baseofs_loc, dstaddr_loc, len_itemsize_loc)
-        else {
-            panic!(
-                "ZERO_ARRAY memset locations: {itemsize_loc:?} {baseofs_loc:?} {dstaddr_loc:?} {len_itemsize_loc:?}"
-            );
-        };
-        let dst_addr =
-            self.addr_add_zero_array(base_loc, startindex_loc, itemsize.value, baseofs.value);
-        self.mc.LEA(*dstaddr, dst_addr);
-        let mut length_loc = *length_loc;
-        if len_itemsize.value > 1 {
-            let (Loc::Reg(index), Loc::Reg(bytes)) = (length_loc, bytes_loc) else {
-                panic!("ZERO_ARRAY scaled length needs registers: {length_loc:?} {bytes_loc:?}");
-            };
-            assert!(
-                crate::regalloc::valid_addressing_size(len_itemsize.value as usize),
-                "rewrite did not correctly handle shift/mul!"
-            );
-            let shift = crate::regalloc::get_scale(len_itemsize.value as usize);
-            self.mc
-                .LEA(*bytes, addr_add(&Loc::immed(0), &Loc::Reg(index), 0, shift));
-            length_loc = *bytes_loc;
-        }
+    /// length_loc])`. Regalloc has already emitted both `LEA`s and run
+    /// `before_call`.
+    fn zero_array_memset(&mut self, dstaddr_loc: &Loc, length_loc: &Loc) {
         let memset_addr = libc::memset as *const () as i64;
         self.simple_call_no_collect(
             Loc::immed(memset_addr),
-            &[*dstaddr_loc, Loc::immed(0), length_loc],
+            &[*dstaddr_loc, Loc::immed(0), *length_loc],
         );
     }
 
@@ -9363,5 +9320,20 @@ impl RegAllocAssembler for Assembler386<'_> {
             frame_depth,
         );
         self.fail_index += 1;
+    }
+
+    fn regalloc_lea_scaled_addr(
+        &mut self,
+        dst: Loc,
+        index_loc: &Loc,
+        itemsize: i64,
+        base_loc: &Loc,
+        ofs: i64,
+    ) {
+        let Loc::Reg(dst) = dst else {
+            panic!("LEA destination must be a register, got {dst:?}");
+        };
+        let addr = self.addr_add_zero_array(base_loc, index_loc, itemsize, ofs);
+        self.mc.LEA(dst, addr);
     }
 }

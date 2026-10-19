@@ -709,7 +709,6 @@ impl<'a> RegAlloc<'a> {
                 self.prepare_op_call_malloc_nursery_varsize(dst, args, i, asm);
             }
             OpCode::CheckMemoryError => self.prepare_op_check_memory_error(args, i, asm),
-            OpCode::RecordKnownResult => {}
             OpCode::New
             | OpCode::NewWithVtable
             | OpCode::NewArray
@@ -718,7 +717,7 @@ impl<'a> RegAlloc<'a> {
             | OpCode::Newunicode => {
                 self.prepare_raw_call_like(dst, args, op, i, asm, SAVE_DEFAULT_REGS);
             }
-            _ => {}
+            _ => self.notimplemented(opcode),
         }
     }
 
@@ -892,22 +891,57 @@ impl<'a> RegAlloc<'a> {
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.prepare_op_cond_call_gc_wb(args, i, asm);
             }
-            OpCode::JitDebug
-            | OpCode::DebugMergePoint
-            | OpCode::RecordExactClass
-            | OpCode::RecordExactValueR
-            | OpCode::RecordExactValueI
-            | OpCode::RecordKnownResult
-            | OpCode::QuasiimmutField
-            | OpCode::AssertNotNone
-            | OpCode::Keepalive
-            | OpCode::EnterPortalFrame
-            | OpCode::LeavePortalFrame
-            | OpCode::IncrementDebugCounter
-            | OpCode::VirtualRefFinish
-            | OpCode::ForceSpill => {}
-            _ => {}
+            // aarch64/regalloc.py `prepare_op_jit_debug = void`,
+            // `prepare_op_keepalive = void`.
+            OpCode::JitDebug | OpCode::Keepalive => {}
+            // `prepare_op_enter_portal_frame` / `prepare_op_leave_portal_frame`
+            // hand the op to llsupport/assembler.py `enter_portal_frame` /
+            // `leave_portal_frame`, which only feed the codemap
+            // (`HAS_CODEMAP`); dynasm keeps no codemap.
+            OpCode::EnterPortalFrame | OpCode::LeavePortalFrame => {}
+            OpCode::IncrementDebugCounter => self.prepare_op_increment_debug_counter(args, i, asm),
+            // aarch64/assembler.py `_walk_operations`: `FORCE_SPILL` (tests
+            // only) goes straight to `regalloc.force_spill_var`.
+            OpCode::ForceSpill => {
+                let v = args[0];
+                let tp = self.tp(v);
+                self.force_spill_var(v, tp);
+            }
+            _ => self.notimplemented(opcode),
         }
+    }
+
+    /// aarch64/regalloc.py `prepare_op_increment_debug_counter`.
+    pub(crate) fn prepare_op_increment_debug_counter(
+        &mut self,
+        args: &[OpRef],
+        i: usize,
+        asm: &mut dyn RegAllocAssembler,
+    ) {
+        let a0 = args[0];
+        let base_loc = self.make_sure_var_in_reg(a0, Type::Int, args, None, false);
+        // `get_scratch_reg(INT, boxes)`.
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        let value_loc = Loc::Reg(self.rm.force_allocate_reg(
+            tmp,
+            args,
+            None,
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        ));
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+        self.perform_discard(i, vec![base_loc, value_loc], asm);
+    }
+
+    /// aarch64/regalloc.py `notimplemented`, the `operations` default.
+    /// `compile_loop` catches the panic and declines the trace, as
+    /// `NotImplementedError` does upstream.
+    pub(crate) fn notimplemented(&self, opcode: OpCode) -> ! {
+        panic!("[ARM64/regalloc] {opcode:?} not implemented")
     }
 
     pub(crate) fn prepare_int_cmp(

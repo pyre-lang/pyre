@@ -1052,6 +1052,23 @@ pub(crate) fn push_j(mc: &mut Assembler, abs_addr: i32) {
     writeimm32(mc, abs_addr);
 }
 
+/// `INC_m` — `inc qword [base + ofs]`.
+pub(crate) fn inc_m(mc: &mut Assembler, mem: (u8, i32)) {
+    encode_rex(mc, rex_mem_reg_plus_const(mem), REX_W);
+    DynasmApi::push(mc, 0xFF);
+    encode_m(mc, mem.0, mem.1, 0);
+}
+
+/// `INC_j` — `inc qword [abs32]`. `encode_abs`: modrm `0x04 | 0<<3`,
+/// sib `0x25`, disp32.
+pub(crate) fn inc_j(mc: &mut Assembler, abs_addr: i32) {
+    encode_rex(mc, 0, REX_W);
+    DynasmApi::push(mc, 0xFF);
+    DynasmApi::push(mc, 0x04);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
+}
+
 /// `CALL_b` — `call qword [rbp + ofs]`. No REX.W (`rx86.py` `CALL_b`).
 pub fn call_b(mc: &mut Assembler, offset: i32) {
     DynasmApi::push(mc, 0xFF);
