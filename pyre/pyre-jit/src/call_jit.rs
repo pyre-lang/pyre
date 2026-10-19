@@ -2214,6 +2214,12 @@ fn jit_blackhole_resume_from_guard(
     // `llmodel.py grab_exc_value`: read `jf_guard_exc`. The slot stays put;
     // `jitframe_trace` is the root across this resume.
     let guard_exc = unsafe { (*deadframe).jf_guard_exc as i64 };
+    // `blackhole.py _prepare_resume_from_failure` takes the exception off
+    // this fail descr. A leftover residual cell from a nested `list(gen)`
+    // that already caught `StopIteration` is not this guard's raise.
+    if guard_exc == 0 {
+        clear_residual_call_exception();
+    }
 
     // compile.py `resume_in_blackhole(descr, deadframe)`:
     // recover the failed descr from `descr_addr` (history.py:125
