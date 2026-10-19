@@ -6104,6 +6104,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             &guard_words,
             &expand_inline_struct,
         )?;
+        // `removeassert.py` melt of abort-bound `format!` / `assert_eq!`
+        // message construction.  Runs before the live `format!` collapsers
+        // so a placeholder panic does not expand into `str` + `ll_strconcat`
+        // only to be discarded.  `format!("line {lineno}")` that feeds an
+        // exception string is not abort-bound and stays for those collapsers.
+        let abort_messages_melted = melt_abort_message_ops(&mut lo.graph);
         // `format!`-chain expansion (descriptor census): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -6159,7 +6165,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // bare raise so `remove_assertion_errors` prunes the branch as it
         // does for a direct implicit raise.  Gated on an actual collapse
         // so untouched graphs keep their single end-of-lowering simplify.
-        if collapse_panic_message_chains(&mut lo.graph) > 0 {
+        if abort_messages_melted > 0 || collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
             let guard_words = lo.guard_word_vars.clone();
             simplify_lowered_graph_expanding(
@@ -23404,6 +23410,7 @@ impl<'a> Lowering<'a> {
                 // re-match folds away together with its discriminant
                 // switch.
                 self.graph.set_raise_implicit(bb_id, "AssertionError");
+                melt_abort_message_chain(&mut self.graph, bb_id);
                 Ok(())
             }
             TermKind::UnwindResume | TermKind::UnwindTerminate => {
@@ -24226,6 +24233,11 @@ impl<'a> Lowering<'a> {
             && regular_call_is_panicking_abort(reg, self.llbc)
         {
             self.graph.set_raise_implicit(bb_id, "AssertionError");
+            // `removeassert.py` `remove_asserts` / `kill_assertion_link`:
+            // the abort is an implicit AssertionError (`ll_assert` with a
+            // constant message). Melt the format operands rustc evaluated
+            // before `panic_fmt` / `assert_failed`.
+            melt_abort_message_chain(&mut self.graph, bb_id);
             return Ok(());
         }
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
@@ -79832,6 +79844,294 @@ fn can_thread_var_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable
     }
 }
 
+/// `alloc::fmt::format`, `fmt::Arguments` constructors, `fmt::rt::Argument::new_*`,
+/// and the pure helpers that exist only to fill those operands (`kind_name`,
+/// `expected_fmt_arg`, `__len`).  `rtyper/debug.py` `ll_assert` takes a
+/// constant message; rustc still evaluates these before `panic_fmt`.
+fn is_abort_message_call(segments: &[String]) -> bool {
+    if segments.first().map(String::as_str) == Some("__str_const") {
+        return true;
+    }
+    if fmt_path_ends_with(segments, &["fmt", "format"]) {
+        return true;
+    }
+    let Some(raw_leaf) = segments.last() else {
+        return false;
+    };
+    let leaf = crate::front::clause_spec::unspecialized_leaf(raw_leaf);
+    if is_abort_message_helper_leaf(leaf) {
+        return true;
+    }
+    if segments.iter().any(|s| s == "Argument") && leaf.starts_with("new_") {
+        return true;
+    }
+    if segments.iter().any(|s| s == "Arguments")
+        && (matches!(
+            leaf,
+            "new" | "new_v1" | "new_const" | "from_str" | "from_str_nonconst"
+        ) || leaf.starts_with("new_"))
+    {
+        return true;
+    }
+    // `core::fmt::<Impl>::new` when the owner stayed an `<Impl>` placeholder.
+    leaf == "new"
+        && segments.iter().any(|s| s == "fmt")
+        && !segments.iter().any(|s| s == "Argument")
+}
+
+fn is_abort_message_helper_leaf(leaf: &str) -> bool {
+    matches!(leaf, "kind_name" | "expected_fmt_arg" | "__len")
+}
+
+fn abort_message_call_target(target: &crate::model::CallTarget) -> bool {
+    use crate::model::CallTarget;
+    match target {
+        CallTarget::FunctionPath { segments, .. } => is_abort_message_call(segments),
+        CallTarget::Method {
+            name,
+            resolved_path,
+            ..
+        } => {
+            resolved_path
+                .as_ref()
+                .is_some_and(|p| is_abort_message_call(&p.segments))
+                || is_abort_message_helper_leaf(name)
+        }
+        CallTarget::SyntheticTransparentCtor { name, .. } => {
+            matches!(name.as_str(), "Tuple" | "Array" | "Some")
+        }
+        _ => false,
+    }
+}
+
+fn block_produced_var_ids(block: &crate::model::Block) -> std::collections::HashSet<u64> {
+    block
+        .operations
+        .iter()
+        .filter_map(|op| op.result.as_ref().map(|r| r.id()))
+        .collect()
+}
+
+fn is_abort_message_op(
+    kind: &crate::model::OpKind,
+    produced_in_block: &std::collections::HashSet<u64>,
+) -> bool {
+    use crate::model::OpKind;
+    match kind {
+        // `graph_body.rs` `stamp_declared` / `declaration` pin startblock
+        // `Input` ops to the funcobj header. A unique-pred chain from the
+        // startblock into an abort (a body that is only `panic!("…{}", x)`)
+        // still has to keep those parameters even when they feed only the
+        // melted message.
+        OpKind::Input { .. } => false,
+        OpKind::Call { target, .. } => abort_message_call_target(target),
+        OpKind::FieldWrite { base, .. } => produced_in_block.contains(&base.id()),
+        _ => crate::inline::can_remove_op(kind),
+    }
+}
+
+fn abort_message_op_is_live(
+    op: &crate::model::SpaceOperation,
+    produced_in_block: &std::collections::HashSet<u64>,
+    live: &std::collections::HashSet<u64>,
+) -> bool {
+    use crate::model::OpKind;
+    if !is_abort_message_op(&op.kind, produced_in_block) {
+        return false;
+    }
+    match &op.kind {
+        // A write into a live aggregate (the pieces / args array whose
+        // `Arguments::new` result escaped) must keep its value operand.
+        OpKind::FieldWrite { base, .. } => live.contains(&base.id()),
+        _ => op.result.as_ref().is_some_and(|r| live.contains(&r.id())),
+    }
+}
+
+fn link_raises_implicit_assertion_error(
+    link: &crate::model::Link,
+    exceptblock: BlockId,
+    assert_err: &crate::flowspace::model::HostObject,
+) -> bool {
+    use crate::flowspace::model::ConstValue;
+    use crate::model::LinkArg;
+    link.target == exceptblock
+        && matches!(
+            link.args.first(),
+            Some(LinkArg::Const(c))
+                if matches!(&c.value, ConstValue::HostObject(h) if *h == *assert_err)
+        )
+}
+
+/// Abort block plus the unique-predecessor chain that has no other successor
+/// — the blocks rustc fills with `format_args!` before `panic_fmt`.
+fn abort_message_region(graph: &FunctionGraph, abort: BlockId) -> Vec<BlockId> {
+    let mut region = vec![abort];
+    let mut cur = abort;
+    for _ in 0..graph.blocks.len() {
+        let preds = graph.predecessors(cur);
+        if preds.len() != 1 {
+            break;
+        }
+        let pred = preds[0];
+        if graph.block(pred).exits.len() != 1 {
+            break;
+        }
+        region.push(pred);
+        cur = pred;
+    }
+    region
+}
+
+/// Melt abort-bound message construction (`removeassert.py` "melt away the
+/// (hopefully) dead operation that compute the condition").  Ops whose
+/// result is used only as the panicking call's format operands disappear;
+/// a store into an escaped object, and a `format!` whose result is live,
+/// stay.
+fn melt_abort_message_chain(graph: &mut FunctionGraph, abort: BlockId) -> usize {
+    use crate::model::LinkArg;
+    let region = abort_message_region(graph, abort);
+    let region_set: std::collections::HashSet<BlockId> = region.iter().copied().collect();
+    let exceptblock = graph.exceptblock;
+    let mut outside_used: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        let in_region = region_set.contains(&block.id);
+        if !in_region {
+            for op in &block.operations {
+                for v in crate::inline::op_variable_refs(&op.kind) {
+                    outside_used.insert(v.id());
+                }
+            }
+        }
+        for exit in &block.exits {
+            if in_region && (region_set.contains(&exit.target) || exit.target == exceptblock) {
+                continue;
+            }
+            for arg in &exit.args {
+                if let Some(v) = arg.as_variable() {
+                    outside_used.insert(v.id());
+                }
+            }
+        }
+    }
+    let mut live = outside_used;
+    for block in &graph.blocks {
+        if !region_set.contains(&block.id) {
+            continue;
+        }
+        let produced = block_produced_var_ids(block);
+        for op in &block.operations {
+            if is_abort_message_op(&op.kind, &produced) {
+                continue;
+            }
+            for v in crate::inline::op_variable_refs(&op.kind) {
+                live.insert(v.id());
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in 0..graph.blocks.len() {
+            let block_id = graph.blocks[bi].id;
+            if !region_set.contains(&block_id) {
+                continue;
+            }
+            let live_inputs: Vec<usize> = graph.blocks[bi]
+                .inputargs
+                .iter()
+                .enumerate()
+                .filter(|(_, inp)| live.contains(&inp.id()))
+                .map(|(i, _)| i)
+                .collect();
+            let preds = graph.predecessors(block_id);
+            for pred in preds {
+                if !region_set.contains(&pred) {
+                    continue;
+                }
+                for exit in &graph.block(pred).exits {
+                    if exit.target != block_id {
+                        continue;
+                    }
+                    for &i in &live_inputs {
+                        if let Some(LinkArg::Value(v)) = exit.args.get(i)
+                            && live.insert(v.id())
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            let produced = block_produced_var_ids(&graph.blocks[bi]);
+            let pull: Vec<u64> = graph.blocks[bi]
+                .operations
+                .iter()
+                .filter(|op| abort_message_op_is_live(op, &produced, &live))
+                .flat_map(|op| crate::inline::op_variable_refs(&op.kind))
+                .map(|v| v.id())
+                .collect();
+            for id in pull {
+                if live.insert(id) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut deleted = 0usize;
+    for block in &mut graph.blocks {
+        if !region_set.contains(&block.id) {
+            continue;
+        }
+        let produced = block_produced_var_ids(block);
+        let dead: Vec<usize> = block
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| {
+                is_abort_message_op(&op.kind, &produced)
+                    && !abort_message_op_is_live(op, &produced, &live)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if dead.is_empty() {
+            continue;
+        }
+        deleted += dead.len();
+        let drop: std::collections::HashSet<usize> = dead.into_iter().collect();
+        let mut kept = Vec::with_capacity(block.operations.len() - drop.len());
+        for (i, op) in block.operations.drain(..).enumerate() {
+            if !drop.contains(&i) {
+                kept.push(op);
+            }
+        }
+        block.operations = kept;
+    }
+    deleted
+}
+
+fn melt_abort_message_ops(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::HOST_ENV;
+    let assert_err = HOST_ENV
+        .lookup_builtin("AssertionError")
+        .expect("HOST_ENV missing AssertionError");
+    let exceptblock = graph.exceptblock;
+    let aborts: Vec<BlockId> = graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block.exits.as_slice(),
+                [exit] if link_raises_implicit_assertion_error(exit, exceptblock, &assert_err)
+            )
+        })
+        .map(|block| block.id)
+        .collect();
+    let mut deleted = 0usize;
+    for abort in aborts {
+        deleted += melt_abort_message_chain(graph, abort);
+    }
+    deleted
+}
+
 /// A block is collapsible into a bare implicit-`AssertionError` raise when
 /// every op is a pure value / ctor / field op or a recognised `fmt`
 /// message extern — the message-building work a Rust `panic!` / `assert!`
@@ -79843,44 +80143,14 @@ fn can_thread_var_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable
 /// — a real side-effecting function such as `Write::write_fmt` — likewise
 /// blocks the collapse.
 fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
-    use crate::model::{CallTarget, OpKind};
-    let is_message_extern = |segments: &[String]| -> bool {
-        if segments.first().map(String::as_str) == Some("__str_const") {
-            return true;
-        }
-        let n = segments.len();
-        n >= 2
-            && segments.first().map(String::as_str) == Some("fmt")
-            && matches!(segments[n - 2].as_str(), "Argument" | "Arguments")
-    };
+    use crate::model::OpKind;
     let mut produced = std::collections::HashSet::new();
     for op in &block.operations {
         let pure = match &op.kind {
-            OpKind::ConstInt(_)
-            | OpKind::ConstFnAddr { .. }
-            | OpKind::ConstUInt(_)
-            | OpKind::ConstBool(_)
-            | OpKind::ConstFloat(_)
-            | OpKind::ConstStr(_)
-            | OpKind::ConstInternedStr(_)
-            | OpKind::ConstRef(_)
-            | OpKind::ConstRefNull
-            | OpKind::ConstNone
-            | OpKind::ConstRefAddr(_)
-            | OpKind::ConstSymbolic { .. }
-            | OpKind::FieldRead { .. }
-            | OpKind::BinOp { .. }
-            | OpKind::UnaryOp { .. } => true,
+            OpKind::Input { .. } => false,
+            OpKind::Call { target, .. } => abort_message_call_target(target),
             OpKind::FieldWrite { base, .. } => produced.contains(&base.id()),
-            OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { .. },
-                ..
-            } => true,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => is_message_extern(segments),
-            _ => false,
+            kind => crate::inline::can_remove_op(kind),
         };
         if !pure {
             return false;
@@ -111622,6 +111892,485 @@ mod tests {
                     if field.name == "__pos_0" && field.owner_root.as_deref().is_some_and(|owner| owner.ends_with("::Ok")))
             }),
             "the Result Ok payload must keep the lifted string repr: {graph:#?}"
+        );
+    }
+
+    /// `panic!("x {} y", n)` / `assert_eq!(a, b, "m {}", c)` / live
+    /// `format!("line {}", n)` — the `removeassert.py` melt of abort-bound
+    /// `format!` construction (`remove_asserts` / `kill_assertion_link`).
+    fn leftover_fmt_message_paths(graph: &crate::model::FunctionGraph) -> Vec<Vec<String>> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| {
+                let crate::model::OpKind::Call { target, .. } = &op.kind else {
+                    return None;
+                };
+                let segs: Vec<String> = match target {
+                    crate::model::CallTarget::FunctionPath { segments, .. } => segments.clone(),
+                    crate::model::CallTarget::Method {
+                        name,
+                        resolved_path,
+                        ..
+                    } => resolved_path
+                        .as_ref()
+                        .map(|p| p.segments.clone())
+                        .unwrap_or_else(|| vec![name.clone()]),
+                    _ => return None,
+                };
+                let leaf = segs
+                    .last()
+                    .map(|s| crate::front::clause_spec::unspecialized_leaf(s).to_string());
+                let is_fmt = super::fmt_path_ends_with(&segs, &["fmt", "format"])
+                    || segs.iter().any(|s| s == "Arguments")
+                    || (segs.iter().any(|s| s == "Argument")
+                        && leaf.as_deref().is_some_and(|l| l.starts_with("new_")));
+                is_fmt.then_some(segs)
+            })
+            .collect()
+    }
+
+    fn has_implicit_assertion_error(graph: &crate::model::FunctionGraph) -> bool {
+        graph.blocks.iter().any(|block| {
+            block
+                .exits
+                .iter()
+                .any(|link| oefmt_link_is_assert_raise(link, graph.exceptblock))
+        })
+    }
+
+    fn regular_call_block(
+        fun_id: u64,
+        args: Vec<serde_json::Value>,
+        dest: serde_json::Value,
+        target: u64,
+        unwind: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "statements": [],
+            "terminator": {
+                "span": span_json(),
+                "kind": {
+                    "Call": {
+                        "call": {
+                            "func": {
+                                "Regular": {
+                                    "kind": {"Fun": fun_id},
+                                    "generics": empty_generics()
+                                }
+                            },
+                            "args": args,
+                            "dest": dest
+                        },
+                        "target": target,
+                        "on_unwind": unwind
+                    }
+                }
+            }
+        })
+    }
+
+    fn fmt_chain_opaque_fun(
+        def_id: u64,
+        path: &[&str],
+        inputs: Vec<serde_json::Value>,
+        output: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": inputs,
+                "output": output
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn fmt_placeholder_types() -> (
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        Vec<serde_json::Value>,
+    ) {
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let argument_ty = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": empty_generics()}
+        });
+        let arguments_ty = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": empty_generics()}
+        });
+        let str_ty = serde_json::json!({
+            "Adt": {"builtin": "Str", "generics": empty_generics()}
+        });
+        let types = vec![
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": item_meta_json(&["core", "fmt", "rt", "Argument"], "", false),
+                "kind": {"Struct": []}
+            }),
+            serde_json::json!({
+                "def_id": 1,
+                "item_meta": item_meta_json(&["core", "fmt", "Arguments"], "", false),
+                "kind": {"Struct": []}
+            }),
+        ];
+        (i64_ty, unit, argument_ty, arguments_ty, str_ty, types)
+    }
+
+    fn fmt_placeholder_callees(
+        argument_ty: &serde_json::Value,
+        arguments_ty: &serde_json::Value,
+        str_ty: &serde_json::Value,
+        i64_ty: &serde_json::Value,
+        unit: &serde_json::Value,
+        abort_leaf: &str,
+    ) -> Vec<serde_json::Value> {
+        vec![
+            fmt_chain_opaque_fun(
+                1,
+                &["core", "fmt", "rt", "Argument", "new_display"],
+                vec![i64_ty.clone()],
+                argument_ty.clone(),
+            ),
+            fmt_chain_opaque_fun(
+                2,
+                &["core", "fmt", "Arguments", "new"],
+                vec![argument_ty.clone()],
+                arguments_ty.clone(),
+            ),
+            fmt_chain_opaque_fun(
+                3,
+                &["alloc", "fmt", "format"],
+                vec![arguments_ty.clone()],
+                str_ty.clone(),
+            ),
+            fmt_chain_opaque_fun(
+                4,
+                &["core", "panicking", abort_leaf],
+                vec![str_ty.clone()],
+                unit.clone(),
+            ),
+        ]
+    }
+
+    fn fmt_placeholder_chain_blocks(
+        i64_ty: &serde_json::Value,
+        argument_ty: &serde_json::Value,
+        arguments_ty: &serde_json::Value,
+        str_ty: &serde_json::Value,
+        n_local: u64,
+        arg_local: u64,
+        args_local: u64,
+        formatted_local: u64,
+        after_format: u64,
+        unwind: u64,
+    ) -> Vec<serde_json::Value> {
+        let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": {"kind": {"Local": i}, "ty": ty}});
+        let dest =
+            |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+        vec![
+            regular_call_block(
+                1,
+                vec![copy(n_local, i64_ty)],
+                dest(arg_local, argument_ty),
+                1,
+                unwind,
+            ),
+            regular_call_block(
+                2,
+                vec![copy(arg_local, argument_ty)],
+                dest(args_local, arguments_ty),
+                2,
+                unwind,
+            ),
+            regular_call_block(
+                3,
+                vec![copy(args_local, arguments_ty)],
+                dest(formatted_local, str_ty),
+                after_format,
+                unwind,
+            ),
+        ]
+    }
+
+    /// `panic!("x {} y", n)`: the placeholder chain feeds only
+    /// `panic_fmt`.  `removeassert.py` melts it to a bare implicit
+    /// `AssertionError` raise.
+    #[test]
+    fn panic_placeholder_format_melts_to_implicit_assertion_error() {
+        let (i64_ty, unit, argument_ty, arguments_ty, str_ty, types) = fmt_placeholder_types();
+        let unwind = 4u64;
+        let mut body = fmt_placeholder_chain_blocks(
+            &i64_ty,
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            1,
+            2,
+            3,
+            4,
+            3,
+            unwind,
+        );
+        body.push(regular_call_block(
+            4,
+            vec![serde_json::json!({"Copy": {"kind": {"Local": 4}, "ty": str_ty}})],
+            serde_json::json!({"kind": {"Local": 0}, "ty": unit}),
+            5,
+            unwind,
+        ));
+        body.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span_json(), "kind": "UnwindResume"}
+        }));
+        body.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span_json(), "kind": "Return"}
+        }));
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "panic_placeholder"], "", true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [i64_ty.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span_json(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span_json(), "ty": unit},
+                            {"index": 1, "name": "n", "span": span_json(), "ty": i64_ty},
+                            {"index": 2, "name": "arg", "span": span_json(), "ty": argument_ty},
+                            {"index": 3, "name": "args", "span": span_json(), "ty": arguments_ty},
+                            {"index": 4, "name": "msg", "span": span_json(), "ty": str_ty}
+                        ]
+                    },
+                    "body": body
+                }
+            }
+        });
+        let mut funs = vec![caller];
+        funs.extend(fmt_placeholder_callees(
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            &i64_ty,
+            &unit,
+            "panic_fmt",
+        ));
+        let llbc = llbc_with_types("fixture", types, funs);
+        let graph =
+            super::lower_function(&llbc, "panic_placeholder").expect("lower panic!(\"x {} y\", n)");
+        let leftover = leftover_fmt_message_paths(&graph);
+        assert!(
+            leftover.is_empty(),
+            "panic! placeholder format must melt: leftover={leftover:?} graph={graph:#?}"
+        );
+        assert!(
+            has_implicit_assertion_error(&graph),
+            "panic! must remain RaiseImplicit(AssertionError): {graph:#?}"
+        );
+        let start = graph.block(graph.startblock);
+        let input_ops = start
+            .operations
+            .iter()
+            .filter(|op| matches!(op.kind, crate::model::OpKind::Input { .. }))
+            .count();
+        assert_eq!(
+            input_ops,
+            start.inputargs.len(),
+            "melt must keep startblock Input ops (`stamp_declared`): {graph:#?}"
+        );
+    }
+
+    /// `assert_eq!(a, b, "m {}", c)`: the fail arm is the same placeholder
+    /// chain into `assert_failed`.  Format / Arguments must not remain.
+    #[test]
+    fn assert_eq_placeholder_format_melts_to_implicit_assertion_error() {
+        let (i64_ty, unit, argument_ty, arguments_ty, str_ty, types) = fmt_placeholder_types();
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let unwind = 6u64;
+        let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": {"kind": {"Local": i}, "ty": ty}});
+        let dest =
+            |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+        let body = vec![
+            serde_json::json!({
+                "statements": [],
+                "terminator": {
+                    "span": span_json(),
+                    "kind": {
+                        "Switch": {
+                            "discr": {"Copy": {"kind": {"Local": 1}, "ty": bool_ty}},
+                            "targets": {"If": [1, 2]}
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": unit},
+                        {"Aggregate": ["Tuple", []]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }),
+            regular_call_block(1, vec![copy(2, &i64_ty)], dest(3, &argument_ty), 3, unwind),
+            regular_call_block(
+                2,
+                vec![copy(3, &argument_ty)],
+                dest(4, &arguments_ty),
+                4,
+                unwind,
+            ),
+            regular_call_block(3, vec![copy(4, &arguments_ty)], dest(5, &str_ty), 5, unwind),
+            regular_call_block(4, vec![copy(5, &str_ty)], dest(0, &unit), 1, unwind),
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "UnwindResume"}
+            }),
+        ];
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "assert_eq_placeholder"], "", true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [bool_ty.clone(), i64_ty.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span_json(),
+                    "locals": {
+                        "arg_count": 2,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span_json(), "ty": unit},
+                            {"index": 1, "name": "eq", "span": span_json(), "ty": bool_ty},
+                            {"index": 2, "name": "c", "span": span_json(), "ty": i64_ty},
+                            {"index": 3, "name": "arg", "span": span_json(), "ty": argument_ty},
+                            {"index": 4, "name": "args", "span": span_json(), "ty": arguments_ty},
+                            {"index": 5, "name": "msg", "span": span_json(), "ty": str_ty}
+                        ]
+                    },
+                    "body": body
+                }
+            }
+        });
+        let mut funs = vec![caller];
+        funs.extend(fmt_placeholder_callees(
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            &i64_ty,
+            &unit,
+            "assert_failed",
+        ));
+        let llbc = llbc_with_types("fixture", types, funs);
+        let graph = super::lower_function(&llbc, "assert_eq_placeholder")
+            .expect("lower assert_eq!(a, b, \"m {}\", c)");
+        let leftover = leftover_fmt_message_paths(&graph);
+        assert!(
+            leftover.is_empty(),
+            "assert_eq! placeholder format must melt: leftover={leftover:?} graph={graph:#?}"
+        );
+    }
+
+    /// `let s = format!("line {}", n); use(s)` is not abort-bound.
+    /// `is_fmt_format_call` + `traces_to_str_const` stay for a literal;
+    /// a placeholder `format!` keeps the format call or the existing
+    /// str-concat expansion.
+    #[test]
+    fn live_format_placeholder_is_not_melted() {
+        let (i64_ty, unit, argument_ty, arguments_ty, str_ty, types) = fmt_placeholder_types();
+        let unwind = 4u64;
+        let mut body = fmt_placeholder_chain_blocks(
+            &i64_ty,
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            1,
+            2,
+            3,
+            0,
+            3,
+            unwind,
+        );
+        body.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span_json(), "kind": "Return"}
+        }));
+        body.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span_json(), "kind": "UnwindResume"}
+        }));
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "live_format_placeholder"], "", true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [i64_ty.clone()],
+                "output": str_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span_json(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span_json(), "ty": str_ty},
+                            {"index": 1, "name": "n", "span": span_json(), "ty": i64_ty},
+                            {"index": 2, "name": "arg", "span": span_json(), "ty": argument_ty},
+                            {"index": 3, "name": "args", "span": span_json(), "ty": arguments_ty}
+                        ]
+                    },
+                    "body": body
+                }
+            }
+        });
+        let mut funs = vec![caller];
+        funs.extend(fmt_placeholder_callees(
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            &i64_ty,
+            &unit,
+            "panic_fmt",
+        ));
+        let llbc = llbc_with_types("fixture", types, funs);
+        let graph = super::lower_function(&llbc, "live_format_placeholder")
+            .expect("lower live format!(\"line {}\", n)");
+        let leftover = leftover_fmt_message_paths(&graph);
+        let has_str_concat = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                crate::model::OpKind::BinOp { op: name, .. } if name == "add" => true,
+                crate::model::OpKind::UnaryOp { op: name, .. } if name == "str" => true,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__str_const") => true,
+                _ => false,
+            });
+        assert!(
+            !leftover.is_empty() || has_str_concat,
+            "live format! must keep its format call or the str-concat expansion: \
+             leftover={leftover:?} graph={graph:#?}"
+        );
+        assert!(
+            !has_implicit_assertion_error(&graph),
+            "live format! must not become RaiseImplicit(AssertionError): {graph:#?}"
         );
     }
 
