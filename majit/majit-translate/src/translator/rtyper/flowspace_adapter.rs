@@ -1391,6 +1391,34 @@ fn is_vec_set_len_segments(segments: &[String]) -> bool {
     }
 }
 
+/// `<Vec<T> as Index<usize>>::index` (Rust MIR `v[i]` / `vec::Vec::index`).
+///
+/// RPython writes the same operation as `lst[i]`:
+/// `pairtype(AbstractBaseListRepr, IntegerRepr).rtype_getitem` (`rlist.py`)
+/// → `ll_getitem_nonneg` / `ll_getitem`. A Rust `Vec` is the raw header
+/// `RustVecRepr`; `rtype_getitem` calls `ll_vec_getitem_fast` and
+/// `exception_cannot_occur` (out-of-bounds is a panic, not a raised
+/// `IndexError`). Routed to the same flowspace `getitem` that
+/// [`OpKind::ArrayRead`] and [`rust_vec_helper_ops`] `VecOp::GetItem`
+/// already emit, so pairtype dispatch (`RustVecRepr`, `IntegerRepr`,
+/// `"getitem"`) is the one lowering.
+///
+/// The foreign `vec` crate has no classdef, so the call arrives as
+/// `CallTarget::FunctionPath` (`front::mir::impl_method_owner` returns
+/// `None`). `Index<Range>` is a different callee; this recognizer is the
+/// `index` leaf only.
+fn is_vec_index_segments(segments: &[String]) -> bool {
+    match segments {
+        [a, b, c, leaf]
+            if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") && leaf == "index" =>
+        {
+            true
+        }
+        [a, b, leaf] if a == "vec" && b == "Vec" && leaf == "index" => true,
+        _ => false,
+    }
+}
+
 /// Test-only mirror of whether the flowspace op(s) this `OpKind`
 /// lowers to carry a non-empty `canraise` (`operation.py`).
 ///
@@ -1498,6 +1526,15 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             ..
         } if is_vec_set_len_segments(segments) => false,
+        // `Vec::index` lowers (in `translate_op`) to `getitem`, whose
+        // `canraise` is `[IndexError, KeyError, Exception]` (`operation.py`).
+        // `RustVecRepr.rtype_getitem` then `exception_cannot_occur`.
+        // Matched before the general `Call` arm.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if args.len() == 2 && is_vec_index_segments(segments) => true,
         // `[__iter_next]` (`front::iter_next`) lowers to the raising
         // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
         // = [StopIteration, RuntimeError]`).  Matched before the general
@@ -3575,6 +3612,21 @@ pub fn translate_op(
                             result,
                         )]);
                     }
+                    // `v[i]` (`vec::Vec::index`) is RPython `lst[i]`. Emit
+                    // `getitem(recv, index)` so `RustVecRepr.rtype_getitem`
+                    // / `pairtype(AbstractBaseListRepr, IntegerRepr).rtype_getitem`
+                    // (`rlist.py`) is the one lowering — the same op
+                    // [`OpKind::ArrayRead`] already emits. `Index<Range>` is
+                    // a different callee.
+                    if is_vec_index_segments(segments) {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "Vec::index requires exactly two args (receiver, index), got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        return Ok(vec![FlowspaceOp::new("getitem", arg_hls, result)]);
+                    }
                     // `Vec::extend_from_slice(recv, slice)` — same method
                     // shape as the `Vec::push` arm, but the bound method is
                     // `extend` and its arg is the source slice (a non-resized
@@ -4005,33 +4057,25 @@ pub fn translate_op(
                             // `__pos_0` payloads union.
                             bk.intern_enum_variant_host(&owner_qual, name)
                         } else {
-                            // A closure env ctor.  Normal struct ctors keep the
-                            // dotted qualname (`_init_classdef`'s
-                            // `struct_force_key_from_dotted_qualname` reduces it
-                            // to the `module::Type` FORCE key), but a closure's
-                            // deep `<Impl>::fn::closure` path does not reduce to
-                            // a field-registry key, so the dotted class mints
-                            // fieldless.  When the full `::` `name_path` IS a
-                            // struct-root registry key, intern under it and
-                            // project the captured fields via
-                            // `getuniqueclassdef_for_struct_root`, matching the
-                            // fielded classdef the closure param-typing path
-                            // (`tyref_input_class_root`) derives.  RPython
-                            // forbids closures.
-                            let colon_qual = format!("{owner_qual}::{name}");
-                            let is_closure_root = majit_charon_reader::ullbc::is_closure_leaf(name)
-                                && bk
-                                    .struct_fields
-                                    .borrow()
-                                    .as_ref()
-                                    .is_some_and(|reg| reg.fields.contains_key(&colon_qual));
-                            if is_closure_root {
-                                let _ = bk.getuniqueclassdef_for_struct_root(&colon_qual);
-                                bk.intern_class_by_qualname(&colon_qual)
-                            } else {
-                                let qualname = format!("{}.{}", owner_path.join("."), name);
-                                bk.intern_class_by_qualname(&qualname)
+                            // Struct ctor: intern under the dotted
+                            // constructor qualname. `intern_class_by_qualname`
+                            // / `normalize_class_qualname` reduce it to the
+                            // crate-relative STRUCT path
+                            // `synthetic_transparent_ctor_owner` /
+                            // `rewrite_op_malloc` uses (`ClassDesc` /
+                            // `getuniqueclassdef` identity, `rclass.py`
+                            // `getinstancerepr`). A zero-capture closure
+                            // env keeps that unique path: the shared leaf
+                            // is not a ClassDesc. Project registered
+                            // fields onto the interned classdef
+                            // (`getuniqueclassdef_for_struct_root`); a
+                            // fieldless env stays empty.
+                            let qualname = format!("{}.{}", owner_path.join("."), name);
+                            let class_host = bk.intern_class_by_qualname(&qualname);
+                            if bk.is_known_struct_root(class_host.qualname()) {
+                                let _ = bk.getuniqueclassdef_for_struct_root(class_host.qualname());
                             }
+                            class_host
                         }
                     };
                     // Rust `T { fields }` allocates without running any
@@ -4157,21 +4201,18 @@ pub fn translate_op(
 
         // ─── Pyre-internal: IndirectCall ───
         // An `indirect_call` op has no pre-rtyper spelling. Upstream mints it
-        // inside the rtyper — `rpbc.py` `rtype_simple_call(self, hop):
-        // return self.call(hop)`, which reaches the emit in
-        // `FunctionReprBase.call`:
-        // ```python
-        // vlist.append(hop.inputconst(Void, row_of_graphs.values()))
-        // v = hop.genop('indirect_call', vlist, resulttype=rresult)
-        // ```
-        // Everything the annotator sees is still a `simple_call`
-        // (`SimpleCall` in `flowspace/operation.py`,
-        // `simple_call_SomeObject` in `annotator/unaryop.py`),
-        // and this adapter is the entry into annotation. So the op cannot be
+        // inside the rtyper — `rpbc.py` `FunctionReprBase.call` for a PBC
+        // family (`inputconst(Void, row_of_graphs.values())`), or
+        // `rptr.py` `PtrRepr.rtype_simple_call` for a `Ptr(FuncType)`
+        // value (`inputconst(Void, None)`). Everything the annotator
+        // sees is still a `simple_call` (`SimpleCall` in
+        // `flowspace/operation.py`, `simple_call_SomeObject` in
+        // `annotator/unaryop.py` / `SomePtr.call` in `lltype.py`), and
+        // this adapter is the entry into annotation. So the op cannot be
         // lowered to a flowspace `indirect_call` before arriving here: the
         // trailing `c_graphs` Constant that `GraphAnalyzer.analyze`
-        // (graphanalyze.py) reads out
-        // of `op.args[-1]` is a product of rtyping, which has not run yet.
+        // (`graphanalyze.py`) reads out of `op.args[-1]` is a product of
+        // rtyping, which has not run yet.
         //
         // `family_key` carries the pre-rtyper identity of the vtable slot, so a
         // dyn-trait dispatch lowers to the same `getattr` + `simple_call` shape
@@ -4191,15 +4232,26 @@ pub fn translate_op(
             let result = resolve_result_hlvalue(op, value_map)?;
             dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
         }
-        // A stored function pointer — no trait receiver and no method name, so
-        // there is nothing for a `getattr` to name. It keeps failing loud.
-        OpKind::IndirectCall { .. } => Err(TyperError::message(format!(
-            "translate_op: IndirectCall at result={} carries no `family_key`, \
-             so it names no dyn-trait vtable slot the adapter can lower to the \
-             pre-rtyper `getattr` + `simple_call` shape; a raw function-pointer \
-             callee has no such shape before rtyping",
-            fmt_op_result(op),
-        ))),
+        // A stored function pointer has no trait receiver. The annotator
+        // sees `simple_call(funcptr, *args)` whose args[0] is the
+        // `Ptr(FuncType)` value (`SomePtr.call`); `PtrRepr.rtype_simple_call`
+        // then emits `direct_call` or `indirect_call` with
+        // `inputconst(Void, None)`.
+        OpKind::IndirectCall {
+            funcptr,
+            args,
+            family_key: None,
+            ..
+        } => {
+            let funcptr_hl = lookup_operand(value_map, funcptr, op, "funcptr")?;
+            let mut call_args = Vec::with_capacity(args.len() + 1);
+            call_args.push(funcptr_hl);
+            for (i, v) in args.iter().enumerate() {
+                call_args.push(lookup_operand(value_map, v, op, &format!("args[{i}]"))?);
+            }
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+        }
 
         // ─── Pyre-internal: VtableMethodPtr ───
         // TODO(rclass-vtable-rework): pyre-only adaptation of
@@ -8716,6 +8768,152 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translate_op_vec_index_lowers_to_getitem() {
+        // `v[i]` → flowspace `getitem(recv, index)`, the same op ArrayRead
+        // emits. `RustVecRepr.rtype_getitem` then `ll_vec_getitem_fast`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_vec_index_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let receiver = Hlvalue::Variable(Variable::new());
+        let index = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), receiver.clone());
+        value_map.insert(vars[1].clone(), index.clone());
+        value_map.insert(vars[2].clone(), result.clone());
+        for segments in [
+            vec!["vec".into(), "Vec".into(), "index".into()],
+            vec![
+                "alloc".into(),
+                "vec".into(),
+                "<Impl>".into(),
+                "index".into(),
+            ],
+        ] {
+            let op = SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
+                    result_ty: ValueType::Int,
+                },
+            };
+            assert!(
+                op_canraise(&op.kind),
+                "Vec::index lowers to getitem, which can raise"
+            );
+            let translated = translate_op(&op, &value_map, &empty_call_registry())
+                .expect("Vec::index must lower to getitem");
+            assert_eq!(translated.len(), 1);
+            assert_eq!(translated[0].opname, "getitem");
+            assert_eq!(translated[0].args, vec![receiver.clone(), index.clone()]);
+            assert_eq!(translated[0].result, result);
+        }
+    }
+
+    /// A graph `fn f(v: Vec<i64>, i: usize) -> i64 { v[i] }` annotates the
+    /// receiver as `SomeRustVec` and rtypes `getitem` through
+    /// `RustVecRepr.rtype_getitem` → `ll_vec_getitem_fast_i`.
+    #[test]
+    fn vec_index_graph_rtypes_through_rustvec_getitem() {
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = LegacyGraph::new("vec_index");
+        let entry = graph.startblock;
+        let v_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "v".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("Vec<i64>".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let i_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, v_var.clone());
+        graph.push_inputarg_var(entry, i_var.clone());
+        let r_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath {
+                        segments: vec!["vec".into(), "Vec".into(), "index".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![v_var, i_var]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(r_var.clone()));
+
+        let registry = empty_call_registry();
+        let lifted = function_graph_to_flowspace(&graph, &registry)
+            .expect("Vec::index FunctionPath must lift to getitem");
+        let start = lifted.graph.borrow().startblock.clone();
+        let lifted_ops = start.borrow().operations.clone();
+        let getitem = lifted_ops
+            .iter()
+            .find(|op| op.opname == "getitem")
+            .expect("adapter lowers Vec::index to getitem");
+        assert_eq!(getitem.args.len(), 2);
+
+        let (value_to_var, _) = specialize_legacy_graph_with_registry_returning_value_to_var(
+            &graph, &registry,
+        )
+        .expect("Vec::index graph must annotate and rtype through RustVecRepr.rtype_getitem");
+        let result_var = value_to_var
+            .get(&r_var)
+            .expect("getitem result must project");
+        {
+            let cell = result_var.annotation.borrow();
+            match cell.as_ref().map(|rc| rc.as_ref()) {
+                Some(SomeValue::Integer(_)) => {}
+                other => panic!("rustvec_integer_getitem returns s_item, got {other:?}"),
+            }
+        }
+        assert_eq!(result_var.concretetype(), Some(LowLevelType::Signed));
+
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let start = graph_ref.borrow().startblock.clone();
+        let rtyped = start.borrow().operations.clone();
+        let helper = rtyped
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .expect("RustVecRepr.rtype_getitem emits direct_call of ll_vec_getitem_fast");
+        let Hlvalue::Constant(c_func) = &helper.args[0] else {
+            panic!("expected Constant funcptr, got {:?}", helper.args[0]);
+        };
+        let dbg = format!("{:?}", c_func.value);
+        assert!(
+            dbg.contains("ll_vec_getitem_fast_i"),
+            "expected ll_vec_getitem_fast_i in {dbg}"
+        );
+    }
+
     /// The frontend cannot see the adapter's expansion: `lower_function`
     /// still contains the raw `alloc::vec::from_elem` call, while the
     /// flowspace graph must carry `newlist` + `mul` instead.  This real-LLBC
@@ -10186,20 +10384,20 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_indirect_call_without_family_key_fails_loud() {
+    fn translate_op_indirect_call_without_family_key_lowers_to_simple_call() {
         // An IndirectCall carrying no `family_key` is a stored function
-        // pointer: it names no trait receiver and no method, so there is
-        // nothing for a `getattr` to spell, and a function pointer has no
-        // pre-rtyper shape at all — upstream only ever mints `indirect_call`
-        // inside `rtype_simple_call` and `FunctionReprBase.call` (rpbc.py),
-        // after rtyping. Fail-loud is the
-        // parity-correct behaviour for that arm.
+        // pointer. The annotator sees `simple_call(funcptr, *args)`
+        // (`SomePtr.call`); `PtrRepr.rtype_simple_call` later emits
+        // `indirect_call` with `inputconst(Void, None)`.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
-        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
-        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let funcptr_hl = Hlvalue::Variable(Variable::new());
+        let arg_hl = Hlvalue::Variable(Variable::new());
+        let result_hl = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), funcptr_hl.clone());
+        value_map.insert(vars[2].clone(), arg_hl.clone());
+        value_map.insert(vars[3].clone(), result_hl.clone());
         let op = SpaceOperation {
             result: Some(vars[3].clone()),
             kind: OpKind::IndirectCall {
@@ -10210,13 +10408,14 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry())
-            .expect_err("a family-key-less IndirectCall must fail loud");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("IndirectCall") && msg.contains("family_key"),
-            "fail-loud must name IndirectCall and the missing family_key, got: {msg}"
-        );
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("a stored function-pointer IndirectCall lowers to simple_call");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 2);
+        assert_eq!(translated[0].args[0], funcptr_hl);
+        assert_eq!(translated[0].args[1], arg_hl);
+        assert_eq!(translated[0].result, result_hl);
     }
 
     /// An IndirectCall that does carry a `family_key` names a dyn-trait vtable

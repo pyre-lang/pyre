@@ -329,10 +329,12 @@ fn host_object_ref_bits(
         if crate::translator::rtyper::unit_variant_fold::is_zero_length_shaped_aggregate(name) {
             return 0;
         }
-        panic!(
-            "Assembler.emit_const: empty-class instance {} must go through emit_prebuilt_instance_const_r",
-            class.qualname()
-        );
+        if empty_class_prebuilt_instance(obj, callcontrol).is_some() {
+            panic!(
+                "Assembler.emit_const: empty-class instance {} must go through emit_prebuilt_instance_const_r",
+                class.qualname()
+            );
+        }
     }
     panic!(
         "Assembler.emit_const: HostObject {} has no runtime counterpart",
@@ -518,7 +520,7 @@ trait AssemblerEncode {
 
     fn emit_prebuilt_instance_const_r(
         &mut self,
-        class_name: String,
+        spec: EmptyClassPrebuilt,
         state: &mut AssemblyState,
     ) -> u8;
 
@@ -3904,14 +3906,16 @@ impl AssemblerEncode for Assembler {
             return self.emit_empty_array_const_r(name, state);
         }
         // A named empty-class singleton (`DictKeyError`, `PyreEnv`, …)
-        // is `InstanceRepr.convert_const` / `get_reusable_prebuilt_instance`:
-        // malloc immortal, `initialize_prebuilt_instance` writes typeptr.
-        // The translator cannot allocate that object, so pool a sentinel
-        // plus a class-name descriptor for the load pass.
+        // is `InstanceRepr.convert_const` / `convert_const_exact` /
+        // `get_reusable_prebuilt_instance`: malloc immortal,
+        // `initialize_prebuilt_instance` writes typeptr when the STRUCT
+        // has one. The translator cannot allocate that object, so pool a
+        // sentinel plus a layout descriptor keyed by HostObject identity
+        // (`emit_const` pools by `value._obj.container`).
         if let ConstValue::HostObject(obj) = value
-            && let Some(class_name) = empty_class_instance_host_object_name(obj)
+            && let Some(spec) = empty_class_prebuilt_instance(obj, callcontrol)
         {
-            return self.emit_prebuilt_instance_const_r(class_name, state);
+            return self.emit_prebuilt_instance_const_r(spec, state);
         }
         let bits = match value {
             // assembler.py::Assembler.emit_const casts ref constants to
@@ -4113,20 +4117,33 @@ impl AssemblerEncode for Assembler {
 
     /// Record a prebuilt empty-class instance for runtime materialization
     /// and pool its sentinel — [`Self::emit_str_const_r`]'s shape for
-    /// `InstanceRepr.convert_const`. Identical class names share one
-    /// descriptor and one sentinel.
+    /// `InstanceRepr.convert_const_exact`. Identical HostObject identities
+    /// share one descriptor and one sentinel (`iprebuiltinstances[value]`,
+    /// `emit_const`'s `value_key = value._obj.container`).
     fn emit_prebuilt_instance_const_r(
         &mut self,
-        class_name: String,
+        spec: EmptyClassPrebuilt,
         state: &mut AssemblyState,
     ) -> u8 {
         if let Some(ordinal) = state
             .prebuilt_instance_consts
             .iter()
-            .position(|d| d.class_name == class_name)
+            .position(|d| d.identity == spec.identity)
         {
             return self.emit_const_r_bits(prebuilt_instance_const_sentinel(ordinal), state);
         }
+        // `TypeLayoutBuilder.consider_constant` assigns the prebuilt
+        // constant's TYPE its type id at translation. Intern the same
+        // Size descr `new` interns so kind-0 decode /
+        // `GcLLDescr_framework.init_size_descr` can stamp it.
+        let _ = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
+            size: spec.size,
+            type_id: spec.type_id,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: spec.is_gc_managed,
+        });
         let ordinal = state.prebuilt_instance_consts.len();
         let constants_r_index = state.constants_r.len();
         let reg = self.emit_const_r_bits(prebuilt_instance_const_sentinel(ordinal), state);
@@ -4139,7 +4156,10 @@ impl AssemblerEncode for Assembler {
             .prebuilt_instance_consts
             .push(super::jitcode::PrebuiltInstanceConstDescriptor {
                 constants_r_index,
-                class_name,
+                identity: spec.identity,
+                size: spec.size,
+                type_id: spec.type_id,
+                has_vtable: spec.has_vtable,
             });
         reg
     }
@@ -4271,15 +4291,32 @@ fn empty_array_host_object_name(obj: &crate::flowspace::model::HostObject) -> Op
         .then(|| name.to_string())
 }
 
-/// Qualname of an interned empty-class singleton (`reusable_prebuilt_instance`).
+/// Assembly-time layout of an empty-class prebuilt instance.
+///
+/// `rewrite_op_malloc` chooses `new_with_vtable` vs `new` from
+/// `has_gcstruct_a_vtable`; the size spec is the same
+/// `bh_size_spec_from_callcontrol` row `new` / `new_with_vtable` emit.
+struct EmptyClassPrebuilt {
+    identity: u64,
+    size: usize,
+    type_id: u64,
+    has_vtable: bool,
+    is_gc_managed: bool,
+}
+
+/// Empty-class singleton (`reusable_prebuilt_instance` /
+/// `InstanceRepr.convert_const`).
 ///
 /// Structural: an instance of a named class, empty constructor args, no
 /// unit-variant discriminant, not an exception instance, not `Array<T;0>`
-/// / `Tuple<>`. `rclass.py InstanceRepr.convert_const` keeps this as a
-/// prebuilt instance rather than Void.
-fn empty_class_instance_host_object_name(
+/// / `Tuple<>`, and a size spec whose `all_fielddescrs` (typeptr already
+/// omitted, `heaptracker.all_fielddescrs`) is empty — the same spec
+/// `rewrite_op_malloc` reads for `new` / `new_with_vtable`.
+/// `convert_const` keeps this as a prebuilt instance rather than Void.
+fn empty_class_prebuilt_instance(
     obj: &crate::flowspace::model::HostObject,
-) -> Option<String> {
+    callcontrol: Option<&CallControl>,
+) -> Option<EmptyClassPrebuilt> {
     let class = obj.instance_class()?;
     if crate::translator::rtyper::unit_variant_fold::unit_variant_const_from_host(obj).is_some() {
         return None;
@@ -4294,7 +4331,24 @@ fn empty_class_instance_host_object_name(
     if !obj.instance_args().unwrap_or(&[]).is_empty() {
         return None;
     }
-    Some(class.qualname().to_string())
+    let cc = callcontrol?;
+    // `InstanceRepr.convert_const` → `create_instance` mallocs the same
+    // `self.object_type` `rewrite_op_malloc` uses for this class's `new`
+    // / `new_with_vtable` (`rclass.py` `getinstancerepr`). The interned
+    // class qualname is that STRUCT (`ClassDesc` / `getuniqueclassdef`
+    // identity); look the size spec up by that key alone.
+    let owner = class.qualname();
+    let spec = bh_size_spec_from_callcontrol(cc, owner)?;
+    if !spec.all_fielddescrs.is_empty() {
+        return None;
+    }
+    Some(EmptyClassPrebuilt {
+        identity: obj.identity_id() as u64,
+        size: spec.size,
+        type_id: spec.type_id,
+        has_vtable: crate::codewriter::heaptracker::callcontrol_has_vtable(cc, owner),
+        is_gc_managed: spec.is_gc_managed,
+    })
 }
 
 /// Per-assembly state (RPython: Assembler.setup() fields).
@@ -4325,7 +4379,8 @@ struct AssemblyState {
     /// committed to [`JitCodeBody::empty_array_consts`].
     empty_array_consts: Vec<super::jitcode::EmptyArrayConstDescriptor>,
     /// Prebuilt empty-class instances recorded while assembling,
-    /// committed to [`JitCodeBody::prebuilt_instance_consts`].
+    /// committed to [`JitCodeBody::prebuilt_instance_consts`]. Keyed by
+    /// HostObject identity (`convert_const_exact` / `emit_const`).
     prebuilt_instance_consts: Vec<super::jitcode::PrebuiltInstanceConstDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
@@ -8472,12 +8527,80 @@ mod tests {
         );
     }
 
+    fn empty_class_layout_cc(
+        owner: &str,
+    ) -> (
+        crate::call::CallControl,
+        parking_lot::MutexGuard<'static, ()>,
+    ) {
+        use crate::call::{CallControl, StructLayout};
+
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let guard = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(owner_id),
+        )]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 0,
+                align: 1,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: Vec::new(),
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        (cc, guard)
+    }
+
+    fn class_with_fields_layout_cc(
+        owner: &str,
+    ) -> (
+        crate::call::CallControl,
+        parking_lot::MutexGuard<'static, ()>,
+    ) {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let guard = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(owner_id),
+        )]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![StructFieldLayout {
+                    name: "value".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        (cc, guard)
+    }
+
     #[test]
     fn empty_class_instance_emits_prebuilt_instance_sentinel() {
-        let class = HostObject::new_class("dictmultiobject::DictKeyError", Vec::new());
+        let owner = "dictmultiobject::DictKeyError";
+        let (cc, _guard) = empty_class_layout_cc(owner);
+        let class = HostObject::new_class(owner, Vec::new());
         let inst = class
             .reusable_prebuilt_instance()
             .expect("empty class instance");
+        let identity = inst.identity_id() as u64;
         let mut flat = SSARepr {
             name: "empty_class".into(),
             insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
@@ -8487,27 +8610,70 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &empty_regallocs());
+        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 1);
+        let desc = &body.prebuilt_instance_consts[0];
+        assert_eq!(desc.identity, identity);
+        assert_eq!(desc.size, 0);
+        assert!(!desc.has_vtable);
         assert_eq!(
-            body.prebuilt_instance_consts[0].class_name,
-            "dictmultiobject::DictKeyError"
+            desc.type_id,
+            majit_ir::descr::StructId::from_canonical(owner).as_u64()
         );
-        let idx = body.prebuilt_instance_consts[0].constants_r_index;
+        let idx = desc.constants_r_index;
         assert_eq!(body.constants_r[idx], prebuilt_instance_const_sentinel(0));
         assert!(body.empty_array_consts.is_empty());
         assert!(body.unit_variant_consts.is_empty());
     }
 
     #[test]
-    fn empty_class_instance_dedups_by_class() {
-        let class = HostObject::new_class("KwargsDictStrategy", Vec::new());
+    fn empty_class_prebuilt_instance_interns_new_size_descr() {
+        let owner = "c1i::PrebuiltSizeDescrOnly";
+        let (cc, _guard) = empty_class_layout_cc(owner);
+        let class = HostObject::new_class(owner, Vec::new());
+        let inst = class
+            .reusable_prebuilt_instance()
+            .expect("empty class instance");
+        let type_id = majit_ir::descr::StructId::from_canonical(owner).as_u64();
+        let mut flat = SSARepr {
+            name: "empty_class_prebuilt_size".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(inst)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        assert_eq!(body.prebuilt_instance_consts.len(), 1);
+        assert_eq!(body.prebuilt_instance_consts[0].type_id, type_id);
+        let descrs = asm.snapshot_descrs();
+        assert!(
+            descrs.iter().any(|d| matches!(
+                d,
+                crate::jitcode::BhDescr::Size {
+                    type_id: tid,
+                    vtable: 0,
+                    ..
+                } if *tid == type_id
+            )),
+            "prebuilt-only empty class interned the new Size descr, got {descrs:?}"
+        );
+    }
+
+    #[test]
+    fn empty_class_instance_dedups_by_identity() {
+        let owner = "KwargsDictStrategy";
+        let (cc, _guard) = empty_class_layout_cc(owner);
+        let class = HostObject::new_class(owner, Vec::new());
         let a = class
             .reusable_prebuilt_instance()
             .expect("empty class instance");
         let b = class
             .reusable_prebuilt_instance()
             .expect("same interned instance");
+        assert_eq!(a.identity_id(), b.identity_id());
+        let identity = a.identity_id() as u64;
         let mut flat = SSARepr {
             name: "empty_class_dedup".into(),
             insns: vec![
@@ -8522,14 +8688,71 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &empty_regallocs());
+        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 1);
-        assert_eq!(
-            body.prebuilt_instance_consts[0].class_name,
-            "KwargsDictStrategy"
-        );
+        assert_eq!(body.prebuilt_instance_consts[0].identity, identity);
         assert_eq!(body.constants_r.len(), 1);
         assert_eq!(body.constants_r[0], prebuilt_instance_const_sentinel(0));
+    }
+
+    #[test]
+    fn empty_class_distinct_host_objects_assemble_two_descriptors() {
+        let owner = "c1i::TwoEmptyHosts";
+        let (cc, _guard) = empty_class_layout_cc(owner);
+        let class = HostObject::new_class(owner, Vec::new());
+        let a = HostObject::new_instance(class.clone(), Vec::new());
+        let b = HostObject::new_instance(class, Vec::new());
+        assert_ne!(a.identity_id(), b.identity_id());
+        let id_a = a.identity_id() as u64;
+        let id_b = b.identity_id() as u64;
+        let mut flat = SSARepr {
+            name: "empty_class_two_hosts".into(),
+            insns: vec![
+                FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                    crate::flowspace::model::Constant::new(ConstValue::HostObject(a)),
+                )),
+                FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                    crate::flowspace::model::Constant::new(ConstValue::HostObject(b)),
+                )),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        assert_eq!(body.prebuilt_instance_consts.len(), 2);
+        assert_eq!(body.prebuilt_instance_consts[0].identity, id_a);
+        assert_eq!(body.prebuilt_instance_consts[1].identity, id_b);
+        assert_eq!(
+            body.prebuilt_instance_consts[0].type_id,
+            body.prebuilt_instance_consts[1].type_id
+        );
+        assert_eq!(body.constants_r.len(), 2);
+        assert_eq!(body.constants_r[0], prebuilt_instance_const_sentinel(0));
+        assert_eq!(body.constants_r[1], prebuilt_instance_const_sentinel(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "has no runtime counterpart")]
+    fn zero_arg_instance_with_fields_is_not_prebuilt_instance() {
+        let owner = "c1i::HasFields";
+        let (cc, _guard) = class_with_fields_layout_cc(owner);
+        let class = HostObject::new_class(owner, Vec::new());
+        let inst = HostObject::new_instance(class, Vec::new());
+        assert!(
+            empty_class_prebuilt_instance(&inst, Some(&cc)).is_none(),
+            "a layout with instance fields is not convert_const's empty class"
+        );
+        let mut flat = SSARepr {
+            name: "class_with_fields".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(inst)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
     }
 
     #[test]
