@@ -273,6 +273,14 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
             // identity, `rclass.py` `getinstancerepr`). The ctor leaf
             // alone is not that object: a shared `closure` / `closure#N`
             // leaf is ambiguous across TypeDecls.
+            //
+            // Every such ctor yields the one prebuilt instance instead of a
+            // fresh `malloc` (`rclass.py` `InstanceRepr.new_instance`). A
+            // fieldless Rust struct is zero-sized and has no address identity
+            // (`Box::new` of it does not allocate, `ptr::eq` between two of them
+            // is unspecified), so no caller can tell the instances apart. PyPy
+            // reaches the same shape for its stateless strategy objects through
+            // `space.fromcache(Strategy)`.
             if *is_struct {
                 let fieldless = op
                     .result
