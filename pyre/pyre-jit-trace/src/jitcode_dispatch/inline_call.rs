@@ -10336,14 +10336,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // forwarding optimization and is invalidated by that call; seed
             // the frame-local shadow too so a later LOAD_DEREF re-reads the
             // same live cell instead of manufacturing an unstamped
-            // GetarrayitemGcR result.  This callee shape has no fresh cellvars
-            // (rejected above), so existing freevars begin at `nlocals`.
+            // GetarrayitemGcR result.  The freevar band follows the varnames
+            // and the pure cellvars (`finish_for_call_with_globals_obj`), so a
+            // callee with a fresh cell of its own puts its first freevar past
+            // that cell, not at the first non-varname slot.
+            let freevar_base =
+                callee_code.varnames.len() + pyre_interpreter::npure_cellvars(callee_code);
             for (i, (&cell, &value)) in live_freevar_cells()
                 .iter()
                 .zip(&freevar_cell_ops)
                 .enumerate()
             {
-                let slot = (callee_code.varnames.len() + i) as i64;
+                let slot = (freevar_base + i) as i64;
                 let mut state = sub_wc.frame_state.borrow_mut();
                 let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
