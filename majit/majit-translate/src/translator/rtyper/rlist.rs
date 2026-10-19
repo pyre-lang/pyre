@@ -29,7 +29,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
-use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
+use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, inputconst_from_lltype};
+use crate::translator::rtyper::rrustvec::{RUST_VEC_HINT, vec_item_kind_of};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, SliceKind,
     constant_with_lltype, exception_args, functionptr_const, helper_pygraph_from_graph,
@@ -555,6 +556,7 @@ fn rtype_newlist_layout(
     let (newlist_name, setitem_name) = match layout {
         ListLayout::Fixed => ("ll_fixed_newlist", "ll_fixed_setitem_fast"),
         ListLayout::Resized => ("ll_newlist", "ll_setitem_fast"),
+        ListLayout::RustVec => ("ll_vec_newlist_hint", "ll_vec_setitem_fast"),
     };
 
     // upstream `v_result = llops.gendirectcall(LIST.ll_newlist, cno)`.
@@ -593,6 +595,7 @@ fn rtype_newlist_layout(
                 ListLayout::Resized => {
                     build_ll_setitem_fast_helper_graph(setitem_name, ptr.clone(), item.clone())
                 }
+                ListLayout::RustVec => rustvec_does_not_mint_list_setitem_fast(),
             },
         )?
     };
@@ -704,6 +707,7 @@ fn alloc_and_set_helper_name(layout: ListLayout) -> &'static str {
     match layout {
         ListLayout::Fixed => "ll_fixed_alloc_and_set",
         ListLayout::Resized => "ll_alloc_and_set",
+        ListLayout::RustVec => "ll_vec_alloc_and_set",
     }
 }
 
@@ -804,6 +808,7 @@ fn build_alloc_and_set_family(
                 ListLayout::Resized => {
                     build_ll_setitem_fast_helper_graph(setitem_name, ptr.clone(), item.clone())
                 }
+                ListLayout::RustVec => rustvec_does_not_mint_list_setitem_fast(),
             },
         )?
     };
@@ -1006,6 +1011,13 @@ fn alloc_and_set_sub_names(
             "_ll_alloc_and_set_nonnull",
             "_ll_alloc_and_set_jit",
             "_ll_alloc_and_set_nojit",
+        ),
+        ListLayout::RustVec => (
+            "ll_vec_newlist_hint",
+            "_ll_vec_alloc_and_clear",
+            "_ll_vec_alloc_and_set_nonnull",
+            "_ll_vec_alloc_and_set_jit",
+            "_ll_vec_alloc_and_set_nojit",
         ),
     }
 }
@@ -1592,6 +1604,7 @@ impl Repr for ListRepr {
                 // start=0 specialisation used by append's resize does not fit.
                 let arraycopy_range = {
                     let item = item_lltype.clone();
+                    let items = items_ptr.clone();
                     hop.rtyper.lowlevel_helper_function_with_builder(
                         "ll_arraycopy".to_string(),
                         vec![
@@ -1603,7 +1616,11 @@ impl Repr for ListRepr {
                         ],
                         LowLevelType::Void,
                         move |_rtyper, _args, _result| {
-                            build_ll_arraycopy_general_helper_graph("ll_arraycopy", item.clone())
+                            build_ll_arraycopy_general_helper_graph(
+                                "ll_arraycopy",
+                                item.clone(),
+                                items.clone(),
+                            )
                         },
                     )?
                 };
@@ -2572,6 +2589,83 @@ fn items_array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
     }))
 }
 
+/// The `ptr` field of a [`ListLayout::RustVec`] header: a raw nolength
+/// `Array(ITEM)`, not a GC list items array.
+fn rust_vec_items_array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(Array::with_hints(
+            item_lltype.clone(),
+            vec![("nolength".into(), ConstValue::Bool(true))],
+        )),
+    }))
+}
+
+fn items_array_ptr_lltype_for_layout(
+    layout: ListLayout,
+    item_lltype: &LowLevelType,
+) -> LowLevelType {
+    match layout {
+        ListLayout::Fixed | ListLayout::Resized => items_array_ptr_lltype(item_lltype),
+        ListLayout::RustVec => rust_vec_items_array_ptr_lltype(item_lltype),
+    }
+}
+
+/// `VecOp::NewHint` / `ll_vec_newlist_hint_*` — allocate a raw Vec header
+/// with capacity `lengthhint` and `len = 0`. The caller stores `len` after
+/// `ll_arraycopy`.
+fn rust_vec_newhint_funcptr(
+    item_lltype: &LowLevelType,
+    result_lltype: &LowLevelType,
+) -> Result<Constant, TyperError> {
+    use majit_ir::rvec::{VecOp, vec_helper_path};
+    let kind = vec_item_kind_of(item_lltype).ok_or_else(|| {
+        TyperError::message(format!(
+            "ListLayout::RustVec newlist: item lltype {} is not one word",
+            item_lltype.short_name()
+        ))
+    })?;
+    let path = vec_helper_path(VecOp::NewHint, kind);
+    let fptr = functionptr(
+        FuncType {
+            args: vec![LowLevelType::Signed],
+            result: result_lltype.clone(),
+        },
+        path,
+        None,
+        Some(path.to_string()),
+    );
+    let fptr_type = LowLevelType::Ptr(Box::new(fptr._TYPE.clone()));
+    inputconst_from_lltype(&fptr_type, &ConstValue::LLPtr(Box::new(fptr)))
+}
+
+/// `NewHint` leaves `len = 0`; store the copied length on a RustVec result.
+fn emit_rustvec_len_store(block: &BlockRef, layout: ListLayout, l: &Variable, length: &Variable) {
+    if layout != ListLayout::RustVec {
+        return;
+    }
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(l.clone()),
+            void_field_const("len"),
+            Hlvalue::Variable(length.clone()),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+}
+
+fn rustvec_does_not_mint_list_getitem_fast() -> Result<PyGraph, TyperError> {
+    Err(TyperError::message(
+        "ListLayout::RustVec does not mint ll_getitem_fast; RustVecRepr.rtype_getitem uses ll_vec_getitem_fast",
+    ))
+}
+
+fn rustvec_does_not_mint_list_setitem_fast() -> Result<PyGraph, TyperError> {
+    Err(TyperError::message(
+        "ListLayout::RustVec does not mint ll_setitem_fast; RustVecRepr.rtype_setitem uses ll_vec_setitem_fast",
+    ))
+}
+
 fn none_void_const() -> Hlvalue {
     Hlvalue::Constant(Constant::with_concretetype(
         ConstValue::None,
@@ -2769,9 +2863,8 @@ fn build_ll_arraycopy_helper_graph(
 pub(crate) fn build_ll_arraycopy_general_helper_graph(
     name: &str,
     item_lltype: LowLevelType,
+    items_ptr: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    let items_ptr = items_array_ptr_lltype(&item_lltype);
-
     let src = variable_with_lltype("source", items_ptr.clone());
     let dst = variable_with_lltype("dest", items_ptr.clone());
     let src_start = variable_with_lltype("source_start", LowLevelType::Signed);
@@ -3690,26 +3783,7 @@ fn build_ll_extend_helper_graph(
         Hlvalue::Variable(len1.clone()),
     ));
     // len2 = l2 length (per layout).
-    let len2 = variable_with_lltype("len2", LowLevelType::Signed);
-    match l2_layout {
-        ListLayout::Fixed => {
-            startblock.borrow_mut().operations.push(SpaceOperation::new(
-                "getarraysize",
-                vec![Hlvalue::Variable(l2_arg.clone())],
-                Hlvalue::Variable(len2.clone()),
-            ));
-        }
-        ListLayout::Resized => {
-            startblock.borrow_mut().operations.push(SpaceOperation::new(
-                "getfield",
-                vec![
-                    Hlvalue::Variable(l2_arg.clone()),
-                    void_field_const("length"),
-                ],
-                Hlvalue::Variable(len2.clone()),
-            ));
-        }
-    }
+    let len2 = emit_list_length_read(&startblock, l2_layout, &l2_arg);
     // newlength = len1 + len2.
     let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -3795,21 +3869,7 @@ fn build_ll_extend_helper_graph(
             Hlvalue::Variable(items1.clone()),
         ));
     // items2 = l2 items (per layout): the slice IS its own array.
-    let items2_hlv = match l2_layout {
-        ListLayout::Fixed => Hlvalue::Variable(l2_c),
-        ListLayout::Resized => {
-            let items2 = variable_with_lltype("items2", items_ptr.clone());
-            block_continue
-                .borrow_mut()
-                .operations
-                .push(SpaceOperation::new(
-                    "getfield",
-                    vec![Hlvalue::Variable(l2_c), void_field_const("items")],
-                    Hlvalue::Variable(items2.clone()),
-                ));
-            Hlvalue::Variable(items2)
-        }
-    };
+    let items2_hlv = emit_list_items_read(&block_continue, l2_layout, &item_lltype, &l2_c);
     // ll_arraycopy(items2, items1, 0, len1, len2).
     let copy_void = variable_with_lltype("v", LowLevelType::Void);
     block_continue
@@ -3990,6 +4050,16 @@ fn build_ll_newlist_helper_graph_inner(
             ));
             header
         }
+        ListLayout::RustVec => {
+            let header = variable_with_lltype("l", ptr_lltype.clone());
+            let c_newhint = rust_vec_newhint_funcptr(&item_lltype, &ptr_lltype)?;
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "direct_call",
+                vec![Hlvalue::Constant(c_newhint), Hlvalue::Variable(length_arg)],
+                Hlvalue::Variable(header.clone()),
+            ));
+            header
+        }
     };
     startblock.closeblock(vec![
         Link::new(
@@ -4129,6 +4199,15 @@ fn emit_list_items_read(
             block.borrow_mut().operations.push(SpaceOperation::new(
                 "getfield",
                 vec![Hlvalue::Variable(l.clone()), void_field_const("items")],
+                Hlvalue::Variable(items.clone()),
+            ));
+            Hlvalue::Variable(items)
+        }
+        ListLayout::RustVec => {
+            let items = variable_with_lltype("items", rust_vec_items_array_ptr_lltype(item_lltype));
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(l.clone()), void_field_const("ptr")],
                 Hlvalue::Variable(items.clone()),
             ));
             Hlvalue::Variable(items)
@@ -5109,7 +5188,6 @@ fn build_ll_copy_helper_graph(
 ) -> Result<PyGraph, TyperError> {
     let newlist_const = sub_helper_funcptr_constant(rtyper, newlist)?;
     let copy_const = sub_helper_funcptr_constant(rtyper, arraycopy)?;
-    let items_ptr = items_array_ptr_lltype(&item_lltype);
 
     let l_arg = variable_with_lltype("l", source_ptr_lltype);
     let startblock = Block::shared(vec![Hlvalue::Variable(l_arg.clone())]);
@@ -5121,23 +5199,7 @@ fn build_ll_copy_helper_graph(
     );
 
     // length = l.ll_length() (per source layout).
-    let length = variable_with_lltype("length", LowLevelType::Signed);
-    match source_layout {
-        ListLayout::Fixed => {
-            startblock.borrow_mut().operations.push(SpaceOperation::new(
-                "getarraysize",
-                vec![Hlvalue::Variable(l_arg.clone())],
-                Hlvalue::Variable(length.clone()),
-            ));
-        }
-        ListLayout::Resized => {
-            startblock.borrow_mut().operations.push(SpaceOperation::new(
-                "getfield",
-                vec![Hlvalue::Variable(l_arg.clone()), void_field_const("length")],
-                Hlvalue::Variable(length.clone()),
-            ));
-        }
-    }
+    let length = emit_list_length_read(&startblock, source_layout, &l_arg);
     // new_lst = RESLIST.ll_newlist(length).
     let new_lst = variable_with_lltype("new_lst", result_ptr_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -5149,34 +5211,10 @@ fn build_ll_copy_helper_graph(
         Hlvalue::Variable(new_lst.clone()),
     ));
     // src/dst items (per layout): a FixedSizeListRepr value IS its items array;
-    // the resized header reaches the array through `items`.
-    let src_items = match source_layout {
-        ListLayout::Fixed => Hlvalue::Variable(l_arg),
-        ListLayout::Resized => {
-            let items = variable_with_lltype("src_items", items_ptr.clone());
-            startblock.borrow_mut().operations.push(SpaceOperation::new(
-                "getfield",
-                vec![Hlvalue::Variable(l_arg), void_field_const("items")],
-                Hlvalue::Variable(items.clone()),
-            ));
-            Hlvalue::Variable(items)
-        }
-    };
-    let dst_items = match result_layout {
-        ListLayout::Fixed => Hlvalue::Variable(new_lst.clone()),
-        ListLayout::Resized => {
-            let items = variable_with_lltype("dst_items", items_ptr);
-            startblock.borrow_mut().operations.push(SpaceOperation::new(
-                "getfield",
-                vec![
-                    Hlvalue::Variable(new_lst.clone()),
-                    void_field_const("items"),
-                ],
-                Hlvalue::Variable(items.clone()),
-            ));
-            Hlvalue::Variable(items)
-        }
-    };
+    // the resized header reaches the array through `items`; a Rust Vec
+    // header through `ptr`.
+    let src_items = emit_list_items_read(&startblock, source_layout, &item_lltype, &l_arg);
+    let dst_items = emit_list_items_read(&startblock, result_layout, &item_lltype, &new_lst);
     // ll_arraycopy(src_items, dst_items, length) — 0-to-0 full copy.
     let copy_void = variable_with_lltype("v", LowLevelType::Void);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -5185,10 +5223,11 @@ fn build_ll_copy_helper_graph(
             Hlvalue::Constant(copy_const),
             src_items,
             dst_items,
-            Hlvalue::Variable(length),
+            Hlvalue::Variable(length.clone()),
         ],
         Hlvalue::Variable(copy_void),
     ));
+    emit_rustvec_len_store(&startblock, result_layout, &new_lst, &length);
     startblock.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(new_lst)],
@@ -5232,17 +5271,20 @@ fn emit_listslice_alloc_and_copy(
     src_start: Hlvalue,
     newlength: &Variable,
 ) {
-    let items_ptr = items_array_ptr_lltype(item_lltype);
     // The result repr (`hop.r_result`) is a fixed list when the slice is never
     // resized (`ListDef.offspring` keeps `resized=False`), so `ll_newlist`
     // returns a bare `Ptr(GcArray)` with no `items` field; a resized result is
-    // a header reaching its array through `items`.  Read the result layout off
-    // its pointer lltype and branch `dst_items` the same way `src_items`
-    // branches on `source_layout` (`ll_arraycopy` uses `dest.ll_items()`,
-    // rlist.py, which is `ll_fixed_items(l) = l` for a fixed list).
+    // a header reaching its array through `items`; a Rust Vec result is a raw
+    // `{ptr, len, cap}` header reaching its array through `ptr`.  Read the
+    // result layout off its pointer lltype and branch `dst_items` the same way
+    // `src_items` branches on `source_layout` (`ll_arraycopy` uses
+    // `dest.ll_items()`, rlist.py, which is `ll_fixed_items(l) = l` for a
+    // fixed list).
     let result_layout = list_layout_from_lltype(&result_ptr_lltype)
         .expect("getslice result lltype must be a list pointer");
-    // l = RESLIST.ll_newlist(newlength).
+    // l = RESLIST.ll_newlist(newlength). For a RustVec result this is
+    // `VecOp::NewHint` / `ll_vec_newlist_hint_*` (len stays 0 until the
+    // store after the copy).
     let new_lst = variable_with_lltype("new_lst", result_ptr_lltype);
     block.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
@@ -5253,35 +5295,9 @@ fn emit_listslice_alloc_and_copy(
         Hlvalue::Variable(new_lst.clone()),
     ));
     // src items (per source layout): a fixed list IS its items array; a resized
-    // header reaches the array through `items`.
-    let src_items = match source_layout {
-        ListLayout::Fixed => Hlvalue::Variable(l.clone()),
-        ListLayout::Resized => {
-            let items = variable_with_lltype("src_items", items_ptr.clone());
-            block.borrow_mut().operations.push(SpaceOperation::new(
-                "getfield",
-                vec![Hlvalue::Variable(l.clone()), void_field_const("items")],
-                Hlvalue::Variable(items.clone()),
-            ));
-            Hlvalue::Variable(items)
-        }
-    };
-    // dst items (per result layout): mirror the source branch above.
-    let dst_items = match result_layout {
-        ListLayout::Fixed => Hlvalue::Variable(new_lst.clone()),
-        ListLayout::Resized => {
-            let items = variable_with_lltype("dst_items", items_ptr);
-            block.borrow_mut().operations.push(SpaceOperation::new(
-                "getfield",
-                vec![
-                    Hlvalue::Variable(new_lst.clone()),
-                    void_field_const("items"),
-                ],
-                Hlvalue::Variable(items.clone()),
-            ));
-            Hlvalue::Variable(items)
-        }
-    };
+    // header reaches the array through `items`; a Rust Vec header through `ptr`.
+    let src_items = emit_list_items_read(block, source_layout, item_lltype, l);
+    let dst_items = emit_list_items_read(block, result_layout, item_lltype, &new_lst);
     // ll_arraycopy(src_items, dst_items, src_start, 0, newlength).
     let copy_void = variable_with_lltype("v", LowLevelType::Void);
     block.borrow_mut().operations.push(SpaceOperation::new(
@@ -5296,6 +5312,7 @@ fn emit_listslice_alloc_and_copy(
         ],
         Hlvalue::Variable(copy_void),
     ));
+    emit_rustvec_len_store(block, result_layout, &new_lst, newlength);
     block.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(new_lst)],
@@ -5614,7 +5631,9 @@ fn build_ll_listslice_startstop_helper_graph(
 }
 
 /// Derive the [`ListLayout`] from a list repr's `Ptr` lltype: a resized list
-/// is `Ptr(GcStruct("list", …))`, a fixed list is `Ptr(GcArray)`.
+/// is `Ptr(GcStruct("list", …))`, a fixed list is `Ptr(GcArray)`, a Rust
+/// Vec is `Ptr(Struct(raw) "RustVec" {ptr, len, cap})` with the
+/// [`RUST_VEC_HINT`].
 fn list_layout_from_lltype(ptr_lltype: &LowLevelType) -> Result<ListLayout, TyperError> {
     let LowLevelType::Ptr(ptr) = ptr_lltype else {
         return Err(TyperError::message(
@@ -5622,6 +5641,9 @@ fn list_layout_from_lltype(ptr_lltype: &LowLevelType) -> Result<ListLayout, Type
         ));
     };
     match &ptr.TO {
+        PtrTarget::Struct(header) if header._hints.get(RUST_VEC_HINT).is_some() => {
+            Ok(ListLayout::RustVec)
+        }
         PtrTarget::Struct(_) => Ok(ListLayout::Resized),
         PtrTarget::Array(_) => Ok(ListLayout::Fixed),
         other => Err(TyperError::message(format!(
@@ -5725,7 +5747,7 @@ fn rtype_bltn_list_via_ll_copy(
 /// `cRESLIST` Void const is implicit — the result repr is `hop.r_result`, which
 /// the helper builders read directly (and off whose lltype they select the
 /// result layout for the destination-items copy).
-fn rtype_getslice_via_ll_listslice(
+pub(crate) fn rtype_getslice_via_ll_listslice(
     hop: &HighLevelOp,
     source_layout: ListLayout,
     source_ptr_lltype: LowLevelType,
@@ -5741,13 +5763,16 @@ fn rtype_getslice_via_ll_listslice(
         .map(Arc::clone)
         .ok_or_else(|| TyperError::message("rtype_getslice: r_result not populated"))?;
     let result_ptr_lltype = r_result.lowleveltype().clone();
-    let items_ptr = items_array_ptr_lltype(&item_lltype);
+    let items_ptr = items_array_ptr_lltype_for_layout(source_layout, &item_lltype);
 
     // ll_arraycopy(src, dst, src_start, dst_start, length) — general 5-arg
     // (rgc.py): a slice copies from `src_start = start != 0`, so the
-    // start=0 specialisation used by `ll_copy` does not fit.
+    // start=0 specialisation used by `ll_copy` does not fit. A RustVec
+    // source copies from the raw nolength `ptr` array; the helper is the
+    // same `ll_arraycopy` loop, keyed by that items-ptr type.
     let arraycopy = {
         let item = item_lltype.clone();
+        let items = items_ptr.clone();
         hop.rtyper.lowlevel_helper_function_with_builder(
             "ll_arraycopy".to_string(),
             vec![
@@ -5759,7 +5784,7 @@ fn rtype_getslice_via_ll_listslice(
             ],
             LowLevelType::Void,
             move |_rtyper, _args, _result| {
-                build_ll_arraycopy_general_helper_graph("ll_arraycopy", item.clone())
+                build_ll_arraycopy_general_helper_graph("ll_arraycopy", item.clone(), items.clone())
             },
         )?
     };
@@ -5849,14 +5874,20 @@ fn rtype_getslice_via_ll_listslice(
 }
 
 /// `FixedSizeListRepr` (bare `Ptr(GcArray)`) vs the resized `ListRepr`
-/// (`Ptr(GcStruct("list", length, items))`) differ only in how `ll_length` /
-/// `ll_getitem_fast` / `ll_setitem_fast` reach the element array, so the
-/// checked / negative-index `ll_getitem` / `ll_setitem` CFGs
-/// (`rlist.py:688-748`) are written once and parameterised by this layout.
+/// (`Ptr(GcStruct("list", length, items))`) vs the raw Rust `Vec` header
+/// (`Ptr(Struct(raw) "RustVec" {ptr, len, cap})` with a nolength items
+/// array) differ only in how `ll_length` / items access reach the element
+/// array, so the checked / negative-index `ll_getitem` / `ll_setitem` CFGs
+/// (`rlist.py` `ll_getitem_nonneg` / `ll_getitem` / `ll_setitem_nonneg` /
+/// `ll_setitem`) and `ll_listslice_*` are written once and
+/// parameterised by this layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ListLayout {
     Fixed,
     Resized,
+    /// Raw `{ptr, len, cap}` header. Length is `getfield(l, "len")`, items
+    /// are the nolength array at `getfield(l, "ptr")`.
+    RustVec,
 }
 
 impl ListLayout {
@@ -5864,6 +5895,7 @@ impl ListLayout {
         match self {
             ListLayout::Fixed => "ll_fixed_getitem_fast",
             ListLayout::Resized => "ll_getitem_fast",
+            ListLayout::RustVec => "ll_vec_getitem_fast",
         }
     }
     /// rlist.py `ll_getitem_foldable_nonneg` — the foldable
@@ -5874,48 +5906,56 @@ impl ListLayout {
         match self {
             ListLayout::Fixed => "ll_fixed_getitem_fast_foldable",
             ListLayout::Resized => "ll_getitem_fast_foldable",
+            ListLayout::RustVec => "ll_vec_getitem_fast_foldable",
         }
     }
     fn setitem_fast_name(self) -> &'static str {
         match self {
             ListLayout::Fixed => "ll_fixed_setitem_fast",
             ListLayout::Resized => "ll_setitem_fast",
+            ListLayout::RustVec => "ll_vec_setitem_fast",
         }
     }
     fn getitem_neg_name(self) -> &'static str {
         match self {
             ListLayout::Fixed => "ll_fixed_getitem",
             ListLayout::Resized => "ll_getitem",
+            ListLayout::RustVec => "ll_vec_getitem",
         }
     }
     fn getitem_nonneg_checked_name(self) -> &'static str {
         match self {
             ListLayout::Fixed => "ll_fixed_getitem_nonneg_checked",
             ListLayout::Resized => "ll_getitem_nonneg_checked",
+            ListLayout::RustVec => "ll_vec_getitem_nonneg_checked",
         }
     }
     fn getitem_checked_name(self) -> &'static str {
         match self {
             ListLayout::Fixed => "ll_fixed_getitem_checked",
             ListLayout::Resized => "ll_getitem_checked",
+            ListLayout::RustVec => "ll_vec_getitem_checked",
         }
     }
     fn setitem_neg_name(self) -> &'static str {
         match self {
             ListLayout::Fixed => "ll_fixed_setitem",
             ListLayout::Resized => "ll_setitem",
+            ListLayout::RustVec => "ll_vec_setitem",
         }
     }
     fn setitem_nonneg_checked_name(self) -> &'static str {
         match self {
             ListLayout::Fixed => "ll_fixed_setitem_nonneg_checked",
             ListLayout::Resized => "ll_setitem_nonneg_checked",
+            ListLayout::RustVec => "ll_vec_setitem_nonneg_checked",
         }
     }
     fn setitem_checked_name(self) -> &'static str {
         match self {
             ListLayout::Fixed => "ll_fixed_setitem_checked",
             ListLayout::Resized => "ll_setitem_checked",
+            ListLayout::RustVec => "ll_vec_setitem_checked",
         }
     }
 }
@@ -6110,6 +6150,7 @@ fn list_layout_tag(layout: ListLayout) -> &'static str {
     match layout {
         ListLayout::Fixed => "fixed",
         ListLayout::Resized => "resized",
+        ListLayout::RustVec => "rustvec",
     }
 }
 
@@ -6936,8 +6977,9 @@ fn build_ll_listeq_look_inside_iff_helper_graph(
 }
 
 /// Push the `ll_length` read for `layout` onto `block` and return the Signed
-/// length var: `getarraysize(l)` (Fixed, bare `Ptr(GcArray)`) or
-/// `getfield(l, "length")` (Resized, struct header).
+/// length var: `getarraysize(l)` (Fixed, bare `Ptr(GcArray)`),
+/// `getfield(l, "length")` (Resized, GC list header), or
+/// `getfield(l, "len")` (RustVec raw header).
 fn emit_list_length_read(block: &BlockRef, layout: ListLayout, l: &Variable) -> Variable {
     let length = variable_with_lltype("length", LowLevelType::Signed);
     let op = match layout {
@@ -6949,6 +6991,11 @@ fn emit_list_length_read(block: &BlockRef, layout: ListLayout, l: &Variable) -> 
         ListLayout::Resized => SpaceOperation::new(
             "getfield",
             vec![Hlvalue::Variable(l.clone()), void_field_const("length")],
+            Hlvalue::Variable(length.clone()),
+        ),
+        ListLayout::RustVec => SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(l.clone()), void_field_const("len")],
             Hlvalue::Variable(length.clone()),
         ),
     };
@@ -7001,6 +7048,7 @@ fn list_getitem_fast_funcptr(
                 ptr_for_builder.clone(),
                 item_for_builder.clone(),
             ),
+            ListLayout::RustVec => rustvec_does_not_mint_list_getitem_fast(),
         },
     )?;
     sub_helper_funcptr_constant(rtyper, &inner)
@@ -7477,6 +7525,7 @@ fn list_getitem_helper(
                     ptr_for_builder.clone(),
                     item_for_builder.clone(),
                 ),
+                ListLayout::RustVec => rustvec_does_not_mint_list_getitem_fast(),
             },
             (false, false) => build_ll_list_getitem_neg_helper_graph(
                 rtyper_inner,
@@ -7616,6 +7665,7 @@ fn list_setitem_fast_funcptr(
                 ptr_for_builder.clone(),
                 item_for_builder.clone(),
             ),
+            ListLayout::RustVec => rustvec_does_not_mint_list_setitem_fast(),
         },
     )?;
     sub_helper_funcptr_constant(rtyper, &inner)
@@ -8077,6 +8127,7 @@ fn list_setitem_helper(
                     ptr_for_builder.clone(),
                     item_for_builder.clone(),
                 ),
+                ListLayout::RustVec => rustvec_does_not_mint_list_setitem_fast(),
             },
             (false, false) => build_ll_list_setitem_neg_helper_graph(
                 rtyper_inner,

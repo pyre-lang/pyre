@@ -25,7 +25,9 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, GCREF, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
-use crate::translator::rtyper::rlist::ListIteratorRepr;
+use crate::translator::rtyper::rlist::{
+    ListIteratorRepr, ListLayout, rtype_getslice_via_ll_listslice,
+};
 use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, hop_arg_const_string, inputconst_from_lltype,
 };
@@ -256,6 +258,21 @@ impl Repr for RustVecRepr {
             v,
             vec![self.lltype.clone(), LowLevelType::Signed],
             self.item_lltype().clone(),
+        )
+    }
+
+    /// RPython `AbstractBaseListRepr.rtype_getslice(r_lst, hop)` (`rlist.py`)
+    /// via `rtype_getslice_via_ll_listslice`. The source is the raw
+    /// `{ptr, len, cap}` header (`ListLayout::RustVec`); the result is a
+    /// fresh `RustVecRepr` of the same item (`hop.r_result`).
+    fn rtype_getslice(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_lst = hop.inputarg(ConvertedTo::Repr(self), 0)?;
+        rtype_getslice_via_ll_listslice(
+            hop,
+            ListLayout::RustVec,
+            self.lltype.clone(),
+            self.item_lltype().clone(),
+            v_lst,
         )
     }
 
@@ -841,5 +858,167 @@ mod tests {
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "getfield");
         assert_eq!(ops.ops[0].args.len(), 2);
+    }
+
+    /// `v[start:stop]` on a `Vec<PyObjectRef>` (`VecItemKind::Ref`) with
+    /// non-constant nonneg bounds decomposes to `"startstop"` and lowers
+    /// to `gendirectcall(ll_listslice_startstop, …)` (`rlist.py`
+    /// `AbstractBaseListRepr.rtype_getslice`).
+    #[test]
+    fn rtype_getslice_ref_startstop_emits_ll_listslice_startstop() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = setup_rtyper();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let r_vec = rust_vec_repr(&rtyper, VecItemKind::Ref);
+        let vec_lltype = r_vec.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(vec_lltype));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_stop = Variable::new();
+        v_stop.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        let v_stop_h = Hlvalue::Variable(v_stop);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "getslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), v_stop_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = std::rc::Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::RustVec(
+            crate::annotator::model::SomeRustVec::for_kind(VecItemKind::Ref),
+        ));
+        hop.args_r.borrow_mut().push(Some(r_vec.clone()));
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ true, false,
+            )));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(v_stop_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ true, false,
+            )));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_vec.clone());
+
+        let out = rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation getslice must dispatch to RustVecRepr.rtype_getslice")
+            .expect("getslice returns the fresh Vec Variable");
+        let Hlvalue::Variable(_) = out else {
+            panic!("getslice must return a Variable (the ll_listslice result)");
+        };
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        assert_eq!(
+            direct_calls,
+            1,
+            "expected a single ll_listslice_startstop direct_call, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        let names: Vec<String> = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_listslice_startstop"),
+            "getslice must mint an ll_listslice_startstop helper graph, got {names:?}"
+        );
+    }
+
+    /// `v[start:]` on a `Vec<PyObjectRef>` (`VecItemKind::Ref`) decomposes
+    /// to `"startonly"` and lowers to
+    /// `gendirectcall(ll_listslice_startonly, l, start)`.
+    #[test]
+    fn rtype_getslice_ref_startonly_emits_ll_listslice_startonly() {
+        use crate::annotator::model::{SomeInteger, SomeValue, s_none};
+        use crate::flowspace::model::{Constant, SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = setup_rtyper();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let r_vec = rust_vec_repr(&rtyper, VecItemKind::Ref);
+        let vec_lltype = r_vec.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(vec_lltype));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        let c_stop = Hlvalue::Constant(Constant::new(ConstValue::None));
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "getslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), c_stop.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = std::rc::Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::RustVec(
+            crate::annotator::model::SomeRustVec::for_kind(VecItemKind::Ref),
+        ));
+        hop.args_r.borrow_mut().push(Some(r_vec.clone()));
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ true, false,
+            )));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(c_stop);
+        hop.args_s.borrow_mut().push(s_none());
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_vec.clone());
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation getslice must dispatch to RustVecRepr.rtype_getslice")
+            .expect("getslice returns the fresh Vec Variable");
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        assert_eq!(
+            direct_calls,
+            1,
+            "expected a single ll_listslice_startonly direct_call, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        let names: Vec<String> = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_listslice_startonly"),
+            "getslice [start:] must mint an ll_listslice_startonly helper graph, got {names:?}"
+        );
     }
 }
