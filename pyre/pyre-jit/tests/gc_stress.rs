@@ -3247,6 +3247,75 @@ assert raised
     );
 }
 
+/// `parse_into_fresh_frame` copies `_match_signature`'s scope into the
+/// frame locals array after `parse_into_scope` has allocated
+/// (`space.newdict(kwargs=True)`). That array is a nursery GcArray
+/// (`createframe_obj` `NurseryGc`); a one-byte nursery either moves it
+/// during the dict alloc or spills it old while the dict is still young.
+/// The copy must reload the array and remember it (`framework.py`
+/// `transform_generic_set`).
+#[test]
+fn kwargs_dict_survives_collection_inside_parse_into_scope() {
+    const CHILD: &str = "PYRE_PARSE_INTO_SCOPE_KWARGS_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kwargs_dict_survives_collection_inside_parse_into_scope",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated parse_into_scope kwargs regression");
+        assert!(
+            output.status.success(),
+            "kwargs dict was lost across parse_into_scope:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+def f(**k):
+    j = 0
+    while j < 8:
+        _ = [0] * 4
+        j = j + 1
+    return k["x"]
+
+def g(a, **k):
+    return a + k["b"]
+
+i = 0
+while i < 400:
+    assert f(x=i) == i
+    d = {"x": i, "y": 1}
+    assert f(**d) == i
+    assert g(i, b=1) == i + 1
+    i = i + 1
+
+def h(**k):
+    return k
+
+saved = h(x=7, y=8)
+j = 0
+while j < 20:
+    _ = [0] * 8
+    j = j + 1
+assert saved["x"] == 7
+assert saved["y"] == 8
+"#,
+        "parse_into_scope_kwargs.py",
+        "parse_into_scope kwargs dict",
+        "a **kwargs dict created in parse_into_scope must survive the copy into frame locals",
+    );
+}
+
 /// `setup_context` reads `frame.last_instr`. A compiled caller keeps that
 /// coordinate in the virtualizable until the consumer forces it, so
 /// `warnings.warn(..., stacklevel=2)` reports the call in the loop.
