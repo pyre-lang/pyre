@@ -846,7 +846,6 @@ fn derive_pc_live_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,
     code: &CodeObject,
-    is_true_portal: bool,
 ) -> Vec<Option<usize>> {
     // py_pc -> the stream position whose nearest-`-live-`-at-or-before is
     // the PC's resume marker.  Default = the PC's own first insn position
@@ -876,15 +875,17 @@ fn derive_pc_live_indices_from_sparse(
             .map(|k| pc_pos[k].1)
     };
     // Unconditional control-transfer target of `pc` (`JUMP_FORWARD`,
-    // `JUMP_BACKWARD_NO_INTERRUPT`, and non-portal `JUMP_BACKWARD`), or
-    // `None` for any other opcode.  Those jumps still emit no
-    // resume-relevant jitcode of their own: the blackhole steps them and
-    // lands at the target, so their resume liveness IS the target block's.
-    // True-portal `JUMP_BACKWARD` carries the jitted `bytecode_trace` poll
-    // (`emit_jump_absolute_tick`) before `loop_header` + `goto`, so it is
-    // no longer an empty uncond jump — a branch whose not-taken arm is
+    // `JUMP_BACKWARD_NO_INTERRUPT`), or `None` for any other opcode.
+    // Those jumps still emit no resume-relevant jitcode of their own: the
+    // blackhole steps them and lands at the target, so their resume
+    // liveness IS the target block's.
+    // `JUMP_BACKWARD` carries the jitted `bytecode_trace` poll
+    // (`emit_jump_absolute_tick`; `interp_jit.py` `jump_absolute` runs
+    // it on every frame) before `loop_header` + `goto`, so it is no
+    // longer an empty uncond jump — a branch whose not-taken arm is
     // that back-edge must resume at the poll, not skip to the jump target.
-    // Used by the break-arm re-key below.
+    // `loop_header` stays true-portal only. Used by the break-arm re-key
+    // below.
     let uncond_jump_target = |pc: usize| -> Option<usize> {
         let (instr, op_arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
         match instr {
@@ -894,13 +895,9 @@ fn derive_pc_live_indices_from_sparse(
                 delta.get(op_arg).as_usize(),
             )),
             // `JUMP_BACKWARD_NO_INTERRUPT` still emits no resume-relevant
-            // jitcode (no tick).  Non-portal `JUMP_BACKWARD` is the same:
-            // the tick is true-portal only.  `backward_jump_target` keeps
-            // the skip_caches vs direct `pc + 1` base distinction.
+            // jitcode (no tick). `backward_jump_target` keeps the
+            // skip_caches vs direct `pc + 1` base distinction.
             Instruction::JumpBackwardNoInterrupt { .. } => {
-                pyre_interpreter::backward_jump_target(code, pc, instr, op_arg)
-            }
-            Instruction::JumpBackward { .. } if !is_true_portal => {
                 pyre_interpreter::backward_jump_target(code, pc, instr, op_arg)
             }
             _ => None,
@@ -2285,9 +2282,8 @@ const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
 /// the loop.  The pyre-only breaker bits stay armed for `eval_loop_jit`
 /// (`bh_bytecode_trace_jitted_slow`).
 ///
-/// `emit_tick` is the true-portal `JUMP_BACKWARD` gate: a non-portal jitcode
-/// aliases `frame_var` to the outermost frame (same gap as ReturnValue's
-/// `last_instr` store).  `eb_addr == 0` also takes the no-tick shape.
+/// Every frame runs the `bytecode_trace` poll (`interp_jit.py`
+/// `jump_absolute`). `eb_addr == 0` takes the no-tick shape.
 fn emit_jump_absolute_tick(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -2300,7 +2296,6 @@ fn emit_jump_absolute_tick(
     ec_var: super::flow::Variable,
     bytecode_trace_slow_fn_idx: u16,
     bytecode_trace_slow_flavor: CallFlavor,
-    emit_tick: bool,
     emit_header: bool,
     jdindex: usize,
     catch_for_pc: &[Option<u16>],
@@ -2310,7 +2305,7 @@ fn emit_jump_absolute_tick(
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) {
     let eb_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
-    let header_block = if !emit_tick || eb_addr == 0 {
+    let header_block = if eb_addr == 0 {
         current_block.clone()
     } else {
         // interp_jit.py jump_absolute: `self.last_instr = intmask(jumpto)`
@@ -2321,9 +2316,6 @@ fn emit_jump_absolute_tick(
         // `jump_absolute` shim uses `set_last_instr_from_next_instr(jumpto)`
         // (`last_instr = jumpto - 1`), which is the f_lasti store and not
         // the live convention.
-        //
-        // Portal jitcode only (`emit_tick`): in a non-portal callee
-        // `frame_var` aliases the outermost frame (ReturnValue arm).
         //
         // Split a new graph block for the poll.  JUMP_BACKWARD falls
         // through from STORE_FAST in the same CFG block; appending the
@@ -3423,65 +3415,6 @@ fn frontend_load_const_flow_value(
         }
     }
     pyobject_const_ref_value(pyre_interpreter::pyframe::load_const_from_code(code, idx))
-}
-
-/// Resolve `name` the way `flowcontext.py find_global` does —
-/// module globals first, then `__builtins__` — returning the raw resolved
-/// object (or `None` when pyre cannot reproduce the static lookup).
-/// `frontend_global_flow_value` wraps the result in a const `FlowValue`;
-/// the `LOAD_GLOBAL` walker uses it to classify the FINAL resolved value
-/// (globals OR builtins) before deciding whether const-folding is GC-safe.
-fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::PyObjectRef> {
-    let w_code = w_code as pyre_object::PyObjectRef;
-    if w_code.is_null() {
-        return None;
-    }
-    let roots = pyre_object::gc_roots::push_roots();
-    let code_slot = roots.base();
-    let w_code = roots.pin_root(w_code);
-    // pyopcode.py `_load_global`: `finditem_str(self.get_w_globals_storage(),
-    // varname)` then the builtins fallback. Read the globals OBJECT
-    // (`pycode.w_globals`) rather than the off-GC proxy storage.
-    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
-    if w_globals.is_null() {
-        return None;
-    }
-    if let Some(w_value) = pyre_interpreter::baseobjspace::finditem_str(w_globals, name)
-        .ok()
-        .flatten()
-    {
-        return Some(w_value);
-    }
-    // That lookup reaches a user `__getitem__` on a non-dict mapping, and a
-    // dict is one of the two kinds a minor collection relocates.  Re-read the
-    // globals off the code object rather than reuse the pointer from before the
-    // call. `PyCode` is movable, so reload it from the shadow stack before
-    // reading the collector-forwarded `w_globals` field again.
-    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(roots.get(code_slot)) };
-    let w_builtin = pyre_interpreter::baseobjspace::finditem_str(w_globals, "__builtins__")
-        .ok()
-        .flatten()?;
-    let lookup_obj = if unsafe { pyre_object::is_module(w_builtin) } {
-        unsafe { pyre_object::w_module_get_w_dict(w_builtin) }
-    } else if unsafe { pyre_object::is_dict(w_builtin) } {
-        w_builtin
-    } else {
-        return None;
-    };
-    if lookup_obj.is_null() {
-        return None;
-    }
-    pyre_interpreter::baseobjspace::finditem_str(lookup_obj, name)
-        .ok()
-        .flatten()
-}
-
-fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::flow::FlowValue> {
-    // `flowcontext.py find_global` resolves globals during flow
-    // analysis and pushes a Constant.  Do the same when the current
-    // PyCode exposes its globals/builtins; callers fall back to a
-    // fresh Ref only when pyre cannot reproduce the static lookup.
-    frontend_global_object(w_code, name).map(pyobject_const_ref_value)
 }
 
 fn set_last_bool_exitcase(block: &super::flow::BlockRef, branch_taken: bool) {
@@ -9762,13 +9695,9 @@ impl CodeWriter {
                                 if target_py_pc < num_instrs {
                                     // interp_jit.py `jump_absolute`: jitted
                                     // `bytecode_trace` then `can_enter_jit`.
-                                    // pyre-adaptation (inlined callee's own
-                                    // frame is unpublished — same gap as
-                                    // ReturnValue's last_instr store): the
-                                    // whole tick is true-portal only;
-                                    // `loop_header` stays under the existing
-                                    // true-portal && !handler-only condition.
-                                    let emit_tick = is_true_portal;
+                                    // Every frame runs the tick; `loop_header`
+                                    // stays true-portal only — the jitdriver
+                                    // merge point.
                                     let emit_header = !backward_jump_is_handler_only_target(
                                         code,
                                         py_pc,
@@ -9786,7 +9715,6 @@ impl CodeWriter {
                                         ec_var,
                                         bytecode_trace_jitted_slow_fn_idx,
                                         bytecode_trace_jitted_slow_fn_flavor,
-                                        emit_tick,
                                         emit_header,
                                         PYTHON_PORTAL_JD_INDEX,
                                         &catch_for_pc,
@@ -9816,23 +9744,9 @@ impl CodeWriter {
                             // raises and catches, the raise.  Store `py_pc`, not the
                             // `py_pc - 1` of the resume-at sites (`emit_abort_permanent!`)
                             // — this opcode is dispatched here, not resumed at.
-                            //
-                            // Portal jitcode only.  In a non-portal callee
-                            // `frame_var` aliases the OUTERMOST frame rather
-                            // than naming that callee's own (the same aliasing
-                            // the `LoadGlobal` register-form namespace declines
-                            // for below), so the store would stamp the callee's
-                            // coordinate into its caller and the caller would
-                            // then resolve it against its own line table.  A
-                            // frame observed after an inlined callee returned —
-                            // through `sys._getframe(1)` or a retained traceback
-                            // — would report an unrelated line, which is the
-                            // very failure this store exists to remove.
-                            // Declining leaves the caller's own coordinate
-                            // intact.  The inlined callee's own frame stays
-                            // unpublished during a resume that aliases
-                            // `frame_var` to the outermost frame.
-                            if is_true_portal {
+                            // `frame_var` is this jitcode's own frame, including an
+                            // inlined callee.
+                            {
                                 let v_li: super::flow::FlowValue =
                                     super::flow::Constant::signed(py_pc as i64).into();
                                 record_graph_op(
@@ -9916,66 +9830,47 @@ impl CodeWriter {
                             if is_true_portal {
                                 let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             }
-                            // #336: in the PORTAL jitcode, load the global at
-                            // RUNTIME from the live frame instead of const-
-                            // folding the resolved object's address into the
-                            // jitcode constant pool.  Const-folding bakes a raw
-                            // pointer into `constants_r`, which the moving
-                            // (incminimark) GC does not forward; a global object
-                            // still young at build time and relocated afterwards
-                            // (e.g. a `memo` dict mutated in the loop) leaves a
-                            // dangling pointer the blackhole resume then reads.
-                            // The namespace operand (r0) is emitted as a NULL
-                            // `ConstRef` placeholder and resolved by the walker
-                            // (`replace_movable_load_global_namespace_with_frame_globals`,
-                            // jitcode_dispatch) from the live frame of the level
-                            // being walked.  That lets
-                            // `try_walker_load_global_cell_fold` hoist the lookup
-                            // to a GC-safe live cell read (`QuasiimmutField` +
-                            // `jit_namespace_cell_lookup`), so the value is read
-                            // through the forwarded dict every iteration; the
-                            // `bh_load_global_fn` residual fallback never reads
-                            // the operand, deriving the namespace from the live
-                            // frame when that frame owns this `w_code` and from
-                            // `w_code`'s own live `w_globals` otherwise.  pycode
-                            // (r1) is the jitcode's own promoted `W_Code`; the
-                            // frame (r2) feeds `get_builtin()`.
+                            // Every jitcode — portal and non-portal — loads the
+                            // global at RUNTIME from this MIFrame.
+                            // `pyopcode.py _load_global` calls
+                            // `self.get_w_globals()` (`pyframe.py
+                            // PyFrame.get_w_globals`): debugdata.w_globals when
+                            // the frame carries a payload (`exec(code, ns)`),
+                            // else `jit.promote(self.pycode).w_globals`.  Baking
+                            // the codewrite-time object skips that read, so a
+                            // rebind of a class or module global never
+                            // invalidates and `debugdata.w_globals` is ignored.
                             //
-                            // This placeholder-plus-frame form is portal-only.
-                            // A non-portal callee graph declares its own
-                            // frame/ec inputs; `frame_var` is that callee red,
-                            // not the outermost portal frame. A
-                            // non-portal callee instead keeps the
-                            // `flowcontext.py find_global` const-fold,
-                            // which the inliner needs as a foldable constant call
-                            // target — EXCEPT for a mutable container (dict /
-                            // list / set) or a function.  A container is grown
-                            // in place and relocates nursery->oldgen after the
-                            // jitcode is built, so its const-folded address
-                            // dangles when the blackhole resumes the unfused
-                            // callee (dynasm SIGSEGVs; cranelift null-softens the
-                            // read).  A function global can be rebound through
-                            // its module cell after the jitcode is built, so a
-                            // baked callable goes stale.  Resolve both through
-                            // the `bh_load_global_fn` residual whose namespace
-                            // operand is the callee's module dict object, built
-                            // eagerly at `PyFrame.__init__` so it reaches the
-                            // non-moving oldgen before any jitcode build: the
-                            // cell-fold then reads the value live through that
-                            // stable dict every iteration, giving the optimizer a
-                            // guarded value instead of baking a relocating or
-                            // rebindable one.  Classes / modules are created at
-                            // module load and are neither grown nor rebound, so
-                            // const-folding them stays safe.
+                            // The namespace operand (r0) is a NULL `ConstRef`
+                            // placeholder. The walker
+                            // (`replace_movable_load_global_namespace_with_frame_globals`)
+                            // replaces it from THIS jitcode's own namespace —
+                            // `WalkFrameState.inline_w_globals` for an inlined
+                            // callee (never the portal snapshot), the portal
+                            // snapshot's `frame_w_globals` at the merge point.
+                            // `try_walker_load_global_cell_fold` then hoists
+                            // the lookup to a GC-safe cell read
+                            // (`celldict.py ModuleDictStrategy.getitem_str`:
+                            // `version?` quasi-immutable +
+                            // `_getdictvalue_no_unwrapping_pure` elidable +
+                            // `unwrap_cell`), guarded by
+                            // `GUARD_NOT_INVALIDATED`.  A class or function
+                            // global becomes a constant call target through
+                            // that fold, not through a baked pointer.  The
+                            // `bh_load_global_fn` residual never reads the
+                            // placeholder: it re-resolves from this jitcode's
+                            // own frame (`get_w_globals`).  pycode (r1) is this
+                            // jitcode's promoted `W_Code`; frame (r2) is this
+                            // jitcode's own red (`get_builtin()`).
                             //
-                            // Widening the register form to every jitcode costs
-                            // a `ForceToken` / `GuardNotForced` /
-                            // `GuardNoException` per global in a non-portal
-                            // body.  On `bench/synth/
-                            // exception_reraise_tb_depth_hot` that turns five
-                            // const-folded loads into five residual calls and
-                            // takes `guard_failures` from 1803 to 63769.
-                            let result_value: super::flow::FlowValue = if is_true_portal {
+                            // Widening the residual without the cell fold
+                            // leaving a constant is what once turned five
+                            // loads on `exception_reraise_tb_depth_hot` into
+                            // five `ForceToken` / `GuardNotForced` /
+                            // `GuardNoException` calls (`guard_failures`
+                            // 1803 → 63769). The walker must seed this
+                            // frame's namespace so the fold fires.
+                            let result_value: super::flow::FlowValue = {
                                 // `bh_load_global_fn` derives globals from the
                                 // live frame; the namespace operand is only a
                                 // trace-time cell-fold hint. The walker replaces
@@ -10006,98 +9901,6 @@ impl CodeWriter {
                                 loaded
                                     .map(super::flow::FlowValue::from)
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
-                            } else {
-                                let name_idx = raw_namei as usize >> 1;
-                                let name = code.names.get(name_idx).map(|name| name.as_str());
-                                // Classify the FINAL resolved global — module
-                                // globals OR `__builtins__`.  Only a
-                                // module-load-immortal, non-rebindable call
-                                // target (a class or a module) is safe to
-                                // const-fold: it is promoted to the non-moving
-                                // oldgen before any jitcode build and is not
-                                // rebound in place, and the inliner needs it as a
-                                // foldable constant call target.  Every other
-                                // resolved global is either relocatable (an
-                                // `int`/`str` built at run time, or a mutable
-                                // dict/list/set whose const-folded address
-                                // dangles once the moving GC relocates it — the
-                                // baked pointer then crashes the blackhole
-                                // resume) or rebindable (a function whose module
-                                // cell can be reassigned after the jitcode is
-                                // built, so a baked callable goes stale).  Route
-                                // those through the live residual
-                                // (`bh_load_global_fn` resolves the value from
-                                // the frame's own globals every iteration, never
-                                // baking the relocating or rebindable pointer);
-                                // `LOAD_GLOBAL` under the JIT always resolves
-                                // through `get_w_globals()` live
-                                // (celldict.py:287), so the residual is the
-                                // orthodox shape and the const-fold is the
-                                // optimization carve-out.
-                                let global_is_const_foldable = name
-                                    .and_then(|nm| frontend_global_object(w_code, nm))
-                                    .is_some_and(|obj| unsafe {
-                                        pyre_object::is_type(obj) || pyre_object::is_module(obj)
-                                    });
-                                if !global_is_const_foldable {
-                                    // The namespace operand is the callee's
-                                    // module dict OBJECT (`pycode.w_globals`).
-                                    // `PyFrame.__init__` stamps it eagerly
-                                    // (`w_code_get_w_globals`), a
-                                    // `malloc_typed`-immortal wrapper, so by
-                                    // jitcode build time it is already in the
-                                    // non-moving oldgen and const-folding ITS
-                                    // pointer is GC-safe.
-                                    // `try_walker_load_global_cell_fold` reads
-                                    // the container VALUE live through it each
-                                    // iteration, so the relocating value is
-                                    // never baked.  A container is never a call
-                                    // target, so the cell-fold's deep-inline
-                                    // call mis-resolution does not apply.
-                                    let ns_obj = unsafe {
-                                        pyre_interpreter::w_code_get_w_globals(
-                                            w_code as pyre_object::PyObjectRef,
-                                        )
-                                    };
-                                    let ns_const: super::flow::FlowValue =
-                                        super::flow::Constant::new(
-                                            super::flow::ConstantValue::Signed(ns_obj as i64),
-                                            Some(Kind::Ref),
-                                        )
-                                        .into();
-                                    let code_const: super::flow::FlowValue =
-                                        super::flow::Constant::new(
-                                            super::flow::ConstantValue::Signed(w_code as i64),
-                                            Some(Kind::Ref),
-                                        )
-                                        .into();
-                                    let loaded = residual_call!(
-                                        load_global_fn_idx,
-                                        CallFlavor::Plain,
-                                        majit_ir::RuntimeHelperKind::LoadGlobal,
-                                        vec![super::flow::Constant::signed(raw_namei).into()],
-                                        vec![ns_const, code_const, frame_var.into()],
-                                        vec![],
-                                        vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
-                                        ResKind::Ref,
-                                        py_pc as i64,
-                                    );
-                                    loaded
-                                        .map(super::flow::FlowValue::from)
-                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
-                                } else {
-                                    // Module-load-immortal, non-rebindable call
-                                    // target (a class or a module): const-fold so
-                                    // the inliner sees a foldable constant call
-                                    // target.  Such objects reach the non-moving
-                                    // oldgen before any jitcode build and are not
-                                    // rebound, so the baked pointer stays stable.
-                                    // Function globals take the residual path
-                                    // above because rebinding can change their
-                                    // module-cell payload.
-                                    name.and_then(|nm| frontend_global_flow_value(w_code, nm))
-                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
-                                }
                             };
                             current_state.stack.push(result_value.clone());
                             // `loaded_dst_reg == stack_base + current_depth`
@@ -15277,8 +15080,7 @@ impl CodeWriter {
             .iter()
             .position(|i| i.is_live())
             .expect("canonical splice stream carries no -live- marker");
-        let derived =
-            derive_pc_live_indices_from_sparse(&spliced, num_instrs, code, is_true_portal);
+        let derived = derive_pc_live_indices_from_sparse(&spliced, num_instrs, code);
         let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
         let mut last = first_live;
         for entry in &derived {
@@ -16563,9 +16365,10 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 /// same `transform_graph_to_jitcode` body.  With the frame-input shape
 /// de-conflated from true-portal-ness, every drained graph carries the Portal
 /// input shape and graph-side frame-vable dual-writes, while the
-/// `jit_merge_point` marker and the LOAD_GLOBAL /
-/// LOAD_CONST namespace split gate on `is_true_portal`.  Per-helper walker
-/// emit sites feed compile-time-known operands directly per
+/// `jit_merge_point` marker and the LOAD_CONST namespace split gate on
+/// `is_true_portal`.  `LOAD_GLOBAL` no longer splits: portal and non-portal
+/// both emit the live-frame residual.  Per-helper walker emit sites feed
+/// compile-time-known operands directly per
 /// `pyframe.py getcode(): hint(self.pycode, promote=True)`.
 ///
 /// Per-helper migration status:
@@ -16576,21 +16379,18 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 ///     and emits `build_load_const_fn_residual_call_ir_r_insn_with_const_pycode`
 ///     with the callee's own `w_code` pointer as `Operand::ConstRef`.
 ///   * `bh_load_global_fn(namespace_ptr, w_code_ptr, frame_ptr, namei)` —
-///     **pycode operand migrated**.  Walker emit in the
-///     `Instruction::LoadGlobal` arm splits on `is_true_portal`: portal keeps
-///     the `getfield_vable_r(portal_frame_reg, code_field)` + register
-///     operand; non-portal skips that vable getfield and emits
-///     `build_load_global_fn_residual_call_ir_r_insn_with_const_pycode`
-///     with the callee's own `w_code` pointer as `Operand::ConstRef`.
+///     **pycode operand migrated; namespace is the live-frame residual**.
+///     Portal and non-portal both emit a NULL `ConstRef` namespace
+///     placeholder plus this jitcode's own `frame_var`.  pycode is the
+///     jitcode's promoted `W_Code` ConstRef
+///     (`pyframe.py getcode(): hint(self.pycode, promote=True)`).
 ///     This fixes the function_calls miscompile: in a chained blackhole
-///     resume `portal_frame_reg` aliases the OUTERMOST (caller) frame, so
-///     `getfield_vable_r(portal_frame_reg, pycode)` returned the caller's
-///     `W_Code`, and an inlined callee's `LOAD_GLOBAL` then indexed the
-///     caller's `names` table (resolving the wrong global, e.g. calling
-///     an int).  Same basis as the migrated LoadConst pycode ConstRef
-///     (`pyframe.py getcode(): hint(self.pycode, promote=True)`)
-///     and safe for the same reason (see "Why LoadConst ConstRef works"
-///     below): pycode is a promoted constant whose value equals the
+///     resume a vable pycode read off the outermost frame returned the
+///     caller's `W_Code`, and an inlined callee's `LOAD_GLOBAL` then
+///     indexed the caller's `names` table (resolving the wrong global,
+///     e.g. calling an int).  Same basis as the migrated LoadConst pycode
+///     ConstRef and safe for the same reason (see "Why LoadConst ConstRef
+///     works" below): pycode is a promoted constant whose value equals the
 ///     pointer `getfield_vable_r` would read, so the QuasiimmutField key
 ///     matches.
 ///
@@ -16637,13 +16437,11 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 ///     `inline_callee_consts` inside an inlined callee — so a
 ///     cross-module inlined `LOAD_GLOBAL` reads its own module's
 ///     globals rather than the caller's.  `bh_load_global_fn` never
-///     reads the operand at all: it resolves `w_globals` from the live
-///     frame when that frame owns this `w_code` and from the `w_code`'s
-///     own `w_globals` otherwise.  What is still declined rather than
-///     compiled is a callee whose code object was rebound to a second
-///     namespace (`frame_stores_global`), because this inline-frame
-///     encoder does not put `FrameDebugData.w_globals` into resume
-///     data.
+///     reads the operand at all: it resolves `w_globals` from this
+///     jitcode's own frame (`get_w_globals`).  A callee whose code object
+///     was rebound to a second namespace (`frame_stores_global`) is still
+///     declined by the inliner, because the inline-frame encoder does not
+///     put `FrameDebugData.w_globals` into resume data.
 ///   * `bh_call_fn` / `bh_call_fn_N(callable, null_or_self, args...)` —
 ///     frame-less residual call ABI matching RPython
 ///     `bhimpl_residual_call_r_r` (`cpu.bh_call_r(func, None, args_r,
@@ -17909,22 +17707,6 @@ mod tests {
             ),
             other => panic!("expected Ref constant, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn frontend_global_flow_value_reads_w_code_globals_as_constant() {
-        let code = compile_exec("x\n").expect("compile failed");
-        let w_code = pyre_interpreter::box_code_constant(&code);
-        let globals = pyre_object::w_module_dict_new();
-        let w_value = pyre_object::intobject::w_int_new(42);
-        unsafe {
-            pyre_object::w_dict_setitem_str(globals, "x", w_value);
-            pyre_interpreter::w_code_set_w_globals(w_code, globals);
-        }
-
-        let value = frontend_global_flow_value(w_code as *const (), "x").expect("global constant");
-
-        assert_eq!(value, pyobject_const_ref_value(w_value));
     }
 
     #[test]

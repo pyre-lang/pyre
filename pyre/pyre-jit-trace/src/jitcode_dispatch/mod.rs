@@ -6856,6 +6856,9 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
             }
             return;
         };
+        // `pyframe.py get_w_globals` on a debugdata-less frame is
+        // `jit.promote(self.pycode).w_globals`: GETFIELD_GC_R of this
+        // callee red, not a ConstRef of the dict word.
         let w_globals = crate::state::frame_get_globals_obj(ctx.trace_ctx, frame);
         // Recording-time residual execution needs the same concrete shadow;
         // the compiled value remains the GETFIELD_GC_R result above and is
@@ -13661,11 +13664,12 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
 /// re-reads the `is_being_profiled` green, and GNI fails when the slot
 /// is written.  Recording the promote half here ate five ops of a
 /// `trace_limit=8` walk and fragmented `trace_too_long_effect_replay`
-/// (aborts 17→46, guard_failures 1247→7746).  Marker only; the pending
-/// GNI flushes on the next real guard, coalesced with `w_tracefunc?`.
+/// (aborts 17→46, guard_failures 1247→7746).  Marker only, followed by the
+/// `GUARD_NOT_INVALIDATED` that `pyjitpl.py opimpl_record_quasiimmut_field`
+/// generates when the heapcache still needs one.
 fn record_portal_profilefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    _op_pc: usize,
+    op_pc: usize,
 ) -> Result<(), DispatchError> {
     if ctx.fbw_mode.inline_subwalk {
         return Ok(());
@@ -13683,7 +13687,7 @@ fn record_portal_profilefunc_guard<Sym: WalkSym>(
         ec_box,
         crate::descr::ec_profilefunc_descr(),
     );
-    Ok(())
+    walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
 /// RPython `pyjitpl.py _establish_nullity(box, orgpc)` — the shared body

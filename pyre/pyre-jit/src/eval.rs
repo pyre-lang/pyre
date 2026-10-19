@@ -13761,71 +13761,12 @@ fn materialize_virtual_from_rd(
     // index; a corrupt resume stream (out-of-range vidx) raises IndexError here
     // rather than being swallowed as a NULL ref.
     let entry = &virtuals[vidx];
-    // resume.py decode_int decode_* parity.
-    fn decode_tagged_fieldnum(
-        tagged: i16,
-        dead_frame: &[Value],
-        num_failargs: i32,
-        rd_consts: &[majit_ir::Const],
-        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut DirectVirtualsCache,
-    ) -> Option<Value> {
-        if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
-            return None;
-        }
-        let (val, tagbits) = majit_metainterp::resume::untag(tagged);
-        Some(match tagbits {
-            majit_ir::resumedata::TAGBOX => {
-                // resume.py:1562-1564: if num < 0: num += self.count; then
-                // cpu.get_*_value(self.deadframe, num) — direct deadframe
-                // access, so a corrupt stream (out-of-range num) raises here
-                // rather than being papered over with a 0.
-                let idx = if val < 0 {
-                    (val + num_failargs) as usize
-                } else {
-                    val as usize
-                };
-                dead_frame[idx].clone()
-            }
-            majit_ir::resumedata::TAGINT => Value::Int(val as i64),
-            majit_ir::resumedata::TAGCONST => {
-                // resume.py decode_ref: if tagged_eq(tagged, NULLREF):
-                //   return ConstPtr.value
-                if tagged == majit_ir::resumedata::NULLREF {
-                    return Some(Value::Ref(majit_ir::GcRef::NULL));
-                }
-                // resume.py/1571/1582: self.consts[num - TAG_CONST_OFFSET]
-                // — direct index; a corrupt stream raises IndexError here.
-                let ci = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-                rd_consts[ci].to_value()
-            }
-            majit_ir::resumedata::TAGVIRTUAL => {
-                // resume.py assign_number_to_virtual nested virtuals are numbered negatively;
-                // getvirtual_ptr resolves them via Python negative list
-                // indexing into rd_virtuals (resume.py).
-                let vidx = if val < 0 {
-                    (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
-                } else {
-                    val as usize
-                };
-                return Some(materialize_virtual_from_rd(
-                    vidx,
-                    dead_frame,
-                    num_failargs,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                ));
-            }
-            // untag masks to 2 bits (TAGMASK), so tagbits is exhaustively one
-            // of TAGCONST/TAGINT/TAGBOX/TAGVIRTUAL above. resume.py's decode_*
-            // encode this with `assert tag == TAGBOX` in the final else.
-            _ => unreachable!("untag yields a 2-bit tag; all four are handled"),
-        })
-    }
-    /// resume.py decode_int(fieldnum)
-    /// Returns the raw i64 value for integer-typed fields.
-    fn decode_tagged_fieldnum_int(
+    // resume.py ResumeDataDirectReader.decode_int / decode_ref / decode_float.
+    // TAGBOX: cpu.get_*_value(deadframe, num) — direct index; a corrupt
+    // stream (out-of-range num) raises here rather than being papered over
+    // with a 0. Nested virtuals are numbered negatively; getvirtual_*
+    // resolves them via Python negative list indexing into rd_virtuals.
+    fn decode_int(
         tagged: i16,
         dead_frame: &[Value],
         num_failargs: i32,
@@ -13833,51 +13774,140 @@ fn materialize_virtual_from_rd(
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         virtuals_cache: &mut DirectVirtualsCache,
     ) -> i64 {
-        match decode_tagged_fieldnum(
-            tagged,
-            dead_frame,
-            num_failargs,
-            rd_consts,
-            rd_virtuals,
-            virtuals_cache,
-        ) {
-            Some(Value::Int(n)) => n,
-            Some(Value::Float(f)) => f.to_bits() as i64,
-            Some(Value::Ref(gc)) => gc.0 as i64,
-            _ => 0,
+        let (num, tag) = majit_metainterp::resume::untag(tagged);
+        if tag == majit_ir::resumedata::TAGCONST {
+            // resume.py ResumeDataDirectReader.decode_int: TAGCONST -> consts[..].getint()
+            let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+            rd_consts[ci].getint()
+        } else if tag == majit_ir::resumedata::TAGINT {
+            num as i64
+        } else if tag == majit_ir::resumedata::TAGVIRTUAL {
+            // resume.py ResumeDataDirectReader.decode_int: TAGVIRTUAL -> getvirtual_int(num)
+            let vidx = if num < 0 {
+                (rd_virtuals.map_or(0, |v| v.len()) as i32 + num) as usize
+            } else {
+                num as usize
+            };
+            match materialize_virtual_from_rd(
+                vidx,
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            ) {
+                Value::Int(n) => n,
+                other => panic!(
+                    "resume.py ResumeDataDirectReader.decode_int TAGVIRTUAL: \
+                     getvirtual_int expected Value::Int, got {other:?}"
+                ),
+            }
+        } else {
+            assert!(
+                tag == majit_ir::resumedata::TAGBOX,
+                "resume.py ResumeDataDirectReader.decode_int: assert tag == TAGBOX (got {tag})"
+            );
+            let idx = if num < 0 {
+                (num + num_failargs) as usize
+            } else {
+                num as usize
+            };
+            match dead_frame[idx] {
+                Value::Int(n) => n,
+                other => panic!(
+                    "resume.py ResumeDataDirectReader.decode_int TAGBOX: \
+                     expected Value::Int, got {other:?}"
+                ),
+            }
         }
     }
 
-    /// resume.py decode_float(fieldnum)
-    /// Returns the raw f64 value for float-typed fields.
-    fn decode_tagged_fieldnum_float(
+    fn decode_ref(
         tagged: i16,
         dead_frame: &[Value],
         num_failargs: i32,
         rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         virtuals_cache: &mut DirectVirtualsCache,
-    ) -> f64 {
-        match decode_tagged_fieldnum(
-            tagged,
-            dead_frame,
-            num_failargs,
-            rd_consts,
-            rd_virtuals,
-            virtuals_cache,
-        ) {
-            Some(Value::Float(f)) => f,
-            Some(Value::Int(n)) => f64::from_bits(n as u64),
-            _ => 0.0,
+    ) -> majit_ir::GcRef {
+        let (num, tag) = majit_metainterp::resume::untag(tagged);
+        if tag == majit_ir::resumedata::TAGCONST {
+            // resume.py ResumeDataDirectReader.decode_ref:
+            // TAGCONST (NULLREF -> null, else getref_base())
+            if tagged == majit_ir::resumedata::NULLREF {
+                return majit_ir::GcRef::NULL;
+            }
+            let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+            rd_consts[ci].getref_base()
+        } else if tag == majit_ir::resumedata::TAGVIRTUAL {
+            // resume.py ResumeDataDirectReader.decode_ref: TAGVIRTUAL -> getvirtual_ptr
+            let vidx = if num < 0 {
+                (rd_virtuals.map_or(0, |v| v.len()) as i32 + num) as usize
+            } else {
+                num as usize
+            };
+            match materialize_virtual_from_rd(
+                vidx,
+                dead_frame,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+            ) {
+                Value::Ref(r) => r,
+                other => panic!(
+                    "resume.py ResumeDataDirectReader.decode_ref TAGVIRTUAL: \
+                     getvirtual_ptr expected Value::Ref, got {other:?}"
+                ),
+            }
+        } else {
+            assert!(
+                tag == majit_ir::resumedata::TAGBOX,
+                "resume.py ResumeDataDirectReader.decode_ref: assert tag == TAGBOX (got {tag})"
+            );
+            let idx = if num < 0 {
+                (num + num_failargs) as usize
+            } else {
+                num as usize
+            };
+            match dead_frame[idx] {
+                Value::Ref(r) => r,
+                other => panic!(
+                    "resume.py ResumeDataDirectReader.decode_ref TAGBOX: \
+                     expected Value::Ref, got {other:?}"
+                ),
+            }
         }
     }
 
-    fn box_opt_value(v: &Option<Value>) -> pyre_object::PyObjectRef {
-        match v {
-            Some(Value::Ref(gc)) => gc.0 as pyre_object::PyObjectRef,
-            Some(Value::Int(n)) => pyre_object::intobject::w_int_new(*n),
-            Some(Value::Float(f)) => pyre_object::floatobject::w_float_new(*f),
-            _ => std::ptr::null_mut(),
+    fn decode_float(
+        tagged: i16,
+        dead_frame: &[Value],
+        num_failargs: i32,
+        rd_consts: &[majit_ir::Const],
+    ) -> f64 {
+        let (num, tag) = majit_metainterp::resume::untag(tagged);
+        if tag == majit_ir::resumedata::TAGCONST {
+            // resume.py ResumeDataDirectReader.decode_float: TAGCONST -> getfloatstorage()
+            let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+            f64::from_bits(rd_consts[ci].getfloatstorage() as u64)
+        } else {
+            assert!(
+                tag == majit_ir::resumedata::TAGBOX,
+                "resume.py ResumeDataDirectReader.decode_float: assert tag == TAGBOX (got {tag})"
+            );
+            let idx = if num < 0 {
+                (num + num_failargs) as usize
+            } else {
+                num as usize
+            };
+            match dead_frame[idx] {
+                Value::Float(f) => f,
+                other => panic!(
+                    "resume.py ResumeDataDirectReader.decode_float TAGBOX: \
+                     expected Value::Float, got {other:?}"
+                ),
+            }
         }
     }
     // resume.py AbstractVArrayInfo: dispatch by virtual kind.
@@ -13915,24 +13945,8 @@ fn materialize_virtual_from_rd(
                 // resume.py:656-670: dispatch by arraydescr kind and pass
                 // the same arraydescr through to setarrayitem_*.
                 if ad.is_array_of_pointers() {
-                    let value = match decode_tagged_fieldnum(
-                        fnum,
-                        dead_frame,
-                        num_failargs,
-                        rd_consts,
-                        rd_virtuals,
-                        virtuals_cache,
-                    ) {
-                        Some(Value::Ref(gc)) => gc.0 as i64,
-                        Some(other) => box_opt_value(&Some(other)) as i64,
-                        None => 0,
-                    };
-                    // `resume.py` `bh_setarrayitem_gc_*`: re-read
-                    // `virtuals_cache` after decode (`getvirtual_ptr`).
-                    let array = virtuals_cache.live_ptr(vidx) as i64;
-                    bh_setarrayitem_ref_from_descr(array, i, value, arraydescr);
-                } else if ad.is_array_of_floats() {
-                    let value = decode_tagged_fieldnum_float(
+                    // resume.py setarrayitem_ref: decode_ref
+                    let value = decode_ref(
                         fnum,
                         dead_frame,
                         num_failargs,
@@ -13940,11 +13954,20 @@ fn materialize_virtual_from_rd(
                         rd_virtuals,
                         virtuals_cache,
                     )
-                    .to_bits() as i64;
+                    .0 as i64;
+                    // `resume.py` `bh_setarrayitem_gc_*`: re-read
+                    // `virtuals_cache` after decode (`getvirtual_ptr`).
+                    let array = virtuals_cache.live_ptr(vidx) as i64;
+                    bh_setarrayitem_ref_from_descr(array, i, value, arraydescr);
+                } else if ad.is_array_of_floats() {
+                    // resume.py setarrayitem_float: decode_float
+                    let value =
+                        decode_float(fnum, dead_frame, num_failargs, rd_consts).to_bits() as i64;
                     let array = virtuals_cache.live_ptr(vidx) as i64;
                     bh_setarrayitem_float_from_descr(array, i, value, arraydescr);
                 } else {
-                    let value = decode_tagged_fieldnum_int(
+                    // resume.py setarrayitem_int: decode_int
+                    let value = decode_int(
                         fnum,
                         dead_frame,
                         num_failargs,
@@ -14016,26 +14039,37 @@ fn materialize_virtual_from_rd(
                     if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                         continue;
                     }
-                    let v = decode_tagged_fieldnum(
-                        fnum,
-                        dead_frame,
-                        num_failargs,
-                        rd_consts,
-                        rd_virtuals,
-                        virtuals_cache,
-                    );
-                    if let Some(val) = v {
-                        // resume.py: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
-                        let raw = match val {
-                            Value::Int(i) => i,
-                            Value::Float(f) => f.to_bits() as i64,
-                            Value::Ref(r) => r.0 as i64,
-                            Value::Void => 0,
-                        };
-                        let (fo, fs, ft) = extract_interior_field_info(&fielddescrs[j]);
-                        let array = virtuals_cache.live_ptr(vidx) as *mut pyre_object::GcTypedArray;
-                        pyre_object::setinteriorfield(array, items_base, i, fo, fs, is, ft, raw);
-                    }
+                    // resume.py ResumeDataDirectReader.setinteriorfield:
+                    // is_pointer_field -> decode_ref; is_float_field ->
+                    // decode_float; else decode_int.
+                    let (fo, fs, ft) = extract_interior_field_info(&fielddescrs[j]);
+                    let raw = match ft {
+                        0 => {
+                            decode_ref(
+                                fnum,
+                                dead_frame,
+                                num_failargs,
+                                rd_consts,
+                                rd_virtuals,
+                                virtuals_cache,
+                            )
+                            .0 as i64
+                        }
+                        2 => {
+                            decode_float(fnum, dead_frame, num_failargs, rd_consts).to_bits() as i64
+                        }
+                        _ => decode_int(
+                            fnum,
+                            dead_frame,
+                            num_failargs,
+                            rd_consts,
+                            rd_virtuals,
+                            virtuals_cache,
+                        ),
+                    };
+                    // resume.py: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
+                    let array = virtuals_cache.live_ptr(vidx) as *mut pyre_object::GcTypedArray;
+                    pyre_object::setinteriorfield(array, items_base, i, fo, fs, is, ft, raw);
                 }
             }
             return virtuals_cache.live_ref_value(vidx);
@@ -14103,19 +14137,12 @@ fn materialize_virtual_from_rd(
                 // resume.py:1545-1550: descr drives decode AND store
                 if di.item_type == 2 {
                     // resume.py: newvalue = self.decode_float(fieldnum)
-                    let fval = decode_tagged_fieldnum_float(
-                        fnum,
-                        dead_frame,
-                        num_failargs,
-                        rd_consts,
-                        rd_virtuals,
-                        virtuals_cache,
-                    );
+                    let fval = decode_float(fnum, dead_frame, num_failargs, rd_consts);
                     // resume.py:1547: self.cpu.bh_raw_store_f(buffer, offset, newvalue, descr)
                     backend.bh_raw_store_f(buffer, offset, fval, &bh_descr);
                 } else {
                     // resume.py: newvalue = self.decode_int(fieldnum)
-                    let ival = decode_tagged_fieldnum_int(
+                    let ival = decode_int(
                         fnum,
                         dead_frame,
                         num_failargs,
@@ -14137,7 +14164,7 @@ fn materialize_virtual_from_rd(
                 "resume.py:724 VRawSliceInfo.allocate_int: len(self.fieldnums) == 1"
             );
             // resume.py: base_buffer = decoder.decode_int(self.fieldnums[0])
-            let base = decode_tagged_fieldnum_int(
+            let base = decode_int(
                 fieldnums[0],
                 dead_frame,
                 num_failargs,
@@ -14183,7 +14210,7 @@ fn materialize_virtual_from_rd(
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
-                let char_val = decode_tagged_fieldnum_int(
+                let char_val = decode_int(
                     fnum,
                     dead_frame,
                     num_failargs,
@@ -14226,22 +14253,20 @@ fn materialize_virtual_from_rd(
             // `resume.py concat_strings` / `concat_unicodes`: `decode_ref`
             // of `left` is a GC-traced local across `decode_ref` of
             // `right` (`VStrConcatInfo.allocate` / `VUniConcatInfo.allocate`).
-            let left_value = decode_tagged_fieldnum(
+            let left_ref = decode_ref(
                 fieldnums[0],
                 dead_frame,
                 num_failargs,
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
-            )
-            .unwrap_or(Value::Ref(majit_ir::GcRef::NULL));
-            let left_root = match left_value {
-                Value::Ref(r) if !r.is_null() => {
-                    Some(majit_gc::shadow_stack::OwnerRootGuard::new(r))
-                }
-                _ => None,
+            );
+            let left_root = if !left_ref.is_null() {
+                Some(majit_gc::shadow_stack::OwnerRootGuard::new(left_ref))
+            } else {
+                None
             };
-            let right_val = decode_tagged_fieldnum_int(
+            let right_ref = decode_ref(
                 fieldnums[1],
                 dead_frame,
                 num_failargs,
@@ -14271,8 +14296,9 @@ fn materialize_virtual_from_rd(
             // allocate; `VStrConcatInfo.allocate` keeps it in a GC local.
             let left_val = match &left_root {
                 Some(root) => root.get().0 as i64,
-                None => pending_source_raw_bits(left_value),
+                None => 0,
             };
+            let right_val = right_ref.0 as i64;
             let backend = driver.meta_interp().backend();
             let result = backend.bh_call_r(
                 func as i64,
@@ -14303,15 +14329,17 @@ fn materialize_virtual_from_rd(
             } else {
                 majit_ir::effectinfo::OopSpecIndex::StrSlice
             };
-            let str_val = decode_tagged_fieldnum_int(
+            // resume.py slice_string: decode_ref / decode_int / decode_int
+            let str_val = decode_ref(
                 fieldnums[0],
                 dead_frame,
                 num_failargs,
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
-            );
-            let start_val = decode_tagged_fieldnum_int(
+            )
+            .0 as i64;
+            let start_val = decode_int(
                 fieldnums[1],
                 dead_frame,
                 num_failargs,
@@ -14319,7 +14347,7 @@ fn materialize_virtual_from_rd(
                 rd_virtuals,
                 virtuals_cache,
             );
-            let length_val = decode_tagged_fieldnum_int(
+            let length_val = decode_int(
                 fieldnums[2],
                 dead_frame,
                 num_failargs,
@@ -14482,77 +14510,34 @@ fn materialize_virtual_from_rd(
     // Phase 3: setfields — decode each field and write to object.
     // resume.py: for each fielddescr, decoder.setfield(struct, num, descr)
     let is_instance = matches!(kind, VirtualKind::Instance { .. });
-    match kind {
-        VirtualKind::Instance { known_class, .. }
-            if known_class == Some(&pyre_object::INT_TYPE as *const _ as i64) =>
-        {
-            // W_IntObject fast path: find intval field.
-            // fielddescrs may include ob_type (offset 0) first.
-            let intval_idx = fielddescrs
-                .iter()
-                .position(|fd| fd.offset == INT_INTVAL_OFFSET)
-                .unwrap_or(0);
-            if let Some(&tagged) = fieldnums.get(intval_idx) {
-                let val = decode_tagged_value(
-                    tagged,
-                    dead_frame,
-                    num_failargs,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                );
-                let intval = match val {
-                    Value::Int(n) => n,
-                    Value::Ref(gc) if !gc.is_null() => unsafe {
-                        pyre_object::intobject::w_int_get_value(gc.0 as pyre_object::PyObjectRef)
-                    },
-                    _ => 0,
-                };
-                let obj_ptr = virtuals_cache.live_ptr(vidx);
-                unsafe {
-                    (*(obj_ptr as *mut pyre_object::intobject::W_IntObject)).intval = intval;
-                }
-            }
+    // resume.py AbstractVirtualStructInfo.setfields:
+    // skip only UNINITIALIZED; an explicit NULLREF is still stored
+    // (`decoder.setfield(struct, num, descr)`).
+    for (i, &tagged) in fieldnums.iter().enumerate() {
+        if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
+            continue;
         }
-        VirtualKind::Instance { known_class, .. }
-            if known_class == Some(&pyre_object::FLOAT_TYPE as *const _ as i64) =>
-        {
-            // W_FloatObject fast path: find floatval field.
-            let floatval_idx = fielddescrs
-                .iter()
-                .position(|fd| fd.offset == FLOAT_FLOATVAL_OFFSET)
-                .unwrap_or(0);
-            if let Some(&tagged) = fieldnums.get(floatval_idx) {
-                let val = decode_tagged_value(
-                    tagged,
-                    dead_frame,
-                    num_failargs,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                );
-                let floatval = match val {
-                    Value::Float(f) => f,
-                    Value::Int(bits) => f64::from_bits(bits as u64),
-                    _ => 0.0,
-                };
-                let obj_ptr = virtuals_cache.live_ptr(vidx);
-                unsafe {
-                    (*(obj_ptr as *mut pyre_object::floatobject::W_FloatObject)).floatval =
-                        floatval;
-                }
-            }
+        let Some(descr) = fielddescrs.get(i) else {
+            debug_assert!(false, "fielddescrs missing for field {}", i);
+            continue;
+        };
+        // Skip vtable slot (offset 0) for Instance — already set by allocate_with_vtable.
+        if descr.offset == 0 && is_instance {
+            continue;
         }
-        _ => {
-            // resume.py AbstractVirtualStructInfo.setfields:
-            // for each fielddescr, decoder.setfield(struct, num, descr)
-            for (i, &tagged) in fieldnums.iter().enumerate() {
-                if tagged == majit_ir::resumedata::NULLREF
-                    || tagged == majit_ir::resumedata::UNINITIALIZED_TAG
-                {
-                    continue;
-                }
-                let val = decode_tagged_value(
+        // resume.py ResumeDataDirectReader.setfield: kind from descr
+        // (is_pointer_field -> decode_ref; is_float_field ->
+        // decode_float; else decode_int).
+        match descr.field_type {
+            // Pointer-width store: 4 bytes on wasm32. A fixed
+            // 8-byte write runs past the object whenever the ref
+            // is the struct's last field, and the high half of a
+            // 32-bit pointer is zero, so the neighbouring 4 bytes
+            // are zeroed. Same width contract as
+            // `VirtualizableInfo::write_field` and
+            // `bh_setfield_gc_r`.
+            majit_ir::Type::Ref => {
+                let p = decode_ref(
                     tagged,
                     dead_frame,
                     num_failargs,
@@ -14560,127 +14545,60 @@ fn materialize_virtual_from_rd(
                     rd_virtuals,
                     virtuals_cache,
                 );
-                let raw = match val {
-                    Value::Int(n) => n,
-                    Value::Float(f) => f.to_bits() as i64,
-                    Value::Ref(gc) => gc.0 as i64,
-                    _ => 0,
-                };
-                let Some(descr) = fielddescrs.get(i) else {
-                    debug_assert!(false, "fielddescrs missing for field {}", i);
-                    continue;
-                };
-                // Skip vtable slot (offset 0) for Instance — already set by allocate_with_vtable.
-                if descr.offset == 0 && is_instance {
-                    continue;
-                }
                 // `resume.py` `setfields`: re-read `virtuals_cache` after
                 // decode (`getvirtual_ptr` / `abstract_virtual_struct_info_setfields`).
                 let obj_ptr = virtuals_cache.live_ptr(vidx);
                 unsafe {
                     let addr = (obj_ptr as *mut u8).add(descr.offset);
-                    match descr.field_type {
-                        // Pointer-width store: 4 bytes on wasm32. A fixed
-                        // 8-byte write runs past the object whenever the ref
-                        // is the struct's last field, and the high half of a
-                        // 32-bit pointer is zero, so the neighbouring 4 bytes
-                        // are zeroed. Same width contract as
-                        // `VirtualizableInfo::write_field` and
-                        // `bh_setfield_gc_r`.
-                        majit_ir::Type::Ref => {
-                            let p = match val {
-                                Value::Ref(gc) => gc.0,
-                                Value::Int(n) => n as usize,
-                                _ => 0,
-                            };
-                            // `resume.py:1512` reaches this store through
-                            // `cpu.bh_setfield_gc_r`, whose `write_ref_at_mem`
-                            // (llmodel.py) carries the framework GC
-                            // transformer's barrier. This materializer writes
-                            // the field itself, so it owes the same barrier:
-                            // `allocate_with_vtable` / `allocate_struct` build
-                            // the virtual straight in the non-moving old
-                            // generation, so a young `p` is an old -> young
-                            // edge that reaches `old_objects_pointing_to_young`
-                            // only from here. Per store, not once per object —
-                            // decoding a later field can materialize a nested
-                            // virtual, and the collection that runs there
-                            // drains the remembered set and restores
-                            // `TRACK_YOUNG_PTRS`.
-                            write_barrier_after_ref_store(obj_ptr as i64);
-                            std::ptr::write(addr as *mut usize, p);
-                        }
-                        majit_ir::Type::Float => {
-                            let bits = match val {
-                                Value::Float(f) => f.to_bits(),
-                                Value::Int(n) => n as u64,
-                                _ => 0,
-                            };
-                            std::ptr::write(addr as *mut u64, bits);
-                        }
-                        _ => match descr.field_size {
-                            1 => std::ptr::write(addr, raw as u8),
-                            2 => std::ptr::write(addr as *mut u16, raw as u16),
-                            4 => std::ptr::write(addr as *mut u32, raw as u32),
-                            _ => std::ptr::write(addr as *mut i64, raw),
-                        },
+                    // `resume.py ResumeDataDirectReader.setfield` reaches
+                    // this store through `cpu.bh_setfield_gc_r`, whose
+                    // `write_ref_at_mem` (llmodel.py) carries the
+                    // framework GC transformer's barrier. This
+                    // materializer writes the field itself, so it owes
+                    // the same barrier: `allocate_with_vtable` /
+                    // `allocate_struct` build the virtual straight in
+                    // the non-moving old generation, so a young `p` is
+                    // an old -> young edge that reaches
+                    // `old_objects_pointing_to_young` only from here.
+                    // Per store, not once per object — decoding a later
+                    // field can materialize a nested virtual, and the
+                    // collection that runs there drains the remembered
+                    // set and restores `TRACK_YOUNG_PTRS`.
+                    write_barrier_after_ref_store(obj_ptr as i64);
+                    std::ptr::write(addr as *mut usize, p.0);
+                }
+            }
+            majit_ir::Type::Float => {
+                let bits = decode_float(tagged, dead_frame, num_failargs, rd_consts).to_bits();
+                let obj_ptr = virtuals_cache.live_ptr(vidx);
+                unsafe {
+                    let addr = (obj_ptr as *mut u8).add(descr.offset);
+                    std::ptr::write(addr as *mut u64, bits);
+                }
+            }
+            _ => {
+                let raw = decode_int(
+                    tagged,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals,
+                    virtuals_cache,
+                );
+                let obj_ptr = virtuals_cache.live_ptr(vidx);
+                unsafe {
+                    let addr = (obj_ptr as *mut u8).add(descr.offset);
+                    match descr.field_size {
+                        1 => std::ptr::write(addr, raw as u8),
+                        2 => std::ptr::write(addr as *mut u16, raw as u16),
+                        4 => std::ptr::write(addr as *mut u32, raw as u32),
+                        _ => std::ptr::write(addr as *mut i64, raw),
                     }
                 }
             }
         }
     }
     virtuals_cache.live_ref_value(vidx)
-}
-
-/// resume.py ResumeDataDirectReader decode_int/decode_ref parity.
-///
-/// Decode a tagged value from rd_numb into a concrete Value.
-/// Handles TAGBOX (deadframe), TAGINT (inline), TAGCONST (constant pool),
-/// and TAGVIRTUAL (lazy materialization via materialize_virtual_from_rd).
-fn decode_tagged_value(
-    tagged: i16,
-    dead_frame: &[Value],
-    num_failargs: i32,
-    rd_consts: &[majit_ir::Const],
-    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    virtuals_cache: &mut DirectVirtualsCache,
-) -> Value {
-    let (val, tagbits) = majit_metainterp::resume::untag(tagged);
-    match tagbits {
-        majit_metainterp::resume::TAGBOX => {
-            let idx = if val < 0 {
-                (val + num_failargs) as usize
-            } else {
-                val as usize
-            };
-            dead_frame.get(idx).cloned().unwrap_or(Value::Int(0))
-        }
-        majit_metainterp::resume::TAGINT => Value::Int(val as i64),
-        majit_metainterp::resume::TAGCONST => rd_consts
-            .get((val - majit_metainterp::resume::TAG_CONST_OFFSET) as usize)
-            .copied()
-            .unwrap_or(majit_ir::Const::Int(0))
-            .to_value(),
-        majit_metainterp::resume::TAGVIRTUAL => {
-            // resume.py: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num).
-            // resume.py nested virtuals are numbered negatively;
-            // resolve via negative indexing into rd_virtuals (resume.py).
-            let vidx = if val < 0 {
-                (rd_virtuals.map_or(0, |v| v.len()) as i32 + val) as usize
-            } else {
-                val as usize
-            };
-            materialize_virtual_from_rd(
-                vidx,
-                dead_frame,
-                num_failargs,
-                rd_consts,
-                rd_virtuals,
-                virtuals_cache,
-            )
-        }
-        _ => Value::Int(0),
-    }
 }
 
 fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
@@ -14869,46 +14787,24 @@ pub(crate) fn decode_and_restore_guard_failure(
         } else {
             innermost.map(|f| f.py_pc).unwrap_or(ni)
         };
-        // When the resume pc is overridden to the innermost section's
-        // `py_pc` (a multi-frame inlined-callee guard), the positional
-        // `write_from_resume_data_partial` has left the physical frame's
-        // `valuestackdepth` at the CHAIN frame's depth (the outer
-        // section's).  Correct it to the innermost section's depth so the
-        // interpreter does not resume at the inner pc carrying the outer
-        // depth — an over-count that materializes a stray operand slot and
-        // shifts every subsequent push by one (`PyFrame::push` overflow at
-        // the function's peak stack use).  `last_instr` is already handled
-        // via `resume_pc`; only the vsd lags.  Clear the slots above the
-        // corrected depth so a GC scan before the first re-executed push
-        // does not see a stale operand pointer.
-        //
-        // The correction must also run when a deeper inlined-callee frame is
-        // present (`resumed_frames.len() > 1`) even if the innermost
-        // section's `py_pc` numerically coincides with `ni`: the positional
-        // vsd left by `write_from_resume_data_partial` is still the CHAIN
-        // (outer) frame's depth, and the matching pc value does not make it
-        // correct.  Single-frame guards keep the prior `resume_pc != ni`
-        // behavior.
-        //
-        // It addresses the PHYSICAL frame, so it applies only while the
-        // innermost section belongs to that frame's OWN code object.
-        // `consume_vable_info` (resume.py) writes the virtualizable
-        // from its own resume section and nothing re-points it at an inlined
-        // callee: a callee frame is a separate object the rebuild
-        // materializes, and its depth does not index the portal frame's
-        // `locals_cells_stack_w`.  Writing a foreign code object's depth here
-        // left the live frame BELOW its own stack base (`_Unframer.read`'s 3
-        // on `_Unpickler.load`, base 5), and the paired `clear_stack_above`
-        // then nulled two live locals.
+        // `write_from_resume_data_partial` / `consume_vable_info` write the
+        // virtualizable (outermost) frame. An inlined callee is a separate
+        // object this rebuild materializes; its depth does not index the
+        // portal `locals_cells_stack_w`. Correct vsd only when the innermost
+        // section IS that physical frame.
+        let outermost_ptr = resumed_frames.first().map(|f| f.frame_ptr);
         if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(code) = innermost
-                .map(|f| f.code as usize)
-                .filter(|&code| code == jit_state.pycode_as_usize())
-            {
-                if let Some(corrected_vsd) =
-                    pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)
-                {
-                    jit_state.set_valuestackdepth(corrected_vsd);
+            if let Some(inner) = innermost {
+                let same_physical = outermost_ptr.is_some_and(|outer| {
+                    !inner.frame_ptr.is_null() && std::ptr::eq(inner.frame_ptr, outer)
+                });
+                if same_physical {
+                    if let Some(corrected_vsd) = pyre_jit_trace::state::depth_based_vsd_for_wcode(
+                        inner.code as usize,
+                        resume_pc,
+                    ) {
+                        jit_state.set_valuestackdepth(corrected_vsd);
+                    }
                 }
             }
         }
@@ -15280,10 +15176,43 @@ fn sync_virtualizable_after_guard_failure(
     }
 }
 
+/// resume.py `consume_one_section` / `enumerate_vars`: the live Ref at
+/// `portal_frame_reg` (`interp_jit.py` `reds = ['frame', 'ec']`) is this
+/// section's own PyFrame. A virtual is already materialized into `values`
+/// by `_prepare_next_section`.
+fn section_frame_red_from_values(
+    jitcode_index: i32,
+    jitcode_pc: i32,
+    values: &[Value],
+) -> *mut pyre_interpreter::pyframe::PyFrame {
+    let (frame_reg, _) = pyre_jit_trace::state::portal_red_regs_at(jitcode_index);
+    if frame_reg == u16::MAX {
+        return std::ptr::null_mut();
+    }
+    let banks =
+        pyre_jit_trace::state::frame_liveness_reg_indices_by_bank_at(jitcode_index, jitcode_pc);
+    if banks.total_len() != values.len() {
+        panic!(
+            "section_frame_red_from_values: liveness bank len {} != section values {} \
+             (jitcode_index={jitcode_index} pc={jitcode_pc} frame_reg={frame_reg})",
+            banks.total_len(),
+            values.len(),
+        );
+    }
+    let Some(ref_pos) = banks.ref_.iter().position(|&c| c == u32::from(frame_reg)) else {
+        return std::ptr::null_mut();
+    };
+    match values.get(banks.int.len() + ref_pos) {
+        Some(Value::Ref(r)) => r.as_usize() as *mut pyre_interpreter::pyframe::PyFrame,
+        _ => std::ptr::null_mut(),
+    }
+}
+
 /// Decode rd_numb into per-frame ResumedFrame chain via
 /// `majit_ir::resumedata::rebuild_from_numbering`.
-/// Single-frame only (RPython's blackhole_from_resumedata uses
-/// per-jitcode liveness for multi-frame decode).
+/// One `ResumedFrame` per encoded jitcode section (`rebuild_from_resumedata` /
+/// `blackhole_from_resumedata`): outermost keeps the jitdriver virtualizable,
+/// inner sections carry that section's own frame red.
 fn build_resumed_frames(
     raw_values: &[i64],
     rd_numb: &[u8],
@@ -15379,14 +15308,17 @@ fn build_resumed_frames(
                 frame.values.len()
             );
         }
-        let mut values = Vec::new();
+        // Rooted per push: a later section's materialization, pending-field
+        // replay and the vable sync below can collect before the section
+        // frame red is read back out of these copies.
+        let mut values = Vec::with_capacity(frame.values.len());
         _prepare_next_section(
             frame,
             &dead_frame_typed,
             exit_layout,
             &mut values,
             virtuals_cache,
-            false,
+            true,
         );
         all_values.push(values);
     }
@@ -15546,6 +15478,42 @@ fn build_resumed_frames(
         // outermost (caller / JIT-driver) frame and the last entry is the
         // innermost (deepest callee).
         let is_outermost = idx == 0;
+        // `blackhole_from_resumedata` / `rebuild_from_resumedata`: each
+        // section's registers hold that level's own reds. The outermost
+        // red is the jitdriver virtualizable (`consume_vable_info`). An
+        // inlined callee's PyFrame is that section's `portal_frame_reg`
+        // (`interp_jit.py` `reds = ['frame', 'ec']`), a virtual the reader
+        // materializes from TAGVIRTUAL.
+        let frame_ptr = if is_outermost {
+            vable_frame_ptr
+        } else {
+            let (frame_reg, _) = pyre_jit_trace::state::portal_red_regs_at(frame.jitcode_index);
+            if frame_reg == u16::MAX {
+                // Codeless continuation (`ctor_continuation`, `OperatorTail`):
+                // `from_core_degenerate` leaves `portal_frame_reg` at
+                // `u16::MAX`. No Python frame red exists for this section.
+                std::ptr::null_mut()
+            } else {
+                let own = section_frame_red_from_values(frame.jitcode_index, frame.pc, &values);
+                if own.is_null() {
+                    panic!(
+                        "build_resumed_frames: inlined section {idx} \
+                         (jitcode_index={} pc={}) has no frame red \
+                         (portal_frame_reg={frame_reg}); \
+                         consume_one_section (resume.py) writes that register \
+                         from the section -live- R-bank",
+                        frame.jitcode_index, frame.pc,
+                    );
+                }
+                own
+            }
+        };
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[dynasm-debug] frame_ptr={:?} py_pc={} idx={}",
+                frame_ptr, py_pc, idx
+            );
+        }
         let w_code = if is_outermost {
             // virtualizable.py read_boxes: code from resume data, not heap.
             if !vable_pycode.is_null() {
@@ -15555,68 +15523,24 @@ fn build_resumed_frames(
             } else {
                 std::ptr::null()
             }
+        } else if !frame_ptr.is_null() {
+            unsafe { (*frame_ptr).pycode }
         } else {
             pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
                 .unwrap_or(std::ptr::null())
         };
-        let raw_code = if !w_code.is_null() {
-            unsafe {
-                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
-            }
-        } else {
-            std::ptr::null()
-        };
-        // resume.py:1095/1067 parity: virtualizable_ptr is the JIT driver's
-        // PyFrame, shared across the entire blackhole chain. RPython's
-        // newframe(jitcode) creates a fresh MIFrame for each inner section
-        // (inlined call) but the virtualizable on the JIT driver is the same.
-        // pyre's BlackholeInterpreter holds its own register state per
-        // section, so inner frames don't need a PyFrame — they only need
-        // virtualizable_ptr to write back to the outermost frame at the
-        // merge point. Use vable_frame_ptr for ALL sections.
-        let frame_ptr = vable_frame_ptr;
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[dynasm-debug] frame_ptr={:?} py_pc={} idx={}",
-                frame_ptr, py_pc, idx
-            );
-        }
-        // Per-frame VSD: outermost uses vable_vsd, inner frames derive
-        // from their code's nlocals + snapshot stack depth.
+        // consume_vable_info writes the outermost vsd; an inlined
+        // callee answers from its own materialized frame.
         let vsd = if is_outermost {
-            // resume.py consume_vable_info parity: outermost frame's vsd comes directly
-            // from the virtualizable. RPython does not sentinel-check 0.
             vable_vsd
-        } else if !raw_code.is_null() {
-            let nlocals = unsafe { &*raw_code }.varnames.len();
-            nlocals + values.len().saturating_sub(nlocals)
+        } else if !frame_ptr.is_null() {
+            unsafe { (*frame_ptr).valuestackdepth }
         } else {
             values.len()
         };
-        // PyFrame.get_w_globals: namespace comes from this frame's restored
-        // pycode/debugdata pair; it is not a physical virtualizable scalar.
-        let namespace = if is_outermost {
-            if !vable_frame_ptr.is_null() {
-                unsafe { (*vable_frame_ptr).get_w_globals() as *const () }
-            } else {
-                std::ptr::null()
-            }
-        } else if !w_code.is_null() {
-            // get_w_globals: each inlined-callee section resolves LOAD_GLOBAL
-            // in its own module namespace, taken from its own code — not the
-            // chain virtualizable's (mirrors recover_inline_callee_globals).
-            // Fall back to the chain namespace only when the callee code
-            // carries no globals yet.
-            let callee_ns = unsafe {
-                pyre_interpreter::w_code_get_w_globals(w_code as pyre_object::PyObjectRef)
-                    as *const ()
-            };
-            if !callee_ns.is_null() {
-                callee_ns
-            } else {
-                std::ptr::null()
-            }
+        // pyframe.py get_w_globals: this section's own frame.
+        let namespace = if !frame_ptr.is_null() {
+            unsafe { (*frame_ptr).get_w_globals() as *const () }
         } else {
             std::ptr::null()
         };

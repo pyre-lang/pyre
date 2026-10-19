@@ -2650,21 +2650,28 @@ pub(super) enum InlineArmOutcome {
 /// and the arm census both read healthy.
 enum DefaultEdge {
     /// `_ => break` and the divergent macros: the loop is over, take the
-    /// function's typed return.
+    /// function's typed return. `_ => return <expr>` is `LowerAsArm`.
     Return,
     /// `_ => {}`: fall out of the match and run the next iteration.
     NextIteration,
-    /// A default arm with a body. It is an arm like any other, just with no
-    /// opcode test in front of it, so lower it as one — a body that cannot
-    /// lower then degrades to an abort stub, which is the fail-closed path
-    /// every other arm already has.
+    /// A default arm with a body, including `_ => return <expr>`.
+    /// `GraphFlattener.make_return` emits a typed return of that block's
+    /// own value; jumping to `default_label` would return the portal's
+    /// trailing expression instead. Lowered like any other arm, so a
+    /// returning body reuses `InlineArmOutcome::InlinedTerminal`.
     LowerAsArm,
 }
 
 fn classify_default_edge(body: &Expr) -> DefaultEdge {
     fn leaves_the_loop(body: &Expr) -> bool {
         match body {
-            Expr::Break(_) | Expr::Return(_) => true,
+            // `break` has no operand; the unmatched-opcode edge jumps to
+            // `default_label`, bound at the portal's trailing typed return.
+            // `Expr::Return` is not an exit of that kind:
+            // `GraphFlattener.make_return` carries the return block's own
+            // value, so `_ => return <expr>` is `LowerAsArm` and reuses
+            // `InlineArmOutcome::InlinedTerminal`.
+            Expr::Break(_) => true,
             Expr::Macro(m) => is_divergent_macro(&m.mac.path),
             // Only when that is the whole body: an exit preceded by work
             // would leave the work out of the trace, which is the same loss
@@ -4583,6 +4590,82 @@ mod suffix_loop_int_return_tests {
         assert!(
             !body.contains("void_return"),
             "a lowerable int tail must not emit void_return: {body}"
+        );
+    }
+}
+
+/// `_ => return <expr>` must not share `_ => break`'s jump to `default_label`.
+/// That label is bound at the portal's trailing expression, so the jump would
+/// return the trailing value instead of `<expr>`. `GraphFlattener.make_return`
+/// emits a typed return of the return block's own value; the default arm
+/// reuses the non-default returning-arm path (`InlinedTerminal`).
+#[cfg(test)]
+mod default_return_arm_tests {
+    use super::*;
+
+    fn expr(src: &str) -> Expr {
+        syn::parse_str(src).expect("default-edge fixture must parse as Expr")
+    }
+
+    fn config() -> LowererConfig {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_type_name = "Machine".to_string();
+        config.env_type_name = "Program".to_string();
+        config
+    }
+
+    #[test]
+    fn default_edge_classification() {
+        for src in ["break", "{ break; }", "panic!()", "{ unreachable!(); }"] {
+            assert!(
+                matches!(classify_default_edge(&expr(src)), DefaultEdge::Return),
+                "{src}"
+            );
+        }
+        assert!(matches!(
+            classify_default_edge(&expr("{}")),
+            DefaultEdge::NextIteration
+        ));
+        for src in ["return 123456789", "{ return 123456789; }"] {
+            assert!(
+                matches!(classify_default_edge(&expr(src)), DefaultEdge::LowerAsArm),
+                "{src}"
+            );
+        }
+    }
+
+    /// The default arm's operand differs from the portal's trailing
+    /// expression. Jumping to `default_label` would emit only the trailing
+    /// `0`; `GraphFlattener.make_return` requires a typed return of 123456789.
+    #[test]
+    fn default_return_arm_emits_its_own_typed_return() {
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn mainloop(program: &Program) -> i64 {
+                loop {
+                    jit_merge_point!(driver, program, pc; state);
+                    let opcode = program[pc];
+                    match opcode {
+                        0 => {},
+                        _ => return 123456789,
+                    }
+                }
+                0
+            }
+        };
+        let dispatch = crate::jit_interp::codegen_trace::find_dispatch_match(&func.block)
+            .expect("opcode fetch must be the dispatch");
+        let arms = crate::jit_interp::classify::classify_arms(&dispatch.arms);
+        let generated = lower_dispatch_body(&config(), &func.block, &arms, &func.sig.output)
+            .expect("dispatch lowering must produce a body");
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("123456789"),
+            "the default arm's return operand must appear in the JitCode \
+             (flatten.py GraphFlattener.make_return): {body}"
+        );
+        assert!(
+            body.contains("int_return"),
+            "the default arm must emit a typed int_return of its operand: {body}"
         );
     }
 }
