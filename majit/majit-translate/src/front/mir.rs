@@ -40715,6 +40715,70 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Truncate a box-wide int (`jtransform.py` `_int_to_int_cast`:
+    /// `int_and` unsigned, `int_signext` signed). The planner supplies
+    /// [`crate::front::checked_arith_uint::WrappingTruncation`].
+    fn emit_narrow_truncation(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        value: Variable,
+        truncation: crate::front::checked_arith_uint::WrappingTruncation,
+        result_ty: ValueType,
+    ) -> Variable {
+        use crate::front::checked_arith_uint::WrappingTruncation;
+        match truncation {
+            WrappingTruncation::None => value,
+            WrappingTruncation::Mask(bits) => {
+                let mask_val = (1u64 << bits) - 1;
+                let mask = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(mask.clone()),
+                    kind: OpKind::ConstUInt(mask_val),
+                });
+                let masked = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(masked.clone()),
+                    kind: OpKind::BinOp {
+                        op: "and".to_string(),
+                        lhs: value,
+                        rhs: mask,
+                        result_ty,
+                    },
+                });
+                masked
+            }
+            WrappingTruncation::SignExt(nbytes) => {
+                // `jtransform.py` `_int_to_int_cast`: signed narrow target is
+                // `int_signext(v, nbytes)` with `nbytes = size2` in bytes.
+                // The front spells the leaf the way `"and"` becomes `int_and`.
+                let width = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(width.clone()),
+                    kind: OpKind::ConstInt(i64::from(nbytes)),
+                });
+                let extended = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(extended.clone()),
+                    kind: OpKind::BinOp {
+                        op: "signext".to_string(),
+                        lhs: value,
+                        rhs: width,
+                        result_ty,
+                    },
+                });
+                extended
+            }
+        }
+    }
+
     fn try_lower_wrapping_binop(
         &mut self,
         mir_bb: usize,
@@ -40744,17 +40808,8 @@ impl<'a> Lowering<'a> {
         // `uint_{add,sub,mul}` back onto `int_*` — one machine op under two
         // rtyper dispatches — has no entry for `uint_floordiv` / `uint_mod`,
         // which really are different instructions, so an unsigned receiver
-        // keeps the `Call` form.
-        let (op, signed_only) = match leaf.as_str() {
-            "wrapping_add" => ("add", false),
-            "wrapping_sub" => ("sub", false),
-            "wrapping_mul" => ("mul", false),
-            "wrapping_div" => ("floordiv", true),
-            "wrapping_rem" => ("mod", true),
-            "wrapping_shl" => ("lshift", false),
-            "wrapping_shr" => ("rshift", false),
-            _ => return Ok(false),
-        };
+        // keeps the `Call` form. Width / truncation / shift-count live in
+        // `wrapping_plan`.
         let [lhs, rhs] = args else {
             return Ok(false);
         };
@@ -40770,42 +40825,23 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         };
         let word_bytes = crate::layout::target_word_size();
-        let word_bits = (word_bytes * 8) as u32;
         let signed_atom = self.tyref_literal_int_atom(src);
         let unsigned_atom = self.tyref_literal_uint_atom(src);
-        let (atom, unsigned_receiver) = match (signed_atom, unsigned_atom) {
-            (Some(atom), None) => (atom, false),
-            (None, Some(atom)) => (atom, true),
+        let atom = match (signed_atom, unsigned_atom) {
+            (Some(atom), None) | (None, Some(atom)) => atom,
             _ => return Ok(false),
         };
-        // `I128` / `U128` and any unrecognised atom stay a `Call`.
-        // `Isize` / `Usize` are the target word.
-        let bits = match atom {
-            "I8" | "U8" => 8,
-            "I16" | "U16" => 16,
-            "I32" | "U32" => 32,
-            "I64" | "U64" => 64,
-            "Isize" | "Usize" => word_bits,
-            _ => return Ok(false),
-        };
-        let signed_word = !unsigned_receiver
-            && crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes);
-        let unsigned_word = unsigned_receiver
-            && crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes);
-        // Only `wrapping_{add,sub,mul}` widen a receiver narrower than the
-        // word: the word op, then a truncation back (`rint.py`
-        // `cast_primitive`, `jtransform.py` `_int_to_int_cast`: `int_and`
-        // for an unsigned target, `int_signext` for a signed one).
-        // `div` / `rem` / `shl` / `shr` keep the word-only gate.
-        let narrow_truncation = bits < word_bits
-            && matches!(
-                leaf.as_str(),
-                "wrapping_add" | "wrapping_sub" | "wrapping_mul"
-            );
-        if !signed_word && !unsigned_word && !narrow_truncation {
+        use crate::front::checked_arith_uint::WrappingPlan;
+        let Some(WrappingPlan::Inline {
+            op,
+            unsigned_receiver,
+            shift_count_mask,
+            truncation,
+        }) = crate::front::checked_arith_uint::wrapping_plan(atom, leaf, word_bytes)
+        else {
             return Ok(false);
-        }
-        if signed_only && !signed_word {
+        };
+        if op == "neg" {
             return Ok(false);
         }
         let bb_id = self.emit_bb(mir_bb);
@@ -40814,26 +40850,18 @@ impl<'a> Lowering<'a> {
         } else {
             ValueType::Int
         };
-        let shift_rhs = if matches!(leaf.as_str(), "wrapping_shl" | "wrapping_shr") {
-            let bits: i64 = if matches!(self.tyref_literal_int_atom(src), Some("I64"))
-                || matches!(self.tyref_literal_uint_atom(src), Some("U64"))
-            {
-                64
-            } else {
-                (crate::layout::target_word_size() * 8) as i64
-            };
-            if bits <= 1 {
-                return Ok(false);
-            }
+        let shift_rhs = if let Some(count_mask) = shift_count_mask {
+            // Rust `wrapping_shl` / `wrapping_shr` mask the count with
+            // `bits - 1` of the receiver (`u32` and a 4-byte usize: 31).
             let mask = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(mask.clone()),
-                kind: if unsigned_word {
-                    OpKind::ConstUInt((bits - 1) as u64)
+                kind: if unsigned_receiver {
+                    OpKind::ConstUInt(u64::from(count_mask))
                 } else {
-                    OpKind::ConstInt(bits - 1)
+                    OpKind::ConstInt(i64::from(count_mask))
                 },
             });
             let masked = self
@@ -40864,56 +40892,7 @@ impl<'a> Lowering<'a> {
                 result_ty: result_ty.clone(),
             },
         });
-        let res = if narrow_truncation && unsigned_receiver {
-            let mask_val = (1u64 << bits) - 1;
-            let mask = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(mask.clone()),
-                kind: OpKind::ConstUInt(mask_val),
-            });
-            let masked = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(masked.clone()),
-                kind: OpKind::BinOp {
-                    op: "and".to_string(),
-                    lhs: res,
-                    rhs: mask,
-                    result_ty,
-                },
-            });
-            masked
-        } else if narrow_truncation {
-            // `jtransform.py` `_int_to_int_cast`: signed narrow target is
-            // `int_signext(v, nbytes)` with `nbytes = size2` in bytes.
-            // The front spells the leaf the way `"and"` becomes `int_and`.
-            let nbytes = i64::from(bits / 8);
-            let width = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(width.clone()),
-                kind: OpKind::ConstInt(nbytes),
-            });
-            let extended = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(extended.clone()),
-                kind: OpKind::BinOp {
-                    op: "signext".to_string(),
-                    lhs: res,
-                    rhs: width,
-                    result_ty,
-                },
-            });
-            extended
-        } else {
-            res
-        };
+        let res = self.emit_narrow_truncation(bb_id, res, truncation, result_ty);
         self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -40978,7 +40957,9 @@ impl<'a> Lowering<'a> {
     }
 
     /// `i64`/`u64`/`isize`/`usize::wrapping_neg` is `llop.int_neg`.  The
-    /// binary wrapping table cannot take it: the method is unary.
+    /// binary wrapping table cannot take it: the method is unary. A
+    /// receiver narrower than the i64 box (4-byte `usize`/`isize`, `i32`/
+    /// `u32`) is `int_neg` then the same truncation as wrapping_add.
     fn try_lower_wrapping_unop(
         &mut self,
         mir_bb: usize,
@@ -41011,31 +40992,43 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         };
         let word_bytes = crate::layout::target_word_size();
-        let signed_word = self.tyref_literal_int_atom(src).is_some_and(|atom| {
-            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
-        });
-        let unsigned_word = self.tyref_literal_uint_atom(src).is_some_and(|atom| {
-            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
-        });
-        if !signed_word && !unsigned_word {
+        let signed_atom = self.tyref_literal_int_atom(src);
+        let unsigned_atom = self.tyref_literal_uint_atom(src);
+        let atom = match (signed_atom, unsigned_atom) {
+            (Some(atom), None) | (None, Some(atom)) => atom,
+            _ => return Ok(false),
+        };
+        use crate::front::checked_arith_uint::WrappingPlan;
+        let Some(WrappingPlan::Inline {
+            op,
+            unsigned_receiver,
+            truncation,
+            ..
+        }) = crate::front::checked_arith_uint::wrapping_plan(atom, leaf, word_bytes)
+        else {
+            return Ok(false);
+        };
+        if op != "neg" {
             return Ok(false);
         }
         let bb_id = self.emit_bb(mir_bb);
+        let result_ty = if unsigned_receiver {
+            ValueType::Unsigned
+        } else {
+            ValueType::Int
+        };
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::UnaryOp {
-                op: "neg".to_string(),
+                op: op.to_string(),
                 operand: operand.clone(),
-                result_ty: if unsigned_word {
-                    ValueType::Unsigned
-                } else {
-                    ValueType::Int
-                },
+                result_ty: result_ty.clone(),
             },
         });
+        let res = self.emit_narrow_truncation(bb_id, res, truncation, result_ty);
         self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -42888,30 +42881,18 @@ impl<'a> Lowering<'a> {
 
     /// Bit width and unsignedness of a literal integer `TyRef`.
     /// `I128` / `U128` stay `None` so the 128-bit carrier is left alone.
+    ///
+    /// `Isize` / `Usize` are the target word, not the i64 box. A 4-byte
+    /// word is 32 bits so `as usize` truncates (`jtransform.py`
+    /// `_int_to_int_cast` when `size2 < sizeof(Signed)`).
     fn literal_int_width(&self, ty: &TyRef) -> Option<(u32, bool)> {
-        let word_bits = (crate::layout::target_word_size() * 8) as u32;
+        let word_bytes = crate::layout::target_word_size();
         if let Some(atom) = self.tyref_literal_uint_atom(ty) {
-            let bits = match atom {
-                "U8" => 8,
-                "U16" => 16,
-                "U32" => 32,
-                "U64" => 64,
-                "U128" => 128,
-                "Usize" => word_bits,
-                _ => return None,
-            };
+            let bits = crate::front::checked_arith_uint::literal_int_atom_bits(atom, word_bytes)?;
             return Some((bits, true));
         }
         if let Some(atom) = self.tyref_literal_int_atom(ty) {
-            let bits = match atom {
-                "I8" => 8,
-                "I16" => 16,
-                "I32" => 32,
-                "I64" => 64,
-                "I128" => 128,
-                "Isize" => word_bits,
-                _ => return None,
-            };
+            let bits = crate::front::checked_arith_uint::literal_int_atom_bits(atom, word_bytes)?;
             return Some((bits, false));
         }
         None
@@ -88860,6 +88841,162 @@ mod tests {
         assert!(
             call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_div"),
             "u32::wrapping_div must stay a call; ops={ops:?}"
+        );
+    }
+
+    fn has_binop(ops: &[&SpaceOperation], name: &str) -> bool {
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == name))
+    }
+
+    fn has_and_const_uint(ops: &[&SpaceOperation], value: u64) -> bool {
+        ops.iter().any(|op| match &op.kind {
+            OpKind::BinOp { op, rhs, .. } if op == "and" => rhs_defined_by(
+                ops,
+                rhs,
+                |kind| matches!(kind, OpKind::ConstUInt(n) if *n == value),
+            ),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn wrapping_shl_of_u32_is_lshift_then_mask() {
+        let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_shl_u32",
+            &["core", "num", "<Impl>", "wrapping_shl"],
+            &[u32_ty.clone(), u32_ty.clone()],
+            u32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_shl_u32").expect("lower u32::wrapping_shl");
+        let ops = graph_ops(&graph);
+        assert!(
+            has_binop(&ops, "lshift"),
+            "u32::wrapping_shl must become lshift; ops={ops:?}"
+        );
+        assert!(
+            has_and_const_uint(&ops, 31),
+            "u32::wrapping_shl must mask the count with 31; ops={ops:?}"
+        );
+        assert!(
+            has_and_const_uint(&ops, 0xFFFF_FFFF),
+            "u32::wrapping_shl must mask the result with 0xFFFF_FFFF; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_shl"),
+            "u32::wrapping_shl must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_shr_of_u32_is_rshift_without_truncation() {
+        let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_shr_u32",
+            &["core", "num", "<Impl>", "wrapping_shr"],
+            &[u32_ty.clone(), u32_ty.clone()],
+            u32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_shr_u32").expect("lower u32::wrapping_shr");
+        let ops = graph_ops(&graph);
+        assert!(
+            has_binop(&ops, "rshift"),
+            "u32::wrapping_shr must become rshift; ops={ops:?}"
+        );
+        assert!(
+            has_and_const_uint(&ops, 31),
+            "u32::wrapping_shr must mask the count with 31; ops={ops:?}"
+        );
+        assert!(
+            !has_and_const_uint(&ops, 0xFFFF_FFFF),
+            "u32::wrapping_shr must not truncate; the receiver is already canonical; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_shr"),
+            "u32::wrapping_shr must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_neg_of_u32_is_neg_then_mask() {
+        let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_neg_u32",
+            &["core", "num", "<Impl>", "wrapping_neg"],
+            &[u32_ty.clone()],
+            u32_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_neg_u32").expect("lower u32::wrapping_neg");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg")),
+            "u32::wrapping_neg must become int_neg; ops={ops:?}"
+        );
+        assert!(
+            has_and_const_uint(&ops, 0xFFFF_FFFF),
+            "u32::wrapping_neg must mask with 0xFFFF_FFFF; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_neg"),
+            "u32::wrapping_neg must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_add_of_usize_is_bare_add() {
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_add_usize",
+            &["core", "num", "<Impl>", "wrapping_add"],
+            &[usize_ty.clone(), usize_ty.clone()],
+            usize_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_add_usize").expect("lower usize::wrapping_add");
+        let ops = graph_ops(&graph);
+        assert!(
+            has_binop(&ops, "add"),
+            "usize::wrapping_add at the host word must become add; ops={ops:?}"
+        );
+        assert!(
+            !has_and_const_uint(&ops, 0xFFFF_FFFF),
+            "usize::wrapping_add at the host word must not truncate; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_add"),
+            "usize::wrapping_add must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_neg_of_usize_is_bare_neg() {
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_neg_usize",
+            &["core", "num", "<Impl>", "wrapping_neg"],
+            &[usize_ty.clone()],
+            usize_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_neg_usize").expect("lower usize::wrapping_neg");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg")),
+            "usize::wrapping_neg at the host word must become int_neg; ops={ops:?}"
+        );
+        assert!(
+            !has_and_const_uint(&ops, 0xFFFF_FFFF),
+            "usize::wrapping_neg at the host word must not truncate; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_neg"),
+            "usize::wrapping_neg must not residualize; ops={ops:?}"
         );
     }
 
