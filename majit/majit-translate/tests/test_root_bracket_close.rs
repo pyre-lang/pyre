@@ -1559,9 +1559,9 @@ fn call_kw_binder_bodies_erase_root_brackets() {
     );
     assert_eq!(calls_to(&graph, "pin_root"), 0, "match_signature pin_root");
     assert_eq!(
-        calls_to(&graph, "pin_root_gcarray"),
+        calls_to(&graph, "publish_roots"),
         0,
-        "match_signature pin_root_gcarray"
+        "match_signature publish_roots"
     );
     assert_eq!(
         calls_to(&graph, "shadow_stack_len"),

@@ -712,6 +712,15 @@ impl<K, V, S> RDict<K, V, S> {
         crate::gc_roots::shadow_stack_set(slot, self.indexes as PyObjectRef);
     }
 
+    /// Read a stack-local dict's `entries` / `indexes` back from the slots
+    /// that hold them across a collection point (`shadowstack.py`
+    /// `expand_pop_roots`). A stack `RDict` is not a GC object, so the
+    /// collector updates only the published slots.
+    pub fn restore_from_roots(&mut self, entries_slot: usize, indexes_slot: usize) {
+        self.entries = crate::gc_roots::shadow_stack_get(entries_slot) as *mut GcEntries<K, V>;
+        self.indexes = crate::gc_roots::shadow_stack_get(indexes_slot) as *mut TypedItemsBlock;
+    }
+
     /// `alloc_typed_items_block` returns an old-gen block with no
     /// `GCFLAG_VISITED`. Until `self.indexes` holds it, `visit_indexes`
     /// cannot mark it, and `dealloc_typed_items_block` on the outgoing

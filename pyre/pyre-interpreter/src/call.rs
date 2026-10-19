@@ -1997,13 +1997,15 @@ fn arguments_from_call_kw(
 ) -> Result<crate::argument::Arguments, crate::PyError> {
     let nargs = positional.len();
     let _roots = pyre_object::gc_roots::push_roots();
-    // Packing reads the names tuple and can collect; keep the callable live.
-    let _ = pyre_object::gc_roots::pin_root(w_function);
-    let first_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(self_or_null);
-    let kw_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(kwarg_names);
-    let pos_base = pyre_object::gc_roots::pin_roots(positional);
+    // Packing reads the names tuple and can collect. Per-word `publish`
+    // then one `normalize_roots`: a slice literal of the four words is
+    // not the form this look-inside body already uses
+    // (`call_function_impl_result`). `shadowstack.py` `push_roots`.
+    let fn_slot = pyre_object::gc_roots::publish_roots(&[w_function]);
+    let first_slot = pyre_object::gc_roots::publish_roots(&[self_or_null]);
+    let kw_slot = pyre_object::gc_roots::publish_roots(&[kwarg_names]);
+    let pos_base = pyre_object::gc_roots::publish_roots(positional);
+    pyre_object::gc_roots::normalize_roots(fn_slot, 3 + nargs);
 
     let kwnames = pyre_object::gc_roots::shadow_stack_get(kw_slot);
     let nkw = if !kwnames.is_null() && unsafe { pyre_object::is_tuple(kwnames) } {
@@ -2091,10 +2093,15 @@ fn pin_funcrun_argument_vecs(
     let nargs = args.arguments_w.len();
     let names_is_some = args.keyword_names_w.is_some();
     let nkw = crate::argument::arguments_keyword_count(args);
-    let args_base = pyre_object::gc_roots::pin_roots(&args.arguments_w);
-    let names_base =
-        pyre_object::gc_roots::pin_roots(args.keyword_names_w.as_deref().unwrap_or(&[]));
-    let values_base = pyre_object::gc_roots::pin_roots(args.keywords_w.as_deref().unwrap_or(&[]));
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    // Three slices, one run: `pin_roots` per slice would query after the
+    // positionals and leave the keyword words invisible (`shadowstack.py`
+    // `push_roots`).
+    let args_base = pyre_object::gc_roots::publish_roots(&args.arguments_w);
+    let names_base = pyre_object::gc_roots::publish_roots(names);
+    let values_base = pyre_object::gc_roots::publish_roots(values);
+    pyre_object::gc_roots::normalize_roots(args_base, nargs + names.len() + values.len());
     (
         nargs,
         nkw,
@@ -2185,15 +2192,19 @@ fn parse_into_fresh_frame(
     w_kw_defs: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = crate::argument::pin_root_gcarray(args.arguments_w_gc);
-    let _ = crate::argument::pin_root_gcarray(args.keyword_names_w_gc);
-    let _ = crate::argument::pin_root_gcarray(args.keywords_w_gc);
-    let first_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_firstarg);
-    let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_kw_defs);
+    let args_gc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::publish_roots(&[
+        args.arguments_w_gc as PyObjectRef,
+        args.keyword_names_w_gc as PyObjectRef,
+        args.keywords_w_gc as PyObjectRef,
+    ]);
+    let first_slot = pyre_object::gc_roots::publish_roots(&[w_firstarg]);
+    let kw_defs_slot = pyre_object::gc_roots::publish_roots(&[w_kw_defs]);
     let ndef = defaults_w.len();
-    let defaults_base = pyre_object::gc_roots::pin_roots(defaults_w);
+    let defaults_base = pyre_object::gc_roots::publish_roots(defaults_w);
+    let frame_ptr = frame as *mut PyFrame;
+    let frame_slot = pyre_object::gc_roots::publish_roots(&[frame_ptr as PyObjectRef]);
+    pyre_object::gc_roots::normalize_roots(args_gc_slot, 6 + ndef);
     let scopelen = signature.scope_length();
     let mut scope_w: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; scopelen];
     let defaults_w: Vec<PyObjectRef> = (0..ndef)
@@ -2209,9 +2220,6 @@ fn parse_into_fresh_frame(
     // names it sits on `hint(frame, access_directly=True,
     // fresh_virtualizable=True)` so `jtransform.py
     // is_virtualizable_getset` does not put it in `vable_array_vars`.
-    let frame_ptr = frame as *mut PyFrame;
-    let frame_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
     let locals_slot = {
         let frame =
             unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame) };
@@ -2275,10 +2283,10 @@ pub(crate) fn funcrun_obj(
     args: &crate::argument::Arguments,
 ) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
-    let func_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(func);
-    let first_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_firstarg);
+    // Publish `func` / `w_firstarg` before `pin_funcrun_argument_vecs`
+    // normalizes the argument slices (`shadowstack.py` `push_roots`).
+    let func_slot = pyre_object::gc_roots::publish_roots(&[func]);
+    let first_slot = pyre_object::gc_roots::publish_roots(&[w_firstarg]);
     let (
         nargs,
         nkw,
@@ -2289,6 +2297,7 @@ pub(crate) fn funcrun_obj(
         methodcall,
         names_is_some,
     ) = pin_funcrun_argument_vecs(args);
+    pyre_object::gc_roots::normalize_roots(func_slot, 2);
 
     let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
     let code = unsafe { crate::getcode(func_now) };
@@ -2421,9 +2430,19 @@ pub fn call_kw(
         kwarg_names,
         pyre_object::gc_roots::shadow_stack_get(callable_slot),
     )?;
-    let _ = crate::argument::pin_root_gcarray(args.arguments_w_gc);
-    let _ = crate::argument::pin_root_gcarray(args.keyword_names_w_gc);
-    let _ = crate::argument::pin_root_gcarray(args.keywords_w_gc);
+    let gc_base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::publish_roots(&[
+        args.arguments_w_gc as PyObjectRef,
+        args.keyword_names_w_gc as PyObjectRef,
+        args.keywords_w_gc as PyObjectRef,
+    ]);
+    pyre_object::gc_roots::normalize_roots(gc_base, 3);
+    args.arguments_w_gc =
+        pyre_object::gc_roots::shadow_stack_get(gc_base) as *mut pyre_object::FixedObjectArray;
+    args.keyword_names_w_gc =
+        pyre_object::gc_roots::shadow_stack_get(gc_base + 1) as *mut pyre_object::FixedObjectArray;
+    args.keywords_w_gc =
+        pyre_object::gc_roots::shadow_stack_get(gc_base + 2) as *mut pyre_object::FixedObjectArray;
     let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     // `pyopcode.py CALL_FUNCTION_KW`: `function.is_builtin_code(w_function)`
     // unwraps a `_Method` before testing its code, so `'a-b'.split(sep='-')`
@@ -2460,15 +2479,25 @@ pub fn call_kw_in_ctx(
     let _roots = pyre_object::gc_roots::push_roots();
     let callable_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(callable);
-    let args = arguments_from_call_kw(
+    let mut args = arguments_from_call_kw(
         self_or_null,
         positional,
         kwarg_names,
         pyre_object::gc_roots::shadow_stack_get(callable_slot),
     )?;
-    let _ = crate::argument::pin_root_gcarray(args.arguments_w_gc);
-    let _ = crate::argument::pin_root_gcarray(args.keyword_names_w_gc);
-    let _ = crate::argument::pin_root_gcarray(args.keywords_w_gc);
+    let gc_base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::publish_roots(&[
+        args.arguments_w_gc as PyObjectRef,
+        args.keyword_names_w_gc as PyObjectRef,
+        args.keywords_w_gc as PyObjectRef,
+    ]);
+    pyre_object::gc_roots::normalize_roots(gc_base, 3);
+    args.arguments_w_gc =
+        pyre_object::gc_roots::shadow_stack_get(gc_base) as *mut pyre_object::FixedObjectArray;
+    args.keyword_names_w_gc =
+        pyre_object::gc_roots::shadow_stack_get(gc_base + 1) as *mut pyre_object::FixedObjectArray;
+    args.keywords_w_gc =
+        pyre_object::gc_roots::shadow_stack_get(gc_base + 2) as *mut pyre_object::FixedObjectArray;
     crate::baseobjspace::call_args(
         pyre_object::gc_roots::shadow_stack_get(callable_slot),
         &args,
@@ -4269,7 +4298,7 @@ fn call_with_minted_keyword_names(
 /// Residual: the flatten arm of `call_args` would otherwise walk an
 /// unregistered `FunctionPath`.
 #[majit_macros::dont_look_inside]
-fn call_with_kwargs_in_ctx_impl(
+pub(crate) fn call_with_kwargs_in_ctx_impl(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     pos_args: &[PyObjectRef],

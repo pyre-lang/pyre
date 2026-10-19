@@ -101,12 +101,6 @@ fn classify_call(
     let segments: Vec<&str> = path.split("::").collect();
     let leaf = *segments.last()?;
     if !segments.contains(&super::ROOT_SCOPE_MODULE) {
-        // Typed pin of a GcArray (SomeList). `pin_root` takes PyObjectRef;
-        // a List→PyObject cast at the look-inside caller is
-        // `__cast_instance_intrinsic` and Skips the body.
-        if leaf == "pin_root_gcarray" {
-            return Some((Leaf::Pin, false));
-        }
         return None;
     }
     let names_type = |ty: &majit_charon_reader::ullbc::TyRef, name: &str| {
@@ -1883,16 +1877,13 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             },
             Ok(TermKind::Return) => {
                 if depth != 0 {
-                    // 10.04 `Drop` of the guard lives in an `is_cleanup`
-                    // block. `FunDecl::unstructured` keeps those blocks, so
-                    // `UnwindResume` is among them and a later
-                    // `UnwindTerminate` can be last. Return is then the
-                    // normal closer.
-                    if body
-                        .body
-                        .iter()
-                        .any(|bb| matches!(bb.term_ref(llbc), Ok(TermKind::UnwindResume)))
-                    {
+                    // `Drop` of a RootScope guard lives in an `is_cleanup`
+                    // block, so Return is the normal closer while
+                    // `Leaf::Open` is still open on this path. Forgive
+                    // leftover slots only then. A body that published
+                    // without its own open bracket (publish then return;
+                    // UnwindResume from a slice temporary) is refused.
+                    if open != 0 {
                         depth = 0;
                     } else {
                         return Err("returns-with-published-slots");
@@ -5108,10 +5099,9 @@ mod tests {
         );
     }
 
-    /// `Drop` of the guard lives in an `is_cleanup` block. `unstructured`
-    /// keeps those blocks, so a later `UnwindTerminate` can be last while
-    /// `UnwindResume` remains in the body. Return with published slots is
-    /// accepted when a retained block is `UnwindResume`.
+    /// `Drop` of the guard lives in an `is_cleanup` block. Return with
+    /// published slots is accepted when a `Leaf::Open` bracket opened in
+    /// this body is still open on the Return path.
     #[test]
     fn analyze_accepts_return_with_slots_when_unwind_resume_is_not_last() {
         let llbc = stack_ops_llbc();
@@ -5133,22 +5123,46 @@ mod tests {
         }
     }
 
+    /// Publish one slot with no `Leaf::Open`. UnwindResume from a slice
+    /// temporary must not forgive leftover depth at Return.
+    #[test]
+    fn analyze_refuses_return_with_published_slots_without_open_bracket() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            2,
+            vec![
+                bb(call_fun(4, vec![copy(0)], 1, 1)),
+                bb(json!("Return")),
+                bb_cleanup(json!("UnwindResume")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("returns-with-published-slots") => {}
+            Ok(Some(_)) => panic!("expected returns-with-published-slots, got accepted"),
+            Ok(None) => panic!("expected returns-with-published-slots, got no bracket"),
+            Err(reason) => panic!("expected returns-with-published-slots, got {reason}"),
+        }
+    }
+
     /// `pin_self`: pin, `len - 1`, return that index. The return place is
-    /// the Index special; erase would strip its assignment. Last block is
-    /// `UnwindResume` so the cleanup-drop depth hack does not refuse first.
+    /// the Index special; erase would strip its assignment. Open is still
+    /// live on the Return path so leftover depth is forgiven and the
+    /// slot-index check is what refuses.
     #[test]
     fn analyze_refuses_returning_the_len_minus_one_slot_index() {
         let llbc = stack_ops_llbc();
         let copy = |i| json!({"Copy": place(i)});
         let body = body_of(
-            4,
+            5,
             vec![
-                bb(call_fun(4, vec![copy(1)], 2, 1)),
-                bb(call_fun(3, vec![], 3, 2)),
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(4, vec![copy(1)], 3, 2)),
+                bb(call_fun(3, vec![], 4, 3)),
                 bb_stmts(
                     vec![assign_local(
                         0,
-                        json!({"BinaryOp": [json!("Sub"), copy(3), usize_lit(1)]}),
+                        json!({"BinaryOp": [json!("Sub"), copy(4), usize_lit(1)]}),
                     )],
                     json!("Return"),
                 ),

@@ -82,6 +82,18 @@ def a_duplicate_keyword_is_still_a_type_error():
         raise AssertionError("expected TypeError")
 
 
+def two_starstar_mappings_reject_a_duplicate_key():
+    def f(**kw):
+        return kw
+
+    try:
+        f(**{"k": 1}, **{"k": 2})
+    except TypeError as exc:
+        assert "got multiple values for keyword argument 'k'" in str(exc), str(exc)
+    else:
+        raise AssertionError("expected TypeError")
+
+
 def every_dispatch_arm_keeps_the_key():
     # The call surface reaches a callee through several arms, and each one
     # rebuilds its argument view before forwarding.  An arm that carries the
@@ -140,6 +152,56 @@ def every_dispatch_arm_keeps_the_key():
     ]
     for name, call in arms:
         assert types_of(call()) == [S], (name, types_of(call()))
+
+
+def a_callable_instance_receives_the_mapping_key():
+    class S(str):
+        pass
+
+    class C:
+        def __call__(self, **kw):
+            return [(type(k).__name__, k) for k in kw]
+
+    key = S("a")
+    got = C()(**{key: 1})
+    assert got == [("S", key)], got
+    assert type(got[0][1]) is S, type(got[0][1])
+    assert got[0][1] is key
+    assert hash(got[0][1]) == hash(key)
+
+
+def a_missing_starstar_mapping_key_is_the_same_object():
+    # argument.py `_do_combine_starstarargs_wrapped` looks the name up
+    # with `space.getitem` / `dict.__getitem__`, so a miss is KeyError
+    # whose args[0] is that key object.  3.14 CALL_FUNCTION_EX
+    # `format_kwargs_error` rewrites the same KeyError as TypeError
+    # "got multiple values for keyword argument".
+    key = S("missing")
+
+    class Mapping:
+        def keys(self):
+            return [key]
+
+        def __iter__(self):
+            return iter([key])
+
+        def __getitem__(self, k):
+            raise KeyError(k)
+
+    def f(**kw):
+        return kw
+
+    try:
+        f(**Mapping())
+    except KeyError as exc:
+        assert len(exc.args) >= 1, exc.args
+        assert exc.args[0] is key, (exc.args[0], key)
+        assert type(exc.args[0]) is S, type(exc.args[0])
+    except TypeError as exc:
+        assert "got multiple values for keyword argument" in str(exc), str(exc)
+        assert "missing" in str(exc), str(exc)
+    else:
+        raise AssertionError("expected KeyError or TypeError")
 
 
 K = "no_such_keyword"
@@ -277,7 +339,10 @@ the_keys_survive_a_sort()
 a_literal_keyword_is_an_exact_str()
 an_unknown_keyword_names_the_key_it_was_given()
 a_duplicate_keyword_is_still_a_type_error()
+two_starstar_mappings_reject_a_duplicate_key()
 every_dispatch_arm_keeps_the_key()
+a_callable_instance_receives_the_mapping_key()
+a_missing_starstar_mapping_key_is_the_same_object()
 sum_rejects_an_unknown_keyword()
 round_rejects_an_unknown_keyword()
 pow_rejects_an_unknown_keyword()
