@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=12.9
-# dynasm 3.3-4.5x, cranelift 5.0-6.4x; the ceiling is twice the slower,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=8
+# Native CI readings span 2.5x (macos dynasm, run 39064955611) to 6.9x (ubuntu
+# cranelift); the ceiling is 15% over the widest, so its derived floor 2.0
+# sits under the fastest.
 # Deep operand-stack Variables kept across a short-circuit guard, pure and
 # mutating.
 #

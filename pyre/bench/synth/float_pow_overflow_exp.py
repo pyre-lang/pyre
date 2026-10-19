@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=12
+# pyre-check: max-pypy-ratio=6
+# Native CI readings span 1.8x (windows dynasm) to 3.0x (ubuntu cranelift), so
+# the ceiling is 6 and its derived floor 1.5 sits under the fastest of them.
 # A float or complex power coerces each int operand to a double first, so an
 # over-range int base or exponent raises OverflowError up front (even
 # `1.0 ** huge`, which never reaches the arithmetic), matching float(huge).

@@ -188,6 +188,67 @@ impl W_UnicodeObject {
     pub fn eq_w(&self, w_other: &W_UnicodeObject) -> bool {
         crate::lowlevel_string::jit_ll_streq(self.value, w_other.value) != 0
     }
+
+    /// `unicodeobject.py W_UnicodeObject.is_w`, past its `isinstance`,
+    /// `self is w_other` and `user_overridden_class` checks, which the caller
+    /// makes: they read the static type objects, which the rtyper does not
+    /// lower, and a graph it declines types `self._utf8` as a plain
+    /// `GcRef`, so `_handle_stroruni_call` would not see a `STR` operand.
+    /// Strings longer than one code point compare `_utf8` storage identity
+    /// (`s1 is s2`; AsciiListStrategy re-wraps that same storage), shorter
+    /// ones are unique-ified and compare by value (`s1 == s2`, `ll_streq` on
+    /// the two `STR`s).
+    #[inline]
+    pub fn is_w(&self, w_other: &W_UnicodeObject) -> bool {
+        let s1 = self.value;
+        let s2 = w_other.value;
+        if self.len > 1 {
+            return std::ptr::eq(s1, s2);
+        }
+        crate::lowlevel_string::jit_ll_streq(s1, s2) != 0
+    }
+
+    /// `unicodeobject.py W_UnicodeObject.descr_eq` past
+    /// `convert_arg_to_w_unicode`, which the caller's `str` type check
+    /// satisfies: `self._utf8 == w_other._utf8`, `ll_streq` on the two
+    /// `STR`s.
+    #[inline]
+    pub fn descr_eq(&self, w_other: &W_UnicodeObject) -> bool {
+        crate::lowlevel_string::jit_ll_streq(self.value, w_other.value) != 0
+    }
+
+    /// `unicodeobject.py W_UnicodeObject.descr_ne`, as [`Self::descr_eq`].
+    #[inline]
+    pub fn descr_ne(&self, w_other: &W_UnicodeObject) -> bool {
+        crate::lowlevel_string::jit_ll_streq(self.value, w_other.value) == 0
+    }
+
+    /// `unicodeobject.py W_UnicodeObject.descr_lt` past
+    /// `convert_arg_to_w_unicode`: `self._utf8 < w_other._utf8`, `ll_strcmp`
+    /// on the two `STR`s. WTF-8 byte order matches code-point order, lone
+    /// surrogates included.
+    #[inline]
+    pub fn descr_lt(&self, w_other: &W_UnicodeObject) -> bool {
+        crate::lowlevel_string::jit_ll_strcmp(self.value, w_other.value) < 0
+    }
+
+    /// `unicodeobject.py W_UnicodeObject.descr_le`, as [`Self::descr_lt`].
+    #[inline]
+    pub fn descr_le(&self, w_other: &W_UnicodeObject) -> bool {
+        crate::lowlevel_string::jit_ll_strcmp(self.value, w_other.value) <= 0
+    }
+
+    /// `unicodeobject.py W_UnicodeObject.descr_gt`, as [`Self::descr_lt`].
+    #[inline]
+    pub fn descr_gt(&self, w_other: &W_UnicodeObject) -> bool {
+        crate::lowlevel_string::jit_ll_strcmp(self.value, w_other.value) > 0
+    }
+
+    /// `unicodeobject.py W_UnicodeObject.descr_ge`, as [`Self::descr_lt`].
+    #[inline]
+    pub fn descr_ge(&self, w_other: &W_UnicodeObject) -> bool {
+        crate::lowlevel_string::jit_ll_strcmp(self.value, w_other.value) >= 0
+    }
 }
 
 /// The translated user-subclass layout selected by `typedef.py _getusercls`.

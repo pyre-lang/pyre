@@ -2955,9 +2955,9 @@ unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
         return Some(true);
     }
     if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
-        let s1 = pyre_object::unicodeobject::w_str_storage(a);
-        let s2 = pyre_object::unicodeobject::w_str_storage(b);
-        return Some(pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0);
+        let a = &*(a as *const pyre_object::unicodeobject::W_UnicodeObject);
+        let b = &*(b as *const pyre_object::unicodeobject::W_UnicodeObject);
+        return Some(a.eq_w(b));
     }
     if is_exact_type(a, &INT_TYPE) && is_exact_type(b, &INT_TYPE) && !is_long(a) && !is_long(b) {
         return Some(w_int_get_value(a) == w_int_get_value(b));
@@ -3023,12 +3023,9 @@ pub(crate) unsafe fn pin_free_builtin_is(a: PyObjectRef, b: PyObjectRef) -> bool
             && bytesobject::w_bytes_getitem(a, 0) == bytesobject::w_bytes_getitem(b, 0);
     }
     if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
-        let s1 = pyre_object::unicodeobject::w_str_storage(a);
-        let s2 = pyre_object::unicodeobject::w_str_storage(b);
-        if pyre_object::unicodeobject::w_str_len(a) > 1 {
-            return std::ptr::eq(s1, s2);
-        }
-        return pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0;
+        let a = &*(a as *const pyre_object::unicodeobject::W_UnicodeObject);
+        let b = &*(b as *const pyre_object::unicodeobject::W_UnicodeObject);
+        return b.is_w(a);
     }
     false
 }
@@ -3056,15 +3053,15 @@ unsafe fn pin_free_builtin_ord(a: PyObjectRef, b: PyObjectRef, op: CompareOp) ->
         return Some(compare_f64(w_float_get_value(a), w_float_get_value(b), op));
     }
     if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
-        let s1 = pyre_object::unicodeobject::w_str_storage(a);
-        let s2 = pyre_object::unicodeobject::w_str_storage(b);
+        let a = &*(a as *const pyre_object::unicodeobject::W_UnicodeObject);
+        let b = &*(b as *const pyre_object::unicodeobject::W_UnicodeObject);
         return Some(match op {
-            CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
-            CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
-            CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
-            CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
-            CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
-            CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
+            CompareOp::Lt => a.descr_lt(b),
+            CompareOp::Le => a.descr_le(b),
+            CompareOp::Gt => a.descr_gt(b),
+            CompareOp::Ge => a.descr_ge(b),
+            CompareOp::Eq => a.descr_eq(b),
+            CompareOp::Ne => a.descr_ne(b),
         });
     }
     if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
@@ -7107,19 +7104,15 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             }));
         }
         if is_str(a) && is_str(b) {
-            // `W_UnicodeObject.descr_eq` / `descr_lt` and their siblings
-            // compare the two `_utf8` payloads, which `rtype_eq` /
-            // `rtype_lt` turn into `ll_streq` / `ll_strcmp` calls. WTF-8
-            // byte order matches code-point order, lone surrogates included.
-            let s1 = pyre_object::unicodeobject::w_str_storage(a);
-            let s2 = pyre_object::unicodeobject::w_str_storage(b);
+            let a = &*(a as *const pyre_object::unicodeobject::W_UnicodeObject);
+            let b = &*(b as *const pyre_object::unicodeobject::W_UnicodeObject);
             return Ok(w_bool_from(match op {
-                CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
-                CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
-                CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
-                CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
-                CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
-                CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
+                CompareOp::Lt => a.descr_lt(b),
+                CompareOp::Le => a.descr_le(b),
+                CompareOp::Gt => a.descr_gt(b),
+                CompareOp::Ge => a.descr_ge(b),
+                CompareOp::Eq => a.descr_eq(b),
+                CompareOp::Ne => a.descr_ne(b),
             }));
         }
     }

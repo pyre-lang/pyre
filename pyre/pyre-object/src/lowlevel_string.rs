@@ -363,13 +363,11 @@ pub extern "C" fn jit_ll_strconcat(
 
 /// `rstr.py LLHelpers.ll_streq` — compare two rstr `STR` payloads.
 ///
-/// `@jit.elidable`.  Upstream also tags it `@jit.oopspec('stroruni.equal(s1,
-/// s2)')`.  The tag stays off here because the direct caller,
-/// `descroperation::compare_slot`, is a legacy-typed graph: its operands are
-/// `OBJECTPTR`, not `Ptr(STR)`, and `_handle_stroruni_call` asserts on that.
-/// A string `==` / `!=` the rtyper types as `Ptr(STR)` still reaches this
-/// helper as `OS_STR_EQUAL` through `jtransform`'s string-equality rewrite.
+/// `@jit.elidable` and `@jit.oopspec('stroruni.equal(s1, s2)')`: the
+/// operands are the `STR` payloads `w_str_storage` reads, so vstring's
+/// `opt_call_stroruni_STR_EQUAL` sees a sliced or constant operand.
 /// Answers 1 / 0 so the result fills a full word.
+#[majit_macros::oopspec("stroruni.equal(s1, s2)")]
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_streq(
     s1: *const crate::unicodeobject::UnicodeValueStorage,

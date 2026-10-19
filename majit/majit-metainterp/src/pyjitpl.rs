@@ -4168,22 +4168,29 @@ impl<M: Clone> MetaInterp<M> {
 
     /// history.py `RefFrontendOp._resref` of one live Box, plus the
     /// transitive `_heapc_deps` stored on that FrontendOp (and on those
-    /// deps). A recorder-sized `Vec<bool>` marks already-walked `_index`
-    /// values so a register extra-area stays bounded to this box's dep DAG.
+    /// deps). The walked `_index` values are marked in a set sized by this
+    /// box's dep DAG, not by the recorder: the register extra-areas call this
+    /// once per live Ref register on every collection, so a recorder-sized
+    /// mark array made each collection while tracing cost
+    /// (live registers) x (trace length).
     pub fn forward_frontend_resref(&self, opref: OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
         let Some(trace_ctx) = self.tracing.as_ref().or(self.compile_tracing.as_ref()) else {
             return;
         };
-        let mut visited = vec![false; trace_ctx.recorder.frontend_visited_len()];
-        let mut live_boxes: Vec<OpRef> = Vec::new();
-        Self::push_frontend_live_box(opref, &mut live_boxes, &mut visited);
+        if opref.is_constant() || opref.is_none() {
+            return;
+        }
+        let mut visited = std::collections::BTreeSet::from([opref.raw()]);
+        let mut live_boxes = vec![opref];
         let mut i = 0;
         while i < live_boxes.len() {
             let op = live_boxes[i];
             i += 1;
             trace_ctx.recorder.forward_concrete_ref(op, visitor);
             for dep in trace_ctx.recorder.heapc_dep_boxes(op) {
-                Self::push_frontend_live_box(dep, &mut live_boxes, &mut visited);
+                if !dep.is_none() && visited.insert(dep.raw()) {
+                    live_boxes.push(dep);
+                }
             }
         }
     }

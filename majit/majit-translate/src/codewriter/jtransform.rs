@@ -9217,7 +9217,7 @@ impl<'a> Transformer<'a> {
             ("stroruni.copy_string_to_raw", StrOrUniKind::Unicode) => OopSpecIndex::UniCopyToRaw,
             // BYTEARRAY → raise NotSupported (jtransform.py).
             (_, StrOrUniKind::ByteArray) => return None,
-            // else: assert 0 (jtransform.py:2077).
+            // else: assert 0 (jtransform.py _handle_stroruni_call).
             (_, StrOrUniKind::Other) => {
                 panic!("args[0].concretetype must be STR or UNICODE")
             }
