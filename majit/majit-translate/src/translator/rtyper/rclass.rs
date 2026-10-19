@@ -62,13 +62,13 @@ thread_local! {
 
 use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::{ClassDefKey, DescEntry};
-use crate::annotator::model::{DescKind, SomePBC, SomeValue};
+use crate::annotator::model::{DescKind, SomeInstance, SomePBC, SomeValue};
 use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
+    self, _ptr, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
@@ -4720,6 +4720,48 @@ pub fn getinstancerepr(
     Ok(result)
 }
 
+/// Whether a high-level instance may be passed as `arg_ty` at an ll
+/// function-pointer call (`cast_instance_to_base_ptr`).
+///
+/// `arg_ty` must be a pointer of the instance's `getgcflavor`. This
+/// annotator-time helper has no rtyper, so the instance's lltype is
+/// the same mapping `fn_ptr_arg_lltype` uses for `FuncType.ARGS`
+/// (`OBJECTPTR` / `NONGCOBJECTPTR`). `lltype.castable` / `cast_pointer`
+/// then accept that `GcStruct` or an ancestor reached through
+/// `_first_struct`. A classdef-less instance is not a cast source.
+pub(crate) fn instance_can_cast_to_fn_ptr_arg(inst: &SomeInstance, arg_ty: &LowLevelType) -> bool {
+    let Some(classdef) = inst.classdef.as_ref() else {
+        return false;
+    };
+    let LowLevelType::Ptr(ptr) = arg_ty else {
+        return false;
+    };
+    let Ok(flavor) = getgcflavor(classdef) else {
+        return false;
+    };
+    let expected_gckind = match flavor {
+        Flavor::Gc => GcKind::Gc,
+        Flavor::Raw => GcKind::Raw,
+    };
+    if ptr._gckind() != expected_gckind {
+        return false;
+    }
+    // `fn_ptr_arg_lltype` fallback: a high-level instance is OBJECTPTR
+    // (gc) or NONGCOBJECTPTR (raw). `castable` walks `_first_struct`
+    // for an ancestor.
+    let inst_lltype = match flavor {
+        Flavor::Gc => &*OBJECTPTR,
+        Flavor::Raw => &*NONGCOBJECTPTR,
+    };
+    if arg_ty == inst_lltype {
+        return true;
+    }
+    let LowLevelType::Ptr(inst_ptr) = inst_lltype else {
+        return false;
+    };
+    matches!(lltype::castable(ptr, inst_ptr), Ok(depth) if depth >= 0)
+}
+
 /// RPython `rtype_new_instance(rtyper, classdef, llops,
 /// classcallhop=None, nonmovable=False)` (rclass.py):
 ///
@@ -4818,21 +4860,9 @@ pub(super) fn pair_instance_instance_convert_from_to(
             (None, None) => true,
             _ => false,
         };
-    let same_struct = match (&r_ins1.classdef, &r_ins2.classdef) {
-        (Some(c1), Some(c2)) => {
-            crate::annotator::model::same_struct_identity(&c1.borrow().name, &c2.borrow().name)
-        }
-        _ => false,
-    };
     // Upstream's two arms (upcast to parent / downcast after a
     // successful isinstance check) both emit the same cast_pointer.
-    // Two frontend spellings of one struct (`Arguments` vs
-    // `argument::Arguments`) have no shared `basedef` Rc; they are
-    // still one type, so the same cast is identity.
-    if classdef_eq(&basedef, &r_ins2.classdef)
-        || classdef_eq(&basedef, &r_ins1.classdef)
-        || same_struct
-    {
+    if classdef_eq(&basedef, &r_ins2.classdef) || classdef_eq(&basedef, &r_ins1.classdef) {
         return Ok(llops
             .genop(
                 "cast_pointer",
@@ -5126,6 +5156,48 @@ mod tests {
         };
         assert_eq!(conflict.message, "conflict");
         let _missing_marker = _missing.clone();
+    }
+
+    #[test]
+    fn instance_can_cast_to_fn_ptr_arg_rejects_unrelated_classes_sharing_a_shortname() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::classdesc::ClassDesc;
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::SomeInstance;
+        use crate::flowspace::model::HostObject;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let classdef = |name: &str| {
+            let host = HostObject::new_class(name, vec![]);
+            let entry = ann.bookkeeper.getdesc(&host).unwrap();
+            let DescEntry::Class(class_rc) = &entry else {
+                panic!("expected Class desc for {name}");
+            };
+            ClassDesc::getuniqueclassdef(class_rc).unwrap()
+        };
+        let classdef_a = classdef("pkg1.SameShort");
+        let classdef_b = classdef("pkg2.SameShort");
+        assert_eq!(classdef_a.borrow().shortname, "SameShort");
+        assert_eq!(classdef_b.borrow().shortname, "SameShort");
+        assert_ne!(classdef_a.borrow().name, classdef_b.borrow().name);
+
+        let inst_a = SomeInstance::new(Some(classdef_a), false, Default::default());
+        let inst_b = SomeInstance::new(Some(classdef_b), false, Default::default());
+        let same_short = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("SameShort", vec![])),
+        }));
+        assert!(
+            !instance_can_cast_to_fn_ptr_arg(&inst_a, &same_short),
+            "pkg1.SameShort must not cast to a GcStruct named only by the shared shortname"
+        );
+        assert!(
+            !instance_can_cast_to_fn_ptr_arg(&inst_b, &same_short),
+            "pkg2.SameShort must not cast to a GcStruct named only by the shared shortname"
+        );
+        assert!(
+            instance_can_cast_to_fn_ptr_arg(&inst_a, &OBJECTPTR),
+            "annotator-time ARGS mapping is still OBJECTPTR"
+        );
     }
 
     #[test]
@@ -7726,45 +7798,5 @@ mod tests {
         .expect("conversion does not error");
         assert!(converted.is_none());
         assert!(llops.ops.is_empty());
-    }
-
-    /// Bare-leaf vs `module::Leaf` of one struct convert by `cast_pointer`.
-    /// `same_struct_identity` unifies the spellings at annotation union
-    /// time; rtype convert must emit the same identity cast when the two
-    /// ClassDefs never shared an Rc (`Arguments` vs `argument::Arguments`).
-    #[test]
-    fn instance_repr_convert_same_struct_spellings_is_cast_pointer() {
-        use crate::annotator::annrpython::RPythonAnnotator;
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        rtyper
-            .initialize_exceptiondata()
-            .expect("initialize_exceptiondata");
-        let bare = ClassDef::new_standalone("Arguments", None);
-        let qualified = ClassDef::new_standalone("argument::Arguments", None);
-        let r_bare = getinstancerepr(&rtyper, Some(&bare), Flavor::Gc).expect("bare");
-        let r_qual = getinstancerepr(&rtyper, Some(&qualified), Flavor::Gc).expect("qualified");
-        Repr::setup(r_bare.as_ref()).expect("setup bare");
-        Repr::setup(r_qual.as_ref()).expect("setup qualified");
-        let v = Variable::new();
-        v.set_concretetype(Some(r_bare.lowleveltype().clone()));
-        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-        let converted = super::super::pairtype::pair_convert_from_to(
-            r_bare.as_ref(),
-            r_qual.as_ref(),
-            &Hlvalue::Variable(v),
-            &mut llops,
-        )
-        .expect("conversion does not error")
-        .expect("same-struct spellings convert");
-        assert_eq!(llops.ops.len(), 1);
-        assert_eq!(llops.ops[0].opname, "cast_pointer");
-        let Hlvalue::Variable(v_converted) = converted else {
-            panic!("cast_pointer yields a Variable");
-        };
-        assert_eq!(
-            v_converted.concretetype().as_ref(),
-            Some(r_qual.lowleveltype())
-        );
     }
 }

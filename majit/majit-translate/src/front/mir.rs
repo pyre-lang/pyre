@@ -4659,6 +4659,28 @@ fn tombstoned_owner_spelling(
     }
 }
 
+/// Intern spelling of a type declaration path.
+///
+/// A withdrawn leaf (`harden_duplicate_leaf_metadata` emptied its origin)
+/// paints the crate-stripped path, so intern matches the constructor's
+/// crate-relative key (`synthetic_transparent_ctor_owner`) instead of
+/// minting a second ClassDef from the bare token. Unique leaves stay the
+/// leaf: Input.class_root and cast constants are compared as those
+/// tokens (`== Some("PyObject")`). Disambiguate a colliding leaf by that
+/// path, never by leaf name alone (`bookkeeper.py` keys the live class
+/// object).
+fn class_root_from_name_path(
+    name_path: &str,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    let leaf = name_path.rsplit("::").next().unwrap_or(name_path);
+    if tombstoned.contains(leaf) {
+        tombstoned_owner_spelling(name_path, leaf, tombstoned)
+    } else {
+        leaf.to_string()
+    }
+}
+
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
 pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
     DuplicateLeafFacts::discover(llbc).tombstoned_leaves()
@@ -5422,6 +5444,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             &fd.signature.output,
             llbc,
             static_addrs.error_carrier,
+            tombstoned_leaves,
         );
         lo.graph.return_is_str =
             dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);
@@ -22520,17 +22543,12 @@ impl<'a> Lowering<'a> {
         // capture must key the full crate-stripped path the registry
         // kept — the same spelling [`tyref_input_class_root`] uses for
         // the env parameter.
-        // A tombstoned leaf uses the same spelling as
-        // [`adt_node_class_root_with`]: the crate-stripped path, or the
-        // full declaration path when stripping yields the leaf itself.
+        // Owner intern is [`class_root_from_name_path`]: a withdrawn
+        // leaf paints the crate-stripped path, otherwise the leaf.
         let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
             strip_crate_prefix(&name_path)
         } else {
-            let owner_base = if self.tombstoned_leaves.contains(&owner_leaf) {
-                tombstoned_owner_spelling(&name_path, &owner_leaf, self.tombstoned_leaves)
-            } else {
-                owner_leaf
-            };
+            let owner_base = class_root_from_name_path(&name_path, self.tombstoned_leaves);
             match adt_head_instantiation_suffix(head, self.llbc) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
                 None => match struct_instantiation_suffix(&name_path, head, self.llbc) {
@@ -64231,11 +64249,16 @@ fn dont_look_inside_return_token(
 /// mints.  Only instantiations whose type arguments are all by-value ADTs
 /// qualify: a reference, raw-pointer or `Box` argument can make the enum a
 /// null-niche pointer, which has no enum class.  A named struct keys as its
-/// class root.  `None` otherwise.
+/// class root — the same intern spelling [`class_root_from_name_path`]
+/// paints, so a residual `prepend` of a withdrawn leaf (`Arguments`)
+/// intern's the crate-relative path and unique-graph `mergeinputargs`
+/// meets the constructor (`annrpython.py` `mergeinputargs`).  `None`
+/// otherwise.
 fn dont_look_inside_return_class_root(
     output: &TyRef,
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
         crate::front::result_exc::tyref_result_ok(output, llbc)
@@ -64247,14 +64270,14 @@ fn dont_look_inside_return_class_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let type_args = adt
         .get("generics")
         .and_then(|g| g.get("types"))
         .and_then(serde_json::Value::as_array)?;
     if type_args.is_empty() {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let by_value_args = type_args.iter().all(|arg| {
         strip_ty_indirections(arg, llbc).is_some_and(|arg| {
@@ -66115,7 +66138,7 @@ fn adt_node_class_root_leaf(
         // (`bookkeeper.py` `getuniqueclassdef(cls)`).
         return None;
     }
-    let mut leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    let leaf = class_root_from_name_path(&name, tombstoned);
     // `harden_duplicate_leaf_metadata` clears the origin of a leaf shared
     // by two declarations (`eval::Code` and `module::struct::Code`). The
     // bare token then canonicalises to itself and matches no field row, so
@@ -66126,9 +66149,6 @@ fn adt_node_class_root_leaf(
     // A crate-root declaration (`crate::Code`) strips to the leaf itself.
     // The stripped spelling is the withdrawn token, so paint the full
     // declaration path — the same spelling the constructor joins.
-    if tombstoned.contains(&leaf) {
-        leaf = tombstoned_owner_spelling(&name, &leaf, tombstoned);
-    }
     // A reference-payload workspace enum instantiation projects to a
     // per-instantiation base class (`Result<Tuple>`) so its variant
     // payloads do not union across instantiations.  The discriminant
@@ -89701,6 +89721,151 @@ mod tests {
             super::tyref_to_value_type(&opcode_ty, &llbc),
             ValueType::Ref(Some("Opcode".to_string())),
             "a leaf harden did not clear keeps its bare intern key"
+        );
+    }
+
+    /// `argument::Arguments` and `nodes::Arguments` share a leaf, so
+    /// `harden_duplicate_leaf_metadata` empties the origin. Intern paint
+    /// then uses the crate-stripped path (`class_root_from_name_path`)
+    /// instead of minting a second ClassDef from the bare token beside
+    /// the constructor's crate-relative key. Unique leaves stay the leaf.
+    /// Field type strings stay the leaf so layout keys such as
+    /// `*mut PyObject` keep matching.
+    #[test]
+    fn colliding_arguments_paints_crate_relative_identity() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |segs: &[&str]| {
+            serde_json::json!({
+                "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let adt = |def_id: u64, hash: u64| {
+            serde_json::json!({"Value": [hash, {
+                "Adt": {
+                    "id": def_id,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }]})
+        };
+        let field = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "ty": {"Scalar": "Bool"},
+                "attr_info": null
+            })
+        };
+        let interpreter_args = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["pyre_interpreter", "argument", "Arguments"]),
+            "kind": {"Struct": [field("arguments_w")]}
+        });
+        let ruff_args = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["ruff_python_ast", "nodes", "Arguments"]),
+            "kind": {"Struct": [field("range")]}
+        });
+        let opcode = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "Opcode"]),
+            "kind": {"Struct": [field("code")]}
+        });
+        let string = serde_json::json!({
+            "def_id": 3,
+            "item_meta": item_meta(&["alloc", "string", "String"]),
+            "kind": {"Struct": [field("vec")]}
+        });
+        let object_root = serde_json::json!({
+            "def_id": 4,
+            "item_meta": item_meta(&["pyre_object", "pyobject", "PyObject"]),
+            "kind": {"Struct": [field("ob_type")]}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "pyre_interpreter",
+                "type_decls": [interpreter_args, ruff_args, opcode, string, object_root],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let interp_ty = serde_json::from_value::<TyRef>(adt(0, 40)).expect("interpreter Arguments");
+        let ruff_ty = serde_json::from_value::<TyRef>(adt(1, 41)).expect("ruff Arguments");
+        let opcode_ty = serde_json::from_value::<TyRef>(adt(2, 42)).expect("Opcode");
+        let string_ty = serde_json::from_value::<TyRef>(adt(3, 43)).expect("String");
+        let object_ty = serde_json::from_value::<TyRef>(adt(4, 44)).expect("PyObject");
+        let tombstoned = super::tombstoned_leaves_of(&llbc);
+        assert!(tombstoned.contains("Arguments"));
+        assert_eq!(
+            super::tyref_class_root_with(&interp_ty, &llbc, &tombstoned).as_deref(),
+            Some("argument::Arguments")
+        );
+        assert_eq!(
+            super::tyref_class_root_with(&ruff_ty, &llbc, &tombstoned).as_deref(),
+            Some("nodes::Arguments")
+        );
+        assert_eq!(super::tyref_to_ast_string(&interp_ty, &llbc), "Arguments");
+        assert_eq!(super::tyref_to_ast_string(&ruff_ty, &llbc), "Arguments");
+        assert_eq!(
+            super::tyref_class_root(&opcode_ty, &llbc).as_deref(),
+            Some("Opcode"),
+            "a unique two-segment type keeps the leaf intern key"
+        );
+        assert_eq!(
+            super::tyref_class_root(&string_ty, &llbc).as_deref(),
+            Some("String")
+        );
+        assert_eq!(super::tyref_to_ast_string(&string_ty, &llbc), "String");
+        assert_eq!(
+            super::tyref_class_root(&object_ty, &llbc).as_deref(),
+            Some("PyObject"),
+            "a unique three-segment type keeps the leaf intern key"
+        );
+        assert_eq!(super::tyref_to_ast_string(&object_ty, &llbc), "PyObject");
+        assert_eq!(
+            super::dont_look_inside_return_class_root(
+                &interp_ty,
+                &llbc,
+                crate::ErrorCarrierSpec::default(),
+                &tombstoned
+            )
+            .as_deref(),
+            Some("argument::Arguments"),
+            "a residual returning Arguments intern's the crate-relative path"
+        );
+        assert_eq!(
+            super::dont_look_inside_return_class_root(
+                &object_ty,
+                &llbc,
+                crate::ErrorCarrierSpec::default(),
+                &tombstoned
+            )
+            .as_deref(),
+            Some("PyObject"),
+            "a unique residual return keeps the leaf intern key"
         );
     }
 

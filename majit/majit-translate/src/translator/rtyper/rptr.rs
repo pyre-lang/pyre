@@ -5,9 +5,13 @@
 //! import/file path so ports can refer to `rtyper::rptr::PtrRepr` and
 //! related symbols by their original RPython home.
 
-use crate::flowspace::model::{ConstValue, Hlvalue};
+use crate::annotator::model::SomeValue;
+use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::rclass::{
+    Flavor, NONGCOBJECTPTR, OBJECTPTR, getinstancerepr, instance_can_cast_to_fn_ptr_arg,
+};
 use crate::translator::rtyper::rmodel::{RTypeResult, ptr_target_func};
 use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp};
 
@@ -26,17 +30,35 @@ pub use crate::translator::rtyper::rmodel::{InteriorPtrRepr, LLADTMethRepr, PtrR
 /// the pointer names a graph). Otherwise the hop is `indirect_call` with
 /// a trailing `inputconst(Void, None)` — no known graphs — after
 /// `hop.exception_is_here()`. The result type is `FUNC.RESULT`.
+///
+/// Upstream converts with `hop.inputargs(*hop.args_r)` because the
+/// caller already emitted `cast_instance_to_base_ptr`. A matching
+/// `SomeInstance` at this hop is converted to `FUNC.ARGS` here
+/// (`cast_pointer` / identity), the same values `hop.inputargs(*ARGS)`
+/// would produce.
 pub(crate) fn rtype_simple_call(r: &PtrRepr, hop: &HighLevelOp) -> RTypeResult {
     let func_type = ptr_target_func(&r.ptrtype().TO).ok_or_else(|| {
         TyperError::message(format!("calling a non-function {:?}", r.ptrtype().TO))
     })?;
     let args_r = hop.args_r.borrow().clone();
+    let args_s = hop.args_s.borrow().clone();
     let mut vlist = Vec::with_capacity(args_r.len() + 1);
     for (i, r_arg) in args_r.iter().enumerate() {
         let r_arg = r_arg
             .as_ref()
             .ok_or_else(|| TyperError::message("PtrRepr.rtype_simple_call missing arg repr"))?;
-        vlist.push(hop.inputarg(r_arg, i)?);
+        if i == 0 {
+            vlist.push(hop.inputarg(r_arg, i)?);
+            continue;
+        }
+        let arg_ty = func_type.args.get(i - 1);
+        vlist.push(inputarg_as_functype_arg(
+            hop,
+            i,
+            r_arg.as_ref(),
+            args_s.get(i),
+            arg_ty,
+        )?);
     }
     let nexpected = func_type.args.len();
     let nactual = vlist.len().saturating_sub(1);
@@ -64,6 +86,71 @@ pub(crate) fn rtype_simple_call(r: &PtrRepr, hop: &HighLevelOp) -> RTypeResult {
     Ok(hop.genop(opname, vlist, GenopResult::LLType(func_type.result.clone())))
 }
 
+fn inputarg_as_functype_arg(
+    hop: &HighLevelOp,
+    i: usize,
+    src_r: &dyn Repr,
+    s_arg: Option<&SomeValue>,
+    arg_ty: Option<&LowLevelType>,
+) -> Result<Hlvalue, TyperError> {
+    let Some(arg_ty) = arg_ty else {
+        return hop.inputarg(src_r, i);
+    };
+    if let Some(SomeValue::Instance(inst)) = s_arg {
+        if instance_can_cast_to_fn_ptr_arg(inst, arg_ty) {
+            return convert_instance_to_fn_ptr_arg(hop, i, src_r, arg_ty);
+        }
+        if inst.classdef.is_none() && is_gc_ptr(arg_ty) {
+            if src_r.lowleveltype() == arg_ty {
+                return hop.inputarg(src_r, i);
+            }
+            return fn_ptr_null_arg(arg_ty);
+        }
+    }
+    if matches!(s_arg, Some(SomeValue::None_(_))) && matches!(arg_ty, LowLevelType::Ptr(_)) {
+        return fn_ptr_null_arg(arg_ty);
+    }
+    hop.inputarg(src_r, i)
+}
+
+fn convert_instance_to_fn_ptr_arg(
+    hop: &HighLevelOp,
+    i: usize,
+    src_r: &dyn Repr,
+    arg_ty: &LowLevelType,
+) -> Result<Hlvalue, TyperError> {
+    if src_r.lowleveltype() == arg_ty {
+        return hop.inputarg(src_r, i);
+    }
+    if *arg_ty == *OBJECTPTR {
+        let r_obj = getinstancerepr(&hop.rtyper, None, Flavor::Gc)?;
+        return hop.inputarg(&*r_obj, i);
+    }
+    if *arg_ty == *NONGCOBJECTPTR {
+        let r_obj = getinstancerepr(&hop.rtyper, None, Flavor::Raw)?;
+        return hop.inputarg(&*r_obj, i);
+    }
+    let v = hop.inputarg(src_r, i)?;
+    hop.genop("cast_pointer", vec![v], GenopResult::LLType(arg_ty.clone()))
+        .ok_or_else(|| TyperError::message("cast_pointer for ll function pointer argument"))
+}
+
+fn fn_ptr_null_arg(arg_ty: &LowLevelType) -> Result<Hlvalue, TyperError> {
+    let LowLevelType::Ptr(ptr) = arg_ty else {
+        return Err(TyperError::message(
+            "fn-ptr s_None argument requires a Ptr ARGS slot",
+        ));
+    };
+    Ok(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::LLPtr(Box::new(ptr._defl())),
+        arg_ty.clone(),
+    )))
+}
+
+fn is_gc_ptr(ty: &LowLevelType) -> bool {
+    matches!(ty, LowLevelType::Ptr(p) if p._needsgc())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,9 +160,12 @@ mod tests {
 
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::bookkeeper::Bookkeeper;
-    use crate::annotator::model::{SomeInteger, SomePtr, SomeValue};
+    use crate::annotator::classdesc::ClassDesc;
+    use crate::annotator::description::DescEntry;
+    use crate::annotator::model::{SomeInstance, SomeInteger, SomePtr, SomeValue};
     use crate::flowspace::model::{
-        Block, BlockKey, ConstValue, Constant, FunctionGraph, Hlvalue, SpaceOperation, Variable,
+        Block, BlockKey, ConstValue, Constant, FunctionGraph, Hlvalue, HostObject, SpaceOperation,
+        Variable,
     };
     use crate::model::{FunctionGraph as LegacyGraph, OpKind, ValueType};
     use crate::translator::rtyper::call_registry::CallRegistry;
@@ -391,5 +481,63 @@ mod tests {
         };
         assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
         assert_eq!(c_graphs.value, ConstValue::None);
+    }
+
+    #[test]
+    fn ptrrepr_rtype_simple_call_casts_matching_instance_to_objectptr() {
+        let (ann, rtyper) = live_rtyper_for_hop();
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("MatchingFnPtrRtypeInst", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let DescEntry::Class(class_rc) = &entry else {
+            panic!("expected Class desc");
+        };
+        let classdef = ClassDesc::getuniqueclassdef(class_rc).unwrap();
+        let inst_repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).unwrap();
+        let objectptr = OBJECTPTR.clone();
+        let ptr = Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![objectptr.clone()],
+                result: LowLevelType::Void,
+            }),
+        };
+        let r_ptr = Arc::new(PtrRepr::new(ptr.clone()));
+        let r_ptr_dyn: Arc<dyn Repr> = r_ptr.clone();
+        let r_inst: Arc<dyn Repr> = inst_repr.clone();
+        let hop = empty_hop(&rtyper, "simple_call");
+        let v_func = Variable::new();
+        v_func.set_concretetype(Some(LowLevelType::Ptr(Box::new(ptr.clone()))));
+        let v_inst = Variable::new();
+        v_inst.set_concretetype(Some(inst_repr.lowleveltype().clone()));
+        hop.args_v
+            .borrow_mut()
+            .extend([Hlvalue::Variable(v_func), Hlvalue::Variable(v_inst)]);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Ptr(SomePtr::new(ptr)),
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default())),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_ptr_dyn), Some(r_inst)]);
+
+        let result = rtype_simple_call(&r_ptr, &hop).unwrap().unwrap();
+        assert!(matches!(result, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "cast_pointer"),
+            "matching instance converts to OBJECTPTR via cast_pointer"
+        );
+        let indirect = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "indirect_call")
+            .expect("PtrRepr.rtype_simple_call emits indirect_call");
+        assert_eq!(indirect.args.len(), 3);
+        let Hlvalue::Variable(v_arg) = &indirect.args[1] else {
+            panic!("instance arg must be the cast_pointer result");
+        };
+        assert_eq!(v_arg.concretetype(), Some(objectptr));
     }
 }

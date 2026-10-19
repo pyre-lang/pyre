@@ -155,18 +155,17 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     `gen_cast` helper + the cast-table at `rbuiltin.py+`).
 ///   * rbuiltin.py — `llmemory.*` family (need `Address` /
 ///     `_fakeaddress` ports).  `cast_ptr_to_int` /
-///     `cast_int_to_ptr` (rbuiltin.py/551) are ported —
+///     `cast_int_to_ptr` (rbuiltin.py) are ported —
 ///     frontend `expr as T` for `Ref↔Int` emits `Call { target:
 ///     FunctionPath { segments: ["rpython", "rtyper", "lltypesystem",
 ///     "lltype", "cast_*"], fun_decl_id: None }, args }`, routed through the
 ///     `flowspace_adapter` module-qualified HOST_ENV resolver to
 ///     `BuiltinFunctionRepr.rtype_simple_call → BUILTIN_TYPER →
-///     rtype_cast_ptr_to_int / rtype_cast_int_to_ptr`.  The 2-arg
-///     upstream shape (`simple_call(lltype.cast_int_to_ptr, T_const,
-///     v_int)`) is reduced to a 1-arg call because pyre's surface DSL
-///     has no constant carrier for the target Ptr type; the result
-///     lltype is recovered from `hop.r_result.lowleveltype` (matches
-///     upstream's `resulttype=hop.r_result.lowleveltype`).
+///     rtype_cast_ptr_to_int / rtype_cast_int_to_ptr`.  The adapter
+///     emits the 2-arg `simple_call(lltype.cast_int_to_ptr,
+///     Constant(PTRTYPE), v_int)` shape; `rtype_cast_int_to_ptr`
+///     takes `inputargs(Void, Signed)` and genops only `v_input`
+///     (`rbuiltin.py`).
 ///     TODO: `InstanceRepr→PtrRepr` swap in
 ///     `rtype_cast_ptr_to_int` body awaits typed `&Foo` lift to
 ///     `SomePtr`.
@@ -575,6 +574,9 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "dealloc_varsize_with_gc_header",
             rtype_dealloc_varsize_gc_header,
         ),
+        // `<[T]>::to_vec(slice)` is `list(slice)` (`builtin_list` /
+        // `rtype_bltn_list` → `ll_copy`, `rlist.py`).
+        ("alloc.slice.<Impl>", "to_vec", rtype_builtin_list),
     ];
     for (module_name, attr_name, typer) in module_entries {
         if let Some(host) = HOST_ENV
@@ -4741,33 +4743,47 @@ pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
 /// Upstream takes a 2-arg `simple_call(lltype.cast_int_to_ptr, T,
 /// v_int)` shape — `args_s[0]` is the constant target type `T`
 /// (Void-typed at LL, just a marker) and `args_s[1]` is the
-/// integer value.  Upstream `rtype_cast_int_to_ptr` then calls
-/// `hop.inputargs(lltype.Void, lltype.Signed)` (rbuiltin.py)
-/// — two formal inputs.
-///
-/// `rffi.cast` emits the 2-arg form when the frontend has `CArrayPtr`.
-/// `Int → Ref` casts still emit 1-arg; that path takes a single
-/// `Signed` inputarg and recovers the Ptr from `hop.r_result.lowleveltype`.
+/// integer value.  `rtype_cast_int_to_ptr` then calls
+/// `hop.inputargs(lltype.Void, lltype.Signed)` (`rbuiltin.py`)
+/// and genops only `v_input`.
 pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
 
-    let r_result = hop
-        .r_result
-        .borrow()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| TyperError::message("rtype_cast_int_to_ptr: missing r_result"))?;
-    let result_lltype = r_result.lowleveltype().clone();
-    // Upstream `inputargs(lltype.Void, lltype.Signed)` then genops only
-    // `v_input`. The type marker has no runtime value; take the integer
-    // operand (arg 1 of the 2-arg form, arg 0 of the 1-arg form).
-    let int_arg = if hop.nb_args() == 2 { 1 } else { 0 };
-    let v_input = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), int_arg)?;
+    {
+        let args_s = hop.args_s.borrow();
+        let s0 = args_s.first().ok_or_else(|| {
+            TyperError::message("rtype_cast_int_to_ptr: hop.args_s[0] missing".to_string())
+        })?;
+        if !s0.is_constant() {
+            return Err(TyperError::message(
+                "rtype_cast_int_to_ptr: hop.args_s[0] must be a constant".to_string(),
+            ));
+        }
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
     hop.exception_cannot_occur()?;
+    let v_input = vlist
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| TyperError::message("rtype_cast_int_to_ptr: missing v_input".to_string()))?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_cast_int_to_ptr: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
     Ok(hop.genop(
         "cast_int_to_ptr",
         vec![v_input],
-        GenopResult::LLType(result_lltype),
+        GenopResult::LLType(lltype),
     ))
 }
 
@@ -5877,6 +5893,18 @@ mod tests {
         assert!(
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `lltype.cast_pointer`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_slice_to_vec_as_builtin_list() {
+        let host = HOST_ENV
+            .import_module("alloc.slice.<Impl>")
+            .and_then(|m| m.module_get("to_vec"))
+            .expect("HOST_ENV missing alloc.slice.<Impl>.to_vec");
+        assert!(
+            lookup_typer(&host).is_some(),
+            "BUILTIN_TYPER missing entry for `alloc.slice.<Impl>.to_vec`"
         );
     }
 
