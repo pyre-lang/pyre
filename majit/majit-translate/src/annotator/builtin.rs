@@ -928,6 +928,7 @@ pub fn builtin_bool(
         let truthy = match c {
             ConstValue::Bool(b) => *b,
             ConstValue::Int(n) => *n != 0,
+            ConstValue::UInt(n) => *n != 0,
             ConstValue::Int128(n) => *n != 0,
             ConstValue::UInt128(n) => *n != 0,
             ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
@@ -1022,6 +1023,7 @@ pub fn builtin_int(
     };
     constpropagate(bk, &prop_args, s_result, |consts| match consts {
         [ConstValue::Int(n)] => Some(ConstValue::Int(*n)),
+        [ConstValue::UInt(n)] => i64::try_from(*n).ok().map(ConstValue::Int),
         [ConstValue::Bool(b)] => Some(ConstValue::Int(if *b { 1 } else { 0 })),
         [s] if s.as_text().is_some() => s
             .as_text()
@@ -1073,6 +1075,7 @@ pub fn builtin_float(
         SomeValue::Float(SomeFloat::new()),
         |consts| match consts {
             [ConstValue::Int(n)] => Some(ConstValue::float(*n as f64)),
+            [ConstValue::UInt(n)] => Some(ConstValue::float(*n as f64)),
             [ConstValue::Bool(b)] => Some(ConstValue::float(if *b { 1.0 } else { 0.0 })),
             [ConstValue::Float(bits)] => Some(ConstValue::Float(*bits)),
             [s] if s.as_text().is_some() => s
@@ -1106,6 +1109,13 @@ pub fn builtin_chr(
                     None
                 }
             }
+            [ConstValue::UInt(n)] => {
+                if *n <= 0xff {
+                    Some(ConstValue::ByteStr(vec![*n as u8]))
+                } else {
+                    None
+                }
+            }
             _ => None,
         },
     )
@@ -1127,9 +1137,9 @@ pub fn builtin_unichr(
     let s_int = arg_at(args_s, 0, "builtin_unichr");
     let mut result = SomeUnicodeCodePoint::new(false);
     if is_immutable_constant(s_int)
-        && let Some(ConstValue::Int(n)) = s_int.const_()
-        && (0..=0x10_FFFF).contains(n)
-        && let Some(ch) = u32::try_from(*n).ok().and_then(char::from_u32)
+        && let Some(n) = s_int.const_().and_then(ConstValue::as_int)
+        && (0..=0x10_FFFF).contains(&n)
+        && let Some(ch) = u32::try_from(n).ok().and_then(char::from_u32)
     {
         result.inner.base.const_box = Some(super::super::flowspace::model::Constant::new(
             ConstValue::uni_str(ch.to_string()),

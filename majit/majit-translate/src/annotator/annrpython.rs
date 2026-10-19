@@ -3158,7 +3158,13 @@ impl RPythonAnnotator {
                         super::super::flowspace::model::ConstValue::Int(i) if int_keyed => {
                             Some(ExitCaseKey::Int(*i))
                         }
+                        super::super::flowspace::model::ConstValue::UInt(i) if int_keyed => {
+                            Some(ExitCaseKey::Int(*i as i64))
+                        }
                         super::super::flowspace::model::ConstValue::Int(i) => {
+                            Some(ExitCaseKey::Bool(*i != 0))
+                        }
+                        super::super::flowspace::model::ConstValue::UInt(i) => {
                             Some(ExitCaseKey::Bool(*i != 0))
                         }
                         _ => None,

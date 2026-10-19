@@ -4872,19 +4872,23 @@ impl Bookkeeper {
         match &c.value {
             ConstValue::List(items) => self.immutable_list_with_key(Some(c), &c.value, items),
             ConstValue::Dict(items) => self.immutable_dict_with_key(Some(c), &c.value, items),
-            // `ConstUInt` is stored as `ConstValue::Int` with
-            // `concretetype = Unsigned` (`flowspace_adapter`). The value
-            // branch only sees the signed carrier, so `u64::MAX` becomes
-            // `-1` and a later `r_uint` binding no longer contains it.
+            // Legacy `ConstUInt` stored as `ConstValue::Int` with
+            // `concretetype = Unsigned`. Prefer `ConstValue::UInt`; this
+            // arm still annotates leftover Int+Unsigned stamps as
+            // `SomeInteger(unsigned=True)` (`bookkeeper.immutablevalue`
+            // for an `r_uint`).
             ConstValue::Int(i)
                 if matches!(
                     c.concretetype,
                     Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Unsigned)
+                        | Some(
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::UnsignedLongLong
+                        )
                 ) =>
             {
                 let mut s = SomeInteger::new(true, true);
                 s.base.const_box = Some(Constant::with_concretetype(
-                    ConstValue::Int(*i),
+                    ConstValue::UInt(*i as u64),
                     crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Unsigned,
                 ));
                 Ok(SomeValue::Integer(s))
@@ -4916,6 +4920,14 @@ impl Bookkeeper {
                 // upstream: `result = SomeInteger(nonneg = x>=0)`.
                 let mut s = SomeInteger::new(*i >= 0, false);
                 s.base.const_box = Some(Constant::new(ConstValue::Int(*i)));
+                Ok(SomeValue::Integer(s))
+            }
+            ConstValue::UInt(i) => {
+                // `rarithmetic.build_int` `ForValuesEntry.compute_annotation`:
+                // `SomeInteger(knowntype=r_uint)`. `bookkeeper.immutablevalue`
+                // reaches that via `extregistry` on the `r_uint` instance.
+                let mut s = SomeInteger::new(true, true);
+                s.base.const_box = Some(Constant::new(ConstValue::UInt(*i)));
                 Ok(SomeValue::Integer(s))
             }
             ConstValue::Int128(i) => {
@@ -6088,6 +6100,7 @@ mod tests {
                 KnownType::ULongLongLong,
                 true,
             ),
+            (ConstValue::UInt(u64::MAX), KnownType::Ruint, true),
         ] {
             let s = bk()
                 .immutablevalue(&value)

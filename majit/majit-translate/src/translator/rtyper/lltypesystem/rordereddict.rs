@@ -2936,7 +2936,8 @@ pub fn build_ll_dict_lookup_helper_graph(
 
     // Value/const constructors.
     let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
-    let unsigned = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Unsigned);
+    let unsigned =
+        |n: i64| constant_with_lltype(ConstValue::UInt(n as u64), LowLevelType::Unsigned);
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
     let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
     let key_field = || void_field_const("key");
@@ -5087,7 +5088,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         "uint_add",
         vec![
             var(&ad_ipp),
-            constant_with_lltype(ConstValue::Int(1), uns()),
+            constant_with_lltype(ConstValue::UInt(1), uns()),
         ],
         &ad_iinc,
     );
@@ -5332,7 +5333,8 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
         ));
     };
     let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
-    let unsigned = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Unsigned);
+    let unsigned =
+        |n: i64| constant_with_lltype(ConstValue::UInt(n as u64), LowLevelType::Unsigned);
     let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
     let sig = || LowLevelType::Signed;
     let uns = || LowLevelType::Unsigned;

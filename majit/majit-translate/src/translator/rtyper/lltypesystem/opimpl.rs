@@ -547,12 +547,12 @@ pub fn op_llong_ge(args: &[ConstValue]) -> Option<ConstValue> {
 // uint_* and ullong_*
 //
 // Upstream `op_uint_*` (`opimpl.py op_uint_lshift`) operates on `r_uint` —
-// `unsigned long` in C, `u64` on 64-bit hosts. The Rust port carries
-// `LowLevelType::Unsigned` and `LowLevelType::UnsignedLongLong` values
-// in [`ConstValue::Int(i64)`] (per `lltype.rs`) using bit-
-// pattern equivalence: an `r_uint(N)` is stored as `Int(N as i64)`.
-// Each fold reinterprets the i64 as u64, applies the unsigned
-// operation, and re-encodes the bit pattern as i64.
+// `unsigned long` in C, `u64` on 64-bit hosts. The carrier is
+// [`ConstValue::UInt`]; `Int` is still accepted as the bit pattern
+// (`intmask` / leftover stamps). Results are `UInt` so
+// `Hashable.key = (type(value), value)` keeps them apart from signed
+// `Int`. On a 64-bit host `r_ulonglong is r_uint`
+// (`rarithmetic.build_int`).
 //
 // The wrap-around math (add/sub/mul/and/or/xor/eq/ne) is identical to
 // the signed family — `i64::wrapping_add` and `u64::wrapping_add`
@@ -560,22 +560,27 @@ pub fn op_llong_ge(args: &[ConstValue]) -> Option<ConstValue> {
 //   - comparisons (`uint_lt`/`le`/`gt`/`ge`): unsigned ordering
 //   - `uint_floordiv`/`uint_mod`: unsigned division semantics
 //   - `uint_rshift`: logical (zero-fill) right shift
-//
-// Convergence path: when `lltype.rs` adds a separate `r_uint` carrier
-// these helpers become no-ops over a typed wrapper.
+
+fn uint_bits(value: &ConstValue) -> Option<u64> {
+    value.as_uint()
+}
 
 fn uint_pair(args: &[ConstValue]) -> Option<(u64, u64)> {
     match args {
-        [ConstValue::Int(a), ConstValue::Int(b)] => Some((*a as u64, *b as u64)),
+        [a, b] => Some((uint_bits(a)?, uint_bits(b)?)),
         _ => None,
     }
 }
 
 fn uint_arg(args: &[ConstValue]) -> Option<u64> {
     match args {
-        [ConstValue::Int(a)] => Some(*a as u64),
+        [a] => uint_bits(a),
         _ => None,
     }
+}
+
+fn uint_const(n: u64) -> ConstValue {
+    ConstValue::UInt(n)
 }
 
 /// RPython `op_uint_is_true` derived via `get_primitive_op_src`.
@@ -584,22 +589,22 @@ pub fn op_uint_is_true(args: &[ConstValue]) -> Option<ConstValue> {
 }
 
 pub fn op_uint_invert(args: &[ConstValue]) -> Option<ConstValue> {
-    Some(ConstValue::Int(!uint_arg(args)? as i64))
+    Some(uint_const(!uint_arg(args)?))
 }
 
 pub fn op_uint_add(args: &[ConstValue]) -> Option<ConstValue> {
     let (a, b) = uint_pair(args)?;
-    Some(ConstValue::Int(a.wrapping_add(b) as i64))
+    Some(uint_const(a.wrapping_add(b)))
 }
 
 pub fn op_uint_sub(args: &[ConstValue]) -> Option<ConstValue> {
     let (a, b) = uint_pair(args)?;
-    Some(ConstValue::Int(a.wrapping_sub(b) as i64))
+    Some(uint_const(a.wrapping_sub(b)))
 }
 
 pub fn op_uint_mul(args: &[ConstValue]) -> Option<ConstValue> {
     let (a, b) = uint_pair(args)?;
-    Some(ConstValue::Int(a.wrapping_mul(b) as i64))
+    Some(uint_const(a.wrapping_mul(b)))
 }
 
 /// High 64 bits of the unsigned 64x64 -> 128 product — the overflow high
@@ -607,7 +612,7 @@ pub fn op_uint_mul(args: &[ConstValue]) -> Option<ConstValue> {
 /// (`umulhi`) and `bhimpl_uint_mul_high`.
 pub fn op_uint_mul_high(args: &[ConstValue]) -> Option<ConstValue> {
     let (a, b) = uint_pair(args)?;
-    Some(ConstValue::Int((((a as u128) * (b as u128)) >> 64) as i64))
+    Some(uint_const((((a as u128) * (b as u128)) >> 64) as u64))
 }
 
 pub fn op_uint_floordiv(args: &[ConstValue]) -> Option<ConstValue> {
@@ -615,7 +620,7 @@ pub fn op_uint_floordiv(args: &[ConstValue]) -> Option<ConstValue> {
     if b == 0 {
         return None;
     }
-    Some(ConstValue::Int((a / b) as i64))
+    Some(uint_const(a / b))
 }
 
 pub fn op_uint_mod(args: &[ConstValue]) -> Option<ConstValue> {
@@ -623,22 +628,22 @@ pub fn op_uint_mod(args: &[ConstValue]) -> Option<ConstValue> {
     if b == 0 {
         return None;
     }
-    Some(ConstValue::Int((a % b) as i64))
+    Some(uint_const(a % b))
 }
 
 pub fn op_uint_and(args: &[ConstValue]) -> Option<ConstValue> {
     let (a, b) = uint_pair(args)?;
-    Some(ConstValue::Int((a & b) as i64))
+    Some(uint_const(a & b))
 }
 
 pub fn op_uint_or(args: &[ConstValue]) -> Option<ConstValue> {
     let (a, b) = uint_pair(args)?;
-    Some(ConstValue::Int((a | b) as i64))
+    Some(uint_const(a | b))
 }
 
 pub fn op_uint_xor(args: &[ConstValue]) -> Option<ConstValue> {
     let (a, b) = uint_pair(args)?;
-    Some(ConstValue::Int((a ^ b) as i64))
+    Some(uint_const(a ^ b))
 }
 
 /// RPython `op_uint_lshift` (`opimpl.py`) — `r_uint(x << y)`.
@@ -646,14 +651,16 @@ pub fn op_uint_xor(args: &[ConstValue]) -> Option<ConstValue> {
 /// truncates to 0 in u64 space.
 pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::Int(a), ConstValue::Int(b)] => {
-            if *b < 0 {
+        [a, b] => {
+            let a = uint_bits(a)?;
+            let b = b.as_int()?;
+            if b < 0 {
                 return None;
             }
-            if *b >= u64::BITS as i64 {
-                Some(ConstValue::Int(0))
+            if b >= u64::BITS as i64 {
+                Some(uint_const(0))
             } else {
-                Some(ConstValue::Int((*a as u64).wrapping_shl(*b as u32) as i64))
+                Some(uint_const(a.wrapping_shl(b as u32)))
             }
         }
         _ => None,
@@ -664,14 +671,16 @@ pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
 /// shift in u64 space. `y >= 64` collapses to 0.
 pub fn op_uint_rshift(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::Int(a), ConstValue::Int(b)] => {
-            if *b < 0 {
+        [a, b] => {
+            let a = uint_bits(a)?;
+            let b = b.as_int()?;
+            if b < 0 {
                 return None;
             }
-            if *b >= u64::BITS as i64 {
-                Some(ConstValue::Int(0))
+            if b >= u64::BITS as i64 {
+                Some(uint_const(0))
             } else {
-                Some(ConstValue::Int(((*a as u64) >> (*b as u32)) as i64))
+                Some(uint_const(a >> (b as u32)))
             }
         }
         _ => None,
@@ -1123,27 +1132,27 @@ pub fn op_cast_unichar_to_int(args: &[ConstValue]) -> Option<ConstValue> {
 
 // wide-int casts (i64 / u64 carrier preserves bit pattern)
 //
-// On 64-bit hosts every signed/unsigned long-long type collapses onto
-// the single [`ConstValue::Int(i64)`] carrier (per `lltype.rs`).
+// On 64-bit hosts signed long-long collapses onto [`ConstValue::Int`]
+// (`SignedLongLong is Signed`) and unsigned long-long onto
+// [`ConstValue::UInt`] (`r_ulonglong is r_uint`).
 // The `cast_int_to_longlong` / `cast_int_to_uint` family is therefore
 // identity at the bit-pattern level. Upstream's per-type asserts
 // remain available for parity once the carriers diverge.
 
 /// RPython `op_cast_int_to_uint` (`opimpl.py`) — `r_uint(b)`.
-/// Identity on the i64 carrier.
 pub fn op_cast_int_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::Int(_)] => Some(args[0].clone()),
+        [ConstValue::Int(n)] => Some(ConstValue::UInt(*n as u64)),
+        [ConstValue::UInt(n)] => Some(ConstValue::UInt(*n)),
         _ => None,
     }
 }
 
 /// RPython `op_cast_uint_to_int` (`opimpl.py`) — `intmask(b)`.
-/// Identity on the i64 carrier (intmask is an i64 truncation that's
-/// already the carrier).
 pub fn op_cast_uint_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::Int(_)] => Some(args[0].clone()),
+        [ConstValue::UInt(n)] => Some(ConstValue::Int(*n as i64)),
+        [ConstValue::Int(n)] => Some(ConstValue::Int(*n)),
         _ => None,
     }
 }
@@ -1170,7 +1179,7 @@ pub fn op_truncate_longlong_to_int(args: &[ConstValue]) -> Option<ConstValue> {
 /// RPython `op_cast_bool_to_uint` (`opimpl.py`).
 pub fn op_cast_bool_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::Bool(b)] => Some(ConstValue::Int(*b as i64)),
+        [ConstValue::Bool(b)] => Some(ConstValue::UInt(u64::from(*b))),
         _ => None,
     }
 }
@@ -1181,7 +1190,7 @@ pub fn op_cast_bool_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
 /// matching upstream's `float(int(...))` lossy conversion).
 pub fn op_cast_uint_to_float(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::Int(n)] => Some(ConstValue::float(*n as u64 as f64)),
+        [n] => Some(ConstValue::float(uint_bits(n)? as f64)),
         _ => None,
     }
 }
@@ -1221,7 +1230,7 @@ pub fn op_cast_float_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
             if !f.is_finite() {
                 return None;
             }
-            Some(ConstValue::Int(float_trunc_mod_2_pow_64(f) as i64))
+            Some(ConstValue::UInt(float_trunc_mod_2_pow_64(f)))
         }
         _ => None,
     }
@@ -1722,6 +1731,9 @@ mod tests {
     fn i(n: i64) -> ConstValue {
         ConstValue::Int(n)
     }
+    fn u(n: u64) -> ConstValue {
+        ConstValue::UInt(n)
+    }
     fn b(v: bool) -> ConstValue {
         ConstValue::Bool(v)
     }
@@ -2012,40 +2024,39 @@ mod tests {
 
     #[test]
     fn uint_uses_unsigned_division_and_comparison() {
-        // Stored as i64=-1, interpreted as u64=0xFFFFFFFFFFFFFFFF.
-        let umax = i(-1);
+        let umax = u(u64::MAX);
         // Unsigned: u64::MAX > 1 (signed: -1 < 1).
-        assert_eq!(op_uint_lt(&[umax.clone(), i(1)]), Some(b(false)));
-        assert_eq!(op_uint_gt(&[umax.clone(), i(1)]), Some(b(true)));
-        // Unsigned: u64::MAX // 2 == 0x7FFFFFFFFFFFFFFF (signed 0).
+        assert_eq!(op_uint_lt(&[umax.clone(), u(1)]), Some(b(false)));
+        assert_eq!(op_uint_gt(&[umax.clone(), u(1)]), Some(b(true)));
+        // Unsigned: u64::MAX // 2 == 0x7FFFFFFFFFFFFFFF.
         assert_eq!(
-            op_uint_floordiv(&[umax.clone(), i(2)]),
-            Some(i(0x7FFFFFFFFFFFFFFFi64))
+            op_uint_floordiv(&[umax.clone(), u(2)]),
+            Some(u(0x7FFFFFFFFFFFFFFF))
         );
         // Logical right shift fills with zero.
         assert_eq!(
             op_uint_rshift(&[umax.clone(), i(1)]),
-            Some(i(0x7FFFFFFFFFFFFFFFi64))
+            Some(u(0x7FFFFFFFFFFFFFFF))
         );
         // Modular arithmetic agrees with signed for add/sub/mul.
-        assert_eq!(op_uint_add(&[i(-1), i(1)]), Some(i(0)));
+        assert_eq!(op_uint_add(&[u(u64::MAX), u(1)]), Some(u(0)));
         // Division by zero refuses to fold.
-        assert_eq!(op_uint_floordiv(&[i(1), i(0)]), None);
+        assert_eq!(op_uint_floordiv(&[u(1), u(0)]), None);
         // Negative shift refuses to fold.
-        assert_eq!(op_uint_lshift(&[i(1), i(-1)]), None);
+        assert_eq!(op_uint_lshift(&[u(1), i(-1)]), None);
     }
 
     #[test]
     fn ullong_matches_uint_on_64bit_carrier() {
         // `r_ulonglong` ≡ `r_uint` ≡ u64 on the 64-bit carrier.
-        assert_eq!(op_ullong_lt(&[i(-1), i(1)]), Some(b(false)));
+        assert_eq!(op_ullong_lt(&[u(u64::MAX), u(1)]), Some(b(false)));
         assert_eq!(
-            op_ullong_floordiv(&[i(-1), i(2)]),
-            Some(i(0x7FFFFFFFFFFFFFFFi64))
+            op_ullong_floordiv(&[u(u64::MAX), u(2)]),
+            Some(u(0x7FFFFFFFFFFFFFFF))
         );
         assert_eq!(
-            op_ullong_rshift(&[i(-1), i(1)]),
-            Some(i(0x7FFFFFFFFFFFFFFFi64))
+            op_ullong_rshift(&[u(u64::MAX), i(1)]),
+            Some(u(0x7FFFFFFFFFFFFFFF))
         );
     }
 
@@ -2054,12 +2065,9 @@ mod tests {
         let v = i(0x1234_5678);
         assert_eq!(
             op_cast_int_to_uint(std::slice::from_ref(&v)),
-            Some(v.clone())
+            Some(u(0x1234_5678))
         );
-        assert_eq!(
-            op_cast_uint_to_int(std::slice::from_ref(&v)),
-            Some(v.clone())
-        );
+        assert_eq!(op_cast_uint_to_int(&[u(0x1234_5678)]), Some(v.clone()));
         assert_eq!(
             op_cast_int_to_longlong(std::slice::from_ref(&v)),
             Some(v.clone())
@@ -2068,52 +2076,50 @@ mod tests {
             op_truncate_longlong_to_int(std::slice::from_ref(&v)),
             Some(v.clone())
         );
-        assert_eq!(op_cast_bool_to_uint(&[b(true)]), Some(i(1)));
+        assert_eq!(op_cast_bool_to_uint(&[b(true)]), Some(u(1)));
     }
 
     #[test]
     fn cast_float_uint_round_trip_within_u64_range() {
-        assert_eq!(op_cast_uint_to_float(&[i(1024)]), Some(f(1024.0)));
-        // Carry the u64 max as i64=-1 → expect 2^64 in float space.
-        assert_eq!(op_cast_uint_to_float(&[i(-1)]), Some(f(u64::MAX as f64)));
-        assert_eq!(op_cast_float_to_uint(&[f(1024.0)]), Some(i(1024)));
+        assert_eq!(op_cast_uint_to_float(&[u(1024)]), Some(f(1024.0)));
+        assert_eq!(
+            op_cast_uint_to_float(&[u(u64::MAX)]),
+            Some(f(u64::MAX as f64))
+        );
+        assert_eq!(op_cast_float_to_uint(&[f(1024.0)]), Some(u(1024)));
         // Negative finite floats fold via 2's-complement wrap —
-        // upstream `r_uint(long(-1.0))` is `0xFFFFFFFFFFFFFFFF`, which
-        // in `ConstValue::Int(i64)` is `-1`. Truncates toward zero
-        // (`-1.5` → `-1`, not `-2`).
-        assert_eq!(op_cast_float_to_uint(&[f(-1.0)]), Some(i(-1)));
-        assert_eq!(op_cast_float_to_uint(&[f(-1.5)]), Some(i(-1)));
-        assert_eq!(op_cast_float_to_uint(&[f(-2.0)]), Some(i(-2)));
+        // upstream `r_uint(long(-1.0))` is `0xFFFFFFFFFFFFFFFF`.
+        // Truncates toward zero (`-1.5` → `-1`, not `-2`).
+        assert_eq!(op_cast_float_to_uint(&[f(-1.0)]), Some(u(u64::MAX)));
+        assert_eq!(op_cast_float_to_uint(&[f(-1.5)]), Some(u(u64::MAX)));
+        assert_eq!(op_cast_float_to_uint(&[f(-2.0)]), Some(u((-2i64) as u64)));
         // Wrap, not saturate, near the i64::MAX boundary. `2^63`
-        // should produce the bit pattern `0x8000_0000_0000_0000`,
-        // which as `i64` is `i64::MIN`. A naive `f as i64` saturates
-        // at `i64::MAX = 2^63 - 1` and misses the high-bit pattern.
+        // should produce the bit pattern `0x8000_0000_0000_0000`.
         assert_eq!(
             op_cast_float_to_uint(&[f(9223372036854775808.0)]), // 2^63
-            Some(i(i64::MIN)),
+            Some(u(1u64 << 63)),
         );
         assert_eq!(
             op_cast_float_to_ulonglong(&[f(9223372036854775808.0)]),
-            Some(i(i64::MIN)),
+            Some(u(1u64 << 63)),
         );
         // 2^65 → upstream `r_uint(2^65)` is `2^65 mod 2^64 == 0`. The
         // bit-shift implementation walks the IEEE-754 mantissa /
         // exponent and folds correctly across the full finite range.
         assert_eq!(
             op_cast_float_to_uint(&[f(36893488147419103232.0)]), // 2^65
-            Some(i(0)),
+            Some(u(0)),
         );
         // -2^65 wraps to `(-2^65) mod 2^64 == 0` for the same reason.
         assert_eq!(
             op_cast_float_to_uint(&[f(-36893488147419103232.0)]),
-            Some(i(0)),
+            Some(u(0)),
         );
         // 2^63 + 2^32 (still inside finite-float exact range) — wrap
-        // produces 0x8000_0000_0000_0000 + 2^32 in u64, which is
-        // i64::MIN + 2^32 in i64.
+        // produces 0x8000_0000_0000_0000 + 2^32 in u64.
         assert_eq!(
             op_cast_float_to_uint(&[f(9223372041149743104.0)]),
-            Some(i(i64::MIN.wrapping_add(0x1_0000_0000))),
+            Some(u((1u64 << 63).wrapping_add(0x1_0000_0000))),
         );
         // NaN / inf refuse to fold.
         assert_eq!(op_cast_float_to_uint(&[f(f64::NAN)]), None);

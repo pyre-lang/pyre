@@ -361,6 +361,7 @@ fn is_default_exitcase(exitcase: &Option<ExitCase>) -> bool {
 fn signed_switch_key(value: &ConstValue) -> Option<i64> {
     match value {
         ConstValue::Int(value) => Some(*value),
+        ConstValue::UInt(value) => Some(*value as i64),
         ConstValue::Bool(value) => Some(i64::from(*value)),
         _ => None,
     }
@@ -1620,6 +1621,7 @@ pub(crate) fn constant_kind(c: &Constant) -> char {
 pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
     match cv {
         ConstValue::Int(_)
+        | ConstValue::UInt(_)
         | ConstValue::Bool(_)
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)

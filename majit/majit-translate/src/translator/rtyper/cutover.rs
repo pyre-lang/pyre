@@ -6707,8 +6707,9 @@ mod tests {
             let (join, inputs) = graph.create_block_with_arg_vars(1);
             let input = inputs[0].clone();
             let (tail, tail_inputs) = graph.create_block_with_arg_vars(1);
-            let make_constant =
-                |value| Constant::with_concretetype(ConstValue::Int(value), LowLevelType::Unsigned);
+            let make_constant = |value| {
+                Constant::with_concretetype(ConstValue::UInt(value as u64), LowLevelType::Unsigned)
+            };
             let first = make_constant(1);
             graph.block_mut(graph.startblock).exits = vec![
                 crate::model::Link::new_mixed(vec![LinkArg::Value(literal.clone())], join, None),

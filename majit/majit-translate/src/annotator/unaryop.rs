@@ -543,8 +543,8 @@ pub fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
                     .consider(ann)
                     .expect("bool: len() dispatch failed")
                     .expect("bool: len() is not a void operation");
-                if let Some(ConstValue::Int(n)) = s_len.const_() {
-                    r.base.const_box = Some(Constant::new(ConstValue::Bool(*n > 0)));
+                if let Some(n) = s_len.const_().and_then(ConstValue::as_int) {
+                    r.base.const_box = Some(Constant::new(ConstValue::Bool(n > 0)));
                 }
             }
         }
@@ -1345,6 +1345,7 @@ fn init_sometuple_overrides(
                         .as_ref()
                         .and_then(|c| match c.value {
                             ConstValue::Int(v) => Some(v),
+                            ConstValue::UInt(v) => Some(v as i64),
                             _ => None,
                         })
                         .expect("tuple.getslice: const_box mismatch"),
@@ -1357,6 +1358,7 @@ fn init_sometuple_overrides(
                         .as_ref()
                         .and_then(|c| match c.value {
                             ConstValue::Int(v) => Some(v),
+                            ConstValue::UInt(v) => Some(v as i64),
                             _ => None,
                         })
                         .expect("tuple.getslice: const_box mismatch"),
@@ -2508,6 +2510,7 @@ fn const_str_of(sv: &SomeValue) -> Option<String> {
 fn const_int_of(sv: &SomeValue) -> Option<i64> {
     match sv.const_() {
         Some(ConstValue::Int(v)) => Some(*v),
+        Some(ConstValue::UInt(v)) => Some(*v as i64),
         _ => None,
     }
 }

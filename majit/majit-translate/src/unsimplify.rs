@@ -324,6 +324,7 @@ fn rematerializable_marker_receiver_producer(
     let can_copy = match &producer.kind {
         OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
+        | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)

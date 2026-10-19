@@ -502,7 +502,7 @@ fn fold_constant_cast_pointer(
 fn lowlevel_value_to_const_value(v: &LowLevelValue) -> Option<ConstValue> {
     match v {
         LowLevelValue::Signed(n) => Some(ConstValue::Int(*n)),
-        LowLevelValue::Unsigned(u) => Some(ConstValue::Int(*u as i64)),
+        LowLevelValue::Unsigned(u) => Some(ConstValue::UInt(*u)),
         LowLevelValue::Bool(b) => Some(ConstValue::Bool(*b)),
         LowLevelValue::Float(bits) | LowLevelValue::LongFloat(bits) => {
             Some(ConstValue::Float(*bits))

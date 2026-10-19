@@ -6903,7 +6903,7 @@ impl<'a> Transformer<'a> {
         let stored = if let Some(v) = value.as_variable() {
             v.clone()
         } else if let LinkArg::Const(c) = value
-            && let crate::flowspace::model::ConstValue::Int(n) = c.value
+            && let Some(n) = c.value.as_int()
         {
             raw_list_const_int(graph, &mut ops, n as usize)
         } else {

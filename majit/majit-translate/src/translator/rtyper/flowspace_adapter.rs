@@ -408,7 +408,7 @@ pub fn build_value_to_hlvalue_map(
                     map.insert(
                         result,
                         Hlvalue::Constant(Constant::with_concretetype(
-                            ConstValue::Int(*n as i64),
+                            ConstValue::UInt(*n),
                             LowLevelType::Unsigned,
                         )),
                     );
@@ -620,6 +620,10 @@ fn intmask_unsigned_store(
     match &c.value {
         ConstValue::Int(n) => Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int(*n),
+            LowLevelType::Signed,
+        )),
+        ConstValue::UInt(n) => Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(*n as i64),
             LowLevelType::Signed,
         )),
         ConstValue::Int128(v) if *v >= i64::MIN as i128 && *v <= i64::MAX as i128 => {
@@ -4538,6 +4542,9 @@ fn exitcase_to_hlvalue(
 fn constant_from_constvalue(value: ConstValue) -> Constant {
     match value {
         ConstValue::Int(n) => Constant::with_concretetype(ConstValue::Int(n), LowLevelType::Signed),
+        ConstValue::UInt(n) => {
+            Constant::with_concretetype(ConstValue::UInt(n), LowLevelType::Unsigned)
+        }
         ConstValue::Int128(n) => {
             Constant::with_concretetype(ConstValue::Int128(n), LowLevelType::SignedLongLongLong)
         }
@@ -4571,7 +4578,7 @@ fn legacy_const_define_hlvalue(
             Constant::with_concretetype(ConstValue::Int(*value), LowLevelType::Signed),
         ))),
         OpKind::ConstUInt(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::Int(*n as i64),
+            ConstValue::UInt(*n),
             LowLevelType::Unsigned,
         )))),
         OpKind::ConstInt128(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
@@ -10801,7 +10808,7 @@ mod tests {
         value_map.insert(
             vars[2].clone(),
             Hlvalue::Constant(Constant::with_concretetype(
-                ConstValue::Int(0),
+                ConstValue::UInt(0),
                 LowLevelType::Unsigned,
             )),
         );

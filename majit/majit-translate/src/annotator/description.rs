@@ -1194,6 +1194,7 @@ impl FunctionDesc {
     fn nameof_const(value: &ConstValue) -> String {
         match value {
             ConstValue::Int(i) => i.to_string(),
+            ConstValue::UInt(i) => i.to_string(),
             ConstValue::Bool(b) => {
                 if *b {
                     "True".to_string()

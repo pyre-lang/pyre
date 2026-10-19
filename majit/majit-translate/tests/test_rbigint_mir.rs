@@ -1216,6 +1216,9 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
                 OpKind::ConstInt(value) if *value == i64::MAX => {
                     saw_mask = true;
                 }
+                OpKind::ConstUInt(value) if *value == i64::MAX as u64 => {
+                    saw_mask = true;
+                }
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..

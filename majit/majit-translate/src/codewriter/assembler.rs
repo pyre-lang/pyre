@@ -3658,6 +3658,7 @@ impl AssemblerEncode for Assembler {
     fn resolve_const_i_value(value: &ConstValue, callcontrol: Option<&CallControl>) -> i64 {
         match value {
             ConstValue::Int(n) => *n,
+            ConstValue::UInt(n) => *n as i64,
             ConstValue::Bool(b) => *b as i64,
             ConstValue::SpecTag(tag) => *tag as i64,
             // assembler.py::Assembler.emit_const converts raw pointers via
@@ -3827,6 +3828,7 @@ impl AssemblerEncode for Assembler {
     ) -> u8 {
         match value {
             ConstValue::Int(value) => self.emit_const_i(*value, state),
+            ConstValue::UInt(value) => self.emit_const_i(*value as i64, state),
             ConstValue::HostObject(obj) => {
                 let bits = exception_class_addr(obj, callcontrol, "goto_if_exception_mismatch")
                     .unwrap_or_else(|| {
@@ -10315,11 +10317,12 @@ mod tests {
             };
             let mut cases = Vec::new();
             for link in &block.exits {
-                if let Some(crate::model::ExitCase::Const(
-                    crate::flowspace::model::ConstValue::Int(n),
-                )) = &link.exitcase
-                {
-                    cases.push(*n);
+                if let Some(crate::model::ExitCase::Const(cv)) = &link.exitcase {
+                    match cv {
+                        crate::flowspace::model::ConstValue::Int(n) => cases.push(*n),
+                        crate::flowspace::model::ConstValue::UInt(n) => cases.push(*n as i64),
+                        _ => {}
+                    }
                 }
             }
             if !cases.is_empty() {

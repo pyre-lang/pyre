@@ -322,7 +322,7 @@ fn var_kind_from(
                     value_type_kind(ty)
                 }
             }
-            OpKind::ConstInt(_) => Some('i'),
+            OpKind::ConstInt(_) | OpKind::ConstUInt(_) => Some('i'),
             OpKind::ConstRefAddr(_) => Some('r'),
             OpKind::Input { ty, .. } => value_type_kind(ty),
             OpKind::UnaryOp { operand, .. } => var_kind_from(graph, def_block, operand, seen),

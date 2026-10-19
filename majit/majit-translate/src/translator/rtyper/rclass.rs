@@ -435,6 +435,7 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         ConstValue::Placeholder => false,
         ConstValue::Bool(flag) => *flag,
         ConstValue::Int(value) => *value != 0,
+        ConstValue::UInt(value) => *value != 0,
         ConstValue::Int128(value) => *value != 0,
         ConstValue::UInt128(value) => *value != 0,
         ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
@@ -830,6 +831,11 @@ pub(crate) fn constant_to_lowlevel_value(
     match (target, &c.value) {
         (LowLevelType::Void, _) => Ok(lltype::LowLevelValue::Void),
         (LowLevelType::Signed, ConstValue::Int(n)) => Ok(lltype::LowLevelValue::Signed(*n)),
+        (LowLevelType::Signed, ConstValue::UInt(n)) => Ok(lltype::LowLevelValue::Signed(*n as i64)),
+        (LowLevelType::Unsigned, ConstValue::UInt(n)) => Ok(lltype::LowLevelValue::Unsigned(*n)),
+        (LowLevelType::Unsigned, ConstValue::Int(n)) => {
+            Ok(lltype::LowLevelValue::Unsigned(*n as u64))
+        }
         (LowLevelType::Signed, ConstValue::Bool(b)) => {
             Ok(lltype::LowLevelValue::Signed(i64::from(*b)))
         }

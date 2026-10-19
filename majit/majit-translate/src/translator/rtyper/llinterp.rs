@@ -192,6 +192,7 @@ impl LLValue {
 fn const_to_llvalue(c: &Constant) -> LLValue {
     match &c.value {
         ConstValue::Int(n) => LLValue::Int(*n),
+        ConstValue::UInt(n) => LLValue::Int(*n as i64),
         ConstValue::Bool(b) => LLValue::Bool(*b),
         ConstValue::Float(bits) => LLValue::Float(*bits),
         // Item 2 string split: ByteStr is the Python 2 `str` shape and
@@ -233,6 +234,7 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
     if let Some(v) = value.downcast_ref::<ConstValue>() {
         return Ok(match v {
             ConstValue::Int(n) => LLValue::Int(*n),
+            ConstValue::UInt(n) => LLValue::Int(*n as i64),
             ConstValue::Bool(b) => LLValue::Bool(*b),
             ConstValue::Float(bits) => LLValue::Float(*bits),
             ConstValue::ByteStr(s) => LLValue::Str(String::from_utf8_lossy(s).into_owned()),

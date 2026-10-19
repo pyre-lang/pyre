@@ -2759,6 +2759,20 @@ pub enum ConstValue {
     /// `test_model.py`. Phase 3 generalises this to arbitrary
     /// Python values.
     Int(i64),
+    /// RPython `r_uint` / `r_ulonglong` constant.
+    ///
+    /// `rarithmetic.build_int` interns by `(sign, bits)`: on a 64-bit
+    /// host `r_ulonglong is r_uint`. `lltype.Unsigned =
+    /// build_number("Unsigned", r_uint)`; `UnsignedLongLong` is the
+    /// same type. `_numbertypes[r_int] = _numbertypes[int]`, so
+    /// `SignedLongLong` is `Signed` and its constants stay `Int`.
+    /// `rmodel.inputconst` requires `typeOf(value)` to match
+    /// (`LowLevelType._contains_value` → `isCompatibleType`); a
+    /// constant whose concretetype is `Unsigned` therefore holds an
+    /// `r_uint`. Distinct from `Int` because `Hashable.key =
+    /// (type(value), value)` keeps `Constant(r_uint(0))` apart from
+    /// `Constant(0)`.
+    UInt(u64),
     /// RPython `r_longlonglong` constant. Kept separate from `Int`
     /// because a 128-bit primitive cannot be represented by the
     /// word-sized flowspace carrier without truncation.
@@ -2975,6 +2989,7 @@ impl PartialEq for ConstValue {
             (ConstValue::Atom(a), ConstValue::Atom(b)) => a == b,
             (ConstValue::Placeholder, ConstValue::Placeholder) => true,
             (ConstValue::Int(a), ConstValue::Int(b)) => a == b,
+            (ConstValue::UInt(a), ConstValue::UInt(b)) => a == b,
             (ConstValue::Int128(a), ConstValue::Int128(b)) => a == b,
             (ConstValue::UInt128(a), ConstValue::UInt128(b)) => a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
@@ -3030,6 +3045,7 @@ impl std::fmt::Display for ConstValue {
             ConstValue::Atom(atom) => write!(f, "{atom}"),
             ConstValue::Placeholder => f.write_str("<placeholder>"),
             ConstValue::Int(value) => write!(f, "{value}"),
+            ConstValue::UInt(value) => write!(f, "{value}"),
             ConstValue::Int128(value) => write!(f, "{value}"),
             ConstValue::UInt128(value) => write!(f, "{value}"),
             ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
@@ -3063,6 +3079,7 @@ impl Hash for ConstValue {
             ConstValue::Atom(atom) => atom.hash(state),
             ConstValue::Placeholder => {}
             ConstValue::Int(value) => value.hash(state),
+            ConstValue::UInt(value) => value.hash(state),
             ConstValue::Int128(value) => value.hash(state),
             ConstValue::UInt128(value) => value.hash(state),
             ConstValue::Float(bits) => bits.hash(state),
@@ -3698,6 +3715,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::Atom(_) => "Atom",
         ConstValue::Placeholder => "Placeholder",
         ConstValue::Int(_) => "Int",
+        ConstValue::UInt(_) => "UInt",
         ConstValue::Int128(_) => "Int128",
         ConstValue::UInt128(_) => "UInt128",
         ConstValue::Float(_) => "Float",
@@ -3839,12 +3857,32 @@ impl ConstValue {
         }
     }
 
+    /// Signed word bits. `UInt` returns the same bits via `as i64`
+    /// (`rarithmetic.intmask`).
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            ConstValue::Int(n) => Some(*n),
+            ConstValue::UInt(n) => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    /// Unsigned word bits. `Int` returns the same bits via `as u64`.
+    pub fn as_uint(&self) -> Option<u64> {
+        match self {
+            ConstValue::UInt(n) => Some(*n),
+            ConstValue::Int(n) => Some(*n as u64),
+            _ => None,
+        }
+    }
+
     /// Best-effort Python truthiness for the constant variants the
     /// current flow-space port constructs directly.
     pub fn truthy(&self) -> Option<bool> {
         match self {
             ConstValue::Placeholder => None,
             ConstValue::Int(n) => Some(*n != 0),
+            ConstValue::UInt(n) => Some(*n != 0),
             ConstValue::Int128(n) => Some(*n != 0),
             ConstValue::UInt128(n) => Some(*n != 0),
             // Python `bool(float)` is `float != 0.0` (including -0.0
@@ -3938,9 +3976,10 @@ impl ConstValue {
     /// current flow-space port.
     pub fn class_of(&self) -> Option<HostObject> {
         match self {
-            ConstValue::Int(_) | ConstValue::Int128(_) | ConstValue::UInt128(_) => {
-                HOST_ENV.lookup_builtin("int")
-            }
+            ConstValue::Int(_)
+            | ConstValue::UInt(_)
+            | ConstValue::Int128(_)
+            | ConstValue::UInt128(_) => HOST_ENV.lookup_builtin("int"),
             ConstValue::Float(_) => HOST_ENV.lookup_builtin("float"),
             ConstValue::Bool(_) => HOST_ENV.lookup_builtin("bool"),
             ConstValue::ByteStr(_) => HOST_ENV.lookup_builtin("str"),
@@ -5474,7 +5513,10 @@ fn is_valid_switch_exitcase(exitcase: &Hlvalue) -> bool {
     matches!(
         exitcase,
         Hlvalue::Constant(Constant {
-            value: ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::None,
+            value: ConstValue::Int(_)
+                | ConstValue::UInt(_)
+                | ConstValue::Bool(_)
+                | ConstValue::None,
             ..
         })
     ) || match exitcase {
@@ -5824,19 +5866,38 @@ mod tests {
     }
 
     #[test]
-    fn constant_hashable_equality_ignores_concretetype() {
+    fn constant_hashable_key_is_int_type_and_value() {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
+        // `Hashable.key = (type(value), value)`: concretetype is not
+        // part of the key. Two `Int(1)` constants compare equal even
+        // when one is stamped Signed and the other Unsigned.
         let a = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Signed);
         let b = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Unsigned);
-
         assert_eq!(a, b);
-
         let mut ha = std::collections::hash_map::DefaultHasher::new();
         let mut hb = std::collections::hash_map::DefaultHasher::new();
         a.hash(&mut ha);
         b.hash(&mut hb);
         assert_eq!(ha.finish(), hb.finish());
+
+        // The integer class lives on the value: `r_uint(1)` is
+        // `ConstValue::UInt`, so it is a different Hashable key from
+        // signed `1`.
+        let signed = Constant::new(ConstValue::Int(1));
+        let unsigned = Constant::new(ConstValue::UInt(1));
+        assert_ne!(signed, unsigned);
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        let mut hu = std::collections::hash_map::DefaultHasher::new();
+        signed.hash(&mut hs);
+        unsigned.hash(&mut hu);
+        assert_ne!(hs.finish(), hu.finish());
+
+        // `_numbertypes[r_int] = _numbertypes[int]`: `SignedLongLong`
+        // is `Signed` on a 64-bit host, so its constants stay `Int`.
+        let sll = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::SignedLongLong);
+        assert!(matches!(sll.value, ConstValue::Int(1)));
+        assert_eq!(sll, signed);
     }
 
     #[test]

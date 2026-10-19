@@ -1961,6 +1961,7 @@ fn link_arg_const_int_in_block(graph: &FunctionGraph, block: usize, arg: &LinkAr
     match arg {
         LinkArg::Const(c) => match &c.value {
             crate::flowspace::model::ConstValue::Int(value) => Some(*value),
+            crate::flowspace::model::ConstValue::UInt(value) => i64::try_from(*value).ok(),
             _ => None,
         },
         LinkArg::Value(var) => graph.blocks[block].operations.iter().find_map(|op| {
@@ -4754,6 +4755,7 @@ fn break_arm_closes(
 fn materialize_call_arg_constant(graph: &mut FunctionGraph, bb: BlockId, c: &Constant) -> Variable {
     let (kind, ty) = match &c.value {
         ConstValue::Int(n) => (OpKind::ConstInt(*n), ConcreteType::Signed),
+        ConstValue::UInt(n) => (OpKind::ConstUInt(*n), ConcreteType::Signed),
         ConstValue::Bool(b) => (OpKind::ConstBool(*b), ConcreteType::Signed),
         ConstValue::ByteStr(s) => (OpKind::ConstStr(s.clone()), ConcreteType::GcRef),
         ConstValue::Float(bits) => (OpKind::ConstFloat(*bits), ConcreteType::Float),
@@ -9734,6 +9736,7 @@ fn concrete_type_of_constant(
 ) -> Option<crate::model::ConcreteType> {
     match &constant.value {
         crate::flowspace::model::ConstValue::Int(_)
+        | crate::flowspace::model::ConstValue::UInt(_)
         | crate::flowspace::model::ConstValue::Int128(_)
         | crate::flowspace::model::ConstValue::UInt128(_) => {
             Some(crate::model::ConcreteType::Signed)

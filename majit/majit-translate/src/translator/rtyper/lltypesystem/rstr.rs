@@ -1305,7 +1305,8 @@ pub(crate) fn build_ll_int2hex_helper_graph(
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
     let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
-    let unsigned_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Unsigned);
+    let unsigned_const =
+        |n: i64| constant_with_lltype(ConstValue::UInt(n as u64), LowLevelType::Unsigned);
     let chars_field_const =
         || constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void);
     let hash_field_const =
@@ -2152,7 +2153,8 @@ pub(crate) fn build_ll_int2dec_helper_graph(
     let result_chars_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
 
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
-    let unsigned_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Unsigned);
+    let unsigned_const =
+        |n: i64| constant_with_lltype(ConstValue::UInt(n as u64), LowLevelType::Unsigned);
     let hash_field_const =
         || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
     let chars_field_const =

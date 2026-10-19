@@ -529,7 +529,7 @@ pub fn build_ll_new_helper_graph(
         vec![
             Hlvalue::Constant(min_fn),
             Hlvalue::Variable(uint_size),
-            constant_with_lltype(ConstValue::Int(1280), LowLevelType::Unsigned),
+            constant_with_lltype(ConstValue::UInt(1280), LowLevelType::Unsigned),
         ],
         Hlvalue::Variable(uint_min.clone()),
     ));

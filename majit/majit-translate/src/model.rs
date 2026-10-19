@@ -3351,6 +3351,7 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         let matches_case = |link: &Link| match &link.exitcase {
             Some(ExitCase::Bool(b)) => Some(*b) == bool_case,
             Some(ExitCase::Const(ConstValue::Int(n))) => Some(*n) == int_case,
+            Some(ExitCase::Const(ConstValue::UInt(n))) => Some(*n as i64) == int_case,
             _ => false,
         };
         let is_default = |link: &Link| {
@@ -3756,6 +3757,7 @@ pub fn link_arg_is_int_zero(graph: &FunctionGraph, value: &LinkArg) -> bool {
         LinkArg::Const(c) => matches!(
             c.value,
             crate::flowspace::model::ConstValue::Int(0)
+                | crate::flowspace::model::ConstValue::UInt(0)
                 | crate::flowspace::model::ConstValue::Int128(0)
                 | crate::flowspace::model::ConstValue::UInt128(0)
         ),

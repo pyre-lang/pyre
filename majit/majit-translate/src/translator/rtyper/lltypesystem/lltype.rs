@@ -458,21 +458,25 @@ impl LowLevelType {
                 )
             }
             // Upstream checks `typeOf(value)` against the exact Number
-            // primitive (`lltype.py`).  The word and 64-bit
-            // integer families historically share pyre's i64
-            // `ConstValue::Int` carrier.  The 128-bit families have their
-            // own carriers so values outside i64/u64 remain lossless; keep
-            // accepting `Int` there as the legacy representation of small
-            // typed constants while requiring the matching signedness for
-            // the full-width carriers.
-            LowLevelType::Unsigned
-            | LowLevelType::SignedLongLong
-            | LowLevelType::UnsignedLongLong => matches!(value, ConstValue::Int(_)),
+            // primitive (`lltype.py` `_contains_value` →
+            // `isCompatibleType(typeOf(value), self)`). `Unsigned =
+            // build_number("Unsigned", r_uint)` so the constant is
+            // `ConstValue::UInt`. On a 64-bit host `r_ulonglong is
+            // r_uint`, so `UnsignedLongLong` is the same type.
+            // `_numbertypes[r_int] = _numbertypes[int]`: `SignedLongLong`
+            // is `Signed` and its constants stay `Int`.
+            LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => {
+                matches!(value, ConstValue::UInt(_))
+            }
+            LowLevelType::SignedLongLong => matches!(value, ConstValue::Int(_)),
             LowLevelType::SignedLongLongLong => {
                 matches!(value, ConstValue::Int(_) | ConstValue::Int128(_))
             }
             LowLevelType::UnsignedLongLongLong => {
-                matches!(value, ConstValue::Int(_) | ConstValue::UInt128(_))
+                matches!(
+                    value,
+                    ConstValue::Int(_) | ConstValue::UInt(_) | ConstValue::UInt128(_)
+                )
             }
             // upstream `Float` / `SingleFloat` / `LongFloat` accept
             // Python `float`.
@@ -6660,11 +6664,16 @@ mod tests {
         assert!(LowLevelType::Bool.contains_value(&ConstValue::Bool(true)));
         assert!(!LowLevelType::Bool.contains_value(&ConstValue::Int(0)));
 
-        // RPython `Signed` / `Unsigned` / `SignedLongLong` /
-        // `UnsignedLongLong` accept Python int.
+        // RPython `Signed` / `SignedLongLong` accept Python `int`
+        // (`typeOf(42) == Signed`; `SignedLongLong is Signed` on 64-bit).
+        // `Unsigned` / `UnsignedLongLong` accept `r_uint`
+        // (`typeOf(r_uint(42)) == Unsigned`).
         assert!(LowLevelType::Signed.contains_value(&ConstValue::Int(42)));
-        assert!(LowLevelType::Unsigned.contains_value(&ConstValue::Int(42)));
+        assert!(LowLevelType::Unsigned.contains_value(&ConstValue::UInt(42)));
+        assert!(!LowLevelType::Unsigned.contains_value(&ConstValue::Int(42)));
+        assert!(LowLevelType::UnsignedLongLong.contains_value(&ConstValue::UInt(42)));
         assert!(LowLevelType::SignedLongLong.contains_value(&ConstValue::Int(42)));
+        assert!(!LowLevelType::SignedLongLong.contains_value(&ConstValue::UInt(42)));
         assert!(LowLevelType::SignedLongLongLong.contains_value(&ConstValue::Int128(i128::MIN)));
         assert!(LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::UInt128(u128::MAX)));
         assert!(!LowLevelType::SignedLongLongLong.contains_value(&ConstValue::UInt128(u128::MAX)));

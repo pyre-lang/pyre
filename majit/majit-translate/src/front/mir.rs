@@ -7108,11 +7108,12 @@ fn zero_field_cur(ty: &ValueType) -> FieldCur {
         ValueType::SingleFloat => FieldCur::Arg(LinkArg::Const(
             crate::flowspace::model::Constant::new(ConstValue::Int(0)),
         )),
-        ValueType::Int | ValueType::Unsigned | ValueType::State | ValueType::Unknown => {
-            FieldCur::Arg(LinkArg::Const(crate::flowspace::model::Constant::new(
-                ConstValue::Int(0),
-            )))
-        }
+        ValueType::Unsigned => FieldCur::Arg(LinkArg::Const(
+            crate::flowspace::model::Constant::new(ConstValue::UInt(0)),
+        )),
+        ValueType::Int | ValueType::State | ValueType::Unknown => FieldCur::Arg(LinkArg::Const(
+            crate::flowspace::model::Constant::new(ConstValue::Int(0)),
+        )),
     }
 }
 
@@ -7121,7 +7122,7 @@ fn alias_op_for_field(cur: &FieldCur, ty: &ValueType) -> Option<OpKind> {
         FieldCur::NullRef => Some(OpKind::ConstRefNull),
         FieldCur::Arg(arg) => {
             if matches!(ty, ValueType::Unsigned)
-                && matches!(arg, LinkArg::Const(constant) if matches!(constant.value, ConstValue::Int(0)))
+                && matches!(arg, LinkArg::Const(constant) if matches!(constant.value, ConstValue::UInt(0) | ConstValue::Int(0)))
             {
                 return Some(OpKind::ConstUInt(0));
             }
@@ -7973,6 +7974,7 @@ fn link_arg_as_alias_op(value: &crate::model::LinkArg, result_ty: &ValueType) ->
         }),
         LinkArg::Const(constant) => match &constant.value {
             crate::flowspace::model::ConstValue::Int(v) => Some(OpKind::ConstInt(*v)),
+            crate::flowspace::model::ConstValue::UInt(v) => Some(OpKind::ConstUInt(*v)),
             crate::flowspace::model::ConstValue::Int128(v) => Some(OpKind::ConstInt128(*v)),
             crate::flowspace::model::ConstValue::UInt128(v) => Some(OpKind::ConstUInt128(*v)),
             crate::flowspace::model::ConstValue::Float(v) => Some(OpKind::ConstFloat(*v)),
@@ -8468,8 +8470,8 @@ fn niche_option_switch_missing_01_arm(llbc: &Llbc, arms: &[(serde_json::Value, u
     let mut has1 = false;
     for (scalar, _) in arms {
         match scalar_to_const_value(scalar, llbc) {
-            Some(ConstValue::Int(0)) => has0 = true,
-            Some(ConstValue::Int(1)) => has1 = true,
+            Some(ConstValue::Int(0) | ConstValue::UInt(0)) => has0 = true,
+            Some(ConstValue::Int(1) | ConstValue::UInt(1)) => has1 = true,
             _ => return false,
         }
     }
@@ -11595,6 +11597,8 @@ impl<'a> Lowering<'a> {
             (ValueType::Int, DecodedConst::UInt(n)) if n <= i64::MAX as u64 => {
                 Some(ConstValue::Int(n as i64))
             }
+            (ValueType::Unsigned, DecodedConst::UInt(n)) => Some(ConstValue::UInt(n)),
+            (ValueType::Unsigned, DecodedConst::Int(n)) => Some(ConstValue::UInt(n as u64)),
             (ValueType::Int | ValueType::Bool, DecodedConst::Bool(b)) => Some(ConstValue::Bool(b)),
             (ValueType::Float, DecodedConst::Float(bits)) => Some(ConstValue::Float(bits)),
             _ => None,
@@ -13951,6 +13955,7 @@ impl<'a> Lowering<'a> {
                 match &c.value {
                     crate::flowspace::model::ConstValue::Int(_) if already_signed => return value,
                     crate::flowspace::model::ConstValue::Int(n) => *n,
+                    crate::flowspace::model::ConstValue::UInt(n) => *n as i64,
                     crate::flowspace::model::ConstValue::Int128(v)
                         if *v >= i64::MIN as i128 && *v <= i64::MAX as i128 =>
                     {
@@ -43165,8 +43170,8 @@ impl<'a> Lowering<'a> {
                 ))
             })?;
             match case {
-                ConstValue::Int(1) => some_bb = Some(*bb),
-                ConstValue::Int(0) => none_bb = Some(*bb),
+                ConstValue::Int(1) | ConstValue::UInt(1) => some_bb = Some(*bb),
+                ConstValue::Int(0) | ConstValue::UInt(0) => none_bb = Some(*bb),
                 other => {
                     return Err(LowerError::Unsupported(format!(
                         "bb{mir_bb}: niche-Option SwitchInt has non-0/1 case {other:?}"
@@ -70041,13 +70046,15 @@ fn scalar_to_const_value(v: &serde_json::Value, llbc: &Llbc) -> Option<ConstValu
     }
     // `{Scalar: {Signed|Unsigned|Isize|Usize: [ty, value]}}`
     if let Some(scalar) = obj.get("Scalar").and_then(Value::as_object) {
-        for (_k, payload) in scalar {
+        for (k, payload) in scalar {
             let arr = payload.as_array()?;
             if arr.len() != 2 {
                 continue;
             }
-            let n: i64 = scalar_value_to_i64(&arr[1])?;
-            return Some(ConstValue::Int(n));
+            return Some(match k.as_str() {
+                "Unsigned" | "Usize" => ConstValue::UInt(scalar_value_to_u64(&arr[1])?),
+                _ => ConstValue::Int(scalar_value_to_i64(&arr[1])?),
+            });
         }
     }
     // `{Char: "c"}` — character matched as a SwitchInt arm.
@@ -70081,6 +70088,22 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
     }
     if let Some(n) = v.as_u64() {
         return Some(n as i64);
+    }
+    None
+}
+
+fn scalar_value_to_u64(v: &serde_json::Value) -> Option<u64> {
+    if let Some(s) = v.as_str() {
+        return s.parse().ok();
+    }
+    if let Some(b) = v.as_bool() {
+        return Some(u64::from(b));
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(n) = v.as_i64() {
+        return u64::try_from(n).ok();
     }
     None
 }

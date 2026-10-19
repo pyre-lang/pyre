@@ -791,6 +791,7 @@ fn materialize(out: &mut crate::model::FunctionGraph, block: BlockId, hlv: &Hlva
         Hlvalue::Constant(c) => {
             let (kind, lltype) = match &c.value {
                 ConstValue::Int(n) => (OpKind::ConstInt(*n), LowLevelType::Signed),
+                ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
                 ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
                 other => panic!(
                     "jtransform_opname::lower_graph: cannot materialise constant operand {other:?}"
@@ -1306,7 +1307,7 @@ mod tests {
                 OpKind::BinOp { op, .. } => binary.push(op.as_str()),
                 OpKind::LoweredBlackholeOp { opname, .. } => lowered.push(opname.as_str()),
                 OpKind::Live => live += 1,
-                OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => {}
+                OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstFnAddr { .. } => {}
                 other => panic!("unexpected lowered integer-fragment op: {other:?}"),
             }
         }
@@ -1997,7 +1998,7 @@ mod tests {
             vec![
                 callee,
                 Hlvalue::Variable(size),
-                constant_with_lltype(ConstValue::Int(1280), LowLevelType::Unsigned),
+                constant_with_lltype(ConstValue::UInt(1280), LowLevelType::Unsigned),
             ],
             Hlvalue::Variable(out.clone()),
         ));
@@ -2019,7 +2020,9 @@ mod tests {
             for op in &block.operations {
                 match &op.kind {
                     OpKind::Call { target, args, .. } => calls.push((target.clone(), args.len())),
-                    OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => const_ints += 1,
+                    OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstFnAddr { .. } => {
+                        const_ints += 1
+                    }
                     other => residual.push(format!("{other:?}")),
                 }
             }

@@ -88,6 +88,7 @@ fn is_falsy(value: &ConstValue) -> bool {
         ConstValue::None => true,
         ConstValue::Bool(b) => !*b,
         ConstValue::Int(n) => *n == 0,
+        ConstValue::UInt(n) => *n == 0,
         ConstValue::Float(bits) => f64::from_bits(*bits) == 0.0,
         ConstValue::ByteStr(s) => s.is_empty(),
         ConstValue::UniStr(s) => s.is_empty(),

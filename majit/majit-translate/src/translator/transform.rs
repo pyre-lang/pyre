@@ -976,6 +976,7 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
     match cv {
         ConstValue::Bool(_)
         | ConstValue::Int(_)
+        | ConstValue::UInt(_)
         | ConstValue::Int128(_)
         | ConstValue::UInt128(_)
         | ConstValue::Float(_)

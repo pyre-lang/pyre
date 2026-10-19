@@ -369,6 +369,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
 fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
     match value {
         ConstValue::Int(_)
+        | ConstValue::UInt(_)
         | ConstValue::Bool(_)
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)

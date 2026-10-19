@@ -2754,7 +2754,10 @@ impl HighLevelOp {
     ) -> Result<Constant, TyperError> {
         match converted_to.into() {
             ConvertedTo::Repr(repr) => inputconst(repr, value),
-            ConvertedTo::LowLevelType(lltype) => inputconst_from_lltype(lltype, value),
+            ConvertedTo::LowLevelType(lltype) => {
+                let value = const_value_for_integer_lltype(value.clone(), lltype);
+                inputconst_from_lltype(lltype, &value)
+            }
         }
     }
 
@@ -3402,7 +3405,28 @@ pub(crate) fn variable_with_lltype(name: &str, lltype: LowLevelType) -> Variable
 }
 
 pub(crate) fn constant_with_lltype(value: ConstValue, lltype: LowLevelType) -> Hlvalue {
+    let value = const_value_for_integer_lltype(value, &lltype);
     Hlvalue::Constant(Constant::with_concretetype(value, lltype))
+}
+
+/// Stamp an integer constant so `typeOf(value)` matches `lltype`
+/// (`rmodel.inputconst` / `LowLevelType._contains_value`).
+/// `Unsigned` / `UnsignedLongLong` hold `r_uint` (`ConstValue::UInt`);
+/// `Signed` / `SignedLongLong` hold `int` (`ConstValue::Int`).
+/// `rarithmetic.build_int` interns by `(sign, bits)`.
+pub(crate) fn const_value_for_integer_lltype(
+    value: ConstValue,
+    lltype: &LowLevelType,
+) -> ConstValue {
+    match (value, lltype) {
+        (ConstValue::Int(n), LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => {
+            ConstValue::UInt(n as u64)
+        }
+        (ConstValue::UInt(n), LowLevelType::Signed | LowLevelType::SignedLongLong) => {
+            ConstValue::Int(n as i64)
+        }
+        (other, _) => other,
+    }
 }
 
 pub(crate) fn helper_pygraph_from_graph(

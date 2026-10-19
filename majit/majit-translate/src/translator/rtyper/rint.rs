@@ -56,7 +56,9 @@ use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
-use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, LowLevelOpList};
+use crate::translator::rtyper::rtyper::{
+    ConvertedTo, GenopResult, HighLevelOp, LowLevelOpList, const_value_for_integer_lltype,
+};
 
 /// RPython `class IntegerRepr(FloatRepr)` (`rint.py`).
 ///
@@ -238,14 +240,32 @@ impl Repr for IntegerRepr {
         let converted = match value {
             ConstValue::AddressOffset(_) => value.clone(),
             ConstValue::InheritanceId { .. } => value.clone(),
-            ConstValue::Int(_) => value.clone(),
+            ConstValue::Int(n) => match self.lltype {
+                // `cast_primitive(Unsigned, int)` → `r_uint`
+                // (`lltype.Unsigned = build_number("Unsigned", r_uint)`).
+                LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => {
+                    ConstValue::UInt(*n as u64)
+                }
+                _ => value.clone(),
+            },
+            ConstValue::UInt(n) => match self.lltype {
+                LowLevelType::Signed | LowLevelType::SignedLongLong => ConstValue::Int(*n as i64),
+                LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => ConstValue::UInt(*n),
+                LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(*n as u128),
+                _ => value.clone(),
+            },
             // RPython's `typeOf(value)` sees `r_longlonglong` /
             // `r_ulonglonglong` as `lltype.Number` too.  Keep their
             // dedicated carriers intact so `i128::MIN` / `u128::MAX`
             // survive `convert_const` without first narrowing through
             // pyre's legacy i64 integer carrier.
             ConstValue::Int128(_) | ConstValue::UInt128(_) => value.clone(),
-            ConstValue::Bool(value) => ConstValue::Int(i64::from(*value)),
+            ConstValue::Bool(flag) => match self.lltype {
+                LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => {
+                    ConstValue::UInt(u64::from(*flag))
+                }
+                _ => ConstValue::Int(i64::from(*flag)),
+            },
             _ => return Err(TyperError::message(format!("not an integer: {value:?}"))),
         };
         Ok(Constant::with_concretetype(converted, self.lltype.clone()))
@@ -325,10 +345,12 @@ impl Repr for IntegerRepr {
         let mut vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         if self.s_result_unsigned(hop) {
             // upstream `zero = self.lowleveltype._defl()` — the default
-            // primitive value is 0 for the unsigned integer lltypes;
-            // pyre encodes it as `ConstValue::Int(0)` pinned to the
-            // specific lowleveltype.
-            let zero = HighLevelOp::inputconst(&self.lltype, &ConstValue::Int(0))?;
+            // primitive value is 0 for the unsigned integer lltypes.
+            // `rmodel.inputconst` requires `typeOf(value)` to match
+            // (`LowLevelType._contains_value`); Unsigned holds `r_uint`
+            // (`ConstValue::UInt`).
+            let zero_value = const_value_for_integer_lltype(ConstValue::Int(0), &self.lltype);
+            let zero = HighLevelOp::inputconst(&self.lltype, &zero_value)?;
             vlist.insert(0, Hlvalue::Constant(zero));
             let opname = format!("{}sub", self.opprefix()?);
             return Ok(hop.genop(&opname, vlist, GenopResult::LLType(self.lltype.clone())));
@@ -1373,6 +1395,16 @@ mod tests {
         assert_eq!(c.concretetype, Some(LowLevelType::Signed));
         let c = r.convert_const(&ConstValue::Bool(true)).unwrap();
         assert_eq!(c.concretetype, Some(LowLevelType::Signed));
+
+        // `cast_primitive(Unsigned, int)` → `r_uint` (`rint.convert_const`).
+        let u = unsigned_repr();
+        let c = u.convert_const(&ConstValue::Int(7)).unwrap();
+        assert_eq!(c.value, ConstValue::UInt(7));
+        assert_eq!(c.concretetype, Some(LowLevelType::Unsigned));
+        let c = u.convert_const(&ConstValue::UInt(7)).unwrap();
+        assert_eq!(c.value, ConstValue::UInt(7));
+        let c = u.convert_const(&ConstValue::Bool(true)).unwrap();
+        assert_eq!(c.value, ConstValue::UInt(1));
     }
 
     #[test]

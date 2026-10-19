@@ -209,22 +209,26 @@ fn lltype_when_pointer(value: &ConstValue) -> Option<LowLevelType> {
 /// the lltype family that valid pyre carriers can lower into. The
 /// upstream cases are reproduced verbatim where the carrier already
 /// distinguishes them (Bool, Float family, Char, UniChar, Address,
-/// Ptr); the integer family is broadened because pyre flattens the
-/// seven integer Python types into one `Int(i64)` carrier.
+/// Ptr). Signed integers are `ConstValue::Int`; `r_uint` /
+/// `r_ulonglong` are `ConstValue::UInt` (`rarithmetic.build_int`).
 fn const_value_compatible_with_concretetype(value: &ConstValue, t: &LowLevelType) -> bool {
     match (value, t) {
         // Upstream integer families: `int → Signed`, `r_uint →
         // Unsigned`, `r_longlong → SignedLongLong`, `r_ulonglong →
-        // UnsignedLongLong`, `r_longlonglong → SignedLongLongLong`,
-        // `r_ulonglonglong → UnsignedLongLongLong`. pyre's
-        // `Int(i64)` is the common carrier.
+        // UnsignedLongLong`. `SignedLongLong is Signed` on 64-bit
+        // (`_numbertypes[r_int] = _numbertypes[int]`); `UnsignedLongLong
+        // is Unsigned` (`r_ulonglong is r_uint`).
         (
             ConstValue::Int(_),
             LowLevelType::Signed
-            | LowLevelType::Unsigned
             | LowLevelType::SignedLongLong
-            | LowLevelType::UnsignedLongLong
             | LowLevelType::SignedLongLongLong
+            | LowLevelType::UnsignedLongLongLong,
+        ) => true,
+        (
+            ConstValue::UInt(_),
+            LowLevelType::Unsigned
+            | LowLevelType::UnsignedLongLong
             | LowLevelType::UnsignedLongLongLong,
         ) => true,
         (ConstValue::Bool(_), LowLevelType::Bool) => true,
@@ -664,33 +668,28 @@ mod tests {
     }
 
     /// Upstream `support.py:65-69` runs
-    /// `lltype.typeOf(r_uint(7)) == Unsigned`, so an `Int` carrier
-    /// paired with an `Unsigned` concretetype is the *valid* lowering
-    /// of `r_uint(7)`. pyre's flattened `ConstValue::Int(i64)` carries
-    /// every integer Python class, so the compatibility check
-    /// accepts the pair and round-trips the value.
+    /// `lltype.typeOf(r_uint(7)) == Unsigned`. The value is
+    /// `ConstValue::UInt`.
     #[test]
-    fn llvalue_from_constant_accepts_int_carrier_with_unsigned_concretetype() {
-        let c = Constant::with_concretetype(ConstValue::Int(7), LowLevelType::Unsigned);
-        assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(7)));
+    fn llvalue_from_constant_accepts_uint_carrier_with_unsigned_concretetype() {
+        let c = Constant::with_concretetype(ConstValue::UInt(7), LowLevelType::Unsigned);
+        assert_eq!(llvalue_from_constant(&c), Some(ConstValue::UInt(7)));
     }
 
-    /// Same compatibility relaxation extends to `SignedLongLong` /
-    /// `UnsignedLongLong` and the two `LongLongLong` variants —
-    /// upstream's `r_longlong` / `r_ulonglong` / `r_longlonglong` /
-    /// `r_ulonglonglong` all bottom out as `ConstValue::Int(i64)` in
-    /// pyre's carrier model.
+    /// `SignedLongLong` is `Signed` on 64-bit (`_numbertypes[r_int] =
+    /// _numbertypes[int]`), so its constants stay `Int`.
+    /// `UnsignedLongLong` is `Unsigned` (`r_ulonglong is r_uint`).
     #[test]
     fn llvalue_from_constant_accepts_int_carrier_with_long_long_family() {
-        for t in [
-            LowLevelType::SignedLongLong,
-            LowLevelType::UnsignedLongLong,
-            LowLevelType::SignedLongLongLong,
-            LowLevelType::UnsignedLongLongLong,
-        ] {
-            let c = Constant::with_concretetype(ConstValue::Int(42), t);
-            assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(42)));
-        }
+        let c = Constant::with_concretetype(ConstValue::Int(42), LowLevelType::SignedLongLong);
+        assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(42)));
+        let c = Constant::with_concretetype(ConstValue::UInt(42), LowLevelType::UnsignedLongLong);
+        assert_eq!(llvalue_from_constant(&c), Some(ConstValue::UInt(42)));
+        let c = Constant::with_concretetype(ConstValue::Int(42), LowLevelType::SignedLongLongLong);
+        assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(42)));
+        let c =
+            Constant::with_concretetype(ConstValue::Int(42), LowLevelType::UnsignedLongLongLong);
+        assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(42)));
     }
 
     /// Upstream invariant still bites real mismatches: `Bool`

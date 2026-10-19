@@ -270,6 +270,7 @@ fn hlvalue_is_true(value: Option<&Hlvalue>) -> bool {
         Some(Hlvalue::Constant(c)) => match &c.value {
             ConstValue::Bool(value) => *value,
             ConstValue::Int(value) => *value != 0,
+            ConstValue::UInt(value) => *value != 0,
             ConstValue::None => false,
             _ => true,
         },

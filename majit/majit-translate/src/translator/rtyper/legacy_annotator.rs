@@ -221,6 +221,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_) => ValueType::Int,
+        ConstValue::UInt(_) => ValueType::Unsigned,
         ConstValue::Int128(_) => ValueType::Int128,
         ConstValue::UInt128(_) => ValueType::UInt128,
         ConstValue::Float(_) => ValueType::Float,

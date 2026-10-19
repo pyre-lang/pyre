@@ -168,13 +168,12 @@ impl Repr for FloatRepr {
     /// ```
     ///
     /// `base_int` covers RPython's `r_uint` / `r_longlong` etc. from
-    /// `rlib/rarithmetic.py`; pyre maps those to `ConstValue::Int` so
-    /// the `int | base_int | float | bool` check collapses to
-    /// "is the ConstValue an Int, Float, or Bool".
+    /// `rlib/rarithmetic.py`; `r_uint` is `ConstValue::UInt`.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         let as_float = match value {
             ConstValue::Float(bits) => *bits,
             ConstValue::Int(i) => (*i as f64).to_bits(),
+            ConstValue::UInt(i) => (*i as f64).to_bits(),
             ConstValue::Bool(b) => (if *b { 1.0_f64 } else { 0.0_f64 }).to_bits(),
             other => {
                 return Err(TyperError::message(format!("not a float: {other:?}")));

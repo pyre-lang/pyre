@@ -1939,7 +1939,7 @@ fn tuple_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
     };
     if int2.is_immutable_constant()
         && let Some(c) = &int2.base.const_box
-        && let ConstValue::Int(idx) = c.value
+        && let Some(idx) = c.value.as_int()
     {
         let idx_usize = if idx < 0 {
             let adj = tup1.items.len() as i64 + idx;
