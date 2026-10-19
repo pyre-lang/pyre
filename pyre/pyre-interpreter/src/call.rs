@@ -4258,7 +4258,7 @@ fn call_with_minted_keyword_names(
 /// Residual: the flatten arm of `call_args` would otherwise walk an
 /// unregistered `FunctionPath`.
 #[majit_macros::dont_look_inside]
-fn call_with_kwargs_in_ctx_impl(
+pub(crate) fn call_with_kwargs_in_ctx_impl(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     pos_args: &[PyObjectRef],
