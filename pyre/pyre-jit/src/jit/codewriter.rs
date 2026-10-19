@@ -5432,6 +5432,56 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
     groups
 }
 
+/// `-live-` immediately before `op_idx`, skipping Labels / `---`.
+///
+/// `jitcode.py get_live_vars_info` walks BACK `OFFSET_SIZE+1` from an opcode
+/// onto that marker. A different op in between means this opcode has no
+/// attached leading `-live-`.
+fn preceding_live_insn_index(insns: &[super::flatten::Insn], op_idx: usize) -> Option<usize> {
+    let mut i = op_idx;
+    while i > 0 {
+        i -= 1;
+        match &insns[i] {
+            insn if insn.is_live() => return Some(i),
+            super::flatten::Insn::Label(_) | super::flatten::Insn::Unreachable => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Next non-marker opcode after a `-live-` (Labels / `---` / further `-live-`
+/// skipped). The colour→slot row at the marker is this opcode's map.
+fn following_opcode_insn_index(insns: &[super::flatten::Insn], live_idx: usize) -> Option<usize> {
+    insns
+        .iter()
+        .enumerate()
+        .skip(live_idx + 1)
+        .find(|(_, insn)| {
+            !insn.is_live()
+                && !matches!(
+                    insn,
+                    super::flatten::Insn::Label(_) | super::flatten::Insn::Unreachable
+                )
+        })
+        .map(|(i, _)| i)
+}
+
+/// Python PC that owns `insn_idx` as a real opcode: latest `pc_run` start at
+/// or before it, else an exact `first_insn_post_merge` hit.
+fn py_owning_opcode_insn(
+    insn_idx: usize,
+    pc_run: &[(usize, i64)],
+    first_insn: &[Option<usize>],
+) -> Option<usize> {
+    pc_run
+        .iter()
+        .filter(|&&(pos, _)| pos <= insn_idx)
+        .max_by_key(|&&(pos, _)| pos)
+        .map(|&(_, py)| py as usize)
+        .or_else(|| first_insn.iter().position(|&pos| pos == Some(insn_idx)))
+}
+
 /// `PYRE_CATCH_LIVE_CENSUS`: when set to any value, count the silent drop-outs between
 /// `catch_exception` anchors and handler-live widening, so the remaining
 /// anchorless exception-table population can be measured directly.
@@ -6325,6 +6375,34 @@ fn filter_liveness_in_place(
                 pc_entries.dedup();
                 if let Some(slot_out) = marker_pcdep.get_mut(py_pc) {
                     *slot_out = pc_entries;
+                }
+            }
+            // Folded group: unreachable members skip the union loop and leave
+            // `Vec::new()`. `finalize_jitcode` keys the shared marker offset
+            // first-py-wins, so that empty map would ship as the `-live-`
+            // row while `all_liveness` still names colours. Fill empty
+            // members from the opcode this marker precedes (`get_live_vars_info`
+            // walks back onto it), else any reachable sibling's non-empty map.
+            let follow_py = following_opcode_insn_index(&ssarepr.insns, insn_idx).and_then(|idx| {
+                first_insn_post_merge
+                    .iter()
+                    .position(|&pos| pos == Some(idx))
+            });
+            let donor = follow_py
+                .and_then(|py| marker_pcdep.get(py).filter(|m| !m.is_empty()).cloned())
+                .or_else(|| {
+                    py_pcs
+                        .iter()
+                        .copied()
+                        .find_map(|py| marker_pcdep.get(py).filter(|m| !m.is_empty()).cloned())
+                });
+            if let Some(donor) = donor {
+                for &py_pc in &py_pcs {
+                    if let Some(slot_out) = marker_pcdep.get_mut(py_pc)
+                        && slot_out.is_empty()
+                    {
+                        *slot_out = donor.clone();
+                    }
                 }
             }
         }
@@ -16511,11 +16589,47 @@ impl CodeWriter {
         let abort_permanent_some: Vec<(usize, i64)> = ssarepr.abort_permanent_insn_pos.clone();
         // PC-run starts ride the same translation as a fourth sparse group.
         let pc_run_some: Vec<(usize, i64)> = ssarepr.pc_run_insn_pos.clone();
+        // Every assembled `-live-` (first emission and later unrolled copies)
+        // rides the same translation so `pcdep_by_jit_pc` can ship a row at
+        // each marker byte offset. Absent must not mean "inherit predecessor".
+        let all_live_insn_indices: Vec<usize> = ssarepr
+            .insns
+            .iter()
+            .enumerate()
+            .filter(|(_, insn)| insn.is_live())
+            .map(|(i, _)| i)
+            .collect();
+        let mut preceding_live_by_opcode_py: Vec<(usize, usize)> = Vec::new();
+        for (py, pos) in first_insn_post_merge.iter().enumerate() {
+            if let Some(op_idx) = *pos
+                && let Some(live_idx) = preceding_live_insn_index(&ssarepr.insns, op_idx)
+            {
+                preceding_live_by_opcode_py.push((live_idx, py));
+            }
+        }
+        for &(op_idx, py) in &ssarepr.pc_run_insn_pos {
+            if let Some(live_idx) = preceding_live_insn_index(&ssarepr.insns, op_idx) {
+                preceding_live_by_opcode_py.push((live_idx, py as usize));
+            }
+        }
+        let following_opcode_py_by_live: Vec<(usize, usize)> = all_live_insn_indices
+            .iter()
+            .filter_map(|&live_idx| {
+                let follow = following_opcode_insn_index(&ssarepr.insns, live_idx)?;
+                let py = py_owning_opcode_insn(
+                    follow,
+                    &ssarepr.pc_run_insn_pos,
+                    &first_insn_post_merge,
+                )?;
+                Some((live_idx, py))
+            })
+            .collect();
         let mut combined_indices = pc_map.clone();
         combined_indices.extend(after_call_some.iter().map(|(_, idx)| *idx));
         combined_indices.extend(first_insn_some.iter().map(|(_, idx)| *idx));
         combined_indices.extend(abort_permanent_some.iter().map(|(idx, _)| *idx));
         combined_indices.extend(pc_run_some.iter().map(|(idx, _)| *idx));
+        combined_indices.extend(all_live_insn_indices.iter().copied());
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -16547,6 +16661,9 @@ impl CodeWriter {
         // two disjoint regions keeps both, and the byte range between two
         // consecutive entries is exactly one opcode's emission.
         let pc_run_base = abort_permanent_base + abort_permanent_some.len();
+        let live_bytes_base = pc_run_base + pc_run_some.len();
+        let live_bytes: Vec<usize> =
+            combined_bytes[live_bytes_base..live_bytes_base + all_live_insn_indices.len()].to_vec();
         // `(offset, emission index, py_pc)`.  The emission index is carried
         // into the sort key because the run order is what decides the owner
         // below, and it is NOT recoverable from the py_pc: a run that opens a
@@ -17029,14 +17146,66 @@ impl CodeWriter {
             // static analysis, so source its depth from `liveness_for`.
             let static_depth =
                 pyre_jit_trace::state::liveness_for(code as *const _).depth_at_py_pc();
+            let mut pcdep_by_off: BTreeMap<usize, Vec<(u8, u16, u16)>> = BTreeMap::new();
             for (&off, &py) in by_off.iter() {
                 let pcdep = pcdep_color_slots.get(py).cloned().unwrap_or_default();
                 let depth = depth_at_pc.get(py).copied().unwrap_or(0);
                 let const_slots = const_ref_slots_at_pc.get(py).cloned().unwrap_or_default();
-                pcdep_by_jit_pc.push((off, pcdep));
+                pcdep_by_off.insert(off, pcdep);
                 depth_pred_by_jit_pc.push((off, depth));
                 const_ref_slots_by_jit_pc.push((off, const_slots));
             }
+            // Every assembled `-live-` gets its own colour→slot row: the map of
+            // the opcode that marker precedes (`get_live_vars_info` walks back
+            // onto it). A branch-guard `-live-` therefore keeps the jump's
+            // pre-pop resume snapshot, not a later post-pop py. First-py-wins
+            // on a folded offset can pick an unreachable member whose
+            // `marker_pcdep` was empty; overlay the reachable following op.
+            // Later unrolled copies are absent from `block_head_py_by_jit_pc`
+            // and must not inherit the predecessor opcode via the scan.
+            let first_nonempty_row_by_off: BTreeMap<usize, Vec<(u8, u16, u16)>> = {
+                let mut map = BTreeMap::new();
+                for (py, &off) in pc_map_bytes.iter().enumerate() {
+                    if let Some(row) = pcdep_color_slots.get(py)
+                        && !row.is_empty()
+                    {
+                        map.entry(off).or_insert(row.clone());
+                    }
+                }
+                map
+            };
+            let live_byte_off = |live_idx: usize| -> Option<usize> {
+                all_live_insn_indices
+                    .binary_search(&live_idx)
+                    .ok()
+                    .map(|k| live_bytes[k])
+            };
+            let row_for_py = |py: usize, marker_off: usize| -> Vec<(u8, u16, u16)> {
+                let own = pcdep_color_slots.get(py).cloned().unwrap_or_default();
+                if !own.is_empty() {
+                    return own;
+                }
+                first_nonempty_row_by_off
+                    .get(&marker_off)
+                    .cloned()
+                    .unwrap_or(own)
+            };
+            for &(live_idx, py) in &preceding_live_by_opcode_py {
+                if let Some(off) = live_byte_off(live_idx) {
+                    pcdep_by_off.insert(off, row_for_py(py, off));
+                }
+            }
+            for &(live_idx, py) in &following_opcode_py_by_live {
+                if let Some(off) = live_byte_off(live_idx) {
+                    pcdep_by_off
+                        .entry(off)
+                        .or_insert_with(|| row_for_py(py, off));
+                }
+            }
+            for (k, _) in all_live_insn_indices.iter().enumerate() {
+                pcdep_by_off.entry(live_bytes[k]).or_insert_with(Vec::new);
+            }
+            pcdep_by_jit_pc.extend(pcdep_by_off);
             // Marker tier: exact-match, block-head precedence. Source the
             // corrected block-entry PC from the inversion table so the direct
             // depth twin and `containing_py_pc_for_jitcode_pc` cannot diverge.
@@ -19386,6 +19555,100 @@ mod tests {
             std::collections::BTreeSet::from([3]),
             "Int bank must be untouched by the Ref-only filter",
         );
+    }
+
+    /// Folded `-live-` group: an unreachable first member must not publish
+    /// `vec![]` as the shared marker's colour→slot row. Take the reachable
+    /// member's map (`get_live_vars_info` walks back from that opcode).
+    #[test]
+    fn filter_liveness_folded_marker_uses_reachable_member_pcdep() {
+        use pyre_interpreter::bytecode::{Arg, CodeUnit, CodeUnits, OpArgByte};
+        // JUMP_FORWARD over a NOP: pc 1 is unreachable and is the first
+        // member of the folded group; pc 2 is the jump target.
+        let mut code = first_nested_function_code("def f():\n    x = 1\n    return x\n");
+        code.instructions = CodeUnits::from([
+            CodeUnit::new(
+                Instruction::JumpForward {
+                    delta: Arg::marker(),
+                },
+                OpArgByte::new(1),
+            ),
+            CodeUnit::new(Instruction::Nop, OpArgByte::new(0)),
+            CodeUnit::new(Instruction::ReturnValue, OpArgByte::new(0)),
+        ]);
+        let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
+        assert!(
+            live_vars.is_reachable(0),
+            "JUMP_FORWARD at pc 0 is the entry"
+        );
+        assert!(
+            !live_vars.is_reachable(1),
+            "NOP skipped by JUMP_FORWARD must be unreachable"
+        );
+        assert!(
+            live_vars.is_reachable(2),
+            "RETURN at the jump target must be reachable"
+        );
+        let unreachable_pc = 1;
+        let reachable_pc = 2;
+
+        let n = code.instructions.len();
+        let mut ssarepr = SSARepr::new("folded_live_pcdep");
+        let shared_live = ssarepr.insns.len();
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                0,
+            ))]));
+        let follow_op = ssarepr.insns.len();
+        ssarepr.insns.push(Insn::op(
+            "int_is_true",
+            vec![Operand::Register(Register::new(Kind::Int, 0))],
+        ));
+        ssarepr
+            .pc_first_insn_pos
+            .push((reachable_pc as i64, follow_op));
+
+        let mut walker_tracked_pc_live_indices = vec![0usize; n];
+        for py_pc in 0..n {
+            if py_pc == reachable_pc || py_pc == unreachable_pc {
+                walker_tracked_pc_live_indices[py_pc] = shared_live;
+                continue;
+            }
+            walker_tracked_pc_live_indices[py_pc] = ssarepr.insns.len();
+            ssarepr
+                .insns
+                .push(Insn::live(vec![Operand::Register(Register::new(
+                    Kind::Ref,
+                    0,
+                ))]));
+        }
+
+        let reachable_map = vec![(1u8, 0u16, 0u16)];
+        let mut pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> = vec![Vec::new(); n];
+        pcdep_color_slots[reachable_pc] = reachable_map.clone();
+
+        let (_post, _after, _first, marker_pcdep) = filter_liveness_in_place(
+            &mut ssarepr,
+            &code,
+            &pcdep_color_slots,
+            u16::MAX,
+            u16::MAX,
+            Some(&walker_tracked_pc_live_indices),
+            None,
+            false,
+        );
+
+        assert!(
+            !marker_pcdep[reachable_pc].is_empty(),
+            "reachable member must keep its colour→slot map"
+        );
+        assert_eq!(
+            marker_pcdep[unreachable_pc], marker_pcdep[reachable_pc],
+            "folded marker row must equal the reachable member's map, not vec![]"
+        );
+        assert_eq!(marker_pcdep[reachable_pc], reachable_map);
     }
 
     /// Regression: before orphan widening, a `catch_exception` with no

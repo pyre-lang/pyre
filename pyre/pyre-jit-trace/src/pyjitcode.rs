@@ -853,6 +853,31 @@ impl PyJitCode {
         Self::predecessor_index(search).map(|i| table[i].1.clone())
     }
 
+    /// Color→slot map for a snapshot *entry* coordinate.
+    ///
+    /// An exact `pcdep_by_jit_pc` hit is that coordinate's own row, including
+    /// an empty one. A `-live-` that is absent from the first-offset table
+    /// must not inherit the previous opcode's map (`pcdep_for_jitcode_pc`
+    /// predecessor scan): `get_live_vars_info` (`jitcode.py`) walks BACK
+    /// onto the marker itself, and `get_list_of_active_boxes` reads
+    /// `registers_r[index]` there. Interior non-live offsets still
+    /// predecessor-scan.
+    pub fn pcdep_for_snapshot_entry(&self, jit_pc: usize, op_live: u8) -> Vec<(u8, u16, u16)> {
+        let table = &self.metadata.pcdep_by_jit_pc;
+        match table.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            Ok(i) => table[i].1.clone(),
+            Err(_) => {
+                let is_live = self.jitcode.can_decode_live_vars(jit_pc, op_live)
+                    || self.jitcode.code.get(jit_pc) == Some(&op_live);
+                if is_live {
+                    Vec::new()
+                } else {
+                    self.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default()
+                }
+            }
+        }
+    }
+
     /// Value-stack depth keyed by a JitCode byte offset via the
     /// `depth_pred_by_jit_pc` predecessor twin. Equals
     /// `depth_at_py_pc[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction for a
