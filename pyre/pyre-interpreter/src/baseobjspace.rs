@@ -16719,36 +16719,13 @@ pub fn call(
     }
 }
 
-/// Flatten `Arguments` keywords for a non-Function/non-Method callable.
-/// The loop lives here so `call_args` itself is loop-free (`look_inside_graph`
-/// residualizes a loopy graph; `call_args` is not `unroll_safe`).
-#[inline(never)]
-fn flatten_keyword_pairs(
-    keyword_names_w: &[PyObjectRef],
-    keywords_w: &[PyObjectRef],
-) -> Result<Vec<(Wtf8Buf, PyObjectRef)>, PyError> {
-    debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
-    let mut kwargs = Vec::with_capacity(keyword_names_w.len());
-    for i in 0..keyword_names_w.len() {
-        let name = keyword_names_w[i];
-        let value = keywords_w[i];
-        // `do_combine_starstarargs_wrapped` already rejects a non-string
-        // key while `**` is expanded, so this only guards the WTF-8 read
-        // below for `Arguments` values built natively instead.
-        if unsafe { !is_str(name) } {
-            return Err(PyError::type_error("keywords must be strings"));
-        }
-        kwargs.push((unsafe { w_str_get_wtf8(name) }.to_owned(), value));
-    }
-    Ok(kwargs)
-}
-
 /// PyPy `descroperation.py call_args` — dispatch one structured
 /// `Arguments` instance without flattening its keyword half.
 ///
 /// `Function.call_args` → `PyCode.funcrun` → `Arguments.parse_into_scope`.
 /// `_Method.call_args` prepends the instance and recurses. Everything else
-/// flattens into `call_with_kwargs_in_ctx` (builtins, types, `__call__`).
+/// forwards the original `keyword_names_w` objects through
+/// `call_with_kwargs_in_ctx_impl` (builtins, types, `__call__`).
 pub fn call_args(
     callable: PyObjectRef,
     args: &crate::argument::Arguments,
@@ -16799,10 +16776,12 @@ fn call_args_generic(
     )
 }
 
-/// Residual: `flatten_keyword_pairs` returns
-/// `Result<Vec<(Wtf8Buf, PyObjectRef)>>`, whose Ok payload would share
-/// the unspecialized `result::Result` ClassDef with `funcrun`'s
-/// `Result<PyObjectRef, PyError>` (`RustVec ∪ object`).
+/// Residual: `descroperation.py call_args` looks up `__call__` and
+/// `get_and_call_args`s the original `Arguments`. Forward
+/// `keyword_names_w` / `keywords_w` without reminting
+/// (`call_with_kwargs_in_ctx_impl`). The helper is residual so
+/// `call_args` stays loop-free (`look_inside_graph` residualizes a loopy
+/// graph; `call_args` is not `unroll_safe`).
 #[majit_macros::dont_look_inside]
 fn call_args_keyword_pairs(
     callable: PyObjectRef,
@@ -16810,12 +16789,36 @@ fn call_args_keyword_pairs(
 ) -> Result<PyObjectRef, PyError> {
     let keyword_names_w: &[PyObjectRef] = args.keyword_names_w.as_deref().unwrap_or(&[]);
     let keywords_w: &[PyObjectRef] = args.keywords_w.as_deref().unwrap_or(&[]);
-    let kwargs = flatten_keyword_pairs(keyword_names_w, keywords_w)?;
-    crate::call::call_with_kwargs_in_ctx(
+    let pos = args.arguments_w.as_slice();
+    debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
+    for &name in keyword_names_w {
+        if unsafe { !is_str(name) } {
+            return Err(PyError::type_error("keywords must be strings"));
+        }
+    }
+    // `Arguments.keyword_names_w` stays the mapping's own key objects
+    // (`_collect_keyword_args` setitems that name). Pin the callable, the
+    // positionals, the values and the names (`pin_roots` publishes the run
+    // then normalizes) and reload each word from its slot.
+    let npos = pos.len();
+    let nkw = keyword_names_w.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = roots.pin_roots(&[callable]);
+    let pos_base = roots.pin_roots(pos);
+    let values_base = roots.pin_roots(keywords_w);
+    let names_base = roots.pin_roots(keyword_names_w);
+    let callable = roots.get(callable_slot);
+    let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
+    let values_now: Vec<PyObjectRef> = (0..nkw).map(|i| roots.get(values_base + i)).collect();
+    let names_now: Vec<PyObjectRef> = (0..nkw).map(|i| roots.get(names_base + i)).collect();
+    crate::call::call_with_kwargs_in_ctx_impl(
         crate::call::getexecutioncontext(),
         callable,
-        &args.arguments_w,
-        &kwargs,
+        &pos_now,
+        &names_now,
+        &values_now,
+        true,
+        std::ptr::null_mut(),
     )
 }
 
