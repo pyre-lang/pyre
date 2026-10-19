@@ -1,6 +1,13 @@
 # pyre-check: pypy-diverges: pins a recursion depth decided by sys.setrecursionlimit alone; pypy3's moves between repeats
 # CPython-suite gap: recursion tests do not compare cold and JIT-hot call depth.
 # parity-tests reason: this guards pyre's native budget across JIT guard resume.
+#
+# warm_recursion_honours_the_recursion_limit:
+# test_sys exercises `sys.setrecursionlimit` on cold frames only, so nothing there grades
+# a recursion whose levels all run as compiled code. a self-recursive function warmed past
+# the function-entry threshold runs its recursion through the trace's own
+# `CALL_ASSEMBLER`. Every level below the first is an activation the trace mints, so it
+# reaches no interpreter door, and the logical half of the recursion check has no other
 
 """`sys.setrecursionlimit` must keep deciding how deep recursion goes after
 the recursive function is JIT-hot.
@@ -81,4 +88,57 @@ sys.setrecursionlimit(2000)
 check("raised limit", readings(rounds=6), 2000)
 sys.setrecursionlimit(limit)
 
+def warm_recursion_honours_the_recursion_limit():
+    """A warm recursive function still answers to `sys.setrecursionlimit`.
+
+    `rec` is entered thousands of times before the limit is lowered, so the JIT
+    owns it by the time the deep call arrives. The limit has to bound that call
+    the same way it bounds `cold_rec`, which is the same function text run once.
+
+    The module body deliberately keeps the deep call in a helper of its own and
+    does not wrap it in a `try`/`finally`: both change which of the module frame's
+    statements run compiled, and the recursion has to start from compiled code for
+    this to grade anything.
+    """
+
+    import sys
+
+
+    def rec(n):
+        return 0 if n <= 0 else rec(n - 1) + 1
+
+
+    def cold_rec(n):
+        return 0 if n <= 0 else cold_rec(n - 1) + 1
+
+
+    def warm_overflows(depth):
+        try:
+            rec(depth)
+        except RecursionError:
+            return True
+        return False
+
+
+    def cold_overflows(depth):
+        try:
+            cold_rec(depth)
+        except RecursionError:
+            return True
+        return False
+
+
+    # Warm past the function-entry threshold, so `rec` is entered as compiled code
+    # rather than through the interpreter's own activation door.
+    for _ in range(3000):
+        rec(20)
+
+    sys.setrecursionlimit(500)
+    assert rec(100) == 100
+    assert warm_overflows(1000), "a warm recursion outran a limit of 500"
+    assert cold_overflows(1000)
+    # The budget the raise consumed is given back, so the next call answers.
+    assert rec(100) == 100
+    sys.setrecursionlimit(1000)
+warm_recursion_honours_the_recursion_limit()
 print("OK")

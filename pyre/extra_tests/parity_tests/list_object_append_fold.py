@@ -13,6 +13,10 @@
 # side-exits to the resizing push.  Each loop therefore crosses several
 # reallocation boundaries, and the interleaved `pop` / `insert` / slot
 # assignment keep exercising the same block from the non-folded side.
+#
+# list_pop_fold:
+# list tests do not trace pop across strategy changes and guards. this guards pyre's eager
+# JIT fold and rollback journal.
 
 N = 400
 
@@ -201,4 +205,169 @@ run()
 # so this run executes the compiled form rather than building it.
 run()
 
+def list_pop_fold():
+    N = 400
+
+
+    def check(got, want, label):
+        assert got == want, "%s: %r != %r" % (label, got, want)
+
+
+    # ── the folded shape: append then pop, hot, with a live result ──
+    def append_pop_live(n):
+        xs = [0, 1, 2, 3, 4]
+        total = 0
+        i = 0
+        while i < n:
+            xs.append(i)
+            total = total + xs.pop()
+            i = i + 1
+        return total * 100 + len(xs)
+
+
+    def expected_append_pop_live(n):
+        return sum(range(n)) * 100 + 5
+
+
+    # ── the same shape with the result discarded, so the box is dead ──
+    def append_pop_dead(n):
+        xs = [7, 8, 9]
+        i = 0
+        while i < n:
+            xs.append(i)
+            xs.pop()
+            i = i + 1
+        return len(xs) * 1000 + xs[0] * 100 + xs[2]
+
+
+    # ── two receivers alternating: a wrong rewind routes a value to the other list
+    def two_receivers(n):
+        xs = [0]
+        ys = [0]
+        a = 0
+        b = 0
+        i = 0
+        while i < n:
+            xs.append(i)
+            ys.append(-i)
+            a = a + xs.pop()
+            b = b + ys.pop()
+            i = i + 1
+        return a + b + len(xs) + len(ys)
+
+
+    # ── draining to empty, then one pop too many ──
+    def drain_then_overpop(n):
+        xs = []
+        i = 0
+        while i < n:
+            xs.append(i)
+            i = i + 1
+        total = 0
+        while xs:
+            total = total + xs.pop()
+        try:
+            xs.pop()
+        except IndexError as e:
+            return total * 10 + len(str(e).split()[0])
+        return -1
+
+
+    # ── declines: the indexed form, and the non-Integer strategies ──
+    def pop_indexed(n):
+        xs = list(range(n))
+        total = 0
+        i = 0
+        while i < n // 2:
+            total = total + xs.pop(0)
+            i = i + 1
+        return total * 100 + len(xs)
+
+
+    def pop_float(n):
+        xs = [0.5]
+        total = 0.0
+        i = 0
+        while i < n:
+            xs.append(i + 0.5)
+            total = total + xs.pop()
+            i = i + 1
+        return int(total * 2) * 10 + len(xs)
+
+
+    def pop_object(n):
+        xs = ["seed"]
+        total = 0
+        i = 0
+        while i < n:
+            xs.append("e%d" % (i % 7))
+            total = total + int(xs.pop()[1:])
+            i = i + 1
+        return total * 10 + len(xs)
+
+
+    # ── despecialisation mid-loop: an Integer list that becomes an Object one ──
+    class Box(object):
+        def __init__(self, v):
+            self.v = v
+
+    def pop_object_strategy(n):
+        pool = [Box(0), Box(1), Box(2), Box(3), Box(4), Box(5), Box(6)]
+        xs = [pool[0]]
+        total = 0
+        i = 0
+        while i < n:
+            xs.append(pool[i % 7])
+            total = total + xs.pop().v
+            i = i + 1
+        return total * 10 + len(xs)
+
+    def pop_object_strategy_dead(n):
+        pool = [Box(0), Box(1)]
+        xs = [pool[0], pool[1]]
+        i = 0
+        while i < n:
+            xs.append(pool[i % 2])
+            xs.pop()
+            i = i + 1
+        return len(xs) * 10 + xs[0].v + xs[1].v
+
+    def strategy_flip(n):
+        xs = [0, 1, 2]
+        total = 0
+        i = 0
+        while i < n:
+            if i == n // 2:
+                xs.append("x")
+                total = total + len(xs.pop())
+            else:
+                xs.append(i)
+                total = total + xs.pop()
+            i = i + 1
+        return total * 10 + len(xs)
+
+
+    def run():
+        check(append_pop_live(N), expected_append_pop_live(N), "append_pop_live")
+        check(append_pop_dead(N), 3 * 1000 + 7 * 100 + 9, "append_pop_dead")
+        check(two_receivers(N), 2, "two_receivers")
+        check(drain_then_overpop(N), sum(range(N)) * 10 + 3, "drain_then_overpop")
+        check(pop_indexed(N), sum(range(N // 2)) * 100 + N - N // 2, "pop_indexed")
+        check(pop_float(N), (sum(range(N)) * 2 + N) * 10 + 1, "pop_float")
+        check(pop_object(N), sum(i % 7 for i in range(N)) * 10 + 1, "pop_object")
+        check(
+            pop_object_strategy(N),
+            sum(i % 7 for i in range(N)) * 10 + 1,
+            "pop_object_strategy",
+        )
+        check(pop_object_strategy_dead(N), 2 * 10 + 0 + 1, "pop_object_strategy_dead")
+        check(strategy_flip(N), (sum(range(N)) - N // 2 + 1) * 10 + 3, "strategy_flip")
+
+
+    run()
+
+    # A second pass on already-warm code: every loop above has been traced by now,
+    # so this run executes the compiled form rather than building it.
+    run()
+list_pop_fold()
 print("OK")

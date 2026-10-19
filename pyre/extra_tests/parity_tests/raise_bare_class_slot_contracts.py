@@ -1,5 +1,10 @@
 # CPython-suite gap: exception tests do not hot-loop flattened slots after bare-class raises.
 # parity-tests reason: pins slot defaults and live payloads without distorting synth jitstats.
+#
+# raise_bare_class_bridge_identity:
+# exception tests do not alternate bare exception classes at one hot raise site after a
+# guard bridge has compiled. a bridge must keep the normalized exception instance distinct
+# from the bare class operand that produced it.
 
 """Bare-class raise initializes every flattened exception slot."""
 
@@ -105,4 +110,37 @@ for _ in range(3000):
         except StopIteration as inner:
             assert inner.__context__ is outer and inner.value is None
 
+def raise_bare_class_bridge_identity():
+    N = 200000
+
+
+    class UserError(Exception):
+        pass
+
+
+    def raise_it(cls):
+        raise cls
+
+
+    def probe(cls):
+        caught = 0
+        last = None
+        i = 0
+        while i < N:
+            try:
+                raise_it(cls)
+            except BaseException as exc:
+                caught += 1
+                last = exc
+            i += 1
+        assert caught == N, (cls, caught)
+        assert type(last) is cls, (cls, type(last))
+        return last
+
+
+    # Order is the condition: a class the bare-class raise fold accepts, then one it
+    # declines, then a second accepted class not yet seen at this site.
+    for exception_class in (ValueError, UserError, RuntimeError):
+        probe(exception_class)
+raise_bare_class_bridge_identity()
 print("OK")

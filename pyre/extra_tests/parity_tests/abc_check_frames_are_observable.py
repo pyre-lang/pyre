@@ -17,6 +17,13 @@
 #
 # CPython, PyPy and pyre agree on both observations today, so this is a parity
 # fact rather than a house rule.
+#
+# abcmeta_type_call_inline:
+# `test_abc` never instantiates an ABCMeta-built class in a loop hot enough to compile,
+# and no suite test installs `__call__` on a metaclass after such a loop has run.
+# `typeobject.py:_type_call` runs unless the metatype supplies a `__call__` of its own. An
+# `ABCMeta` subclass supplies `__instancecheck__`, `__subclasscheck__` and `register` and
+# leaves `__call__` alone, so a class built with one instantiates through the same path a
 import sys
 import abc
 
@@ -180,4 +187,56 @@ the_cache_membership_body_is_not_a_frame()
 # does not apply.
 if hasattr(abc.ABCMeta('_Probe', (), {}), '_abc_cache'):
     the_declined_membership_body_is_not_a_frame()
+
+def abcmeta_type_call_inline():
+    import abc
+
+    N = 40000
+    SWITCH = N // 2
+
+
+    class Meta(abc.ABCMeta):
+        pass
+
+
+    class Point(metaclass=Meta):
+        def __init__(self, x):
+            self.x = x
+
+
+    class Fixed:
+        x = 7
+
+
+    def inlines():
+        # The plain shape: default `__new__`, an `__init__` the walk can enter, and
+        # a metaclass that overrides neither.
+        total = 0
+        i = 0
+        while i < N:
+            total += Point(i).x
+            i += 1
+        assert total == N * (N - 1) // 2, 'wrong sum: %r' % (total,)
+
+
+    def metaclass_gains_call():
+        total = 0
+        i = 0
+        while i < N:
+            total += Point(i).x
+            if i == SWITCH:
+                Meta.__call__ = lambda cls, x: Fixed()
+            i += 1
+        # `i == SWITCH` is assigned before the rebind, so iterations 0..SWITCH read
+        # their own index and the rest read `Fixed.x`.
+        expected = SWITCH * (SWITCH + 1) // 2 + (N - SWITCH - 1) * 7
+        assert total == expected, 'baked a stale metaclass __call__: %r != %r' % (
+            total,
+            expected,
+        )
+
+
+    inlines()
+    metaclass_gains_call()
+abcmeta_type_call_inline()
 print('OK')
