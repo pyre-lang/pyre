@@ -709,7 +709,7 @@ class StackSummary(list):
         return ''.join(row)
 
     def _should_show_carets(self, start_offset, end_offset, all_lines, anchors):
-        with suppress(SyntaxError, ImportError):
+        with suppress(SyntaxError, ImportError, AttributeError):
             import ast
             tree = ast.parse('\n'.join(all_lines))
             if not tree.body:
