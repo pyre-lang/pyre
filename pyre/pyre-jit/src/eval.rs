@@ -14510,18 +14510,74 @@ fn materialize_virtual_from_rd(
     // Phase 3: setfields — decode each field and write to object.
     // resume.py: for each fielddescr, decoder.setfield(struct, num, descr)
     let is_instance = matches!(kind, VirtualKind::Instance { .. });
-    match kind {
-        VirtualKind::Instance { known_class, .. }
-            if known_class == Some(&pyre_object::INT_TYPE as *const _ as i64) =>
-        {
-            // W_IntObject fast path: find intval field.
-            // fielddescrs may include ob_type (offset 0) first.
-            let intval_idx = fielddescrs
-                .iter()
-                .position(|fd| fd.offset == INT_INTVAL_OFFSET)
-                .unwrap_or(0);
-            if let Some(&tagged) = fieldnums.get(intval_idx) {
-                let intval = decode_int(
+    // resume.py AbstractVirtualStructInfo.setfields:
+    // skip only UNINITIALIZED; an explicit NULLREF is still stored
+    // (`decoder.setfield(struct, num, descr)`).
+    for (i, &tagged) in fieldnums.iter().enumerate() {
+        if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
+            continue;
+        }
+        let Some(descr) = fielddescrs.get(i) else {
+            debug_assert!(false, "fielddescrs missing for field {}", i);
+            continue;
+        };
+        // Skip vtable slot (offset 0) for Instance — already set by allocate_with_vtable.
+        if descr.offset == 0 && is_instance {
+            continue;
+        }
+        // resume.py ResumeDataDirectReader.setfield: kind from descr
+        // (is_pointer_field -> decode_ref; is_float_field ->
+        // decode_float; else decode_int).
+        match descr.field_type {
+            // Pointer-width store: 4 bytes on wasm32. A fixed
+            // 8-byte write runs past the object whenever the ref
+            // is the struct's last field, and the high half of a
+            // 32-bit pointer is zero, so the neighbouring 4 bytes
+            // are zeroed. Same width contract as
+            // `VirtualizableInfo::write_field` and
+            // `bh_setfield_gc_r`.
+            majit_ir::Type::Ref => {
+                let p = decode_ref(
+                    tagged,
+                    dead_frame,
+                    num_failargs,
+                    rd_consts,
+                    rd_virtuals,
+                    virtuals_cache,
+                );
+                // `resume.py` `setfields`: re-read `virtuals_cache` after
+                // decode (`getvirtual_ptr` / `abstract_virtual_struct_info_setfields`).
+                let obj_ptr = virtuals_cache.live_ptr(vidx);
+                unsafe {
+                    let addr = (obj_ptr as *mut u8).add(descr.offset);
+                    // `resume.py ResumeDataDirectReader.setfield` reaches
+                    // this store through `cpu.bh_setfield_gc_r`, whose
+                    // `write_ref_at_mem` (llmodel.py) carries the
+                    // framework GC transformer's barrier. This
+                    // materializer writes the field itself, so it owes
+                    // the same barrier: `allocate_with_vtable` /
+                    // `allocate_struct` build the virtual straight in
+                    // the non-moving old generation, so a young `p` is
+                    // an old -> young edge that reaches
+                    // `old_objects_pointing_to_young` only from here.
+                    // Per store, not once per object — decoding a later
+                    // field can materialize a nested virtual, and the
+                    // collection that runs there drains the remembered
+                    // set and restores `TRACK_YOUNG_PTRS`.
+                    write_barrier_after_ref_store(obj_ptr as i64);
+                    std::ptr::write(addr as *mut usize, p.0);
+                }
+            }
+            majit_ir::Type::Float => {
+                let bits = decode_float(tagged, dead_frame, num_failargs, rd_consts).to_bits();
+                let obj_ptr = virtuals_cache.live_ptr(vidx);
+                unsafe {
+                    let addr = (obj_ptr as *mut u8).add(descr.offset);
+                    std::ptr::write(addr as *mut u64, bits);
+                }
+            }
+            _ => {
+                let raw = decode_int(
                     tagged,
                     dead_frame,
                     num_failargs,
@@ -14531,114 +14587,12 @@ fn materialize_virtual_from_rd(
                 );
                 let obj_ptr = virtuals_cache.live_ptr(vidx);
                 unsafe {
-                    (*(obj_ptr as *mut pyre_object::intobject::W_IntObject)).intval = intval;
-                }
-            }
-        }
-        VirtualKind::Instance { known_class, .. }
-            if known_class == Some(&pyre_object::FLOAT_TYPE as *const _ as i64) =>
-        {
-            // W_FloatObject fast path: find floatval field.
-            let floatval_idx = fielddescrs
-                .iter()
-                .position(|fd| fd.offset == FLOAT_FLOATVAL_OFFSET)
-                .unwrap_or(0);
-            if let Some(&tagged) = fieldnums.get(floatval_idx) {
-                let floatval = decode_float(tagged, dead_frame, num_failargs, rd_consts);
-                let obj_ptr = virtuals_cache.live_ptr(vidx);
-                unsafe {
-                    (*(obj_ptr as *mut pyre_object::floatobject::W_FloatObject)).floatval =
-                        floatval;
-                }
-            }
-        }
-        _ => {
-            // resume.py AbstractVirtualStructInfo.setfields:
-            // skip only UNINITIALIZED; an explicit NULLREF is still stored
-            // (`decoder.setfield(struct, num, descr)`).
-            for (i, &tagged) in fieldnums.iter().enumerate() {
-                if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
-                    continue;
-                }
-                let Some(descr) = fielddescrs.get(i) else {
-                    debug_assert!(false, "fielddescrs missing for field {}", i);
-                    continue;
-                };
-                // Skip vtable slot (offset 0) for Instance — already set by allocate_with_vtable.
-                if descr.offset == 0 && is_instance {
-                    continue;
-                }
-                // resume.py ResumeDataDirectReader.setfield: kind from descr
-                // (is_pointer_field -> decode_ref; is_float_field ->
-                // decode_float; else decode_int).
-                match descr.field_type {
-                    // Pointer-width store: 4 bytes on wasm32. A fixed
-                    // 8-byte write runs past the object whenever the ref
-                    // is the struct's last field, and the high half of a
-                    // 32-bit pointer is zero, so the neighbouring 4 bytes
-                    // are zeroed. Same width contract as
-                    // `VirtualizableInfo::write_field` and
-                    // `bh_setfield_gc_r`.
-                    majit_ir::Type::Ref => {
-                        let p = decode_ref(
-                            tagged,
-                            dead_frame,
-                            num_failargs,
-                            rd_consts,
-                            rd_virtuals,
-                            virtuals_cache,
-                        );
-                        // `resume.py` `setfields`: re-read `virtuals_cache` after
-                        // decode (`getvirtual_ptr` / `abstract_virtual_struct_info_setfields`).
-                        let obj_ptr = virtuals_cache.live_ptr(vidx);
-                        unsafe {
-                            let addr = (obj_ptr as *mut u8).add(descr.offset);
-                            // `resume.py ResumeDataDirectReader.setfield` reaches
-                            // this store through `cpu.bh_setfield_gc_r`, whose
-                            // `write_ref_at_mem` (llmodel.py) carries the
-                            // framework GC transformer's barrier. This
-                            // materializer writes the field itself, so it owes
-                            // the same barrier: `allocate_with_vtable` /
-                            // `allocate_struct` build the virtual straight in
-                            // the non-moving old generation, so a young `p` is
-                            // an old -> young edge that reaches
-                            // `old_objects_pointing_to_young` only from here.
-                            // Per store, not once per object — decoding a later
-                            // field can materialize a nested virtual, and the
-                            // collection that runs there drains the remembered
-                            // set and restores `TRACK_YOUNG_PTRS`.
-                            write_barrier_after_ref_store(obj_ptr as i64);
-                            std::ptr::write(addr as *mut usize, p.0);
-                        }
-                    }
-                    majit_ir::Type::Float => {
-                        let bits =
-                            decode_float(tagged, dead_frame, num_failargs, rd_consts).to_bits();
-                        let obj_ptr = virtuals_cache.live_ptr(vidx);
-                        unsafe {
-                            let addr = (obj_ptr as *mut u8).add(descr.offset);
-                            std::ptr::write(addr as *mut u64, bits);
-                        }
-                    }
-                    _ => {
-                        let raw = decode_int(
-                            tagged,
-                            dead_frame,
-                            num_failargs,
-                            rd_consts,
-                            rd_virtuals,
-                            virtuals_cache,
-                        );
-                        let obj_ptr = virtuals_cache.live_ptr(vidx);
-                        unsafe {
-                            let addr = (obj_ptr as *mut u8).add(descr.offset);
-                            match descr.field_size {
-                                1 => std::ptr::write(addr, raw as u8),
-                                2 => std::ptr::write(addr as *mut u16, raw as u16),
-                                4 => std::ptr::write(addr as *mut u32, raw as u32),
-                                _ => std::ptr::write(addr as *mut i64, raw),
-                            }
-                        }
+                    let addr = (obj_ptr as *mut u8).add(descr.offset);
+                    match descr.field_size {
+                        1 => std::ptr::write(addr, raw as u8),
+                        2 => std::ptr::write(addr as *mut u16, raw as u16),
+                        4 => std::ptr::write(addr as *mut u32, raw as u32),
+                        _ => std::ptr::write(addr as *mut i64, raw),
                     }
                 }
             }
@@ -15354,14 +15308,17 @@ fn build_resumed_frames(
                 frame.values.len()
             );
         }
-        let mut values = Vec::new();
+        // Rooted per push: a later section's materialization, pending-field
+        // replay and the vable sync below can collect before the section
+        // frame red is read back out of these copies.
+        let mut values = Vec::with_capacity(frame.values.len());
         _prepare_next_section(
             frame,
             &dead_frame_typed,
             exit_layout,
             &mut values,
             virtuals_cache,
-            false,
+            true,
         );
         all_values.push(values);
     }
@@ -15572,13 +15529,6 @@ fn build_resumed_frames(
             pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
                 .unwrap_or(std::ptr::null())
         };
-        // `dispatch_bytecode` (pyopcode.py) stamps `last_instr` on this
-        // frame before the opcode; resume py_pc is that coordinate.
-        if !is_outermost && !frame_ptr.is_null() {
-            unsafe {
-                (*frame_ptr).last_instr = py_pc as isize;
-            }
-        }
         // consume_vable_info writes the outermost vsd; an inlined
         // callee answers from its own materialized frame.
         let vsd = if is_outermost {
