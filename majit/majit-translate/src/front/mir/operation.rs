@@ -2,6 +2,19 @@
 
 use super::*;
 
+/// Whether `&place` / `&raw place` is the field's address, and whether
+/// the FieldRead must restamp as a raw-enum address (`Int`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::front::mir) enum BorrowAddress {
+    /// The borrow aliases the referent value.
+    None,
+    /// Projection borrow: `taken_by_address` on the FieldRead.
+    Field,
+    /// Result `&T` is a raw address and the owner is a raw-address Deref:
+    /// restamp the FieldRead as Int (`BufferView::backing`).
+    RawEnumField,
+}
+
 impl<'a> Lowering<'a> {
     /// `ptr::add` consumed only as `(*dest).field` on a struct pointee.
     ///
@@ -3179,12 +3192,16 @@ impl<'a> Lowering<'a> {
                 // `&mut self._s` is the `getfield` of that reference, not the
                 // address of an inline substructure. A transparent scalar
                 // (`CodeFlags`) borrow is the word, not an address.
-                let projection = self.place_borrow_takes_address(&place)
-                    && !tyref_is_string_builder(&place.ty, self.llbc);
+                let address = self.place_borrow_takes_address(&place, dest_ty);
+                let address = if !tyref_is_string_builder(&place.ty, self.llbc) {
+                    address
+                } else {
+                    BorrowAddress::None
+                };
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 // A Deref reborrow of an existing `&[u8]` keeps the identity.
                 let v = self.resolve_place(mir_bb, place)?;
-                self.mark_place_address_of(mir_bb, projection, before, &v);
+                self.mark_place_address_of(mir_bb, address, before, &v);
                 Ok((None, v))
             }
             // `RawPtr { place, ... }` — `&raw const x` / `&raw mut x`.
@@ -3205,10 +3222,10 @@ impl<'a> Lowering<'a> {
                 if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
                     return Ok((None, address));
                 }
-                let projection = self.place_borrow_takes_address(&place);
+                let address = self.place_borrow_takes_address(&place, dest_ty);
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
-                self.mark_place_address_of(mir_bb, projection, before, &v);
+                self.mark_place_address_of(mir_bb, address, before, &v);
                 Ok((None, v))
             }
             // `Repeat(elem, elem_ty, count)` — `[v; N]` literal. The
@@ -6383,18 +6400,42 @@ impl<'a> Lowering<'a> {
     /// An erased `OwnerRootGuard` is that one reference. Borrowing the
     /// option to match on it reads the word `new` stored; marking the
     /// read as an address would hand the consumer the slot instead.
-    pub(in crate::front::mir) fn place_borrow_takes_address(&self, place: &Place) -> bool {
+    ///
+    /// A borrow whose result `&T` is a raw address (`ty_is_raw_address`)
+    /// and whose owner is reached through a raw-address Deref is also
+    /// the field's address (`rewrite_op_getsubstruct` `int_add`). The
+    /// field *value* of a tagged enum intern's `Ref` (`SomeInstance`);
+    /// `&Enum` intern's `Int`. `container_owner_declared_gc` only
+    /// stamps a raw owner for an int-bank field value, so this arm
+    /// covers the borrow of a Ref-bank field off a raw-address Deref
+    /// (`BufferView::backing` `&self.backing`).
+    pub(in crate::front::mir) fn place_borrow_takes_address(
+        &self,
+        place: &Place,
+        dest_ty: &TyRef,
+    ) -> BorrowAddress {
         if owner_root_guard::tyref_is_guard(&place.ty, self.llbc)
             || owner_root_guard::tyref_is_option_of_guard(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_root(&place.ty, self.llbc)
             || rbigint_gc_root::tyref_is_option_of_root(&place.ty, self.llbc)
         {
-            return false;
+            return BorrowAddress::None;
         }
+        // A raw-owned exception attr is the pointer word the instance holds,
+        // not the field's address.
         if self.place_is_raw_owned_exception_field(place) {
-            return false;
+            return BorrowAddress::None;
         }
-        Self::place_ref_is_address_of(place)
+        let raw_enum_field = ty_is_raw_address(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) && self.place_owner_reached_through_raw_address_deref(place);
+        if raw_enum_field {
+            return BorrowAddress::RawEnumField;
+        }
+        if Self::place_ref_is_address_of(place)
             && tyref_transparent_inner_value_type(
                 &place.ty,
                 self.llbc,
@@ -6403,6 +6444,34 @@ impl<'a> Lowering<'a> {
                 &self.raw_alloc_flavor_structs,
             )
             .is_none()
+        {
+            return BorrowAddress::Field;
+        }
+        BorrowAddress::None
+    }
+
+    /// Walk Field / Downcast projections to the Deref that reaches the
+    /// field's owner. `true` when that owner's type is a raw address
+    /// (`&BufferView`, `*mut Signature`). A by-value local or a Deref of
+    /// a GC / Ref-bank owner is `false`.
+    pub(in crate::front::mir) fn place_owner_reached_through_raw_address_deref(
+        &self,
+        place: &Place,
+    ) -> bool {
+        match &place.kind {
+            PlaceKind::Projection(inner, elem) => {
+                if matches!(elem, ProjectionElem::Atom(s) if s == "Deref") {
+                    return ty_is_raw_address(
+                        &inner.ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    );
+                }
+                self.place_owner_reached_through_raw_address_deref(inner)
+            }
+            _ => false,
+        }
     }
 
     /// Record that the `Variable` just resolved for a place is the
@@ -6425,11 +6494,11 @@ impl<'a> Lowering<'a> {
     /// Both guards are load-bearing, because a local's Variable *is* the
     /// Variable of whatever op produced it:
     ///
-    /// - `projection` — `&mut x` on a bare local resolves to that local's
-    ///   Variable with nothing emitted.  Matching on the last op's result
-    ///   alone would then mark the op that produced `x`, which may be an
-    ///   unrelated earlier field read.  Autoref makes this the common
-    ///   case, not a corner: `self.method()` on `&mut self` is a
+    /// - `BorrowAddress::None` — `&mut x` on a bare local resolves to that
+    ///   local's Variable with nothing emitted.  Matching on the last op's
+    ///   result alone would then mark the op that produced `x`, which may
+    ///   be an unrelated earlier field read.  Autoref makes this the
+    ///   common case, not a corner: `self.method()` on `&mut self` is a
     ///   `Rvalue::Ref` over a local at every call site.
     /// - `before` — a projection that emits nothing (a bare `Deref`, or a
     ///   field the front resolves without a read) leaves the preceding op
@@ -6441,11 +6510,11 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn mark_place_address_of(
         &mut self,
         mir_bb: usize,
-        projection: bool,
+        address: BorrowAddress,
         before: usize,
         v: &Variable,
     ) {
-        if !projection {
+        if matches!(address, BorrowAddress::None) {
             return;
         }
         let bb_id = self.emit_bb(mir_bb);
@@ -6455,9 +6524,21 @@ impl<'a> Lowering<'a> {
         }
         if let Some(op) = block.operations.last_mut()
             && op.result.as_ref() == Some(v)
-            && let OpKind::FieldRead { field, .. } = &mut op.kind
+            && let OpKind::FieldRead { field, ty, .. } = &mut op.kind
         {
             field.taken_by_address = true;
+            // Annotator copies `FieldRead.ty` (`legacy_annotator` FieldRead
+            // arm). A value read of a tagged enum intern's `Ref`; the
+            // borrow's result `&Enum` is `Int`. Stamping the address
+            // kind here joins that borrow with a recursive `&Enum` Call
+            // dest. `owner_declared_gc = Some(false)` is the same raw
+            // owner `container_owner_declared_gc` records for an
+            // int-bank field off a raw-address Deref, so
+            // `jtransform.rewrite_op_getfield` emits `int_add`.
+            if matches!(address, BorrowAddress::RawEnumField) {
+                field.owner_declared_gc = Some(false);
+                *ty = ValueType::Int;
+            }
         }
     }
 

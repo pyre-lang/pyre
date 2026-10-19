@@ -295,9 +295,6 @@ pub fn do_combine_starstarargs_wrapped(
     values_w: Option<&[PyObjectRef]>,
     w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    // argument.py `seen = {}` — membership of already-emitted keys.  A
-    // small list, not `HashMap`: the std HashMap graph does not annotate.
-    let mut seen: Vec<rustpython_wtf8::Wtf8Buf> = Vec::new();
     // The per-key value lookup below runs `__getitem__` when `values_w` is
     // None, so every turn is a collection point.
     // `gctransform/framework.py push_roots` stores every live GCREF before
@@ -306,17 +303,36 @@ pub fn do_combine_starstarargs_wrapped(
     // `keyword_names_w[i] = w_key` / `keywords_w[i] = w_value` into GC lists
     // the caller allocated and owns. Those lists are the two shadow-stack
     // ranges whose bases are `keyword_names_w` / `keywords_w`; this helper
-    // fills slot `i` of each during the iteration and returns None.
+    // fills slot `i` of each during the iteration and returns None. A stack
+    // `RDict` is not a GC object; `entries_gc_ptr` / `indexes` are published
+    // there and restored before each use (`RDict::entries_gc_ptr`).
     let _roots = pyre_object::gc_roots::push_roots();
     let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
     let n = keys_w.len();
+    let has_values = values_w.is_some();
     let values_slice = values_w.unwrap_or(&[]);
-    debug_assert!(values_w.is_none() || values_slice.len() == n);
+    debug_assert!(!has_values || values_slice.len() == n);
     let root_base = pyre_object::gc_roots::publish_roots(&[w_starstararg, w_function]);
     let existing_base = pyre_object::gc_roots::publish_roots(existingkeywords_w.unwrap_or(&[]));
     let keys_base = pyre_object::gc_roots::publish_roots(keys_w);
     let values_base = pyre_object::gc_roots::publish_roots(values_slice);
-    pyre_object::gc_roots::normalize_roots(root_base, 2 + existing_len + n + values_slice.len());
+    let seen_entries_slot = pyre_object::gc_roots::publish_roots(&[pyre_object::PY_NULL]);
+    let seen_indexes_slot = pyre_object::gc_roots::publish_roots(&[pyre_object::PY_NULL]);
+    pyre_object::gc_roots::normalize_roots(
+        root_base,
+        2 + existing_len + n + values_slice.len() + 2,
+    );
+    // `_do_combine_starstarargs_wrapped` `seen = {}` — RPython `{}` is
+    // `SomeDict` of `text_w` (`_utf8`) → `None`. `StrKey` is that STR
+    // (`celldict.py`); `contains_key` / `insert` are `key in seen` /
+    // `seen[key] = None` (`ll_dict_contains` / `ll_dict_setitem`).
+    let mut seen: pyre_object::rordereddict::RDict<
+        pyre_object::celldict::StrKey,
+        (),
+        pyre_object::dictmultiobject::StrKeyBuildHasher,
+    > = pyre_object::rordereddict::RDict::new();
+    pyre_object::gc_roots::shadow_stack_set(seen_entries_slot, seen.entries_gc_ptr());
+    seen.reload_indexes_root(seen_indexes_slot);
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let mut existing_now = vec![pyre_object::PY_NULL; existing_len];
@@ -330,24 +346,28 @@ pub fn do_combine_starstarargs_wrapped(
         if unsafe { !pyre_object::is_str(w_key) } {
             return Err(crate::PyError::type_error("keywords must be strings"));
         }
-        // `space.text_w` preserves lone surrogates as WTF-8 bytes; keep the
-        // key in WTF-8 so a surrogate keyword name survives the seen-set and
-        // the dict value read.
-        let key = unsafe { pyre_object::w_str_get_wtf8(w_key).to_owned() };
-        // argument.py:439-445 — duplicate check against existing kwargs +
-        // already-seen names in this iteration.
+        // `space.text_w` preserves lone surrogates as WTF-8 bytes; the
+        // copy can collect. `%S` formats the live key object, so this
+        // buffer is only the collection point `argument.py` `text_w`
+        // performs before `key in seen`.
+        let _key = unsafe { pyre_object::w_str_get_wtf8(w_key).to_owned() };
+        // `text_w` copies into an owned buffer and can collect.
+        // `shadowstack.py` `expand_pop_roots` restores before the next use.
+        let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+        // `_do_combine_starstarargs_wrapped` — duplicate check against
+        // existing kwargs + already-seen names in this iteration.
         let already_in_existing = existing_len != 0 && {
             pyre_object::gc_roots::shadow_stack_copy_range(existing_base, &mut existing_now);
             contains_w_names(w_key, &existing_now)
         };
-        let mut already_seen = false;
-        for j in 0..seen.len() {
-            if seen.as_slice()[j] == key {
-                already_seen = true;
-                break;
-            }
-        }
-        if already_in_existing || already_seen {
+        // `contains_w_names` can collect (`is_w` / `eq_w`). Restore
+        // before `w_str_storage` (`shadowstack.py` restore-before-use).
+        let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+        let seen_key = pyre_object::celldict::StrKey(unsafe {
+            pyre_object::unicodeobject::w_str_storage(w_key)
+        });
+        seen.restore_from_roots(seen_entries_slot, seen_indexes_slot);
+        if already_in_existing || seen.contains_key(&seen_key) {
             // `contains_w_names` can collect; `%S` needs the key object.
             let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
             return Err(raise_type_error!(
@@ -356,22 +376,23 @@ pub fn do_combine_starstarargs_wrapped(
                 &[FmtArg::Obj(w_key)],
             ));
         }
-        // `contains_w_names` can collect; the key is read back from its slot.
+        // `seen[key] = None` before the value lookup.
+        seen.insert(seen_key, ());
+        pyre_object::gc_roots::shadow_stack_set(seen_entries_slot, seen.entries_gc_ptr());
+        seen.reload_indexes_root(seen_indexes_slot);
+        // `seen.insert` can collect; the key is read back from its slot.
         let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py — `keyword_names_w[i] = w_key`.
         pyre_object::gc_roots::shadow_stack_set(keyword_names_w + i, w_key);
         // argument.py — `space.getitem` when `values_w` is None. A str subclass
         // is probed as `w_key`; the WTF-8 `seen` key is the wrong probe.
-        let w_value = if values_w.is_some() {
+        let w_value = if has_values {
             pyre_object::gc_roots::shadow_stack_get(values_base + i)
         } else {
             crate::baseobjspace::getitem(w_starstararg(), w_key)?
         };
         // argument.py — `keywords_w[i] = w_value`.
         pyre_object::gc_roots::shadow_stack_set(keywords_w + i, w_value);
-        // argument.py `seen[key] = None` — record key, value slot
-        // is unread.
-        seen.push(key);
     }
     Ok(())
 }
@@ -785,22 +806,8 @@ pub struct Arguments {
     pub keywords_w_gc: *mut pyre_object::FixedObjectArray,
 }
 
-/// Pin a `make_sure_not_resized` GcArray without a List→PyObject cast at
-/// the caller. `pin_root` takes `PyObjectRef`; `*mut FixedObjectArray` is
-/// SomeList, and `__cast_instance_intrinsic` of that List Skips the
-/// look-inside body (`match_signature`, `parse_into_scope`, `call_args`).
-/// The helper is residual (`dont_look_inside`); `erase_shadow_stack`
-/// treats the call as `pin_root` (`Leaf::Pin`) so the jitcode still
-/// aliases the slot to the GETFIELD local.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(crate) fn pin_root_gcarray(
-    root: *mut pyre_object::FixedObjectArray,
-) -> *mut pyre_object::FixedObjectArray {
-    pyre_object::gc_roots::pin_root(root as PyObjectRef) as *mut pyre_object::FixedObjectArray
-}
-
 /// Reload a pinned `make_sure_not_resized` twin from its shadow-stack slot.
-/// `pin_root_gcarray` returns the pointer at pin time; a collecting call
+/// `publish_roots` publishes the pointer; a collecting call
 /// forwards the slot in place (`framework.py pop_roots`).
 /// Always inlined so the caller is not a param_slots callee of this get
 /// (`copy_shadow_range_to_vec`).
@@ -928,10 +935,10 @@ impl Arguments {
     }
 
     /// Rebuild the `make_sure_not_resized` GcArray twins from the owned Vecs.
-    /// The Vec words are pinned across the three mallocs (`framework.py
-    /// push_roots`); each twin is pinned before the next so a collecting
-    /// allocation cannot drop a header this struct holds only as a raw
-    /// pointer.
+    /// The Vec words are published as one run before the first normalize
+    /// (`framework.py` `push_roots`); each twin is published before the next
+    /// malloc so a collecting allocation cannot drop a header this struct
+    /// holds only as a raw pointer.
     #[majit_macros::dont_look_inside]
     pub fn freeze_gc_arrays(&mut self) {
         let _roots = pyre_object::gc_roots::push_roots();
@@ -939,42 +946,47 @@ impl Arguments {
         let values_is_some = self.keywords_w.is_some();
         let names = self.keyword_names_w.as_deref().unwrap_or(&[]);
         let values = self.keywords_w.as_deref().unwrap_or(&[]);
-        let args_base = pyre_object::gc_roots::pin_roots(&self.arguments_w);
-        let names_base = pyre_object::gc_roots::pin_roots(names);
-        let values_base = pyre_object::gc_roots::pin_roots(values);
         let n_args = self.arguments_w.len();
         let n_names = names.len();
         let n_values = values.len();
+        let args_base = pyre_object::gc_roots::publish_roots(&self.arguments_w);
+        let names_base = pyre_object::gc_roots::publish_roots(names);
+        let values_base = pyre_object::gc_roots::publish_roots(values);
+        pyre_object::gc_roots::normalize_roots(args_base, n_args + n_names + n_values);
         let arguments_w: Vec<PyObjectRef> = (0..n_args)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(args_base + i))
             .collect();
-        let args_live = pyre_object::gc_roots::pin_roots(&arguments_w);
         let keyword_names_w: Vec<PyObjectRef> = (0..n_names)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
             .collect();
-        let names_live = pyre_object::gc_roots::pin_roots(&keyword_names_w);
         let keywords_w: Vec<PyObjectRef> = (0..n_values)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
             .collect();
-        let values_live = pyre_object::gc_roots::pin_roots(&keywords_w);
+        let args_live = pyre_object::gc_roots::publish_roots(&arguments_w);
+        let names_live = pyre_object::gc_roots::publish_roots(&keyword_names_w);
+        let values_live = pyre_object::gc_roots::publish_roots(&keywords_w);
+        pyre_object::gc_roots::normalize_roots(args_live, n_args + n_names + n_values);
         let arguments_w: Vec<PyObjectRef> = (0..n_args)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(args_live + i))
             .collect();
         self.arguments_w_gc = freeze_one_gc_array(&arguments_w);
         let args_gc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pin_root_gcarray(self.arguments_w_gc);
+        let _ = pyre_object::gc_roots::publish_roots(&[self.arguments_w_gc as PyObjectRef]);
         let keyword_names_w: Vec<PyObjectRef> = (0..n_names)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(names_live + i))
             .collect();
         self.keyword_names_w_gc = freeze_one_gc_array(&keyword_names_w);
         let names_gc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pin_root_gcarray(self.keyword_names_w_gc);
+        let _ = pyre_object::gc_roots::publish_roots(&[self.keyword_names_w_gc as PyObjectRef]);
         let keywords_w: Vec<PyObjectRef> = (0..n_values)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(values_live + i))
             .collect();
         self.keywords_w_gc = freeze_one_gc_array(&keywords_w);
         let keywords_gc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pin_root_gcarray(self.keywords_w_gc);
+        let _ = pyre_object::gc_roots::publish_roots(&[self.keywords_w_gc as PyObjectRef]);
+        // Each header was published before the next `alloc_mro_block_gc`;
+        // one `normalize_published_run` before the slot reads.
+        pyre_object::gc_roots::normalize_roots(args_gc_slot, 3);
         self.arguments_w_gc = gcarray_from_slot(args_gc_slot);
         self.keyword_names_w_gc = gcarray_from_slot(names_gc_slot);
         self.keywords_w_gc = gcarray_from_slot(keywords_gc_slot);
@@ -1394,10 +1406,7 @@ impl Arguments {
         // `getarrayitem_gc`). Reading the owned Vecs first residualizes
         // `ll_vec_*` and clears the heapcache that a CALL_KW walker plants
         // on these fields. `_jit_few_keywords` / `methodcall` are write-once
-        // (`Arguments.__init__`); load them with the twins. `pin_root_gcarray`
-        // is residual (`dont_look_inside_cannot_raise`) and
-        // `invalidate_caches_varargs` drops that seed, so a later GETFIELD
-        // of the recording-time native box would stay in the trace.
+        // (`Arguments.__init__`); load them with the twins.
         // Upstream `argument.py Arguments` is GC-managed and can keep
         // those GETFIELDs; the native box cannot.
         let arguments_w_gc = self.arguments_w_gc;
@@ -1423,11 +1432,13 @@ impl Arguments {
         // so the jitcode sees ordinary array ops; Close is `RootScope` Drop.
         let _roots = pyre_object::gc_roots::push_roots();
         let args_gc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let arguments_w_gc = pin_root_gcarray(arguments_w_gc);
+        let _ = pyre_object::gc_roots::publish_roots(&[
+            arguments_w_gc as PyObjectRef,
+            keyword_names_w_gc as PyObjectRef,
+            keywords_w_gc as PyObjectRef,
+        ]);
         let names_gc_slot = args_gc_slot + 1;
-        let mut keyword_names_w_gc = pin_root_gcarray(keyword_names_w_gc);
         let keywords_gc_slot = args_gc_slot + 2;
-        let mut keywords_w_gc = pin_root_gcarray(keywords_w_gc);
 
         // argument.py — positional copy. Index the `make_sure_not_resized`
         // GcArray (`GETFIELD` + `getarrayitem_gc`) so a CALL_KW walker's
@@ -1444,17 +1455,23 @@ impl Arguments {
         let has_kwarg = signature.has_kwarg();
         let defaults_len = defaults_w.len();
         let scope_len = scope_w.len();
-        let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_kw_defs);
-        let firstarg_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_firstarg);
-        let defaults_base = pyre_object::gc_roots::pin_roots(defaults_w);
+        // Per-word `publish_roots` then one `normalize_roots`: a slice
+        // literal of mixed GcArray/PyObject words is not lowerable on this
+        // look-inside path (`try_walker_descend_match_signature`). The three
+        // arrays above are `publish_roots`. `shadowstack.py`
+        // `push_roots` writes the whole livevar set before any query.
+        let kw_defs_slot = pyre_object::gc_roots::publish_roots(&[w_kw_defs]);
+        let firstarg_slot = pyre_object::gc_roots::publish_roots(&[w_firstarg]);
+        let defaults_base = pyre_object::gc_roots::publish_roots(defaults_w);
         let scope_base = pyre_object::gc_roots::publish_roots(scope_w);
-        // Always a scalar pin: joining `scope_base` (`SliceBase`) into this
+        // Always a scalar publish: joining `scope_base` (`SliceBase`) into this
         // local on the no-kwarg arm rebinds the special and refuses erase.
-        let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+        let kwds_slot = pyre_object::gc_roots::publish_roots(&[pyre_object::PY_NULL]);
         pyre_object::gc_roots::normalize_roots(args_gc_slot, 6 + defaults_len + scope_len);
+        // Gets stay in this body: `gcarray_from_slot` is ParamSlots and
+        // refuses erase (`copy_shadow_range_to_vec`).
+        let (arguments_w_gc, mut keyword_names_w_gc, mut keywords_w_gc) =
+            reload_gc_twins!(args_gc_slot, names_gc_slot, keywords_gc_slot);
         let w_kw_defs = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot);
 
         // argument.py:222-236 — *vararg collection.
@@ -1696,6 +1713,8 @@ impl Arguments {
                 // `getitem_str` on `resolve_dict_backing(w_kw_defs)`: a dict subclass
                 // `__getitem__` / `__missing__` is never dispatched, while an error
                 // from a colliding key's `__eq__` propagates.
+                // measured: python3.15t 3.15.2 prints 1 / TypeError for a dict subclass
+                // whose __getitem__ returns 999 / whose __missing__ returns 555; pypy3 prints 999 / 555
                 let mut missing_kw = false;
                 for i in co_argcount..(co_argcount + co_kwonlyargcount) {
                     if !pyre_object::gc_roots::shadow_stack_get(scope_base + i).is_null() {
@@ -1768,17 +1787,28 @@ impl Arguments {
         blindargs: usize,
     ) -> Result<Vec<PyObjectRef>, MatchSignatureError> {
         let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pin_root_gcarray(self.arguments_w_gc);
-        let _ = pin_root_gcarray(self.keyword_names_w_gc);
-        let _ = pin_root_gcarray(self.keywords_w_gc);
+        let base = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::publish_roots(&[
+            self.arguments_w_gc as PyObjectRef,
+            self.keyword_names_w_gc as PyObjectRef,
+            self.keywords_w_gc as PyObjectRef,
+        ]);
+        let first_slot = pyre_object::gc_roots::publish_roots(&[w_firstarg]);
+        let kw_defs_slot = pyre_object::gc_roots::publish_roots(&[w_kw_defs]);
+        let ndef = defaults_w.len();
+        let defaults_base = pyre_object::gc_roots::publish_roots(defaults_w);
+        pyre_object::gc_roots::normalize_roots(base, 5 + ndef);
         let scopelen = signature.scope_length();
         let mut scope_w: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; scopelen];
+        let defaults_now: Vec<PyObjectRef> = (0..ndef)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(defaults_base + i))
+            .collect();
         match self.match_signature(
-            w_firstarg,
+            pyre_object::gc_roots::shadow_stack_get(first_slot),
             &mut scope_w,
             signature,
-            defaults_w,
-            w_kw_defs,
+            &defaults_now,
+            pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
             blindargs,
         ) {
             MatchOutcome::Ok => Ok(scope_w),
@@ -1911,28 +1941,30 @@ impl Arguments {
         // and can run a subclass `__setitem__`, so every turn is a collection
         // point.  The dictionary moves under one, and the names and values sit
         // in native vectors no root walker updates, so the whole set is
-        // published before the first turn and read back on the turn that uses
-        // it.  `w_args` is nursery-allocated too, so it is read back at the
-        // return rather than carried across the loop in a local.
+        // published before `w_dict_new` (`shadowstack.py` `push_roots`) and
+        // read back on the turn that uses it.  `w_args` is nursery-allocated
+        // too, so it is read back at the return rather than carried across
+        // the loop in a local.
         let _roots = pyre_object::gc_roots::push_roots();
-        let args_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_args);
-        let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new());
         let names: &[PyObjectRef] = self.keyword_names_w.as_deref().unwrap_or(&[]);
         let values: &[PyObjectRef] = self.keywords_w.as_deref().unwrap_or(&[]);
+        let npairs = if self.keyword_names_w.is_some() {
+            names.len().min(values.len())
+        } else {
+            0
+        };
+        let mut pairs = Vec::with_capacity(npairs * 2);
+        for i in 0..npairs {
+            pairs.push(names[i]);
+            pairs.push(values[i]);
+        }
+        let args_slot = pyre_object::gc_roots::publish_roots(&[w_args]);
+        let pairs_base = pyre_object::gc_roots::publish_roots(&pairs);
+        pyre_object::gc_roots::normalize_roots(args_slot, 1 + pairs.len());
+        let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new());
         // argument.py `topacked`: `if self.keyword_names_w is not None`.
         if self.keyword_names_w.is_some() {
-            let npairs = names.len().min(values.len());
-            let mut pairs = Vec::with_capacity(npairs * 2);
-            for i in 0..npairs {
-                pairs.push(names[i]);
-                pairs.push(values[i]);
-            }
-            let pairs_base = pyre_object::gc_roots::shadow_stack_len();
-            for i in 0..pairs.len() {
-                let _ = pyre_object::gc_roots::pin_root(pairs[i]);
-            }
             for i in 0..npairs {
                 let w_key = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
                 let w_value = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
@@ -2085,9 +2117,9 @@ fn starargs_newtuple_copy(
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pin_root_gcarray(arguments_w_gc);
-    let first_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_firstarg);
+    let _ = pyre_object::gc_roots::publish_roots(&[arguments_w_gc as PyObjectRef]);
+    let first_slot = pyre_object::gc_roots::publish_roots(&[w_firstarg]);
+    pyre_object::gc_roots::normalize_roots(args_slot, 2);
     let block = unsafe { crate::baseobjspace::tuple_ll_newlist(nstar as i64) };
     let block_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(block as PyObjectRef);
@@ -2363,11 +2395,14 @@ pub fn collect_keyword_args(
     // at each turn.
     let _roots = pyre_object::gc_roots::push_roots();
     let names_gc_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pin_root_gcarray(keyword_names_w_gc);
-    let values_gc_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pin_root_gcarray(keywords_w_gc);
-    let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_kwds);
+    let _ = pyre_object::gc_roots::publish_roots(&[
+        keyword_names_w_gc as PyObjectRef,
+        keywords_w_gc as PyObjectRef,
+        w_kwds,
+    ]);
+    let values_gc_slot = names_gc_slot + 1;
+    let kwds_slot = names_gc_slot + 2;
+    pyre_object::gc_roots::normalize_roots(names_gc_slot, 3);
     let n = unsafe { (*gcarray_from_slot(names_gc_slot)).len() };
     let mut i = 0usize;
     while i < n {
@@ -2503,6 +2538,8 @@ enum FinditemStrOutcome {
 /// `getitem_str` on `resolve_dict_backing(w_kw_defs)`: a dict subclass
 /// `__getitem__` / `__missing__` is never dispatched, while an error from a
 /// colliding key's `__eq__` propagates.
+/// measured: python3.15t 3.15.2 prints 1 / TypeError for a dict subclass
+/// whose __getitem__ returns 999 / whose __missing__ returns 555; pypy3 prints 999 / 555
 #[majit_macros::dont_look_inside]
 fn kwdefaults_storage_lookup_str(w_dict: PyObjectRef, name: &str) -> FinditemStrOutcome {
     let _roots = pyre_object::gc_roots::push_roots();

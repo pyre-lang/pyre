@@ -2931,7 +2931,7 @@ pub(in crate::front::mir) fn operand_is_declared_raw(
     }
 }
 
-/// Whether `ty` is one pointer word to a Raw struct or enum.
+/// Whether `ty` is one pointer word to a storage-raw struct or enum.
 ///
 /// `history.getkind` classifies `Ptr(TO)` from `TO._gckind`
 /// (`rewrite_op_getfield`). Storage-raw (`declared_raw_adt_node`) answers
@@ -2939,11 +2939,6 @@ pub(in crate::front::mir) fn operand_is_declared_raw(
 /// getgcflavor`) stays a front `Ref`: `crosses_raw_ref` must not emit
 /// `cast_ptr_to_int` for it. A borrow of a storage-raw struct
 /// (`rffi.py` `CStruct`) stays `Ref`.
-///
-/// `&Enum` / `*const Enum` of a non-GC tagged enum is an address even
-/// when a payload field is not storage-raw ([`pointee_is_raw_word`]: a
-/// fat pointer or GC word inside `TO` does not change `TO._gckind`).
-/// A fieldless enum is the tag integer; that borrow is not an address.
 pub(in crate::front::mir) fn ty_is_raw_address(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2974,14 +2969,14 @@ pub(in crate::front::mir) fn ty_is_raw_address(
         {
             return true;
         }
-        // `&mut Enum` / `&Enum` / `*const Enum` of a non-GC tagged enum is
-        // one address word (`pointee_is_raw_word`). A raw struct borrow
-        // stays `Ref`. Classifying it as an address makes `RootScope::get`
-        // a `[Ref, Int]` signature called with `[Int, Int]`. A fieldless
-        // enum is the tag integer (`type_decl_is_fieldless_enum`);
-        // `Rvalue::Ref` is the identity on that word, so the borrow is not
-        // an address (`rclass.py` has no `cast_pointer` of an int).
-        if borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
+        // struct borrow stays `Ref`. A fieldless enum is the tag integer
+        // (`type_decl_is_fieldless_enum`); `Rvalue::Ref` is the identity
+        // on that word, so the borrow is not an address (`rclass.py` has
+        // no `cast_pointer` of an int).
+        if is_borrow
+            && borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        {
             return true;
         }
         // Arc/Rc of a flavor-raw ADT: the handle word is one raw (non-GC)
@@ -3030,26 +3025,16 @@ pub(in crate::front::mir) fn borrowed_pointee_is_raw_enum(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
-    if !matches!(td.kind, TypeDeclKind::Enum(_)) || type_decl_is_fieldless_enum(td, llbc) {
-        return false;
-    }
-    // A one-word niche (`None` = null) is identity on the payload word;
-    // `&Option<P>` peels to that word. A tagged aggregate is a real
-    // pointer. Recursing into payload fields (`declared_raw_adt_node`)
-    // would reject a non-GC enum whose variant holds a fat pointer or a
-    // GC word (`pointee_is_raw_word`: `TO._gckind` does not follow those).
-    let ty = TyRef::Other(pointee.clone());
-    if tyref_is_niche_option(&ty, llbc) || tyref_enum_layout_is_pointer_niche(&ty, llbc) {
-        return false;
-    }
-    pointee_is_raw_word(
-        pointee,
-        llbc,
-        gc_struct_ids,
-        no_immutable_fields(),
-        raw_alloc_flavor_structs,
-        &mut Vec::new(),
-    )
+    matches!(td.kind, TypeDeclKind::Enum(_))
+        && !type_decl_is_fieldless_enum(td, llbc)
+        && declared_raw_adt_node(
+            pointee,
+            llbc,
+            gc_struct_ids,
+            no_immutable_fields(),
+            raw_alloc_flavor_structs,
+        )
+        .is_some()
 }
 
 /// Class-root leaf of the Raw pointee behind one pointer word.
@@ -5204,7 +5189,11 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
 /// mints.  Only instantiations whose type arguments are all by-value ADTs
 /// qualify: a reference, raw-pointer or `Box` argument can make the enum a
 /// null-niche pointer, which has no enum class.  A named struct keys as its
-/// class root.  `None` otherwise.
+/// class root — the same intern spelling [`class_identity_spelling`]
+/// paints, so a residual `prepend` of a withdrawn leaf (`Arguments`)
+/// intern's the crate-relative path and unique-graph `mergeinputargs`
+/// meets the constructor (`annrpython.py` `mergeinputargs`).  `None`
+/// otherwise.
 pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     output: &TyRef,
     llbc: &Llbc,
@@ -5818,6 +5807,23 @@ pub(in crate::front::mir) fn tyref_class_root_with(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     adt_node_class_root_with(node, llbc, tombstoned)
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
+}
+
+/// A stored fn-ptr argument whose Rust type is a reference or pointer
+/// (or `Option` of one) to a class-backed struct. Those arguments are
+/// `cast_instance_to_base_ptr` at the call site (`annlowlevel.py`).
+pub(in crate::front::mir) fn tyref_is_class_backed_fn_ptr_arg(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc);
+    let inner = payload.as_ref().unwrap_or(ty);
+    let is_ptr = tyref_node(inner, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .and_then(|n| n.as_object())
+        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"));
+    is_ptr && tyref_class_root_with(inner, llbc, tombstoned).is_some()
 }
 
 /// The underlying JSON type node of a `TyRef`, resolving the `Dedup`
