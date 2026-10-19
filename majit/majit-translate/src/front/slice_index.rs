@@ -37,12 +37,14 @@
 //! `<[T] as Index<RangeFrom<usize>>>::index(s, RangeFrom { start: k })`.
 //! Its sibling `&s[..k]` uses `RangeTo { end: k }` and rewrites to
 //! `getslice(s, 0, k)` (`SliceKind::StartStop`).
-//! `lower_call` keeps `core::slice::index::<Impl>::index` and
-//! `rustpython_wtf8::Wtf8::index` as unregistered residuals (the gh#346 census
-//! wall), and the `RangeFrom { start }` operand is
-//! built by `front::mir`'s `Rvalue::Aggregate` arm as a
-//! `SyntheticTransparentCtor("RangeFrom")` + `FieldWrite("start")` chain —
-//! i.e. `SomeInstance(classdef='core.ops.range.RangeFrom')`, the same shape
+//! `lower_call` keeps `core::slice::index::<Impl>::index`,
+//! `rustpython_wtf8::Wtf8::index`, and range-indexed `Vec::index` as
+//! unregistered residuals (the gh#346 census wall); the scalar `Vec::index`
+//! integer case is intercepted earlier (`is_vec_index_call`). The
+//! `RangeFrom { start }` operand is built by `front::mir`'s
+//! `Rvalue::Aggregate` arm as a `SyntheticTransparentCtor("RangeFrom")` +
+//! `FieldWrite("start")` chain — i.e.
+//! `SomeInstance(classdef='core.ops.range.RangeFrom')`, the same shape
 //! `front::range_iter` sees for a `Range { start, end }` for-loop.
 //!
 //! RPython models `l[start:]` as a **copy**: the annotator's `getslice`
@@ -631,12 +633,12 @@ fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable
     has_len && has_one
 }
 
-/// `true` when `kind` is a residual range-index call over either a Rust slice
-/// or the WTF-8 string view used for Python unicode — the `&s[range]`
-/// residual whose `range` operand this pass folds.
+/// `true` when `kind` is a residual range-index call over a Rust slice,
+/// a `Vec` receiver, or the WTF-8 string view used for Python unicode —
+/// the `&s[range]` residual whose `range` operand this pass folds.
 /// The scalar `Vec`/`Constants` integer index is intercepted earlier in
 /// `lower_call` (`is_vec_index_regular` / `constants_call_leaf`), so only the
-/// range-indexed slice residual reaches here.
+/// range-indexed residual reaches here.
 fn is_slice_range_index_call(kind: &OpKind) -> bool {
     matches!(
         kind,
@@ -649,7 +651,10 @@ fn is_slice_range_index_call(kind: &OpKind) -> bool {
 
 /// The residual callee spelling for `<[T]>::index` with a range index.
 /// Charon runs `monomorphize:false`, so the callee keeps the inherent-impl
-/// path `core::slice::index::<Impl>::index`.
+/// path `core::slice::index::<Impl>::index`. A `Vec` indexed by a range is
+/// the same `rtype_getslice` (`rlist.py` `AbstractBaseListRepr.rtype_getslice`)
+/// as the slice spelling: Rust `Vec` is the rtyper raw list repr and a slice
+/// is the raw `{ptr,len}` view, so the rewrite keeps the list receiver.
 fn slice_index_segments_match(segments: &[String]) -> bool {
     // `Wtf8` is the frontend's RPython `SomeString` spelling (mir.rs maps
     // Wtf8/Wtf8Buf/String/str to ValueType::Str). Its Index<Range*> impl is
@@ -665,6 +670,13 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
     if segments == ["Wtf8", "index"] || segments == ["rustpython_wtf8", "Wtf8", "index"] {
         return true;
     }
+    // Scalar `Vec::index` is intercepted in `lower_call` (`is_vec_index_call`)
+    // before a residual is planted, so this arm only sees `Range*`.
+    // Residual spelling after `impl_method_owner_for_fundecl`:
+    // `["vec","Vec","index"]`. FunDecl `name_path`: `alloc::vec::<Impl>::index`.
+    if vec_inherent_index_segments(segments) {
+        return true;
+    }
     let n = segments.len();
     if n < 4 || segments.first().map(String::as_str) != Some("core") {
         return false;
@@ -675,6 +687,17 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
         && segments[n - 2] == "<Impl>";
     let array_impl = segments[n - 3] == "array" && segments[n - 2] == "<Impl>";
     segments[n - 1] == "index" && (slice_impl || array_impl)
+}
+
+/// Inherent `Vec::index` (not `index_mut`). Accepts the impl-owner residual
+/// `["vec","Vec","index"]` and crate-qualified / FunDecl forms that end in
+/// `"vec","Vec","index"` or `"vec","<Impl>","index"`.
+fn vec_inherent_index_segments(segments: &[String]) -> bool {
+    let n = segments.len();
+    n >= 3
+        && segments[n - 1] == "index"
+        && segments[n - 3] == "vec"
+        && (segments[n - 2] == "Vec" || segments[n - 2] == "<Impl>")
 }
 
 /// `true` when the `RangeFrom` value is consumed by EXACTLY its own
@@ -2579,6 +2602,97 @@ mod tests {
             "<Impl>".into(),
             "index".into(),
         ]));
+    }
+
+    #[test]
+    fn range_to_accepts_vec_inherent_index_and_rejects_index_mut() {
+        assert!(slice_index_segments_match(&[
+            "vec".into(),
+            "Vec".into(),
+            "index".into(),
+        ]));
+        assert!(slice_index_segments_match(&[
+            "alloc".into(),
+            "vec".into(),
+            "Vec".into(),
+            "index".into(),
+        ]));
+        assert!(slice_index_segments_match(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "index".into(),
+        ]));
+        assert!(!slice_index_segments_match(&[
+            "vec".into(),
+            "Vec".into(),
+            "index_mut".into(),
+        ]));
+        assert!(!slice_index_segments_match(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "index_mut".into(),
+        ]));
+    }
+
+    /// Residual `["vec","Vec","index"]` with a `RangeTo` is the same
+    /// `rtype_getslice` rewrite as the slice spelling.
+    #[test]
+    fn rangeto_rewrites_vec_inherent_index() {
+        let mut g = FunctionGraph::new("test_vec_inherent_rangeto");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let end = g
+            .push_op_var(
+                a,
+                OpKind::Input {
+                    name: "end".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        g.push_inputarg_var(a, end.clone());
+        let range = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: rangeto_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeTo".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(a).operations.push(SpaceOperation {
+            result: None,
+            kind: end_field_write(&range, &end),
+        });
+        let sub = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["vec".into(), "Vec".into(), "index".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![slice, range.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![sub]);
+
+        let site = SliceIndexRangeToSite {
+            range_result: range,
+            end,
+        };
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     /// A RangeFrom whose `usize` start is a runtime value is retained as a
