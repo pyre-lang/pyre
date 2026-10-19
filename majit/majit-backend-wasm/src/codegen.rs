@@ -5792,6 +5792,11 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         .map(|bridge| fail_index_base.wrapping_add(bridge.source_fail_index))
         .collect();
     inline_fail.sort_unstable();
+    // Frame-entry dispatch tests the cell in the shared epilogue, so the
+    // helper must not write `jf_descr` / `jf_gcmap` (`patch_jump_for_descr`
+    // never does). Param-entry and no-dispatch call the helper only on the
+    // recovery path (`_build_failure_recovery`).
+    let helper_stores_header = !(bridge_dispatch && bridge_param_type_indices.is_empty());
     let planned_guard_exits = plan_guard_exit_outline(
         analysis_ops,
         inputargs,
@@ -5804,6 +5809,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         *fail_index_base,
         *invalidated_flag_addr,
         &inline_fail,
+        helper_stores_header,
     );
     let guard_exit_addrs = if planned_guard_exits.save > GUARD_EXIT_OUTLINE_COST
         && !planned_guard_exits.words.is_empty()
@@ -6020,7 +6026,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         }));
     }
     if guard_exit_type_idx.is_some() {
-        codes.function(&build_guard_exit_helper());
+        codes.function(&build_guard_exit_helper(helper_stores_header));
     }
     module.section(&codes);
 
@@ -6179,7 +6185,12 @@ const GUARD_EXIT_OUTLINE_COST: usize = 160;
 /// from a host box parked like [`crate::release::LoopAsmResources::exit_table`].
 /// The bridge-cell `local.set` and the `br` stay at the site: a callee cannot
 /// write the caller's locals or branch to the caller's block.
-fn build_guard_exit_helper() -> Function {
+///
+/// `store_header` is the recovery path (`_build_failure_recovery` writes
+/// `jf_descr` / `jf_gcmap`, and `must_save_exception` when the flag is set).
+/// Frame-entry dispatch leaves it off: the helper runs before the cell test,
+/// and `patch_jump_for_descr` writes neither field.
+fn build_guard_exit_helper(store_header: bool) -> Function {
     // params: 0 frame, 1 record, 2 counter value. Locals: 3 index, 4 count, 5 value.
     let mut func = Function::new(vec![(2, ValType::I32), (1, ValType::I64)]);
     let mut raw_sink = func.instructions();
@@ -6238,16 +6249,18 @@ fn build_guard_exit_helper() -> Function {
     sink.i64_store(mem64(0));
     sink.end();
 
-    emit_dynamic_exit_header(&mut sink, majit_backend::jitframe::JF_DESCR_OFS as u64, 0);
-    emit_dynamic_exit_header(&mut sink, majit_backend::jitframe::JF_GCMAP_OFS as u64, 4);
+    if store_header {
+        emit_dynamic_exit_header(&mut sink, majit_backend::jitframe::JF_DESCR_OFS as u64, 0);
+        emit_dynamic_exit_header(&mut sink, majit_backend::jitframe::JF_GCMAP_OFS as u64, 4);
 
-    sink.local_get(1);
-    sink.i32_load(mem32(4));
-    sink.i32_const(GUARD_EXIT_FLAG_EXC as i32);
-    sink.i32_and();
-    sink.if_(BlockType::Empty);
-    emit_store_guard_exc_raw(&mut sink);
-    sink.end();
+        sink.local_get(1);
+        sink.i32_load(mem32(4));
+        sink.i32_const(GUARD_EXIT_FLAG_EXC as i32);
+        sink.i32_and();
+        sink.if_(BlockType::Empty);
+        emit_store_guard_exc_raw(&mut sink);
+        sink.end();
+    }
 
     sink.end();
     sink.flush();
@@ -6309,8 +6322,13 @@ fn guard_exit_emits_spill(
 
 /// Smaller of the two inline shapes: the spill-helper call, not the direct
 /// stores. Direct stores are larger, so this under-admits them.
-fn guard_exit_outline_save(n: usize, exc: bool, counter: bool) -> usize {
-    let inline = 2 * n + 14 + usize::from(exc) * 13 + usize::from(counter) * 3;
+fn guard_exit_outline_save(n: usize, exc: bool, counter: bool, store_header: bool) -> usize {
+    let header = if store_header {
+        14 + usize::from(exc) * 13
+    } else {
+        0
+    };
+    let inline = 2 * n + header + usize::from(counter) * 3;
     let site = 4 + usize::from(counter);
     inline.saturating_sub(site)
 }
@@ -6335,6 +6353,7 @@ fn plan_guard_exit_outline(
     fail_index_base: u32,
     invalidated_flag_addr: u32,
     inline_fail: &[u32],
+    store_header: bool,
 ) -> PlannedGuardExits {
     if exit_table_base == 0 {
         return PlannedGuardExits {
@@ -6364,6 +6383,7 @@ fn plan_guard_exit_outline(
                     ref_homes,
                     frame,
                     counter_slot,
+                    store_header,
                 )
             })
             .flatten();
@@ -6388,6 +6408,7 @@ fn outline_guard_record(
     ref_homes: &RefHomes,
     frame: FrameGeometry,
     counter_slot: Option<usize>,
+    store_header: bool,
 ) -> Option<(Vec<u32>, usize)> {
     let args = live_exit_fail_args(op);
     if args.len() > GUARD_EXIT_MAX_HOMES {
@@ -6433,7 +6454,7 @@ fn outline_guard_record(
     for (i, dest) in dests.iter().enumerate() {
         record[dest_base + i] = *dest;
     }
-    let site_save = guard_exit_outline_save(srcs.len(), exc, counter_ofs.is_some());
+    let site_save = guard_exit_outline_save(srcs.len(), exc, counter_ofs.is_some(), store_header);
     Some((record, site_save))
 }
 
@@ -6685,6 +6706,13 @@ fn build_function(
     // it, and a frame address is out of range.
     let realloc_result_local =
         resume_key_local + u32::from(resume_dispatch) + u32::from(gcmap_frame_local.is_some());
+    // Frame-entry dispatch loads the cell in the shared epilogue. The descr
+    // pair (`exit_table_base`) is a different word from the dispatch cell
+    // (`cells_base` / `bridge_slot_local`), so the pair address — and the
+    // `must_save_exception` bit — rides here until that test.
+    let exit_ident_local =
+        (bridge_dispatch && bridge_param_type_indices.is_empty() && ca.exit_table_base != 0)
+            .then_some(realloc_result_local + 1);
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -6741,6 +6769,7 @@ fn build_function(
         const_table_base: gc_table_base,
         attached: ca.attached,
         guard_exit: guard_exit_outline,
+        exit_ident_local,
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -6765,7 +6794,8 @@ fn build_function(
             + u32::from(resume_dispatch)
             + u32::from(gcmap_frame_local.is_some())
             // `_check_frame_depth` result; see `realloc_result_local`.
-            + 1,
+            + 1
+            + u32::from(exit_ident_local.is_some()),
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -10800,10 +10830,18 @@ fn build_function(
         sink.end();
         sink.local_tee(bridge_slot_local);
         sink.if_(BlockType::Empty);
+        // `patch_jump_for_descr`: jump to the attached bridge without writing
+        // `jf_descr` / `jf_gcmap` / `jf_guard_exc`.
         sink.local_get(0); // frame_ptr argument to the bridge
         sink.local_get(bridge_slot_local); // table slot
         sink.return_call_indirect(0, 0); // tail call, table 0, type 0: (i32) -> i32
         sink.end();
+        // `_build_failure_recovery`: write descr, gcmap, and (when the
+        // identity low bit is set) `must_save_exception`, then return to
+        // the host. `bridge_slot_local` is 0 here and holds the pair address.
+        if let Some(ident_local) = exit_ident_local {
+            emit_recovery_header_from_identity(&mut sink, ident_local, bridge_slot_local);
+        }
     }
 
     sink.local_get(0);
@@ -11795,6 +11833,10 @@ struct BridgeDispatch<'a> {
     /// Outlined cold exit, when the module admitted one helper for every
     /// home-backed spill. `None` keeps each exit inline.
     guard_exit: Option<GuardExitOutline<'a>>,
+    /// Frame-entry recovery identity: exit-table pair address with the low
+    /// bit `must_save_exception`. `None` stores `jf_descr` / `jf_gcmap` at
+    /// the guard (FINISH, `exit_table_base == 0`, or no frame-entry dispatch).
+    exit_ident_local: Option<u32>,
 }
 
 fn emit_guard_true(
@@ -12129,6 +12171,9 @@ fn emit_guard_param_tail_call(
     sink.i32_load(memarg(0, 2));
     sink.local_tee(dispatch.bridge_slot_local);
     sink.if_(BlockType::Empty);
+    // `patch_jump_for_descr`: the attached path writes neither `jf_descr`
+    // nor `jf_gcmap`. Fail-arg spill and `must_save_exception` stay on the
+    // recovery fall-through (`emit_guard_spill` below).
     sink.local_get(0);
     for arg in fail_args {
         if arg.ty() == Some(Type::Float) {
@@ -12445,6 +12490,9 @@ fn emit_guard_spill(
     dispatch: BridgeDispatch<'_>,
 ) {
     if emit_outlined_guard_exit(sink, constants, value_types, op, guard_idx, dispatch) {
+        if defers_recovery_header(dispatch, op) {
+            emit_set_exit_identity(sink, dispatch, op, guard_idx);
+        }
         return;
     }
     emit_guard_fail_args_spill(
@@ -12460,10 +12508,15 @@ fn emit_guard_spill(
         const_tables,
         const_table_base,
     );
+    if defers_recovery_header(dispatch, op) {
+        emit_set_exit_identity(sink, dispatch, op, guard_idx);
+        return;
+    }
     emit_guard_fail_index_store(sink, dispatch, op, guard_idx);
-    // assembler.py `_build_failure_recovery` (exc=True): stage pos_exc_value
-    // into jf_guard_exc and clear pos_exception / pos_exc_value. Only the
-    // failing arm reaches here; a bridge tail-call returns before this spill.
+    // `_build_failure_recovery(exc=True)`: stage pos_exc_value into
+    // jf_guard_exc and clear pos_exception / pos_exc_value. Frame-entry
+    // dispatch defers this to the epilogue so `patch_jump_for_descr` does
+    // not clear the globals an attached bridge's `SAVE_EXCEPTION` reads.
     emit_store_guard_exc(sink, op);
 }
 
@@ -12828,6 +12881,72 @@ fn emit_store_header_word(sink: &mut PeepSink<'_, '_>, offset: u64, value: usize
     emit_header_base(sink);
     sink.i32_const(value as i32);
     sink.i32_store(memarg(offset, 2));
+}
+
+/// Frame-entry dispatch stores `jf_descr` / `jf_gcmap` only after the cell
+/// test has said no (`_build_failure_recovery`). `patch_jump_for_descr`
+/// jumps to an attached bridge without writing either field. The dispatch
+/// cell (`cells_base`) and the descr pair (`exit_table_base`) are different
+/// words, so the pair address rides in `ident_local` until that test; the
+/// low bit is `must_save_exception`. Identity 0 is FINISH (already stored)
+/// or an exit that did not defer. `exit_table_base == 0` keeps storing the
+/// fail index at offset 0 at the guard.
+fn emit_recovery_header_from_identity(
+    sink: &mut PeepSink<'_, '_>,
+    ident_local: u32,
+    addr_local: u32,
+) {
+    sink.local_get(ident_local);
+    sink.if_(BlockType::Empty);
+    sink.local_get(ident_local);
+    sink.i32_const(!1i32);
+    sink.i32_and();
+    sink.local_set(addr_local);
+    emit_header_base(sink);
+    sink.local_get(addr_local);
+    sink.i32_load(memarg(0, 2));
+    sink.i32_store(memarg(majit_backend::jitframe::JF_DESCR_OFS as u64, 2));
+    emit_header_base(sink);
+    sink.local_get(addr_local);
+    sink.i32_load(memarg(4, 2));
+    sink.i32_store(memarg(majit_backend::jitframe::JF_GCMAP_OFS as u64, 2));
+    sink.local_get(ident_local);
+    sink.i32_const(1);
+    sink.i32_and();
+    sink.if_(BlockType::Empty);
+    emit_store_guard_exc_raw(sink);
+    sink.end();
+    sink.end();
+}
+
+fn defers_recovery_header(dispatch: BridgeDispatch<'_>, op: &Op) -> bool {
+    dispatch.exit_ident_local.is_some() && op.opcode != OpCode::Finish
+}
+
+fn emit_set_exit_identity(
+    sink: &mut PeepSink<'_, '_>,
+    dispatch: BridgeDispatch<'_>,
+    op: &Op,
+    guard_idx: u32,
+) {
+    let Some(ident_local) = dispatch.exit_ident_local else {
+        return;
+    };
+    let local = (guard_idx - dispatch.fail_index_base) as usize;
+    let exit_addr = dispatch
+        .exit_table_base
+        .wrapping_add((local * 2 * 4) as u32);
+    debug_assert_eq!(
+        exit_addr & 1,
+        0,
+        "exit-table pair must be even for the exc bit"
+    );
+    let exc = matches!(
+        op.opcode,
+        OpCode::GuardNoException | OpCode::GuardException | OpCode::GuardNotForced
+    );
+    sink.i32_const((exit_addr | u32::from(exc)) as i32);
+    sink.local_set(ident_local);
 }
 
 /// Pair `local` of the exit table: word 0 is the descr cell, word 1 the gcmap.
@@ -14030,6 +14149,7 @@ mod tests {
             const_table_base: 0,
             attached: majit_backend::AttachedDescrPtrs::default(),
             guard_exit: None,
+            exit_ident_local: None,
         };
 
         assert_eq!(inline_region_br_depth(&inline, &dispatch, 0), 0);
