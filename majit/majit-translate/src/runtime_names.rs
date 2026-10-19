@@ -127,6 +127,9 @@ pub(crate) mod shims {
     /// the look-inside `ll_join_chars` helper (`rbuiltin.py`
     /// `rtype_builtin_chr`).
     pub(crate) const CHR: &str = "__majit_chr";
+    /// `str::chars()`: the front respells `s.chars()` as `__majit_utf8iter(s)`,
+    /// the translator-synthesised `Utf8StringIterator` (`rutf8.py`).
+    pub(crate) const UTF8_ITER: &str = "__majit_utf8iter";
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";

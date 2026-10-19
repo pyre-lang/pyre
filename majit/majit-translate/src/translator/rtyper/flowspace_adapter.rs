@@ -3312,6 +3312,9 @@ pub fn translate_op(
                             Some("enumerate")
                         }
                         [leaf] if leaf == crate::runtime_names::shims::CHR => Some("chr"),
+                        [leaf] if leaf == crate::runtime_names::shims::UTF8_ITER => {
+                            Some("utf8iter")
+                        }
                         _ => None,
                     };
                     if let Some(builtin) = builtin {
@@ -10034,6 +10037,49 @@ mod tests {
                 .expect("enumerate builtin")
         );
         assert_eq!(translated[0].args[1..], [lst]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_utf8iter_marker_calls_the_utf8iter_builtin() {
+        // `__majit_utf8iter(s)` (the front's spelling of `s.chars()`) →
+        // `simple_call(utf8iter, s)`, so `builtin_utf8iter` types it
+        // `SomeIterator(s_str, "utf8")`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let s = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), s.clone());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::UTF8_ITER.into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_utf8iter marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("utf8iter")
+                .expect("utf8iter builtin")
+        );
+        assert_eq!(translated[0].args[1..], [s]);
         assert_eq!(translated[0].result, result_var);
     }
 

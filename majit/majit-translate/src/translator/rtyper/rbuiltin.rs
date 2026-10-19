@@ -232,6 +232,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("max", rtype_builtin_max),
         // rbuiltin.py `typer_for(reversed)`
         ("reversed", rtype_builtin_reversed),
+        // Translator shim: `__majit_utf8iter` → HOST_ENV `utf8iter`.
+        ("utf8iter", rtype_builtin_utf8iter),
         // rbuiltin.py:709-715
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
@@ -2248,6 +2250,20 @@ pub fn rtype_builtin_reversed(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize
         .borrow()
         .clone()
         .ok_or_else(|| TyperError::message("rtype_builtin_reversed: r_result missing"))?;
+    r_result.newiter(hop)
+}
+
+/// `utf8iter(s)` — the front's `__majit_utf8iter` spelling of
+/// `Utf8StringIterator(s)` (`rutf8.py`).  Same shape as
+/// `rtype_builtin_reversed`: the result repr's `newiter` mallocs the
+/// iterator from the string operand.
+pub fn rtype_builtin_utf8iter(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_builtin_utf8iter: r_result missing"))?;
     r_result.newiter(hop)
 }
 

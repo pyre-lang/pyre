@@ -1804,6 +1804,10 @@ impl HostEnv {
             crate::runtime_names::shims::LL_ARRAYMOVE,
             HostObject::new_builtin_callable(crate::runtime_names::shims::LL_ARRAYMOVE),
         );
+        // Front-end spelling of `rutf8.Utf8StringIterator(s)`: `s.chars()`
+        // becomes `__majit_utf8iter(s)`.  Not a Python builtin class; a
+        // translator shim keyed like CAST_INSTANCE (callable, not a class).
+        self.insert_builtin("utf8iter", HostObject::new_builtin_callable("utf8iter"));
     }
 
     fn bootstrap_std_modules(&mut self) {

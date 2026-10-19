@@ -153,16 +153,35 @@ fn range_probe(op: &SpaceOperation) -> Option<()> {
     }
 }
 
+fn utf8_iter_probe(op: &SpaceOperation) -> Option<Variable> {
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.len() == 1 && segments[0] == crate::runtime_names::shims::UTF8_ITER => {
+            args.first().cloned().map(LinkArg::into_variable)
+        }
+        _ => None,
+    }
+}
+
 /// The container an `iter` op constructed `var` over, when the backward walk
 /// confirms one.  `originates_from_iter_op` is this with the container
 /// discarded; [`iter_next_item_type`] needs it, because the container is the
 /// only thing that separates the two iterator reprs.
+///
+/// `__majit_utf8iter(s)` is the `str::chars` constructor (`Utf8StringIterator`);
+/// it is not a slice `iter`, so the probe is a sibling of [`iter_probe`]
+/// rather than an extension of [`is_iter_op_segments`].
 pub(crate) fn iter_op_container_with(
     graph: &FunctionGraph,
     edges: &BackEdges,
     var: &Variable,
 ) -> Option<Variable> {
-    walk_back_with(graph, edges, var, iter_probe)
+    walk_back_with(graph, edges, var, |op| {
+        iter_probe(op).or_else(|| utf8_iter_probe(op))
+    })
 }
 
 /// Walk backwards from `var` to the op that produced it, asking `probe`
@@ -1743,5 +1762,178 @@ mod tests {
             native, 1,
             "native [__iter_next] replaces the residual and its recast"
         );
+    }
+
+    fn chars_next_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["core", "str", "iter", "<Impl>", "next"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            fun_decl_id: None,
+        }
+    }
+
+    /// `while let Some(ch) = s.chars().next()`: the iterator originates from
+    /// `__majit_utf8iter`, so `Chars::next` rewrites to the `[__iter_next]`
+    /// diamond.  The residual is not routed as `core::slice::iter`.
+    #[test]
+    fn utf8iter_chars_next_rewrites_to_iter_next_diamond() {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+
+        let mut g = FunctionGraph::new("test_utf8iter_chars_next");
+        let n = g.startblock;
+        let s = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![s]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (a, a_args) = g.create_block_with_arg_vars(1);
+        let it_a = a_args[0].clone();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: chars_next_target(),
+                    args: crate::model::call_args(vec![it_a]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: opt_c.clone(),
+                    field: FieldDescriptor::new("__discriminant", None),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (some_t, some_args) = g.create_block_with_arg_vars(1);
+        let some_opt = some_args[0].clone();
+        g.push_op_var(
+            some_t,
+            OpKind::FieldRead {
+                base: some_opt,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Int,
+                pure: true,
+            },
+            true,
+        );
+        g.set_return(some_t, None);
+
+        let (none_t, _none_args) = g.create_block_with_arg_vars(0);
+        g.set_return(none_t, None);
+
+        g.set_goto(n, a, vec![it]);
+        g.set_goto(a, c, vec![opt.clone()]);
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(
+                Vec::new(),
+                none_t,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            )
+            .with_prevblock(c),
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c)],
+                some_t,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            )
+            .with_prevblock(c),
+        ];
+
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1, "while-let Some over chars() must fold");
+        let residual_chars_next = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().is_some_and(|s| s == "next")
+                            && segments.iter().any(|s| s == "str")
+                )
+            })
+            .count();
+        assert_eq!(residual_chars_next, 0, "residual Chars::next must be gone");
+        let residual_slice_iter = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if is_iter_op_segments(segments)
+                )
+            })
+            .count();
+        assert_eq!(
+            residual_slice_iter, 0,
+            "utf8iter must not be rewritten as core::slice::iter"
+        );
+        let native = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if is_iter_next_segments(segments)
+                )
+            })
+            .count();
+        assert_eq!(native, 1, "native [__iter_next] replaces Chars::next");
+        let utf8iter = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.len() == 1
+                            && segments[0] == crate::runtime_names::shims::UTF8_ITER
+                )
+            })
+            .count();
+        assert_eq!(utf8iter, 1, "__majit_utf8iter constructor must remain");
     }
 }

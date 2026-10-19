@@ -3230,7 +3230,17 @@ pub fn rtyper_makerepr(
         SomeValue::Iterator(s_iter) => {
             let r_container = rtyper.getrepr(s_iter.s_container.as_ref())?;
             let foldable = list_container_foldable(s_iter.s_container.as_ref());
-            if s_iter.variant.first().map(String::as_str) == Some("enumerate") {
+            if s_iter.variant.first().map(String::as_str) == Some("utf8") {
+                // `Utf8StringIteratorRepr` (`rutf8.py Utf8StringIterator`).
+                // Do not pass `["utf8"]` into `StringRepr.make_iterator_repr`
+                // — upstream `BaseLLStringRepr.make_iterator_repr` rejects
+                // any variant (`lltypesystem/rstr.py`).
+                Ok(std::sync::Arc::new(
+                    crate::translator::rtyper::lltypesystem::rstr::Utf8StringIteratorRepr::new(
+                        r_container.lowleveltype().clone(),
+                    )?,
+                ) as std::sync::Arc<dyn Repr>)
+            } else if s_iter.variant.first().map(String::as_str) == Some("enumerate") {
                 let r_baseiter = r_container.make_iterator_repr(&[], foldable)?;
                 let const_startindex = match &s_iter.enumerate_start {
                     None => None,

@@ -229,6 +229,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // builtin.py:89-99 — enumerate / reversed.
     analyzer_for(&mut reg, "enumerate", builtin_enumerate);
     analyzer_for(&mut reg, "reversed", builtin_reversed);
+    analyzer_for(&mut reg, "utf8iter", builtin_utf8iter);
     // builtin.py:102-130 — bool / int / float / chr / unichr /
     // unicode / bytearray.
     analyzer_for(&mut reg, "bool", builtin_bool);
@@ -879,6 +880,24 @@ pub fn builtin_reversed(
     Ok(SomeValue::Iterator(SomeIterator::new(
         s_obj.clone(),
         vec!["reversed".to_string()],
+    )))
+}
+
+/// Translator-synthesised `Utf8StringIterator(s)` (`rutf8.py`):
+/// `SomeIterator(s_str, ["utf8"])`.  The front spells `s.chars()` as
+/// `__majit_utf8iter(s)`; next yields a nonneg integer code point.
+pub fn builtin_utf8iter(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new("utf8iter() takes exactly one argument"));
+    }
+    let s_str = arg_at(args_s, 0, "builtin_utf8iter");
+    Ok(SomeValue::Iterator(SomeIterator::new(
+        s_str.clone(),
+        vec!["utf8".to_string()],
     )))
 }
 
@@ -4853,6 +4872,19 @@ mod tests {
         };
         assert_eq!(it.variant, vec!["enumerate".to_string()]);
         assert_eq!(it.enumerate_start, Some(ConstValue::Int(5)));
+    }
+
+    #[test]
+    fn builtin_utf8iter_wraps_string_as_utf8_iterator() {
+        use crate::annotator::model::SomeString;
+        let bk = bk();
+        let s_str = SomeValue::String(SomeString::new(false, true));
+        let result = builtin_utf8iter(&bk, &[Some(s_str)], &no_kwds()).unwrap();
+        let SomeValue::Iterator(it) = result else {
+            panic!("expected SomeIterator");
+        };
+        assert_eq!(it.variant, vec!["utf8".to_string()]);
+        assert!(matches!(*it.s_container, SomeValue::String(_)));
     }
 
     #[test]

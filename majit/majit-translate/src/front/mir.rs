@@ -27813,6 +27813,32 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `core::str::<Impl>::chars` (and the autoderef `String` →
+                // `str` receiver) constructs `rutf8.Utf8StringIterator`, not
+                // a byte `StringIteratorRepr`.  Emit `__majit_utf8iter(s)`
+                // with `fun_decl_id: None` so CallRegistry is not asked for
+                // the Opaque `chars` body (`Utf8StringIteratorRepr`).
+                if args.len() == 1 && self.is_str_chars_constructor(&reg, first_arg_ty.as_ref()) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null(p)` is
                 // upstream's null test `p is None` (`flowspace` `is_`,
                 // `binaryop.py` `is__default`, `rnone.py` `rtype_is_None` →
@@ -35809,6 +35835,25 @@ impl<'a> Lowering<'a> {
                     | "alloc::boxed::iter::<Impl>::into_iter"
             )
         })
+    }
+
+    /// `core::str::<Impl>::chars` / `core::str::chars` on a string-family
+    /// receiver (`tyref_is_string_family`), including autoderef
+    /// `String` → `str`.  Yields Unicode scalars (`Utf8StringIterator`),
+    /// so it is not a byte-view identity and not a slice `iter`.
+    fn is_str_chars_constructor(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        if leaf != Some("chars") || !path.contains("str") {
+            return false;
+        }
+        first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
     }
 
     /// `<[T]>::len` / `Vec::len` — the container element count.  Lowered
@@ -115188,8 +115233,12 @@ mod tests {
         let chars = super::lower_function(&string_view_call_llbc("chars"), "string_view_call")
             .expect("chars lowers");
         assert!(
-            graph_calls_leaf(&chars, "chars"),
-            "str::chars must stay a call, graph: {chars:#?}"
+            graph_calls_leaf(&chars, crate::runtime_names::shims::UTF8_ITER),
+            "str::chars must rewrite to __majit_utf8iter, graph: {chars:#?}"
+        );
+        assert!(
+            !graph_calls_leaf(&chars, "chars"),
+            "str::chars must not remain a residual chars call, graph: {chars:#?}"
         );
         assert!(
             !returned_value_is_start_input(&chars),

@@ -4006,6 +4006,12 @@ fn someiterator_next(ann: &RPythonAnnotator, it: &SomeIterator) -> SomeValue {
             s_item,
         ]));
     }
+    // `Utf8StringIterator.next` (`rutf8.py`) returns a nonneg int code
+    // point.  Must run before `container_getanyitem`, which would give
+    // SomeChar for a SomeString container.
+    if it.variant.first().map(String::as_str) == Some("utf8") {
+        return SomeValue::Integer(SomeInteger::new(true, false));
+    }
     // upstream: `if variant == ("reversed",): variant = ()`.
     let variant: Option<&str> = if it.variant.len() == 1 && it.variant[0] == "reversed" {
         None
@@ -6371,6 +6377,24 @@ mod tests {
         let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
         let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Char(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_someiterator_next_utf8_on_string_returns_nonneg_integer() {
+        use super::super::model::SomeString;
+        let ann = mk_ann();
+        let it = SomeIterator::new(
+            SomeValue::String(SomeString::new(false, true)),
+            vec!["utf8".to_string()],
+        );
+        let mut v = Variable::named("it");
+        ann.setbinding(&mut v, SomeValue::Iterator(it));
+        let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann).unwrap().unwrap();
+        match r {
+            SomeValue::Integer(i) => assert!(i.nonneg, "utf8 next is a nonneg code point"),
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
     }
 
     #[test]
