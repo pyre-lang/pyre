@@ -1,12 +1,4 @@
 # pyre-check: max-pypy-ratio=26
-# pyre-check: jitstats-band=guard_failures=16
-# The windows-latest dynasm leg reads 619, 619 and 610 guard
-# failures (runs 36192328967, 36254696576, 36316164602) against 605 on macos
-# and ubuntu, with the same seven loops and four bridges. The count moves
-# between runs of one commit there. On macOS it stays 605 across nursery
-# sizes 256KB-16MB, PYPY_GC_MIN / PYPY_GC_MAJOR_COLLECT / PYPY_GC_GROWTH and
-# PYTHONHASHSEED, and N = 8000 also reads 605, so the extra failures come
-# after iteration 8000 on that host only.
 # A frame that raises and catches in one body contributes EXACTLY ONE
 # traceback node, and it keeps that count once the loop is compiled.
 #

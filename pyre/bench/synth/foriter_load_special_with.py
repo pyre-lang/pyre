@@ -1,8 +1,3 @@
-# pyre-check: jitstats-band=guard_failures=1
-# Run 33384229844 reads 200 guard failures on every CI host while darwin-arm64
-# reads 201 from the same topology (then 2 loops, 1 bridge); only that counter
-# moves. Since the FOR_ITER allowlist was deleted the topology is 2 loops, 2
-# bridges, and darwin-arm64 reads 401.
 # A `with` block in a hot FOR_ITER body, whose handler runs every tenth
 # iteration. The frame is traced: 2 loops and 2 bridges, and the 401 guard
 # failures are the two bridges' warm-up (trace_eagerness=200 each), not a

@@ -1,7 +1,6 @@
 # pyre-check: max-pypy-ratio=4
 # The measured reading stays under 4, so the ceiling is 4.
 # pyre-check: skip-cpython
-# pyre-check: jitstats-band=guard_failures=8
 # Jitcounter decay scales every JitCounter entry down once per 32 minor
 # collections (majit-trace/src/counter.rs), so how far a guard's counter has
 # advanced when the workload reaches it depends on how much the process has
@@ -13,9 +12,6 @@
 # the same commit.  With `decay=0` the same nine-point sweep reads one number,
 # 3792, with `loops_compiled=6` and `bridges_compiled=18` throughout.  The pin
 # trades the marginal nineteenth bridge for a number that does not move.
-# Width 8 is margin over the pinned run: the mode this fixture used to fall
-# into moves `guard_failures` by ~117 and `bridges_compiled` by one, and the
-# latter stays gated exactly.
 #
 # CPython (the oracle) has no `pypyjit`; PyPy and pyre do.  Guarding the import
 # keeps the output identical across all three while the param only binds where a

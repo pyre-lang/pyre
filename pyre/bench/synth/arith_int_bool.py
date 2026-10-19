@@ -1,12 +1,5 @@
 # pyre-check: max-pypy-ratio=4.9
-# pyre-check: jitstats-band=guard_failures=2
 # pyre-check: spec-folds=binary_op_descent,compare_op_descent
-# One host disagrees with the other two by a single count: at the same
-# commit the ubuntu-24.04 and windows-latest legs read dynasm
-# guard_failures=2507 and macos-latest read 2508, while loops_compiled=7 and
-# bridges_compiled=12 held on all three and stay gated exactly. Width 2
-# leaves one count of margin; the moves this gate is here to catch on this
-# fixture are in the hundreds (2307 -> 2507 on the run that recorded it).
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept verbatim from its former standalone file with module-level names prefixed
 # by the source name. Bug-repro / resume / kept-stack tests are NOT merged (they

@@ -1,7 +1,4 @@
 # pyre-check: max-pypy-ratio=4.5
-# pyre-check: jitstats-band=loops_compiled=1
-# Run 33384229844 reads four loops on windows and three on the other hosts;
-# bridges stay at two and all dunder admission/refusal checks are unchanged.
 # A `BINARY_OP` / `COMPARE_OP` whose dunder is a call-free Python body.
 #
 # The walker used to refuse every one of these.  The refusal was not about the

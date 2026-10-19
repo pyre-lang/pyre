@@ -1,12 +1,10 @@
 # pyre-check: requires-modules=gc
 # pyre-check: no-cpython
-# pyre-check: jitstats-band=guard_failures=8,bridges_compiled=1
 # Immortal modules and builtin types are traced through `prebuilt_root_objects`,
 # so `gc.get_rpy_roots()` is a few hundred objects (pypy3 has about 613) and
 # the `<module>` list comprehension over it stays below the loop threshold,
 # remaining interpreted as on pypy3. The one compiled loop is
-# `warm_jit_for_code_stats`. The band covers per-platform spread in the root
-# list.
+# `warm_jit_for_code_stats`.
 import gc
 import sys
 

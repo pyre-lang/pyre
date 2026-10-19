@@ -1,4 +1,4 @@
-# pyre-check: jitstats-band=guard_failures=5
+# pyre-check: jitstats-band=guard_failures=1
 # `guard_failures` / `bridges_compiled` follow the minor-collection schedule
 # (`counter.py` `decay_all_counters`, every 32 minors). At PYPY_GC_NURSERY
 # 2MB..16MB (check.py pins 4MB) and on wasm this file reads loops=68
@@ -6,6 +6,8 @@
 # The extra `RAISE_WARM` trips through `boom` push the last fail=2 hop past
 # `trace_eagerness` (200 / `increment_trace_eagerness`); without them 4MB
 # sits at 185/200 (130 bridges) while 2MB and wasm compile the hop (131).
+# ubuntu cranelift read guard_failures 27144 in CI run 39115984762; every
+# other leg reads 27143.
 # A frame whose residual call raises must still run its own `finally`, and must
 # contribute exactly one traceback node.
 #

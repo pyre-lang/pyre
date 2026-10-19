@@ -1,7 +1,4 @@
 # pyre-check: max-pypy-ratio=41
-# pyre-check: jitstats-band=guard_failures=1
-# Run 33384229844 reads 413 guard failures on windows and 414 on the other
-# hosts with the same four-loop/two-bridge PEP 479 topology.
 # PEP 479: a StopIteration that escapes a generator body is replaced by
 # RuntimeError("generator raised StopIteration") chained from it, across every
 # drive path (list / for / tuple / next / send) and whether the StopIteration

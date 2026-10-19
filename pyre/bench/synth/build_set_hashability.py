@@ -1,7 +1,4 @@
 # pyre-check: max-pypy-ratio=105
-# pyre-check: jitstats-band=guard_failures=1
-# ubuntu-24.04 run 34737668364 read wasm guard_failures 42 against the
-# recorded 43, with loops_compiled=3 and bridges_compiled=0 unchanged.
 # BUILD_SET (the {...} set literal) hashes every element through
 # space.hash_w, so an unhashable element — a list, or an instance whose
 # __hash__ is None / raises / returns a non-int — raises instead of silently

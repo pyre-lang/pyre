@@ -1,7 +1,3 @@
-# pyre-check: jitstats-band=loops_compiled=1,guard_failures=1
-# Host split after the helper inline: ubuntu, windows, and wasm compile 4
-# loops and fail 249 guards; macOS dynasm compiles 5 and fails 250. Both
-# old bridges are gone on every host.
 # `_abc_instancecheck` answers from two per-class weak-set caches, and a
 # question that hits one is meant to cost the probe and nothing else.  This
 # drives both answers in a hot loop: a class that matches (positive cache) and
