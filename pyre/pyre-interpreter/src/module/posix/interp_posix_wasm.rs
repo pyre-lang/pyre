@@ -451,7 +451,7 @@ fn dir_entry_type() -> PyObjectRef {
     DIR_ENTRY_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("posix.DirEntry", init_dir_entry_type);
         crate::typedef::mark_cpython_heap_type(tp, false);
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp
     })
 }
@@ -560,7 +560,7 @@ fn scandir_iterator_type() -> PyObjectRef {
         let tp =
             crate::typedef::make_builtin_type("posix.ScandirIterator", init_scandir_iterator_type);
         crate::typedef::mark_cpython_heap_type(tp, false);
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp
     })
 }

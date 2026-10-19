@@ -22718,7 +22718,7 @@ pub fn file_wrapper_type() -> PyObjectRef {
         // TextIOWrapper heap spec.  This legacy wrapper accessor must publish
         // the same owner as `_io::interp_textio::type_object`.
         crate::typedef::mark_cpython_heap_type(tp, true);
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp
     })
 }

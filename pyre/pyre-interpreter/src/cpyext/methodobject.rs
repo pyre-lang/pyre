@@ -247,7 +247,7 @@ pub fn pycfunction_type() -> PyObjectRef {
             };
             install_attribute_fence(pyre_object::gc_roots::shadow_stack_get(ns_slot));
         });
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp
     })
 }
@@ -265,7 +265,7 @@ pub fn pycmethod_type() -> PyObjectRef {
             |_ns| {},
             pycfunction_type(),
         );
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp
     })
 }

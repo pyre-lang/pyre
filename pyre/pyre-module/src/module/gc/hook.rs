@@ -680,7 +680,7 @@ pub(super) fn gc_collect_step_stats_type() -> PyObjectRef {
                 );
             }
         });
-        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true) };
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
         tp
     })
@@ -835,7 +835,7 @@ fn make_private_stats_type(
             );
         }
     });
-    unsafe { typeobject::w_type_set_hasdict(tp, true) };
+    unsafe { pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true) };
     unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
     tp
 }

@@ -1055,7 +1055,7 @@ pub(super) fn carg_type() -> pyre_object::PyObjectRef {
                 })
             );
         });
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true) };
         super::finish_cpython_type(tp, "_ctypes", true)
     })
 }

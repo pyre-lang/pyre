@@ -11421,13 +11421,10 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     if unsafe { pyre_object::typeobject::w_type_has_vectorcall(w_type) } {
         return type_call_decline("type declares a vectorcall");
     }
-    // `map` is baked as a constant, so install the terminator now if the type
-    // has not been asked for one yet — a class nobody has read an attribute off
-    // still carries null, and baking that would hand every traced instance a
-    // map the interpreter's own instances do not have.  The terminator is
-    // created once and never replaced, so the constant stays valid.
-    let terminator =
-        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(w_type) };
+    // `map` is baked as a constant from `w_type.terminator`
+    // (`typeobject.py W_TypeObject.__init__` / `mapdict.py
+    // _mapdict_init_empty`). Types own that word from construction.
+    let terminator = unsafe { pyre_object::typeobject::w_type_get_terminator(w_type) };
     if terminator.is_null() {
         return type_call_decline("no terminator");
     }
@@ -11732,8 +11729,7 @@ pub(crate) fn try_walker_inline_object_new<Sym: WalkSym>(
     if !std::ptr::eq(typedef_of(w_object), typedef_of(w_type)) {
         return Ok(None);
     }
-    let terminator =
-        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(w_type) };
+    let terminator = unsafe { pyre_object::typeobject::w_type_get_terminator(w_type) };
     if terminator.is_null() {
         return Ok(None);
     }

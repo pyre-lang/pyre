@@ -2715,7 +2715,7 @@ fn descriptor_type(
             init(ns);
             super::methodobject::install_attribute_fence(ns);
         });
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp
     })
 }
@@ -5596,7 +5596,7 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_type);
     unsafe {
-        pyre_object::typeobject::w_type_set_hasdict(
+        crate::objspace::std::mapdict::set_type_hasdict(
             pyre_object::gc_roots::shadow_stack_get(type_slot),
             (*tp).tp_dictoffset != 0,
         );
