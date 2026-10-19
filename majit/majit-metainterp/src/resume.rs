@@ -2979,23 +2979,6 @@ impl ResumeDataLoopMemo {
         }
     }
 
-    /// Drop per-compile caches (`resume.py ResumeDataLoopMemo.__init__`)
-    /// but keep the writer / livebox scratch capacities.
-    pub fn recycle_for_next_compile(&mut self) {
-        self.consts = majit_ir::SharedConstPool::new(Vec::new());
-        self.large_ints.clear();
-        self.refs.clear();
-        self.cached_boxes.clear();
-        self.cached_virtuals.clear();
-        self.nvirtuals = 0;
-        self.nvholes = 0;
-        self.nvreused = 0;
-        self.livebox_map_scratch.clear();
-        self.new_livebox_map_scratch.clear();
-        self.virtual_fields_scratch.clear();
-        self.virtual_worklist_scratch.clear();
-    }
-
     fn take_livebox_map(&mut self) -> LiveboxMap {
         let mut map = std::mem::take(&mut self.livebox_map_scratch);
         map.clear();

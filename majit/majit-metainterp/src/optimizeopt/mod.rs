@@ -101,10 +101,6 @@ impl ExtraQueue {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
-    }
 }
 
 impl Extend<(usize, majit_ir::OpRc)> for ExtraQueue {
@@ -3218,91 +3214,6 @@ impl OptContext {
             pending_invalid_loop: std::cell::Cell::new(None),
             const_operands: std::cell::RefCell::new(crate::FxIndexMap::default()),
         }
-    }
-
-    /// Drop the per-compile graph, keep map/vec capacities.
-    /// `optimizer.py Optimizer.__init__` builds those maps once per
-    /// optimizer; RPython `BridgeCompileData.optimize` then constructs a
-    /// new `UnrollOptimizer` per compile (nursery allocation). Recycle
-    /// the same maps across `compile_bridge` instead of dropping them.
-    pub(crate) fn reset_keep_capacity(
-        &mut self,
-        estimated_ops: usize,
-        num_inputs: usize,
-        inputarg_base: u32,
-        start_next_pos: u32,
-    ) {
-        self.supports_efficient_uint_mul_high = true;
-        self.new_operations.clear();
-        self.new_operations.reserve(estimated_ops);
-        self.new_operations_drained = false;
-        self.new_operations_index.clear();
-        self.new_operations_index.reserve(estimated_ops);
-        self.emitted_operations.clear();
-        if estimated_ops > self.emitted_operations.capacity() {
-            self.emitted_operations.reserve(estimated_ops);
-        }
-        self.num_inputs = num_inputs as u32;
-        self.inputarg_base = inputarg_base;
-        self.next_pos = start_next_pos;
-        self.extra_operations_after.clear();
-        self.extra_pending.clear();
-        self.pending_guard_class_postprocess = None;
-        self.pending_mark_last_guard = None;
-        self.pending_finish_guard_postprocess = None;
-        self.imported_short_pure_ops.clear();
-        self.imported_virtual_args = None;
-        self.imported_loop_invariant_results.clear();
-        self.imported_short_preamble_builder = None;
-        self.const_infos.clear();
-        self.potential_extra_ops.clear();
-        self.active_short_preamble_producer = None;
-        self.preview_short_state = None;
-        self.exported_const_short_boxes.clear();
-        self.imported_virtuals.clear();
-        self.imported_label_args = None;
-        self.can_replace_guards = true;
-        self.patchguardop = None;
-        self.preamble_end_args = None;
-        self.skip_flush_mode = false;
-        self.building_bridge = false;
-        self.current_pass_idx = 0;
-        self.optearlyforce_idx = 0;
-        self.in_final_emission = false;
-        self.callinfocollection = None;
-        self.pending_for_guard.clear();
-        self.pending_pure_from_args.clear();
-        self.pending_pure_from_args2.clear();
-        self.pure_ops = None;
-        self.constant_fold_alloc = None;
-        self.string_length_resolver = None;
-        self.string_content_resolver = None;
-        self.string_constant_alloc = None;
-        self.quasi_immutable_deps.clear();
-        self.snapshot_boxes.clear();
-        self.snapshot_frame_sizes.clear();
-        self.snapshot_vable_boxes.clear();
-        self.minimum_virtualizable_size = -1;
-        self.snapshot_vref_boxes.clear();
-        self.snapshot_frame_pcs.clear();
-        self.byte_bridge_resume = None;
-        self.inputargs.clear();
-        self.inputarg_refs.clear();
-        self.resop_refs.clear();
-        if estimated_ops > self.resop_refs.capacity() {
-            self.resop_refs.reserve(estimated_ops);
-        }
-        self.live_synthetics.clear();
-        self.phase1_emit_ops.clear();
-        self.phase1_emit_ops_index.clear();
-        self.input_ops.clear();
-        self.input_ops.reserve(estimated_ops);
-        self.last_guard_idx = None;
-        self.guard_chain_broken = false;
-        self.last_seen_snapshot_pos = None;
-        self.last_op_removed = false;
-        self.pending_invalid_loop.set(None);
-        self.const_operands.get_mut().clear();
     }
 
     pub fn num_inputs(&self) -> usize {

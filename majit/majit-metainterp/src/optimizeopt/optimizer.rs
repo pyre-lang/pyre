@@ -94,16 +94,6 @@ pub trait Optimization {
     /// Called once before optimization starts.
     fn setup(&mut self) {}
 
-    /// Drop state that `setup` keeps for an intra-compile phase-1 → phase-2
-    /// handoff (`OptPure.extra_call_pure` / `preamble_pure_ops`) so a recycled
-    /// optimizer cannot leak it into the next `compile_bridge`.
-    ///
-    /// RPython `BridgeCompileData.optimize` constructs a new
-    /// `UnrollOptimizer` per compile; nursery allocation is cheap there.
-    fn reset_between_compiles(&mut self) {
-        self.setup();
-    }
-
     /// Called after all operations have been processed.
     fn flush(&mut self, _ctx: &mut OptContext) {}
 
@@ -453,11 +443,6 @@ pub struct Optimizer {
     pub terminal_op: Option<Op>,
     /// Preserved final context after optimization, for jump_to_existing_trace.
     pub final_ctx: Option<OptContext>,
-    /// Recycled `OptContext` maps from the previous compile. Taken at the
-    /// start of the next `optimize_with_constants_and_inputs_at` so
-    /// `resop_refs` / `new_operations` / `emitted_operations` keep their
-    /// capacity (`optimizer.py Optimizer.__init__` builds those maps once).
-    recycled_ctx: Option<Box<OptContext>>,
     /// RPython Box identity: generation epoch for Phase 2 ops.
     /// Phase 1 JUMP arg OpRef indices to pre-tag as gen=0.
     /// bridgeopt.py deserialize_optimizer_knowledge: pending bridge resume data for deserialization
@@ -1445,7 +1430,6 @@ impl Optimizer {
             skip_flush: false,
             terminal_op: None,
             final_ctx: None,
-            recycled_ctx: None,
             pending_bridge_rd: None,
             building_bridge: false,
             simple_compile: false,
@@ -1476,62 +1460,6 @@ impl Optimizer {
         }
     }
 
-    /// Keep the pass boxes and `ResumeDataLoopMemo` scratch, drop the
-    /// per-compile graph. RPython `BridgeCompileData.optimize` constructs a
-    /// new `UnrollOptimizer` per compile; nursery allocation is cheap there.
-    pub fn recycle_for_next_compile(&mut self) {
-        self.final_num_inputs = 0;
-        self.call_pure_results = crate::optimizeopt::util::ArgsDict::default();
-        self.last_guard_op_idx = None;
-        self.replaces_guard.clear();
-        self.pendingfields.clear();
-        self.can_replace_guards = true;
-        self.quasi_immutable_deps.clear();
-        self.imported_virtuals.clear();
-        self.trace_inputargs.clear();
-        self.runtime_boxes.clear();
-        self.exported_loop_state = None;
-        self.imported_loop_state = None;
-        self.imported_short_aliases.clear();
-        self.imported_short_preamble = None;
-        self.imported_short_preamble_builder = None;
-        self.short_preamble_producer = None;
-        self.published_short_preamble_producer_slot = None;
-        self.compile_live_op_roots_slot = None;
-        self.imported_label_args = None;
-        self.patchguardop = None;
-        self.skip_flush = false;
-        self.terminal_op = None;
-        if let Some(ctx) = self.final_ctx.take() {
-            self.stash_recycled_ctx(ctx);
-        }
-        self.pending_bridge_rd = None;
-        self.building_bridge = false;
-        self.simple_compile = false;
-        self.all_descrs = Arc::new(Vec::new());
-        self.snapshot_boxes = Vec::new();
-        self.snapshot_frame_sizes.clear();
-        self.snapshot_vable_boxes = Vec::new();
-        self.snapshot_vref_boxes = Vec::new();
-        self.snapshot_frame_pcs.clear();
-        self.byte_bridge_resume = None;
-        self.phase1_emit_ops.clear();
-        self.opt_ops_emitted = 0;
-        self.opt_guards_emitted = 0;
-        self.opt_guards_shared_emitted = 0;
-        self.explicit_input_ops_seed = None;
-        self.trace_inputarg_boxes.clear();
-        self.resumedata_memo.borrow_mut().recycle_for_next_compile();
-        for pass in &mut self.passes {
-            pass.reset_between_compiles();
-        }
-    }
-
-    fn stash_recycled_ctx(&mut self, mut ctx: OptContext) {
-        ctx.reset_keep_capacity(0, 0, 0, 0);
-        self.recycled_ctx = Some(Box::new(ctx));
-    }
-
     fn take_opt_context(
         &mut self,
         estimated_ops: usize,
@@ -1539,10 +1467,6 @@ impl Optimizer {
         inputarg_base: u32,
         start_next_pos: u32,
     ) -> OptContext {
-        if let Some(mut ctx) = self.recycled_ctx.take() {
-            ctx.reset_keep_capacity(estimated_ops, num_inputs, inputarg_base, start_next_pos);
-            return *ctx;
-        }
         OptContext::with_num_inputs_and_start_pos(
             estimated_ops,
             num_inputs,
@@ -5006,8 +4930,7 @@ impl Optimizer {
             // emitted by the failing propagation and the untouched tail from
             // this level available to the caller's unwind.  Each outer level
             // appends its own untouched tail in turn, so no parked producer is
-            // silently discarded and a reused context never observes a
-            // half-drained scheduling state.
+            // silently discarded.
             ctx.extra_operations_after.extend(unfinished);
         } else {
             debug_assert!(unfinished.is_empty());

@@ -1296,11 +1296,6 @@ impl Optimization for OptPure {
         // across optimization runs (set by set_extra_call_pure before opt).
     }
 
-    fn reset_between_compiles(&mut self) {
-        self.setup();
-        self.extra_call_pure.clear();
-    }
-
     fn set_call_pure_results(&mut self, results: &crate::optimizeopt::util::ArgsDict) {
         self.call_pure_results = results.clone();
     }

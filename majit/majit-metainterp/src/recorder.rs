@@ -396,8 +396,8 @@ fn snapshot_box_from_tagged<'c>(
 /// A guard the optimizer never emits never builds its box vectors.
 ///
 /// `recorder` stays valid while `MetaInterp.tracing` owns the `Trace`.
-/// `OptContext::reset_keep_capacity` drops this value without reading the
-/// pointer, before a later compile can free the trace.
+/// Dropping `OptContext` at the end of the compile drops this value
+/// without reading the pointer.
 pub(crate) struct ByteBridgeResume {
     recorder: *const Trace,
     unique_cache: Vec<Option<Operand>>,
