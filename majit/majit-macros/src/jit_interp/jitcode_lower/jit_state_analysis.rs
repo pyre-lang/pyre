@@ -1,4 +1,20 @@
 use super::*;
+use std::collections::HashSet;
+use syn::visit::Visit;
+
+/// Exhaustive walk for `state.<name>[...]` (Return, Tuple, Match guards,
+/// Macro, …). `visit_expr_index` records the array, then keeps descending.
+struct UsedStateArrayProbe<'a, 'c> {
+    lowerer: &'a Lowerer<'c>,
+    used: &'a mut HashSet<String>,
+}
+
+impl<'ast, 'a, 'c> Visit<'ast> for UsedStateArrayProbe<'a, 'c> {
+    fn visit_expr_index(&mut self, idx: &'ast syn::ExprIndex) {
+        self.lowerer.record_state_array_index(&idx.expr, self.used);
+        syn::visit::visit_expr_index(self, idx);
+    }
+}
 
 impl<'c> Lowerer<'c> {
     pub(super) fn stmt_modifies_jit_state(&self, stmt: &Stmt) -> bool {
@@ -443,6 +459,54 @@ impl<'c> Lowerer<'c> {
                 self.expr_is_state_root(expr)
             }
             _ => false,
+        }
+    }
+
+    /// Plain `[int]`/`[float]` names whose `state.<name>[...]` the body
+    /// reads or writes, in `state_array_names_in_order`. Split-dispatch /
+    /// pc-return arms declare only these as packed `{ptr, len}` arguments
+    /// (`Transformer.handle_regular_call` / `MIFrame.setup_call`).
+    pub(super) fn body_used_state_array_names(&self, stmts: &[Stmt]) -> Vec<String> {
+        let Some(config) = self.config else {
+            return Vec::new();
+        };
+        let mut used = HashSet::new();
+        let mut probe = UsedStateArrayProbe {
+            lowerer: self,
+            used: &mut used,
+        };
+        for stmt in stmts {
+            syn::visit::Visit::visit_stmt(&mut probe, stmt);
+        }
+        config
+            .state_array_names_in_order()
+            .into_iter()
+            .filter(|name| used.contains(*name))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn record_state_array_index(&self, indexed: &Expr, used: &mut HashSet<String>) {
+        let Some(config) = self.config else {
+            return;
+        };
+        let field = match indexed {
+            Expr::Field(field) => field,
+            Expr::Paren(ExprParen { expr, .. }) | Expr::Reference(ExprReference { expr, .. }) => {
+                self.record_state_array_index(expr, used);
+                return;
+            }
+            _ => return,
+        };
+        if !self.expr_is_state_root(&field.base) {
+            return;
+        }
+        let member = match &field.member {
+            syn::Member::Named(ident) => ident.to_string(),
+            syn::Member::Unnamed(idx) => idx.index.to_string(),
+        };
+        if config.state_arrays.contains_key(&member) {
+            used.insert(member);
         }
     }
 }

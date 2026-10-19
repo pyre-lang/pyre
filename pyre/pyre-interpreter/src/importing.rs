@@ -747,9 +747,6 @@ pub struct OptionalModuleHooks {
     /// `interp_gc.py`'s app-level hook object, installed once when the
     /// execution context binds the shared action flag.
     pub gc_initialize: fn(PyObjectRef, &mut (dyn crate::executioncontext::ActionFlagOps + 'static)),
-    /// `interp_gc.py _run_finalizers`, with the enable/disable bracket the
-    /// module keeps around `UserDelAction._run_finalizers`.
-    pub gc_run_finalizers_now: fn(),
     /// `interp_array.py` type setup. `array.array` is installed only when
     /// this runs; without the module the type is absent.
     pub init_array_type: fn(PyObjectRef),

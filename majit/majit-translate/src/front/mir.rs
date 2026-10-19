@@ -24217,10 +24217,32 @@ impl<'a> Lowering<'a> {
         // resolve instead of blocking the annotator on a classdef-less instance.
         // Gated on the raw-pointer pointee (not a bare ADT) so foreign value
         // types (`BigInt` / `Wtf8Buf` — no registered struct) are excluded.
+        //
+        // `tupleobject.py wraptuple` length 2 unpacks `list_w` through
+        // `specialisedtupleobject.py makespecialisedtuple` (`w_arg1, w_arg2 =
+        // list_w`). Those reads are `rlist.py ll_getitem_fast` —
+        // `getarrayitem` of `GcArray(OBJECTPTR)`. An items-block base
+        // accessor (`is_object_items_block_base_accessor`: `l.items`)
+        // residualizes as a HostObject whose result is a classdef-less
+        // instance, so `ArrayRead` → flowspace `getitem` rewrites to
+        // `getattr("__getitem__")` (`getitem_SomeInstance`). Narrow through
+        // the `[Class]` list spelling brick 3 already uses for
+        // `*base.add(idx)` (`object_ref_items_list_root`).
+        let items_block_items_list_root = match &call.func {
+            CallFunc::Regular(reg)
+                if regular_call_is_items_block_accessor(reg, self.llbc)
+                    && !graph_is_string_items_owner(&self.graph.name) =>
+            {
+                object_ref_items_list_root(&call.dest.ty, self.llbc)
+                    .or_else(|| object_ref_items_list_root(dest_class_ty, self.llbc))
+            }
+            _ => None,
+        };
         let result_narrow_root: Option<String> = match &result_ty {
             // A producer's graph returns the rbigint its handle roots
             // ([`OwnerRootPlan`]), the instance `RBigInt::clone` narrows to.
             _ if self.owner_root.erases(dest_local) || rerooted => Some("RBigInt".to_string()),
+            _ if items_block_items_list_root.is_some() => items_block_items_list_root,
             ValueType::Ref(Some(root)) => {
                 // A pointer-niche Option is `SomeInstance(payload)`, not the
                 // Option enum class, even when `tyref_to_value_type` names
@@ -25692,18 +25714,19 @@ impl<'a> Lowering<'a> {
                 // though `StringRepr.lowleveltype = Ptr(STR)` (`rstr.py`,
                 // `StringRepr`) and `TUPLE_TYPE` (`rtuple.py`) really are one
                 // GC pointer inside an RPython list.  Those describe the repr
-                // of a list the translation BUILDS; the container under this
-                // arm is a host Rust one that no translation replaces, and the
-                // read strides over its real memory.  `&str` is two words
-                // there, `String`/`Wtf8Buf` three, and `(Wtf8Buf,
-                // PyObjectRef)` four, so naming any of them a one-word item
-                // reads the wrong address from the second element on.  The
-                // managed `GcArray(GCREF)` items view — the one container that
-                // IS one word per item — carries its own proof
-                // (`first_arg_is_string_array_view`) and mints
-                // `STRING_GCREF_GCARRAY_TYPE_ID` below without asking here;
-                // routing host containers through the same `[str]` identity
-                // would also alias them into that array's `_cache_array` slot.
+                // of a list the translation BUILDS; a host Rust container
+                // that no translation replaces still strides over its real
+                // memory.  `&str` is two words there, `String`/`Wtf8Buf`
+                // three, and `(Wtf8Buf, PyObjectRef)` four, so naming any of
+                // them a one-word item reads the wrong address from the
+                // second element on.  A translated `Vec<String>` is that
+                // built list (`translated_str_vec_index` below) and mints
+                // `STRING_GCREF_GCARRAY_TYPE_ID` without asking here.  The
+                // managed `GcArray(GCREF)` items view — the other container
+                // that IS one word per item — carries its own proof
+                // (`first_arg_is_string_array_view`).  Routing a host
+                // container through the same `[str]` identity would also
+                // alias it into that array's `_cache_array` slot.
                 let element_spelling = element_scalar;
                 // A `&[PyObjectRef]` is `Ptr(GcArray(Ptr(PyObject)))` in the
                 // translated type model — the block a gateway wrapper's
@@ -25722,6 +25745,19 @@ impl<'a> Lowering<'a> {
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc))
                     || element_is_niche_option;
+                // A translated `Vec<String>` / `Vec<Wtf8Buf>` is `ListRepr` of
+                // `SomeString` (`project_struct_field_type` maps the
+                // string-family element to `s_str0`, then `Vec<` to
+                // `SomeList`). Host `String` is three words, so it has no
+                // `element_spelling` above; the list's items are one GCREF
+                // each (`StringRepr`). Scalar `Vec::index` therefore emits
+                // the same `ArrayRead` / `getitem` as any other `ListRepr`
+                // (`rlist.py` `AbstractBaseListRepr.rtype_getitem` /
+                // `ll_getitem_fast`) with `item_ty = Str`, on the list
+                // itself — never the host buf pointer.
+                let translated_str_vec_index = args.len() == 2
+                    && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
+                    && tyref_is_string_family(&call.dest.ty, self.llbc);
                 let vable_array_var = (args.len() == 2)
                     .then(|| declared_vable_array_var(&self.graph, &args[0]))
                     .flatten();
@@ -25784,7 +25820,7 @@ impl<'a> Lowering<'a> {
                 // ([`narrow_item_array_type_id`]); a `Vec<u8>` read strides by
                 // 8 without it.
                 let index_element = index_leg.then(|| {
-                    if first_arg_is_string_array_view {
+                    if first_arg_is_string_array_view || translated_str_vec_index {
                         return (
                             ValueType::Str,
                             Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
@@ -25946,7 +25982,8 @@ impl<'a> Lowering<'a> {
                     let plain_vec_index = vable_array_var.is_none()
                         && !vable_array
                         && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
-                        && !reaches_declared_vable_array(&self.graph, &args[0]);
+                        && !reaches_declared_vable_array(&self.graph, &args[0])
+                        && !translated_str_vec_index;
                     let rust_vec_kind = plain_vec_index
                         .then(|| {
                             first_arg_ty
@@ -67329,6 +67366,17 @@ fn is_string_array_base_adapter(name: &str) -> bool {
         || path_ends_with_segments(name, "unicode_array::<Impl>::base")
 }
 
+/// `BytesArray` / `UnicodeArray` methods share `items_block_items_base`
+/// with object lists, but their items are `SomeString` (`BytesListStrategy`
+/// / `AsciiListStrategy`, `externalvsinternal(..., gcref=True)`). Narrowing
+/// that accessor to `[PyObject]` there unions `Instance(PyObject)` with
+/// `String` at `ll_setitem_fast`. Brick 3 already recovers `[str]` for
+/// those graphs (`string_items_elem_ptr_add`).
+fn graph_is_string_items_owner(name: &str) -> bool {
+    name.split("::")
+        .any(|seg| matches!(path_segment_ident(seg), "bytes_array" | "unicode_array"))
+}
+
 /// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
 /// whose `.add(*_ITEMS_OFFSET)` the front-end collapses to the
 /// receiver (see [`Lowering::is_items_block_base_ptr_add`]).
@@ -82364,6 +82412,33 @@ mod tests {
         assert!(!graph_is_items_block_base_accessor(neighbour_typed));
     }
 
+    /// `BytesArray` / `UnicodeArray` methods share `items_block_items_base`
+    /// with object lists. The `[PyObject]` call-result narrow must not fire
+    /// on those graphs (`SomeString` items, `string_items_elem_ptr_add`).
+    #[test]
+    fn string_array_graphs_skip_the_object_items_list_narrow() {
+        use super::graph_is_string_items_owner;
+
+        assert!(graph_is_string_items_owner(
+            "pyre_object::bytes_array::<Impl>::push"
+        ));
+        assert!(graph_is_string_items_owner(
+            "pyre_object::bytes_array::<Impl>::set"
+        ));
+        assert!(graph_is_string_items_owner(
+            "pyre_object::unicode_array::<Impl>::set"
+        ));
+        assert!(!graph_is_string_items_owner(
+            "pyre_object::tupleobject::wraptuple"
+        ));
+        assert!(!graph_is_string_items_owner(
+            "pyre_object::listobject::w_list_make_empty"
+        ));
+        assert!(!graph_is_string_items_owner(
+            "pyre_object::my_bytes_array::<Impl>::push"
+        ));
+    }
+
     #[test]
     fn decode_packed_format_pieces_matches_real_llbc_templates() {
         use super::decode_packed_format_pieces;
@@ -88804,7 +88879,10 @@ mod tests {
 
     /// `tupleobject.py wraptuple` length 2 is `list_w[0]`, `list_w[1]`,
     /// `newtuple2`. Those reads are `rlist.py ll_getitem_fast` —
-    /// `getarrayitem` of a constant index, not `direct_ptradd`.
+    /// `getarrayitem` of a constant index, not `direct_ptradd`. The
+    /// items-base accessor result is the `GcArray(OBJECTPTR)` list
+    /// (`[PyObject]`), so `getitem` uses ListRepr rather than
+    /// `getitem_SomeInstance`.
     #[test]
     fn wraptuple_len2_item_reads_are_getarrayitem() {
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
@@ -88824,6 +88902,38 @@ mod tests {
                 .iter()
                 .any(|leaf| *leaf == "add" || *leaf == "wrapping_add"),
             "length-2 item pointer must not remain a residual add; ops={ops:?}"
+        );
+        let items_base = ops
+            .iter()
+            .copied()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("tuple_items_base")
+                )
+            })
+            .unwrap_or_else(|| panic!("wraptuple must call tuple_items_base; ops={ops:?}"));
+        let items_base_result = items_base
+            .result
+            .as_ref()
+            .unwrap_or_else(|| panic!("tuple_items_base must define a result; ops={ops:?}"));
+        let narrowed_to_object_list = ops.iter().any(|op| {
+            crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { args, .. }
+                        if matches!(
+                            args.first(),
+                            Some(LinkArg::Value(value)) if value == items_base_result
+                        )
+                )
+        });
+        assert!(
+            narrowed_to_object_list,
+            "tuple_items_base result must annotate as [PyObject] GcArray; ops={ops:?}"
         );
     }
 

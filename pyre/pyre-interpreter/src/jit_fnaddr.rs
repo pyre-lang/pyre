@@ -3510,16 +3510,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::register_finalizer",
         crate::executioncontext::register_finalizer,
     );
-    // `bytearray_check_exports` and `gc.collect` both reach the queued-finalizer
-    // drain, which is one residual call: the `gc` module owns the bracket, so
-    // the body is behind a hook and only this `dont_look_inside` wrapper has an
-    // address to bind.
-    pa0!(
-        &mut entries,
-        "pyre_interpreter::executioncontext::run_finalizers_now",
-        "pyre_interpreter::run_finalizers_now",
-        crate::executioncontext::run_finalizers_now,
-    );
     pa0!(
         &mut entries,
         "pyre_object::object_array::itemsblock_gc_enabled",
@@ -8486,20 +8476,6 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_interpreter::register_finalizer"], expected);
-    }
-
-    /// The finalizer drain `bytearray_check_exports` and `gc.collect` reach is a
-    /// residual call, so both resolver spellings bind the wrapper.
-    #[test]
-    fn jit_trace_fnaddrs_covers_run_finalizers_now() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::executioncontext::run_finalizers_now as *const () as usize as i64;
-
-        assert_eq!(
-            bindings["pyre_interpreter::executioncontext::run_finalizers_now"],
-            expected
-        );
-        assert_eq!(bindings["pyre_interpreter::run_finalizers_now"], expected);
     }
 
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the

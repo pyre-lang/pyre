@@ -1052,7 +1052,7 @@ impl<'c> Lowerer<'c> {
         // JitCode (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`). The
         // get/set are the `dum_nocheck` item ops off the pointer
         // (`rlist.py` `rtype_getitem` / `rtype_setitem`).
-        let base_reg = self.plain_array_ptr_reg(&member_name)?;
+        let base_reg = self.plain_array_ptr_reg(&member_name, field.member.span())?;
         let lhs_reg = self.alloc_reg();
 
         match item_kind {
@@ -1200,7 +1200,7 @@ impl<'c> Lowerer<'c> {
         // The `{ptr, len}` words are declared int arguments of this
         // JitCode (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`); this
         // op is the `dum_nocheck` item store off the pointer.
-        let base_reg = self.plain_array_ptr_reg(&member_name)?;
+        let base_reg = self.plain_array_ptr_reg(&member_name, field.member.span())?;
 
         let (value_register, descr, set_raw) = match item_kind {
             ValueKind::Float => (
@@ -3145,7 +3145,7 @@ impl<'c> Lowerer<'c> {
         // The `{ptr, len}` words are declared int arguments of this
         // JitCode (`MIFrame.setup_call` / `bhimpl_inline_call_ir_v`); this
         // op is the `dum_nocheck` item read off the pointer.
-        let base_reg = self.plain_array_ptr_reg(&member_name)?;
+        let base_reg = self.plain_array_ptr_reg(&member_name, field.member.span())?;
 
         let (dst, descr, get_raw, binding_kind) = match item_kind {
             ValueKind::Float => (

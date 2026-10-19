@@ -1227,21 +1227,23 @@ impl MIFrame {
                 }
             }
         };
-        let (nlocals, valid_stack_only, jitcode_ptr, pcdep_entries) = {
+        let (nlocals, valid_stack_only, jitcode_ptr, pcdep_entries, has_color_map) = {
             let s = self.sym();
-            let (metadata_stack_depth, pcdep_entries) = if s.jitcode.is_null() {
-                (None, Vec::new())
+            let (metadata_stack_depth, pcdep_entries, has_color_map) = if s.jitcode.is_null() {
+                (None, Vec::new(), false)
             } else {
                 unsafe {
                     let jc = &*s.jitcode;
+                    let has_color_map = jc.payload.metadata.has_color_map;
                     match resume_jit_pc {
                         Some(jit_pc) => (
                             jc.payload
                                 .depth_for_jitcode_pc_pred(jit_pc)
                                 .map(|d| d as usize),
                             jc.payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default(),
+                            has_color_map,
                         ),
-                        None => (None, Vec::new()),
+                        None => (None, Vec::new(), has_color_map),
                     }
                 }
             };
@@ -1250,7 +1252,13 @@ impl MIFrame {
             } else {
                 s.valuestackdepth.saturating_sub(s.nlocals)
             };
-            (s.nlocals, valid_stack_only, s.jitcode, pcdep_entries)
+            (
+                s.nlocals,
+                valid_stack_only,
+                s.jitcode,
+                pcdep_entries,
+                has_color_map,
+            )
         };
         let pcdep_opt: Option<&[(u8, u16, u16)]> =
             (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
@@ -1615,52 +1623,49 @@ impl MIFrame {
                             jit_pc, reg_idx
                         );
                     }
-                    let raw = registers_r_bank[reg_idx as usize];
+                    // `registers_r_bank` is slot-indexed (`sym.registers_r`).
+                    // `pyjitpl.py` `MIFrame.get_list_of_active_boxes` records
+                    // `registers_r[index]`, the color-indexed register. An
+                    // unmapped live color is a jitcode temporary no frame
+                    // slot backs, so the slot mirror at `color` is a leftover
+                    // local and is never read. At loop close the color-
+                    // indexed bank is the walked merge-point snapshot
+                    // `loop_close_registers_r` (`CloseLoop`
+                    // `merge_point_registers_r`, the same `ctx.registers_r`
+                    // `collect_outer_active_boxes` reads via
+                    // `regs_r.get_box(color)`).
                     let mapped = crate::state::semantic_ref_slot_for_reg_color(
                         nlocals,
                         valid_stack_only,
                         pcdep_opt.unwrap_or(&[]),
                         reg_idx as usize,
                     )
-                    .is_some();
-                    // `registers_r_bank` is indexed by frame slot, so a live
-                    // color no slot backs is a jitcode temporary the bank
-                    // does not hold: `registers_r_bank[color]` is whatever
-                    // local sits in slot `color`. `get_list_of_active_boxes`
-                    // records `registers_r[index]`, the register itself. At
-                    // the merge point that is the walked frame's register,
-                    // e.g. the `pycode` green `getfield_vable_r` loads before
-                    // `jit_merge_point`, which is a `virtualizable_boxes`
-                    // entry and so one of `reached_loop_header`'s
-                    // `live_arg_boxes`.
-                    let walked = if mapped {
-                        None
+                    .is_some()
+                        // `reconstructed_ref_slot_color`: empty metadata is
+                        // identity coloring (the color is the semantic slot)
+                        // for skeleton/fixture compatibility. A populated
+                        // `has_color_map` is authoritative, so an absent
+                        // color stays unmapped.
+                        || (!has_color_map
+                            && (reg_idx as usize) < nlocals + valid_stack_only);
+                    if mapped {
+                        registers_r_bank[reg_idx as usize]
+                    } else if let Some(v) = self
+                        .loop_close_registers_r
+                        .get(reg_idx as usize)
+                        .copied()
+                        .filter(|r| !r.is_none())
+                    {
+                        // Color-indexed merge-point register
+                        // (`pyjitpl.py` `MIFrame.get_list_of_active_boxes`
+                        // `registers_r[index]`). Includes a loop inputarg
+                        // the virtualizable shadow still holds.
+                        v
                     } else {
-                        self.loop_close_registers_r
-                            .get(reg_idx as usize)
-                            .copied()
-                            .filter(|r| !r.is_none())
-                    };
-                    let shadow_holds = raw.is_input_arg()
-                        && (0..ctx.virtualizable_boxes_len().unwrap_or(0))
-                            .any(|i| ctx.virtualizable_box_at(i) == Some(raw));
-                    // An unmapped bridge inputarg the shadow no longer
-                    // holds is not a merge-point loop inputarg. One the
-                    // shadow still names is.
-                    //
-                    // Outside the loop-close window no walked register is
-                    // at hand, and `registers_r_bank[color]` for an unmapped
-                    // color is a leftover local, not the register. Empty
-                    // pcdep (skeleton fixtures) has no color map, so keep
-                    // the raw box there.
-                    if let Some(walked) = walked {
-                        walked
-                    } else if !mapped && raw.is_input_arg() && !shadow_holds {
+                        // `-live-` is a union over a PC range
+                        // (`liveness.py`); a color live in that union
+                        // and dead at this position has no register.
                         ctx.const_ref(0)
-                    } else if !mapped && !pcdep_entries.is_empty() && !raw.is_input_arg() {
-                        ctx.const_ref(0)
-                    } else {
-                        raw
                     }
                 };
                 boxes.push(opref);
@@ -3885,6 +3890,127 @@ mod tests {
         unsafe {
             let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
         }
+    }
+
+    /// Color 1 owns local slot 1; color 2 is live with no slot. Returns the
+    /// snapshot boxes from `get_list_of_active_boxes` at the merge-point
+    /// `-live-`.
+    fn snapshot_live_ref_colors_1_and_2(
+        slot_at_2: OpRef,
+        loop_close_registers_r: Vec<OpRef>,
+        shadow: Option<OpRef>,
+    ) -> Vec<OpRef> {
+        use indexmap::IndexMap;
+        use majit_jitcode::liveness::encode_liveness;
+        use std::sync::Arc;
+
+        let mut all_liveness = vec![0, 2, 0];
+        all_liveness.extend(encode_liveness(&[1, 2]));
+        let mut insns: IndexMap<String, u8> = IndexMap::new();
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
+        crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
+
+        let runtime_jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new(
+                "get_list_of_active_boxes_unmapped_color_helper",
+            );
+            inner.set_body(majit_jitcode::jitcode::JitCodeBody {
+                code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
+                c_num_regs_r: 3,
+                startpoints: Some([0_usize].into_iter().collect()),
+                ..Default::default()
+            });
+            inner
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.jitcode = Arc::new(runtime_jc);
+        pyjit.metadata.n_py_instrs = 1;
+        pyjit.metadata.block_head_py_by_jit_pc = vec![(0, 0)];
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0)];
+        pyjit.metadata.is_drained = true;
+        pyjit.metadata.has_color_map = true;
+        pyjit.metadata.pcdep_by_jit_pc.push((0, vec![(1, 1, 1)]));
+        pyjit.metadata.depth_pred_by_jit_pc.push((0, 0));
+        let inner_jc = crate::state::JitCode {
+            index: 0,
+            payload: Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+
+        let mapped = OpRef::ref_op(20);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = inner_jc_ptr;
+        sym.nlocals = 2;
+        sym.valuestackdepth = 2;
+        sym.execution_context = OpRef::input_arg_ref(0);
+        sym.registers_r
+            .replace(vec![OpRef::NONE, mapped, slot_at_2]);
+
+        let mut ctx = crate::trace_ctx_for_test(1);
+        if let Some(held) = shadow {
+            let info = crate::frame_layout::build_pyframe_virtualizable_info();
+            ctx.install_virtualizable_info(info.clone());
+            ctx.set_virtualizable_boxes_with_info(vec![held], Vec::new(), &info, &[0]);
+        }
+        let mut frame = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            residual_call_pc: None,
+            loop_close_marker_jit_pc: Some(0),
+            loop_close_registers_r,
+            close_merge_point_vsd: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        };
+
+        let active = frame.get_list_of_active_boxes(&mut ctx, false, false, None);
+        unsafe {
+            let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
+        }
+        active
+    }
+
+    #[test]
+    fn get_list_of_active_boxes_reads_an_unmapped_inputarg_color_from_the_walked_register() {
+        let leftover = OpRef::input_arg_ref(3);
+        let walked = OpRef::ref_op(50);
+        let mapped = OpRef::ref_op(20);
+        let active = snapshot_live_ref_colors_1_and_2(
+            leftover,
+            vec![OpRef::NONE, OpRef::ref_op(21), walked],
+            None,
+        );
+        assert_eq!(active, vec![mapped, walked]);
+    }
+
+    #[test]
+    fn get_list_of_active_boxes_keeps_an_unmapped_inputarg_color_the_shadow_still_holds() {
+        let held = OpRef::input_arg_ref(3);
+        let mapped = OpRef::ref_op(20);
+        let stale_slot = OpRef::ref_op(99);
+        let active = snapshot_live_ref_colors_1_and_2(
+            stale_slot,
+            vec![OpRef::NONE, OpRef::ref_op(21), held],
+            Some(held),
+        );
+        assert_eq!(active, vec![mapped, held]);
+    }
+
+    #[test]
+    fn get_list_of_active_boxes_records_const_null_for_an_unmapped_dead_color() {
+        let leftover = OpRef::input_arg_ref(3);
+        let mapped = OpRef::ref_op(20);
+        let active = snapshot_live_ref_colors_1_and_2(leftover, Vec::new(), None);
+        assert_eq!(active, vec![mapped, OpRef::const_ptr(majit_ir::GcRef(0))]);
     }
 
     #[test]

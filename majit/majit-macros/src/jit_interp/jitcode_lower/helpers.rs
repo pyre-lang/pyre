@@ -213,37 +213,35 @@ pub(super) fn plain_array_len_binding_name(array_name: &str) -> String {
 }
 
 /// Plain `[int]`/`[float]` `{ptr, len}` as `(parent_identity, callee_packed)`
-/// pairs, packed densely from `next_callee_int`.
+/// pairs for `array_names`, packed densely from `next_callee_int`.
 ///
-/// `MIFrame.setup_call` / `fill_registers` and `bhimpl_inline_call_ir_v`
-/// give the callee only the declared argument boxes. `getarrayitem_raw_i` /
-/// `getarrayitem_raw_f` read the ptr register of the current JitCode frame,
-/// so that register must be a declared int argument in the callee's own
-/// numbering. `inline_call_grouped` requires a positional I-list
-/// (`callee_dst == index`); dense packing after the existing int args
-/// satisfies it without hole padding.
+/// Split-dispatch / pc-return arms declare only the arrays whose
+/// `state.<name>[...]` the arm body reads or writes. Parent registers stay
+/// the portal identity slots (`plain_array_ptr_identity_reg`); callee
+/// registers continue densely after the existing int args.
+/// `Transformer.handle_regular_call` / `MIFrame.setup_call` copy those
+/// declared boxes. `inline_call_grouped` requires a positional I-list
+/// (`callee_dst == index`).
 pub(super) fn plain_array_identity_int_pairs(
     config: Option<&LowererConfig>,
     next_callee_int: u16,
+    array_names: &[&str],
 ) -> Vec<(u16, u16)> {
     let Some(config) = config else {
         return Vec::new();
     };
-    if config.state_arrays.is_empty() {
-        return Vec::new();
-    }
-    let int_base = config.int_identity_base();
-    let mut offset = config.plain_int_scalar_count();
     let mut callee = next_callee_int;
     let mut pairs = Vec::new();
-    for _ in config.state_array_names_in_order() {
-        let ptr = int_base.saturating_add(offset);
+    for name in array_names {
+        let Some(ptr) = config.plain_array_ptr_identity_reg(name) else {
+            continue;
+        };
+        let Some(len) = config.plain_array_len_identity_reg(name) else {
+            continue;
+        };
         pairs.push((ptr, callee));
-        offset = offset.saturating_add(1);
         callee = callee.saturating_add(1);
-        let len = int_base.saturating_add(offset);
         pairs.push((len, callee));
-        offset = offset.saturating_add(1);
         callee = callee.saturating_add(1);
     }
     pairs
@@ -256,20 +254,11 @@ pub(super) fn quote_inline_arg_pairs(pairs: &[(u16, u16)]) -> TokenStream {
     quote! { &[#(#args),*] }
 }
 
-/// Caller registers an inline_call reads, including plain `[int]` identity
-/// slots passed as declared int arguments.
-pub(super) fn inline_call_read_regs(
-    bindings: &[Binding],
-    identity_int_pairs: &[(u16, u16)],
-) -> Vec<Register> {
-    let mut regs: Vec<Register> = bindings.iter().map(Register::from_binding).collect();
-    for &(parent, _) in identity_int_pairs {
-        let reg = Register::int(parent);
-        if !regs.contains(&reg) {
-            regs.push(reg);
-        }
-    }
-    regs
+/// Caller registers an inline_call reads: the callee's declared arguments
+/// (`Transformer.rewrite_call` / `handle_regular_call` `op.args[1:]`;
+/// `MIFrame.setup_call` copies those boxes).
+pub(super) fn inline_call_read_regs(bindings: &[Binding]) -> Vec<Register> {
+    bindings.iter().map(Register::from_binding).collect()
 }
 
 pub(super) fn inline_ref_arg_tokens(bindings: &[Binding]) -> TokenStream {
@@ -302,20 +291,16 @@ pub(super) fn inline_float_arg_tokens(bindings: &[Binding]) -> TokenStream {
 
 /// Returns `(call_match, post_live)` so the caller can register the
 /// `BC_INLINE_CALL` and the trailing `BC_LIVE` marker as two distinct
-/// `OpMeta` entries (RPython `jtransform.py:480-481` emits inline_call
+/// `OpMeta` entries (`Transformer.handle_regular_call` emits inline_call
 /// followed by `-live-`).
 ///
-/// `identity_int_pairs` are `(parent_identity, callee_packed)` for each
-/// plain `[int]`/`[float]` `{ptr, len}`. `MIFrame.setup_call` plants only
-/// declared arguments; a callee `getarrayitem_raw_i` reads the current
-/// frame's ptr register.
+/// I/R/F lists are the callee's declared arguments (`op.args[1:]`).
+/// `MIFrame.setup_call` copies those boxes.
 pub(super) fn inline_call_tokens(
     bindings: &[Binding],
     result_reg: u16,
-    identity_int_pairs: &[(u16, u16)],
 ) -> (TokenStream, TokenStream) {
-    let mut args_i_pairs = inline_int_arg_pairs(bindings);
-    args_i_pairs.extend_from_slice(identity_int_pairs);
+    let args_i_pairs = inline_int_arg_pairs(bindings);
     let args_i = quote_inline_arg_pairs(&args_i_pairs);
     let args_r = inline_ref_arg_tokens(bindings);
     let args_f = inline_float_arg_tokens(bindings);
@@ -412,12 +397,8 @@ pub(super) fn inline_call_tokens(
     (call_match, post_live)
 }
 
-pub(super) fn inline_call_tokens_void(
-    bindings: &[Binding],
-    identity_int_pairs: &[(u16, u16)],
-) -> (TokenStream, TokenStream) {
-    let mut args_i_pairs = inline_int_arg_pairs(bindings);
-    args_i_pairs.extend_from_slice(identity_int_pairs);
+pub(super) fn inline_call_tokens_void(bindings: &[Binding]) -> (TokenStream, TokenStream) {
+    let args_i_pairs = inline_int_arg_pairs(bindings);
     let args_i = quote_inline_arg_pairs(&args_i_pairs);
     let args_r = inline_ref_arg_tokens(bindings);
     let args_f = inline_float_arg_tokens(bindings);
@@ -1232,7 +1213,7 @@ mod packed_plain_array_int_args_tests {
         let config = array_config();
         let base = config.int_identity_base();
         assert_eq!(
-            plain_array_identity_int_pairs(Some(&config), 3),
+            plain_array_identity_int_pairs(Some(&config), 3, &["cells"]),
             vec![(base, 3), (base + 1, 4)],
             "parent identity regs map onto callee ints packed after three locals"
         );
@@ -1243,7 +1224,7 @@ mod packed_plain_array_int_args_tests {
         let config = array_config();
         let base = config.int_identity_base();
         assert_eq!(
-            plain_array_identity_int_pairs(Some(&config), 0),
+            plain_array_identity_int_pairs(Some(&config), 0, &["cells"]),
             vec![(base, 0), (base + 1, 1)],
             "no hole padding: callee 0 is the ptr, callee 1 is the len"
         );
@@ -1253,7 +1234,7 @@ mod packed_plain_array_int_args_tests {
     fn concatenate_keeps_dense_callee_numbering() {
         let config = array_config();
         let mut pairs = vec![(10, 0), (11, 1), (12, 2)];
-        pairs.extend(plain_array_identity_int_pairs(Some(&config), 3));
+        pairs.extend(plain_array_identity_int_pairs(Some(&config), 3, &["cells"]));
         let callees: Vec<u16> = pairs.iter().map(|&(_, callee)| callee).collect();
         assert_eq!(callees, vec![0, 1, 2, 3, 4]);
         for (index, &(_, callee)) in pairs.iter().enumerate() {
@@ -1262,5 +1243,24 @@ mod packed_plain_array_int_args_tests {
                 "inline_call_grouped callee_dst == index"
             );
         }
+    }
+
+    #[test]
+    fn unused_array_is_omitted_from_the_packed_pairs() {
+        let mut config = array_config();
+        config
+            .state_arrays
+            .insert("stack".into(), (1, ValueKind::Int));
+        let stack_ptr = config
+            .plain_array_ptr_identity_reg("stack")
+            .expect("stack ptr");
+        let stack_len = config
+            .plain_array_len_identity_reg("stack")
+            .expect("stack len");
+        assert_eq!(
+            plain_array_identity_int_pairs(Some(&config), 0, &["stack"]),
+            vec![(stack_ptr, 0), (stack_len, 1)],
+            "only the arrays the arm body uses become declared int args"
+        );
     }
 }

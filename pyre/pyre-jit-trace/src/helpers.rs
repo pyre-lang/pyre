@@ -282,6 +282,19 @@ pub extern "C" fn jit_dict_exact_unicode_lookup_or_null(
     }
 }
 
+pub extern "C" fn jit_dict_exact_kwargs_lookup_or_null(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+) -> PyObjectRef {
+    unsafe {
+        jit_dict_exact_lookup_or_null(
+            dict,
+            key,
+            pyre_object::kwargsdict::w_dict_lookup_or_null_kwargs_strategy,
+        )
+    }
+}
+
 pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
     ctx: &mut TraceCtx,
     helper: *const (),

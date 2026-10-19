@@ -175,12 +175,10 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// So the redirected-array readers carry no force.
 ///
 /// Non-gateway force sites call [`force_frame`] or
-/// [`force_frame_before_locals_read`] directly, and only two of them sit in
+/// [`force_frame_before_locals_read`] directly, and only one of them sits in
 /// a graph that has a jitcode — `pyframe.rs`
-/// `FrameLocalsProxy::force_locals` and `builtins.rs`
-/// `bytearray_check_exports`. Both want the force to survive there: the
-/// first carries the `vable_token` test itself, the second materializes the
-/// red frame so the collector reads a current `valuestackdepth`. In the rest
+/// `FrameLocalsProxy::force_locals`. It wants the force to survive there:
+/// it carries the `vable_token` test itself. In the rest
 /// the codewriter never looks inside, so a direct call and a deleted marker
 /// come to the same thing.
 ///
@@ -599,34 +597,6 @@ pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub fn may_ignore_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_ignore_finalizer(obj);
-}
-
-/// `interp_gc.py _run_finalizers` — the queued-finalizer drain, re-enabled for
-/// its duration when the app level disabled it.
-///
-/// The re-enable bracket belongs to the `gc` module, so it is reached through
-/// [`crate::importing::OptionalModuleHooks`]; the drain it wraps,
-/// `UserDelAction._run_finalizers`, is interpreter-level. Without that module
-/// nothing can have disabled finalizers at app level -- `gc.enable` and
-/// `gc.disable` are the only writers of `enabled_at_app_level` -- so the
-/// bracket degenerates to the drain alone, which still has to run: a caller
-/// such as `builtins::bytearray_check_exports` collects a dead
-/// `W_MemoryView`, whose export is released by the `_finalize_` the collection
-/// only queues. The drain carries `@jit.dont_look_inside`
-/// (`executioncontext.py`) and reads the space's `UserDelAction`, runtime state
-/// the translated trace cannot read, so either arm is one residual call, as for
-/// `may_ignore_finalizer` above. Keeping that residual on this side of the hook
-/// is what lets that caller stay a two-phase subject.
-#[majit_macros::dont_look_inside]
-pub fn run_finalizers_now() {
-    if let Some(hooks) = crate::importing::optional_module_hooks() {
-        (hooks.gc_run_finalizers_now)();
-        return;
-    }
-    let action = space_user_del_action();
-    if !action.is_null() {
-        unsafe { (*action)._run_finalizers() };
-    }
 }
 
 /// Shared execution context for all frames in one interpreter run.

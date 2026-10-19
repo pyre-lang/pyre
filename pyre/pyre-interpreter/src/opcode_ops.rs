@@ -897,32 +897,12 @@ pub fn map_add_value(
 /// is the error `framelocalsproxy_or` and `_PyNamespace_New` report; the
 /// `DICT_UPDATE` wrapper below is what rewrites it.
 pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
-    unsafe {
-        if pyre_object::is_dict(source) {
-            // `w_dict_store` allocates when the storage grows or the strategy
-            // is promoted, and `dict` is itself a moving `W_DictObject`, so
-            // neither it nor the pairs waiting in this native snapshot survive
-            // the loop unrooted.  The general mapping path below already roots
-            // its own loop for the same reason.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(dict);
-            let entries = pyre_object::w_dict_items(source);
-            let mut flat = Vec::with_capacity(entries.len() * 2);
-            for &(key, value) in &entries {
-                flat.push(key);
-                flat.push(value);
-            }
-            let pair_base = pyre_object::gc_roots::pin_roots(&flat);
-            for index in 0..entries.len() {
-                pyre_object::w_dict_store(
-                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                    pyre_object::gc_roots::shadow_stack_get(pair_base + index * 2),
-                    pyre_object::gc_roots::shadow_stack_get(pair_base + index * 2 + 1),
-                );
-            }
-            return Ok(());
-        }
+    // pyopcode.py `DICT_UPDATE` → `space.call_method(w_dict, "update", w_item)`
+    // → `descr_update` → `update1`.  `update1` copies a dict subclass whose
+    // `__iter__` is still `dict.__iter__` from the backing mapping (issue 2435)
+    // and otherwise walks `keys()` / `space.getitem`.
+    if unsafe { crate::baseobjspace::isinstance_dict_w(source) } {
+        return crate::type_methods::dict_update1(dict, source);
     }
     // The scope opens ahead of the key fetch, not after it: `getattr_str`, the
     // `keys()` call and the iteration of whatever it answers are all Python,
@@ -935,14 +915,13 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
     let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
     let keys = crate::builtins::collect_iterable(keys_obj)?;
     unsafe {
-        // A generic mapping's keys are not pre-validated the way a real
-        // dict's are (the `is_dict(source)` fast path above skips the hash
-        // check for exactly that reason) — `d[key] = mapping[key]` still
-        // hashes `key`, so an unhashable one must raise here too.  `dict`,
-        // `source`, and every collected key are rooted for the loop's
-        // duration: `getitem` (arbitrary `__getitem__`) and
-        // `try_hash_value` (arbitrary `__hash__`) both may allocate and
-        // move them.
+        // A generic mapping's keys are not pre-validated the way a dict's
+        // are (`update1` above copies from the backing mapping) —
+        // `d[key] = mapping[key]` still hashes `key`, so an unhashable one
+        // must raise here too.  `dict`, `source`, and every collected key
+        // are rooted for the loop's duration: `getitem` (arbitrary
+        // `__getitem__`) and `try_hash_value` (arbitrary `__hash__`) both
+        // may allocate and move them.
         let key_base = pyre_object::gc_roots::pin_roots(&keys);
         let key_len = keys.len();
         for i in 0..key_len {
@@ -1043,36 +1022,23 @@ pub fn dict_merge_value(
             ));
         }
     } else {
-        // Dict source fast paths: an empty target merges without the
-        // duplicate check (`update1`); an empty source is a no-op.  The raw
-        // items walk is exact-dict only — a dict subclass may override
-        // `keys()` / `__getitem__`, so it falls through to the generic loop.
+        // `pyopcode.py _dict_merge`: an empty target calls `update1`
+        // (`dictmultiobject.py`), which copies a dict subclass whose
+        // `__iter__` is still `dict.__iter__` from the backing mapping
+        // (issue 2435) and otherwise walks `keys()` / `space.getitem`.
+        // An empty source is a no-op.
         let l2 = crate::baseobjspace::len_w(source())?;
-        if l1 == 0 && unsafe { pyre_object::is_dict(source()) } {
-            // A store into the target allocates the storage it grows into, so
-            // the snapshot has to be published too.
-            let items = unsafe { pyre_object::w_dict_items(source()) };
-            let mut live = Vec::with_capacity(items.len() * 2);
-            for &(k, v) in &items {
-                live.push(k);
-                live.push(v);
-            }
-            let items_base = pyre_object::gc_roots::pin_roots(&live);
-            for index in 0..items.len() {
-                unsafe {
-                    pyre_object::w_dict_store(
-                        dict(),
-                        pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
-                        pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1),
-                    )
-                };
-            }
+        if l1 == 0 {
+            crate::type_methods::dict_update1(dict(), source())?;
             return Ok(());
         }
         if l2 == 0 {
             return Ok(());
         }
         unroll_safe = unroll_safe && majit_rlib::jit::isvirtual(&source()) && l2 < 10;
+    }
+    if source_is_dict && crate::type_methods::dict_subclass_uses_default_iter(source()) {
+        return _dict_merge_dict(dict(), source(), w_callable());
     }
     _dict_merge_loop(dict(), source(), unroll_safe, w_callable())
 }
@@ -1165,6 +1131,70 @@ fn _dict_merge_loop(
                 pyre_object::gc_roots::shadow_stack_get(val_slot),
             )
         };
+    }
+    Ok(())
+}
+
+/// [3.14-spec] pyopcode.py _dict_merge_loop reads a dict source through keys() and space.getitem;
+/// CPython v3.14.6 dict_merge takes the dict_dict_merge entry walk when
+/// `PyDict_Check(b) && Py_TYPE(b)->tp_iter == dict_iter` (C source at tag v3.14.6, and measured:
+/// `f(x=1, **D(a=1))` with D overriding __getitem__/keys and inheriting dict.__iter__ yields the
+/// backing value and never calls keys()). Engineered as dictmultiobject.py rev_update1_dict_dict's
+/// live storage walk plus _dict_merge_loop's contains_w check.
+fn _dict_merge_dict(
+    w_dict: PyObjectRef,
+    w_item: PyObjectRef,
+    w_function: PyObjectRef,
+) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.pin_roots(&[w_dict, w_item, w_function]);
+    let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let source = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let w_callable = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+    let orig_size = unsafe {
+        pyre_object::dictmultiobject::w_dict_len(
+            crate::type_methods::resolve_dict_backing(source()),
+        )
+    };
+    let mut i = 0;
+    loop {
+        let source_now = crate::type_methods::resolve_dict_backing(source());
+        let Some(live) = (unsafe { pyre_object::dictmultiobject::w_dict_next_slot(source_now, i) })
+        else {
+            break;
+        };
+        i = live;
+        let Some((k, v)) =
+            (unsafe { pyre_object::dictmultiobject::w_dict_nth_item(source_now, i) })
+        else {
+            break;
+        };
+        let _iteration_roots = pyre_object::gc_roots::push_roots();
+        let iteration_roots = pyre_object::gc_roots::pin_roots(&[k, v]);
+        let key = || pyre_object::gc_roots::shadow_stack_get(iteration_roots);
+        let value = || pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
+        if crate::baseobjspace::contains(dict(), key())? {
+            let key_str = unsafe { crate::display::py_str_wtf8(key()) }?;
+            return Err(crate::argument::raise_type_error(
+                w_callable(),
+                crate::display::wtf8_format!(
+                    "got multiple values for keyword argument '",
+                    key_str,
+                    "'"
+                ),
+            ));
+        }
+        unsafe { pyre_object::w_dict_store(dict(), key(), value()) };
+        if orig_size
+            != unsafe {
+                pyre_object::dictmultiobject::w_dict_len(crate::type_methods::resolve_dict_backing(
+                    source(),
+                ))
+            }
+        {
+            return Err(PyError::runtime_error("dict mutated during update"));
+        }
+        i += 1;
     }
     Ok(())
 }
