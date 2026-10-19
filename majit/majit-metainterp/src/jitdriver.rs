@@ -1820,7 +1820,7 @@ pub struct EntryPoint {
 struct PortalEntryCaptures {
     /// `confirm_enter_jit`; a hook installed after `register_descriptor`
     /// stays visible because this is another handle to the WarmEnterState cell.
-    confirm_enter_jit_ptr: std::rc::Rc<std::cell::Cell<Option<fn(&GreenKey) -> bool>>>,
+    confirm_enter_jit_ptr: std::rc::Rc<std::cell::Cell<Option<fn(&[i64]) -> bool>>>,
     /// `jitdriver_sd.index` — `isinstance(cell, JitCell)` operand.
     jd_index: usize,
 }
@@ -12387,7 +12387,7 @@ mod tests {
     #[test]
     fn a_confirm_enter_jit_veto_stops_the_structured_back_edge_compiled_door() {
         static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn refuse(_key: &GreenKey) -> bool {
+        fn refuse(_greenargs: &[i64]) -> bool {
             CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             false
         }
@@ -12425,7 +12425,7 @@ mod tests {
     #[test]
     fn a_permissive_confirm_enter_jit_preserves_the_structured_back_edge_compiled_door() {
         static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn allow(_key: &GreenKey) -> bool {
+        fn allow(_greenargs: &[i64]) -> bool {
             CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
@@ -12806,7 +12806,7 @@ mod tests {
     fn function_entry_force_start_installs_comparekey_from_portal_greens() {
         // warmstate.py bound_reached: `cell = JitCell(*greenargs)`.
         // CountingDoorState::code_ptr is 0, so `with_typed_decision_key`
-        // declines; the portal greens are what must `set_comparekey`.
+        // declines; the portal greens are stored on the cell at construction.
         let mut driver = JitDriver::<CountingDoorState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         driver
@@ -12980,7 +12980,7 @@ mod tests {
         let idx = driver.register_descriptor(jd);
         driver.meta.finish_setup_descrs_for_jitdrivers();
 
-        fn refuse(_key: &GreenKey) -> bool {
+        fn refuse(_greenargs: &[i64]) -> bool {
             false
         }
 
@@ -15855,8 +15855,7 @@ mod tests {
         let key_b = sd.unwrap_greenkey(&[7, 0x1000]);
         let key_c = sd.unwrap_greenkey(&[7, 0x2000]);
 
-        let mut cell = BaseJitCell::new();
-        *cell.comparekey.borrow_mut() = Some(key_a);
+        let cell = BaseJitCell::new_for_driver_with_greens(0, &key_a.values, &key_a.types);
         assert!(cell.comparekey_matches(&key_b));
         assert!(!cell.comparekey_matches(&key_c));
     }
