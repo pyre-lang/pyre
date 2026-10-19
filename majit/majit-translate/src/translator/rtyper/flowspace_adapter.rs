@@ -3318,6 +3318,11 @@ pub fn translate_op(
                         [leaf] if leaf == crate::runtime_names::shims::UNICHAR_AS_UTF8 => {
                             Some("unichr_as_utf8")
                         }
+                        [leaf]
+                            if leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING =>
+                        {
+                            Some("get_raw_address_of_string")
+                        }
                         _ => None,
                     };
                     if let Some(builtin) = builtin {
@@ -10125,6 +10130,46 @@ mod tests {
                 .expect("unichr_as_utf8 builtin")
         );
         assert_eq!(translated[0].args[1..], [code]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_get_raw_address_of_string_marker_calls_the_builtin() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let s = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), s.clone());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_get_raw_address_of_string marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("get_raw_address_of_string")
+                .expect("get_raw_address_of_string builtin")
+        );
+        assert_eq!(translated[0].args[1..], [s]);
         assert_eq!(translated[0].result, result_var);
     }
 

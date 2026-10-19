@@ -1815,6 +1815,12 @@ impl HostEnv {
             "unichr_as_utf8",
             HostObject::new_builtin_callable("unichr_as_utf8"),
         );
+        // Front-end spelling of `rffi.get_raw_address_of_string(s)`:
+        // `s.as_ptr()` on a string-family value becomes a `CCHARP`.
+        self.insert_builtin(
+            "get_raw_address_of_string",
+            HostObject::new_builtin_callable("get_raw_address_of_string"),
+        );
     }
 
     fn bootstrap_std_modules(&mut self) {

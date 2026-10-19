@@ -231,6 +231,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "reversed", builtin_reversed);
     analyzer_for(&mut reg, "utf8iter", builtin_utf8iter);
     analyzer_for(&mut reg, "unichr_as_utf8", builtin_unichr_as_utf8);
+    analyzer_for(
+        &mut reg,
+        "get_raw_address_of_string",
+        builtin_get_raw_address_of_string,
+    );
     // builtin.py:102-130 — bool / int / float / chr / unichr /
     // unicode / bytearray.
     analyzer_for(&mut reg, "bool", builtin_bool);
@@ -917,6 +922,23 @@ pub fn builtin_unichr_as_utf8(
     }
     let _s_int = arg_at(args_s, 0, "builtin_unichr_as_utf8");
     Ok(SomeValue::String(SomeString::new(false, false)))
+}
+
+/// Translator-synthesised `rffi.get_raw_address_of_string(string)`:
+/// `SomePtr(CCHARP)`.  The front spells `str::as_ptr()` as
+/// `__majit_get_raw_address_of_string(s)`.
+pub fn builtin_get_raw_address_of_string(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "get_raw_address_of_string() takes exactly one argument",
+        ));
+    }
+    let _s_str = arg_at(args_s, 0, "builtin_get_raw_address_of_string");
+    Ok(raw_alloc_ptr_somevalue())
 }
 
 /// Upstream `builtin_bool(s_obj)` (builtin.py).
@@ -4914,6 +4936,21 @@ mod tests {
             matches!(result, SomeValue::String(_)),
             "unichr_as_utf8 annotates a UTF-8 string, got {result:?}"
         );
+    }
+
+    #[test]
+    fn builtin_get_raw_address_of_string_returns_ccharp() {
+        use crate::annotator::model::{SomePtr, SomeString};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let bk = bk();
+        let s_str = SomeValue::String(SomeString::new(false, true));
+        let result = builtin_get_raw_address_of_string(&bk, &[Some(s_str)], &no_kwds()).unwrap();
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        assert_eq!(result, SomeValue::Ptr(SomePtr::new(*ptr_ty)));
     }
 
     #[test]

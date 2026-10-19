@@ -134,6 +134,9 @@ pub(crate) mod shims {
     /// one-code-point UTF-8 string via `rutf8.unichr_as_utf8`
     /// (`allow_surrogates=True`).
     pub(crate) const UNICHAR_AS_UTF8: &str = "__majit_unichr_as_utf8";
+    /// `str::as_ptr()`: the front respells `s.as_ptr()` as
+    /// `__majit_get_raw_address_of_string(s)`, `rffi.get_raw_address_of_string`.
+    pub(crate) const GET_RAW_ADDRESS_OF_STRING: &str = "__majit_get_raw_address_of_string";
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";

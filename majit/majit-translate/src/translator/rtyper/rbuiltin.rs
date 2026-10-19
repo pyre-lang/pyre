@@ -236,6 +236,12 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("utf8iter", rtype_builtin_utf8iter),
         // Translator shim: `__majit_unichr_as_utf8` → HOST_ENV `unichr_as_utf8`.
         ("unichr_as_utf8", rtype_builtin_unichr_as_utf8),
+        // Translator shim: `__majit_get_raw_address_of_string` → HOST_ENV
+        // `get_raw_address_of_string` (`rffi.get_raw_address_of_string`).
+        (
+            "get_raw_address_of_string",
+            rtype_builtin_get_raw_address_of_string,
+        ),
         // rbuiltin.py:709-715
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
@@ -2287,6 +2293,31 @@ pub fn rtype_builtin_unichr_as_utf8(
         vec![LowLevelType::Signed],
         STRPTR.clone(),
         move |_rtyper, _args, _result| build_ll_unichr_as_utf8_helper_graph("ll_unichr_as_utf8"),
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// `get_raw_address_of_string(s)` — the front's
+/// `__majit_get_raw_address_of_string` spelling of
+/// `rffi.get_raw_address_of_string`.  Returns `CCHARP`.
+pub fn rtype_builtin_get_raw_address_of_string(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rffi::{
+        CCHARP, build_ll_get_raw_address_of_string_helper_graph,
+    };
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&*STRPTR)])?;
+    hop.exception_cannot_occur()?;
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_get_raw_address_of_string".to_string(),
+        vec![STRPTR.clone()],
+        (*CCHARP).clone(),
+        move |_rtyper, _args, _result| {
+            build_ll_get_raw_address_of_string_helper_graph("ll_get_raw_address_of_string")
+        },
     )?;
     hop.gendirectcall(&helper, vlist)
 }

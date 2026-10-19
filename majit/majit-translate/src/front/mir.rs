@@ -28007,6 +28007,38 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `core::str::<Impl>::as_ptr` on a string-family receiver
+                // is `rffi.get_raw_address_of_string` (`CCHARP`).  Emit
+                // `__majit_get_raw_address_of_string(s)` with
+                // `fun_decl_id: None` so CallRegistry is not asked for
+                // the Opaque `as_ptr` body.  `AtomicIsize::as_ptr` and
+                // slice/vec `as_ptr` have no `str` path segment.
+                if args.len() == 1
+                    && self.is_str_as_ptr(&reg, first_arg_ty.as_ref(), const_arg_ty.as_ref())
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING
+                                        .to_string(),
+                                ],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `core::str::<Impl>::contains(haystack, needle)` is the
                 // flowspace `contains` operation (`op.contains(container, item)`,
                 // `rstr.py` `rtype_contains`).  A `char` Pattern — including
@@ -36781,6 +36813,32 @@ impl<'a> Lowering<'a> {
             return false;
         }
         first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
+    }
+
+    /// `core::str::<Impl>::as_ptr` / `core::str::as_ptr` on a
+    /// string-family receiver (`tyref_is_string_family` /
+    /// `tyref_strips_to_str`).  `as_ptr` contains the substring
+    /// `"str"`, so the owner test is a path *segment* `== "str"`.
+    fn is_str_as_ptr(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        const_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        if leaf != Some("as_ptr") || !path.split("::").any(|seg| seg == "str") {
+            return false;
+        }
+        first_arg_ty.or(const_arg_ty).is_some_and(|ty| {
+            tyref_is_string_family(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
+        })
     }
 
     /// `core::str::<Impl>::contains` / `core::str::contains`.
@@ -111888,6 +111946,37 @@ mod tests {
         );
     }
 
+    /// `oefmt_single_t` `valuefmt.as_ptr()` is `rffi.get_raw_address_of_string`
+    /// (`__majit_get_raw_address_of_string`).  A leftover
+    /// `core::str::<Impl>::as_ptr` FunctionPath is the prepass wall.
+    #[test]
+    #[ignore]
+    fn oefmt_single_t_lowers_str_as_ptr_to_get_raw_address() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "oefmt_single_t").expect("lower oefmt_single_t");
+        let paths = oefmt_call_paths(&graph);
+        let leftover: Vec<_> = paths
+            .iter()
+            .filter(|segments| {
+                let leaf = segments.last().map(String::as_str);
+                leaf == Some("as_ptr") && segments.iter().any(|s| s == "str")
+            })
+            .cloned()
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "str::as_ptr must not remain residual: {leftover:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+            }),
+            "as_ptr must become get_raw_address_of_string: {paths:#?}"
+        );
+    }
+
     /// `core::str::<Impl>::contains` with a returned dest, so the BinOp
     /// survives `prune_dead_phis`.  A `char` Pattern is `unichr_as_utf8`
     /// then Contains; `&str` is Contains on the string (`rstr.py`
@@ -117469,6 +117558,34 @@ mod tests {
                 "{leaf} aliases the receiver, graph: {graph:#?}"
             );
         }
+    }
+
+    #[test]
+    fn str_as_ptr_rewrites_to_get_raw_address_of_string() {
+        let dest = serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Const"]
+        });
+        let graph = super::lower_function(
+            &std_extern_call_fixture(
+                "str_as_ptr",
+                &["core", "str", "<Impl>", "as_ptr"],
+                &[str_ref_ty()],
+                dest,
+            ),
+            "str_as_ptr",
+        )
+        .expect("lower str::as_ptr");
+        assert!(
+            graph_calls_leaf(
+                &graph,
+                crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING
+            ),
+            "str::as_ptr must rewrite to get_raw_address_of_string, graph: {graph:#?}"
+        );
+        assert!(
+            !graph_calls_leaf(&graph, "as_ptr"),
+            "str::as_ptr must not remain residual, graph: {graph:#?}"
+        );
     }
 
     fn layout_struct_llbc(
