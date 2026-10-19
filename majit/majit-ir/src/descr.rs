@@ -3437,22 +3437,7 @@ impl GcCache {
                     match (existing_vtable != 0, new_vtable != 0) {
                         (true, false) => false,
                         (false, true) => true,
-                        _ => {
-                            // Both sides carry a vtable, or neither does.
-                            // `heaptracker.py all_fielddescrs` never lists
-                            // `typeptr`; a longer analyzer list that still
-                            // carries that header word is not a fuller
-                            // layout. Prefer the typeptr-free list, then
-                            // the existing field-count upgrade.
-                            match (
-                                size_list_has_typeptr(existing),
-                                size_list_has_typeptr(&descr),
-                            ) {
-                                (true, false) => true,
-                                (false, true) => false,
-                                _ => new_count > existing_count,
-                            }
-                        }
+                        _ => new_count > existing_count,
                     }
                 }
             }
@@ -5862,16 +5847,19 @@ pub trait FieldDescr: Descr {
     }
 
     /// The class pointer is the object-header field at offset 0
-    /// (`rpython/rtyper/rclass.py`, `OBJECT.typeptr`). Its
-    /// descriptors use two field spellings, each bare or struct-qualified:
-    /// - `"typeptr"` / `"STRUCT.typeptr"` (codewriter format, descr.py:227)
-    /// - `"ob_type"` / `"STRUCT.ob_type"` (e.g. `"PyObject.ob_type"`)
+    /// (`rpython/rtyper/rclass.py`, `OBJECT.typeptr`).
+    ///
+    /// `heaptracker.py all_fielddescrs` skips only the literal `typeptr` of
+    /// the root object struct. The interpreter spelling of that header word
+    /// is the leaf `ob_type` at offset 0; a later `ob_type` at a non-zero
+    /// offset is a distinct field and stays listed.
     fn is_typeptr(&self) -> bool {
         let name = self.field_name();
-        name == "typeptr"
-            || name.ends_with(".typeptr")
-            || name == "ob_type"
-            || name.ends_with(".ob_type")
+        if name == "typeptr" || name.ends_with(".typeptr") {
+            return true;
+        }
+        let leaf = name.rsplit('.').next().unwrap_or(name);
+        leaf == "ob_type" && self.offset() == 0
     }
 
     /// Whether this descr names the class word: the header slot carrying
@@ -6374,9 +6362,28 @@ fn heaptracker_skips_listed_field(fd: &dyn FieldDescr) -> bool {
 }
 
 fn listed_fielddescrs(all: Vec<Arc<dyn FieldDescr>>) -> Vec<Arc<dyn FieldDescr>> {
-    all.into_iter()
+    let listed: Vec<Arc<dyn FieldDescr>> = all
+        .into_iter()
         .filter(|fd| !heaptracker_skips_listed_field(fd.as_ref()))
-        .collect()
+        .collect();
+    // `heaptracker.py get_fielddescr_index_in` numbers after skipping
+    // `typeptr`; `descr.py get_field_descr` writes that index once at mint.
+    // A producer that counted typeptr fails here rather than being rewritten.
+    for (i, fd) in listed.iter().enumerate() {
+        debug_assert!(
+            fd.index_in_parent() == i,
+            "field {} has index_in_parent {} at listed position {}; listed=[{}]",
+            fd.field_name(),
+            fd.index_in_parent(),
+            i,
+            listed
+                .iter()
+                .map(|f| f.field_name())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    listed
 }
 
 fn gc_pointers_in_fixed_part(
@@ -6388,12 +6395,6 @@ fn gc_pointers_in_fixed_part(
         .filter(|fd| fd.is_pointer_field() && fd.offset() < size)
         .cloned()
         .collect()
-}
-
-fn size_list_has_typeptr(descr: &DescrRef) -> bool {
-    descr
-        .as_size_descr()
-        .is_some_and(|sd| sd.all_fielddescrs().iter().any(|fd| fd.is_typeptr()))
 }
 
 /// `descr.py name = '%s.%s' % (STRUCT._name, fieldname)` — locate the
@@ -9126,16 +9127,21 @@ mod register_keyed_size_authority_tests {
             .into_iter()
             .enumerate()
             .map(|(index, offset)| {
-                Arc::new(SimpleFieldDescr::new_with_name(
-                    index as u32,
-                    offset,
-                    8,
-                    Type::Ref,
-                    false,
-                    ArrayFlag::Pointer,
-                    format!("ref{index}"),
-                    format!("ref{index}"),
-                )) as Arc<dyn FieldDescr>
+                // `heaptracker.py get_fielddescr_index_in` numbers after
+                // skipping `typeptr`; these rows are listed fields.
+                Arc::new(
+                    SimpleFieldDescr::new_with_name(
+                        index as u32,
+                        offset,
+                        8,
+                        Type::Ref,
+                        false,
+                        ArrayFlag::Pointer,
+                        format!("ref{index}"),
+                        format!("ref{index}"),
+                    )
+                    .with_index_in_parent(index),
+                ) as Arc<dyn FieldDescr>
             })
             .collect();
         let mut sd = SimpleSizeDescr::new(u32::MAX, 16, cache_key as u32);
@@ -9297,20 +9303,26 @@ mod register_keyed_size_authority_tests {
 
     fn size_descr_at(type_id: u32, vtable: usize, offsets: &[usize]) -> DescrRef {
         let mut sd = SimpleSizeDescr::with_vtable(u32::MAX, 32, type_id, vtable);
+        // Names are `f{offset}`, so none are `typeptr` / `PyObject.ob_type`.
+        // `heaptracker.py get_fielddescr_index_in` numbers listed fields
+        // in walk order; mint that index here.
         let fields: Vec<Arc<dyn FieldDescr>> = offsets
             .iter()
             .enumerate()
             .map(|(i, &offset)| {
-                Arc::new(SimpleFieldDescr::new_with_name(
-                    i as u32,
-                    offset,
-                    8,
-                    Type::Int,
-                    false,
-                    ArrayFlag::Signed,
-                    format!("f{offset}"),
-                    format!("f{offset}"),
-                )) as Arc<dyn FieldDescr>
+                Arc::new(
+                    SimpleFieldDescr::new_with_name(
+                        i as u32,
+                        offset,
+                        8,
+                        Type::Int,
+                        false,
+                        ArrayFlag::Signed,
+                        format!("f{offset}"),
+                        format!("f{offset}"),
+                    )
+                    .with_index_in_parent(i),
+                ) as Arc<dyn FieldDescr>
             })
             .collect();
         sd = sd.with_all_fielddescrs(fields);
@@ -9403,16 +9415,19 @@ mod register_keyed_size_authority_tests {
             .iter()
             .enumerate()
             .map(|(i, &offset)| {
-                Arc::new(SimpleFieldDescr::new_with_name(
-                    i as u32,
-                    offset,
-                    8,
-                    Type::Int,
-                    false,
-                    ArrayFlag::Signed,
-                    format!("f{offset}"),
-                    format!("f{offset}"),
-                )) as Arc<dyn FieldDescr>
+                Arc::new(
+                    SimpleFieldDescr::new_with_name(
+                        i as u32,
+                        offset,
+                        8,
+                        Type::Int,
+                        false,
+                        ArrayFlag::Signed,
+                        format!("f{offset}"),
+                        format!("f{offset}"),
+                    )
+                    .with_index_in_parent(i),
+                ) as Arc<dyn FieldDescr>
             })
             .collect();
         Arc::new(sd.with_all_fielddescrs(fields)) as DescrRef
@@ -9469,6 +9484,9 @@ mod register_keyed_size_authority_tests {
             &[spec("intval", 16, 0)],
             &[],
         );
+        // The first mint numbered `intval` at listed index 0
+        // (`heaptracker.py get_fielddescr_index_in`). A later producer
+        // cannot relist header words under that same cached FieldDescr.
         let retried = make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
             24,
@@ -9477,11 +9495,7 @@ mod register_keyed_size_authority_tests {
             0x2222,
             true,
             false,
-            &[
-                spec("ob_type", 0, 0),
-                spec("ob_refcnt", 8, 1),
-                spec("intval", 16, 2),
-            ],
+            &[spec("intval", 16, 0)],
             &[],
         );
         assert_eq!(stamped.size_descr.type_id(), 1);
@@ -10168,11 +10182,11 @@ mod register_keyed_size_authority_tests {
         assert_eq!(b.field_key(), "b.block");
     }
 
-    /// `heaptracker.py all_fielddescrs` skips typeptr while numbering.
-    /// Post-filter is a safety net: it drops the typeptr row and does not
-    /// clone or reindex the remaining shared descriptors.
+    /// `heaptracker.py get_fielddescr_index_in` skips typeptr while numbering,
+    /// so a producer that keeps a typeptr row in the raw list still mints
+    /// payload at listed index 0.
     #[test]
-    fn listed_fielddescrs_drops_typeptr_without_reindexing() {
+    fn listed_fielddescrs_position_equals_index_when_typeptr_skipped_at_mint() {
         let typeptr = SimpleFieldDescr::new_with_name(
             0,
             0,
@@ -10194,7 +10208,7 @@ mod register_keyed_size_authority_tests {
             "S.payload".to_string(),
             "payload",
         )
-        .with_index_in_parent(1);
+        .with_index_in_parent(0);
         let sd = SimpleSizeDescr::new(0, 16, 0).with_all_fielddescrs(vec![
             std::sync::Arc::new(typeptr) as std::sync::Arc<dyn FieldDescr>,
             std::sync::Arc::new(payload) as std::sync::Arc<dyn FieldDescr>,
@@ -10202,11 +10216,53 @@ mod register_keyed_size_authority_tests {
         let listed = SizeDescr::all_fielddescrs(&sd);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].field_key(), "payload");
-        assert_eq!(
-            listed[0].index_in_parent(),
+        for (i, fd) in listed.iter().enumerate() {
+            assert_eq!(
+                fd.index_in_parent(),
+                i,
+                "listed position equals index_in_parent"
+            );
+        }
+    }
+
+    /// An `ob_type` field at a non-zero offset is not the header typeptr
+    /// (`heaptracker.py all_fielddescrs` skips only `typeptr`;
+    /// `rclass.py OBJECT.typeptr` is the first field).
+    #[test]
+    fn listed_fielddescrs_keeps_a_non_header_ob_type_field() {
+        let ob_type = SimpleFieldDescr::new_with_name(
+            0,
+            24,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            "CPyObject.ob_type".to_string(),
+            "ob_type",
+        )
+        .with_index_in_parent(0);
+        assert!(!ob_type.is_typeptr());
+        let header = SimpleFieldDescr::new_with_name(
             1,
-            "post-filter does not reindex a shared descr"
-        );
+            0,
+            8,
+            Type::Ref,
+            true,
+            ArrayFlag::Pointer,
+            "PyObject.ob_type".to_string(),
+            "ob_type",
+        )
+        .with_index_in_parent(0);
+        assert!(header.is_typeptr());
+        let sd = SimpleSizeDescr::new(0, 32, 0).with_all_fielddescrs(vec![
+            std::sync::Arc::new(ob_type) as std::sync::Arc<dyn FieldDescr>,
+            std::sync::Arc::new(header) as std::sync::Arc<dyn FieldDescr>,
+        ]);
+        let listed = SizeDescr::all_fielddescrs(&sd);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].field_key(), "ob_type");
+        assert_eq!(listed[0].offset(), 24);
+        assert_eq!(listed[0].index_in_parent(), 0);
     }
 
     /// Kind-0 bake supplies one complete layout (`descr.py` `get_size_descr`
@@ -10498,9 +10554,9 @@ mod tests {
     #[test]
     fn gc_fielddescrs_drops_offsets_outside_the_fixed_part() {
         let inside: Arc<dyn FieldDescr> =
-            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false));
+            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false).with_index_in_parent(0));
         let array_tail: Arc<dyn FieldDescr> =
-            Arc::new(SimpleFieldDescr::new(1, 8, 8, Type::Ref, false));
+            Arc::new(SimpleFieldDescr::new(1, 8, 8, Type::Ref, false).with_index_in_parent(1));
         let sd = SimpleSizeDescr::new(0, 8, 0).with_all_fielddescrs(vec![inside, array_tail]);
         let offsets: Vec<usize> = sd.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
         assert_eq!(offsets, vec![0]);
@@ -10536,10 +10592,11 @@ mod tests {
                 "PyObject.w_class".to_string(),
                 "w_class".to_string(),
             )
-            .with_class_word(true),
+            .with_class_word(true)
+            .with_index_in_parent(0),
         ) as Arc<dyn FieldDescr>;
         let payload: Arc<dyn FieldDescr> =
-            Arc::new(SimpleFieldDescr::new(1, 16, 8, Type::Int, false));
+            Arc::new(SimpleFieldDescr::new(1, 16, 8, Type::Int, false).with_index_in_parent(1));
         let pad = Arc::new(SimpleFieldDescr::new_with_name(
             0,
             4,
@@ -10625,8 +10682,10 @@ mod tests {
         };
         let foreign: DescrRef = Arc::new(
             SimpleSizeDescr::new(u32::MAX, 72, 0).with_all_fielddescrs(vec![
-                Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false)) as Arc<dyn FieldDescr>,
-                Arc::new(SimpleFieldDescr::new(1, 64, 8, Type::Ref, false)) as Arc<dyn FieldDescr>,
+                Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false).with_index_in_parent(0))
+                    as Arc<dyn FieldDescr>,
+                Arc::new(SimpleFieldDescr::new(1, 64, 8, Type::Ref, false).with_index_in_parent(1))
+                    as Arc<dyn FieldDescr>,
             ]),
         );
         {
@@ -10646,8 +10705,10 @@ mod tests {
     #[test]
     fn size_descr_same_struct_layout_requires_equal_offset_bags() {
         let sd = SimpleSizeDescr::new(0, 32, 0).with_all_fielddescrs(vec![
-            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Int, false)) as Arc<dyn FieldDescr>,
-            Arc::new(SimpleFieldDescr::new(1, 8, 8, Type::Int, false)) as Arc<dyn FieldDescr>,
+            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Int, false).with_index_in_parent(0))
+                as Arc<dyn FieldDescr>,
+            Arc::new(SimpleFieldDescr::new(1, 8, 8, Type::Int, false).with_index_in_parent(1))
+                as Arc<dyn FieldDescr>,
         ]);
         assert!(size_descr_same_struct_layout(&sd, 32, &[0, 8]));
         assert!(size_descr_same_struct_layout(&sd, 32, &[8, 0]));
@@ -11024,7 +11085,8 @@ mod tests {
                 "PyObject.w_class".to_string(),
                 "w_class".to_string(),
             )
-            .with_class_word(true),
+            .with_class_word(true)
+            .with_index_in_parent(0),
         );
         assert!(header.is_w_class());
 
@@ -11051,9 +11113,8 @@ mod tests {
 
     #[test]
     fn class_word_index_in_parent_is_list_position_not_stale_mint() {
-        // Shared header descr mints `index_in_parent` 0; a listed layout
-        // puts it at `all_fielddescrs[1]` behind payload. Positional
-        // consumers read the list index, not the mint.
+        // Producer numbers after skipping typeptr (`heaptracker.py
+        // get_fielddescr_index_in`); payload is listed[0], w_class listed[1].
         let payload: Arc<dyn FieldDescr> = Arc::new(
             SimpleFieldDescr::new(0x1000_2001, 16, 8, Type::Int, false).with_index_in_parent(0),
         );
@@ -11069,13 +11130,13 @@ mod tests {
                 "w_class".to_string(),
             )
             .with_class_word(true)
-            .with_index_in_parent(0),
+            .with_index_in_parent(1),
         );
         assert!(w_class.is_w_class());
         let sd =
             SimpleSizeDescr::new(0x3000_2000, 32, 7).with_all_fielddescrs(vec![payload, w_class]);
         assert_eq!(sd.class_word_index_in_parent(), Some(1));
-        assert_eq!(sd.all_fielddescrs()[1].index_in_parent(), 0);
+        assert_eq!(sd.all_fielddescrs()[1].index_in_parent(), 1);
     }
 
     /// A traced pointer that is not the class word stays out of

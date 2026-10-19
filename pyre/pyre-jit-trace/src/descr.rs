@@ -3905,11 +3905,7 @@ fn shared_pyobject_w_class_descr() -> Arc<majit_ir::descr::SimpleFieldDescr> {
                 "w_class",
             )
             .with_class_word(true)
-            .with_index_in_parent(0)
-            // `rclass.py OBJECT` typeptr is `?`; `__class__` assignment
-            // (`descr_set___class__`) calls `notify_w_class_mutated` and
-            // revokes loops that folded the load.
-            .with_quasi_immutable(true),
+            .with_index_in_parent(0),
         )
     });
     DESCR.clone()
@@ -4917,14 +4913,11 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
         "W_ObjectObject",
         "objectobject::W_ObjectObject",
     );
-    // `alloc_instance_object` (`objectobject.rs`) allocates every interpreter
-    // instance through the stable, non-moving old-gen allocator, because the
-    // instance layer reaches an instance through raw pointers it does not root
-    // — `store_attr_caching` holds one across the allocation of the storage
-    // block it is about to install.  A JIT-emitted instance has to agree: put
-    // it in the nursery and the first minor collection inside such a residual
-    // moves it, after which the caller finishes writing `map` / `storage` into
-    // the dead pre-move copy and the attribute is lost.
+    // Interpreter construction uses `malloc_typed_managed` (nursery,
+    // `try_gc_alloc` / `alloc_nursery_typed`). The published SizeDescr stays
+    // `non_moving` so a JIT `NewWithVtable` declines the nursery
+    // (`rewrite.rs` `handle_new_fixedsize` / `SizeDescr.non_moving`), matching
+    // HEAD's descr flag.
     group.size_descr.set_non_moving(true);
     group
 });
@@ -4949,7 +4942,7 @@ static W_OBJECT_OBJECT_USER_SIZE_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
         .to_vec();
     let mut sd = majit_ir::descr::SimpleSizeDescr::with_vtable(
         W_OBJECT_OBJECT_USER_SIZE_INDEX,
-        pyre_object::W_OBJECT_OBJECT_SIZE,
+        pyre_object::objectobject::W_OBJECT_OBJECT_USER_SIZE,
         pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID,
         &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize,
     );
@@ -4965,6 +4958,10 @@ static W_OBJECT_OBJECT_USER_SIZE_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     descr
 });
 
+/// One `heaptracker.py all_fielddescrs` leaf: name, offset, size, type,
+/// signed, immutable, quasi-immutable.
+type ObjectFieldSpec = (&'static str, usize, usize, Type, bool, bool, bool);
+
 fn build_native_user_mapdict_group(
     size: usize,
     type_id: u32,
@@ -4975,42 +4972,88 @@ fn build_native_user_mapdict_group(
     def_path: &'static str,
     tag: u32,
 ) -> PyreObjectDescrGroup {
+    build_native_user_mapdict_group_with_parent(
+        size,
+        type_id,
+        vtable,
+        map_offset,
+        storage_offset,
+        simple_name,
+        def_path,
+        tag,
+        &[],
+    )
+}
+
+/// [`build_native_user_mapdict_group`] whose inlined realbase has listed
+/// payload besides `w_class`. `parent_fields` is that payload in
+/// declaration order (`heaptracker.py all_fielddescrs` /
+/// `get_fielddescr_index_in`); map and storage follow it so they mint
+/// at the listed positions after the inherited class word.
+fn build_native_user_mapdict_group_with_parent(
+    size: usize,
+    type_id: u32,
+    vtable: usize,
+    map_offset: usize,
+    storage_offset: usize,
+    simple_name: &'static str,
+    def_path: &'static str,
+    tag: u32,
+    parent_fields: &[ObjectFieldSpec],
+) -> PyreObjectDescrGroup {
+    let mut fields: Vec<ObjectFieldSpec> = parent_fields.to_vec();
+    fields.push((
+        "map",
+        map_offset,
+        core::mem::size_of::<usize>(),
+        Type::Int,
+        false,
+        false,
+        false,
+    ));
+    fields.push((
+        "storage",
+        storage_offset,
+        WORD,
+        Type::Ref,
+        false,
+        false,
+        false,
+    ));
     let group = build_object_descr_group_with_field_indices(
         size,
         type_id,
         vtable,
-        &[
-            (
-                "map",
-                map_offset,
-                core::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "storage",
-                storage_offset,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-        ],
+        &fields,
         simple_name,
         def_path,
-        &[tag, tag | 1],
+        &[],
     );
+    // `mapdict_map_descr` / `mapdict_storage_descr` index payload slots
+    // 0 and 1. Parent leaves stay on the SizeDescr listed walk.
+    let map = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "map")
+        .expect("native user mapdict group lists map")
+        .clone();
+    let storage = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "storage")
+        .expect("native user mapdict group lists storage")
+        .clone();
     // The annotator can publish the shared `(STRUCT, fieldname)` shells before
     // this runtime group is forced. `get_field_descr` correctly reuses those
     // objects (descr.py), but their placeholder index is `u32::MAX`.
     // Stamp the two shared descriptors after the cache lookup so HeapCache
     // cannot alias map and storage through that placeholder.
-    group.field_descrs[0].set_index(tag);
-    group.field_descrs[1].set_index(tag | 1);
-    group
+    map.set_index(tag);
+    storage.set_index(tag | 1);
+    PyreObjectDescrGroup {
+        size_descr: group.size_descr,
+        field_descrs: vec![map, storage],
+    }
 }
 
 static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -5026,11 +5069,15 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     // allocation's canonical word does not already hold; without the slot
     // `optimize_setfield_gc` forces a real `NewWithVtable` every iteration.
     let tag = NATIVE_MAPDICT_DESCR_TAG;
+    // Listed order is declaration order after dropping typeptr: intval
+    // then mapdict. `mapdict_map_descr` still wants payload slots 0/1
+    // as map/storage, so the group vector is rebuilt below.
     let group = build_object_descr_group_with_field_indices(
         pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
         pyre_object::intobject::W_INT_USER_GC_TYPE_ID,
         &pyre_object::pyobject::INT_USER_TYPE as *const _ as usize,
         &[
+            ("intval", INT_INTVAL_OFFSET, 8, Type::Int, true, true, false),
             (
                 "map",
                 std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
@@ -5049,7 +5096,6 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
                 false,
                 false,
             ),
-            ("intval", INT_INTVAL_OFFSET, 8, Type::Int, true, true, false),
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
@@ -5062,16 +5108,37 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
         ],
         "W_IntObjectUser",
         "intobject::W_IntObjectUser",
-        &[tag, tag | 1, tag | 2, tag | 3],
+        &[tag | 2, tag, tag | 1, tag | 3],
     );
     // `get_field_descr` reuses a placeholder shell whose index is `u32::MAX`.
     // Stamp after the cache lookup so HeapCache cannot alias the fields.
     // `PyObject.w_class` is dropped from the payload: the builder prepends
-    // the shared header leaf, so this vector is map, storage, intval.
-    group.field_descrs[0].set_index(tag);
-    group.field_descrs[1].set_index(tag | 1);
-    group.field_descrs[2].set_index(tag | 2);
-    group
+    // the shared header leaf, so the listed walk is intval, map, storage.
+    let intval = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "intval")
+        .expect("W_IntObjectUser lists intval")
+        .clone();
+    let map = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "map")
+        .expect("W_IntObjectUser lists map")
+        .clone();
+    let storage = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "storage")
+        .expect("W_IntObjectUser lists storage")
+        .clone();
+    map.set_index(tag);
+    storage.set_index(tag | 1);
+    intval.set_index(tag | 2);
+    PyreObjectDescrGroup {
+        size_descr: group.size_descr,
+        field_descrs: vec![map, storage, intval],
+    }
 });
 
 static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -5126,6 +5193,15 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
         &pyre_object::pyobject::FLOAT_USER_TYPE as *const _ as usize,
         &[
             (
+                "floatval",
+                FLOAT_FLOATVAL_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+            (
                 "map",
                 std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, map),
                 core::mem::size_of::<usize>(),
@@ -5144,15 +5220,6 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
                 false,
             ),
             (
-                "floatval",
-                FLOAT_FLOATVAL_OFFSET,
-                8,
-                Type::Float,
-                false,
-                true,
-                false,
-            ),
-            (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
@@ -5164,20 +5231,41 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
         ],
         "W_FloatObjectUser",
         "floatobject::W_FloatObjectUser",
-        &[tag, tag | 1, tag | 2, tag | 3],
+        &[tag | 2, tag, tag | 1, tag | 3],
     );
     // `get_field_descr` reuses a placeholder shell whose index is `u32::MAX`.
     // Stamp after the cache lookup so HeapCache cannot alias the fields.
     // `PyObject.w_class` is dropped from the payload: the builder prepends
-    // the shared header leaf, so this vector is map, storage, floatval.
-    group.field_descrs[0].set_index(tag);
-    group.field_descrs[1].set_index(tag | 1);
-    group.field_descrs[2].set_index(tag | 2);
-    group
+    // the shared header leaf, so the listed walk is floatval, map, storage.
+    let floatval = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "floatval")
+        .expect("W_FloatObjectUser lists floatval")
+        .clone();
+    let map = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "map")
+        .expect("W_FloatObjectUser lists map")
+        .clone();
+    let storage = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "storage")
+        .expect("W_FloatObjectUser lists storage")
+        .clone();
+    map.set_index(tag);
+    storage.set_index(tag | 1);
+    floatval.set_index(tag | 2);
+    PyreObjectDescrGroup {
+        size_descr: group.size_descr,
+        field_descrs: vec![map, storage, floatval],
+    }
 });
 
 static W_COMPLEX_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_with_parent(
         pyre_object::complexobject::W_COMPLEX_USER_OBJECT_SIZE,
         pyre_object::complexobject::W_COMPLEX_USER_GC_TYPE_ID,
         &pyre_object::pyobject::COMPLEX_USER_TYPE as *const _ as usize,
@@ -5186,6 +5274,26 @@ static W_COMPLEX_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
         "W_ComplexObjectUser",
         "complexobject::W_ComplexObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x40,
+        &[
+            (
+                "real",
+                COMPLEX_REAL_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+            (
+                "imag",
+                COMPLEX_IMAG_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+        ],
     )
 });
 
@@ -5667,7 +5775,9 @@ static W_STRUCT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new
 });
 
 static W_GENERIC_ALIAS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    use pyre_object::_pypy_generic_alias::GenericAlias;
+    let ptr = |key, offset| (key, offset, WORD, Type::Ref, false, false, false);
+    build_native_user_mapdict_group_with_parent(
         std::mem::size_of::<pyre_object::_pypy_generic_alias::GenericAliasUser>(),
         pyre_object::_pypy_generic_alias::W_GENERIC_ALIAS_USER_GC_TYPE_ID_CELL.get(),
         &pyre_object::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE as *const _ as usize,
@@ -5676,11 +5786,26 @@ static W_GENERIC_ALIAS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
         "GenericAliasUser",
         "_pypy_generic_alias::GenericAliasUser",
         NATIVE_MAPDICT_DESCR_TAG | 0xF20,
+        &[
+            ptr("origin", std::mem::offset_of!(GenericAlias, origin)),
+            ptr("args", std::mem::offset_of!(GenericAlias, args)),
+            ptr("parameters", std::mem::offset_of!(GenericAlias, parameters)),
+            (
+                "unpacked",
+                std::mem::offset_of!(GenericAlias, unpacked),
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            ptr("lifeline", std::mem::offset_of!(GenericAlias, lifeline)),
+        ],
     )
 });
 
 static W_LONG_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_with_parent(
         pyre_object::longobject::W_LONG_USER_OBJECT_SIZE,
         pyre_object::longobject::W_LONG_USER_GC_TYPE_ID,
         &pyre_object::pyobject::LONG_USER_TYPE as *const _ as usize,
@@ -5689,6 +5814,15 @@ static W_LONG_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         "W_LongObjectUser",
         "longobject::W_LongObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0xF30,
+        &[(
+            "value",
+            pyre_object::longobject::LONG_VALUE_OFFSET,
+            WORD,
+            Type::Ref,
+            false,
+            true,
+            false,
+        )],
     )
 });
 
@@ -8611,6 +8745,12 @@ mod tests {
             None => descr.struct_path,
         };
         let key = majit_ir::descr::path_hash(stripped);
+        // `descr.py get_field_descr` is first-wins. A truncated mint of
+        // `kind` at listed 0 is reused inside the kind-0 STRUCT walk
+        // (`heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`),
+        // where `kind` is listed after `w_class`, `size`, flattened
+        // `size_watchers`, `name`, and `name_position`. Mint the header
+        // leaf whose listed index is 0.
         let group = majit_ir::descr::publish_borrowed_struct_layout(
             u32::MAX,
             descr.object_size,
@@ -8622,16 +8762,16 @@ mod tests {
             &[],
             vec![majit_ir::descr::BorrowedField {
                 index: 0,
-                name: Cow::Borrowed("W_CType.kind"),
-                field_key: "kind",
-                offset: 64,
-                field_size: 8,
-                field_type: Type::Int,
-                flag: majit_ir::descr::ArrayFlag::Signed,
-                is_immutable: true,
+                name: Cow::Borrowed("ob.w_class"),
+                field_key: "w_class",
+                offset: pyre_object::pyobject::W_CLASS_OFFSET,
+                field_size: WORD,
+                field_type: Type::Ref,
+                flag: majit_ir::descr::ArrayFlag::Pointer,
+                is_immutable: false,
                 is_quasi_immutable: false,
                 index_in_parent: 0,
-                is_class_word: Some(false),
+                is_class_word: Some(true),
             }],
         );
         assert!(
@@ -10371,6 +10511,8 @@ mod tests {
 
         // `&dyn` data word `imp` and vtable word `imp.vtable` share one slot.
         // The vtable read must not reuse the data word's heapcache key.
+        // The producer numbers after skipping typeptr, so `imp` at listed
+        // position 0 has index 0. `index` 1 is the heapcache token.
         let dyn_parent = std::sync::Arc::new(BhSizeSpec {
             size: 32,
             type_id: 0xFA70_DA7A_0000_0006,
@@ -10389,7 +10531,7 @@ mod tests {
                 is_field_signed: false,
                 is_immutable: false,
                 is_quasi_immutable: false,
-                index_in_parent: 1,
+                index_in_parent: 0,
                 is_class_word: None,
             }],
         });
@@ -10400,7 +10542,7 @@ mod tests {
             8,
             Type::Ref,
             ArrayFlag::Pointer,
-            Some(1),
+            Some(0),
         );
         let vtable = bh_field(
             &dyn_parent,
@@ -10505,7 +10647,7 @@ mod tests {
                 is_field_signed: false,
                 is_immutable: false,
                 is_quasi_immutable: false,
-                index_in_parent: 1,
+                index_in_parent: 0,
                 is_class_word: None,
             }],
         });
@@ -10517,7 +10659,7 @@ mod tests {
             is_field_signed: false,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: Some(1),
+            index_in_parent: Some(0),
             parent: Some(std::sync::Arc::clone(&dyn_parent)),
             name: "imp".into(),
             owner: "DictStrategyRef".into(),
@@ -10531,7 +10673,7 @@ mod tests {
             is_field_signed: false,
             is_immutable: false,
             is_quasi_immutable: false,
-            index_in_parent: Some(1),
+            index_in_parent: Some(0),
             parent: Some(dyn_parent),
             name: "imp.vtable".into(),
             owner: "DictStrategyRef".into(),
@@ -11126,7 +11268,7 @@ mod tests {
             field_flag: ArrayFlag::Signed,
             is_field_signed: false,
             is_immutable: false,
-            is_quasi_immutable: true,
+            is_quasi_immutable: false,
             // slot 0 is `ob_type`; `w_class` is slot 1 of the header.
             index_in_parent: Some(1),
             parent: None,
@@ -11137,14 +11279,15 @@ mod tests {
 
     /// The shared `PyObject` header's `w_class` is one Arc (`descr.py`
     /// `get_field_descr(gccache, PyObject, "w_class")`) at the reserved
-    /// walker index. The field is `?` (`notify_w_class_mutated` revokes
-    /// loops that folded the load).
+    /// walker index. The Python class is mapdict-mutable
+    /// (`BaseUserClassMapdict.setclass`); typeptr stays the allocation
+    /// vtable (`rclass.py OBJECT` is immutable, not `?`).
     #[test]
-    fn w_class_descr_is_quasi_immutable_with_reserved_index() {
+    fn w_class_descr_is_mutable_with_reserved_index() {
         let descr = w_class_descr();
         assert!(descr.as_field_descr().is_some_and(|f| f.is_w_class()));
         assert!(!descr.is_always_pure());
-        assert!(descr.is_quasi_immutable());
+        assert!(!descr.is_quasi_immutable());
         assert_eq!(descr.index(), OBJECT_W_CLASS_INDEX);
     }
 
@@ -11720,38 +11863,69 @@ fn stamp_vtable_method_field_spec(spec: &mut majit_ir::descr::SimpleFieldDescrSp
 /// none of the three names a STRUCT a `BhDescr` can carry.
 static PYERROR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_interpreter::error::PyErrorObject;
-    let field = |key, offset| {
-        (
-            key,
-            offset,
-            std::mem::size_of::<usize>(),
-            Type::Ref,
-            false,
-            false,
-            false,
-        )
-    };
+    // Positional order is declaration order with the two `ob_header` words
+    // dropped, matching `heaptracker.py all_fielddescrs` /
+    // `get_fielddescr_index_in`. The inherited `PyObject.w_class` leaf is
+    // prepended by the group factory; a trailing duplicate is filtered.
+    let ptr = |key, offset| (key, offset, WORD, Type::Ref, false, false, false);
+    let int = |key, offset, size, signed| (key, offset, size, Type::Int, signed, false, false);
     build_object_descr_group_with_def_path(
         std::mem::size_of::<PyErrorObject>(),
         <PyErrorObject as pyre_object::lltype::GcType>::type_id(),
         &pyre_interpreter::error::PYERROR_TYPE as *const _ as usize,
         &[
-            field("w_type", pyre_interpreter::error::PYERROR_W_TYPE_OFFSET),
-            field("message", pyre_interpreter::error::PYERROR_MESSAGE_OFFSET),
-            field(
+            int(
+                "kind",
+                std::mem::offset_of!(PyErrorObject, kind),
+                std::mem::size_of::<pyre_interpreter::error::PyErrorKind>(),
+                false,
+            ),
+            ptr("w_type", pyre_interpreter::error::PYERROR_W_TYPE_OFFSET),
+            ptr("message", pyre_interpreter::error::PYERROR_MESSAGE_OFFSET),
+            ptr(
                 "exc_object",
                 pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
             ),
-            field(
+            int(
+                "attach_tb",
+                std::mem::offset_of!(PyErrorObject, attach_tb),
+                std::mem::size_of::<bool>(),
+                false,
+            ),
+            int(
+                "context_recorded",
+                std::mem::offset_of!(PyErrorObject, context_recorded),
+                std::mem::size_of::<bool>(),
+                false,
+            ),
+            int(
+                "reraise_lasti",
+                std::mem::offset_of!(PyErrorObject, reraise_lasti),
+                std::mem::size_of::<i32>(),
+                true,
+            ),
+            ptr(
                 "w_name_context",
                 pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
             ),
-            field(
+            ptr(
                 "w_obj_context",
                 pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
             ),
-            field("w_fmt_x0", pyre_interpreter::error::PYERROR_W_FMT_X0_OFFSET),
-            field(
+            ptr("w_fmt_x0", pyre_interpreter::error::PYERROR_W_FMT_X0_OFFSET),
+            int(
+                "fmt_valuefmt_ptr",
+                std::mem::offset_of!(PyErrorObject, fmt_valuefmt_ptr),
+                WORD,
+                false,
+            ),
+            int(
+                "fmt_valuefmt_len",
+                std::mem::offset_of!(PyErrorObject, fmt_valuefmt_len),
+                WORD,
+                false,
+            ),
+            ptr(
                 "w_class",
                 std::mem::offset_of!(PyErrorObject, ob_header.w_class),
             ),
@@ -12202,13 +12376,21 @@ fn published_declared_group(
         return None;
     }
     let fields = gc._cache_field.get(&key)?;
+    // A declared group that lists a subset (mapdict tail only) still owns
+    // the STRUCT. Rebuilding from the packed kind-0 walk would reuse those
+    // FieldDescr objects inside a longer listed list and trip
+    // `listed_fielddescrs` (`descr.py get_field_descr` is first-wins).
+    // Skip packed names the runtime group did not mint; the SizeDescr walk
+    // stays the declared list.
     let mut field_descrs = Vec::with_capacity(spec.all_fielddescrs.len());
     for field in &spec.all_fielddescrs {
-        let descr = fields.get(field.field_key())?.clone();
+        let Some(descr) = fields.get(field.field_key()) else {
+            continue;
+        };
         if let Some(is_class_word) = field.is_class_word {
             descr.declare_class_word(is_class_word);
         }
-        field_descrs.push(descr);
+        field_descrs.push(descr.clone());
     }
     Some(majit_ir::descr::SimpleDescrGroup {
         size_descr,

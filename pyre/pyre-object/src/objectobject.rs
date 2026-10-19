@@ -65,6 +65,23 @@ const _: () = {
 /// payload (`framework.py:811`).
 pub const W_OBJECT_OBJECT_SIZE: usize = std::mem::size_of::<W_ObjectObject>();
 
+/// `_getusercls(W_ObjectObject)` carrier (`typedef.py`
+/// `W_ObjectObjectUserDictWeakrefable`). Layout-identical to
+/// [`W_ObjectObject`]; the vtable is a property of this STRUCT
+/// (`rclass.new_instance` / `heaptracker.get_vtable_for_gcstruct`).
+#[repr(C)]
+pub struct W_ObjectObjectUser {
+    pub base: W_ObjectObject,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<W_ObjectObjectUser>() == std::mem::size_of::<W_ObjectObject>());
+    assert!(std::mem::offset_of!(W_ObjectObjectUser, base) == 0);
+};
+
+/// Fixed payload size of [`W_ObjectObjectUser`].
+pub const W_OBJECT_OBJECT_USER_SIZE: usize = std::mem::size_of::<W_ObjectObjectUser>();
+
 /// GC type id for the `W_ObjectObject` Rust struct. `pyre-jit::eval`
 /// registers it through `object_subclass_with_custom_trace` with
 /// `W_OBJECT_OBJECT_SIZE` + an `object_object_custom_trace` that
@@ -84,6 +101,20 @@ pub const W_OBJECT_OBJECT_GC_TYPE_ID: u32 = 53;
 /// `object_object_custom_trace` as [`W_OBJECT_OBJECT_GC_TYPE_ID`];
 /// that id is the parent.
 pub const W_OBJECT_OBJECT_USER_GC_TYPE_ID: u32 = 217;
+
+impl crate::lltype::GcType for W_ObjectObject {
+    fn type_id() -> u32 {
+        W_OBJECT_OBJECT_GC_TYPE_ID
+    }
+    const SIZE: usize = W_OBJECT_OBJECT_SIZE;
+}
+
+impl crate::lltype::GcType for W_ObjectObjectUser {
+    fn type_id() -> u32 {
+        W_OBJECT_OBJECT_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_OBJECT_OBJECT_USER_SIZE;
+}
 
 /// Allocate a new instance of a user-defined class.
 ///
@@ -119,65 +150,41 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// `malloc` op itself and then stores each field one at a time
 /// (`rclass.py`, `new_instance`: `genop('malloc', ...)` followed by
 /// `self.setfield(vptr, '__class__', ...)` and one `setfield` per default).
-/// This function is not that shape: it still builds a whole
-/// `W_ObjectObject` and `ptr::write`s it into raw bytes obtained from
-/// `try_gc_alloc_nursery_raw(id, size)`, which carries no `malloc(STRUCT)`
-/// operand for `heaptracker.get_vtable_for_gcstruct` to read. Converging
-/// means two specialized `new_instance` graphs — exact `object()` vs
-/// `typedef.py _getusercls` (`W_ObjectObjectUserDictWeakrefable`) — each
-/// with a constant vtable, matching the two size descrs already published
-/// as `W_ObjectObject` and `objectobject::W_ObjectObjectUser`. One STRUCT
-/// with a runtime `instance_typeptr_for` cannot become `new_with_vtable`.
+/// `rewrite_op_malloc` turns that malloc into `new_with_vtable` when
+/// `heaptracker.get_vtable_for_gcstruct` answers; `rewrite_op_setfield`
+/// then drops the typeptr store unconditionally (`is_typeptr_getset`).
 ///
-/// Allocate a `W_ObjectObject` through the GC. The header tid is the one
-/// [`instance_typeptr_for`] chooses — [`W_OBJECT_OBJECT_GC_TYPE_ID`] for
-/// exact `object()`, [`W_OBJECT_OBJECT_USER_GC_TYPE_ID`] otherwise — so
-/// `object_object_custom_trace` roots the `storage` value slots and dead
-/// instances are reclaimed. When no GC hook is installed (single-crate
-/// tests / pre-init snapshot tools) that same header id is stamped on a
-/// leaking allocation. `lltype::malloc` still writes id 0, which would
-/// disagree with either vtable.
+/// Exact `object()` and `_getusercls` are two STRUCTs
+/// ([`W_ObjectObject`] / [`W_ObjectObjectUser`]), each with a constant
+/// vtable, matching the two size descrs already published. The full
+/// `typedef.py _getusercls` mixin port (map/storage only on the user
+/// class) is still open; these two layout-identical carriers are the
+/// malloc/vtable split that makes `new_with_vtable` per branch.
 ///
-/// PRE-EXISTING-ADAPTATION: PyPy instances live in the movable nursery
-/// (`rclass`/`gctypelayout` standard `GcStruct`). Pyre allocates them
-/// through the stable (non-moving) old-gen allocator instead.
-///
-/// This note used to record a SIGSEGV as the reason — a movable instance
-/// read from `objs[i % 3]` and carried into a method-call guard reading a
-/// stale pointer out of the deadframe, reproduced by
-/// `synth/inheritance_dispatch` — and named "extend the trace GC-safepoint
-/// gcmap to cover transient Ref slots" as the convergence path. That crash
-/// no longer reproduces: with this call switched to `try_gc_alloc`,
-/// `inheritance_dispatch` passes at the default, 256 KB and 128 KB nursery
-/// sizes, the whole `check.py` corpus passes on both backends, and seven
-/// GC-sensitive fixtures produce byte-identical output under a 128 KB
-/// nursery.
-///
-/// The switch is not made because it measures nothing. Allocation is about
-/// a twentieth of what instantiating an object costs — the rest is call
-/// dispatch — and the host-side "nursery" allocator is non-collecting and
-/// falls back to old-gen once the nursery is full
-/// (`majit-backend-dynasm/src/runner.rs` `dynasm_alloc_nursery_typed`), so
-/// the flip only reorders "try nursery, else old-gen" against "always
-/// old-gen": minor and major collection counts and peak RSS come out
-/// unchanged, and every non-microbenchmark fixture moves within noise.
-/// Real convergence needs host-side allocation that may collect, which in
-/// turn needs every allocation site to root the raw pointers it holds.
+/// Each specialized graph allocates through [`crate::lltype::malloc_typed_managed`]
+/// (`gct_fv_gc_malloc` / `init_gc_object`). That is `gc_hook::try_gc_alloc`
+/// → the installed `GC_ALLOC_HOOK` (`pyre_object_gc_alloc_trampoline` →
+/// `majit_gc::alloc_nursery_typed`), the same nursery allocator HEAD's
+/// `try_gc_alloc_nursery_raw` used. `fuse_boxing_alloc` (`model.rs`)
+/// matches `malloc_typed_managed` in `gc_malloc_flavor` and emits
+/// `NewWithVtable` when the type word is a constant; it refuses a moving
+/// `New` only for a non-constant type word
+/// (`unsupported-malloc-flags-nonmovable`).
 fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
     // `mapdict.py user_setup` → `_mapdict_init_empty(
     // w_subtype.terminator)` (`mapdict.py`): the instance map is
     // the owning type's terminator from construction, and `storage = None`.
     //
-    // Reading it before allocation rather than installing it on first
-    // attribute access is what makes `_get_mapdict_map`'s
-    // `jit.promote(self.map)` promotable. A deferred install leaves every
-    // fresh instance at zero until the first access, so the promoted map guard
-    // the JIT bakes cannot hold on the next iteration's fresh instance.
+    // Reading it before allocation is what makes `_get_mapdict_map`'s
+    // `jit.promote(self.map)` promotable (`mapdict.py user_setup` /
+    // `_mapdict_init_empty(w_subtype.terminator)`). The type owns that
+    // word from `typeobject.py W_TypeObject.__init__`.
     //
-    // Zero stays legal: `pyre-object` cannot build a terminator (it lives in
-    // the interpreter's mapdict layer), so a type whose terminator has not
-    // been created yet gets one on first access. The `is_type` test keeps the
-    // sentinel used by single-crate tests from being dereferenced as a type.
+    // Zero stays legal: `_getusercls` allocators stamp `map: 0` because
+    // `pyre-object` cannot call the interpreter mapdict layer. First
+    // attribute access copies `w_subtype.terminator`. The `is_type` test
+    // keeps the sentinel used by single-crate tests from being dereferenced
+    // as a type.
     // `gct_fv_gc_malloc` bracket (`framework.py`): `w_class` is a live
     // child written after the malloc.  Heap types can sit in the nursery,
     // so the slot is re-read after the allocation and the creation barrier
@@ -194,40 +201,57 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
             0
         }
     };
+    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
     // Exact `object()` keeps `INSTANCE_TYPE`. Anything else — a user class,
     // a builtin that still allocates this attribute bag, a dict subclass, a
     // null sentinel — takes `INSTANCE_USER_TYPE` (`typedef.py`
     // `_getusercls(W_ObjectObject)`). Builtin bags on the user typeptr are
     // interim: `typedef.py` `_getusercls` gives each of those its own
     // interp class.
-    let (typeptr, type_id) = instance_typeptr_for(w_class);
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(type_id, W_OBJECT_OBJECT_SIZE);
+    if is_exact_object_class(w_class) {
+        alloc_exact_object_instance(w_class, map)
+    } else {
+        alloc_user_object_instance(w_class, map)
+    }
+}
+
+/// `rclass.new_instance` graph for exact `object()`: one STRUCT, constant
+/// [`INSTANCE_TYPE`]. `#[inline(never)]` so `fuse_boxing_alloc` sees
+/// `malloc_typed_managed` + constant `ob_type` and emits `new_with_vtable`.
+#[inline(never)]
+fn alloc_exact_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
-    let value = W_ObjectObject {
+    crate::lltype::malloc_typed_managed(W_ObjectObject {
         ob_header: PyObject {
-            ob_type: typeptr,
+            ob_type: &INSTANCE_TYPE,
             w_class,
         },
         map,
         storage: std::ptr::null_mut(),
-    };
-    if !raw.is_null() {
-        unsafe {
-            std::ptr::write(raw as *mut W_ObjectObject, value);
-        }
-        crate::gc_hook::try_gc_write_barrier(raw);
-        raw as PyObjectRef
-    } else {
-        alloc_instance_object_fallback(value, type_id)
-    }
+    }) as PyObjectRef
 }
 
-/// Host fallback when the GC nursery hook is not installed (lib tests,
-/// snapshot tools).  `alloc_with_gc_header` is not in CallRegistry, so
-/// the rtyper must not walk this arm from `descr__new__`.
-#[majit_macros::dont_look_inside]
-fn alloc_instance_object_fallback(value: W_ObjectObject, type_id: u32) -> PyObjectRef {
-    majit_gc::header::alloc_with_gc_header(value, type_id) as PyObjectRef
+/// `rclass.new_instance` graph for `_getusercls(W_ObjectObject)`: one
+/// STRUCT, constant [`INSTANCE_USER_TYPE`].
+#[inline(never)]
+fn alloc_user_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    crate::lltype::malloc_typed_managed(W_ObjectObjectUser {
+        base: W_ObjectObject {
+            ob_header: PyObject {
+                ob_type: &INSTANCE_USER_TYPE,
+                w_class,
+            },
+            map,
+            storage: std::ptr::null_mut(),
+        },
+    }) as PyObjectRef
 }
 
 /// Typeptr and GC tid [`alloc_instance_object`] stamps for `w_class`.
@@ -241,14 +265,17 @@ fn alloc_instance_object_fallback(value: W_ObjectObject, type_id: u32) -> PyObje
 /// on `INSTANCE_USER_TYPE`. That is interim: `typedef.py` `_getusercls`
 /// gives each of those its own interp class.
 pub fn instance_typeptr_for(w_class: PyObjectRef) -> (*const PyType, u32) {
-    let exact = unsafe {
-        crate::typeobject::is_type(w_class)
-            && std::ptr::eq(w_class, get_instantiate(&INSTANCE_TYPE))
-    };
-    if exact {
+    if is_exact_object_class(w_class) {
         (&INSTANCE_TYPE, W_OBJECT_OBJECT_GC_TYPE_ID)
     } else {
         (&INSTANCE_USER_TYPE, W_OBJECT_OBJECT_USER_GC_TYPE_ID)
+    }
+}
+
+fn is_exact_object_class(w_class: PyObjectRef) -> bool {
+    unsafe {
+        crate::typeobject::is_type(w_class)
+            && std::ptr::eq(w_class, get_instantiate(&INSTANCE_TYPE))
     }
 }
 
@@ -272,6 +299,22 @@ pub unsafe fn is_instance(obj: PyObjectRef) -> bool {
     ll_isinstance(obj, &INSTANCE_TYPE)
 }
 
+/// Exact `_getusercls(W_ObjectObject)` carrier (`INSTANCE_USER_TYPE`).
+///
+/// `is_instance` is the subclass-range test (`rclass.py` `ll_isinstance`)
+/// and includes exact `object()`. This is `ll_type == vtable` against
+/// [`INSTANCE_USER_TYPE`]: Python subclasses of `object` share that
+/// payload, and exact `object()` (`W_ObjectObject` / `INSTANCE_TYPE`)
+/// does not. PyPy's `W_ObjectObject` has no mapdict; the user class is
+/// the mapdict carrier (`mapdict.py` `BaseUserClassMapdict.getclass`).
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_user_instance(obj: PyObjectRef) -> bool {
+    !obj.is_null() && std::ptr::eq((*obj).ob_type, &INSTANCE_USER_TYPE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +328,7 @@ mod tests {
         let obj = w_instance_new(fake_type);
         unsafe {
             assert!(is_instance(obj));
+            assert!(is_user_instance(obj));
             assert!(std::ptr::eq((*obj).ob_type, &INSTANCE_USER_TYPE));
             let hdr = majit_gc::header::header_of(obj as usize);
             assert_eq!((*hdr).type_id(), W_OBJECT_OBJECT_USER_GC_TYPE_ID);

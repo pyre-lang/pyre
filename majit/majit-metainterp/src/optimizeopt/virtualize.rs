@@ -667,12 +667,12 @@ impl OptVirtualize {
                     PtrInfo::VirtualStruct(vinfo) => {
                         // `heaptracker.py all_fielddescrs` skips typeptr
                         // (`dealt otherwise`): `_fields` never contains it.
-                        // `jtransform.py rewrite_op_setfield` drops the
-                        // store; residual allocation stamps the class word
-                        // at `new_with_vtable`.
-                        if is_typeptr && field_descr.offset() == 0 {
-                            return Some(OptimizationResult::Remove);
-                        }
+                        // A vtable-bearing struct is NEW_WITH_VTABLE /
+                        // VirtualInfo with known_class; a plain NEW has no
+                        // typeptr field. A typeptr store that still reaches
+                        // this arm is emitted on the forced object
+                        // (`store_virtual_field_or_emit` PassOn when the
+                        // listed slots do not hold it).
                         Some(store_virtual_field_or_emit(
                             &vinfo.descr,
                             &mut vinfo.fields,
@@ -4043,8 +4043,8 @@ mod tests {
         // offset+size+type+signed, not fieldname. `descr.py`
         // `cache[STRUCT][fieldname]` still treats them as distinct fields;
         // virtual `_fields` (`AbstractVirtualStructInfo.setfields`) must
-        // too. Windows MAJIT_STRICT shape: dstorage claims slot 3, slot 3
-        // holds dstorage_as_gcref.
+        // too. The producer numbers after skipping typeptr, so dstorage at
+        // listed position 4 has index 4.
         let collide = 0x1000_00dd;
         let dstorage_as_gcref = Arc::new(
             majit_ir::SimpleFieldDescr::new_with_name(
@@ -4070,7 +4070,7 @@ mod tests {
                 "W_DictObject.dstorage".to_string(),
                 "dstorage".to_string(),
             )
-            .with_index_in_parent(3),
+            .with_index_in_parent(4),
         );
         let filler0 = Arc::new(
             majit_ir::SimpleFieldDescr::new(0x1000_00d0, 0, 8, Type::Int, false)
@@ -4101,7 +4101,8 @@ mod tests {
         assert_eq!(dstorage.index(), dstorage_as_gcref.index());
         assert_eq!(dstorage.offset(), 16);
         assert_eq!(dstorage_as_gcref.offset(), 16);
-        assert_eq!(dstorage.index_in_parent(), 3);
+        assert_eq!(dstorage_as_gcref.index_in_parent(), 3);
+        assert_eq!(dstorage.index_in_parent(), 4);
         let fields = parent.as_size_descr().unwrap().all_fielddescrs();
         assert_eq!(parent_list_slot_in(Some(&parent), dstorage.as_ref()), 4);
         assert_eq!(slot_in_field_list(fields, dstorage.as_ref()), Some(4));
@@ -4118,10 +4119,10 @@ mod tests {
 
     #[test]
     fn parent_list_slot_finds_shared_w_class_behind_payload() {
-        // Shared header descr mints `index_in_parent` 0; a listed layout
-        // puts it at `all_fielddescrs[1]`. Identity in the parent list
-        // wins over that mint so SETFIELD w_class does not overwrite
-        // payload slot 0.
+        // Producer numbers after skipping typeptr (`heaptracker.py
+        // get_fielddescr_index_in`); payload is listed[0], w_class listed[1].
+        // Identity in the parent list still wins so SETFIELD w_class does
+        // not overwrite payload slot 0.
         let payload = Arc::new(
             majit_ir::SimpleFieldDescr::new(0x1000_4001, 16, 8, Type::Int, false)
                 .with_index_in_parent(0),
@@ -4138,7 +4139,7 @@ mod tests {
                 "w_class".to_string(),
             )
             .with_class_word(true)
-            .with_index_in_parent(0),
+            .with_index_in_parent(1),
         );
         let parent: DescrRef = Arc::new(
             majit_ir::descr::SimpleSizeDescr::new(0x3000_0400, 32, 1).with_all_fielddescrs(vec![
@@ -5015,10 +5016,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_typeptr_setfield_on_plain_new_is_removed() {
-        // Residual `new` does not stamp the class word. A runtime typeptr
-        // SETFIELD on `PtrInfo::VirtualStruct` must not `PassOn` (that
-        // emits the op with a virtual base and forces a 16-byte header).
+    fn runtime_typeptr_setfield_on_plain_new_survives_force() {
+        // A vtable-bearing struct is NEW_WITH_VTABLE. A plain NEW has no
+        // typeptr field; a typeptr store that still reaches VirtualStruct
+        // is recorded by forcing, then emitted (`virtualize.py
+        // optimize_SETFIELD_GC` / `info.py _force_elements`).
         let sd = size_descr(1);
         let typeptr_descr: DescrRef = Arc::new(majit_ir::SimpleFieldDescr::new_with_name(
             0,
@@ -5036,18 +5038,31 @@ mod tests {
                 OpCode::SetfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Ref, 50),
+                    crate::history::test_support::rooted_inputarg_operand(Type::Ref, 50),
                 ],
-                typeptr_descr,
+                typeptr_descr.clone(),
+            ),
+            Op::new(
+                OpCode::CallN,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
             ),
         ];
         assign_positions(&mut ops);
         let result = run_pass(&ops);
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
-        assert!(
-            result.is_empty(),
-            "runtime typeptr SETFIELD on plain new must not force: {opcodes:?}"
-        );
+        assert_eq!(result[0].opcode, OpCode::New, "forced New: {opcodes:?}");
+        let setfield = result
+            .iter()
+            .find(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("forced VirtualStruct must emit the typeptr store");
+        let descr = setfield.getdescr().expect("SETFIELD_GC descr");
+        let field = descr.as_field_descr().expect("typeptr FieldDescr");
+        assert!(field.is_typeptr(), "materialized store is the typeptr");
+        assert_eq!(field.offset(), 0);
+        assert_eq!(result.last().unwrap().opcode, OpCode::CallN);
     }
 
     fn new_with_vtable_then_guard_class(vtable: i64, expected: i64) -> Vec<Op> {

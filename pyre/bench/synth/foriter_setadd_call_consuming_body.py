@@ -1,5 +1,6 @@
 # pyre-check: max-pypy-ratio=8
 # The ceiling is 1.25x the slowest gated reading (ubuntu cranelift 10.3x).
+# pyre-check: jitstats-band=guard_failures=15
 # `guard_failures` sits on a minor-collection boundary. Under check.py's 4MB
 # nursery, dynasm reads 4807, and cranelift and wasm read 4814 on macOS and
 # 4815 on ubuntu, with six loops and 26 bridges throughout. The extra
