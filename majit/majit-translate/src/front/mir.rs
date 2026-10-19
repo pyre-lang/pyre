@@ -26607,37 +26607,69 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `items_block_set_ref(block, index, value)` is the same
-                // hand-rolled `setarrayitem_gc` as `set_ref`, on the
-                // `ItemsBlock` a list / tuple owns (`ll_setitem_fast`,
-                // `rlist.py`).  The header-flag test and the barrier call in
-                // its body are the GC transform's work; the backend rewrite
-                // re-inserts the conditional barrier in front of the store
-                // (`handle_write_barrier_setarrayitem`).  Collapse the call to
-                // the one `ArrayWrite` over the block, the element store
-                // `*items_block_items_base(block).add(i) = v` lowers to.
+                // `items_block_set_ref(block, index, value)` is
+                // `ll_setitem_fast` (`rlist.py`) on the object-strategy
+                // items list. `W_ListObject.items` is the erased
+                // `lstorage` (`rerased.py`); the object strategy
+                // `unerase`s it at the point of use (`listobject.py`
+                // `ListStrategy.unerase`) to `GcArray(OBJECTPTR)`. The
+                // list root is `[T]` from the stored value's `*mut T`
+                // (`object_stored_ptr_items_list_root`); the stored
+                // value is narrowed to `T`
+                // (`object_stored_ptr_class_root`). String-item
+                // owners skip the base unerase
+                // (`graph_is_string_items_owner`). The header-flag
+                // test and the barrier call in its body are the GC
+                // transform's work; the backend rewrite re-inserts
+                // the conditional barrier in front of the store
+                // (`handle_write_barrier_setarrayitem`). Collapse
+                // the call to the one `ArrayWrite` over the unerased
+                // block. A value operand whose type does not resolve
+                // leaves the call in place.
                 if args.len() == 3 && self.is_items_block_set_ref_call(&reg) {
-                    let value = self.narrow_value_to_instance_root(
-                        bb_id,
-                        args[2].clone().into(),
-                        "PyObject",
-                    );
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: None,
-                        kind: OpKind::ArrayWrite {
-                            base: args[0].clone(),
-                            index: args[1].clone(),
-                            value,
-                            item_ty: ValueType::Ref(None),
-                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
-                            nolength: false,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    let string_owner = graph_is_string_items_owner(&self.graph.name);
+                    let const_value_ty = arg_operands
+                        .get(2)
+                        .and_then(|op| const_operand_tyref(op, self.llbc));
+                    let value_ty = third_arg_ty.as_ref().or(const_value_ty.as_ref());
+                    let value_root =
+                        value_ty.and_then(|ty| object_stored_ptr_class_root(ty, self.llbc));
+                    let list_root = if string_owner {
+                        None
+                    } else {
+                        value_ty.and_then(|ty| object_stored_ptr_items_list_root(ty, self.llbc))
+                    };
+                    if let Some(value_root) = value_root.as_deref() {
+                        let base = match list_root.as_deref() {
+                            Some(root) => self.unerase_object_strategy_items_block(
+                                bb_id,
+                                args[0].clone(),
+                                root,
+                            ),
+                            None => args[0].clone(),
+                        };
+                        let value = self.narrow_value_to_instance_root(
+                            bb_id,
+                            args[2].clone().into(),
+                            value_root,
+                        );
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: None,
+                            kind: OpKind::ArrayWrite {
+                                base,
+                                index: args[1].clone(),
+                                value,
+                                item_ty: ValueType::Ref(None),
+                                array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                                nolength: false,
+                            },
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // Source-level write-barrier helpers guard the `setfield` the
                 // caller performs next (`type_write_barrier`).
@@ -27991,10 +28023,16 @@ impl<'a> Lowering<'a> {
                 }
                 // `items_block_capacity` on a fixed-list GcArray is
                 // `ll_fixed_length` (`rlist.py` `FixedSizeListRepr`): `len`
-                // of the array itself. The same callee on an `ItemsBlock`
-                // header is `len(l.items)` of a resizable list and stays a
-                // call. The split is the operand's lowleveltype
-                // (`[*mut PyObject]` / `FixedObjectArray` vs the header).
+                // of the array itself. The same callee on a resizable
+                // `ItemsBlock` is `len(l.items)` (`rlist.py`
+                // `_ll_list_resize_hint`) and stays a call: pyre empty
+                // lists keep a NULL `items` field and
+                // `items_block_capacity` returns 0 for NULL, while
+                // PyPy's `ll_newemptylist` allocates a zero-length array
+                // so `len(l.items)` is always safe. pyre does not have
+                // that non-null empty storage yet. The split is the
+                // operand's lowleveltype (`[*mut PyObject]` /
+                // `FixedObjectArray` vs the header).
                 if args.len() == 1
                     && self.is_items_block_capacity(&reg)
                     && arg_locals
@@ -35836,6 +35874,21 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             fd.item_meta.name_path() == "pyre_object::object_array::items_block_capacity"
         })
+    }
+
+    /// Object-strategy `ListStrategy.unerase` of an `ItemsBlock`
+    /// (`rerased.py`). The field stays erased; the use site narrows it
+    /// to the type-derived items list (`rlist.py` `ll_setitem_fast`).
+    fn unerase_object_strategy_items_block(
+        &mut self,
+        bb_id: BlockId,
+        block: Variable,
+        root: &str,
+    ) -> Variable {
+        self.narrow_value_to_instance_root(bb_id, block.into(), root)
+            .as_variable()
+            .expect("ListStrategy.unerase of object items stays a Variable")
+            .clone()
     }
 
     /// `items_block_items_base` — the `ItemsBlock` items pointer. On a
@@ -64751,6 +64804,29 @@ fn object_ref_items_list_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     Some(format!("[{root}]"))
 }
 
+/// Element class root of a stored object pointer (`*mut Class`).
+///
+/// `items_block_set_ref` writes that pointer into the object-strategy
+/// items list. Call sites may name a `type T = *mut Class` alias;
+/// peel it so the `RawPtr` is visible. The class is the pointee's
+/// own leaf (`bookkeeper.py` `getuniqueclassdef`).
+fn object_stored_ptr_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let node = tyref_node(ty, llbc)?;
+    let node = type_node_peel_aliases(node, llbc)?;
+    raw_ptr_pointee_class_root(node, llbc)
+}
+
+/// List spelling of a stored object pointer (`*mut Class`).
+///
+/// `items_block_set_ref` writes that pointer into the object-strategy
+/// items list. The list root is `[Class]`, the same spelling
+/// [`object_ref_items_list_root`] builds from an items pointer
+/// (`*mut *mut Class`).
+fn object_stored_ptr_items_list_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let root = object_stored_ptr_class_root(ty, llbc)?;
+    Some(format!("[{root}]"))
+}
+
 /// List spelling of an object-pointer slice (`&[T]` / `*const [T]`).
 ///
 /// `emit_object_vec_gcarray` copies a `Vec<T>` into the length-prefixed
@@ -82073,9 +82149,33 @@ mod tests {
         );
     }
 
+    /// `ll_list_obj_capacity` is `len(l.items)` (`rlist.py`
+    /// `_ll_list_resize_hint` `allocated = len(l.items)`). The resizable
+    /// `ItemsBlock` may be NULL; `items_block_capacity` returns 0 for
+    /// NULL, so the call stays. PyPy's `ll_newemptylist` allocates a
+    /// zero-length array, which pyre does not have yet.
+    #[test]
+    fn items_block_capacity_on_a_resizable_list_stays_a_call() {
+        use crate::model::OpKind;
+        let graph = lower_object_fn("pyre_object::listobject::ll_list_obj_capacity");
+        assert!(
+            calls_leaf(&graph, "items_block_capacity"),
+            "ll_list_obj_capacity must keep items_block_capacity"
+        );
+        let has_arraylen = graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. }))
+        });
+        assert!(!has_arraylen, "the items header is not ll_fixed_length");
+    }
+
     /// `ll_list_obj_setitem_fast` is `items_block_set_ref(l.items, index,
     /// item)`. The call becomes the one `setarrayitem_gc` on the object
     /// items array, the same collapse `FixedObjectArray::set_ref` gets.
+    /// The ArrayWrite base is the object-strategy unerase of the
+    /// `ItemsBlock` (`rerased.py` / `ListStrategy.unerase`).
     #[test]
     fn items_block_set_ref_call_is_one_array_write() {
         use crate::model::OpKind;
@@ -82084,26 +82184,38 @@ mod tests {
             !calls_leaf(&graph, "items_block_set_ref"),
             "ll_list_obj_setitem_fast still calls items_block_set_ref"
         );
-        let writes: Vec<_> = graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .filter_map(|op| match &op.kind {
-                OpKind::ArrayWrite {
-                    item_ty,
-                    array_type_id,
-                    ..
-                } => Some((item_ty.clone(), array_type_id.clone())),
-                _ => None,
-            })
-            .collect();
+        let mut writes = Vec::new();
+        let mut object_items_casts = Vec::new();
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            if crate::model::cast_instance_root(&op.kind) == Some("[PyObject]") {
+                if let Some(result) = op.result.as_ref() {
+                    object_items_casts.push(result.clone());
+                }
+            }
+            if let OpKind::ArrayWrite {
+                base,
+                item_ty,
+                array_type_id,
+                ..
+            } = &op.kind
+            {
+                writes.push((base.clone(), item_ty.clone(), array_type_id.clone()));
+            }
+        }
         assert_eq!(
-            writes,
+            writes
+                .iter()
+                .map(|(_, item_ty, array_type_id)| (item_ty.clone(), array_type_id.clone()))
+                .collect::<Vec<_>>(),
             vec![(
                 crate::model::ValueType::Ref(None),
                 Some(super::OBJECT_REF_GCARRAY_TYPE_ID.to_string())
             )],
             "expected one object-array setarrayitem"
+        );
+        assert!(
+            object_items_casts.contains(&writes[0].0),
+            "ArrayWrite base must be the [PyObject] unerase of the ItemsBlock"
         );
     }
 
@@ -83621,6 +83733,26 @@ mod tests {
             object_ref_items_list_root(&header, &llbc),
             None,
             "a pointer to the object itself is not the items pointer"
+        );
+        assert_eq!(
+            super::object_stored_ptr_items_list_root(&header, &llbc).as_deref(),
+            Some("[PyObject]"),
+            "a stored *mut Class is the items-list element"
+        );
+        assert_eq!(
+            super::object_stored_ptr_items_list_root(&items, &llbc),
+            None,
+            "an items pointer (*mut *mut Class) is not a stored element"
+        );
+        assert_eq!(
+            super::object_stored_ptr_class_root(&header, &llbc).as_deref(),
+            Some("PyObject"),
+            "a stored *mut Class names the element class"
+        );
+        assert_eq!(
+            super::object_stored_ptr_class_root(&items, &llbc),
+            None,
+            "an items pointer (*mut *mut Class) is not a stored element"
         );
     }
 
@@ -115299,6 +115431,126 @@ mod tests {
         assert!(
             !link_carries(&graph, field),
             "the ItemsBlock header must not replace the call; ops={ops:?}"
+        );
+    }
+
+    /// `items_block_capacity` is `len(l.items)` of the ITEMARRAY. A
+    /// published fixed list (`wrappeditems`) lowers to `arraylen_gc`. A
+    /// resizable `ItemsBlock` header (`l.items`) stays a call: empty
+    /// lists keep NULL storage.
+    fn items_capacity_operand_llbc(owner_path: &[&str], field: &str) -> Llbc {
+        let items_ptr = interior_raw_mut(interior_adt(1));
+        let usize_ty = interior_usize();
+        let owner = interior_struct(0, owner_path, &[(field, items_ptr.clone())], 8, &[0], false);
+        let items_block = interior_struct(1, &["object_array", "ItemsBlock"], &[], 8, &[], false);
+        let owner_ptr = interior_raw_mut(interior_adt(0));
+        let owner_ty = interior_adt(0);
+        let caller = interior_caller(
+            "read_items_capacity",
+            1,
+            vec![owner_ptr.clone()],
+            usize_ty.clone(),
+            vec![
+                interior_local(0, None, &usize_ty),
+                interior_local(1, Some("obj"), &owner_ptr),
+                interior_local(2, Some("block"), &items_ptr),
+            ],
+            vec![
+                interior_bb(
+                    vec![interior_assign(
+                        interior_place(2, &items_ptr),
+                        interior_use(interior_field(1, &owner_ptr, &owner_ty, &items_ptr, 0)),
+                    )],
+                    interior_call(
+                        1,
+                        vec![interior_copy(interior_place(2, &items_ptr))],
+                        interior_place(0, &usize_ty),
+                        2,
+                        1,
+                    ),
+                ),
+                interior_bb(vec![], interior_unwind()),
+                interior_bb(vec![], interior_return()),
+            ],
+        );
+        let callee = interior_opaque(
+            1,
+            &["pyre_object", "object_array", "items_block_capacity"],
+            vec![items_ptr],
+            usize_ty,
+        );
+        llbc_with_types("fixture", vec![owner, items_block], vec![caller, callee])
+    }
+
+    fn items_capacity_call<'a>(ops: &'a [&'a SpaceOperation]) -> Option<&'a SpaceOperation> {
+        ops.iter().copied().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("items_block_capacity")
+            )
+        })
+    }
+
+    fn items_capacity_arraylen<'a>(ops: &'a [&'a SpaceOperation]) -> Option<&'a SpaceOperation> {
+        ops.iter().copied().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::ArrayLen {
+                    array_type_id: Some(id),
+                    nolength: false,
+                    ..
+                } if id == super::OBJECT_REF_GCARRAY_TYPE_ID
+            )
+        })
+    }
+
+    #[test]
+    fn items_block_capacity_on_a_fixed_list_is_arraylen() {
+        let llbc = items_capacity_operand_llbc(&["tupleobject", "W_TupleObject"], "wrappeditems");
+        let graph = lower_interior(&llbc, "read_items_capacity");
+        let ops = graph_ops(&graph);
+        let field = field_read_of(&ops, "wrappeditems");
+        assert!(
+            items_capacity_call(&ops).is_none(),
+            "fixed-list items_block_capacity must be dropped; ops={ops:?}"
+        );
+        let len = items_capacity_arraylen(&ops)
+            .unwrap_or_else(|| panic!("fixed-list capacity must be ArrayLen; ops={ops:?}"));
+        match &len.kind {
+            OpKind::ArrayLen { base, .. } => {
+                assert!(
+                    base == field,
+                    "arraylen must take the wrappeditems field; ops={ops:?}"
+                );
+            }
+            other => panic!("expected ArrayLen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn items_block_capacity_on_an_items_block_stays_a_call() {
+        let llbc = items_capacity_operand_llbc(&["listobject", "W_ListObject"], "items");
+        let graph = lower_interior(&llbc, "read_items_capacity");
+        let ops = graph_ops(&graph);
+        let field = field_read_of(&ops, "items");
+        let call = items_capacity_call(&ops).unwrap_or_else(|| {
+            panic!("resizable ItemsBlock capacity must stay a call; ops={ops:?}")
+        });
+        match &call.kind {
+            OpKind::Call { args, .. } => {
+                assert!(
+                    matches!(args.first(), Some(LinkArg::Value(value)) if value == field),
+                    "the call must take the ItemsBlock field; ops={ops:?}"
+                );
+            }
+            other => panic!("expected a call, got {other:?}"),
+        }
+        assert!(
+            items_capacity_arraylen(&ops).is_none(),
+            "the items header is not ll_fixed_length; ops={ops:?}"
         );
     }
 
