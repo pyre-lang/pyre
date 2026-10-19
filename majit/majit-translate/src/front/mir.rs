@@ -40218,11 +40218,15 @@ impl<'a> Lowering<'a> {
     /// `intersects` is `(self & other) != 0`, `bitor` is `self | other`.
     /// `contains` / `intersects` take `&self`, a borrow of the transparent
     /// scalar, so their receiver is the word `*self` reads; `bitor` and the
-    /// `other` operand are by value. Bit ops use the `bitand` / `bitor`
-    /// labels and `Unsigned` result a `u32` `&` / `|` lowers to. A compare
-    /// uses `eq` / `ne` with the `Int` result a `u32` `==` / `!=` lowers to,
-    /// because that destination is `bool`. The flag constants are the
-    /// `Unsigned` values [`code_flags_const`] emits.
+    /// `other` operand are by value. `bits` is that same `*self` word: the
+    /// integer `bits()` returns, not a residual FunctionPath (the impl is
+    /// outside the extracted crates; `jtransform.py`
+    /// `Transformer.handle_residual_call` needs a real function pointer).
+    /// Bit ops use the `bitand` / `bitor` labels and `Unsigned` result a
+    /// `u32` `&` / `|` lowers to. A compare uses `eq` / `ne` with the `Int`
+    /// result a `u32` `==` / `!=` lowers to, because that destination is
+    /// `bool`. The flag constants are the `Unsigned` values
+    /// [`code_flags_const`] emits.
     fn try_lower_code_flags_method(
         &mut self,
         mir_bb: usize,
@@ -40235,6 +40239,28 @@ impl<'a> Lowering<'a> {
         let Some((leaf, flags_ty)) = code_flags_method(self.llbc, reg) else {
             return Ok(false);
         };
+        if leaf == "bits" {
+            let Some(Some(receiver)) = arg_locals.first() else {
+                return Ok(false);
+            };
+            let place = Place {
+                kind: PlaceKind::Projection(
+                    Box::new(Place {
+                        kind: PlaceKind::Local(*receiver as u64),
+                        ty: unit_tyref(),
+                    }),
+                    ProjectionElem::Atom("Deref".to_string()),
+                ),
+                ty: flags_ty,
+            };
+            let res = self.resolve_place(mir_bb, place)?;
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let bb_id = self.emit_bb(mir_bb);
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
         let [lhs, rhs] = args else {
             return Ok(false);
         };
@@ -67562,8 +67588,8 @@ fn code_flags_const(segments: &[String]) -> Option<OpKind> {
 /// residual `FunctionPath`. The owner test is the same crate and module
 /// [`code_flags_const`] uses, plus the `CodeFlags` type: a same-named method
 /// on any other type stays a call. `contains` / `intersects` / `bitor` are
-/// the integer operations the macro expands to; every other method stays
-/// residual.
+/// the integer operations the macro expands to; `bits` is the transparent
+/// `u32` word those ops already read. Every other method stays residual.
 fn code_flags_method(llbc: &Llbc, reg: &RegularCall) -> Option<(&'static str, TyRef)> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
@@ -67593,10 +67619,18 @@ fn code_flags_method(llbc: &Llbc, reg: &RegularCall) -> Option<(&'static str, Ty
         "contains" => "contains",
         "intersects" => "intersects",
         "bitor" => "bitor",
+        "bits" => "bits",
         _ => return None,
     };
-    // `other: Self`, the by-value `CodeFlags` a `*self` read also has.
-    let flags_ty = clone_tyref(fd.signature.inputs.get(1)?);
+    // `contains` / `intersects` / `bitor` take `other: Self`, the by-value
+    // `CodeFlags` a `*self` read also has. `bits` is `&self` only, so the
+    // same type is the pointee of the receiver.
+    let flags_ty = if leaf == "bits" {
+        let first = fd.signature.inputs.first()?;
+        ref_pointee_ty(first, llbc).or_else(|| pointer_pointee_ty(first, llbc))?
+    } else {
+        clone_tyref(fd.signature.inputs.get(1)?)
+    };
     Some((leaf, flags_ty))
 }
 
@@ -83926,9 +83960,9 @@ mod tests {
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
     /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
-    /// (`w_code_const` on `co_consts_w`); it must not project the compiler
-    /// `Constants` wrapper.  `code_getdocstring` still projects that
-    /// wrapper for its slice view.
+    /// (a `co_consts_w` field read on the promoted code); it must not
+    /// project the compiler `Constants` wrapper.  `code_getdocstring`
+    /// still projects that wrapper for its slice view.
     ///
     /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
     /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,
@@ -84058,13 +84092,22 @@ mod tests {
             constant_ops.iter().any(|op| {
                 matches!(
                     &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "co_consts_w"
+                )
+            }),
+            "getconstant_w reads self.getcode().co_consts_w"
+        );
+        assert!(
+            !constant_ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["w_code_const"])
                 )
             }),
-            "PyFrame.constant_at must call w_code_const"
+            "getconstant_w indexes co_consts_w directly"
         );
         assert!(!constant_ops.iter().any(|op| {
             matches!(

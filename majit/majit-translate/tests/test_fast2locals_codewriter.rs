@@ -261,6 +261,15 @@ fn fast2locals_assembles() {
     let Some(graph) = lower_fast2locals() else {
         return;
     };
+    // `CodeFlags::bits` is opaque in the LLBC. Left residual it is an
+    // unresolvable FunctionPath (`jtransform.py Transformer.handle_residual_call`).
+    // `co_flags()` transmutes the transparent `u32` word instead, and
+    // `code_flags_method` inlines `bits` the same way.
+    assert!(
+        call_leafs(&graph).iter().all(|leaf| leaf != "bits"),
+        "CodeFlags::bits must not remain residual in fast2locals, got {:?}",
+        call_leafs(&graph)
+    );
     let path = CallPath::from_segments(["pyre_interpreter", "pyframe", "fast2locals"]);
     let cfg = config();
     let mut callcontrol = CallControl::new();

@@ -4210,10 +4210,13 @@ impl ConstantOpcodeHandler for PyFrame {
         index: crate::bytecode::oparg::ConstIdx,
         _enclosing: &crate::bytecode::CodeObject,
     ) -> Result<Self::Value, PyError> {
-        // `pyopcode.py getconstant_w(index) -> co_consts_w[index]`:
-        // return the one object `self.pycode` holds at `index`.
+        // `pyopcode.py getconstant_w`: `return self.getcode().co_consts_w[index]`.
+        // `getcode` is `hint(self.pycode, promote=True)` (`pyframe.py`); the
+        // promoted wrapper's `co_consts_w[*]` item is then one GC array read.
+        let pycode = majit_metainterp::jit::promote(self.pycode);
         Ok(unsafe {
-            crate::pycode::w_code_const(self.pycode as pyre_object::PyObjectRef, usize::from(index))
+            let table = (*(pycode as *const crate::pycode::PyCode)).co_consts_w;
+            (&*table)[usize::from(index)]
         })
     }
 
@@ -6548,6 +6551,58 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let result = frame.execute_frame(None, None);
         (result, frame)
+    }
+
+    /// `pyopcode.py getconstant_w`: two LOAD_CONST of the same index return
+    /// the identical `co_consts_w` object (`is`). Nested code, tuple, and
+    /// str constants share that slot identity.
+    #[test]
+    fn constant_at_returns_same_identity_for_nested_code_tuple_and_str() {
+        crate::test_hooks::install_hash_hook();
+        let source = concat!(
+            "S = 'hello-identity'\n",
+            "T = ('tuple-item',)\n",
+            "def inner():\n",
+            "    return 1\n",
+        );
+        let code = compile_exec(source).expect("compile failed");
+        let str_idx = code
+            .constants
+            .iter()
+            .position(|constant| match constant {
+                crate::bytecode::ConstantData::Str { value } => value.as_ref() == "hello-identity",
+                _ => false,
+            })
+            .expect("str constant");
+        let tuple_idx = code
+            .constants
+            .iter()
+            .position(|constant| matches!(constant, crate::bytecode::ConstantData::Tuple { .. }))
+            .expect("tuple constant");
+        let code_idx = code
+            .constants
+            .iter()
+            .position(|constant| matches!(constant, crate::bytecode::ConstantData::Code { .. }))
+            .expect("nested code constant");
+        let mut frame = PyFrame::new(code);
+        let enclosing = frame.code().clone();
+        for idx in [str_idx, tuple_idx, code_idx] {
+            let index = crate::bytecode::oparg::ConstIdx::from_u32(idx as u32);
+            let first = frame
+                .constant_at(index, &enclosing)
+                .expect("first LOAD_CONST");
+            let second = frame
+                .constant_at(index, &enclosing)
+                .expect("second LOAD_CONST");
+            assert!(
+                std::ptr::eq(first, second),
+                "LOAD_CONST {idx} must return the same object (`is`)"
+            );
+            assert!(
+                !first.is_null(),
+                "LOAD_CONST {idx} must read a filled co_consts_w slot"
+            );
+        }
     }
 
     // Compiled code can record `ExecutionContext.enter` before handing the
