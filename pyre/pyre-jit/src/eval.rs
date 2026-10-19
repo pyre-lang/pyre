@@ -7665,6 +7665,22 @@ fn stack_almost_full() -> bool {
     pyre_interpreter::stack_check::stack_almost_full()
 }
 
+/// Whether this MetaInterp already owns a trace session.
+///
+/// `JitDriver::is_tracing` is `MetaInterp.tracing.is_some()`. Residual
+/// execution (`with_trace_ctx_and_framestack`) parks that recorder in
+/// `compile_tracing`, so `is_tracing()` is false while `begin_trace_session`
+/// (`trace_meta`) and the profiler event (`open_profiler_tracing_inner`)
+/// stay live. `warmstate.py maybe_compile_and_run` skips only the cell
+/// with `JC_TRACING`; a nested `bound_reached` would build a new
+/// MetaInterp. pyre has one, so the portal doors
+/// (`try_function_entry_jit`, `bound_reached`, `genentry_merge_point_jit`,
+/// `drive_unpack_iterable_trace`) skip whenever a session is already open.
+#[inline]
+fn jit_session_in_progress(driver: &JitDriver<PyreJitState>) -> bool {
+    driver.is_tracing() || driver.meta_interp().trace_meta().is_some()
+}
+
 /// Evaluate a Python frame with JIT compilation.
 ///
 /// This is the main entry point for pyre-jit.
@@ -8165,8 +8181,11 @@ fn get_printable_location_genentry(pycode: pyre_object::PyObjectRef) -> String {
 /// while jitted (`we_are_jitted` and `should_not_inline`); this hook is
 /// that enter. A trace already in progress belongs to the caller — the
 /// walker records `CALL_ASSEMBLER` there instead of nesting a second
-/// `MetaInterp`. With no extracted portal jitcode the enter returns and
-/// `send_ex` continues in the interpreter.
+/// `MetaInterp`. Residual `bh_call_fn` parks that recorder, so
+/// `is_tracing()` is false while `trace_meta` and the profiler event
+/// stay live; skip on `jit_session_in_progress` like
+/// `try_function_entry_jit`. With no extracted portal jitcode the enter
+/// returns and `send_ex` continues in the interpreter.
 fn genentry_merge_point_jit(
     w_gen: pyre_object::PyObjectRef,
     w_arg: pyre_object::PyObjectRef,
@@ -8177,7 +8196,7 @@ fn genentry_merge_point_jit(
     }
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        jit_session_in_progress(driver)
     };
     if tracing {
         return None;
@@ -8285,11 +8304,11 @@ fn drive_generatorentry_trace(
 
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        jit_session_in_progress(driver)
     };
     if tracing {
         if dbg {
-            eprintln!("[jd2] bail: meta.is_tracing()");
+            eprintln!("[jd2] bail: jit_session_in_progress()");
         }
         return None;
     }
@@ -8629,6 +8648,13 @@ fn run_compiled_generatorentry(
             if dbg {
                 eprintln!("[jd2] run_compiled finish exc={is_exception_exit}");
             }
+            // `ll_generatorentry_portal_runner_shim` clears the residual
+            // cells on `Ok` so a later `GUARD_NO_EXCEPTION` is not failed
+            // by a stale raise. This Rust door is `send_ex` → `space.next`
+            // (`pyopcode.py FOR_ITER`); `jit_next` answers exhaustion with
+            // a null return and no published exception. Drain both arms so
+            // that residual's `GUARD_NO_EXCEPTION` sees empty cells.
+            crate::call_jit::clear_residual_call_exception();
             if is_exception_exit {
                 let word = values.first().copied().unwrap_or(0);
                 if let Some(err) = portal_error_from_exc_ref(word) {
@@ -8741,12 +8767,14 @@ fn run_compiled_generatorentry(
                 if dbg {
                     eprintln!("[jd2] run_compiled exc");
                 }
+                crate::call_jit::clear_residual_call_exception();
                 return Some(Err(err));
             }
             crate::call_jit::BlackholeResult::BailToInterpreter => {
                 if dbg {
                     eprintln!("[jd2] run_compiled bail");
                 }
+                crate::call_jit::clear_residual_call_exception();
                 return None;
             }
             // `blackhole.py` `DoneWithThisFrame*`: box via `take_pyresult`.
@@ -8755,6 +8783,7 @@ fn run_compiled_generatorentry(
             | crate::call_jit::BlackholeResult::DoneWithThisFrameVoid
             | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
             | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_)) => {
+                crate::call_jit::clear_residual_call_exception();
                 return done.take_pyresult();
             }
         }
@@ -8865,15 +8894,19 @@ fn drive_unpack_iterable_trace(
     }
 
     let (driver, _) = driver_pair();
-    let meta = driver.meta_interp_mut();
-    // The shared `MetaInterp.tracing` slot holds exactly one ctx; never nest a
-    // jd1 trace inside an active (jd0 or jd1) session.
-    if meta.is_tracing() {
+    // Residual `with_trace_ctx_and_framestack` parks the recorder, so
+    // `is_tracing()` is false while `trace_meta` and
+    // `open_profiler_tracing_inner` stay live. A nested jd1
+    // `force_start_tracing` would open a second profiler event
+    // (`pyjitpl.rs open_profiler_tracing_inner`). Skip like
+    // `try_function_entry_jit`.
+    if jit_session_in_progress(driver) {
         if dbg {
-            eprintln!("[jd1] bail: meta.is_tracing()");
+            eprintln!("[jd1] bail: jit_session_in_progress()");
         }
         return;
     }
+    let meta = driver.meta_interp_mut();
 
     // Extracted merge-point reds: root_base, items_slot, RootScope cell.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
@@ -8990,6 +9023,12 @@ fn drive_unpack_iterable_trace(
                 // takes the value from result slot 0, not from `jf_guard_exc`.
                 if is_exception_exit {
                     pending_err = drain_error_from_exc_ref(values.first().copied().unwrap_or(0));
+                    // The drain consumed the loop-exit `StopIteration` (or
+                    // parked a real error). Leave the residual cells empty
+                    // so a later `GUARD_NO_EXCEPTION` / blackhole resume
+                    // does not reread it (`pyjitpl.py execute_raised`
+                    // dies with the MetaInterp; pyre's TLS cell does not).
+                    crate::call_jit::clear_residual_call_exception();
                 }
                 break;
             }
@@ -10462,10 +10501,11 @@ fn generatorentry_ll_portal_runner(
     // `ll_portal_runner` calls `maybe_compile_and_run` before `portal_ptr`.
     // `send_ex` only reaches its own merge-point hook when `we_are_jitted`
     // is set, and this runner is a normal call out of `CALL_ASSEMBLER`.
-    // A trace already in progress belongs to the caller.
+    // A trace already in progress belongs to the caller, including a
+    // residual whose recorder is parked (`jit_session_in_progress`).
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        jit_session_in_progress(driver)
     };
     // The portal's reds and green stay live across `maybe_compile_and_run`,
     // which can trace, compile or run the loop.
@@ -11648,6 +11688,9 @@ fn maybe_compile_and_run(
             {
                 return None;
             }
+            if jit_session_in_progress(driver) {
+                return None;
+            }
             bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
@@ -12187,6 +12230,20 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
                 .as_deref()
                 .map(|s| s.rd_numb().map_or(0, <[_]>::len))
         );
+    }
+
+    // `compile.py resume_in_blackhole` / `blackhole.py
+    // _prepare_resume_from_failure` take the exception off this fail
+    // descr (`cpu.grab_exc_value`). Pyre's residual helpers also write
+    // `BH_LAST_EXC_VALUE` / `_store_exception`, and a nested `list(gen)`
+    // that already caught `StopIteration` can leave those cells set.
+    // A non-exception guard (`GuardFalse` on a red local) has
+    // `guard_exc == 0`; a leftover cell would be read as this resume's
+    // pending raise and escape the generator body (`generator.py`
+    // `_leak_stopiteration`). Drain it here, the same discard
+    // `ResidualExceptionScope` does at the end of a tracing drive.
+    if guard_exc == 0 {
+        crate::call_jit::clear_residual_call_exception();
     }
 
     // resume.py blackhole_from_resumedata is the single blackhole
@@ -12971,7 +13028,7 @@ fn bound_reached(
     // object. Read it once here too: the decision below and the run further
     // down used to walk the cell chain separately for the same answer.
     let procedure_token = driver.runnable_procedure_token(green_key);
-    if procedure_token.is_none() && !driver.is_tracing() {
+    if procedure_token.is_none() && !jit_session_in_progress(driver) {
         return compile_and_run_once(
             frame_root.frame(),
             green_key,
@@ -13336,7 +13393,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         );
     }
 
-    if driver.is_tracing() {
+    if jit_session_in_progress(driver) {
         return None;
     }
 
