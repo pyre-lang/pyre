@@ -2265,9 +2265,12 @@ impl Optimizer {
             }
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
-            // installs a non-virtual (Instance/Struct) at the alloc_ref.
+            // emits the allocation (`info.py` `AbstractVirtualPtrInfo.force_box`)
+            // then `_force_elements`. A parked non-virtual field producer is
+            // flushed there, immediately before that field's store — not by
+            // walking the field graph before the container allocation.
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
-            let forced = info.force_box(&resolved_box, ctx);
+            let forced = super::info::force_box_impl(&mut info, &resolved_box, ctx, self);
             return ctx.resolve_operand_operand(&forced);
         }
         resolved_box
@@ -5012,7 +5015,7 @@ impl Optimizer {
     ///
     /// Close the window by propagating that one parked definition here, ahead
     /// of the operation that reads it. Everything else keeps its queued order.
-    fn flush_queued_producer(
+    pub(super) fn flush_queued_producer(
         &mut self,
         opref: OpRef,
         ctx: &mut OptContext,
@@ -8002,6 +8005,105 @@ mod tests {
                 ),
                 (OpCode::GuardNonnull, vec![OpRef::ref_op(10)], true),
             ]
+        );
+    }
+
+    #[test]
+    fn test_final_emission_flushes_parked_field_alloc_before_store() {
+        use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
+
+        // Virtual struct V, field holds non-virtual box F. F's NewWithVtable
+        // is parked on an outer `extra_pending` level. Forcing V emits V's
+        // allocation, then F's allocation, then the SetfieldGc that stores
+        // F into V (`info.py` `force_box` then `_force_elements`).
+        let test_descr = std::sync::Arc::new(TestDescr(0));
+        let field_descr_typed: std::sync::Arc<dyn majit_ir::FieldDescr> = test_descr;
+        let descr: DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleSizeDescr::new(0, 16, 0)
+                .with_all_fielddescrs(vec![field_descr_typed]),
+        );
+        let f_descr: DescrRef =
+            std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(1, 24, 2));
+        let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
+
+        let v_rc = OpRc::new(Op::with_descr(OpCode::New, &[], descr.clone()));
+        v_rc.pos().set(OpRef::ref_op(10));
+        ctx.register_extra_producer(&v_rc);
+
+        let f_rc = OpRc::new(Op::with_descr(OpCode::NewWithVtable, &[], f_descr));
+        f_rc.pos().set(OpRef::ref_op(20));
+        ctx.register_extra_producer(&f_rc);
+        let f_box = ctx.materialize_operand_at(OpRef::ref_op(20));
+        let v_box = ctx.materialize_operand_at(OpRef::ref_op(10));
+        ctx.set_ptr_info(
+            &v_box,
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                fields: vec![(0, f_box)].into(),
+                ..VirtualStructInfo::new(descr)
+            }),
+        );
+
+        let decoy = OpRc::new(Op::new(
+            OpCode::IntAdd,
+            &[
+                Operand::const_from_value(majit_ir::Value::Int(1)),
+                Operand::const_from_value(majit_ir::Value::Int(2)),
+            ],
+        ));
+        decoy.pos().set(OpRef::int_op(30));
+        let mut outer = crate::optimizeopt::ExtraQueue::new();
+        outer.push_back((4, f_rc));
+        ctx.extra_pending.push(outer);
+        let mut inner = crate::optimizeopt::ExtraQueue::new();
+        inner.push_back((4, decoy));
+        ctx.extra_pending.push(inner);
+
+        let mut opt = Optimizer::new();
+        let op = Op::new(
+            OpCode::GuardNonnull,
+            &[ctx.materialize_operand_at(OpRef::ref_op(10))],
+        );
+        let (mut seeded_ops, snapshots) =
+            super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
+        ctx.snapshot_boxes = snapshots;
+        let op = seeded_ops.pop().unwrap();
+        let prior = OpRc::new(op.clone());
+        opt.emit_operation(op, &prior, &mut ctx, false)
+            .expect("emit");
+
+        let container_at = ctx
+            .new_operations
+            .iter()
+            .position(|op| op.opcode == OpCode::New && op.pos().get() == OpRef::ref_op(10));
+        let alloc_at = ctx.new_operations.iter().position(|op| {
+            op.opcode == OpCode::NewWithVtable && op.pos().get() == OpRef::ref_op(20)
+        });
+        let store_at = ctx.new_operations.iter().position(|op| {
+            op.opcode == OpCode::SetfieldGc
+                && op.num_args() >= 2
+                && op.arg(1).to_opref() == OpRef::ref_op(20)
+        });
+        assert!(
+            container_at.is_some()
+                && alloc_at.is_some()
+                && store_at.is_some()
+                && container_at.unwrap() < alloc_at.unwrap()
+                && alloc_at.unwrap() < store_at.unwrap(),
+            "container alloc, then F's NewWithVtable, then SetfieldGc; \
+             container={container_at:?} alloc={alloc_at:?} store={store_at:?} ops={:?}",
+            ctx.new_operations
+                .iter()
+                .map(|op| (op.opcode, op.pos().get()))
+                .collect::<Vec<_>>()
+        );
+        let still_parked = ctx.extra_pending.iter().any(|level| {
+            level
+                .iter()
+                .any(|(_, op)| op.pos().get() == OpRef::int_op(30))
+        });
+        assert!(
+            still_parked,
+            "only the field value's producer is flushed; the other parked op stays"
         );
     }
 

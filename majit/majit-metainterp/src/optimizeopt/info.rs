@@ -1056,7 +1056,11 @@ impl PtrInfoExt for PtrInfo {
     /// Generated ops are routed via emit_extra() (RPython
     /// emit_extra parity) so downstream passes can observe them.
     fn force_box(&mut self, op: &Operand, ctx: &mut crate::optimizeopt::OptContext) -> Operand {
-        force_box_impl(self, op, ctx)
+        // Pass-level callers (earlyforce, vstring, pure, `force_box_inline`)
+        // have no `Optimizer`. Final emission enters `force_box_impl` from
+        // `Optimizer::force_box` with the live optimizer so a parked field
+        // producer can be flushed immediately before its store.
+        force_box_emit(self, op, ctx, None)
     }
 
     /// info.py: _is_immutable_and_filled_with_constants
@@ -1124,10 +1128,22 @@ impl PtrInfoExt for PtrInfo {
     }
 }
 
-fn force_box_impl(
+/// `Optimizer::force_box` and the recursive `force_child` below.
+/// `info.py` `AbstractVirtualPtrInfo.force_box` then `_force_elements`.
+pub(super) fn force_box_impl(
     self_: &mut PtrInfo,
     op: &Operand,
     ctx: &mut crate::optimizeopt::OptContext,
+    optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
+) -> Operand {
+    force_box_emit(self_, op, ctx, Some(optimizer))
+}
+
+fn force_box_emit(
+    self_: &mut PtrInfo,
+    op: &Operand,
+    ctx: &mut crate::optimizeopt::OptContext,
+    mut optimizer: Option<&mut crate::optimizeopt::optimizer::Optimizer>,
 ) -> Operand {
     use majit_ir::{Op, OpCode};
 
@@ -1143,7 +1159,11 @@ fn force_box_impl(
     // resulting box, which the parent uses as a SETFIELD/SETARRAYITEM value
     // operand. Box-native: the field box is passed and returned directly,
     // matching `force_box(fld)` rather than an OpRef round-trip.
-    fn force_child(orig: &Operand, ctx: &mut crate::optimizeopt::OptContext) -> Operand {
+    fn force_child(
+        orig: &Operand,
+        ctx: &mut crate::optimizeopt::OptContext,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+    ) -> Operand {
         let value_box = ctx.resolve_operand_operand_opt(orig);
         // optimizer.py:356-357: `info = op.get_forwarded()` then `if op.type ==
         // 'i' and info.is_constant(): return ConstInt(info.get_constant_int())`.
@@ -1168,10 +1188,44 @@ fn force_box_impl(
         if value_is_virtual {
             let vb_op = value_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&vb_op).unwrap();
-            let forced = force_box_impl(&mut info, &vb_op, ctx);
+            // Nested virtuals emit their allocation in `force_box_impl`
+            // (`info.py` `force_box` then `_force_elements`) before the
+            // parent store. Pass-level entry has no optimizer.
+            let forced = match optimizer.as_deref_mut() {
+                Some(opt) => force_box_impl(&mut info, &vb_op, ctx, opt),
+                None => force_box_emit(&mut info, &vb_op, ctx, None),
+            };
             return ctx.resolve_operand_operand(&forced);
         }
         value_box.unwrap_or_else(|| orig.clone())
+    }
+
+    /// `info.py` `_force_elements` calls `force_box(fld)` and then emits the
+    /// store. A non-virtual `fld` whose allocation is still parked in
+    /// `extra_pending` / `extra_operations_after` is flushed here, for that
+    /// one box, immediately before the store. The container itself was
+    /// already emitted by `emit_forced` and is not flushed.
+    fn flush_nonvirtual_field(
+        value: &Operand,
+        ctx: &mut crate::optimizeopt::OptContext,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+    ) {
+        if ctx.is_virtual(value) {
+            return;
+        }
+        // Outside final emission the store itself is queued behind the
+        // producer, so the queue keeps the order.
+        if !ctx.in_final_emission {
+            return;
+        }
+        let Some(opt) = optimizer.as_mut() else {
+            return;
+        };
+        if let Err(crate::optimize::InvalidLoop(reason)) =
+            opt.flush_queued_producer(value.to_opref(), ctx)
+        {
+            ctx.signal_invalid_loop(reason);
+        }
     }
 
     // RPython info.py:148,226: optforce.emit_extra(op)
@@ -1243,7 +1297,7 @@ fn force_box_impl(
                     .and_then(|b| b.const_value())
                     .is_none()
                 {
-                    force_child(&fb, ctx);
+                    force_child(&fb, ctx, &mut optimizer);
                     if ctx
                         .resolve_operand_operand_opt(&fb)
                         .and_then(|b| b.const_value())
@@ -1334,7 +1388,10 @@ fn force_box_impl(
                     continue;
                 };
                 let (_, value_ref) = leftover.swap_remove(pos);
-                let value_ref = force_child(&value_ref, ctx);
+                let value_ref = force_child(&value_ref, ctx, &mut optimizer);
+                // After force_box(fld): flush this one non-virtual producer,
+                // then emit SETFIELD_GC. Not a pre-walk of the field graph.
+                flush_nonvirtual_field(&value_ref, ctx, &mut optimizer);
                 if w_class_store_is_covered_by_alloc(&vinfo.descr, descr, &value_ref, ctx) {
                     continue;
                 }
@@ -1392,7 +1449,10 @@ fn force_box_impl(
                     continue;
                 };
                 let (_, value_ref) = leftover.swap_remove(pos);
-                let value_ref = force_child(&value_ref, ctx);
+                let value_ref = force_child(&value_ref, ctx, &mut optimizer);
+                // After force_box(fld): flush this one non-virtual producer,
+                // then emit SETFIELD_GC. Not a pre-walk of the field graph.
+                flush_nonvirtual_field(&value_ref, ctx, &mut optimizer);
                 if w_class_store_is_covered_by_alloc(&vinfo.descr, descr, &value_ref, ctx) {
                     continue;
                 }
@@ -1459,7 +1519,10 @@ fn force_box_impl(
                         continue;
                     }
                 }
-                let subbox = force_child(&item_ref, ctx);
+                let subbox = force_child(&item_ref, ctx, &mut optimizer);
+                // info.py ArrayPtrInfo._force_elements: force_box(item) then
+                // SETARRAYITEM_GC. Flush only this item's parked producer.
+                flush_nonvirtual_field(&subbox, ctx, &mut optimizer);
                 let idx_ref = Operand::const_(majit_ir::Const::Int(i as i64));
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_idx = idx_ref.clone();
@@ -1530,7 +1593,9 @@ fn force_box_impl(
                     if value_ref.is_none() {
                         continue;
                     }
-                    let subbox = force_child(&value_ref, ctx);
+                    let subbox = force_child(&value_ref, ctx, &mut optimizer);
+                    // info.py ArrayStructInfo._force_elements: force_box(fld) then SETINTERIORFIELD_GC.
+                    flush_nonvirtual_field(&subbox, ctx, &mut optimizer);
                     let arg_alloc = Operand::from_bound_op(&alloc_rc);
                     let arg_idx = idx_ref.clone();
                     let arg_sub = ctx.resolve_operand_operand(&subbox);
@@ -1624,7 +1689,7 @@ fn force_box_impl(
             // Overwriting with `PtrInfo::nonnull()` would lose the
             // raw-slice identity and mis-route any later
             // `get_virtual_fields` / raw-guard path.
-            force_child(&slice.parent, ctx);
+            force_child(&slice.parent, ctx, &mut optimizer);
             // info.py `force_box`: emit the slice's INT_ADD itself.
             let new_rc = emit_forced(ctx, op);
             // Preserve raw-slice identity; mark non-virtual via
