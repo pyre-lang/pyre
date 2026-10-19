@@ -1,7 +1,14 @@
 # CPython-suite gap: the vendored suite slices sequences with plain integer
 # bounds, so no test in it runs Python between the receiver's type test and the
 # fetch that reads its payload.
+# test.test_enum TestMinimalFloatFunction.test_overridden_str_format does
+# ''.join(reversed(self.name)) on a young interned member name while intern
+# WEAKDICT / WEAKREF mallocs collect.
 # parity-tests reason: this is a pyre/PyPy moving-GC root-liveness regression.
+# unicodeobject.py _str_join_many_items keeps self._utf8 (Ptr(STR) getfield)
+# as a livevar; framework.py push_roots / shadowstack.py expand_pop_roots
+# reloads the str object and recomputes chars after any collecting call.
+# parity-env: PYPY_GC_NURSERY=4096
 
 """``seq[a:b]`` must survive a bound ``__index__`` that collects.
 
@@ -12,7 +19,9 @@ that conversion, and the arity-2 specialised tuples box their payload on
 every fetch, so the receiver moves inside the fetch loop as well.
 """
 
+import enum
 import gc
+import sys
 
 
 def churn():
@@ -79,4 +88,40 @@ for n in sizes:
         empty = src[n:n]
         assert empty == []
 
+
+def churn_join_reversed():
+    junk = []
+    for i in range(40):
+        junk.append([object() for _ in range(32)])
+        if i % 4 == 0:
+            gc.collect()
+    return junk
+
+
+def join_reversed_of_a_young_interned_name_survives_minors():
+    for i in range(80):
+        name = sys.intern("first%d" % (i % 7))
+        churn_join_reversed()
+        got = "".join(reversed(name))
+        expect = "".join(reversed(list(name)))
+        if got != expect:
+            raise AssertionError((i, name, got, expect))
+
+    class NewStrFormatEnum(enum.Enum):
+        def __format__(self, spec):
+            return "".join(reversed(self.name))
+
+        first = enum.auto()
+
+    for i in range(40):
+        churn_join_reversed()
+        got = format(NewStrFormatEnum.first)
+        if got != "tsrif":
+            raise AssertionError(("format", i, got))
+        got = "{}".format(NewStrFormatEnum.first)
+        if got != "tsrif":
+            raise AssertionError(("str.format", i, got))
+
+
+join_reversed_of_a_young_interned_name_survives_minors()
 print("OK")

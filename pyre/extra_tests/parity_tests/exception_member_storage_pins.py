@@ -20,7 +20,20 @@
 # pyre-check: pypy-diverges: pypy3 reports `__suppress_context__ may not be
 # deleted` and `expected integer, got str object`, leaves a class-level
 # `__notes__` list alone (`inst.__notes__ == ['n']`), and keeps
-# `e.value is 1` after `StopIteration(1).__init__()`.
+# `e.value is 1` after `StopIteration(1).__init__()`. pypy3 wraps the
+# `__set_name__` error in RuntimeError (typeobject.py `_set_names`) instead
+# of adding a note on the ValueError.
+# test.test_enum TestSpecial.test_init_exception raises from a member
+# constructor during class creation; type_set_names attaches an add_note and
+# intern/list-append may collect while intern WEAKDICTENTRYARRAY is still young.
+# `_rweakvaldict.py ll_set_nonnull` keeps `d` a livevar across `weakref_create`;
+# `framework.py` `push_roots` / `shadowstack.py` `expand_pop_roots` reloads the
+# OperationError handle after `to_exc_object` / `w_str_new_managed`
+# (`add_internal_exception_note`).
+# parity-env: PYPY_GC_NURSERY=4096
+import gc
+
+
 def rejects(fn, message):
     try:
         fn()
@@ -67,4 +80,37 @@ e.__init__(2)
 assert e.value == 2, e.value
 assert e.args == (2,), e.args
 
+
+class Desc:
+    def __set_name__(self, owner, name):
+        raise ValueError("boom")
+
+
+def set_name_notes_stay_live_across_small_nursery_collections():
+    caught = 0
+    junk = []
+    for i in range(80):
+        junk.append([object() for _ in range(32)])
+        if i % 8 == 0:
+            gc.collect()
+        try:
+
+            class C:
+                x = Desc()
+        except ValueError as e:
+            caught += 1
+            notes = getattr(e, "__notes__", None)
+            if not notes:
+                raise AssertionError(("missing __notes__", i, e))
+            joined = " ".join(str(n) for n in notes)
+            if "Error calling __set_name__" not in joined:
+                raise AssertionError(("note text", i, notes))
+        else:
+            raise AssertionError(("expected ValueError", i))
+
+    if caught != 80:
+        raise AssertionError(("caught", caught))
+
+
+set_name_notes_stay_live_across_small_nursery_collections()
 print("OK")

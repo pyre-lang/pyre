@@ -1,6 +1,17 @@
 # CPython-suite gap: nothing in the suite walks a traceback's frame locals in a
 # loop tight enough for a minor collection to land between the walk and the read.
+# test.test_collections ABC mixins JIT-trace ValuesView.__contains__ (nlocals=4,
+# stacksize=3, locals array length 7). An old type-9 varsize ref array
+# (frame locals_cells_stack_w) holds nursery addresses a later JITFRAME covers;
+# snapshot_for_tracing copies those locals.
 # parity-tests reason: this is a pyre/PyPy moving-GC regression gate.
+# pyframe.py STORE_FAST is setarrayitem_gc on the virtualizable locals GcArray;
+# framework.py transform_generic_set emits write_barrier_from_array; rewrite.py
+# handle_write_barrier_setarrayitem / gen_write_barrier_array emit
+# COND_CALL_GC_WB on the array. gctransform/framework.py push_roots /
+# shadowstack.py pop_roots around the dest malloc; setarrayitem_gc /
+# incminimark.py write_barrier then stores the reloaded words.
+# parity-env: PYPY_GC_NURSERY=4096
 
 """A traceback walk reading `f_locals` must survive the collections it triggers.
 
@@ -30,6 +41,17 @@ The trigger was allocation layout rather than the loop bounds: the same body
 reading `N`/`WHICH` from `sys.argv` was clean, and wrapping the defaults to
 defeat constant folding did not change it.
 """
+
+import gc
+from collections import ChainMap, namedtuple
+from collections.abc import ValuesView
+
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=1,function_threshold=1")
+except ImportError:
+    pass
 
 N = 15000
 WHICH = "head"
@@ -76,4 +98,93 @@ def drive():
 r = drive()
 assert r == [(("drive", ("e", "k", "seen")), "mid")], r
 
+
+def promote():
+    junk = [[object() for _ in range(16)] for _ in range(24)]
+    del junk
+    gc.collect()
+
+
+def f4t(a, b, c, d):
+    return a, b, c
+
+
+class Mapping:
+    def __init__(self, data):
+        self.data = data
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __len__(self):
+        return len(self.data)
+
+
+def old_cap7_frame_locals_that_receive_young_args_survive_minors():
+    N = 600
+    kept = []
+    old_self = object()
+    promote()
+    for i in range(N):
+        row = f4t(old_self, object(), object(), object())
+        kept.append(row)
+        if i % 8 == 0:
+            promote()
+    if kept[-1][0] is not old_self:
+        raise AssertionError(("f4t", kept[-1][0], old_self))
+
+    data = {}
+    for i in range(8):
+        data[object()] = object()
+    view = ValuesView(Mapping(data))
+    promote()
+    for i in range(N):
+        needle = object()
+        if needle in view:
+            raise AssertionError(("contains", i, needle))
+        if i % 8 == 0:
+            promote()
+
+
+def churn():
+    junk = [[object() for _ in range(16)] for _ in range(24)]
+    del junk
+    gc.collect()
+
+
+def four_locals(a, b, c, d):
+    return a, b, c, d
+
+
+def jit_traced_frame_locals_that_hold_young_objects_survive_minors():
+    N = 600
+    kept = []
+    hold = []
+    for i in range(N):
+        row = four_locals(object(), object(), object(), object())
+        kept.append(row)
+        if i % 8 == 0:
+            churn()
+        if i % 11 == 0:
+            T = namedtuple("Nt%d" % (i % 5), ["a", "b", "c", "d"])
+            hold.append(T(i, i, i, i))
+        if i % 13 == 0:
+            cm = ChainMap({"a": i}, {"b": i}, {"c": i}, {"d": i})
+            cm.maps[1] = {object(): i}
+            hold.append(cm)
+
+    for i in range(N):
+        got = kept[i]
+        if any(item is None for item in got):
+            raise AssertionError(("dead", i, got))
+        for item in got:
+            if type(item) is not object:
+                raise AssertionError(("type", i, item))
+
+
+old_cap7_frame_locals_that_receive_young_args_survive_minors()
+jit_traced_frame_locals_that_hold_young_objects_survive_minors()
 print("OK")
