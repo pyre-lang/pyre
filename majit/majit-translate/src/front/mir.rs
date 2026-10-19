@@ -2310,6 +2310,7 @@ impl<'l> CrateLowering<'l> {
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
             &self.state.raw_alloc_flavor_structs,
+            &self.state.tombstoned_leaves,
             &fn_path,
         )
     }
@@ -2532,6 +2533,7 @@ impl<'l> CrateLowering<'l> {
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
             &self.state.raw_alloc_flavor_structs,
+            &self.state.tombstoned_leaves,
             &policy_fn_path,
         );
         let segments = spec_segments(llbc, fd, &header.name);
@@ -3021,6 +3023,7 @@ impl SemanticFunctionHeader {
         error_carrier: crate::ErrorCarrierSpec<'_>,
         gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
         raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+        tombstoned_leaves: &std::collections::HashSet<String>,
         policy_fn_path: &str,
     ) -> Self {
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
@@ -3124,6 +3127,7 @@ impl SemanticFunctionHeader {
             &signature.output,
             llbc,
             error_carrier,
+            tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
@@ -6664,6 +6668,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             output,
             llbc,
             static_addrs.error_carrier,
+            tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );

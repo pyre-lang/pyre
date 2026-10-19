@@ -14980,8 +14980,9 @@ fn map_or_value_bank(ty: &ValueType) -> char {
 }
 
 /// Payload enum used as a raw-address niche (`Option<&RawEnum>`): not
-/// fieldless, no GcType, one word of layout so the shared-ref Option is
-/// the null-pointer niche.
+/// fieldless, no GcType. Tagged layout (`Branch` + two-word size) so
+/// `RawEnum` itself is not a pointer niche; `Option<&RawEnum>` remains
+/// the shared-ref null-pointer niche.
 fn raw_address_payload_enum(def_id: u64) -> serde_json::Value {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
@@ -15010,7 +15011,19 @@ fn raw_address_payload_enum(def_id: u64) -> serde_json::Value {
                 "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
             }
         ]},
-        "layout": interior_layout(8, &[0], false)
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 16,
+                "align": 8,
+                "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U32"}}},
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": [8]}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
     })
 }
 
