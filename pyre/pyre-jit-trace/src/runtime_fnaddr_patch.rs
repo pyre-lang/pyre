@@ -957,8 +957,15 @@ pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
 }
 
 /// Immortal rclass instance. `InstanceRepr.create_instance` mallocs
-/// `self.object_type` immortal; `initialize_prebuilt_instance` writes
-/// `ClassRepr.getvtable` into typeptr when the STRUCT has one.
+/// `self.object_type` immortal with `flavor=self.gcflavor`;
+/// `initialize_prebuilt_instance` writes `ClassRepr.getvtable` into
+/// typeptr when the STRUCT has one.
+///
+/// `TypeLayoutBuilder.consider_constant` installs a GC header and type
+/// id only for GC containers. A GC-managed non-headerless instance
+/// keeps `alloc_varsize_with_gc_header_immortal_zeroed`; a raw or
+/// headerless instance is an immortal zeroed block with no header and
+/// no tid.
 ///
 /// `rewrite_op_malloc` is `new_with_vtable` iff `has_gcstruct_a_vtable`;
 /// `get_vtable_for_gcstruct` only reads `_cache_gcstruct2vtable` (filled
@@ -967,9 +974,18 @@ pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
 fn prebuilt_empty_class_instance_addr(
     desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
 ) -> i64 {
-    let (vtable, tid) = prebuilt_instance_vtable_and_tid(desc);
-    let ptr =
-        majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(desc.size, tid) as usize;
+    let vtable = prebuilt_instance_vtable(desc);
+    let ptr = if desc.is_gc_managed && !desc.headerless {
+        let tid = prebuilt_instance_tid(desc);
+        majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(desc.size, tid) as usize
+    } else {
+        let layout =
+            std::alloc::Layout::from_size_align(desc.size.max(1), std::mem::align_of::<usize>())
+                .expect("prebuilt raw instance layout");
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!raw.is_null(), "prebuilt instance allocation failed");
+        raw as usize
+    };
     assert!(ptr != 0, "prebuilt instance allocation failed");
     if let Some(vtable) = vtable {
         assert!(
@@ -987,6 +1003,10 @@ fn prebuilt_empty_class_instance_addr(
 /// Size descr `OpKind::New` interns. Empty-class `all_fielddescrs` is
 /// empty; vtable is 0. The typeptr word is `ClassRepr.getvtable` from
 /// `_cache_gcstruct2vtable`, never this field.
+///
+/// `is_gc_managed` is `InstanceRepr.create_instance`'s `self.gcflavor`.
+/// `TypeLayoutBuilder.consider_constant` headers GC containers only;
+/// a headerless Size stamps `HEADERLESS_SIZE_OWNER_MARKER` in `owner`.
 fn prebuilt_instance_size_descr(
     desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
 ) -> majit_jitcode::jitcode::BhDescr {
@@ -994,25 +1014,22 @@ fn prebuilt_instance_size_descr(
         size: desc.size,
         type_id: desc.type_id,
         vtable: 0,
-        owner: String::new(),
+        owner: if desc.headerless {
+            majit_jitcode::jitcode::HEADERLESS_SIZE_OWNER_MARKER.to_string()
+        } else {
+            String::new()
+        },
         all_fielddescrs: Vec::new(),
-        is_gc_managed: true,
+        is_gc_managed: desc.is_gc_managed,
     }
 }
 
-/// Vtable word and collector tid for one prebuilt instance.
-///
 /// Typeptr-header: the `_cache_gcstruct2vtable` row
 /// `heaptracker.get_vtable_for_gcstruct` reads. Never minted.
-/// Header tid is `SizeDescr.type_id` on the descr `new` interns
-/// (`descr.py get_size_descr` via `make_descr_from_bh` of this
-/// STRUCT's Size). `TypeLayoutBuilder.consider_constant` interned
-/// that Size into kind-0 so `GcLLDescr_framework.init_size_descr`
-/// already stamped it.
-fn prebuilt_instance_vtable_and_tid(
+fn prebuilt_instance_vtable(
     desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
-) -> (Option<usize>, u32) {
-    let vtable = if desc.has_vtable {
+) -> Option<usize> {
+    if desc.has_vtable {
         crate::descr::publish_pyre_class_vtables();
         let found = {
             let gc = majit_ir::descr::gc_cache().lock();
@@ -1028,7 +1045,15 @@ fn prebuilt_instance_vtable_and_tid(
         }
     } else {
         None
-    };
+    }
+}
+
+/// Collector tid for a GC-container prebuilt. Header tid is
+/// `SizeDescr.type_id` on the descr `new` interns (`descr.py get_size_descr`
+/// via `make_descr_from_bh` of this STRUCT's Size).
+/// `TypeLayoutBuilder.consider_constant` interned that Size into kind-0
+/// so `GcLLDescr_framework.init_size_descr` already stamped it.
+fn prebuilt_instance_tid(desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor) -> u32 {
     if let Some((_, cached_size)) = majit_ir::descr::gc_cache()
         .lock()
         .resolve_struct_layout(desc.type_id)
@@ -1065,7 +1090,7 @@ fn prebuilt_instance_vtable_and_tid(
              after TypeLayoutBuilder.consider_constant / kind-0"
         );
     }
-    (vtable, tid)
+    tid
 }
 
 /// One immortal empty `GcArray` for `type_name` (`Array<T;0>`).
@@ -1463,6 +1488,8 @@ mod tests {
             size,
             type_id,
             has_vtable,
+            is_gc_managed: true,
+            headerless: false,
         }
     }
 
@@ -1766,6 +1793,40 @@ mod tests {
             "new_with_vtable keeps ClassRepr.getvtable"
         );
         assert_ne!(sd.vtable(), 0);
+    }
+
+    #[test]
+    fn materialize_prebuilt_instance_consts_raw_flavor_zeroed_without_gc_header() {
+        use majit_jitcode::codewriter::assembler::PREBUILT_INSTANCE_CONST_SENTINEL_BASE;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let type_id = majit_ir::descr::path_hash("c1i::RawFlavorEmpty");
+        let desc = majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor {
+            constants_r_index: 0,
+            identity: 0xC110_00F1,
+            size: 16,
+            type_id,
+            has_vtable: false,
+            is_gc_managed: false,
+            headerless: false,
+        };
+        match prebuilt_instance_size_descr(&desc) {
+            BhDescr::Size { is_gc_managed, .. } => {
+                assert!(!is_gc_managed, "raw flavor Size is not GC-managed")
+            }
+            other => panic!("expected Size descr, got {other:?}"),
+        }
+        let mut jcs = vec![jitcode_with_prebuilt("raw_flavor", desc.clone())];
+        materialize_prebuilt_instance_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_ne!(addr, PREBUILT_INSTANCE_CONST_SENTINEL_BASE);
+        assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
+        assert_ne!(addr, 0);
+        let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, desc.size) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "raw immortal payload must be zeroed"
+        );
     }
 
     /// Walker folds that recognise a residual by callee compare against this

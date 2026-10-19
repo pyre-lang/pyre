@@ -195,10 +195,11 @@ pub struct EmptyArrayConstDescriptor {
 /// that GCREF, pooling by `value._obj.container`. The translator cannot
 /// allocate the runtime object, so the `constants_r` slot holds a
 /// non-canonical sentinel until the load pass writes the immortal
-/// instance. Layout (`size` / `type_id` / `has_vtable`) is resolved at
-/// assembly from the registered size spec (`rewrite_op_malloc`'s
-/// `new_with_vtable` vs `new`); the intern key is the source
-/// HostObject's identity (`convert_const_exact`'s `iprebuiltinstances`).
+/// instance. Layout (`size` / `type_id` / `has_vtable` / `is_gc_managed` /
+/// `headerless`) is resolved at assembly from the registered size spec
+/// (`rewrite_op_malloc`'s `new_with_vtable` vs `new`); the intern key is
+/// the source HostObject's identity (`convert_const_exact`'s
+/// `iprebuiltinstances`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PrebuiltInstanceConstDescriptor {
     /// Position in [`JitCodeBody::constants_r`] holding the sentinel.
@@ -217,6 +218,10 @@ pub struct PrebuiltInstanceConstDescriptor {
     /// `new_with_vtable` (registered vtable + class tid); others are
     /// header-only `new` of this size-descr type id.
     pub has_vtable: bool,
+    /// `InstanceRepr.create_instance`'s `self.gcflavor` (`gc` vs raw).
+    pub is_gc_managed: bool,
+    /// Headerless Size marker (`HEADERLESS_SIZE_OWNER_MARKER` in `owner`).
+    pub headerless: bool,
 }
 
 /// Body of a `JitCode` — populated once by the assembler after
