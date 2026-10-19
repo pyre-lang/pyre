@@ -13,6 +13,20 @@
 # true, so an empty dict stays a 2-tuple. `W_ImportError.descr_reduce`
 # copies a truthy dict and skips `is_w(None)`. `W_AttributeError.descr_reduce`
 # omits a falsy dict and publishes no `__getstate__`.
+#
+# exception_member_delete_drops_reduce_slots:
+# `test_exceptions` pickles a constructed ImportError or AttributeError and never deletes
+# `name` afterwards. `ImportError_getstate` copies every non-NULL slot, explicit `None`
+# included. `AttributeError_getstate` copies a non-NULL `name` the same way.
+# `PyMember_SetOne` clears `_Py_T_OBJECT` to NULL, so `del e.name` drops the key from the
+# reduce state while `e.name = None` keeps it. `readwrite_attrproperty_w` installs no
+#
+# exception_setstate_setattr_leaves_omitted_slots:
+# `test_exceptions` pickles a fully-populated ImportError and never calls `__setstate__`
+# with a partial dict, so an omitted path or a mutated state argument is invisible there.
+# `BaseException___setstate___impl` setattr's each present key and leaves the others.
+# `W_ImportError.descr_setstate` pops name/path/name_from with a None default, so an
+# omitted path becomes None and the caller's state dict loses those keys. OSError has no
 def reduced(exc):
     out = exc.__reduce__()
     assert len(out) == 3, (type(exc), out)
@@ -225,4 +239,79 @@ assert type(out[2]) is dict
 assert out[2] == {"name": "n"}
 assert exc.__dict__ == {}
 
+def exception_member_delete_drops_reduce_slots():
+    def import_error_deleted_name_drops_from_state():
+        exc = ImportError("m", name="n", path="p")
+        del exc.name
+        assert exc.name is None
+        state = exc.__reduce__()[2]
+        assert state == {"path": "p"}, state
+
+
+    def import_error_assigned_none_name_stays_in_state():
+        exc = ImportError("m", name="n", path="p")
+        exc.name = None
+        state = exc.__reduce__()[2]
+        assert state == {"name": None, "path": "p"}, state
+
+
+    def import_error_deleted_path_drops_from_state():
+        exc = ImportError("m", name="n", path="p")
+        del exc.path
+        state = exc.__reduce__()[2]
+        assert state == {"name": "n"}, state
+
+
+    def attribute_error_deleted_name_drops_from_state():
+        exc = AttributeError("m", name="n")
+        del exc.name
+        assert exc.name is None
+        state = exc.__reduce__()[2]
+        assert "name" not in state, state
+        assert state["args"] == ("m",)
+
+
+    def attribute_error_assigned_none_name_stays_in_state():
+        exc = AttributeError("m", name="n")
+        exc.name = None
+        state = exc.__reduce__()[2]
+        assert state["name"] is None, state
+
+
+    import_error_deleted_name_drops_from_state()
+    import_error_assigned_none_name_stays_in_state()
+    import_error_deleted_path_drops_from_state()
+    attribute_error_deleted_name_drops_from_state()
+    attribute_error_assigned_none_name_stays_in_state()
+exception_member_delete_drops_reduce_slots()
+
+def exception_setstate_setattr_leaves_omitted_slots():
+    def import_error_omitted_path_stays():
+        exc = ImportError("m", name="n", path="p")
+        state = {"name": "z", "extra": 1}
+        exc.__setstate__(state)
+        assert exc.name == "z", exc.name
+        assert exc.path == "p", exc.path
+        assert exc.__dict__ == {"extra": 1}, exc.__dict__
+        assert state == {"name": "z", "extra": 1}, state
+
+
+    def import_error_setstate_is_base():
+        assert ImportError.__setstate__ is BaseException.__setstate__
+        assert ModuleNotFoundError.__setstate__ is BaseException.__setstate__
+
+
+    def oserror_setstate_writes_errno_slot():
+        exc = OSError(2, "m")
+        exc.__setstate__({"errno": 9})
+        assert exc.errno == 9, exc.errno
+        assert str(exc) == "[Errno 9] m", str(exc)
+        assert exc.args == (2, "m"), exc.args
+        assert exc.__dict__ == {}, exc.__dict__
+
+
+    import_error_omitted_path_stays()
+    import_error_setstate_is_base()
+    oserror_setstate_writes_errno_slot()
+exception_setstate_setattr_leaves_omitted_slots()
 print("OK")

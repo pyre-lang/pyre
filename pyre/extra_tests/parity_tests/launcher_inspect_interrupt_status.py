@@ -7,6 +7,13 @@
 # gh-152132 changed the `exit(n)` precedence in 3.14.7, so those expectations
 # follow the micro version the runtime reports. `subprocess` spells SIGINT as
 # `-signal.SIGINT`; Windows is excluded by the platform header.
+#
+# launcher_inspect_prompt_over_a_blocked_sys:
+# import tests cover the `None` sentinel and command-line tests cover `-i`, but never
+# combine them. the launcher reads `sys.ps1`/`ps2` from `PyInterpreterState` through
+# `_PySys_GetOptionalAttr`; a program's blocked `sys.modules['sys']` entry must not
+# prevent the requested prompt. `app_main.py` imports the blocked `sys` name, prints an
+# OperationError and exits 1 without opening the prompt
 import signal
 import subprocess
 import sys
@@ -48,4 +55,32 @@ assert run(["-i", "-c", "raise KeyboardInterrupt"], "exit(3)\n") == answer_to_ex
 # A different exception is not an interrupt: the prompt's own clean end stands.
 assert run(["-i", "-c", "raise ValueError('boom')"]) == 0
 
+def launcher_inspect_prompt_over_a_blocked_sys():
+    import subprocess
+    import sys
+
+    PROGRAM = "import sys; sys.modules['sys'] = None"
+    MARKER = "prompt-ran"
+
+
+    def run(args, feed=""):
+        proc = subprocess.run(
+            [sys.executable, *args], input=feed, capture_output=True, text=True
+        )
+        return proc.returncode, proc.stdout
+
+
+    # The control: the assignment itself is ordinary, and a run without `-i` ends
+    # cleanly, so the rows below are about the prompt and nothing else.
+    assert run(["-c", PROGRAM]) == (0, "")
+
+    # The prompt opens over it and runs what is typed there.
+    status, out = run(["-i", "-c", PROGRAM], f"print({MARKER!r})\n")
+    assert status == 0, f"the prompt did not end cleanly: {status}"
+    assert MARKER in out, f"the prompt did not run the statement it was given: {out!r}"
+
+    # And it is the prompt's own status that ends the run, not the program's.
+    status, _ = run(["-i", "-c", PROGRAM], "raise SystemExit(3)\n")
+    assert status == 3, f"the prompt's exit status did not reach the shell: {status}"
+launcher_inspect_prompt_over_a_blocked_sys()
 print("OK")

@@ -2,6 +2,10 @@
 # frames after return or exception unwind.
 # parity-tests reason: this guards JIT frame ownership and the executing
 # caller's operand stack while a traceback chain is cleared.
+#
+# jit_loop_exit_frame_clear:
+# a frame returned after a compiled loop exit must be finished and clearable after
+# resuming normal execution. cover frame lifecycle across a JIT loop exit.
 
 """Completed JIT frames clear; the executing frame refuses without damage."""
 
@@ -50,4 +54,22 @@ for _ in range(4000):
     except ValueError:
         clear_chain(sys.exc_info()[2])
 
+def jit_loop_exit_frame_clear():
+    import sys
+
+
+    def frame_after_loop(n):
+        frame = sys._getframe()
+        total = 0
+        for i in range(n):
+            total += i
+        return frame
+
+
+    for _ in range(30):
+        frame = frame_after_loop(500)
+        assert frame.f_code is frame_after_loop.__code__
+        assert frame.f_locals["total"] == 124750
+        frame.clear()
+jit_loop_exit_frame_clear()
 print("OK")
