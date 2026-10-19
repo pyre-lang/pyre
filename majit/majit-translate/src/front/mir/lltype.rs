@@ -4187,11 +4187,16 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
 /// mints.  Only instantiations whose type arguments are all by-value ADTs
 /// qualify: a reference, raw-pointer or `Box` argument can make the enum a
 /// null-niche pointer, which has no enum class.  A named struct keys as its
-/// class root.  `None` otherwise.
+/// class root — the same intern spelling [`class_identity_spelling`]
+/// paints, so a residual `prepend` of a withdrawn leaf (`Arguments`)
+/// intern's the crate-relative path and unique-graph `mergeinputargs`
+/// meets the constructor (`annrpython.py` `mergeinputargs`).  `None`
+/// otherwise.
 pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     output: &TyRef,
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
+    tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
@@ -4217,14 +4222,14 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let type_args = adt
         .get("generics")
         .and_then(|g| g.get("types"))
         .and_then(serde_json::Value::as_array)?;
     if type_args.is_empty() {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let by_value_args = type_args.iter().all(|arg| {
         strip_ty_indirections(arg, llbc).is_some_and(|arg| {
@@ -4687,6 +4692,23 @@ pub(in crate::front::mir) fn tyref_class_root_with(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     adt_node_class_root_with(node, llbc, tombstoned)
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
+}
+
+/// A stored fn-ptr argument whose Rust type is a reference or pointer
+/// (or `Option` of one) to a class-backed struct. Those arguments are
+/// `cast_instance_to_base_ptr` at the call site (`annlowlevel.py`).
+pub(in crate::front::mir) fn tyref_is_class_backed_fn_ptr_arg(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc);
+    let inner = payload.as_ref().unwrap_or(ty);
+    let is_ptr = tyref_node(inner, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .and_then(|n| n.as_object())
+        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"));
+    is_ptr && tyref_class_root_with(inner, llbc, tombstoned).is_some()
 }
 
 /// The underlying JSON type node of a `TyRef`, resolving the `Dedup`

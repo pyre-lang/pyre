@@ -2138,6 +2138,17 @@ impl HostEnv {
         lltype.module_set("free", HostObject::new_builtin_callable("lltype.free"));
         lltype.module_set("malloc", HostObject::new_builtin_callable("lltype.malloc"));
 
+        // `rpython.rtyper.annlowlevel.cast_instance_to_base_ptr` —
+        // `annlowlevel.py`. The body is `@specialize.argtype(0)` and
+        // calls `cast_object_to_ptr(OBJECTPTR, instance)`; pyre has
+        // no graph for that helper, so HOST_ENV plus the analyser /
+        // typer stand in for `CastObjectToPtrEntry`.
+        let annlowlevel = HostObject::new_module("rpython.rtyper.annlowlevel");
+        annlowlevel.module_set(
+            "cast_instance_to_base_ptr",
+            HostObject::new_builtin_callable("annlowlevel.cast_instance_to_base_ptr"),
+        );
+
         // `rpython.rtyper.lltypesystem.llmemory` — address-arithmetic
         // and weakref typing callables routed through
         // `@typer_for(llmemory.<name>)` decorators upstream.
@@ -2770,6 +2781,7 @@ impl HostEnv {
         mods.insert("rpython.rlib.objectmodel".into(), objectmodel);
         mods.insert("collections".into(), collections);
         mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
+        mods.insert("rpython.rtyper.annlowlevel".into(), annlowlevel);
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
         mods.insert("rpython.rtyper.lltypesystem.rffi".into(), rffi);
         mods.insert("rpython.rtyper.lltypesystem.ll2ctypes".into(), ll2ctypes);

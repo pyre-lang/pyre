@@ -733,6 +733,49 @@ fn raw_item_lltype(
     })
 }
 
+/// Destination `PTRTYPE` for `lltype.cast_int_to_ptr(PTRTYPE, oddint)`
+/// (`lltype.py`). Prefer a `Ptr` already stamped on the result Variable;
+/// otherwise `valuetype_to_lltype` — `Str` → `STRPTR`,
+/// `Ref` → `OBJECTPTR`, the same mapping residual results use.
+fn ptrtype_from_mir_result(
+    op: &SpaceOperation,
+    result_ty: &crate::model::ValueType,
+) -> Result<LowLevelType, TyperError> {
+    if let Some(var) = op.result.as_ref()
+        && let Some(LowLevelType::Ptr(_)) = var.concretetype()
+    {
+        return Ok(var.concretetype().expect("Ptr concretetype"));
+    }
+    match crate::translator::rtyper::cutover::valuetype_to_lltype(result_ty) {
+        Some(ll @ LowLevelType::Ptr(_)) => Ok(ll),
+        Some(other) => Err(TyperError::message(format!(
+            "cast_int_to_ptr: result type {result_ty:?} maps to {other:?}, not a Ptr"
+        ))),
+        None => Err(TyperError::message(format!(
+            "cast_int_to_ptr: result type {result_ty:?} is not a pointer"
+        ))),
+    }
+}
+
+/// Void-typed `Constant(PTRTYPE)` marker for `cast_int_to_ptr`.
+/// `rtype_cast_int_to_ptr` takes it as `hop.inputargs(lltype.Void, …)`
+/// (`rbuiltin.py`).
+fn ptrtype_constant_from_result_ty(
+    op: &SpaceOperation,
+    result_ty: &crate::model::ValueType,
+) -> Result<Hlvalue, TyperError> {
+    let ptrtype = ptrtype_from_mir_result(op, result_ty)?;
+    Ok(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::LowLevelType(Box::new(ptrtype)),
+        LowLevelType::Void,
+    )))
+}
+
+fn is_lltype_cast_int_to_ptr_path(segments: &[String]) -> bool {
+    segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+        && segments.iter().any(|s| s == "lltype")
+}
+
 /// `_LLOpEntry.compute_result_annotation` writes
 /// `lltype_to_annotation(RESULTTYPE)` onto the result Variable.  `raw_load`
 /// carries RESULTTYPE as args[0] (`llop.raw_load(TYPE, addr, ofs)`), so
@@ -3350,7 +3393,7 @@ pub fn translate_op(
         OpKind::UnaryOp {
             op: opname,
             operand,
-            ..
+            result_ty,
         } => {
             let v = lookup_operand(value_map, operand, op, "operand")?;
             let result = resolve_result_hlvalue(op, value_map)?;
@@ -3358,7 +3401,8 @@ pub fn translate_op(
             // (`emit_host_cast_llop`, `dyn_fat`, the
             // `pyobject_from_constant_addr` rewrite). Typed ptr casts
             // have no flowspace unary (`normalize_unary_op_name`);
-            // upstream spells them `simple_call(lltype.cast_*, v)`.
+            // `cast_int_to_ptr(PTRTYPE, oddint)` (`lltype.py`);
+            // `cast_ptr_to_int` stays unary.
             if opname == "cast_int_to_ptr" || opname == "cast_ptr_to_int" {
                 let callable_host = HOST_ENV
                     .import_module("rpython.rtyper.lltypesystem.lltype")
@@ -3366,14 +3410,14 @@ pub fn translate_op(
                     .ok_or_else(|| {
                         TyperError::message(format!("HOST_ENV lltype module must expose {opname}"))
                     })?;
-                return Ok(vec![FlowspaceOp::new(
-                    "simple_call",
-                    vec![
-                        Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
-                        v,
-                    ],
-                    result,
-                )]);
+                let callable =
+                    Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
+                let args = if opname == "cast_int_to_ptr" {
+                    vec![callable, ptrtype_constant_from_result_ty(op, result_ty)?, v]
+                } else {
+                    vec![callable, v]
+                };
+                return Ok(vec![FlowspaceOp::new("simple_call", args, result)]);
             }
             Ok(vec![FlowspaceOp::new(
                 normalize_unary_op_name(opname)?,
@@ -4153,8 +4197,13 @@ pub fn translate_op(
                         };
                     let callable =
                         Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
-                    let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                    let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
                     call_args.push(callable);
+                    // Unary leftover `cast_int_to_ptr(v)` is
+                    // `simple_call(cast_int_to_ptr, PTRTYPE, v)` (`lltype.py`).
+                    if is_lltype_cast_int_to_ptr_path(segments) && arg_hls.len() == 1 {
+                        call_args.push(ptrtype_constant_from_result_ty(op, result_ty)?);
+                    }
                     call_args.extend(arg_hls);
                     Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
                 }
@@ -10877,8 +10926,8 @@ mod tests {
     #[test]
     fn translate_op_unary_ptr_cast_lowers_to_lltype_simple_call() {
         // Frontend leftovers still emit UnaryOp `cast_int_to_ptr` /
-        // `cast_ptr_to_int`. The adapter rewrites them to the same
-        // `simple_call(lltype.cast_*, v)` FunctionPath lowering uses.
+        // `cast_ptr_to_int`. `cast_int_to_ptr(PTRTYPE, oddint)`
+        // (`lltype.py`); `cast_ptr_to_int` stays unary.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_unary_ptr_cast");
         let vars = mint_vars(&mut graph, 3);
@@ -10896,6 +10945,11 @@ mod tests {
             .expect("UnaryOp cast_int_to_ptr must lower to simple_call");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(
+            translated[0].args.len(),
+            3,
+            "simple_call(cast_int_to_ptr, PTRTYPE, value)"
+        );
         let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
             panic!("simple_call callable must be a Constant");
         };
@@ -10907,6 +10961,115 @@ mod tests {
             .and_then(|m| m.module_get("cast_int_to_ptr"))
             .expect("populate_host_env must register lltype.cast_int_to_ptr");
         assert_eq!(host, &expected);
+        let Hlvalue::Constant(ref ptrt) = translated[0].args[1] else {
+            panic!("PTRTYPE must be a Constant");
+        };
+        let ConstValue::LowLevelType(ref ll) = ptrt.value else {
+            panic!(
+                "PTRTYPE must be ConstValue::LowLevelType, got {:?}",
+                ptrt.value
+            );
+        };
+        assert!(
+            matches!(ll.as_ref(), LowLevelType::Ptr(_)),
+            "PTRTYPE must be a Ptr, got {ll:?}"
+        );
+        assert_eq!(ptrt.concretetype, Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn translate_op_unary_cast_int_to_ptr_str_result_uses_strptr() {
+        // `alloc_utf8_payload` leftovers paint the dest `ValueType::Str`;
+        // PTRTYPE is `STRPTR` (`valuetype_to_lltype`).
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_unary_cast_int_to_ptr_str");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::UnaryOp {
+                op: "cast_int_to_ptr".into(),
+                operand: vars[1].clone(),
+                result_ty: ValueType::Str,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("UnaryOp cast_int_to_ptr of Str must insert STRPTR");
+        let Hlvalue::Constant(ref ptrt) = translated[0].args[1] else {
+            panic!("PTRTYPE must be a Constant");
+        };
+        let ConstValue::LowLevelType(ref ll) = ptrt.value else {
+            panic!(
+                "PTRTYPE must be ConstValue::LowLevelType, got {:?}",
+                ptrt.value
+            );
+        };
+        assert_eq!(
+            ll.as_ref(),
+            &*crate::translator::rtyper::lltypesystem::rstr::STRPTR
+        );
+    }
+
+    #[test]
+    fn translate_op_unary_cast_ptr_to_int_stays_unary_simple_call() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_unary_cast_ptr_to_int");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::UnaryOp {
+                op: "cast_ptr_to_int".into(),
+                operand: vars[1].clone(),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("UnaryOp cast_ptr_to_int must lower to simple_call");
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 2, "cast_ptr_to_int stays unary");
+    }
+
+    #[test]
+    fn translate_op_call_cast_int_to_ptr_one_arg_inserts_ptrtype() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_call_cast_int_to_ptr");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![
+                        "rpython".into(),
+                        "rtyper".into(),
+                        "lltypesystem".into(),
+                        "lltype".into(),
+                        "cast_int_to_ptr".into(),
+                    ],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![vars[1].clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("1-arg cast_int_to_ptr Call must insert PTRTYPE");
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 3);
+        assert!(
+            matches!(
+                &translated[0].args[1],
+                Hlvalue::Constant(c)
+                    if matches!(c.value, ConstValue::LowLevelType(_))
+            ),
+            "PTRTYPE is the type marker, got {:?}",
+            translated[0].args[1]
+        );
     }
 
     #[test]

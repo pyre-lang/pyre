@@ -2018,6 +2018,7 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             spec,
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
+            &empty_names,
             &format!(
                 "fixture::{}",
                 fd.item_meta.name_path().rsplit("::").next().unwrap()
