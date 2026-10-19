@@ -2770,9 +2770,10 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "emit_stdout",
         emit_stdout as *const (),
     );
-    // `w_set_new` / `w_frozenset_new` are `#[dont_look_inside]` for the same
-    // host `IndexMap::new` storage-box reason; bind their zero-arg
-    // `fn() -> PyObjectRef` so the residual calls resolve.
+    // BUILD_SET inlines the `w_set_new` body (`flatten.rs
+    // inline_call_targets::SET_DISPLAY_NEW`), which needs the host address;
+    // `w_frozenset_new` is `#[dont_look_inside]`. Bind their zero-arg
+    // `fn() -> PyObjectRef` so the calls resolve.
     pa0!(
         &mut entries,
         "pyre_object::setobject::w_set_new",
@@ -4913,6 +4914,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::next_version_tag_serial",
         pyre_object::celldict::next_version_tag_serial,
     );
+    // Same shape for the `W_SetObject.set_id` counter the `w_set_new` body
+    // calls.
+    pa0!(
+        &mut entries,
+        "pyre_object::setobject::fresh_set_id",
+        "pyre_object::fresh_set_id",
+        pyre_object::setobject::fresh_set_id,
+    );
     // `quasiimmut.py _invalidate_now`, shared by both `?` fields.
     upa1!(
         &mut entries,
@@ -6704,6 +6713,12 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         ref_addr!(
             "kwargsdict::KWARGS_DICT_STRATEGY_REF",
             kwargsdict::KWARGS_DICT_STRATEGY_REF
+        ),
+        // `W_SetObject.strategy` holds the holder the same way; `w_set_new`
+        // stores `EmptySetStrategy`'s.
+        ref_addr!(
+            "setobject::EMPTY_SET_STRATEGY_REF",
+            setobject::EMPTY_SET_STRATEGY_REF
         ),
         (
             "objspace::std::mapdict::MAP_DICT_STRATEGY_REF",

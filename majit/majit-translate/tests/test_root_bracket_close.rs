@@ -769,6 +769,33 @@ fn format_int_decimal_bracket_is_scalar_replaced() {
     }
 }
 
+/// BUILD_SET inlines `set_add_value` (`flatten.rs
+/// inline_call_targets::SET_ADD`). A bracket left as residual shadow-stack
+/// calls makes the walker residualize the whole body through its fnaddr.
+#[test]
+fn set_add_value_bracket_is_scalar_replaced() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let graph = lower_named(llbc, "set_add_value");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "pin_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "base",
+        "get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "set_add_value still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
 /// `int_ll_newlist` is `@oopspec("newlist(length)")`. After jtransform the
 /// call in `ll_listslice_new_int_list` is `new_array` of
 /// `LIST_INT_ITEMS_ARRAY`, not a residual Call.

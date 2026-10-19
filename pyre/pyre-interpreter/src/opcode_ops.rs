@@ -790,22 +790,24 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
             // triggers a moving minor collection; `set`/`value` must be
             // shadow-stack roots across it, then reloaded, or the store
             // below can write through a relocated (stale) pointer.  Its
-            // digest keys the store, so the element is hashed once.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let sp = _roots.pin_roots(&[set, value]);
-            let value = _roots.get(sp + 1);
-            let hash = match crate::builtins::try_hash_value(value) {
+            // digest keys the store, so the element is hashed once.  The
+            // slots are read back as `base + <literal>` through the scope,
+            // and the error arm is a `match`, not a closure, so the
+            // codewriter erases the bracket and the JIT inlines the body.
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.base();
+            let _ = roots.pin_root(set);
+            let _ = roots.pin_root(value);
+            let hash = match crate::builtins::try_hash_value(roots.get(base + 1)) {
                 Ok(hash) => hash,
                 Err(err) => {
                     return Err(crate::baseobjspace::wrap_set_element_hash_error(
-                        _roots.get(sp + 1),
+                        roots.get(base + 1),
                         err,
                     ));
                 }
             };
-            let set = pyre_object::gc_roots::shadow_stack_get(sp);
-            let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-            pyre_object::w_set_add_hashed_checked(set, value, hash)
+            pyre_object::w_set_add_hashed_checked(roots.get(base), roots.get(base + 1), hash)
                 .map_err(crate::baseobjspace::map_set_update_error)?;
         } else if pyre_object::is_list(set) {
             pyre_object::w_list_append(set, value);
@@ -832,18 +834,12 @@ pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), P
                 crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(sp + 1))?;
             let item_base = pyre_object::gc_roots::pin_roots(&items);
             let item_len = items.len();
+            // `_update_from_iterable`: `w_set.add(w_item)` per item.
             for i in 0..item_len {
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                let hash = crate::builtins::try_hash_value(item).map_err(|err| {
-                    crate::baseobjspace::wrap_set_element_hash_error(
-                        pyre_object::gc_roots::shadow_stack_get(item_base + i),
-                        err,
-                    )
-                })?;
-                let set = pyre_object::gc_roots::shadow_stack_get(sp);
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                pyre_object::w_set_add_hashed_checked(set, item, hash)
-                    .map_err(crate::baseobjspace::map_set_update_error)?;
+                set_add_value(
+                    pyre_object::gc_roots::shadow_stack_get(sp),
+                    pyre_object::gc_roots::shadow_stack_get(item_base + i),
+                )?;
             }
         } else if pyre_object::is_list(set) {
             if pyre_object::is_list(iterable) {
