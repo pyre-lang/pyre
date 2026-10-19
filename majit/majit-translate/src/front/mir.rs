@@ -25394,6 +25394,22 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Trait `Clone::clone` of `Vec<T>` / a tuple of Copy and
+                // `Vec` fields, specialized on the receiver before the
+                // call becomes residual `["Clone","clone"]`.
+                if args.len() == 1
+                    && self.try_lower_trait_clone(
+                        mir_bb,
+                        &reg,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                        dest_local,
+                        &args,
+                        target,
+                    )?
+                {
+                    return Ok(());
+                }
                 // `T::default()` for a Copy scalar or thin-pointer `T` is the
                 // zero of that kind — an RPython constant, not a residual
                 // `core` body.
@@ -32164,6 +32180,12 @@ impl<'a> Lowering<'a> {
                 if let Some(target) = self.specialized_trait_target(v) {
                     return Ok(target);
                 }
+                // `Vec<T>` as `Clone::clone` is `rlist.py` `ll_copy`, the
+                // same `list` builtin `<[T]>::to_vec` retargets to. Bind
+                // it here so the call never becomes `["Clone","clone"]`.
+                if let Some(target) = self.specialized_trait_clone_list_target(v) {
+                    return Ok(target);
+                }
                 // `description.py` `ClassDesc.lookup` / `MethodDesc`: a
                 // `Clause` ref still names the impl once the receiver
                 // ADT is known. rustc selected that impl; there is no
@@ -35138,25 +35160,238 @@ impl<'a> Lowering<'a> {
     }
 
     /// `core::clone::impls::<Impl>::clone` on a Copy scalar or thin-pointer
-    /// pointee is the value itself.  A non-Copy clone (Vec, a named struct)
-    /// keeps its ordinary residual call: the path is not enough.
+    /// pointee is the value itself.  A trait `Clone::clone` on the same
+    /// kinds, or on a zero-sized Copy type (`BuildHasherDefault<_>`,
+    /// `PhantomData<_>`), is that same identity: `ll_dict_copy`
+    /// (`rordereddict.py`) has no hasher object, so a Copy/ZST clone is
+    /// the value.  A non-Copy clone (Vec, a named struct) keeps its
+    /// ordinary residual call: the path is not enough.
     fn is_copy_scalar_or_thin_ptr_clone(
         &self,
         reg: &RegularCall,
         first_arg_ty: Option<&TyRef>,
     ) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        if !is_core_clone_impls_clone_path(fd.item_meta.name_path().as_str()) {
+        if !self.is_copy_or_trait_clone_call(reg) {
             return false;
         }
-        first_arg_ty
-            .and_then(|ty| tyref_clone_pointee_node(ty, self.llbc))
-            .is_some_and(|pointee| json_ty_is_copy_scalar_or_thin_ptr(pointee, self.llbc))
+        self.clone_identity_pointee_node(reg, first_arg_ty)
+            .is_some_and(|pointee| json_ty_is_copy_or_zst_clone_identity(pointee, self.llbc))
+    }
+
+    fn is_copy_or_trait_clone_call(&self, reg: &RegularCall) -> bool {
+        match &reg.kind {
+            CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id).is_some_and(|fd| {
+                is_core_clone_impls_clone_path(fd.item_meta.name_path().as_str())
+            }),
+            CallKind::Trait(v) => is_trait_clone_clone(v, self.llbc),
+            _ => false,
+        }
+    }
+
+    /// Pointee of `&self` for `Clone::clone`, or the `Self` type in a
+    /// trait-ref `Clone` obligation.
+    fn clone_identity_pointee_node<'l>(
+        &'l self,
+        reg: &'l RegularCall,
+        first_arg_ty: Option<&'l TyRef>,
+    ) -> Option<&'l serde_json::Value> {
+        if let CallKind::Trait(v) = &reg.kind
+            && let Some(node) = trait_clone_self_node(v, self.llbc)
+        {
+            return Some(node);
+        }
+        first_arg_ty.and_then(|ty| tyref_clone_pointee_node(ty, self.llbc))
+    }
+
+    fn trait_clone_receiver_ty(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+    ) -> Option<TyRef> {
+        let node = self.clone_identity_pointee_node(reg, first_arg_ty)?;
+        serde_json::from_value(node.clone()).ok()
+    }
+
+    /// `Vec<T>` as trait `Clone::clone` → the `list` builtin
+    /// (`rtype_bltn_list` / `rlist.py` `ll_copy`).
+    fn specialized_trait_clone_list_target(
+        &self,
+        v: &serde_json::Value,
+    ) -> Option<(Vec<String>, Option<(String, String)>)> {
+        if !is_trait_clone_clone(v, self.llbc) {
+            return None;
+        }
+        let node = trait_clone_self_node(v, self.llbc)?;
+        let self_ty = serde_json::from_value::<TyRef>(node.clone()).ok()?;
+        tyref_is_vec_value(&self_ty, self.llbc).then(|| (vec!["list".to_string()], None))
+    }
+
+    /// Trait `Clone::clone` of `Vec<T>` is `rlist.py` `ll_copy` (the `list`
+    /// builtin `<[T]>::to_vec` retargets to).  A tuple of Copy/ZST and
+    /// `Vec` fields is field-wise clone plus the tuple Aggregate ctor —
+    /// `KwargsDictStrategy.copy` `self.erase((keys_w[:], values_w[:]))`
+    /// (`kwargsdict.py`).  Anything else stays residual.
+    fn try_lower_trait_clone(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        dest_local: usize,
+        args: &[Variable],
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallKind::Trait(_) = &reg.kind else {
+            return Ok(false);
+        };
+        if !self.is_copy_or_trait_clone_call(reg) {
+            return Ok(false);
+        }
+        let Some(recv) = args.first().cloned() else {
+            return Ok(false);
+        };
+        let Some(self_ty) = self.trait_clone_receiver_ty(reg, first_arg_ty) else {
+            return Ok(false);
+        };
+        if tyref_is_vec_value(&self_ty, self.llbc) {
+            self.emit_vec_list_clone(mir_bb, dest_local, recv, dest_ty, target)?;
+            return Ok(true);
+        }
+        if tyref_is_tuple(&self_ty, self.llbc) && self.tuple_fields_are_copy_or_vec(&self_ty) {
+            let tuple_ty = if tyref_is_tuple(dest_ty, self.llbc) {
+                dest_ty
+            } else {
+                &self_ty
+            };
+            return self.emit_tuple_clone(mir_bb, dest_local, recv, tuple_ty, target);
+        }
+        Ok(false)
+    }
+
+    fn tuple_fields_are_copy_or_vec(&self, ty: &TyRef) -> bool {
+        let mut idx = 0;
+        loop {
+            let Some(elem_ty) = tyref_tuple_element(ty, idx, self.llbc) else {
+                return idx > 0;
+            };
+            if !self.ty_is_copy_or_vec_clone(&elem_ty) {
+                return false;
+            }
+            idx += 1;
+        }
+    }
+
+    fn ty_is_copy_or_vec_clone(&self, ty: &TyRef) -> bool {
+        if tyref_is_vec_value(ty, self.llbc) {
+            return true;
+        }
+        tyref_node(ty, self.llbc)
+            .and_then(|node| strip_ty_indirections(node, self.llbc))
+            .is_some_and(|node| json_ty_is_copy_or_zst_clone_identity(node, self.llbc))
+    }
+
+    fn emit_vec_list_clone(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        recv: Variable,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let res = self.emit_list_copy(mir_bb, recv, dest_ty);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    fn emit_list_copy(&mut self, mir_bb: usize, recv: Variable, dest_ty: &TyRef) -> Variable {
+        let result_ty = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        );
+        self.emit_path_call(mir_bb, "list", vec![recv], result_ty)
+    }
+
+    fn emit_tuple_field_read(
+        &mut self,
+        mir_bb: usize,
+        base: Variable,
+        tuple_ty: &TyRef,
+        idx: usize,
+        elem_ty: &TyRef,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let owner = tyref_positional_aggregate_root(tuple_ty, self.llbc)
+            .unwrap_or_else(|| format!("Tuple{}", tyref_tuple_suffix(tuple_ty, self.llbc)));
+        let ty = tuple_element_field_value_type(
+            elem_ty,
+            Some(clone_tyref(elem_ty)),
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        );
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner)),
+                ty,
+                pure: false,
+            },
+        });
+        res
+    }
+
+    fn emit_tuple_clone(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        recv: Variable,
+        tuple_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let mut cloned = Vec::new();
+        let mut elem_tys = Vec::new();
+        let mut idx = 0;
+        loop {
+            let Some(elem_ty) = tyref_tuple_element(tuple_ty, idx, self.llbc) else {
+                break;
+            };
+            let field = self.emit_tuple_field_read(mir_bb, recv.clone(), tuple_ty, idx, &elem_ty);
+            let value = if tyref_is_vec_value(&elem_ty, self.llbc) {
+                self.emit_list_copy(mir_bb, field, &elem_ty)
+            } else {
+                field
+            };
+            cloned.push(value);
+            elem_tys.push(elem_ty);
+            idx += 1;
+        }
+        if cloned.is_empty() {
+            return Ok(false);
+        }
+        let kind = serde_json::json!({ "Tuple": serde_json::Value::Null });
+        let Ok(shape) = self.aggregate_shape(&kind, tuple_ty, cloned.len()) else {
+            return Ok(false);
+        };
+        let AggregateShape::Ctor(ctor) = shape else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let tuple = self.emit_tuple_ctor_with_typed_fields(bb_id, &ctor, &cloned, &elem_tys);
+        self.local_var[dest_local] = Some(LocalValue::One(tuple));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// `core::default::<Impl>::default` / `core::ptr::mut_ptr::<Impl>::default`
@@ -65581,6 +65816,14 @@ fn json_ty_is_copy_scalar_or_thin_ptr(node: &serde_json::Value, llbc: &Llbc) -> 
     json_ty_is_copy_scalar(node, llbc) || json_ty_is_thin_pointer_element(node, llbc)
 }
 
+/// Copy-scalar / thin-pointer clone identity, plus a zero-sized Copy
+/// type (`BuildHasherDefault<_>`, `PhantomData<_>`). `ll_dict_copy`
+/// (`rordereddict.py`) has no hasher object, so that clone is the value.
+fn json_ty_is_copy_or_zst_clone_identity(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    json_ty_is_copy_scalar_or_thin_ptr(node, llbc)
+        || tyref_is_void_zst(&TyRef::Other(node.clone()), llbc)
+}
+
 fn tyref_peel_one_ref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node
@@ -68305,6 +68548,52 @@ fn trait_payload_owner(v: &serde_json::Value, llbc: &Llbc) -> Option<(String, St
     let path = llbc.trait_by_id(decl_id)?.item_meta.name_path();
     let trait_leaf = path.rsplit("::").next()?.to_string();
     Some((trait_leaf, method_leaf))
+}
+
+/// `CallKind::Trait` payload of `Clone::clone`.
+fn is_trait_clone_clone(v: &serde_json::Value, llbc: &Llbc) -> bool {
+    if let Some((trait_leaf, method_leaf)) = trait_payload_owner(v, llbc)
+        && trait_leaf == "Clone"
+        && method_leaf == "clone"
+    {
+        return true;
+    }
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
+    if arr.get(1).and_then(serde_json::Value::as_u64) != Some(0) {
+        return false;
+    }
+    traitref_unwrap(arr.first().unwrap_or(v), llbc, 0)
+        .and_then(|tref| tref.pointer("/kind/BuiltinOrAuto/builtin_data"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Clone")
+}
+
+/// Owned `Self` of a trait `Clone::clone` obligation, from the trait-ref
+/// generic `types[0]`. A leading `&` is peeled so a tuple `Self` is the
+/// tuple, not the borrow (`tyref_is_tuple` does not peel refs).
+fn trait_clone_self_node<'l>(
+    v: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let arr = v.as_array()?;
+    let tref = traitref_unwrap(arr.first()?, llbc, 0)?;
+    let ty = tref
+        .pointer("/trait_decl_ref/skip_binder/generics/types")?
+        .as_array()?
+        .first()?;
+    let node = strip_ty_indirections(ty, llbc)?;
+    if let Some(pointee) = node
+        .as_object()
+        .and_then(|o| o.get("Ref"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+    {
+        strip_ty_indirections(pointee, llbc)
+    } else {
+        Some(node)
+    }
 }
 
 fn trait_ref_decl_id(trait_ref: &serde_json::Value, llbc: &Llbc) -> Option<u64> {
@@ -89966,6 +90255,146 @@ mod tests {
         Llbc::from_slice(file.to_string().as_bytes()).expect("std extern fixture Llbc parses")
     }
 
+    /// Trait `Clone::clone` of `self_ty` (`&Self` argument, owned dest).
+    fn trait_clone_call_fixture(
+        caller_name: &str,
+        self_ty: serde_json::Value,
+        type_decls: Vec<serde_json::Value>,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let recv_ty = serde_json::json!({"Ref": ["_", self_ty.clone(), "Shared"]});
+        let locals = vec![
+            serde_json::json!({
+                "index": 0,
+                "name": null,
+                "span": span(),
+                "ty": self_ty.clone()
+            }),
+            serde_json::json!({
+                "index": 1,
+                "name": "arg0",
+                "span": span(),
+                "ty": recv_ty.clone()
+            }),
+        ];
+        let trait_ref = serde_json::json!({
+            "kind": {"BuiltinOrAuto": {"builtin_data": "Clone"}},
+            "trait_decl_ref": {
+                "skip_binder": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [self_ty.clone()],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", caller_name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [recv_ty.clone()],
+                "output": self_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": locals
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Trait": [trait_ref, 0]},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [{
+                                                "Copy": {"kind": {"Local": 1}, "ty": recv_ty.clone()}
+                                            }],
+                                            "dest": {"kind": {"Local": 0}, "ty": self_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let clone_trait = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["core", "clone", "Clone"], false),
+            "methods": [{"skip_binder": {"name": "clone"}}]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": type_decls,
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [clone_trait],
+                "assoc_item_names": [{"types": [], "methods": ["clone"], "consts": []}],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("trait clone fixture Llbc parses")
+    }
+
     fn call_leafs(ops: &[&SpaceOperation]) -> Vec<String> {
         ops.iter()
             .filter_map(|op| match &op.kind {
@@ -90109,6 +90538,195 @@ mod tests {
         assert!(
             call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
             "core::clone::<Impl>::clone must not use the impls identity; ops={ops:?}"
+        );
+    }
+
+    fn named_adt(id: u64, types: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": types,
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn type_decl_struct(
+        id: u64,
+        path: &[&str],
+        fields: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let span = serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        });
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": {
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": false
+            },
+            "kind": {"Struct": fields}
+        })
+    }
+
+    #[test]
+    fn trait_clone_of_build_hasher_default_is_identity() {
+        let hasher = named_adt(0, vec![named_adt(1, vec![])]);
+        let llbc = trait_clone_call_fixture(
+            "clone_hasher",
+            hasher,
+            vec![
+                type_decl_struct(0, &["core", "hash", "BuildHasherDefault"], vec![]),
+                type_decl_struct(1, &["fixture", "Fnv1aHasher"], vec![]),
+            ],
+        );
+        let graph =
+            super::lower_function(&llbc, "clone_hasher").expect("lower BuildHasherDefault Clone");
+        let ops = graph_ops(&graph);
+        let leaves = call_leafs(&ops);
+        assert!(
+            !leaves.iter().any(|leaf| *leaf == "clone"),
+            "Copy ZST Clone::clone must be identity; ops={ops:?}"
+        );
+        assert!(
+            !leaves.iter().any(|leaf| *leaf == "list"),
+            "BuildHasherDefault clone must not become list; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_vec_is_list_builtin() {
+        let vec_ty = named_adt(0, vec![named_adt(1, vec![])]);
+        let llbc = trait_clone_call_fixture(
+            "clone_vec",
+            vec_ty,
+            vec![
+                type_decl_struct(0, &["alloc", "vec", "Vec"], vec![]),
+                type_decl_struct(1, &["pyre_object", "object", "PyObjectRef"], vec![]),
+            ],
+        );
+        let graph = super::lower_function(&llbc, "clone_vec").expect("lower Vec Clone");
+        let ops = graph_ops(&graph);
+        let leaves = call_leafs(&ops);
+        assert!(
+            leaves.iter().any(|leaf| *leaf == "list"),
+            "Vec Clone::clone must become the list builtin; ops={ops:?}"
+        );
+        assert!(
+            !leaves.iter().any(|leaf| *leaf == "clone"),
+            "Vec Clone::clone must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_vec_pair_is_two_list_copies_and_tuple() {
+        let vec_ty = named_adt(0, vec![named_adt(1, vec![])]);
+        let tuple_ty = serde_json::json!({
+            "Adt": {
+                "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [vec_ty.clone(), vec_ty.clone()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let llbc = trait_clone_call_fixture(
+            "clone_vec_pair",
+            tuple_ty,
+            vec![
+                type_decl_struct(0, &["alloc", "vec", "Vec"], vec![]),
+                type_decl_struct(1, &["pyre_object", "object", "PyObjectRef"], vec![]),
+            ],
+        );
+        let graph = super::lower_function(&llbc, "clone_vec_pair").expect("lower (Vec, Vec) Clone");
+        let ops = graph_ops(&graph);
+        let list_calls = call_leafs(&ops)
+            .iter()
+            .filter(|leaf| *leaf == "list")
+            .count();
+        assert_eq!(
+            list_calls, 2,
+            "(Vec, Vec) Clone::clone must emit two list copies; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "(Vec, Vec) Clone::clone must not residualize; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+            )),
+            "(Vec, Vec) clone must read field 0; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__pos_1"
+            )),
+            "(Vec, Vec) clone must read field 1; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            )),
+            "(Vec, Vec) clone must construct a tuple; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_user_struct_stays_residual() {
+        let user = named_adt(0, vec![]);
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let field = serde_json::json!({
+            "name": "payload",
+            "ty": i64_ty,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            }
+        });
+        let llbc = trait_clone_call_fixture(
+            "clone_user",
+            user,
+            vec![type_decl_struct(0, &["fixture", "UserClone"], vec![field])],
+        );
+        let graph = super::lower_function(&llbc, "clone_user").expect("lower user Clone");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "a non-Copy user Clone must stay residual; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "list"),
+            "a user Clone must not become list; ops={ops:?}"
         );
     }
 
