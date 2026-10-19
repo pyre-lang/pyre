@@ -454,7 +454,7 @@ unsafe fn hook_libffi_cif_shape(
         not(target_arch = "wasm32")
     ))]
     {
-        use module::_cffi_backend::jit_libffi::{self, types};
+        use majit_rlib::jit_libffi::{self, types};
         use pyre_interpreter::importing::{LibffiCifShape, LibffiType};
         // `getkind(0)` is `OTHER`; there is no record to size.
         let read = |ffi_type: usize| LibffiType {
@@ -601,7 +601,8 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         not(target_arch = "wasm32")
     ))]
     {
-        use module::_cffi_backend::{cdataobj, ctypefunc, ctypeprim, jit_libffi, misc};
+        use majit_rlib::jit_libffi;
+        use module::_cffi_backend::{cdataobj, ctypefunc, ctypeprim, misc};
         single(
             entries,
             "pyre_interpreter::module::_cffi_backend::cdataobj::raw_malloc_varsize_char",
@@ -642,246 +643,37 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             "pyre_module::module::_cffi_backend::ctypefunc::get_mustfree_flag",
             ctypefunc::get_mustfree_flag as *const (),
         );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_size",
-            jit_libffi::exchange_size as *const (),
+        // `jit_libffi.py` lives in `majit_rlib`; Charon records both the
+        // `imp` bodies and the `pub use imp::*` re-exports.
+        macro_rules! libffi_fnaddr {
+            ($name:literal, $fn:expr) => {{
+                let f = $fn as *const ();
+                single(entries, concat!("majit_rlib::jit_libffi::imp::", $name), f);
+                single(entries, concat!("majit_rlib::jit_libffi::", $name), f);
+            }};
+        }
+        libffi_fnaddr!("exchange_size", jit_libffi::exchange_size);
+        libffi_fnaddr!("exchange_result", jit_libffi::exchange_result);
+        libffi_fnaddr!("exchange_arg", jit_libffi::exchange_arg);
+        libffi_fnaddr!("rtype", jit_libffi::rtype);
+        libffi_fnaddr!("nargs", jit_libffi::nargs);
+        libffi_fnaddr!("types::getkind", jit_libffi::types::getkind);
+        libffi_fnaddr!("types::getsize", jit_libffi::types::getsize);
+        libffi_fnaddr!("jit_ffi_call_impl_int", jit_libffi::jit_ffi_call_impl_int);
+        libffi_fnaddr!(
+            "jit_ffi_call_impl_float",
+            jit_libffi::jit_ffi_call_impl_float
         );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::exchange_size",
-            jit_libffi::exchange_size as *const (),
+        libffi_fnaddr!(
+            "jit_ffi_call_impl_longlong",
+            jit_libffi::jit_ffi_call_impl_longlong
         );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_size",
-            jit_libffi::exchange_size as *const (),
+        libffi_fnaddr!(
+            "jit_ffi_call_impl_singlefloat",
+            jit_libffi::jit_ffi_call_impl_singlefloat
         );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::exchange_size",
-            jit_libffi::exchange_size as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_result",
-            jit_libffi::exchange_result as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::exchange_result",
-            jit_libffi::exchange_result as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_result",
-            jit_libffi::exchange_result as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::exchange_result",
-            jit_libffi::exchange_result as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_arg",
-            jit_libffi::exchange_arg as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::exchange_arg",
-            jit_libffi::exchange_arg as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_arg",
-            jit_libffi::exchange_arg as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::exchange_arg",
-            jit_libffi::exchange_arg as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::rtype",
-            jit_libffi::rtype as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::rtype",
-            jit_libffi::rtype as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::rtype",
-            jit_libffi::rtype as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::rtype",
-            jit_libffi::rtype as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::nargs",
-            jit_libffi::nargs as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::nargs",
-            jit_libffi::nargs as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::nargs",
-            jit_libffi::nargs as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::nargs",
-            jit_libffi::nargs as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::types::getkind",
-            jit_libffi::types::getkind as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::types::getkind",
-            jit_libffi::types::getkind as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::types::getkind",
-            jit_libffi::types::getkind as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::types::getkind",
-            jit_libffi::types::getkind as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::types::getsize",
-            jit_libffi::types::getsize as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::types::getsize",
-            jit_libffi::types::getsize as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::types::getsize",
-            jit_libffi::types::getsize as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::types::getsize",
-            jit_libffi::types::getsize as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_int",
-            jit_libffi::jit_ffi_call_impl_int as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_int",
-            jit_libffi::jit_ffi_call_impl_int as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_int",
-            jit_libffi::jit_ffi_call_impl_int as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_int",
-            jit_libffi::jit_ffi_call_impl_int as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_float",
-            jit_libffi::jit_ffi_call_impl_float as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_float",
-            jit_libffi::jit_ffi_call_impl_float as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_float",
-            jit_libffi::jit_ffi_call_impl_float as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_float",
-            jit_libffi::jit_ffi_call_impl_float as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_singlefloat",
-            jit_libffi::jit_ffi_call_impl_singlefloat as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_singlefloat",
-            jit_libffi::jit_ffi_call_impl_singlefloat as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_singlefloat",
-            jit_libffi::jit_ffi_call_impl_singlefloat as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_singlefloat",
-            jit_libffi::jit_ffi_call_impl_singlefloat as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_void",
-            jit_libffi::jit_ffi_call_impl_void as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_void",
-            jit_libffi::jit_ffi_call_impl_void as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void",
-            jit_libffi::jit_ffi_call_impl_void as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void",
-            jit_libffi::jit_ffi_call_impl_void as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_any",
-            jit_libffi::jit_ffi_call_impl_any as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_any",
-            jit_libffi::jit_ffi_call_impl_any as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_any",
-            jit_libffi::jit_ffi_call_impl_any as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_any",
-            jit_libffi::jit_ffi_call_impl_any as *const (),
-        );
+        libffi_fnaddr!("jit_ffi_call_impl_void", jit_libffi::jit_ffi_call_impl_void);
+        libffi_fnaddr!("jit_ffi_call_impl_any", jit_libffi::jit_ffi_call_impl_any);
         single(
             entries,
             "pyre_interpreter::module::_cffi_backend::cdataobj::raw_ptradd",

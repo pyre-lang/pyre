@@ -33,15 +33,172 @@ use crate::{CodeObject, CompileOpts, Mode, PyFrame, compile_source_with_filename
 use pyre_object::*;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
-/// Module-local re-export of the host-OS surface.  Routes through
-/// `rustpython_host_env` when the `host_env` feature is enabled; when
-/// disabled the same names fall back to `std::*` shims so call sites
-/// stay uniform.
+/// Module-local re-export of the host-OS surface. Unix `host_env` outside
+/// `sandbox` goes through `rposix` / `rposix_environ` / `rurandom`. Other
+/// hosts, and `sandbox`, keep `rustpython_host_env`. When `host_env` is off
+/// the same names fall back to `std::*` shims so call sites stay uniform.
 #[cfg(feature = "host_env")]
 pub mod host {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(unix, not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    pub mod fs {
+        use std::ffi::{CString, OsString};
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::path::Path;
+
+        fn path_c(path: &Path) -> std::io::Result<CString> {
+            CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+        }
+
+        fn posix_err() -> std::io::Error {
+            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno())
+        }
+
+        pub struct Metadata {
+            len: u64,
+            mode: libc::mode_t,
+        }
+
+        impl Metadata {
+            pub fn len(&self) -> u64 {
+                self.len
+            }
+            pub fn file_type(&self) -> FileType {
+                FileType { mode: self.mode }
+            }
+        }
+
+        pub struct FileType {
+            mode: libc::mode_t,
+        }
+
+        impl FileType {
+            pub fn is_symlink(&self) -> bool {
+                self.mode & libc::S_IFMT == libc::S_IFLNK
+            }
+        }
+
+        pub struct DirEntry {
+            name: Vec<u8>,
+        }
+
+        impl DirEntry {
+            pub fn file_name(&self) -> OsString {
+                OsString::from_vec(self.name.clone())
+            }
+        }
+
+        pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
+            let c_path = path_c(path)?;
+            let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+            let fd = loop {
+                let fd = unsafe { majit_rlib::rposix::c_open(c_path.as_ptr(), flags, 0 as _) };
+                if fd >= 0 {
+                    break fd;
+                }
+                let err = majit_rlib::rposix::get_saved_errno();
+                if err != libc::EINTR {
+                    return Err(std::io::Error::from_raw_os_error(err));
+                }
+            };
+            let mut out = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n =
+                    unsafe { majit_rlib::rposix::c_read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    let err = majit_rlib::rposix::get_saved_errno();
+                    if err == libc::EINTR {
+                        continue;
+                    }
+                    unsafe {
+                        let _ = majit_rlib::rposix::c_close(fd);
+                    }
+                    return Err(std::io::Error::from_raw_os_error(err));
+                }
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            unsafe {
+                let _ = majit_rlib::rposix::c_close(fd);
+            }
+            Ok(out)
+        }
+
+        fn stat_at(path: &Path, follow: bool) -> std::io::Result<Metadata> {
+            let c_path = path_c(path)?;
+            let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+            let ret = if follow {
+                unsafe { majit_rlib::rposix::c_stat(c_path.as_ptr(), &mut st) }
+            } else {
+                unsafe { majit_rlib::rposix::c_lstat(c_path.as_ptr(), &mut st) }
+            };
+            if ret < 0 {
+                return Err(posix_err());
+            }
+            Ok(Metadata {
+                len: st.st_size as u64,
+                mode: st.st_mode,
+            })
+        }
+
+        pub fn metadata(path: &Path) -> std::io::Result<Metadata> {
+            stat_at(path, true)
+        }
+
+        pub fn symlink_metadata(path: &Path) -> std::io::Result<Metadata> {
+            stat_at(path, false)
+        }
+
+        pub fn read_dir(path: &Path) -> std::io::Result<Vec<std::io::Result<DirEntry>>> {
+            let names = majit_rlib::rposix::listdir(path.as_os_str().as_bytes())
+                .map_err(std::io::Error::from_raw_os_error)?;
+            Ok(names
+                .into_iter()
+                .map(|name| Ok(DirEntry { name }))
+                .collect())
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(not(unix), feature = "sandbox")))]
     pub use rustpython_host_env::fs;
+
     pub mod os {
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        pub fn current_dir() -> std::io::Result<std::path::PathBuf> {
+            use std::os::unix::ffi::OsStringExt;
+            match majit_rlib::rposix::getcwd() {
+                Ok(bytes) => Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                    bytes,
+                ))),
+                Err(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            }
+        }
+
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        pub fn var(key: &str) -> Result<String, std::env::VarError> {
+            match majit_rlib::rposix_environ::getenv_llimpl(key.as_bytes()) {
+                None => Err(std::env::VarError::NotPresent),
+                Some(bytes) => String::from_utf8(bytes).map_err(|e| {
+                    use std::os::unix::ffi::OsStringExt;
+                    std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(e.into_bytes()))
+                }),
+            }
+        }
+
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        pub fn isatty(fd: i32) -> bool {
+            unsafe { majit_rlib::rposix::c_isatty(fd) != 0 }
+        }
+
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        pub fn urandom(size: usize) -> std::io::Result<Vec<u8>> {
+            majit_rlib::rurandom::urandom(size, None).map_err(std::io::Error::from_raw_os_error)
+        }
+
+        #[cfg(any(not(unix), feature = "sandbox"))]
         pub use rustpython_host_env::os::*;
         // `replace` lives in the host layer's `posix`, which is only built for
         // unix, wasi and windows. Targets without it have no replace-specific
@@ -268,7 +425,7 @@ fn default_source_provider() -> Arc<dyn SourceProvider> {
 /// Kernel-filesystem provider — the default on native and the wasmtime
 /// runner's real-FS path.  `is_file`/`is_dir` go straight to `std::fs::
 /// metadata` via the `Path` methods (matching the historical `find_in_dirs`
-/// probes); reads route through the host_env `fs` shim.
+/// probes); reads route through `host::fs`.
 #[cfg(all(
     feature = "host_env",
     not(target_arch = "wasm32"),
@@ -296,6 +453,7 @@ impl SourceProvider for HostFsProvider {
     }
     fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
         host_fs::read_dir(path)?
+            .into_iter()
             .map(|entry| entry.map(|entry| entry.file_name().as_encoded_bytes().to_vec()))
             .collect()
     }
@@ -578,7 +736,8 @@ pub struct OptionalModuleHooks {
     pub immortal_w_class_only_descriptors:
         fn() -> Vec<&'static pyre_object::lltype::PyreClassDescriptor>,
     /// Read the `CIF_DESCRIPTION` block at the given address; `None` when
-    /// `_cffi_backend`, the only builder of such blocks, is absent.
+    /// `_cffi_backend`, the only builder of such blocks (`ctypefunc.py
+    /// CifDescrBuilder.rawallocate`), is absent.
     ///
     /// # Safety
     /// The address must be a block `_cffi_backend` built.
@@ -2510,9 +2669,10 @@ fn exists_and_is_executable(path: &Path) -> bool {
         let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             return false;
         };
-        // Like os.access(X_OK), libc::access checks the process's real uid and
-        // gid.  Inspecting mode bits by hand would get ACLs and root wrong.
-        unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+        // Like os.access(X_OK), `rposix.c_access` checks the process's real
+        // uid and gid.  Inspecting mode bits by hand would get ACLs and root
+        // wrong.
+        unsafe { majit_rlib::rposix::c_access(path.as_ptr(), libc::X_OK) == 0 }
     }
     #[cfg(not(unix))]
     {
@@ -3207,7 +3367,14 @@ fn compute_startup_path_config() -> StartupPathConfig {
 
 #[cfg(feature = "host_env")]
 pub(crate) fn startup_path_config() -> &'static StartupPathConfig {
-    STARTUP_PATH_CONFIG.get_or_init(compute_startup_path_config)
+    // Computed under the GIL and stored without a blocking once: the search
+    // calls `releasegil` externals (`getcwd`, `stat`), so a thread waiting on a
+    // once while holding the GIL would never see this one finish.  Two racing
+    // threads compute the same value and the first `set` wins.
+    if STARTUP_PATH_CONFIG.get().is_none() {
+        let _ = STARTUP_PATH_CONFIG.set(compute_startup_path_config());
+    }
+    STARTUP_PATH_CONFIG.get().expect("startup path config")
 }
 
 /// Resolve the stdlib directory to add to `sys.path`.

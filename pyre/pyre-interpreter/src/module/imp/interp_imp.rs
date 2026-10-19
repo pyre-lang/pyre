@@ -791,22 +791,31 @@ struct FrozenCacheBase {
 fn frozen_cache_base() -> Option<&'static FrozenCacheBase> {
     use std::sync::OnceLock;
     static BASE: OnceLock<Option<FrozenCacheBase>> = OnceLock::new();
-    BASE.get_or_init(|| {
-        let exe = std::env::current_exe().ok()?;
-        let exe_name = exe.file_name()?.to_str()?.to_owned();
-        let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
-        let binary_mtime = modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos() as u64;
-        let dir = crate::importing::detect_stdlib_path()?.join("__pycache__");
-        Some(FrozenCacheBase {
-            dir,
-            exe_name,
-            binary_mtime,
-        })
+    // Computed under the GIL and stored without a blocking once: the stdlib
+    // lookup reaches `releasegil` externals, so a thread waiting on a once while
+    // holding the GIL would never see this one finish.  Two racing threads
+    // compute the same value and the first `set` wins.
+    if BASE.get().is_none() {
+        let _ = BASE.set(compute_frozen_cache_base());
+    }
+    BASE.get().expect("frozen cache base").as_ref()
+}
+
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+fn compute_frozen_cache_base() -> Option<FrozenCacheBase> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_name = exe.file_name()?.to_str()?.to_owned();
+    let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
+    let binary_mtime = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    let dir = crate::importing::detect_stdlib_path()?.join("__pycache__");
+    Some(FrozenCacheBase {
+        dir,
+        exe_name,
+        binary_mtime,
     })
-    .as_ref()
 }
 
 /// Cache file for a source module's marshalled code, colocated with the stdlib

@@ -115,10 +115,20 @@ fn signal_set_items(arg: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
 /// to `OSError` if `class_name` is not registered.
 #[cfg(all(feature = "host_env", unix))]
 fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
-    let strerror = unsafe {
-        std::ffi::CStr::from_ptr(libc::strerror(errno))
-            .to_string_lossy()
-            .into_owned()
+    let strerror = {
+        #[cfg(not(feature = "sandbox"))]
+        {
+            match majit_rlib::rposix::strerror(errno) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(()) => format!("error {errno}"),
+            }
+        }
+        #[cfg(feature = "sandbox")]
+        unsafe {
+            std::ffi::CStr::from_ptr(libc::strerror(errno))
+                .to_string_lossy()
+                .into_owned()
+        }
     };
     let cls = crate::builtins::lookup_exc_class(class_name)
         .or_else(|| crate::builtins::lookup_exc_class("OSError"))
@@ -701,12 +711,22 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
 /// the equivalent `OSError` line to stderr directly.
 fn report_wakeup_fd_error(errno_val: i32) {
     #[cfg(unix)]
-    let msg = unsafe {
-        let p = libc::strerror(errno_val);
-        if p.is_null() {
-            format!("error {errno_val}")
-        } else {
-            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+    let msg = {
+        #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+        {
+            match majit_rlib::rposix::strerror(errno_val) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(()) => format!("error {errno_val}"),
+            }
+        }
+        #[cfg(not(all(feature = "host_env", not(feature = "sandbox"))))]
+        unsafe {
+            let p = libc::strerror(errno_val);
+            if p.is_null() {
+                format!("error {errno_val}")
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
         }
     };
     #[cfg(not(unix))]
@@ -1669,13 +1689,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_store!(
         ns,
         "SIG_DFL",
-        pyre_object::w_int_new(libc::SIG_DFL as i64)
+        pyre_object::w_int_new(majit_rlib::rsignal::SIG_DFL as i64)
     );
     #[cfg(unix)]
     crate::__pyre_store!(
         ns,
         "SIG_IGN",
-        pyre_object::w_int_new(libc::SIG_IGN as i64)
+        pyre_object::w_int_new(majit_rlib::rsignal::SIG_IGN as i64)
     );
     #[cfg(all(windows, feature = "host_env"))]
     crate::__pyre_store!(

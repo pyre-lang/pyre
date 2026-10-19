@@ -1,5 +1,5 @@
 //! The `CIF_DESCRIPTION` block and the call shape a trace can specialize —
-//! RPython: `rpython/rlib/jit_libffi.py`.
+//! `rpython/rlib/jit_libffi.py`.
 //!
 //! For each C function, one `CIF_DESCRIPTION` block of raw memory is built
 //! and every field but `cif` filled in; `atypes` points at an array of
@@ -36,8 +36,9 @@
 
 #[cfg(any(unix, windows))]
 mod imp {
-    use super::super::misc;
-    use majit_rlib::clibffi::{self, FFI_ABI, FFI_TYPE_P, FFI_TYPE_PP, ffi_arg, ffi_cif};
+    use crate::clibffi::{self, FFI_ABI, FFI_TYPE_P, FFI_TYPE_PP, ffi_arg, ffi_cif};
+    use crate::lltypesystem::rffi as llrffi;
+    use crate::rffi::{LONGLONG, UINT, VOIDP};
 
     /// `jit_libffi.py CIF_DESCRIPTION`.  An array of `nargs` exchange offsets
     /// follows the record; `atypes` and any struct `ffi_type` follow that, all
@@ -57,8 +58,9 @@ mod imp {
     pub const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<ffi_arg>();
 
     /// # Safety
-    /// `cif` must be a block [`super::super::ctypefunc::build_cif_descr`] built.
-    pub(crate) unsafe fn header(cif: usize) -> &'static mut CifDescription {
+    /// `cif` must be a `CIF_DESCRIPTION` block with `exchange_args[nargs]`
+    /// following the record.
+    pub unsafe fn header(cif: usize) -> &'static mut CifDescription {
         unsafe { &mut *(cif as *mut CifDescription) }
     }
 
@@ -66,7 +68,7 @@ mod imp {
     ///
     /// # Safety
     /// As [`header`].
-    pub(crate) unsafe fn exchange_args(cif: usize) -> *mut usize {
+    pub unsafe fn exchange_args(cif: usize) -> *mut usize {
         (cif + std::mem::size_of::<CifDescription>()) as *mut usize
     }
 
@@ -138,6 +140,26 @@ mod imp {
         unsafe { header(cif).abi as i64 }
     }
 
+    /// `jit_libffi.py jit_ffi_prep_cif` — fill `cif` after the rest of the
+    /// block is initialized.  There is no variadic form; `c_ffi_prep_cif_var`
+    /// stays on `clibffi.py AbstractFuncPtr.__init__`.
+    ///
+    /// # Safety
+    /// As [`header`].
+    pub unsafe fn jit_ffi_prep_cif(cif_description: usize) -> i64 {
+        let descr = unsafe { header(cif_description) };
+        let res = unsafe {
+            clibffi::c_ffi_prep_cif(
+                &raw mut descr.cif,
+                descr.abi,
+                descr.nargs as UINT,
+                descr.rtype,
+                descr.atypes,
+            )
+        };
+        res as i64
+    }
+
     /// The `kind` letters [`types::getkind`] answers with.
     pub mod kind {
         /// `void`.
@@ -162,7 +184,7 @@ mod imp {
     /// to a less strict kind letter.
     pub mod types {
         use super::kind;
-        use majit_rlib::clibffi::{self, FFI_TYPE_STRUCT};
+        use crate::clibffi::{self, FFI_TYPE_STRUCT};
 
         /// `types.slong` — `cast_type_to_ffitype(rffi.LONG)`.
         fn slong() -> usize {
@@ -302,6 +324,9 @@ mod imp {
             unsafe { do_ffi_call_uint(cif_description, func_addr, exchange_buffer) };
         } else if reskind == kind::FLOAT {
             unsafe { do_ffi_call_float(cif_description, func_addr, exchange_buffer) };
+        } else if reskind == kind::LONGLONG {
+            // `L` is for longlongs, on 32bit.
+            unsafe { do_ffi_call_longlong(cif_description, func_addr, exchange_buffer) };
         } else if reskind == kind::SINGLEFLOAT {
             unsafe { do_ffi_call_singlefloat(cif_description, func_addr, exchange_buffer) };
         } else {
@@ -309,10 +334,6 @@ mod imp {
             // `jit_ffi_call_impl_any` directly and let no `libffi_call`
             // oopspec reach the JIT at all.  `call_release_gil` is not
             // generated, so there is nothing to store back either.
-            // `L` arrives here as well: an integer wider than a machine word
-            // is a 32-bit-only kind (see [`types::getkind`]), and the
-            // longlong-through-a-float-register spelling it would need has no
-            // counterpart in the register banks this backend has.
             unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
         }
     }
@@ -323,13 +344,14 @@ mod imp {
     /// As [`jit_ffi_call`].
     unsafe fn do_ffi_call_sint(cif_description: usize, func_addr: usize, exchange_buffer: usize) {
         let result = unsafe { jit_ffi_call_impl_int(cif_description, func_addr, exchange_buffer) };
-        let target = exchange_buffer + unsafe { exchange_result(cif_description) };
+        let target =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
         match unsafe { types::getsize(rtype(cif_description)) } {
-            1 => misc::raw_write_i8(target, result),
-            2 => misc::raw_write_i16(target, result),
-            4 => misc::raw_write_i32(target, result),
+            1 => unsafe { (target as *mut i8).write(result as i8) },
+            2 => unsafe { (target as *mut i16).write(result as i16) },
+            4 => unsafe { (target as *mut i32).write(result as i32) },
             // The default case expects a full signed number.
-            _ => misc::raw_write_i64(target, result),
+            _ => unsafe { (target as *mut i64).write(result) },
         }
     }
 
@@ -339,13 +361,14 @@ mod imp {
     /// As [`jit_ffi_call`].
     unsafe fn do_ffi_call_uint(cif_description: usize, func_addr: usize, exchange_buffer: usize) {
         let result = unsafe { jit_ffi_call_impl_int(cif_description, func_addr, exchange_buffer) };
-        let target = exchange_buffer + unsafe { exchange_result(cif_description) };
+        let target =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
         match unsafe { types::getsize(rtype(cif_description)) } {
-            1 => misc::raw_write_u8(target, result as u64),
-            2 => misc::raw_write_u16(target, result as u64),
-            4 => misc::raw_write_u32(target, result as u64),
+            1 => unsafe { (target as *mut u8).write(result as u8) },
+            2 => unsafe { (target as *mut u16).write(result as u16) },
+            4 => unsafe { (target as *mut u32).write(result as u32) },
             // The default case expects a full unsigned number.
-            _ => misc::raw_write_u64(target, result as u64),
+            _ => unsafe { (target as *mut u64).write(result as u64) },
         }
     }
 
@@ -356,8 +379,25 @@ mod imp {
     unsafe fn do_ffi_call_float(cif_description: usize, func_addr: usize, exchange_buffer: usize) {
         let result =
             unsafe { jit_ffi_call_impl_float(cif_description, func_addr, exchange_buffer) };
-        let target = exchange_buffer + unsafe { exchange_result(cif_description) };
-        misc::raw_write_f64(target, result);
+        let target =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
+        llrffi::raw_write_f64(target, result);
+    }
+
+    /// `jit_libffi.py _do_ffi_call_longlong`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    unsafe fn do_ffi_call_longlong(
+        cif_description: usize,
+        func_addr: usize,
+        exchange_buffer: usize,
+    ) {
+        let result =
+            unsafe { jit_ffi_call_impl_longlong(cif_description, func_addr, exchange_buffer) };
+        let target =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
+        unsafe { (target as *mut LONGLONG).write(result) };
     }
 
     /// `jit_libffi.py _do_ffi_call_singlefloat`.
@@ -371,8 +411,9 @@ mod imp {
     ) {
         let result =
             unsafe { jit_ffi_call_impl_singlefloat(cif_description, func_addr, exchange_buffer) };
-        let target = exchange_buffer + unsafe { exchange_result(cif_description) };
-        misc::raw_write_f32(target, result);
+        let target =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
+        unsafe { (target as *mut f32).write(result as f32) };
     }
 
     /// `jit_libffi.py jit_ffi_call_impl_int` — reads back a complete
@@ -387,8 +428,9 @@ mod imp {
         exchange_buffer: usize,
     ) -> i64 {
         unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
-        let resultdata = exchange_buffer + unsafe { exchange_result(cif_description) };
-        misc::raw_read_i64(resultdata)
+        let resultdata =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
+        unsafe { (resultdata as *const ffi_arg).read() as i64 }
     }
 
     /// `jit_libffi.py jit_ffi_call_impl_float`.
@@ -402,8 +444,25 @@ mod imp {
         exchange_buffer: usize,
     ) -> f64 {
         unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
-        let resultdata = exchange_buffer + unsafe { exchange_result(cif_description) };
-        misc::raw_read_f64(resultdata)
+        let resultdata =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
+        llrffi::raw_read_f64(resultdata)
+    }
+
+    /// `jit_libffi.py jit_ffi_call_impl_longlong`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    #[majit_macros::oopspec("libffi_call(cif_description,func_addr,exchange_buffer)")]
+    pub unsafe fn jit_ffi_call_impl_longlong(
+        cif_description: usize,
+        func_addr: usize,
+        exchange_buffer: usize,
+    ) -> LONGLONG {
+        unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
+        let resultdata =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
+        unsafe { (resultdata as *const LONGLONG).read() }
     }
 
     /// `jit_libffi.py jit_ffi_call_impl_singlefloat`.
@@ -417,8 +476,9 @@ mod imp {
         exchange_buffer: usize,
     ) -> f64 {
         unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
-        let resultdata = exchange_buffer + unsafe { exchange_result(cif_description) };
-        misc::raw_read_f32(resultdata)
+        let resultdata =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
+        unsafe { f64::from((resultdata as *const f32).read()) }
     }
 
     /// `jit_libffi.py jit_ffi_call_impl_void`.
@@ -447,11 +507,13 @@ mod imp {
     ) {
         let buffer_array = exchange_buffer as *mut *mut std::ffi::c_void;
         for i in 0..unsafe { nargs(cif_description) } {
-            let data = exchange_buffer + unsafe { exchange_arg(cif_description, i) };
+            let data =
+                llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_arg(cif_description, i) });
             unsafe { buffer_array.add(i).write(data as *mut std::ffi::c_void) };
         }
-        let resultdata = (exchange_buffer + unsafe { exchange_result(cif_description) })
-            as *mut std::ffi::c_void;
+        let resultdata =
+            llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) })
+                as *mut std::ffi::c_void;
         let descr = unsafe { header(cif_description) };
         // `clibffi.py c_ffi_call` (`save_err=RFFI_ERR_ALL | RFFI_ALT_ERRNO`).
         // A trace records `CALL_RELEASE_GIL` with the same flags
@@ -459,7 +521,7 @@ mod imp {
         unsafe {
             clibffi::c_ffi_call(
                 &raw mut descr.cif,
-                func_addr as majit_rlib::rffi::VOIDP,
+                func_addr as VOIDP,
                 resultdata,
                 buffer_array,
             );
@@ -494,3 +556,52 @@ mod imp {
 }
 
 pub use imp::*;
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use super::*;
+    use crate::clibffi::ffi_type_double;
+
+    // `c_ffi_prep_cif` is an rffi extern; default tests use the sandbox stub.
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+    #[test]
+    fn jit_ffi_prep_cif_void_no_args() {
+        use crate::clibffi::{FFI_DEFAULT_ABI, FFI_OK, ffi_cif, ffi_type_void};
+        let mut descr = CifDescription {
+            cif: ffi_cif::default(),
+            abi: FFI_DEFAULT_ABI,
+            nargs: 0,
+            rtype: ffi_type_void(),
+            atypes: std::ptr::null_mut(),
+            exchange_size: 0,
+            exchange_result: 0,
+        };
+        let res = unsafe { jit_ffi_prep_cif(&raw mut descr as usize) };
+        assert_eq!(res, FFI_OK as i64);
+    }
+
+    #[test]
+    fn getkind_matches_types_namespace() {
+        unsafe {
+            assert_eq!(
+                types::getkind(crate::clibffi::ffi_type_void() as usize),
+                kind::VOID
+            );
+            assert_eq!(types::getkind(ffi_type_double() as usize), kind::FLOAT);
+            assert_eq!(
+                types::getkind(crate::clibffi::ffi_type_float() as usize),
+                kind::SINGLEFLOAT
+            );
+            // On a 64-bit word, `types.signed` is the 64-bit record and is
+            // asked before `sint64`, so `L` is a 32-bit-only kind.
+            assert_eq!(
+                types::getkind(crate::clibffi::ffi_type_sint64() as usize),
+                if std::mem::size_of::<isize>() == 8 {
+                    kind::SIGNED
+                } else {
+                    kind::LONGLONG
+                }
+            );
+        }
+    }
+}

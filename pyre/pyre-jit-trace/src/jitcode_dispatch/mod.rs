@@ -10267,10 +10267,11 @@ struct LibffiCallPlan {
 ///
 /// `pyjitpl.py`'s `assert self.staticdata.has_libffi_call` "constant-folds
 /// away the rest of this function if the codewriter didn't produce any
-/// OS_LIBFFI_CALL at all".  `_cffi_backend` is the only producer of that
-/// oopspec and the only builder of the block, so a build without it reads no
-/// `CIF_DESCRIPTION` and declines to the same `resbox is None` fallthrough an
-/// unsupported kind takes.
+/// OS_LIBFFI_CALL at all".  The `libffi_call` oopspec lives on
+/// `jit_libffi.py jit_ffi_call_impl_*`; `_cffi_backend` is the only builder
+/// of the block (`ctypefunc.py CifDescrBuilder.rawallocate`), so a build
+/// without it reads no `CIF_DESCRIPTION` and declines to the same
+/// `resbox is None` fallthrough an unsupported kind takes.
 fn libffi_call_plan(cif_description: usize, dst_bank: char) -> Option<LibffiCallPlan> {
     let hooks = pyre_interpreter::importing::optional_module_hooks()?;
     // `ffi_result = cif_description.rtype; reskind = get_ffi_type_kind(...)`.

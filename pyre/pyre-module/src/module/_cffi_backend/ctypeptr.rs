@@ -764,7 +764,7 @@ unsafe fn prepare_pointer_call_argument(
         .ok_or_else(|| PyError::overflow_error("array size would overflow a ssize_t"))?;
     let buf = cdataobj::raw_alloc(datasize, true)?;
     if let Err(e) = unsafe { convert_array_from_object(ct, buf as *mut u8, w_init) } {
-        unsafe { libc::free(buf as *mut libc::c_void) };
+        cdataobj::raw_free(buf);
         return Err(e);
     }
     cdataobj::raw_write_ptr(cdata as usize, buf);

@@ -22,6 +22,7 @@ pub mod cache;
 pub mod clibffi;
 pub mod debug;
 pub mod jit;
+pub mod jit_libffi;
 pub mod lltypesystem;
 pub mod nonconst;
 pub mod rarithmetic;

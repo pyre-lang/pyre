@@ -12223,7 +12223,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `rposix.getloadavg` raises a bare `OSError` when the
                     // count is not 3, and `interp_posix.getloadavg` turns
                     // that into `OSError("Load averages are unobtainable")`.
-                    #[cfg(not(any(target_os = "android", target_os = "redox")))]
                     let [l1, l5, l15] = {
                         let mut loads = [0.0f64; 3];
                         let n = unsafe { majit_rlib::rposix::c_getloadavg(loads.as_mut_ptr(), 3) };
@@ -12232,9 +12231,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                         loads
                     };
-                    #[cfg(any(target_os = "android", target_os = "redox"))]
-                    let [l1, l5, l15] =
-                        rustpython_host_env::time::getloadavg().map_err(|e| io_err(e, ""))?;
                     let mut fields = pyre_object::gc_roots::RootedItems::new();
                     fields.push(pyre_object::w_float_new(l1));
                     fields.push(pyre_object::w_float_new(l5));

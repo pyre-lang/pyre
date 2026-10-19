@@ -1386,6 +1386,25 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+/// `rposix.rename`.
+#[cfg(unix)]
+pub fn rename(path1: &[u8], path2: &[u8]) -> Result<(), i32> {
+    let c1 = std::ffi::CString::new(path1).map_err(|_| libc::EINVAL)?;
+    let c2 = std::ffi::CString::new(path2).map_err(|_| libc::EINVAL)?;
+    let ret = unsafe { c_rename(c1.as_ptr(), c2.as_ptr()) };
+    if ret < 0 {
+        Err(get_saved_errno())
+    } else {
+        Ok(())
+    }
+}
+
+/// `rposix.replace`. Unix is `rename`.
+#[cfg(unix)]
+pub fn replace(path1: &[u8], path2: &[u8]) -> Result<(), i32> {
+    rename(path1, path2)
+}
+
 // `rposix.c_mkfifoat` saves errno. `rposix.c_mknodat` saves errno. Its
 // device argument is `rffi.INT`, matching `rposix.c_mknodat`.
 #[cfg(unix)]
@@ -1475,6 +1494,58 @@ crate::rffi::llexternal!(
     releasegil = false,
     macro = libc::dirfd
 );
+
+/// `rposix._listdir`. Closes `dirp`. `rewind` is `c_rewinddir` before close
+/// (`rposix.fdlistdir`).
+#[cfg(unix)]
+pub fn _listdir(dirp: *mut libc::DIR, rewind: bool) -> Result<Vec<Vec<u8>>, i32> {
+    let mut result = Vec::new();
+    let error;
+    loop {
+        let direntp = unsafe { c_readdir(dirp) };
+        if direntp.is_null() {
+            error = get_saved_errno();
+            break;
+        }
+        let name =
+            unsafe { crate::rffi::charp2str((*direntp).d_name.as_ptr() as crate::rffi::CCHARP) };
+        if name != b"." && name != b".." {
+            result.push(name);
+        }
+    }
+    if rewind {
+        unsafe { c_rewinddir(dirp) };
+    }
+    unsafe {
+        let _ = c_closedir(dirp);
+    }
+    if error != 0 { Err(error) } else { Ok(result) }
+}
+
+/// `rposix.listdir`.
+#[cfg(unix)]
+pub fn listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    let dirp = unsafe { c_opendir(c_path.as_ptr()) };
+    if dirp.is_null() {
+        return Err(get_saved_errno());
+    }
+    _listdir(dirp, false)
+}
+
+/// `rposix.fdlistdir`. Closes `dirfd`.
+#[cfg(unix)]
+pub fn fdlistdir(dirfd: crate::rffi::INT) -> Result<Vec<Vec<u8>>, i32> {
+    let dirp = unsafe { c_fdopendir(dirfd) };
+    if dirp.is_null() {
+        let error = get_saved_errno();
+        unsafe {
+            let _ = c_close(dirfd);
+        }
+        return Err(error);
+    }
+    _listdir(dirp, true)
+}
 
 // `rposix.c_execv` and `rposix.c_execve` save errno.
 #[cfg(unix)]
@@ -1642,20 +1713,28 @@ crate::rffi::llexternal!(
 // `rposix.c_getloadavg` leaves `save_err` at `RFFI_ERR_NONE`.
 // `rposix.getloadavg` raises a bare `OSError` when the count is not 3.
 // `<stdlib.h>` declares `getloadavg`.
-#[cfg(all(unix, not(target_os = "android"), not(target_os = "redox")))]
+#[cfg(unix)]
 crate::rffi::external_compilation_info! {
     const LOADAVG_ECI = {
         includes: ["stdlib.h"],
     };
 }
 
-#[cfg(all(unix, not(target_os = "android"), not(target_os = "redox")))]
+#[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_getloadavg = "getloadavg",
     [*mut f64, crate::rffi::INT],
     crate::rffi::INT,
     compilation_info = LOADAVG_ECI
 );
+
+/// `rposix.getloadavg`.
+#[cfg(unix)]
+pub fn getloadavg() -> Result<[f64; 3], ()> {
+    let mut load = [0.0f64; 3];
+    let r = unsafe { c_getloadavg(load.as_mut_ptr(), 3) };
+    if r != 3 { Err(()) } else { Ok(load) }
+}
 
 // `rposix.c_major`, `c_minor`, and `c_makedev` are `macro=True`. The libc
 // const fn's signature is not the same on every target, so each group
@@ -3255,6 +3334,15 @@ mod tests {
         let missing = unsafe { c_opendir(c"/no/such/pyre-rffi-opendir".as_ptr()) };
         assert!(missing.is_null());
         assert_eq!(get_saved_errno(), libc::ENOENT);
+
+        let names = listdir(dir.as_os_str().as_bytes()).expect("listdir");
+        assert!(names.iter().any(|n| n == b"f"), "listdir {names:?}");
+        assert!(!names.iter().any(|n| n == b"." || n == b".."));
+        assert_eq!(
+            listdir(b"/no/such/pyre-rffi-listdir").unwrap_err(),
+            libc::ENOENT
+        );
+
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);
     }
@@ -3933,6 +4021,12 @@ mod tests {
         );
         assert!(unsafe { c_rename(c"/no/such/pyre-rffi-rename".as_ptr(), c_link.as_ptr()) } < 0);
         assert_eq!(get_saved_errno(), libc::ENOENT);
+        rename(c_link.as_bytes(), renamed.as_os_str().as_bytes()).expect("rename");
+        replace(renamed.as_os_str().as_bytes(), c_link.as_bytes()).expect("replace");
+        assert_eq!(
+            rename(b"/no/such/pyre-rffi-rename", c_link.as_bytes()).unwrap_err(),
+            libc::ENOENT
+        );
 
         let fifo = dir.join("p");
         let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
@@ -4064,11 +4158,13 @@ mod tests {
             assert_eq!(waited, 0);
         }
 
-        #[cfg(not(any(target_os = "android", target_os = "redox")))]
         {
             let mut loads = [0.0f64; 3];
             let n = unsafe { c_getloadavg(loads.as_mut_ptr(), 3) };
             assert!(n == 3 || n == -1, "c_getloadavg {n}");
+            if n == 3 {
+                assert!(getloadavg().is_ok());
+            }
         }
         let mut uts = unsafe { std::mem::zeroed::<libc::utsname>() };
         assert_eq!(

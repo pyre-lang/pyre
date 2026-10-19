@@ -231,7 +231,7 @@ pub unsafe fn w_ffi_dealloc(obj: PyObjectRef) {
         ffi.finalizer = std::ptr::null_mut();
         unsafe { parse_c_type::free_ctxobj(finalizer.ctxobj) };
         for ptr in finalizer.free_mems.drain(..).rev() {
-            unsafe { libc::free(ptr.cast()) };
+            cdataobj::raw_free(ptr as usize);
         }
     }
     if !ffi.init_once_locks.is_null() {
@@ -250,7 +250,7 @@ pub(crate) fn track_free_mem(w_ffi: PyObjectRef, ptr: *mut u8) -> Result<(), PyE
 }
 
 pub(crate) fn allocate_free_mem(w_ffi: PyObjectRef, nbytes: usize) -> Result<*mut u8, PyError> {
-    let ptr = unsafe { libc::calloc(1, nbytes.max(1)) }.cast::<u8>();
+    let ptr = cdataobj::raw_malloc_varsize_zero(nbytes.max(1)) as *mut u8;
     if ptr.is_null() {
         return Err(PyError::new(
             pyre_interpreter::PyErrorKind::MemoryError,
@@ -258,7 +258,7 @@ pub(crate) fn allocate_free_mem(w_ffi: PyObjectRef, nbytes: usize) -> Result<*mu
         ));
     }
     if let Err(error) = track_free_mem(w_ffi, ptr) {
-        unsafe { libc::free(ptr.cast()) };
+        cdataobj::raw_free(ptr as usize);
         return Err(error);
     }
     Ok(ptr)

@@ -2909,12 +2909,22 @@ fn socket_io_err(e: std::io::Error) -> pyre_interpreter::PyError {
     // its `(errno, strerror)` form so `e.errno` and `str(e)` match.
     #[cfg(not(windows))]
     {
-        let strerror = unsafe {
-            let p = libc::strerror(code);
-            if p.is_null() {
-                format!("Unknown error {code}")
-            } else {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        let strerror = {
+            #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+            {
+                match majit_rlib::rposix::strerror(code) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(()) => format!("Unknown error {code}"),
+                }
+            }
+            #[cfg(not(all(feature = "host_env", not(feature = "sandbox"))))]
+            unsafe {
+                let p = libc::strerror(code);
+                if p.is_null() {
+                    format!("Unknown error {code}")
+                } else {
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
             }
         };
         pyre_interpreter::PyError::os_error_errno_strerror(code, strerror)

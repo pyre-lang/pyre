@@ -9244,9 +9244,26 @@ pub(crate) fn crt_lseek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> i6
     {
         crt_call!(libc::lseek64(fd, offset, whence))
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        unsafe { majit_rlib::rposix::c_lseek(fd, offset, whence) as i64 }
+    }
+    #[cfg(all(unix, not(feature = "host_env")))]
     {
         crt_call!(libc::lseek(fd, offset as libc::off_t, whence)) as i64
+    }
+}
+
+/// Errno `crt_lseek` saved: `rposix.get_saved_errno` after `c_lseek`.
+#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+pub(crate) fn crt_lseek_errno() -> i32 {
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        majit_rlib::rposix::get_saved_errno()
+    }
+    #[cfg(not(all(unix, feature = "host_env")))]
+    {
+        crt_errno()
     }
 }
 
@@ -22964,7 +22981,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     let pos = {
                         let pos = crt_lseek(fd, offset, whence);
                         if pos < 0 {
-                            return Err(fd_errno_err(crt_errno()));
+                            return Err(fd_errno_err(crt_lseek_errno()));
                         }
                         pos
                     };
@@ -23014,7 +23031,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                         let pos = {
                             let pos = crt_lseek(fd, 0, libc::SEEK_CUR);
                             if pos < 0 {
-                                return Err(fd_errno_err(crt_errno()));
+                                return Err(fd_errno_err(crt_lseek_errno()));
                             }
                             pos
                         };
@@ -23747,7 +23764,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 if crt_lseek(fd, 0, libc::SEEK_END) < 0 {
                     // A pipe has no end to seek to, and opening one for append
                     // is legal; only a real seek failure is an error.
-                    let errno = crt_errno();
+                    let errno = crt_lseek_errno();
                     if errno != libc::ESPIPE {
                         return Err(fd_errno_err(errno));
                     }
@@ -24334,7 +24351,17 @@ fn file_method_isatty(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let Some(fd) = file_get_fd(self_obj) else {
         return Ok(w_bool_from(false));
     };
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    {
+        Ok(w_bool_from(
+            unsafe { majit_rlib::rposix::c_isatty(fd) } != 0,
+        ))
+    }
+    #[cfg(all(
+        feature = "host_env",
+        not(target_arch = "wasm32"),
+        any(not(unix), feature = "sandbox")
+    ))]
     {
         Ok(w_bool_from(crt_call!(libc::isatty(fd)) != 0))
     }
@@ -24524,32 +24551,45 @@ pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     #[cfg(not(feature = "sandbox"))]
     {
         let count = buf.len().min(i32::MAX as usize);
-        #[cfg(windows)]
-        unsafe extern "C" {
-            fn __doserrno() -> *mut u32;
+        #[cfg(unix)]
+        {
+            let n = unsafe {
+                majit_rlib::rposix::c_read(fd, buf.as_mut_ptr() as majit_rlib::rffi::VOIDP, count)
+            };
+            if n < 0 {
+                // `EINTR` travels to the caller, the way `os.read`'s `OSError`
+                // does: only the caller can run the pending signal handlers
+                // before re-issuing the call ([`eintr_retry`]).
+                return Err(std::io::Error::from_raw_os_error(
+                    majit_rlib::rposix::get_saved_errno(),
+                ));
+            }
+            Ok(n as usize)
         }
-        let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
-            #[cfg(windows)]
-            {
+        #[cfg(windows)]
+        {
+            unsafe extern "C" {
+                fn __doserrno() -> *mut u32;
+            }
+            let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
                 // CPython `_Py_read`: the UCRT maps an empty nonblocking pipe
                 // to EINVAL plus ERROR_NO_DATA in `_doserrno`.
                 *__doserrno() = 0;
+                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, count as _)
+            });
+            if n < 0 {
+                let errno = if errno == libc::EINVAL && unsafe { *__doserrno() } == 232 {
+                    libc::EAGAIN
+                } else {
+                    errno
+                };
+                // `EINTR` travels to the caller, the way `os.read`'s `OSError`
+                // does: only the caller can run the pending signal handlers
+                // before re-issuing the call ([`eintr_retry`]).
+                return Err(std::io::Error::from_raw_os_error(errno));
             }
-            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, count as _)
-        });
-        if n < 0 {
-            #[cfg(windows)]
-            let errno = if errno == libc::EINVAL && unsafe { *__doserrno() } == 232 {
-                libc::EAGAIN
-            } else {
-                errno
-            };
-            // `EINTR` travels to the caller, the way `os.read`'s `OSError`
-            // does: only the caller can run the pending signal handlers
-            // before re-issuing the call ([`eintr_retry`]).
-            return Err(std::io::Error::from_raw_os_error(errno));
+            Ok(n as usize)
         }
-        Ok(n as usize)
     }
 }
 
@@ -25015,9 +25055,14 @@ pub(crate) fn crt_write_once(fd: libc::c_int, data: &[u8]) -> (i64, i32) {
     }
     #[cfg(not(windows))]
     {
-        let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
-            libc::write(fd, data.as_ptr() as *const libc::c_void, count as _)
-        });
+        let ret = unsafe {
+            majit_rlib::rposix::c_write(fd, data.as_ptr() as majit_rlib::rffi::VOIDP, count)
+        };
+        let errno = if ret < 0 {
+            majit_rlib::rposix::get_saved_errno()
+        } else {
+            0
+        };
         (ret as i64, errno)
     }
 }
@@ -25166,10 +25211,24 @@ fn file_close_owned_fd(owned_fd: Option<i32>) -> Result<(), crate::PyError> {
         not(feature = "sandbox")
     ))]
     {
-        if crt_call!(libc::close(fd)) < 0 {
-            Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
-        } else {
-            Ok(())
+        #[cfg(unix)]
+        {
+            if unsafe { majit_rlib::rposix::c_close(fd) } < 0 {
+                Err(crate::PyError::os_error_with_errno(
+                    majit_rlib::rposix::get_saved_errno(),
+                    "close",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if crt_call!(libc::close(fd)) < 0 {
+                Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
+            } else {
+                Ok(())
+            }
         }
     }
     #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
@@ -26298,7 +26357,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-            let read_result = rustpython_host_env::fs::read(&path);
+            let read_result = crate::importing::host::fs::read(&path);
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             match read_result {
                 // Hold the exact file bytes; text-mode reads decode on the way

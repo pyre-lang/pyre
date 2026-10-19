@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 
 #[cfg(all(windows, not(feature = "host_env")))]
 use libc::SIG_ERR;
-#[cfg(any(unix, all(windows, not(feature = "host_env"))))]
+#[cfg(all(windows, not(feature = "host_env")))]
 use libc::{SIG_DFL, SIG_IGN};
+#[cfg(unix)]
+use majit_rlib::rsignal::{SIG_DFL, SIG_IGN};
 #[cfg(all(windows, feature = "host_env"))]
 use rustpython_host_env::signal::SIG_ERR;
 #[cfg(all(windows, feature = "host_env"))]

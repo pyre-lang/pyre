@@ -1955,15 +1955,13 @@ fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
 
 /// The calling thread's identity.
 ///
-/// `rthread.get_ident` reads `tlfield_thread_ident`, filled from
-/// `pthread_self` in `threadlocal.c`. The host thread id is read fresh on
-/// every call and is never a build-time constant, so the front end
-/// residualizes the read instead of tracing into it.
-#[majit_macros::dont_look_inside]
+/// `rthread.py tlfield_thread_ident` is a `ThreadLocalField` with
+/// `loop_invariant=True`; `get_ident()` returns `tlfield_thread_ident.getraw()`.
+#[majit_macros::loop_invariant]
 pub fn current_ident() -> i64 {
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
-        return unsafe { libc::pthread_self() } as u64 as i64;
+        return majit_rlib::rthread::get_ident();
     }
     #[cfg(all(
         windows,

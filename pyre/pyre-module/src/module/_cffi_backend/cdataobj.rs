@@ -591,7 +591,7 @@ pub unsafe fn w_cdata_dealloc(obj: PyObjectRef) {
         let side_block = std::mem::replace(&mut cdata.length, 0);
         unsafe { super::ccallback::free_callback_side_block(side_block, cdata.ptr as *mut u8) };
     } else if matches!(cdata.flavor, FLAVOR_MEM | FLAVOR_NEW_STD) && cdata.datasize >= 0 {
-        unsafe { libc::free(cdata.ptr as *mut libc::c_void) };
+        raw_free(cdata.ptr);
     }
     cdata.ptr = 0;
     cdata.datasize = -1;
@@ -928,7 +928,7 @@ fn do_exit(mut w_cdata: PyObjectRef) -> Result<(), PyError> {
                 // The freed address stays in `ptr`: reading a released
                 // cdata is the caller's error, and `datasize` is what makes
                 // a second release a no-op.
-                unsafe { libc::free(cdata.ptr as *mut libc::c_void) };
+                raw_free(cdata.ptr);
             }
         }
         FLAVOR_NEW_NONSTD => {

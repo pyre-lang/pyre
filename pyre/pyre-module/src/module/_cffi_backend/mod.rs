@@ -28,7 +28,6 @@ pub mod ffi_obj;
 pub mod func;
 pub mod handle;
 pub mod hide_reveal;
-pub mod jit_libffi;
 pub mod lib_obj;
 pub mod libraryobj;
 pub mod misc;

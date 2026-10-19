@@ -20,6 +20,11 @@ pub type itimervalP = *mut itimerval;
 #[allow(non_camel_case_types)]
 pub type c_sigset_t = *mut libc::sigset_t;
 
+/// `rsignal.SIG_DFL`.
+pub const SIG_DFL: libc::sighandler_t = libc::SIG_DFL;
+/// `rsignal.SIG_IGN`.
+pub const SIG_IGN: libc::sighandler_t = libc::SIG_IGN;
+
 crate::rffi::external_compilation_info! {
     const SIGNAL_ECI = {
         includes: ["stdlib.h", "signal.h", "sys/time.h"],

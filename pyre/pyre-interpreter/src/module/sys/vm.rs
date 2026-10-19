@@ -4620,7 +4620,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // Any other `_io.open` failure keeps the stream with its buffer absent:
     // the instance-override methods reach the descriptor without the buffer,
     // and the sandbox controller mounts no real files to open.
-    #[cfg(all(unix, not(feature = "sandbox")))]
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    {
+        if unsafe { majit_rlib::_rsocket_rffi::fcntl(fd, libc::F_GETFD, 0) } == -1 {
+            return w_none();
+        }
+    }
+    #[cfg(all(unix, not(feature = "host_env"), not(feature = "sandbox")))]
     {
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
             return w_none();

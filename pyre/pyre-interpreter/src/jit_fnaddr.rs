@@ -7689,8 +7689,8 @@ mod tests {
         // module publishes: `jit_libffi` defines its cfg-selected bodies in
         // `imp` and re-exports them, and the LLBC carries both spellings.
         assert!(are_alias_spellings(
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_size",
-            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_size",
+            "majit_rlib::jit_libffi::imp::exchange_size",
+            "majit_rlib::jit_libffi::exchange_size",
         ));
         // Word-ABI wrapper beside the MIR-front residual path it serves.
         assert!(are_alias_spellings(

@@ -35,6 +35,9 @@ pub const TLFIELD_ALT_LASTERROR_OFS: usize = 28 * WORD;
 /// The `errno` a target without a C library points `p_errno` at.
 #[cfg(target_arch = "wasm32")]
 const NO_LIBC_ERRNO_OFS: usize = 29 * WORD;
+/// `tlfield_thread_ident` — filled from `pthread_self` / `GetCurrentThreadId`
+/// in `_RPy_ThreadLocals_Init`.
+pub const TLFIELD_THREAD_IDENT_OFS: usize = 30 * WORD;
 
 #[repr(C, align(16))]
 struct ThreadLocals(UnsafeCell<[i64; THREADLOCAL_WORDS]>);
@@ -70,6 +73,24 @@ fn fetch_addr_errno(base: *mut i64) -> *mut i32 {
     }
 }
 
+fn fetch_thread_ident() -> i64 {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        unsafe { libc::pthread_self() as u64 as i64 }
+    }
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentThreadId() -> u32;
+        }
+        unsafe { GetCurrentThreadId() as i64 }
+    }
+    #[cfg(not(any(all(unix, not(target_arch = "wasm32")), windows)))]
+    {
+        1
+    }
+}
+
 /// `llop.threadlocalref_addr` — this thread's container.
 #[inline]
 pub fn threadlocalref_addr() -> *mut i64 {
@@ -81,8 +102,17 @@ pub fn threadlocalref_addr() -> *mut i64 {
         if unsafe { *p_errno } == 0 {
             unsafe { *p_errno = fetch_addr_errno(base) as i64 };
         }
+        let ident = unsafe { base.byte_add(TLFIELD_THREAD_IDENT_OFS) };
+        if unsafe { *ident } == 0 {
+            unsafe { *ident = fetch_thread_ident() };
+        }
         base
     })
+}
+
+/// `rthread.get_ident` — `tlfield_thread_ident.getraw()`.
+pub fn get_ident() -> i64 {
+    unsafe { *threadlocalref_addr().byte_add(TLFIELD_THREAD_IDENT_OFS) }
 }
 
 /// `ThreadLocalField.getraw()` for an `rffi.INT` field.
@@ -136,5 +166,15 @@ mod tests {
         threadlocalref_set(16, 0x5678);
         assert_eq!(threadlocalref_get(16), 0x5678);
         assert_eq!(unsafe { *threadlocalref_addr().byte_add(16) }, 0x5678);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn get_ident_differs_across_threads() {
+        let here = get_ident();
+        let other = std::thread::spawn(get_ident).join().unwrap();
+        assert_ne!(here, 0);
+        assert_ne!(other, 0);
+        assert_ne!(here, other);
     }
 }
