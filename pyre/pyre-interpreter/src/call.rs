@@ -2181,6 +2181,29 @@ fn parse_into_fresh_frame(
     let defaults_w: Vec<PyObjectRef> = (0..ndef)
         .map(|i| pyre_object::gc_roots::shadow_stack_get(defaults_base + i))
         .collect();
+    // `funcrun_obj` owns this frame as a `FrameBox`
+    // (`try_gc_alloc_young_nonmoving_raw`); the body is immobile.
+    // `locals_cells_stack_w` is a nursery GcArray (`createframe_obj`
+    // `NurseryGc` / `try_gc_alloc`) and moves. `parse_into_scope`
+    // allocates (`_match_signature` `space.newdict(kwargs=True)`).
+    // Pin the array as a livevar and reload it after that call
+    // (`framework.py` `push_roots` / `pop_roots`). The getfield that
+    // names it sits on `hint(frame, access_directly=True,
+    // fresh_virtualizable=True)` so `jtransform.py
+    // is_virtualizable_getset` does not put it in `vable_array_vars`.
+    let frame_ptr = frame as *mut PyFrame;
+    let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    let locals_slot = {
+        let frame =
+            unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame) };
+        let fresh_frame = majit_metainterp::jit::hint_fresh_virtualizable(
+            majit_metainterp::jit::hint_access_directly(frame),
+        );
+        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(fresh_frame.locals_cells_stack_w as PyObjectRef);
+        locals_slot
+    };
     args.parse_into_scope(
         pyre_object::gc_roots::shadow_stack_get(first_slot),
         &mut scope_w,
@@ -2190,18 +2213,28 @@ fn parse_into_fresh_frame(
         pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
     )?;
     let scope_base = pyre_object::gc_roots::pin_roots(&scope_w);
-    let fresh_frame = majit_metainterp::jit::hint_fresh_virtualizable(
-        majit_metainterp::jit::hint_access_directly(frame),
-    );
     {
-        let locals = crate::locals_w_mut!(fresh_frame).as_mut_slice();
+        let locals = unsafe {
+            &mut *(pyre_object::gc_roots::shadow_stack_get(locals_slot)
+                as *mut pyre_object::FixedObjectArray)
+        };
         let n = scopelen.min(locals.len());
         let mut i = 0usize;
         while i < n {
-            locals[i] = pyre_object::gc_roots::shadow_stack_get(scope_base + i);
+            locals.set_ref(i, pyre_object::gc_roots::shadow_stack_get(scope_base + i));
             i += 1;
         }
+        // `framework.py transform_generic_set` write-barriers every GC store
+        // into a GC array. The loop itself cannot collect; one remember of
+        // the array that received the stores covers the batch
+        // (`incminimark.py write_barrier` / `remember_frame_locals_array`).
+        crate::pyframe::remember_frame_locals_array(locals as *mut pyre_object::FixedObjectArray);
     }
+    let frame =
+        unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame) };
+    let fresh_frame = majit_metainterp::jit::hint_fresh_virtualizable(
+        majit_metainterp::jit::hint_access_directly(frame),
+    );
     fresh_frame.init_cells();
     Ok(())
 }

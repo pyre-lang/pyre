@@ -7197,11 +7197,17 @@ pub fn createframe_obj(
         let _root = FrameLocalsRoot::new(frame.as_mut_ptr());
         frame.initialize_frame_scopes(outer_ref, _roots.get(root_base) as *const ())?;
     }
-    // Same pointer stored on the frame. `PyFrame::new` remembers that
-    // local; a getfield of `locals_cells_stack_w` on the boxed frame
-    // would enter `vable_array_vars` and `_check_no_vable_array` would
-    // reject the call argument (`jtransform.py`).
-    remember_frame_locals_array(locals_cells_stack_w);
+    // `FrameBox::new` and `initialize_frame_scopes` collect; the nursery
+    // locals array may have moved. `pycode.py PyCode.funcrun` reads
+    // `fresh_frame.locals_cells_stack_w` after `hint(frame,
+    // access_directly=True, fresh_virtualizable=True)`.
+    // `jtransform.py is_virtualizable_getset` returns False for that flag,
+    // so the getfield does not enter `vable_array_vars` /
+    // `_check_no_vable_array`.
+    let fresh_frame = majit_metainterp::jit::hint_fresh_virtualizable(
+        majit_metainterp::jit::hint_access_directly(&mut *frame),
+    );
+    remember_frame_locals_array(fresh_frame.locals_cells_stack_w);
 
     Ok(frame)
 }
