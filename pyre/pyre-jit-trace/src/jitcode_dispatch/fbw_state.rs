@@ -1546,7 +1546,12 @@ pub(crate) fn fbw_bridge_iter_journal_clear() {
 /// fresh body-effect window).  The outer loop's in-flight item is thus no
 /// longer destroyed by an inner consume, and a completed inner loop leaves no
 /// stale entry.
+///
+/// "Already on the stack" means the same `owner` as well as the same `body`:
+/// another activation of the loop's code is another `MIFrame`
+/// (`MetaInterp.newframe`) with its own item.
 pub(crate) fn fbw_foriter_inflight_capture(
+    owner: InflightForiterOwner,
     item: pyre_object::PyObjectRef,
     body: InflightForiterBody,
     consume_journaled: bool,
@@ -1562,6 +1567,7 @@ pub(crate) fn fbw_foriter_inflight_capture(
         // has to continue the frame, because entry replay calls `__next__` again.
         let entry = InflightForiter {
             item,
+            owner,
             body,
             body_effect_since_consume: false,
             body_completed: false,
@@ -1574,7 +1580,10 @@ pub(crate) fn fbw_foriter_inflight_capture(
             stack.push(entry);
             return;
         };
-        match stack.iter().position(|e| e.body == body) {
+        match stack
+            .iter()
+            .position(|e| e.owner == owner && e.body == body)
+        {
             Some(at) => {
                 stack.truncate(at + 1);
                 stack[at] = entry;
@@ -1606,12 +1615,19 @@ pub(crate) fn fbw_foriter_unjournaled_consume() -> bool {
 /// attempt that aborts mid-way (a kept-stack guard on the exhaustion arm)
 /// still leaves the completion recorded; a successful attempt replaces the
 /// entry with a fresh one anyway ([`fbw_foriter_inflight_capture`]).
-pub(crate) fn fbw_foriter_inflight_mark_attempt(body: InflightForiterBody) {
+pub(crate) fn fbw_foriter_inflight_mark_attempt(
+    owner: InflightForiterOwner,
+    body: InflightForiterBody,
+) {
     FBW_FORITER_INFLIGHT.with(|c| {
         let Some(_body_pc) = inflight_foriter_body_pc(body) else {
             return;
         };
-        if let Some(entry) = c.borrow_mut().iter_mut().find(|e| e.body == body) {
+        if let Some(entry) = c
+            .borrow_mut()
+            .iter_mut()
+            .find(|e| e.owner == owner && e.body == body)
+        {
             entry.body_completed = true;
         }
     });
@@ -1637,19 +1653,12 @@ pub fn fbw_foriter_inflight_clear() {
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
 }
 
-/// Height of the in-flight FOR_ITER stack, sampled before an inlined callee's
-/// body runs so [`fbw_foriter_inflight_truncate`] can drop what it pushed.
-pub(crate) fn fbw_foriter_inflight_depth() -> usize {
-    FBW_FORITER_INFLIGHT.with(|c| c.borrow().len())
-}
-
-/// Drop the entries above `depth`. `finishframe` (`pyjitpl.py`) pops the
-/// callee's `MIFrame` with every loop it was running, so once an inlined
-/// callee has finished, or its loop has gone to `CALL_ASSEMBLER`, no consumed
-/// item of its own FOR_ITERs is left to deliver. The enclosing frames' entries
-/// below `depth` stay.
-pub(crate) fn fbw_foriter_inflight_truncate(depth: usize) {
-    FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().truncate(depth));
+/// Drop the items `owner` consumed. `MetaInterp.popframe` (`pyjitpl.py`)
+/// discards the finished `MIFrame` with its value stack, so once an inlined
+/// callee has returned or raised, or its loop has gone to `CALL_ASSEMBLER`,
+/// none of its FOR_ITER items is left to deliver. Other frames' entries stay.
+pub(crate) fn fbw_foriter_inflight_popframe(owner: InflightForiterOwner) {
+    FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().retain(|e| e.owner != owner));
 }
 
 /// #32 S2 deliver selector for the branch-flush leg.  Returns
@@ -1673,9 +1682,9 @@ pub fn fbw_foriter_inflight_take_for_resume(
     }
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
-        let at = stack
-            .iter()
-            .position(|e| foriter_body_matches_frame(e.body, frame, body_pc))?;
+        let at = stack.iter().position(|e| {
+            e.owner.is_portal() && foriter_body_matches_frame(e.body, frame, body_pc)
+        })?;
         // R1 never-double guard (cross-checks #33): an irreversible body effect
         // committed since this consume means re-running the body on delivery
         // would double it — refuse delivery.  A body-COMPLETED entry (the walk
@@ -1715,10 +1724,9 @@ pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usiz
     }
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
-        let Some(at) = stack
-            .iter()
-            .position(|e| foriter_body_matches_frame(e.body, frame, body_pc))
-        else {
+        let Some(at) = stack.iter().position(|e| {
+            e.owner.is_portal() && foriter_body_matches_frame(e.body, frame, body_pc)
+        }) else {
             return false;
         };
         stack[at].body_completed
@@ -1796,24 +1804,29 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 /// or that replay starts at the next iteration and drops this one.
 /// `for_mutate` aborts BEFORE the append's effect, so both signal classes are
 /// clear at the abort point — the clean continuation case.
-/// Which stash entry a take removes, given the indices that matched the parked
-/// frame.  `None` only for an empty stash.
+/// Which stash entry a take removes, given the indices of the portal frame's
+/// entries that matched the parked frame and the topmost portal-owned entry.
+/// `None` when the portal frame owns no entry.
 ///
-/// `foriter_body_matches_frame` decides on the frame's CODE and body pc, not on
-/// the frame itself — a frame address cannot be the key, since a minor
-/// collection relocates the frame between the capture and the take.  Two
-/// activations of one code (a recursive call, or one function inlined at two
-/// levels under different JitCode identities) therefore answer that match
-/// identically, and reaching past the top for one of them would deliver another
-/// activation's item into this frame.  So the match decides only while it is
-/// UNAMBIGUOUS; a second candidate falls back to the legacy top entry, whose
-/// header check then refuses and drops exactly as it did before.  Wrong-frame
-/// delivery is a wrong VALUE and the drop is only a loss, so never trading one
-/// for the other is what makes reaching past the top safe at all.
-fn inflight_take_index(len: usize, mut matching: impl Iterator<Item = usize>) -> Option<usize> {
+/// Only the portal frame's own entries ([`InflightForiterOwner::is_portal`])
+/// are candidates: `foriter_body_matches_frame` decides on the frame's CODE and
+/// body pc, so an inlined activation of the same code answers it identically,
+/// and only the owner tells the two items apart.  A second candidate is still
+/// possible when one loop was captured under both a Python-pc and a JitCode
+/// coordinate; it falls back to the portal frame's top entry, whose header
+/// check then refuses and drops.  The fallback never reaches an inlined
+/// activation's entry: a recursive callee's item names the same header, so the
+/// header check would pass it and push another activation's VALUE onto the
+/// portal frame.  Wrong-frame delivery is a wrong value and the drop is only a
+/// loss, so never trading one for the other is what makes reaching past the
+/// top safe at all.
+fn inflight_take_index(
+    top_portal: Option<usize>,
+    mut matching: impl Iterator<Item = usize>,
+) -> Option<usize> {
     match (matching.next(), matching.next()) {
         (Some(only), None) => Some(only),
-        _ => len.checked_sub(1),
+        _ => top_portal,
     }
 }
 
@@ -1922,19 +1935,18 @@ pub fn fbw_foriter_inflight_take(
     let census_on = super::foriter_inflight_census_enabled();
     let (stash, dropped) = FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
-        let Some(at) = inflight_take_index(
-            stack.len(),
+        let at = inflight_take_index(
+            stack.iter().rposition(|entry| entry.owner.is_portal()),
             stack
                 .iter()
                 .enumerate()
                 .filter(|(_, entry)| {
-                    foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1)
+                    entry.owner.is_portal()
+                        && foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1)
                 })
                 .map(|(at, _)| at),
-        ) else {
-            return (None, Vec::new());
-        };
-        let picked = stack.remove(at);
+        );
+        let picked = at.map(|at| stack.remove(at));
         // Everything still standing is about to be destroyed by the clear, and
         // each one is an iteration whose consumed item nothing will hand back.
         // Name them before they go: a census that reports only what the take
@@ -1945,8 +1957,17 @@ pub fn fbw_foriter_inflight_take(
             Vec::new()
         };
         stack.clear();
-        (Some(picked), dropped)
+        (picked, dropped)
     });
+    for body in dropped {
+        if let Some((code_ptr, dropped_pc)) = inflight_census_key(fallback_code_ptr, body) {
+            super::census_record_foriter_inflight(
+                code_ptr,
+                dropped_pc,
+                super::ForiterInflightOutcome::DroppedUnmatched,
+            );
+        }
+    }
     let stash = stash?;
     let body_effect = stash.body_effect_since_consume;
     let Some(body_pc) = inflight_foriter_body_pc(stash.body) else {
@@ -1957,15 +1978,6 @@ pub fn fbw_foriter_inflight_take(
         crate::trace::fbw_diag::record_foriter_item_dropped();
         return None;
     };
-    for body in dropped {
-        if let Some((code_ptr, dropped_pc)) = inflight_census_key(fallback_code_ptr, body) {
-            super::census_record_foriter_inflight(
-                code_ptr,
-                dropped_pc,
-                super::ForiterInflightOutcome::DroppedUnmatched,
-            );
-        }
-    }
     let key = if census_on {
         inflight_census_key(fallback_code_ptr, stash.body)
     } else {
@@ -2036,6 +2048,12 @@ pub fn fbw_foriter_inflight_take(
 mod foriter_delivery_tests {
     use super::*;
 
+    /// The root portal frame of one walk session.
+    const OWNER: InflightForiterOwner = InflightForiterOwner {
+        session: 1,
+        call_id: 0,
+    };
+
     /// The census columns, for a test that just drove one outcome.  Reading
     /// them is why `foriter_inflight_census_enabled` is unconditionally true
     /// under `cfg(test)`: no corpus fixture reaches a refusal, so these are
@@ -2065,7 +2083,7 @@ mod foriter_delivery_tests {
     fn the_take_alone_records_no_outcome() {
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
 
         assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
 
@@ -2087,7 +2105,7 @@ mod foriter_delivery_tests {
     fn a_push_at_the_header_is_the_only_delivery() {
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
         assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
 
         fbw_foriter_report_delivered();
@@ -2104,7 +2122,7 @@ mod foriter_delivery_tests {
     fn a_header_refusal_is_not_a_delivery() {
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
         assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
 
         let before = dropped_tally();
@@ -2125,7 +2143,7 @@ mod foriter_delivery_tests {
     fn an_r1_refusal_is_its_own_column() {
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
         fbw_mark_foriter_body_effect_since_consume();
 
         let before = dropped_tally();
@@ -2149,8 +2167,8 @@ mod foriter_delivery_tests {
         reset();
         let outer = 1usize as pyre_object::PyObjectRef;
         let inner = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6), false);
-        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35), false);
+        fbw_foriter_inflight_capture(OWNER, outer, InflightForiterBody::Py(6), false);
+        fbw_foriter_inflight_capture(OWNER, inner, InflightForiterBody::Py(35), false);
 
         // Parked at the OUTER header, so the inner entry is the one destroyed.
         assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
@@ -2168,7 +2186,7 @@ mod foriter_delivery_tests {
     fn recorded_but_unexecuted_residual_keeps_consumed_item_for_replay() {
         fbw_store_journal_reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
         fbw_mark_unjournaled_effect(ResidualDecline::Symbolic);
 
         assert!(!fbw_foriter_any_body_effect_signal());
@@ -2208,12 +2226,45 @@ mod foriter_delivery_tests {
         fbw_store_journal_reset();
         let outer = 1usize as pyre_object::PyObjectRef;
         let inner = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6), false);
-        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35), false);
+        fbw_foriter_inflight_capture(OWNER, outer, InflightForiterBody::Py(6), false);
+        fbw_foriter_inflight_capture(OWNER, inner, InflightForiterBody::Py(35), false);
 
         // Parked at the OUTER header (pc 5), whose fallthrough body pc is 6.
         assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
 
+        fbw_store_journal_reset();
+    }
+
+    /// Two activations of one loop body are two `MIFrame`s
+    /// (`MetaInterp.newframe`): the callee's consume does not replace the
+    /// caller's entry, and `MetaInterp.popframe` takes only the callee's item
+    /// with it.
+    #[test]
+    fn a_frame_owns_its_items_and_pops_only_them() {
+        fbw_store_journal_reset();
+        let callee = InflightForiterOwner {
+            call_id: 1,
+            ..OWNER
+        };
+        let caller_item = 1usize as pyre_object::PyObjectRef;
+        let callee_item = 2usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(OWNER, caller_item, InflightForiterBody::Py(6), false);
+        fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
+        assert_eq!(FBW_FORITER_INFLIGHT.with(|c| c.borrow().len()), 2);
+
+        fbw_foriter_inflight_popframe(callee);
+        assert_eq!(FBW_FORITER_INFLIGHT.with(|c| c.borrow().len()), 1);
+
+        // An abort inside the callee: its item is on top and names the same
+        // code and body pc, but the live frame is the portal's.
+        fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((caller_item, 6)));
+
+        // With only the callee's item in flight there is nothing the portal
+        // frame owns: the take delivers nothing and still empties the stash.
+        fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), None);
+        assert_eq!(FBW_FORITER_INFLIGHT.with(|c| c.borrow().len()), 0);
         fbw_store_journal_reset();
     }
 
@@ -2225,8 +2276,8 @@ mod foriter_delivery_tests {
         fbw_store_journal_reset();
         let older = 1usize as pyre_object::PyObjectRef;
         let newer = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(older, InflightForiterBody::Py(6), false);
-        fbw_foriter_inflight_capture(newer, InflightForiterBody::Py(35), false);
+        fbw_foriter_inflight_capture(OWNER, older, InflightForiterBody::Py(6), false);
+        fbw_foriter_inflight_capture(OWNER, newer, InflightForiterBody::Py(35), false);
 
         assert_eq!(fbw_foriter_inflight_take(0, 0, 99), Some((newer, 35)));
 
@@ -2241,7 +2292,7 @@ mod foriter_delivery_tests {
     #[test]
     fn an_ambiguous_frame_match_keeps_the_legacy_top_entry() {
         assert_eq!(
-            inflight_take_index(3, [1usize].into_iter()),
+            inflight_take_index(Some(2), [1usize].into_iter()),
             Some(1),
             "one candidate is the frame's entry"
         );
@@ -2249,19 +2300,19 @@ mod foriter_delivery_tests {
         // (index 1) is what a select-by-recency rule does, so only the
         // ambiguity refusal answers 2 here.
         assert_eq!(
-            inflight_take_index(3, [0usize, 1].into_iter()),
+            inflight_take_index(Some(2), [0usize, 1].into_iter()),
             Some(2),
-            "two candidates cannot be told apart, so the legacy top stands"
+            "two candidates cannot be told apart, so the portal's top stands"
         );
         assert_eq!(
-            inflight_take_index(2, std::iter::empty()),
+            inflight_take_index(Some(1), std::iter::empty()),
             Some(1),
-            "no candidate keeps the legacy top"
+            "no candidate keeps the portal's top"
         );
         assert_eq!(
-            inflight_take_index(0, std::iter::empty()),
+            inflight_take_index(None, std::iter::empty()),
             None,
-            "an empty stash has nothing to take"
+            "a stash the portal frame owns nothing in has nothing to take"
         );
     }
 
@@ -2275,7 +2326,7 @@ mod foriter_delivery_tests {
     fn a_rolled_back_namespace_binding_refuses_consumed_item_delivery() {
         fbw_store_journal_reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
         fbw_namespace_store_mark_rolled_back();
 
         assert!(fbw_namespace_store_rolled_back());
@@ -2292,7 +2343,7 @@ mod foriter_delivery_tests {
     fn executed_body_effect_still_refuses_consumed_item_delivery() {
         fbw_store_journal_reset();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
         fbw_mark_foriter_body_effect_since_consume();
 
         assert!(fbw_foriter_any_body_effect_signal());

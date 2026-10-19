@@ -920,6 +920,17 @@ impl WalkSession {
         self.framestack.iter().all(|frame| frame.is_portal)
     }
 
+    /// `call_ids[-1]` of the innermost Python frame. A transparent helper
+    /// level (`w_code == 0`) is not an `MIFrame` and owns no id; the root
+    /// portal owns 0.
+    pub(crate) fn python_frame_call_id(&self) -> u64 {
+        self.framestack
+            .iter()
+            .rev()
+            .find(|frame| frame.w_code != 0)
+            .map_or(0, |frame| frame.call_id)
+    }
+
     /// Inlined-callee depth, excluding the portal at `framestack[0]`.
     pub(crate) fn inline_depth(&self) -> usize {
         self.framestack
@@ -8463,12 +8474,7 @@ impl<'a> InlineFrameGuard<'a> {
     ) -> Self {
         let mut walk = session.borrow_mut();
         let call_id = if w_code == 0 {
-            walk.framestack
-                .iter()
-                .rev()
-                .find(|frame| frame.w_code != 0)
-                .map(|frame| frame.call_id)
-                .unwrap_or(0)
+            walk.python_frame_call_id()
         } else {
             let call_id = walk.next_call_id;
             walk.next_call_id = walk.next_call_id.saturating_add(1);
@@ -8583,9 +8589,42 @@ enum InflightForiterBody {
     Jit { jitcode_index: i32, op_pc: usize },
 }
 
+/// The `MIFrame` whose FOR_ITER consumed an in-flight item. Upstream the item
+/// sits on that frame's value stack (`pyopcode.py FOR_ITER`), so it is told
+/// apart from another activation of the same loop (`MetaInterp.newframe`) and
+/// leaves with the frame (`MetaInterp.popframe`).
+///
+/// `call_id` is the frame's `MetaInterp.call_ids` entry ([`InlineFrame::call_id`]).
+/// Ids restart in every [`WalkSession`], and a residual run while tracing can
+/// open a nested session on the same thread, so the session is part of the
+/// identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InflightForiterOwner {
+    session: usize,
+    call_id: u64,
+}
+
+impl InflightForiterOwner {
+    /// The innermost Python frame of `session`'s walk.
+    pub(crate) fn current(session: &std::cell::RefCell<WalkSession>) -> Self {
+        Self {
+            session: session.as_ptr() as usize,
+            call_id: session.borrow().python_frame_call_id(),
+        }
+    }
+
+    /// Whether the owner is `framestack[0]`, the portal frame the walk entered
+    /// from. Only that frame is the live `PyFrame` an abort delivery pushes
+    /// onto; an inlined callee's item belongs to another frame.
+    pub(crate) fn is_portal(&self) -> bool {
+        self.call_id == 0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct InflightForiter {
     item: pyre_object::PyObjectRef,
+    owner: InflightForiterOwner,
     body: InflightForiterBody,
     body_effect_since_consume: bool,
     /// [`fbw_bridge_iter_journal_capture`] pushed a cursor for this consume.

@@ -8498,29 +8498,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
     // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) pushes an MIFrame.
     // A seeded frame already exists here, and a walk abort converts through
-    // `convert_and_run_from_pyjitpl` (`blackhole.py`). The remaining terms
-    // are unported OTHER: `code_has_for_iter`, `code_is_self_recursive`,
-    // and the constant-callable screen. That screen pins `Function.code`
+    // `convert_and_run_from_pyjitpl` (`blackhole.py`). A callee's own
+    // FOR_ITER items are keyed by its frame (`InflightForiterOwner`), so a
+    // callee that loops, or re-enters the caller's code, keeps them apart
+    // from the caller's. The remaining term is unported OTHER: the
+    // constant-callable screen. That screen pins `Function.code`
     // (`guards_the_callee_function`) — the greenkey `can_inline_callable`
     // unwraps — not function identity, so a fresh lambda with one code
     // object is admitted the same way a closure is.
     if fbw_foriter_inflight_active() && !instance_next_route {
-        let seeded_callee_resume = (try_multiframe || strict_seed)
+        let foriter_seeded_admit = (try_multiframe || strict_seed)
             && (callable_guard_op.is_constant()
                 || receiver_pinned_by_class
                 || guards_the_callee_function);
-        let foriter_seeded_admit = seeded_callee_resume
-            && !pyre_interpreter::code_has_for_iter(callee_code)
-            && !pyre_interpreter::code_is_self_recursive(callee_code);
         if !foriter_seeded_admit && fbw_inline_diag_enabled() {
             eprintln!(
-                "[inline-foriter-gate] pc={} seeded_admit={foriter_seeded_admit} \
-                 const_callable={} mf={try_multiframe} strict={strict_inlinable} \
-                 for_iter={} selfrec={} guards_fn={guards_the_callee_function}",
+                "[inline-foriter-gate] pc={} const_callable={} mf={try_multiframe} \
+                 strict={strict_inlinable} guards_fn={guards_the_callee_function}",
                 op.pc,
                 callable_guard_op.is_constant(),
-                pyre_interpreter::code_has_for_iter(callee_code),
-                pyre_interpreter::code_is_self_recursive(callee_code),
             );
         }
         if !foriter_seeded_admit {
@@ -10130,9 +10126,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Those recordings can minor-collect. Re-read the rooted holders
     // before the copy is published on the session.
     super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut parent_frame);
-    // The in-flight FOR_ITER entries the callee's own loops push sit above
-    // this height.
-    let inflight_depth_before_subwalk = fbw_foriter_inflight_depth();
+    // The callee frame that owns the FOR_ITER items its own loops consume.
+    let caller_inflight_owner = InflightForiterOwner::current(ctx.session);
+    let callee_inflight_owner;
     let (mut callee_outcome, callee_class_of_last_exc_is_const, mut operator_tail_caller) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -10236,6 +10232,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             true,
             parents,
         );
+        // A level without a live `W_Code` shares its caller's id and is no
+        // `MIFrame` of its own, so it has nothing to pop.
+        callee_inflight_owner = Some(InflightForiterOwner::current(ctx.session))
+            .filter(|owner| *owner != caller_inflight_owner);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
@@ -10336,14 +10336,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // forwarding optimization and is invalidated by that call; seed
             // the frame-local shadow too so a later LOAD_DEREF re-reads the
             // same live cell instead of manufacturing an unstamped
-            // GetarrayitemGcR result.  This callee shape has no fresh cellvars
-            // (rejected above), so existing freevars begin at `nlocals`.
+            // GetarrayitemGcR result.  The freevar band follows the varnames
+            // and the pure cellvars (`finish_for_call_with_globals_obj`), so a
+            // callee with a fresh cell of its own puts its first freevar past
+            // that cell, not at the first non-varname slot.
+            let freevar_base =
+                callee_code.varnames.len() + pyre_interpreter::npure_cellvars(callee_code);
             for (i, (&cell, &value)) in live_freevar_cells()
                 .iter()
                 .zip(&freevar_cell_ops)
                 .enumerate()
             {
-                let slot = (callee_code.varnames.len() + i) as i64;
+                let slot = (freevar_base + i) as i64;
                 let mut state = sub_wc.frame_state.borrow_mut();
                 let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
@@ -10842,13 +10846,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     };
 
     let outcome = promote_published_null_return_since(ctx, outcome, op.pc, exc_before_subwalk)?;
-    if matches!(
-        outcome,
-        DispatchOutcome::SubReturn { .. }
-            | DispatchOutcome::SubRaise { .. }
-            | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
-    ) {
-        fbw_foriter_inflight_truncate(inflight_depth_before_subwalk);
+    if let Some(owner) = callee_inflight_owner
+        && matches!(
+            outcome,
+            DispatchOutcome::SubReturn { .. }
+                | DispatchOutcome::SubRaise { .. }
+                | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
+        )
+    {
+        fbw_foriter_inflight_popframe(owner);
     }
     match outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -14883,7 +14889,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     }
     let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body_coord);
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body_coord);
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
 
     let _roots = pyre_object::gc_roots::push_roots();
@@ -14993,7 +14999,12 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    fbw_foriter_inflight_capture(concrete_item, body_coord, false);
+    fbw_foriter_inflight_capture(
+        InflightForiterOwner::current(ctx.session),
+        concrete_item,
+        body_coord,
+        false,
+    );
     ctx.frame_state.borrow_mut().vstack_last_ref = item_op;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -16063,7 +16074,7 @@ fn walk_generator_resume<Sym: WalkSym>(
 
     let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body_coord);
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body_coord);
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
     let executed_effects_before = fbw_executed_effect_count();
 
@@ -16264,7 +16275,12 @@ fn walk_generator_resume<Sym: WalkSym>(
         return Ok(None);
     };
     write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
-    fbw_foriter_inflight_capture(concrete_item, body_coord, false);
+    fbw_foriter_inflight_capture(
+        InflightForiterOwner::current(ctx.session),
+        concrete_item,
+        body_coord,
+        false,
+    );
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
     let _ = code_root;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))

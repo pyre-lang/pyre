@@ -16955,17 +16955,32 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // frame/ec seeding so a reused color resolves to the live stack value.
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
-    let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
+    //
+    // `consume_boxes` (`resume.py rebuild_from_resumedata`) refills every live
+    // register of the rebuilt MIFrame, so the locals/cells prefix lands at its
+    // colors too: a local the body keeps in a color across the resume
+    // coordinate is read from that color, not reloaded from the frame. A
+    // colored jitcode with no color for a prefix slot at this coordinate keeps
+    // that local in the frame alone; only an uncolored skeleton/fixture has the
+    // identity layout.
+    let pcdep_trivia = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc);
+    let colored = pcdep_trivia.is_some();
+    let pcdep = pcdep_trivia.unwrap_or_default();
     // The allocate path re-reads Refs from the still-live shadow-stack pins
     // after every collecting call. The resume path uses the recorder cell
     // (`rooted_recipe_ref`) so a copy in `recipe.concrete_r` cannot go stale
     // across `assemble_bridge_inline_pending`.
-    for k in stack_base..valuestackdepth {
+    for k in 0..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
             continue;
         }
-        let color = match reconstructed_ref_slot_color(&pcdep, k) {
+        let color = if k < stack_base && colored {
+            semantic_slot_color_for_ref_slot(&pcdep, k)
+        } else {
+            reconstructed_ref_slot_color(&pcdep, k)
+        };
+        let color = match color {
             Some(color) => color,
             // An entirely uncolored skeleton/fixture retains the historical
             // identity layout.  Once a per-PC color map exists, however, an
@@ -16987,8 +17002,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // emitted specialization stays runtime-correct (guard_class + int_op on
         // the unboxed register); the concrete is only the tracing shadow, as for
         // any resumed operand. Skips constants (`constants.get_value` is
-        // authoritative) and non-value (`Void`) slots.
-        if !opref.is_constant() {
+        // authoritative) and non-value (`Void`) slots, and the prefix, which
+        // `restamp_reconstructed_callee_prefix` already stamped.
+        if k >= stack_base && !opref.is_constant() {
             if let Some(v @ majit_ir::Value::Int(_)) = recipe.concrete_r.get(k).copied() {
                 ctx.set_opref_concrete(opref, v);
             } else if let Some(majit_ir::Value::Ref(gc)) = recipe.concrete_r.get(k).copied()

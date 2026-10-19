@@ -10691,7 +10691,7 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     // step, matching the residual executor.
     let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body);
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body);
     // The guard and the helper walk append to `opencoder.py Trace._ops` and
     // can minor-collect; re-read the iterator and its sampled list.
     let iter_pin = residual_call::owner_root_if_gc(iter_obj as usize);
@@ -10764,7 +10764,7 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         if replay {
             unsafe { pyre_object::w_list_iter_set_index(iter_now, index_before + 1) };
         }
-        fbw_foriter_inflight_capture(item, body, true);
+        fbw_foriter_inflight_capture(InflightForiterOwner::current(ctx.session), item, body, true);
     } else if exhausted && replay {
         unsafe { pyre_object::w_list_iter_set_seq(iter_now, pyre_object::PY_NULL) };
     }
@@ -19850,7 +19850,7 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
 
     let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body);
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body);
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // One class guard, as `try_walker_orthodox_list_iter_next` does. The
@@ -19929,7 +19929,12 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
             allocated
         };
         unsafe { pyre_object::functional::w_zip_set_iteration_progress(zip_obj, 1) };
-        fbw_foriter_inflight_capture(concrete_tuple, body, true);
+        fbw_foriter_inflight_capture(
+            InflightForiterOwner::current(ctx.session),
+            concrete_tuple,
+            body,
+            true,
+        );
         ctx.frame_state.borrow_mut().vstack_last_ref = result;
     } else {
         unsafe { pyre_object::functional::w_zip_set_iteration_progress(zip_obj, 0) };
@@ -20012,7 +20017,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
 
     let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body);
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body);
 
     let type_addr = shape.type_addr();
     // The guard appends to `opencoder.py Trace._ops` and can minor-collect.
@@ -20108,7 +20113,12 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     // snapshot that refuse cannot restore, so the next FOR_ITER
     // yields the following item (`fbw_foriter_item_dropped`).
     fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
-    fbw_foriter_inflight_capture(concrete_item_ptr, body, true);
+    fbw_foriter_inflight_capture(
+        InflightForiterOwner::current(ctx.session),
+        concrete_item_ptr,
+        body,
+        true,
+    );
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
     Ok(Some(item))
@@ -20173,7 +20183,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     // this irreversible concrete advance, matching the residual executor.
     let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body);
+    fbw_foriter_inflight_mark_attempt(InflightForiterOwner::current(ctx.session), body);
 
     // guard_class W_IntRangeIterator, unless the operand is already known.
     let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
@@ -20292,7 +20302,12 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     // Same journal as the step-one shape: a root abort that then
     // refuses in-flight delivery must be able to restore the cursor.
     fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
-    fbw_foriter_inflight_capture(concrete_item_ptr, body, true);
+    fbw_foriter_inflight_capture(
+        InflightForiterOwner::current(ctx.session),
+        concrete_item_ptr,
+        body,
+        true,
+    );
     // Range iteration stays at the C level, so the operand-stack mirror
     // remains valid and must receive the item produced by FOR_ITER.  Its
     // virtual state is captured by subsequent body-guard snapshots.
