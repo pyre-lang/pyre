@@ -9184,7 +9184,7 @@ pub struct ResumeRefRootsScope {
 }
 
 impl ResumeRefRootsScope {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         ResumeRefRootsScope {
             base_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
         }

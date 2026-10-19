@@ -506,6 +506,25 @@ pub fn closedbg_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_CLOSEDBG").is_some())
 }
 
+/// Cached env-var presence: 0 uninit, 1 absent, 2 present.
+/// Same load shape as `have_debug_prints` / `OP_HAVE_DEBUG_PRINTS`.
+#[inline(always)]
+pub(crate) fn env_presence_flag(flag: &std::sync::atomic::AtomicU8, init: fn() -> bool) -> bool {
+    match flag.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => env_presence_flag_init(flag, init),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn env_presence_flag_init(flag: &std::sync::atomic::AtomicU8, init: fn() -> bool) -> bool {
+    let on = init();
+    flag.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
 /// `MAJIT_BH_DEBUG`. `setposition` reads this on every resume.
 ///
 /// A `OnceLock` is an acquire load of the cell on every call.
@@ -530,10 +549,15 @@ fn bh_debug_enabled_init() -> bool {
     on
 }
 
+static CALLEE_RCA_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 #[inline]
 pub fn callee_rca_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_CALLEE_RCA").is_some())
+    env_presence_flag(&CALLEE_RCA_FLAG, callee_rca_enabled_init)
+}
+
+fn callee_rca_enabled_init() -> bool {
+    std::env::var_os("MAJIT_CALLEE_RCA").is_some()
 }
 
 pub fn nbody_debug_enabled() -> bool {

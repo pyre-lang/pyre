@@ -815,6 +815,11 @@ fn host_fixed_list_alloc(payload: usize) -> *mut u8 {
 /// `framework.py` `push_roots` / `pop_roots` for a handful of list
 /// locals around a collecting call (`shadowstack.py` `incr_stack` /
 /// `decr_stack`).
+///
+/// The shadow stack holds the livevars. A collection rewrites those
+/// slots. The `FixedSignedList` copies in `IrfLists` / `IrLists` /
+/// `RList` are not the slots, so a later use reloads through [`Self::get`]
+/// (`gc_pop_roots` writing livevars back).
 pub struct ListRootGuard {
     slot: majit_gc::shadow_stack::ShadowStackSlot,
     depth: usize,
@@ -826,11 +831,18 @@ impl ListRootGuard {
         let slot = majit_gc::shadow_stack::shadow_stack_slot();
         let depth = slot.depth();
         for &g in refs {
-            if g.0 != 0 {
-                slot.push(g);
-            }
+            // Include nulls so `get(i)` matches `refs[i]`. `walk_stack_root`
+            // skips a null content the same way `if content:` does.
+            slot.push(g);
         }
         Self { slot, depth }
+    }
+
+    /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`: the
+    /// forwarded livevar after a collecting call.
+    #[inline]
+    pub fn get(&self, i: usize) -> GcRef {
+        self.slot.get(self.depth + i)
     }
 }
 
@@ -882,15 +894,23 @@ impl FixedSignedList {
         if fresh.0 == 0 {
             majit_gc::gc_alloc_failed(payload);
         }
-        // `malloc_varsize` does not zero items. `gct_zero_gc_pointers_inside`
-        // is elided when every GCREF slot is stored before the next
-        // collection point (`_ll_alloc_and_set_nojit`). `fill_from_code`
-        // is that store; this object is not rooted until the caller
-        // finishes filling.
+        // `malloc_varsize` leaves items uninitialized. `ll_newlist` then
+        // `gct_zero_gc_pointers_inside` (`rlist.py` `_ll_alloc_and_set_nojit`
+        // GcPtr arm) so a collection that reaches the array traces nulls,
+        // not leftover nursery words. `fill_from_code` overwrites every
+        // slot; the barrier runs after those stores (`read_list_from`).
+        // `needs` is the old-gen birth flag; the barrier is delayed so a
+        // minor cannot scan zeros, re-arm `TRACK_YOUNG_PTRS`, and miss
+        // young pointers stored afterwards (`remember_young_pointer`).
+        let _ = needs;
         unsafe {
             *(fresh.0 as *mut usize) = len;
-            if needs {
-                majit_gc::gc_write_barrier(fresh);
+            if gc_ptrs && len > 0 {
+                std::ptr::write_bytes(
+                    (fresh.0 as *mut u8).add(offset),
+                    0,
+                    len * std::mem::size_of::<i64>(),
+                );
             }
         }
         Self {
@@ -925,6 +945,8 @@ impl FixedSignedList {
     /// Fill `0..len` from the bytecode that named that length
     /// (`ll_setitem_nonneg` without a bounds check). A young nursery
     /// array does not take a write barrier (`_ll_alloc_and_set_nojit`).
+    /// An old-gen R array is barriered by the caller after this store
+    /// (`gc_write_barrier` / `remember_young_pointer`).
     #[inline]
     pub fn fill_from_code(&mut self, regs: &[i64], code: &[u8], start: usize) {
         let len = self.header_len();
@@ -978,6 +1000,15 @@ mod tests {
         let copy = list;
         assert_eq!(&copy[..], &[1, 2, 3]);
         assert_eq!(copy.as_gcref(), list.as_gcref());
+    }
+
+    #[test]
+    fn fixed_signed_list_r_kind_items_are_null_before_fill() {
+        // `gct_zero_gc_pointers_inside` / `ll_newlist`: GCREF slots are
+        // null until `fill_from_code`. Host `alloc_zeroed` already is;
+        // the GC bump writes only the tid (`malloc_fast`).
+        let list = super::FixedSignedList::alloc_with_roots(4, true, &mut []);
+        assert_eq!(&list[..], &[0, 0, 0, 0]);
     }
 
     #[test]

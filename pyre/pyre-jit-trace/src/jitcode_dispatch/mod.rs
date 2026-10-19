@@ -11743,11 +11743,15 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // a contradictory pair is folded out by the optimizer's constant-class
     // handling, which discards the trace rather than reading a wild slot.
     let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
+    // Every guard below appends to `opencoder.py Trace._ops` and can
+    // minor-collect. Box `w_type` before the first one; `w_type` is a copy.
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(layout_type_addr);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
+    let w_type = walker_concrete_ref_object(ctx, w_type_const).unwrap_or(w_type);
 
     // `typedef.py _getusercls` gives a builtin user subclass a generated payload
     // containing MapdictStorageMixin, and the GuardClass above already
@@ -11760,7 +11764,6 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // lookup precedence without changing that map. Pin the receiver type's
     // version tag so such a mutation revokes the loop before the folded
     // storage access is reused.
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
     // guard_value(getfield_gc_i(obj, map), C_map): `jit.promote(self.map)`
@@ -12004,20 +12007,53 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
+/// [`pyre_interpreter::TypeAttrBinding`] with its object words boxed as
+/// `history.py` `ConstPtr`s. A fold's guards run between the oracle and
+/// [`walker_pin_type_attr_binding`] and can minor-collect; the box is
+/// forwarded, the copy inside the binding is not.
+#[derive(Clone, Copy)]
+enum TypeAttrBindingBox {
+    Unbound,
+    UnboundHeap { w_value: OpRef },
+    Function,
+    StaticMethod { w_wrapper: OpRef },
+}
+
+fn box_type_attr_binding<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    binding: pyre_interpreter::TypeAttrBinding,
+) -> TypeAttrBindingBox {
+    match binding {
+        pyre_interpreter::TypeAttrBinding::Unbound => TypeAttrBindingBox::Unbound,
+        pyre_interpreter::TypeAttrBinding::Function => TypeAttrBindingBox::Function,
+        pyre_interpreter::TypeAttrBinding::UnboundHeap { w_value } => {
+            TypeAttrBindingBox::UnboundHeap {
+                w_value: ctx.trace_ctx.const_ref(w_value as i64),
+            }
+        }
+        pyre_interpreter::TypeAttrBinding::StaticMethod { w_wrapper } => {
+            TypeAttrBindingBox::StaticMethod {
+                w_wrapper: ctx.trace_ctx.const_ref(w_wrapper as i64),
+            }
+        }
+    }
+}
+
 /// Pin whatever the class-MRO value's `space.get` arm depends on beyond the
 /// receiver type's version tag, as [`pyre_interpreter::type_attr_value_fast_path`]
 /// reported it.
 fn walker_pin_type_attr_binding<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-    binding: pyre_interpreter::TypeAttrBinding,
+    binding: TypeAttrBindingBox,
 ) -> Result<(), DispatchError> {
     match binding {
         // Neither arm reads a field of the value, so the version tag that
         // covers rebinding the name is already the whole precondition.
-        pyre_interpreter::TypeAttrBinding::Unbound
-        | pyre_interpreter::TypeAttrBinding::Function => Ok(()),
-        pyre_interpreter::TypeAttrBinding::UnboundHeap { w_value } => {
+        TypeAttrBindingBox::Unbound | TypeAttrBindingBox::Function => Ok(()),
+        TypeAttrBindingBox::UnboundHeap {
+            w_value: value_const,
+        } => {
             // `descr_getattribute` → `space.get` looks up `__get__` on
             // `type(w_value)`.  The payload type's `_version_tag?` is what
             // `mutated` moves when that class gains `__get__`.
@@ -12026,16 +12062,19 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
             // alone, so the class word is pinned on the value itself.
             // `type_attr_value_fast_path` only reports this arm when the
             // payload type exists and its version tag is nonzero.
+            let Some(w_value) = walker_concrete_ref_object(ctx, value_const) else {
+                return Ok(());
+            };
             let Some(value_type) = pyre_interpreter::typedef::r#type(w_value) else {
                 return Ok(());
             };
+            // The first record can minor-collect; box the type before it.
             let type_const = ctx.trace_ctx.const_ref(value_type.as_ptr() as i64);
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 type_const,
                 crate::descr::type_version_tag_descr(),
             );
-            let value_const = ctx.trace_ctx.const_ref(w_value as i64);
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 value_const,
@@ -12043,7 +12082,9 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
             );
             walker_flush_guard_not_invalidated(ctx, op_pc)
         }
-        pyre_interpreter::TypeAttrBinding::StaticMethod { w_wrapper } => {
+        TypeAttrBindingBox::StaticMethod { w_wrapper } => {
+            let w_wrapper =
+                walker_concrete_ref_object(ctx, w_wrapper).unwrap_or(std::ptr::null_mut());
             walker_pin_descriptor_slot(
                 ctx,
                 op_pc,
@@ -12386,8 +12427,11 @@ fn walker_pin_instance_w_class<Sym: WalkSym>(
     expected_typeobj: pyre_object::PyObjectRef,
 ) -> Result<OpRef, DispatchError> {
     let descr = crate::descr::w_class_descr();
-    let actual = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
+    // The getfield appends to `opencoder.py Trace._ops` and can minor-collect.
+    // Box the class first: the `ConstPtr` is forwarded, the copy is not.
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
+    let actual = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
+    let expected_typeobj = walker_concrete_ref_object(ctx, expected).unwrap_or(expected_typeobj);
     if walker_ref_box_is(ctx, actual, expected_typeobj) {
         return Ok(expected);
     }

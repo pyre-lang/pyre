@@ -2374,6 +2374,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         && let Some((w_type, version_tag, map)) =
             unsafe { pyre_interpreter::objspace::std::mapdict::class_descr_fast_path(concrete_obj) }
     {
+        // The shape guard can minor-collect: box `w_type` before it.
+        let value = ctx.trace_ctx.const_ref(w_type as i64);
         walker_guard_mapdict_instance_shape(
             ctx,
             op_pc,
@@ -2383,7 +2385,6 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             version_tag,
             map,
         )?;
-        let value = ctx.trace_ctx.const_ref(w_type as i64);
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
     }
@@ -2403,6 +2404,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // holds the `OpRef` in the walker's `registers_r`, is what
         // `InlineRegisterBankGuard` (`miframe_registers`) walks.  So a class
         // attribute allocated in the nursery folds like any other object.
+        // The raw `w_value` is not one of those holders: box it before the
+        // shape guard, which can minor-collect.
+        let value = ctx.trace_ctx.const_ref(w_value as i64);
         walker_guard_mapdict_instance_shape(
             ctx,
             op_pc,
@@ -2412,7 +2416,6 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             version_tag,
             map,
         )?;
-        let value = ctx.trace_ctx.const_ref(w_value as i64);
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
     }
@@ -2951,6 +2954,8 @@ fn walker_emit_shadow_guard<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     shadow: ShadowGuard,
 ) -> Result<(), DispatchError> {
+    // The caller's guards can minor-collect; `concrete_obj` is a copy of `obj`.
+    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
     let (slot_op, slot_const, shadow_guard) = match shadow {
         ShadowGuard::InstanceMap(map) => (
             walker_record_getfield_gc_i_uncached(ctx, obj, unsafe {
@@ -3053,11 +3058,12 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // payload vtable side-exits instead of reusing the caller's method.
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
+    // The guards can minor-collect: box `w_descr` before them.
+    let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
     walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
 
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
 
-    let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_const)?;
     Ok(Some(()))
 }
@@ -3086,17 +3092,19 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
         return Ok(None);
     };
+    // The guards can minor-collect: box the cell before them.
+    let cell_const = ctx.trace_ctx.const_ref(cell as i64);
     walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     // Do not stamp the payload.  The following CALL must invoke whatever
     // `w_value` holds, not the function that was there at record time.
-    let value = walker_read_object_mutable_cell_stamped(ctx, cell, false);
+    let value = walker_read_object_mutable_cell_stamped(ctx, cell_const, false);
     // `load_method_cell_fast_path` admitted this name because the payload's
     // type carries `flag_method_descriptor`, which is what decides the
     // `(method, self)` pair the paired self-fold writes.  An in-place rebind
     // can replace the method with a `property`; the guard is what makes that
     // side-exit instead of binding a receiver to it.
-    walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell)?;
+    walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell_const)?;
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
 }
@@ -3179,9 +3187,9 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
 
 fn walker_read_object_mutable_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    cell: pyre_object::PyObjectRef,
+    cell_op: OpRef,
 ) -> OpRef {
-    walker_read_object_mutable_cell_stamped(ctx, cell, true)
+    walker_read_object_mutable_cell_stamped(ctx, cell_op, true)
 }
 
 /// `stamp` is false when a later op must not treat the payload as a green
@@ -3190,16 +3198,17 @@ fn walker_read_object_mutable_cell<Sym: WalkSym>(
 /// iteration instead of calling the function the `getfield` just read.
 fn walker_read_object_mutable_cell_stamped<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    cell: pyre_object::PyObjectRef,
+    cell_op: OpRef,
     stamp: bool,
 ) -> OpRef {
-    let cell_op = ctx.trace_ctx.const_ref(cell as i64);
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_op,
         crate::descr::object_mutable_cell_value_descr(),
     );
     if stamp {
+        // The getfield can minor-collect; read the cell through its box.
+        let cell = walker_const_ref_object(ctx, cell_op);
         let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
         ctx.trace_ctx
             .set_opref_concrete(value, majit_ir::Value::Ref(majit_ir::GcRef(live as usize)));
@@ -3233,8 +3242,9 @@ fn walker_guard_object_mutable_cell_payload<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     value: OpRef,
-    cell: pyre_object::PyObjectRef,
+    cell_op: OpRef,
 ) -> Result<(), DispatchError> {
+    let cell = walker_const_ref_object(ctx, cell_op);
     let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
     let physical_type = unsafe { (*live).ob_type } as i64;
     let type_const = ctx.trace_ctx.const_int(physical_type);
@@ -3246,14 +3256,15 @@ fn walker_guard_object_mutable_cell_payload<Sym: WalkSym>(
 fn walker_read_int_mutable_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-    cell: pyre_object::PyObjectRef,
+    cell_op: OpRef,
 ) -> Result<OpRef, DispatchError> {
-    let cell_op = ctx.trace_ctx.const_ref(cell as i64);
     let raw = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         cell_op,
         crate::descr::int_mutable_cell_value_descr(),
     );
+    // The getfield can minor-collect; read the cell through its box.
+    let cell = walker_const_ref_object(ctx, cell_op);
     let live = unsafe { (*(cell as *const pyre_object::celldict::IntMutableCell)).intvalue };
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Int(live));
@@ -3301,6 +3312,8 @@ fn walker_fold_type_name<Sym: WalkSym>(
     // pre-rename pointer after `invalidate_then_store` completed with no
     // watcher. Re-read after the record, the same order as the `getfield`
     // that follows `record_quasiimmut_field` on the rewritten load.
+    // The guards can minor-collect; `concrete_obj` is a copy of the type box.
+    let concrete_obj = walker_const_ref_object(ctx, w_type_const);
     let w_name = unsafe { pyre_object::typeobject::w_type_peek_name_obj(concrete_obj) };
     if w_name.is_null() {
         return Ok(None);
@@ -3331,14 +3344,17 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
     {
         return Ok(None);
     }
+    // Every record below can minor-collect: box the cell before the first.
+    let int_cell = unsafe { pyre_object::celldict::is_int_mutable_cell(cell) };
+    let cell_const = ctx.trace_ctx.const_ref(cell as i64);
     walker_guard_stamped_type_version(ctx, op_pc, obj, w_type)?;
-    let value = if unsafe { pyre_object::celldict::is_int_mutable_cell(cell) } {
+    let value = if int_cell {
         // An `IntMutableCell` only ever holds an int: `write_cell`'s in-place
         // arm stores `intval`, so the payload cannot change shape and the
         // boxing below is the whole of the binding.
-        walker_read_int_mutable_cell(ctx, op_pc, cell)?
+        walker_read_int_mutable_cell(ctx, op_pc, cell_const)?
     } else {
-        let value = walker_read_object_mutable_cell(ctx, cell);
+        let value = walker_read_object_mutable_cell(ctx, cell_const);
         // `type_attr_cell_fast_path` admitted this name because the payload's
         // type has no `__get__` -- the arm where `get` returns the value
         // unchanged.  An in-place rebind can put a descriptor there.
@@ -3347,12 +3363,15 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
         // to a descriptor of another class still passes it.  `space.get`
         // finds `__get__` on `w_class`, and that guard resumes at this
         // LOAD_ATTR.
-        walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell)?;
+        walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell_const)?;
+        let cell = walker_const_ref_object(ctx, cell_const);
         let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
         let live_class = unsafe { (*live).w_class };
         if !live_class.is_null() {
             walker_pin_instance_w_class(ctx, op_pc, value, live_class)?;
         }
+        let cell = walker_const_ref_object(ctx, cell_const);
+        let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
         // A heap type can grow `__get__` without this receiver's version tag
         // moving. Pin the payload type so that edit invalidates the trace.
         if let Some(value_type) = pyre_interpreter::typedef::r#type(live)
@@ -3423,8 +3442,9 @@ fn walker_fold_slot_wrapper_on_type<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    walker_guard_stamped_type_version(ctx, op_pc, obj, concrete_obj)?;
+    // The guard can minor-collect: box the wrapper before it.
     let value_const = ctx.trace_ctx.const_ref(value as i64);
+    walker_guard_stamped_type_version(ctx, op_pc, obj, concrete_obj)?;
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value_const)?;
     Ok(Some(()))
 }
@@ -3481,10 +3501,12 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
         return walker_fold_type_attr_cell(ctx, op_pc, obj, concrete_obj, name.as_str(), dst);
     };
 
+    // The guards can minor-collect: box the value and the binding first.
+    let value_const = ctx.trace_ctx.const_ref(w_value as i64);
+    let binding = box_type_attr_binding(ctx, binding);
     walker_guard_stamped_type_version(ctx, op_pc, obj, w_type)?;
     walker_pin_type_attr_binding(ctx, op_pc, binding)?;
 
-    let value_const = ctx.trace_ctx.const_ref(w_value as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value_const)?;
     Ok(Some(()))
 }
@@ -5191,6 +5213,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     };
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, version_tag, map)?;
     unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
+    // The shape guard can minor-collect. `concrete_obj` is a copy of `obj`.
+    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
     // mapdict.py `PlainAttribute._direct_write` →
     // `obj._mapdict_write_storage(self.storageindex, w_value)`: one
@@ -5203,7 +5227,10 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     });
     crate::state::trace_mapdict_storage_setitem(ctx.trace_ctx, block, storageindex_const, value);
     // The walk is the authoritative execution path, so apply the write now;
-    // the ops above reproduce it in compiled code.
+    // the ops above reproduce it in compiled code. Both records can
+    // minor-collect; re-read both copies from their boxes.
+    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+    let concrete_value = live_box_ref(ctx, value, concrete_value);
     unsafe {
         pyre_interpreter::objspace::std::mapdict::write_boxed_storage(
             concrete_obj,
@@ -11271,14 +11298,21 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // Every guard below can minor-collect: box each word before the first.
+    let value_const = ctx.trace_ctx.const_ref(w_value as i64);
+    let binding = box_type_attr_binding(ctx, binding);
+    let w_type_box = ctx.trace_ctx.const_ref(w_type as i64);
+    let name_box = ctx.trace_ctx.const_ref(concrete_name as i64);
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
 
+    let w_type = walker_const_ref_object(ctx, w_type_box);
     let w_type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[2], w_type)?;
 
     // The baked WTF-8 bytes remain constant only while this exact string is
     // the name operand.  Constant operands make this guard a removable
     // tautology, so it costs nothing in the steady loop.
     let name_ref = r_args[3];
+    let concrete_name = walker_const_ref_object(ctx, name_box);
     walker_guard_stamped_ref_pin(ctx, op.pc, name_ref, concrete_name)?;
 
     // typeobject.py `promote(self.version_tag())`: this quasi-immutable watcher
@@ -11287,7 +11321,6 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
     walker_pin_type_version_tag(ctx, op.pc, w_type_const)?;
     walker_pin_type_attr_binding(ctx, op.pc, binding)?;
 
-    let value_const = ctx.trace_ctx.const_ref(w_value as i64);
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', value_const)?;
     Ok(Some(()))
 }
@@ -16813,6 +16846,15 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
 ///
 /// `copied` is a Rust local. `history.py` `RefFrontendOp` / `getref_base`
 /// is the box the minor collector updates; this local is not.
+/// `history.py` `ConstPtr.value` of a box `const_ref` minted: the word the
+/// collector forwarded, where a raw copy taken before a guard is stale.
+fn walker_const_ref_object<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: OpRef,
+) -> pyre_object::PyObjectRef {
+    walker_concrete_ref_object(ctx, op).unwrap_or(std::ptr::null_mut())
+}
+
 fn live_box_ref<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: OpRef,

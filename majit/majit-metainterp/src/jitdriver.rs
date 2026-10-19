@@ -576,9 +576,15 @@ pub fn spdiag_enabled() -> bool {
 /// guard-failure entry point has to honour it there too — gating only the
 /// jitdriver-internal paths leaves the variable set but inert, which reads as
 /// "bridges are off" while they keep recording.
+static NO_BRIDGE_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline]
 pub fn no_bridge_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| crate::jit_env::env_var_os("MAJIT_NO_BRIDGE").is_some())
+    crate::env_presence_flag(&NO_BRIDGE_FLAG, no_bridge_enabled_init)
+}
+
+fn no_bridge_enabled_init() -> bool {
+    crate::jit_env::env_var_os("MAJIT_NO_BRIDGE").is_some()
 }
 /// `MAJIT_SKIP_BRIDGES=a,b,...` (diagnostic): decline exactly the listed
 /// `MAJIT_MAX_BRIDGES` sequence numbers and take every other one.  Where the
@@ -669,14 +675,26 @@ fn guardlog_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
 }
+static FAILVALS_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline]
 fn failvals_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_FAILVALS").is_some())
+    crate::env_presence_flag(&FAILVALS_FLAG, failvals_enabled_init)
 }
+
+fn failvals_enabled_init() -> bool {
+    std::env::var_os("MAJIT_FAILVALS").is_some()
+}
+
+static PORTAL_RCA_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 #[inline]
 fn portal_rca_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_PORTAL_RCA").is_some())
+    crate::env_presence_flag(&PORTAL_RCA_FLAG, portal_rca_enabled_init)
+}
+
+fn portal_rca_enabled_init() -> bool {
+    std::env::var_os("MAJIT_PORTAL_RCA").is_some()
 }
 
 // ── warm-entry stage probe ───────────────────────────────────────────────
