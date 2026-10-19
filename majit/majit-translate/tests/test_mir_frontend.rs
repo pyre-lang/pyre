@@ -2896,7 +2896,7 @@ fn a_closure_indexes_its_captured_slice_through_the_pair() {
     );
 }
 
-/// `CodeFlags::{contains,intersects,bitor}` on the real interpreter bodies
+/// `CodeFlags::{contains,intersects,bitor,bits}` on the real interpreter bodies
 /// lower to integer ops. The external `bitflags` methods stay opaque in the
 /// LLBC, so a residual call would name an unresolvable `CodeFlags` path.
 #[test]
@@ -2908,10 +2908,12 @@ fn code_flags_methods_lower_to_integer_ops() {
         &["CodeFlags", "contains"],
         &["CodeFlags", "intersects"],
         &["CodeFlags", "bitor"],
+        &["CodeFlags", "bits"],
     ];
     for name in [
         "fill_user_function_args",
         "pyre_interpreter::pyframe::code_flags_make_generator",
+        "fast2locals",
     ] {
         let graph = lower_named(llbc, name).unwrap_or_else(|e| panic!("lower {name}: {e}"));
         let calls: Vec<Vec<String>> = graph

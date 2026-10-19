@@ -1,0 +1,23 @@
+//! `pypy/interpreter/astcompiler/consts.py` — code-object flag bits.
+
+pub const CO_OPTIMIZED: u32 = 0x0001;
+pub const CO_NEWLOCALS: u32 = 0x0002;
+pub const CO_VARARGS: u32 = 0x0004;
+pub const CO_VARKEYWORDS: u32 = 0x0008;
+pub const CO_NESTED: u32 = 0x0010;
+pub const CO_GENERATOR: u32 = 0x0020;
+pub const CO_NOFREE: u32 = 0x0040;
+pub const CO_COROUTINE: u32 = 0x0080;
+pub const CO_ITERABLE_COROUTINE: u32 = 0x0100;
+pub const CO_ASYNC_GENERATOR: u32 = 0x0200;
+pub const CO_GENERATOR_ALLOWED: u32 = 0x1000;
+pub const CO_FUTURE_DIVISION: u32 = 0x20000;
+pub const CO_FUTURE_ABSOLUTE_IMPORT: u32 = 0x40000;
+pub const CO_FUTURE_WITH_STATEMENT: u32 = 0x80000;
+pub const CO_FUTURE_PRINT_FUNCTION: u32 = 0x100000;
+pub const CO_FUTURE_UNICODE_LITERALS: u32 = 0x200000;
+pub const CO_FUTURE_BARRY_AS_BDFL: u32 = 0x400000;
+pub const CO_FUTURE_GENERATOR_STOP: u32 = 0x800000;
+pub const CO_FUTURE_ANNOTATIONS: u32 = 0x1000000;
+pub const CO_KILL_DOCSTRING: u32 = 0x2000000;
+pub const CO_YIELD_INSIDE_TRY: u32 = 0x4000000;

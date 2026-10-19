@@ -289,16 +289,11 @@ pub mod frame_locals_proxy {
             if slot < locals_w!(frame).len() {
                 let raw = locals_w!(frame)[slot];
                 let cellish = if slot < numlocals {
-                    slot < code.localspluskinds.len()
-                        && code.localspluskinds[slot] & crate::bytecode::CO_FAST_CELL != 0
+                    super::cell_slot(code, slot)
                 } else {
                     true
                 };
-                let value = if cellish && !raw.is_null() && unsafe { pyre_object::is_cell(raw) } {
-                    unsafe { pyre_object::w_cell_get(raw) }
-                } else {
-                    raw
-                };
+                let value = super::unwrap_localsplus_slot(cellish, raw);
                 if !value.is_null() {
                     let item = if part == 0 {
                         interned_localsplus_name(code, slot)
@@ -573,8 +568,12 @@ pub mod frame_locals_proxy {
             let value_slot = key_slot + 1;
             if let Some(index) = self.fast_local_index(roots.get(key_slot))? {
                 let frame = self.frame();
+                let is_cell_slot = {
+                    let code = frame.code();
+                    index >= code.varnames.len() || super::cell_slot(code, index)
+                };
                 let slot = locals_w!(frame)[index];
-                if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                if is_cell_slot && !slot.is_null() {
                     unsafe { pyre_object::w_cell_set(slot, roots.get(value_slot)) };
                 } else {
                     frame.set_locals_w(index, roots.get(value_slot));
@@ -693,14 +692,7 @@ pub mod frame_locals_proxy {
                         let frame = self.frame();
                         if $index < locals_w!(frame).len() {
                             let slot = locals_w!(frame)[$index];
-                            let value = if $is_cell
-                                && !slot.is_null()
-                                && unsafe { pyre_object::is_cell(slot) }
-                            {
-                                unsafe { pyre_object::w_cell_get(slot) }
-                            } else {
-                                slot
-                            };
+                            let value = super::unwrap_localsplus_slot($is_cell, slot);
                             if !value.is_null() {
                                 return Ok(Some(value));
                             }
@@ -789,12 +781,7 @@ pub mod frame_locals_proxy {
                     continue;
                 }
                 let slot = locals_w!(frame)[index];
-                let value = if cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) }
-                {
-                    unsafe { pyre_object::w_cell_get(slot) }
-                } else {
-                    slot
-                };
+                let value = super::unwrap_localsplus_slot(cell_slot, slot);
                 // `framelocalsproxy_hasval`: an unbound slot names no entry.
                 if value.is_null() {
                     continue;
@@ -843,12 +830,7 @@ pub mod frame_locals_proxy {
                     continue;
                 }
                 let slot = locals_w!(frame)[index];
-                let value = if cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) }
-                {
-                    unsafe { pyre_object::w_cell_get(slot) }
-                } else {
-                    slot
-                };
+                let value = super::unwrap_localsplus_slot(cell_slot, slot);
                 // `framelocalsproxy_hasval`.
                 if !value.is_null() {
                     size += 1;
@@ -2094,7 +2076,7 @@ impl FrameBox {
         let register_final = unsafe {
             crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
         };
-        let is_coroutine = self.code().flags.contains(crate::CodeFlags::COROUTINE);
+        let is_coroutine = self.co_flags() & crate::astcompiler::consts::CO_COROUTINE != 0;
         let _origin_roots = pyre_object::gc_roots::push_roots();
         // Static pins: an absent name, qualname or origin pins null.
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2140,12 +2122,10 @@ impl FrameBox {
         // frames have their own object type.  In particular, a Coroutine is
         // awaitable but is not itself an iterator; `__await__` supplies the
         // separate CoroutineWrapper iterator.
-        let generator = if unsafe {
-            (*frame_ptr)
-                .code()
-                .flags
-                .contains(crate::CodeFlags::ASYNC_GENERATOR)
-        } {
+        let generator = if unsafe { &(*frame_ptr) }.co_flags()
+            & crate::astcompiler::consts::CO_ASYNC_GENERATOR
+            != 0
+        {
             pyre_object::generator::w_async_generator_new(
                 frame_ptr as pyre_object::gc_hook::GCREF,
                 pycode,
@@ -3260,6 +3240,28 @@ fn cell_slot(code: &CodeObject, idx: usize) -> bool {
         && code.localspluskinds[idx] & crate::bytecode::CO_FAST_CELL != 0
 }
 
+/// `pyframe.py fast2locals`: a cellvar/freevar slot holds the Cell; the
+/// mapping gets `cell.get()`. An empty cell is skipped (contents `None`).
+#[inline]
+fn unwrap_cell_slot(slot: PyObjectRef) -> PyObjectRef {
+    if slot.is_null() {
+        PY_NULL
+    } else {
+        unsafe { pyre_object::w_cell_get(slot) }
+    }
+}
+
+/// Localsplus read: a `CO_FAST_CELL` / extra-band slot is always a Cell
+/// after `MAKE_CELL`, so the mapping stores `cell.get()`, not the Cell.
+#[inline]
+fn unwrap_localsplus_slot(is_cell_slot: bool, slot: PyObjectRef) -> PyObjectRef {
+    if is_cell_slot {
+        unwrap_cell_slot(slot)
+    } else {
+        slot
+    }
+}
+
 /// The frame's locals-plus slots in `co_localsplusnames` order — every
 /// `varnames` entry, then the `cellvars` that are not already varnames, then
 /// the `freevars` — each paired with its slot index and whether the slot holds
@@ -4220,11 +4222,11 @@ impl PyFrame {
     /// The binding is the canonical `W_DictObject`, not the raw `DictStorage`
     /// proxy, so those opcodes route through the object.
     fn bind_unoptimized_locals_scope(&mut self) {
-        let flags = unsafe { (*pyframe_get_pycode(self)).flags };
-        if flags.contains(CodeFlags::OPTIMIZED) {
+        let flags = self.co_flags();
+        if flags & crate::astcompiler::consts::CO_OPTIMIZED != 0 {
             return;
         }
-        if flags.contains(CodeFlags::NEWLOCALS) {
+        if flags & crate::astcompiler::consts::CO_NEWLOCALS != 0 {
             // `build_class` replaces this with the `__prepare__` namespace via
             // `setdictscope`; an orphan NEWLOCALS frame still has a usable
             // mapping.  `newdict(module=True)` — the mapping a class body binds
@@ -4410,7 +4412,7 @@ impl PyFrame {
     /// not here — `jtransform.py rewrite_op_jit_force_virtualizable` deletes
     /// it from jitcode; the interpreter copy still runs.
     pub fn fget_getdictscope(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        if self.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+        if self.co_flags() & crate::astcompiler::consts::CO_OPTIMIZED != 0
             || self.has_active_hidden_locals()
         {
             return Ok(frame_locals_proxy::new(self as *mut PyFrame as PyObjectRef));
@@ -4433,7 +4435,7 @@ impl PyFrame {
     /// Module and class frames keep handing back their real namespace, which
     /// is what makes a module-level `locals() is globals()` still hold.
     pub fn frame_locals_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        if self.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+        if self.co_flags() & crate::astcompiler::consts::CO_OPTIMIZED != 0
             || self.has_active_hidden_locals()
         {
             return self.frame_locals_proxy_snapshot();
@@ -4472,27 +4474,33 @@ impl PyFrame {
     /// read behind it forces the virtualizable for the length of that call.
     #[majit_macros::unroll_safe]
     pub fn frame_locals_proxy_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        // `space.setitem_str` allocates one key per slot and can collect.
+        // RPython's GC transform keeps the frame live across that; FrameAnchor
+        // is the same root `fast2locals` uses. A `locals_plus_names` Vec would
+        // allocate before the first slot read and leave `self` stale, so the
+        // loops index the name arrays in place.
+        let frame_anchor = crate::eval::FrameAnchor::new(self);
         let roots = pyre_object::gc_roots::push_roots();
         let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(unsafe { pyre_object::w_dict_new() });
 
-        let code = self.code();
+        let code = unsafe { (*frame_anchor.live()).getcode() };
+        let varnames = &code.varnames;
+        let numlocals = varnames.len();
         // A plain loop rather than a closure over `self`: a capture path is
         // truncated at a raw-pointer deref, so a closure would capture the
         // `locals_cells_stack_w` field itself and the borrow would read as the
         // address of the virtualizable array instead of a load from it, which
         // suppresses the protocol.  `fast2locals` keeps this shape for the same
         // reason.
-        for (index, name, cell_slot) in locals_plus_names(code) {
-            if index >= locals_w!(self).len() {
+        for i in 0..numlocals {
+            let name = &varnames[i];
+            let frame = unsafe { &*frame_anchor.live() };
+            if i >= locals_w!(frame).len() {
                 continue;
             }
-            let slot = locals_w!(self)[index];
-            let value = if cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
-                unsafe { pyre_object::w_cell_get(slot) }
-            } else {
-                slot
-            };
+            let slot = locals_w!(frame)[i];
+            let value = unwrap_localsplus_slot(cell_slot(code, i), slot);
             if value.is_null() {
                 continue;
             }
@@ -4504,11 +4512,37 @@ impl PyFrame {
             setitem_str_object(roots.get(snapshot_slot), name, roots.get(value_slot))?;
         }
 
+        // `pyframe.py fast2locals`: cellvars then freevars, each through
+        // `cell.get()`. Empty cells are skipped. Positional addressing rather
+        // than a filtered `Vec` because this graph is `unroll_safe`.
+        let npure = npure_cellvars(code);
+        let extra_len = npure + code.freevars.len();
+        for i in 0..extra_len {
+            let name: &str = if i < npure {
+                code.cellvars[nth_pure_cellvar_index(code, i)].as_ref()
+            } else {
+                code.freevars[i - npure].as_ref()
+            };
+            let idx = numlocals + i;
+            let frame = unsafe { &*frame_anchor.live() };
+            if idx >= locals_w!(frame).len() {
+                continue;
+            }
+            let slot = locals_w!(frame)[idx];
+            let value = unwrap_cell_slot(slot);
+            if value.is_null() {
+                continue;
+            }
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(value);
+            setitem_str_object(roots.get(snapshot_slot), name, roots.get(value_slot))?;
+        }
+
         // The extras half comes second, and a key a bound slot already
         // supplied is skipped: `framelocalsproxy_getitem` answers such a key
         // from the slot, so the store would only rewrite the entry with the
         // value it already holds while leaving it at its slot position.
-        let extra = self.get_extra_locals();
+        let extra = unsafe { (*frame_anchor.live()).get_extra_locals() };
         if !extra.is_null() {
             let extra_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(extra);
@@ -6069,6 +6103,7 @@ impl PyFrame {
         let locals_slot = locals_roots.base();
         let _ = locals_roots.pin_root(w_locals);
         let code = unsafe { (*frame_anchor.live()).getcode() };
+        let co_flags = unsafe { (*frame_anchor.live()).co_flags() };
         let numlocals = code.varnames.len();
 
         for i in 0..numlocals {
@@ -6083,9 +6118,8 @@ impl PyFrame {
                 finditem_str_object(locals_roots.get(locals_slot), name)?.unwrap_or(PY_NULL);
             let frame = unsafe { &mut *frame_anchor.live() };
             let slot = locals_w!(frame)[i];
-            let is_cell_slot = i < code.localspluskinds.len()
-                && code.localspluskinds[i] & crate::bytecode::CO_FAST_CELL != 0;
-            if is_cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+            let is_cell_slot = cell_slot(code, i);
+            if is_cell_slot && !slot.is_null() {
                 unsafe { pyre_object::w_cell_set(slot, w_value) };
             } else {
                 frame.set_locals_w(i, w_value);
@@ -6095,7 +6129,8 @@ impl PyFrame {
         // Same positional band as `fast2locals`: a filtered `Vec` would
         // residualize iterator adapters under `unroll_safe`.
         let npure = npure_cellvars(code);
-        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
+        let include_freevars =
+            co_flags & crate::astcompiler::consts::CO_OPTIMIZED != 0 && !skip_free_vars;
         let freevarnames_len = if include_freevars {
             npure + code.freevars.len()
         } else {
@@ -6114,7 +6149,7 @@ impl PyFrame {
                     finditem_str_object(locals_roots.get(locals_slot), name)?.unwrap_or(PY_NULL);
                 let frame = unsafe { &mut *frame_anchor.live() };
                 let slot = locals_w!(frame)[idx];
-                if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                if !slot.is_null() {
                     unsafe { pyre_object::w_cell_set(slot, w_value) };
                 } else {
                     frame.set_locals_w(idx, w_value);
@@ -6164,6 +6199,7 @@ impl PyFrame {
         let locals_slot = locals_roots.base();
         let _ = locals_roots.pin_root(w_locals);
         let code = unsafe { (*frame_anchor.live()).getcode() };
+        let co_flags = unsafe { (*frame_anchor.live()).co_flags() };
         let varnames = &code.varnames;
         let numlocals = varnames.len();
 
@@ -6171,20 +6207,13 @@ impl PyFrame {
             // Non-optimized frames expose a bound hidden slot through a
             // FrameLocalsProxy snapshot instead.  Copying it into the actual
             // module/class namespace would leak the comprehension variable.
-            if hidden_local(code, i) && !code.flags.contains(CodeFlags::OPTIMIZED) {
+            if hidden_local(code, i) && co_flags & crate::astcompiler::consts::CO_OPTIMIZED == 0 {
                 continue;
             }
             let name = &varnames[i];
             let frame = unsafe { &*frame_anchor.live() };
             let slot = locals_w!(frame)[i];
-            let is_cell_slot = i < code.localspluskinds.len()
-                && code.localspluskinds[i] & crate::bytecode::CO_FAST_CELL != 0;
-            let w_value =
-                if is_cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
-                    unsafe { pyre_object::w_cell_get(slot) }
-                } else {
-                    slot
-                };
+            let w_value = unwrap_localsplus_slot(cell_slot(code, i), slot);
             if !w_value.is_null() {
                 setitem_str_object(locals_roots.get(locals_slot), name, w_value)?;
             } else {
@@ -6199,7 +6228,7 @@ impl PyFrame {
         // copying one in publishes a name the body never bound.  A class body
         // carries `__classdict__` as a cell whose value is the namespace
         // itself, and writing that back leaves the namespace holding itself.
-        if !code.flags.contains(CodeFlags::OPTIMIZED) {
+        if co_flags & crate::astcompiler::consts::CO_OPTIMIZED == 0 {
             return Ok(());
         }
         // `freevarnames = co_cellvars` and, under `CO_OPTIMIZED`,
@@ -6229,11 +6258,7 @@ impl PyFrame {
             let frame = unsafe { &*frame_anchor.live() };
             if idx < locals_w!(frame).len() {
                 let slot = locals_w!(frame)[idx];
-                let w_value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
-                    unsafe { pyre_object::w_cell_get(slot) }
-                } else {
-                    slot
-                };
+                let w_value = unwrap_cell_slot(slot);
                 if !w_value.is_null() {
                     setitem_str_object(locals_roots.get(locals_slot), name, w_value)?;
                 } else {
@@ -6619,9 +6644,24 @@ impl PyFrame {
         unsafe { &*pyframe_get_pycode(self) }
     }
 
+    /// `pycode.py` `PyCode.co_flags` — the compiler flag word
+    /// (`astcompiler/consts.py` `CO_*` bits). `CodeFlags` is
+    /// `repr(transparent)` over that `u32`; `bits()` is the word.
+    /// `code_flags_method` lowers the foreign `bitflags` body to a Deref
+    /// of `&self`, so this stays the idiomatic source spelling.
+    #[inline]
+    pub fn co_flags(&self) -> u32 {
+        self.code().flags.bits()
+    }
+
     #[inline]
     pub fn _is_generator_or_coroutine(&self) -> bool {
-        code_flags_make_generator(self.code().flags)
+        let flags = self.co_flags();
+        flags
+            & (crate::astcompiler::consts::CO_GENERATOR
+                | crate::astcompiler::consts::CO_COROUTINE
+                | crate::astcompiler::consts::CO_ASYNC_GENERATOR)
+            != 0
     }
 
     /// pyframe.py initialize_as_generator
@@ -7661,5 +7701,48 @@ x = 7
         let err = crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(key_slot))
             .expect_err("unhashable key");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+    }
+
+    /// `pyframe.py fast2locals`: cellvars and freevars go through `cell.get()`,
+    /// so `locals()` stores the contents, not the Cell. `execute_frame` is the
+    /// interpreter path (`eval.rs` has no JIT).
+    #[test]
+    fn locals_returns_cellvar_and_freevar_values_not_cells() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let source = concat!(
+            "def outer(free):\n",
+            "    captured = 7\n",
+            "    def inner():\n",
+            "        acc = 0\n",
+            "        def peek():\n",
+            "            return acc\n",
+            "        total = 0\n",
+            "        for i in range(40000):\n",
+            "            acc = i\n",
+            "            d = locals()\n",
+            "            total += d['acc'] - i + d['captured'] - captured + d['free'] - free\n",
+            "        return total, peek()\n",
+            "    return inner()\n",
+            "got = outer(8)\n",
+        );
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = super::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .unwrap_or_else(|err| panic!("exec failed: {err:?}"));
+        let w_globals = frame.get_w_globals();
+        let got = unsafe { pyre_object::w_dict_getitem_str(w_globals, "got") }.expect("got");
+        assert!(
+            !unsafe { pyre_object::is_cell(got) },
+            "module result must not be a cell"
+        );
+        assert_eq!(unsafe { pyre_object::w_tuple_len(got) }, 2);
+        let total = unsafe { pyre_object::w_tuple_getitem(got, 0) }.expect("total");
+        let peek = unsafe { pyre_object::w_tuple_getitem(got, 1) }.expect("peek");
+        assert!(!unsafe { pyre_object::is_cell(total) });
+        assert!(!unsafe { pyre_object::is_cell(peek) });
+        assert_eq!(unsafe { pyre_object::w_int_get_value(total) }, 0);
+        assert_eq!(unsafe { pyre_object::w_int_get_value(peek) }, 39999);
     }
 }

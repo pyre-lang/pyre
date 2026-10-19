@@ -17249,6 +17249,100 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// A rustc promoted-const / NamedConst accessor is a `FunDecl` whose
+    /// `src` is `GlobalInitializer` (`FunDecl::is_global_initializer`).
+    /// The body copies an existing `Place::Global` and returns a reference;
+    /// `Place::Global` already folds that inner item (`Constant` for a
+    /// `NamedConst`, `ConstRefAddr` for a prebuilt JitDriver). A body that
+    /// is pure constant construction (a fieldless-enum `Aggregate`, a
+    /// literal) is the same translation-time `flowspace` `Constant`. Emitting
+    /// the accessor as `residual_call` would keep a `symbolic_fnaddr_for_path`
+    /// that `getfunctionptr` never binds (`jtransform.py`
+    /// `Transformer.handle_residual_call`).
+    fn lower_global_initializer_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let gid = fd.is_global_initializer();
+        if gid.is_none() && !fundecl_is_promoted_const(fd) {
+            return Ok(false);
+        }
+        if !call.args.is_empty() {
+            return Ok(false);
+        }
+        let Some(body) = fd.unstructured() else {
+            return Ok(false);
+        };
+        if let Some(inner) = promoted_const_copied_global(&body)
+            && gid != Some(inner_global_id(&inner))
+        {
+            let value = self.resolve_place(mir_bb, inner)?;
+            self.bind_initializer_result(mir_bb, dest_local, target, value)?;
+            return Ok(true);
+        }
+        // `_1 = Aggregate(E::V); _0 = &_1; return` — rustc's promoted
+        // form of a fieldless-enum constant. The by-value model is the
+        // discriminant integer (`tyref_to_value_type` Int / `ConstInt`).
+        if let Some(op) = const_eval_init_body(self.llbc, &body) {
+            let bb_id = self.block_id[mir_bb];
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: op,
+            });
+            self.bind_initializer_result(mir_bb, dest_local, target, res)?;
+            return Ok(true);
+        }
+        // `_1 = const C; _0 = &_1; return` — rustc's promoted form of a
+        // `&str` / integer / fn-item literal. The by-value model is the
+        // same op `build_rvalue` emits for `C` (`__str_const`, `ConstInt`,
+        // `fn_const`).
+        if let Some(value) = promoted_const_copied_const(&body)
+            && let Ok(decoded) = decode_constant(self.llbc, &value)
+        {
+            let bb_id = self.block_id[mir_bb];
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: decoded_const_to_op(decoded),
+            });
+            self.bind_initializer_result(mir_bb, dest_local, target, res)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn bind_initializer_result(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        value: Variable,
+    ) -> Result<(), LowerError> {
+        self.local_var[dest_local] = Some(LocalValue::One(value));
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
     /// An `Option` method over a slice item reference local: `copied` /
     /// `cloned` keep the address, `unwrap_or` loads the item or takes the
     /// default, `is_some` / `is_none` test the address. The item kind comes
@@ -24011,6 +24105,9 @@ impl<'a> Lowering<'a> {
             return Ok(());
         }
         self.refuse_residual_owner_root_guard(mir_bb, &call)?;
+        if self.lower_global_initializer_call(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
         if self.lower_item_addr_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
@@ -40218,11 +40315,15 @@ impl<'a> Lowering<'a> {
     /// `intersects` is `(self & other) != 0`, `bitor` is `self | other`.
     /// `contains` / `intersects` take `&self`, a borrow of the transparent
     /// scalar, so their receiver is the word `*self` reads; `bitor` and the
-    /// `other` operand are by value. Bit ops use the `bitand` / `bitor`
-    /// labels and `Unsigned` result a `u32` `&` / `|` lowers to. A compare
-    /// uses `eq` / `ne` with the `Int` result a `u32` `==` / `!=` lowers to,
-    /// because that destination is `bool`. The flag constants are the
-    /// `Unsigned` values [`code_flags_const`] emits.
+    /// `other` operand are by value. `bits` is that same `*self` word: the
+    /// integer `bits()` returns, not a residual FunctionPath (the impl is
+    /// outside the extracted crates; `jtransform.py`
+    /// `Transformer.handle_residual_call` needs a real function pointer).
+    /// Bit ops use the `bitand` / `bitor` labels and `Unsigned` result a
+    /// `u32` `&` / `|` lowers to. A compare uses `eq` / `ne` with the `Int`
+    /// result a `u32` `==` / `!=` lowers to, because that destination is
+    /// `bool`. The flag constants are the `Unsigned` values
+    /// [`code_flags_const`] emits.
     fn try_lower_code_flags_method(
         &mut self,
         mir_bb: usize,
@@ -40235,6 +40336,28 @@ impl<'a> Lowering<'a> {
         let Some((leaf, flags_ty)) = code_flags_method(self.llbc, reg) else {
             return Ok(false);
         };
+        if leaf == "bits" {
+            let Some(Some(receiver)) = arg_locals.first() else {
+                return Ok(false);
+            };
+            let place = Place {
+                kind: PlaceKind::Projection(
+                    Box::new(Place {
+                        kind: PlaceKind::Local(*receiver as u64),
+                        ty: unit_tyref(),
+                    }),
+                    ProjectionElem::Atom("Deref".to_string()),
+                ),
+                ty: flags_ty,
+            };
+            let res = self.resolve_place(mir_bb, place)?;
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let bb_id = self.emit_bb(mir_bb);
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
         let [lhs, rhs] = args else {
             return Ok(false);
         };
@@ -45584,6 +45707,133 @@ fn regular_call_is_panicking_abort(reg: &RegularCall, llbc: &Llbc) -> bool {
     };
     let mut segs = path.split("::");
     matches!(segs.next(), Some("core") | Some("std")) && segs.next() == Some("panicking")
+}
+
+/// Charon `PathElem::Builtin(PromotedConst, N)` on a FunDecl.
+fn fundecl_is_promoted_const(fd: &FunDecl) -> bool {
+    fd.item_meta.name.last().is_some_and(|seg| match seg {
+        NameSeg::Other(v) => {
+            v.as_object()
+                .and_then(|m| m.get("Builtin"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(serde_json::Value::as_str)
+                == Some("PromotedConst")
+        }
+        _ => false,
+    })
+}
+
+fn inner_global_id(place: &Place) -> u64 {
+    match place.kind {
+        PlaceKind::Global { id, .. } => id,
+        _ => u64::MAX,
+    }
+}
+
+/// The `Place::Global` a promoted-const initializer copies before returning.
+///
+/// rustc emits `_1 = copy Global(id); _0 = &_1; return`. Anything richer
+/// (a second global, a call, a switch) is not this wrapper.
+fn promoted_const_copied_global(body: &Unstructured) -> Option<Place> {
+    let mut copied: Option<Place> = None;
+    for block in &body.body {
+        if block.is_cleanup {
+            continue;
+        }
+        for stmt in &block.statements {
+            match stmt.stmt_kind_ref().ok()? {
+                StmtKind::StorageLive(_)
+                | StmtKind::StorageDead(_)
+                | StmtKind::PlaceMention(_)
+                | StmtKind::Borrowck(_) => {}
+                StmtKind::Assign(_, rvalue) => match rvalue {
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) => {
+                        if matches!(place.kind, PlaceKind::Global { .. }) {
+                            if copied.is_some() {
+                                return None;
+                            }
+                            copied = Some(clone_place(place));
+                        }
+                    }
+                    Rvalue::Ref { .. } | Rvalue::RawPtr { .. } => {}
+                    _ => return None,
+                },
+                StmtKind::Assert(_) => {}
+                StmtKind::Unknown => return None,
+            }
+        }
+        let kind = block.terminator.kind_value();
+        if kind.as_str() != Some("Return")
+            && kind.get("Goto").is_none()
+            && kind.get("target").is_none()
+        {
+            return None;
+        }
+    }
+    copied
+}
+
+/// The `Operand::Const` a promoted-const initializer copies before
+/// returning a shared borrow of that local.
+///
+/// rustc emits `_1 = const C; _0 = &_1; return` for a promoted `&str`
+/// (or other by-value literal). Anything richer is not this wrapper.
+fn promoted_const_copied_const(body: &Unstructured) -> Option<serde_json::Value> {
+    let mut copied: Option<(u64, serde_json::Value)> = None;
+    let mut returned_ref: Option<u64> = None;
+    for block in &body.body {
+        if block.is_cleanup {
+            continue;
+        }
+        for stmt in &block.statements {
+            match stmt.stmt_kind_ref().ok()? {
+                StmtKind::StorageLive(_)
+                | StmtKind::StorageDead(_)
+                | StmtKind::PlaceMention(_)
+                | StmtKind::Borrowck(_) => {}
+                StmtKind::Assign(place, rvalue) => match rvalue {
+                    Rvalue::Use(Operand::Const(value), _) => {
+                        let PlaceKind::Local(dst) = place.kind else {
+                            return None;
+                        };
+                        if copied.is_some() {
+                            return None;
+                        }
+                        copied = Some((dst, value.clone()));
+                    }
+                    Rvalue::Ref { place: src, .. } => {
+                        let PlaceKind::Local(0) = place.kind else {
+                            return None;
+                        };
+                        let PlaceKind::Local(src) = src.kind else {
+                            return None;
+                        };
+                        if returned_ref.is_some() {
+                            return None;
+                        }
+                        returned_ref = Some(src);
+                    }
+                    Rvalue::RawPtr { .. } => {}
+                    _ => return None,
+                },
+                StmtKind::Assert(_) => {}
+                StmtKind::Unknown => return None,
+            }
+        }
+        let kind = block.terminator.kind_value();
+        if kind.as_str() != Some("Return")
+            && kind.get("Goto").is_none()
+            && kind.get("target").is_none()
+        {
+            return None;
+        }
+    }
+    let (dst, value) = copied?;
+    if returned_ref? != dst {
+        return None;
+    }
+    Some(value)
 }
 
 /// `Result::branch` behind `?`. Charon records the impl method
@@ -67562,8 +67812,8 @@ fn code_flags_const(segments: &[String]) -> Option<OpKind> {
 /// residual `FunctionPath`. The owner test is the same crate and module
 /// [`code_flags_const`] uses, plus the `CodeFlags` type: a same-named method
 /// on any other type stays a call. `contains` / `intersects` / `bitor` are
-/// the integer operations the macro expands to; every other method stays
-/// residual.
+/// the integer operations the macro expands to; `bits` is the transparent
+/// `u32` word those ops already read. Every other method stays residual.
 fn code_flags_method(llbc: &Llbc, reg: &RegularCall) -> Option<(&'static str, TyRef)> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
@@ -67593,10 +67843,18 @@ fn code_flags_method(llbc: &Llbc, reg: &RegularCall) -> Option<(&'static str, Ty
         "contains" => "contains",
         "intersects" => "intersects",
         "bitor" => "bitor",
+        "bits" => "bits",
         _ => return None,
     };
-    // `other: Self`, the by-value `CodeFlags` a `*self` read also has.
-    let flags_ty = clone_tyref(fd.signature.inputs.get(1)?);
+    // `contains` / `intersects` / `bitor` take `other: Self`, the by-value
+    // `CodeFlags` a `*self` read also has. `bits` is `&self` only, so the
+    // same type is the pointee of the receiver.
+    let flags_ty = if leaf == "bits" {
+        let first = fd.signature.inputs.first()?;
+        ref_pointee_ty(first, llbc).or_else(|| pointer_pointee_ty(first, llbc))?
+    } else {
+        clone_tyref(fd.signature.inputs.get(1)?)
+    };
     Some((leaf, flags_ty))
 }
 
@@ -67651,6 +67909,44 @@ enum DecodedConst {
     /// `FunctionPath` so it shares the existing `Call` lowering path
     /// when threaded into an indirect call site.
     FnPath(Vec<String>),
+}
+
+/// The `OpKind` `build_rvalue` emits for a decoded constant. A promoted-const
+/// accessor that copies such a literal is this same translation-time
+/// `Constant` (`rtyper` prebuilt `Constant` of a global; residualizing it
+/// would keep a function pointer `Transformer.handle_residual_call` cannot
+/// bind).
+fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
+    match decoded {
+        DecodedConst::Int(n) => OpKind::ConstInt(n),
+        DecodedConst::UInt(n) => OpKind::ConstUInt(n),
+        DecodedConst::Int128(n) => OpKind::ConstInt128(n),
+        DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
+        DecodedConst::Bool(b) => OpKind::ConstBool(b),
+        DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
+        DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
+        DecodedConst::Str(s) => OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), s],
+                fun_decl_id: None,
+            },
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(None),
+        },
+        DecodedConst::FnPath(segments) => {
+            let mut synthetic = Vec::with_capacity(segments.len() + 1);
+            synthetic.push(crate::model::FN_CONST_HEAD.to_string());
+            synthetic.extend(segments);
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: synthetic,
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Int,
+            }
+        }
+    }
 }
 
 /// Literal value tracked by [`const_eval_init_body`].
@@ -69317,10 +69613,8 @@ fn const_lit_to_op(value: ConstLit) -> Option<OpKind> {
         ConstLit::Bool(b) => Some(OpKind::ConstBool(b)),
         ConstLit::Float(bits) => Some(OpKind::ConstFloat(bits)),
         ConstLit::SingleFloat(bits) => Some(OpKind::ConstSingleFloat(bits)),
-        ConstLit::Checked(..)
-        | ConstLit::CheckedUInt(..)
-        | ConstLit::EnumDisc(_)
-        | ConstLit::BitflagBits(_) => None,
+        ConstLit::EnumDisc(n) => i64::try_from(n).ok().map(OpKind::ConstInt),
+        ConstLit::Checked(..) | ConstLit::CheckedUInt(..) | ConstLit::BitflagBits(_) => None,
     }
 }
 
@@ -83926,9 +84220,9 @@ mod tests {
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
     /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
-    /// (`w_code_const` on `co_consts_w`); it must not project the compiler
-    /// `Constants` wrapper.  `code_getdocstring` still projects that
-    /// wrapper for its slice view.
+    /// (a `co_consts_w` field read on the promoted code); it must not
+    /// project the compiler `Constants` wrapper.  `code_getdocstring`
+    /// still projects that wrapper for its slice view.
     ///
     /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
     /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,
@@ -84058,13 +84352,22 @@ mod tests {
             constant_ops.iter().any(|op| {
                 matches!(
                     &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "co_consts_w"
+                )
+            }),
+            "getconstant_w reads self.getcode().co_consts_w"
+        );
+        assert!(
+            !constant_ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["w_code_const"])
                 )
             }),
-            "PyFrame.constant_at must call w_code_const"
+            "getconstant_w indexes co_consts_w directly"
         );
         assert!(!constant_ops.iter().any(|op| {
             matches!(
@@ -84756,6 +85059,134 @@ mod tests {
                 "marker receiver producer must be the driver sentinel: {producer:?}"
             );
         }
+    }
+
+    /// rustc's promoted-const wrapper copies one `Place::Global` and
+    /// returns a reference. That inner id is the NamedConst `getfunctionptr`
+    /// would name (`Transformer.handle_residual_call`).
+    #[test]
+    fn promoted_const_initializer_copies_the_inner_global() {
+        let body: majit_charon_reader::ullbc::Unstructured = serde_json::from_value(serde_json::json!({
+            "span": {"Deduplicated": 0},
+            "locals": {"arg_count": 0, "locals": []},
+            "body": [{
+                "statements": [
+                    {"span": {"Deduplicated": 0}, "kind": {"StorageLive": 1}},
+                    {"span": {"Deduplicated": 0}, "kind": {"Assign": [
+                        {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}},
+                        {"Use": [{"Copy": {
+                            "kind": {"Global": {
+                                "id": 31,
+                                "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+                            }},
+                            "ty": {"Deduplicated": 0}
+                        }}, "Yes"]}
+                    ]}},
+                    {"span": {"Deduplicated": 0}, "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": {"Deduplicated": 0}},
+                        {"Ref": {
+                            "place": {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}},
+                            "kind": "Shared",
+                            "ptr_metadata": {"Const": {"Deduplicated": 0}}
+                        }}
+                    ]}}
+                ],
+                "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
+                "is_cleanup": false
+            }]
+        }))
+        .expect("promoted-const wrapper fixture parses");
+        let place = super::promoted_const_copied_global(&body).expect("inner global");
+        assert_eq!(super::inner_global_id(&place), 31);
+    }
+
+    /// rustc promotes a `&str` literal to `_1 = const C; _0 = &_1`.
+    #[test]
+    fn promoted_const_initializer_copies_the_inner_const() {
+        let body: majit_charon_reader::ullbc::Unstructured =
+            serde_json::from_value(serde_json::json!({
+                "span": {"Deduplicated": 0},
+                "locals": {"arg_count": 0, "locals": []},
+                "body": [{
+                    "statements": [
+                        {"span": {"Deduplicated": 0}, "kind": {"StorageLive": 1}},
+                        {"span": {"Deduplicated": 0}, "kind": {"Assign": [
+                            {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}},
+                            {"Use": [{"Const": {"Deduplicated": 20437}}, "Yes"]}
+                        ]}},
+                        {"span": {"Deduplicated": 0}, "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": {"Deduplicated": 0}},
+                            {"Ref": {
+                                "place": {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}},
+                                "kind": "Shared",
+                                "ptr_metadata": {"Const": {"Deduplicated": 0}}
+                            }}
+                        ]}}
+                    ],
+                    "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
+                    "is_cleanup": false
+                }]
+            }))
+            .expect("promoted-const literal wrapper fixture parses");
+        let value = super::promoted_const_copied_const(&body).expect("inner const");
+        assert_eq!(
+            value.get("Deduplicated").and_then(|v| v.as_u64()),
+            Some(20437)
+        );
+    }
+
+    /// A fieldless-enum discriminant is the by-value constant
+    /// (`tyref_to_value_type` Int / `AggregateShape::Discriminant` ConstInt).
+    #[test]
+    fn const_lit_to_op_fieldless_enum_disc_is_constint() {
+        use crate::model::OpKind;
+        assert!(matches!(
+            super::const_lit_to_op(super::ConstLit::EnumDisc(2)),
+            Some(OpKind::ConstInt(2))
+        ));
+    }
+
+    /// `w_module_dict_is_object_strategy::promoted_const#0` constructs
+    /// `StrategyKind::Object` (`Aggregate` variant 2) and returns `&_1`.
+    /// That body is a `flowspace` `Constant`, not a residual call.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn promoted_const_fieldless_enum_folds_to_discriminant_int() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_object::dictmultiobject::w_module_dict_is_object_strategy",
+        )
+        .expect("lower w_module_dict_is_object_strategy");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.iter().any(|s| s.starts_with("promoted_const"))
+                ))
+                .count(),
+            0,
+            "promoted_const must fold to a constant, not a residual call"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::ConstInt(2))),
+            "StrategyKind::Object is discriminant 2"
+        );
+        assert!(
+            ops().all(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "kind" => {
+                    !field.taken_by_address
+                }
+                _ => true,
+            }),
+            "&StrategyKind is the tag, not the address of the field"
+        );
     }
 
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
