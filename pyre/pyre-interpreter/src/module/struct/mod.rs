@@ -1760,7 +1760,7 @@ pub mod unpack_iter {
 
         /// `descr_next` — unpack the next record, raising `StopIteration`
         /// at the end of the buffer.
-        fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        pub(crate) fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
             if self.buffer.is_null() {
                 return Err(crate::PyError::new(crate::PyErrorKind::StopIteration, ""));
             }

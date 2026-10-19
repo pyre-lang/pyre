@@ -1397,22 +1397,22 @@ pub fn init_typeobjects() {
             (
                 &pyre_object::iterobject::STR_ASCII_ITER_TYPE as *const PyType,
                 "str_ascii_iterator",
-                init_sequence_iterator_type as fn(PyObjectRef),
+                init_str_ascii_iterator_type as fn(PyObjectRef),
             ),
             (
                 &pyre_object::iterobject::STR_ITER_TYPE as *const PyType,
                 "str_iterator",
-                init_sequence_iterator_type as fn(PyObjectRef),
+                init_str_iterator_type as fn(PyObjectRef),
             ),
             (
                 &pyre_object::iterobject::BYTES_ITER_TYPE as *const PyType,
                 "bytes_iterator",
-                init_sequence_iterator_type as fn(PyObjectRef),
+                init_bytes_iterator_type as fn(PyObjectRef),
             ),
             (
                 &pyre_object::iterobject::BYTEARRAY_ITER_TYPE as *const PyType,
                 "bytearray_iterator",
-                init_sequence_iterator_type as fn(PyObjectRef),
+                init_bytearray_iterator_type as fn(PyObjectRef),
             ),
             // `memory_iterator` carries only the iteration protocol: it has
             // neither `__length_hint__` nor `__setstate__`, and pickling one
@@ -32973,7 +32973,7 @@ fn set_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn set_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_set_iterator_receiver(args, "__next__", false)?;
-    crate::baseobjspace::next(args[0])
+    crate::baseobjspace::set_iter_descr_next(args[0])
 }
 
 fn set_iter_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -34397,7 +34397,7 @@ fn set_iterator_text_signatures(ns: PyObjectRef, signatures: &[(&'static str, &'
 }
 
 /// PyPy `iterobject.py W_AbstractSeqIterObject.typedef`.
-fn init_sequence_iterator_type(ns: PyObjectRef) {
+fn init_sequence_iterator_type_with_next(ns: PyObjectRef, next_fn: crate::gateway::BuiltinCodeFn) {
     // Remaining concrete string/bytes iterator bootstrap adapters consume
     // the same host declarations; only their type construction is legacy.
     let _roots = pyre_object::gc_roots::push_roots();
@@ -34405,7 +34405,7 @@ fn init_sequence_iterator_type(ns: PyObjectRef) {
     let _ = pyre_object::gc_roots::pin_root(ns);
     let mut items = pyre_object::gc_roots::RootedItems::new();
     unsafe {
-        for (name, value) in crate::objspace::std::iterobject::rawdict(&mut items) {
+        for (name, value) in crate::objspace::std::iterobject::rawdict(&mut items, next_fn) {
             let value = match value {
                 pyre_object::typedef::TypeDefValue::None => w_none(),
                 pyre_object::typedef::TypeDefValue::Text(text) => w_str_new(&text),
@@ -34423,6 +34423,22 @@ fn init_sequence_iterator_type(ns: PyObjectRef) {
             );
         }
     }
+}
+
+fn init_str_ascii_iterator_type(ns: PyObjectRef) {
+    init_sequence_iterator_type_with_next(ns, crate::baseobjspace::str_ascii_iter_next_method);
+}
+
+fn init_str_iterator_type(ns: PyObjectRef) {
+    init_sequence_iterator_type_with_next(ns, crate::baseobjspace::str_iter_next_method);
+}
+
+fn init_bytes_iterator_type(ns: PyObjectRef) {
+    init_sequence_iterator_type_with_next(ns, crate::baseobjspace::bytes_iter_next_method);
+}
+
+fn init_bytearray_iterator_type(ns: PyObjectRef) {
+    init_sequence_iterator_type_with_next(ns, crate::baseobjspace::bytearray_iter_next_method);
 }
 
 /// Python 3.14 `PySeqIter_Type` restricted to `memory_iterator`'s surface:
@@ -34446,7 +34462,11 @@ fn init_memory_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::memory_iter_next_method,
+                1
+            )
         )
     };
     set_iterator_text_signatures(
@@ -34475,7 +34495,11 @@ fn init_array_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::array_iter_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -34524,7 +34548,7 @@ fn init_callable_iterator_type(ns: PyObjectRef) {
             "__iter__",
             crate::builtins::__majit_wrap_iter_self as fn(&[PyObjectRef]) -> crate::PyResult,
         ),
-        ("__next__", crate::baseobjspace::iter_next_method),
+        ("__next__", crate::baseobjspace::callable_iter_next_method),
         (
             "__reduce__",
             crate::baseobjspace::callable_iter_reduce_method,
@@ -34597,7 +34621,7 @@ macro_rules! define_dict_iterator_type {
 
         fn $next_fn(args: &[PyObjectRef]) -> crate::PyResult {
             dict_iterator_receiver(args, "__next__", false, $owner, &$expected, false)?;
-            crate::baseobjspace::next(args[0])
+            crate::baseobjspace::dict_iter_descr_next(args[0])
         }
 
         fn $len_fn(args: &[PyObjectRef]) -> crate::PyResult {
@@ -34717,7 +34741,10 @@ fn range_iterator_self(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn range_iterator_next(args: &[PyObjectRef]) -> crate::PyResult {
     crate::type_methods::require_range_iterator_receiver(args, "__next__", false, false)?;
-    crate::baseobjspace::next(args[0])
+    match unsafe { pyre_object::w_range_iter_next(args[0]) } {
+        Some(v) => Ok(v),
+        None => Err(crate::PyError::stop_iteration()),
+    }
 }
 
 fn range_iterator_length_hint(args: &[PyObjectRef]) -> crate::PyResult {
@@ -34741,7 +34768,10 @@ fn long_range_iterator_self(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn long_range_iterator_next(args: &[PyObjectRef]) -> crate::PyResult {
     crate::type_methods::require_range_iterator_receiver(args, "__next__", false, true)?;
-    crate::baseobjspace::next(args[0])
+    match unsafe { pyre_object::w_long_range_iter_next(args[0]) } {
+        Some(v) => Ok(v),
+        None => Err(crate::PyError::stop_iteration()),
+    }
 }
 
 fn long_range_iterator_length_hint(args: &[PyObjectRef]) -> crate::PyResult {
@@ -34882,7 +34912,11 @@ fn init_list_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::list_iter_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -34946,7 +34980,11 @@ fn init_tuple_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::tuple_iter_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -35327,7 +35365,7 @@ fn init_count_type(ns: PyObjectRef) {
             "__next__",
             crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__next__",
-                crate::baseobjspace::iter_next_method,
+                crate::baseobjspace::count_next_method,
                 1,
                 "Implement next(self).",
             )
@@ -35508,7 +35546,7 @@ fn init_repeat_type(ns: PyObjectRef) {
             "__next__",
             crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__next__",
-                crate::baseobjspace::iter_next_method,
+                crate::baseobjspace::repeat_next_method,
                 1,
                 "Implement next(self).",
             )
@@ -35819,7 +35857,7 @@ fn compress_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
         false,
         pyre_object::interp_itertools::is_compress,
     )?;
-    crate::baseobjspace::next(obj)
+    crate::baseobjspace::compress_next_w(obj)
 }
 
 fn starmap_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -35890,7 +35928,7 @@ fn starmap_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
         false,
         pyre_object::interp_itertools::is_starmap,
     )?;
-    crate::baseobjspace::next(obj)
+    crate::baseobjspace::starmap_next_w(obj)
 }
 
 fn accumulate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -36012,7 +36050,11 @@ fn init_takewhile_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::takewhile_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -36049,7 +36091,11 @@ fn init_dropwhile_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::dropwhile_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -36086,7 +36132,11 @@ fn init_filterfalse_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::filterfalse_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -36257,7 +36307,11 @@ fn init_islice_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::islice_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -36360,7 +36414,11 @@ fn init_batched_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::batched_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -36509,7 +36567,11 @@ fn init_product_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::product_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -36627,7 +36689,11 @@ fn init_combinations_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::combinations_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -36757,7 +36823,11 @@ fn init_combinations_with_replacement_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::combinations_with_replacement_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -36909,7 +36979,11 @@ fn init_permutations_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::permutations_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -37031,7 +37105,11 @@ fn init_groupby_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::groupby_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -37067,7 +37145,11 @@ fn init_groupby_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::groupby_iterator_next_method,
+                1
+            )
         )
     };
 }
@@ -37236,7 +37318,11 @@ fn init_tee_iterable_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::tee_iterable_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -37454,7 +37540,11 @@ fn init_accumulate_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::accumulate_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -37500,7 +37590,11 @@ fn init_zip_longest_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::zip_longest_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -37666,7 +37760,11 @@ fn init_pairwise_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity(
+                "__next__",
+                crate::baseobjspace::pairwise_next_method,
+                1
+            )
         )
     };
     unsafe {
@@ -37702,7 +37800,7 @@ fn init_cycle_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::cycle_next_method, 1)
         )
     };
     unsafe {
@@ -37839,7 +37937,7 @@ fn init_chain_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1)
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::chain_next_method, 1)
         )
     };
     let from_iterable_fn = crate::gateway::make_builtin_function_with_signature(

@@ -4646,7 +4646,7 @@ unsafe fn bytes_concat_type_error(lhs: PyObjectRef, rhs: PyObjectRef) -> PyError
 /// `W_Root.user_overridden_class` (`baseobjspace.py`).  An exact builtin
 /// payload keeps the flag false; a user subclass of that payload is true.
 #[majit_macros::always_inline]
-unsafe fn user_overridden_class(obj: PyObjectRef) -> bool {
+pub(crate) unsafe fn user_overridden_class(obj: PyObjectRef) -> bool {
     !is_exact_builtin_instance(obj)
 }
 

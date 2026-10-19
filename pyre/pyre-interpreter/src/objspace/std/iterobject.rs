@@ -39,7 +39,12 @@ unsafe fn insert_rooted_gateways(
 /// new interp2app gateways, pinned in `items` until the caller publishes or
 /// spacebinds them. Sequence iterator types that share this declaration list
 /// must call this per type so each namespace owns its own bound methods.
-pub(crate) unsafe fn rawdict(items: &mut RootedItems) -> IndexMap<String, TypeDefValue> {
+/// `next_fn` is this type's own `__next__` gateway (one per exact iterator
+/// type so a wrong-receiver call typechecks).
+pub(crate) unsafe fn rawdict(
+    items: &mut RootedItems,
+    next_fn: crate::gateway::BuiltinCodeFn,
+) -> IndexMap<String, TypeDefValue> {
     let mut entries = IndexMap::new();
     // [3.14-spec] PySeqIter_Type's public name/doc are "iterator"/None,
     // unlike W_AbstractSeqIterObject.typedef's "sequenceiterator"/iter doc.
@@ -56,12 +61,7 @@ pub(crate) unsafe fn rawdict(items: &mut RootedItems) -> IndexMap<String, TypeDe
                 1,
                 "($self, /)",
             ),
-            (
-                "__next__",
-                crate::baseobjspace::iter_next_method,
-                1,
-                "($self, /)",
-            ),
+            ("__next__", next_fn, 1, "($self, /)"),
             (
                 "__reduce__",
                 crate::baseobjspace::seq_iter_reduce_method,
@@ -93,7 +93,7 @@ pub(crate) fn typedef() -> *const TypeDef {
         TypeDef::from_rawdict(
             "iterator",
             vec![],
-            rawdict(&mut items),
+            rawdict(&mut items, crate::baseobjspace::seq_iter_next_method),
             &pyre_object::iterobject::SEQ_ITER_TYPE,
         ) as usize
     }) as *const TypeDef
@@ -118,7 +118,7 @@ pub(crate) fn reverse_typedef() -> *const TypeDef {
                 ),
                 (
                     "__next__",
-                    crate::baseobjspace::iter_next_method,
+                    crate::baseobjspace::reverse_seq_iter_next_method,
                     1,
                     "($self, /)",
                 ),
