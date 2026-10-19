@@ -491,7 +491,7 @@ fn subst_vars(
         *v = replacement.clone();
         return;
     }
-    if let Some(index) = const_var_index(v)
+    if let Some(index) = const_var_index(v, space, key)
         && let Some(replacement) = const_generics.get(index)
     {
         *v = replacement.clone();
@@ -559,9 +559,31 @@ fn type_var_index(v: &Value) -> Option<usize> {
 }
 
 /// Depth-0 const-generic variable index:
-/// `{"kind":{"Var":{"Bound":[0, i]}}}` or `{"kind":{"Var":{"Free": i}}}`.
-fn const_var_index(v: &Value) -> Option<usize> {
-    let var = v.as_object()?.get("kind")?.get("Var")?;
+/// `{"kind":{"Var":{"Bound":[0, i]}}}` or `{"kind":{"Var":{"Free": i}}}`
+/// (any space), and the array ConstantExpr `[{"Var":{"Bound":[0, i]}}, ty]`
+/// or `[{"Var":{"Free": i}}, ty]` when visited in `Space::Const` under a
+/// key other than `"regions"` (a two-element region list has the same
+/// `Var` shape).
+fn const_var_index(v: &Value, space: Space, key: Option<&str>) -> Option<usize> {
+    if let Some(var) = v
+        .as_object()
+        .and_then(|obj| obj.get("kind"))
+        .and_then(|kind| kind.get("Var"))
+    {
+        return var_index(var);
+    }
+    if space != Space::Const || key == Some("regions") {
+        return None;
+    }
+    let arr = v.as_array()?;
+    if arr.len() != 2 {
+        return None;
+    }
+    var_index(arr.first()?.as_object()?.get("Var")?)
+}
+
+/// Index of a `Var` object: `{"Bound":[0, i]}` or `{"Free": i}`.
+fn var_index(var: &Value) -> Option<usize> {
     if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
         if bound.first()?.as_u64()? != 0 {
             return None;
@@ -583,7 +605,7 @@ fn contains_depth0_var(
     if depth > 64 {
         return false;
     }
-    if type_var_index(v).is_some() || const_var_index(v).is_some() {
+    if type_var_index(v).is_some() || const_var_index(v, space, key).is_some() {
         return true;
     }
     if let Some(body) = indirect_body(v, llbc, space) {
@@ -1738,6 +1760,31 @@ mod tests {
             .expect("switch arm const unresolved");
         assert_eq!(llbc.dedup_body(11), Some(&type_body));
         assert_eq!(llbc.dedup_const_body(11), Some(&const_body));
+    }
+
+    /// A const-generic `Var` is the first element of the `[kind, ty]`
+    /// ConstantExpr; depth 0 is replaced, a deeper binder is left. A
+    /// two-element `generics.regions` list is left, even under `Const`.
+    #[test]
+    fn const_var_index_reads_array_constant_expr() {
+        let llbc = empty_llbc();
+        let bool_ty = json!({"Scalar": {"Bool": null}});
+        let replacement = json!([{"Literal": {"Bool": false}}, bool_ty.clone()]);
+        let mut depth0 = json!({"Const": [{"Var": {"Bound": [0, 0]}}, bool_ty.clone()]});
+        substitute_type_vars(&mut depth0, &llbc, &[], &[replacement.clone()]);
+        assert_eq!(depth0, json!({"Const": replacement.clone()}));
+
+        let mut depth1 = json!({"Const": [{"Var": {"Bound": [1, 0]}}, bool_ty.clone()]});
+        substitute_type_vars(&mut depth1, &llbc, &[], &[replacement.clone()]);
+        assert_eq!(
+            depth1,
+            json!({"Const": [{"Var": {"Bound": [1, 0]}}, bool_ty]})
+        );
+
+        let mut fndef = json!({"Const": [{"FnDef": {"generics": {"regions": [{"Var":{"Bound":[0,0]}}, {"Var":{"Bound":[0,1]}}], "types": [], "const_generics": [], "trait_refs": []}}}, {"Scalar":{"Bool":null}}]});
+        let expected = fndef.clone();
+        substitute_type_vars(&mut fndef, &llbc, &[], &[replacement]);
+        assert_eq!(fndef, expected);
     }
 
     /// FunDecl::unstructured keeps rustc unwind cleanup at its original
