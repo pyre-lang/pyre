@@ -25049,27 +25049,49 @@ impl<'a> Lowering<'a> {
                 // destination both being string values so slice / `Vec`
                 // derefs (`&[T]`, root `Builtin::Slice`) keep their ordinary
                 // path.
+                //
+                // `String::from_utf8_lossy` is rewritten to a plain string
+                // (`unicodehelper.py str_decode_utf8` replace arm).  The
+                // consumer is `push_str(&*cow)`: dest is string-family and
+                // the Cow local is already the produced string
+                // (`string_byte_view_locals`).  A residual Cow ADT is not
+                // in that set and keeps the ordinary path.
+                //
+                // `Deref` takes `&self`, so the receiver is often `&Cow<str>`
+                // (a `Ref` of the dest local, or a later `&_cow` binding).
+                // `arg_locals` is `None` for a projection; follow the mark
+                // the same way `Rvalue::Len` does.
                 if args.len() == 1
                     && is_deref_call(&reg, self.llbc)
-                    && first_arg_ty
-                        .as_ref()
-                        .is_some_and(|t| tyref_is_string_family(t, self.llbc))
                     && tyref_is_string_family(&call.dest.ty, self.llbc)
                 {
-                    // A builder-mode accumulator's Shared borrow feeding this
-                    // deref is `ll_build`
-                    // (`AbstractStringBuilderRepr.rtype_method_build`): the
-                    // builder is a STRINGBUILDERPTR, and identity assumes
-                    // SomeString.
-                    let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
-                        Some(built) => built,
-                        None => args[0].clone(),
-                    };
-                    self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    let from_string = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|t| tyref_is_string_family(t, self.llbc));
+                    let from_lossy_cow = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|t| self.tyref_is_cow_str(t))
+                        && first_arg_is_string_byte_view;
+                    if from_string || from_lossy_cow {
+                        // A builder-mode accumulator's Shared borrow feeding this
+                        // deref is `ll_build`
+                        // (`AbstractStringBuilderRepr.rtype_method_build`): the
+                        // builder is a STRINGBUILDERPTR, and identity assumes
+                        // SomeString.
+                        let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
+                            Some(built) => built,
+                            None => args[0].clone(),
+                        };
+                        if from_lossy_cow {
+                            self.alias_dest_to_arg0(dest_local, arg, true);
+                        } else {
+                            self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
+                        }
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // A bodyless `Deref::deref` / `DerefMut::deref_mut` (`Box<T>`,
                 // and a one-word transparent wrapper) whose `&T` is a
@@ -25333,6 +25355,31 @@ impl<'a> Lowering<'a> {
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Checked `Wtf8::from_bytes(&[u8]) -> Option<&Wtf8>`:
+                // `rutf8.py check_utf8` with `allow_surrogates=True`, then
+                // Ok → `Option::Some` of the unchecked identity, Err → None.
+                if self.try_lower_wtf8_from_bytes_checked(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                // `String::from_utf8_lossy(&[u8]) -> Cow<str>`:
+                // `unicodehelper.py str_decode_utf8` replace / U+FFFD arm.
+                if self.try_lower_from_utf8_lossy(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
                     return Ok(());
                 }
                 // Blanket `ToString::to_string` (`alloc::string::<Impl>::to_string`)
@@ -35096,6 +35143,458 @@ impl<'a> Lowering<'a> {
             return false;
         }
         tyref_is_string_value(dest_ty, self.llbc)
+    }
+
+    /// Inherent checked `Wtf8::from_bytes(&[u8]) -> Option<&Wtf8>`.
+    /// Distinct from [`Self::is_wtf8_from_bytes_identity`]: that arm is
+    /// only `from_bytes_unchecked` / `from_utf8_unchecked`.
+    fn is_wtf8_from_bytes_checked(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let owner_ok = impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
+            leaf == "from_bytes" && owner.rsplit("::").next() == Some("Wtf8")
+        });
+        if !owner_ok {
+            return false;
+        }
+        crate::front::result_exc::tyref_is_option(dest_ty, self.llbc)
+            && self
+                .tyref_adt_type_arg(dest_ty, 0)
+                .is_some_and(|payload| tyref_is_string_family(&payload, self.llbc))
+    }
+
+    /// `alloc::string::<Impl>::from_utf8_lossy` whose dest is `Cow<str>`.
+    fn is_string_from_utf8_lossy(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().ends_with("::from_utf8_lossy") && self.tyref_is_cow_str(dest_ty)
+    }
+
+    /// `alloc::borrow::Cow<B>` whose borrowed form `B` is string-family
+    /// (`Cow<str>` / `Cow<&str>`).
+    ///
+    /// `Deref` takes `&self`, so the receiver is `&Cow<str>`.
+    /// [`Self::tyref_adt_type_arg`] reads the Adt node and does not peel
+    /// `Ref`; [`adt_path_of_tyref`] already does, which is why the path
+    /// check would pass and the payload check would not.
+    fn tyref_is_cow_str(&self, ty: &TyRef) -> bool {
+        let Some(path) = adt_path_of_tyref(ty, self.llbc) else {
+            return false;
+        };
+        if !path.ends_with("::Cow") {
+            return false;
+        }
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let adt_ty = peeled.as_ref().unwrap_or(ty);
+        self.tyref_adt_type_arg(adt_ty, 0).is_some_and(|payload| {
+            tyref_is_string_family(&payload, self.llbc) || tyref_strips_to_str(&payload, self.llbc)
+        })
+    }
+
+    fn fun_decl_id_path_ends_with(&self, suffix: &[&str]) -> Option<u64> {
+        let mut found = None;
+        for fd in self.llbc.iter_fun_decls() {
+            let segs: Vec<&str> = fd.item_meta.name_path_str().split("::").collect();
+            if !segs.ends_with(suffix) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(fd.def_id);
+        }
+        found
+    }
+
+    /// `pyre_object::rutf8::check_utf8` (`rutf8.py check_utf8`).
+    fn rutf8_check_utf8_fun_decl_id(&self) -> Option<u64> {
+        self.fun_decl_id_path_ends_with(&["rutf8", "check_utf8"])
+    }
+
+    /// `typedef::decode_utf8_with_errors` (`unicodehelper.py
+    /// _str_decode_utf8_slowpath` / `str_decode_utf8` replace).
+    fn decode_utf8_with_errors_fun_decl_id(&self) -> Option<u64> {
+        self.fun_decl_id_path_ends_with(&["typedef", "decode_utf8_with_errors"])
+    }
+
+    fn emit_fun_decl_call(
+        &mut self,
+        bb_id: BlockId,
+        fun_decl_id: u64,
+        segments: Vec<String>,
+        args: Vec<Variable>,
+        result_ty: ValueType,
+    ) -> Variable {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let target = CallTarget::FunctionPath {
+            segments,
+            fun_decl_id: None,
+        }
+        .with_fun_decl_id(fun_decl_id);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target,
+                args: crate::model::call_args(args),
+                result_ty,
+            },
+        });
+        result
+    }
+
+    fn stamp_successor_local_as_rstr_str(&mut self, target: usize, dest_local: usize) {
+        if !self.block_id.is_lowered(target) {
+            return;
+        }
+        let row = self.block_id.row(target);
+        let entry = self.block_entry_local_var[row].unpack();
+        if let Some(Some(var)) = entry.get(dest_local) {
+            stamp_as_rstr_str(var);
+        }
+        // The dest is already a string byte view in this block
+        // (`from_utf8_lossy` / niche `from_bytes`).  Successor `Deref` /
+        // `&*cow` hydrates `block_entry_string_byte_view_locals`; without
+        // the mark a projected `&Cow<str>` keeps the residual Cow deref.
+        if !self.block_byte_view_conflict[row].contains(dest_local) {
+            self.block_byte_view_seen[row].insert(dest_local);
+            self.block_entry_string_byte_view_locals[row].insert(dest_local);
+        }
+    }
+
+    /// Split a terminator-call block on `disc`. `set_branch` wraps
+    /// `bool()`, so a Result tag 0 (Ok) takes the false arm and Err
+    /// takes the true arm.
+    ///
+    /// Arms join a fresh block, then that join is the emit cursor for
+    /// this MIR block (`emit_block.set`) and the goto to the MIR
+    /// successor — the slice-bounds fork shape.  Framestate pass 1
+    /// unions `emit_bb`'s exits, so a direct arm→successor edge would
+    /// drop the MIR successor out of the pending set.
+    ///
+    /// `true_raises` closes the Err arm with
+    /// `set_raise_implicit(AssertionError)` (`regular_call_is_panicking_abort`
+    /// / `TermKind::Abort` / `rtyper/debug.py ll_assert`) and does not
+    /// goto the join.  `unicodehelper.py str_decode_utf8` replace never
+    /// returns Err.  W1 leaves this false: its Err arm is the real
+    /// `Option::None`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Diamond wiring matches the emit-time Result unwrap; a context object would hide the arm extras"
+    )]
+    fn close_call_diamond(
+        &mut self,
+        mir_bb: usize,
+        target: usize,
+        dest_local: usize,
+        disc: Variable,
+        mark_string: bool,
+        true_raises: bool,
+        true_extras: &[Variable],
+        false_extras: &[Variable],
+        true_produce: impl FnOnce(&mut Self, BlockId, &[Variable]) -> Variable,
+        false_produce: impl FnOnce(&mut Self, BlockId, &[Variable]) -> Variable,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        let placeholder = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        if mark_string {
+            stamp_as_rstr_str(&placeholder);
+            if !self.string_byte_view_locals.contains(&dest_local) {
+                self.string_byte_view_locals.push(dest_local);
+            }
+        }
+        self.local_var[dest_local] = Some(LocalValue::One(placeholder.clone()));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+
+        let mut carried: Vec<Variable> = Vec::new();
+        for v in &link_args {
+            if *v != placeholder && !carried.contains(v) {
+                carried.push(v.clone());
+            }
+        }
+
+        let mut true_sources = Vec::new();
+        if !true_raises {
+            true_sources = carried.clone();
+            for extra in true_extras {
+                if !true_sources.contains(extra) {
+                    true_sources.push(extra.clone());
+                }
+            }
+        }
+        let mut false_sources = carried.clone();
+        for extra in false_extras {
+            if !false_sources.contains(extra) {
+                false_sources.push(extra.clone());
+            }
+        }
+
+        let (true_bb, true_inputs) = self.graph.create_block_with_arg_vars(true_sources.len());
+        let (false_bb, false_inputs) = self.graph.create_block_with_arg_vars(false_sources.len());
+
+        let true_mapped: Vec<Variable> = if true_raises {
+            Vec::new()
+        } else {
+            true_extras
+                .iter()
+                .map(|v| {
+                    crate::front::bool_then::map_source(&true_sources, &true_inputs, v)
+                        .expect("true-arm extra threaded")
+                })
+                .collect()
+        };
+        let false_mapped: Vec<Variable> = false_extras
+            .iter()
+            .map(|v| {
+                crate::front::bool_then::map_source(&false_sources, &false_inputs, v)
+                    .expect("false-arm extra threaded")
+            })
+            .collect();
+
+        let true_val = if true_raises {
+            None
+        } else {
+            Some(true_produce(self, true_bb, &true_mapped))
+        };
+        let false_val = false_produce(self, false_bb, &false_mapped);
+
+        let (join, join_inputs) = self.graph.create_block_with_arg_vars(link_args.len());
+        if let Some(true_val) = true_val {
+            let true_args = remap_diamond_goto_args(
+                &link_args,
+                &placeholder,
+                &true_val,
+                &true_sources,
+                &true_inputs,
+            );
+            self.graph.set_goto(true_bb, join, true_args);
+        } else {
+            self.graph.set_raise_implicit(true_bb, "AssertionError");
+        }
+        let false_args = remap_diamond_goto_args(
+            &link_args,
+            &placeholder,
+            &false_val,
+            &false_sources,
+            &false_inputs,
+        );
+        self.graph.set_goto(false_bb, join, false_args);
+        self.graph
+            .set_branch(bb_id, disc, true_bb, true_sources, false_bb, false_sources);
+
+        // Same forwarded-word remap as the slice-bounds fork, not an
+        // optimizer side table: join phis replace the head Variables so
+        // framestate `getstate` after the split is defined on `join`.
+        let mut remap: std::collections::HashMap<u64, Variable> = std::collections::HashMap::new();
+        for (src, dst) in link_args.iter().zip(join_inputs.iter()) {
+            remap.insert(src.id(), dst.clone());
+        }
+        for value in self.local_var.iter_mut().flatten() {
+            value.remap_words(&remap);
+        }
+        self.remap_forwarded_provenance(&remap);
+        if mark_string {
+            if let Some(LocalValue::One(var)) = &self.local_var[dest_local] {
+                stamp_as_rstr_str(var);
+            }
+            self.stamp_successor_local_as_rstr_str(target, dest_local);
+        }
+        self.emit_block.set(mir_bb, join);
+        let join_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(join, target_bb, join_args);
+        Ok(())
+    }
+
+    /// Checked `Wtf8::from_bytes` → `rutf8.check_utf8(bytes, true)` then
+    /// Ok → `Option::Some` of the unchecked byte identity, Err → `None`.
+    /// `rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8` fast arm.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors the other try_lower_* call intercepts"
+    )]
+    fn try_lower_wtf8_from_bytes_checked(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 1 || !self.is_wtf8_from_bytes_checked(reg, dest_ty) {
+            return Ok(false);
+        }
+        let Some(check_id) = self.rutf8_check_utf8_fun_decl_id() else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(check_id) else {
+            return Ok(false);
+        };
+        let segments = registered_path_for_fun_decl(self.llbc, fd).segments;
+        let output_ty = clone_tyref(&fd.signature.output);
+        let Some((result_owner, _, _, _, _, _)) = self.resolve_result_owners(&output_ty) else {
+            return Ok(false);
+        };
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let tagged_owners = if niche {
+            None
+        } else {
+            match self.resolve_bool_then_option_dest(dest_ty) {
+                Some(owners) => Some(owners),
+                None => return Ok(false),
+            }
+        };
+        let bytes = args[0].clone();
+        let bb_id = self.emit_bb(mir_bb);
+        let allow = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(allow.clone()),
+            kind: OpKind::ConstBool(true),
+        });
+        let result_var = self.emit_fun_decl_call(
+            bb_id,
+            check_id,
+            segments,
+            vec![bytes.clone(), allow],
+            ValueType::Ref(Some(result_owner.clone())),
+        );
+        let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var, &result_owner);
+        let option_owner = tagged_owners.as_ref().map(|(o, _, _)| o.clone());
+        let some_owner = tagged_owners.as_ref().map(|(_, s, _)| s.clone());
+        let payload_ty = tagged_owners
+            .as_ref()
+            .map(|(_, _, t)| t.clone())
+            .unwrap_or(ValueType::Str);
+        // Result Ok=0 is the false arm of `bool(disc)`.
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            disc,
+            niche,
+            false,
+            &[],
+            std::slice::from_ref(&bytes),
+            |this, err_bb, _| {
+                if niche {
+                    let cast = this.option_niche_null_cast(dest_ty);
+                    this.graph.push_niche_null(err_bb, cast.as_ref())
+                } else {
+                    crate::front::bool_then::emit_option_variant(
+                        &mut this.graph,
+                        err_bb,
+                        option_owner.as_ref().expect("tagged Option owner"),
+                        0,
+                        None,
+                    )
+                }
+            },
+            |this, ok_bb, mapped| {
+                let ok_bytes = mapped[0].clone();
+                if niche {
+                    stamp_as_rstr_str(&ok_bytes);
+                    ok_bytes
+                } else {
+                    crate::front::bool_then::emit_option_variant(
+                        &mut this.graph,
+                        ok_bb,
+                        option_owner.as_ref().expect("tagged Option owner"),
+                        1,
+                        Some((
+                            some_owner.as_ref().expect("tagged Some owner").as_str(),
+                            ok_bytes,
+                            payload_ty.clone(),
+                        )),
+                    )
+                }
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// `String::from_utf8_lossy` → `decode_utf8_with_errors(bytes, "replace")`
+    /// then Ok payload as a plain string (`unicodehelper.py str_decode_utf8`
+    /// replace / U+FFFD). Dest is not a Cow ADT.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors the other try_lower_* call intercepts"
+    )]
+    fn try_lower_from_utf8_lossy(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 1 || !self.is_string_from_utf8_lossy(reg, dest_ty) {
+            return Ok(false);
+        }
+        let Some(decode_id) = self.decode_utf8_with_errors_fun_decl_id() else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(decode_id) else {
+            return Ok(false);
+        };
+        let segments = registered_path_for_fun_decl(self.llbc, fd).segments;
+        let output_ty = clone_tyref(&fd.signature.output);
+        let Some((result_owner, ok_owner, _, _, _, _)) = self.resolve_result_owners(&output_ty)
+        else {
+            return Ok(false);
+        };
+        let bytes = args[0].clone();
+        let bb_id = self.emit_bb(mir_bb);
+        let replace = emit_str_const(&mut self.graph, bb_id, "replace");
+        let result_var = self.emit_fun_decl_call(
+            bb_id,
+            decode_id,
+            segments,
+            vec![bytes, replace],
+            ValueType::Ref(Some(result_owner.clone())),
+        );
+        let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var.clone(), &result_owner);
+        // Result Ok=0 is the false arm of `bool(disc)`. Err is unreachable:
+        // `unicodehelper.py str_decode_utf8` replace never returns Err, so
+        // the true arm is `RaiseImplicit(AssertionError)` (`rtyper/debug.py
+        // ll_assert`) and does not join.
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            disc,
+            true,
+            true,
+            &[],
+            std::slice::from_ref(&result_var),
+            |_, _, _| unreachable!("unicodehelper.py str_decode_utf8 replace never returns Err"),
+            |this, ok_bb, mapped| {
+                let payload = emit_payload_read(
+                    &mut this.graph,
+                    ok_bb,
+                    mapped[0].clone(),
+                    &ok_owner,
+                    ValueType::Str,
+                );
+                stamp_as_rstr_str(&payload);
+                payload
+            },
+        )?;
+        Ok(true)
     }
 
     /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
@@ -74160,6 +74659,29 @@ fn emit_niche_null(
     }
 }
 
+/// Reproduce a diamond arm's goto args: the placeholder dest slot is
+/// the arm's produced value, every other live Variable is re-sourced
+/// from the arm's threaded inputarg (`bool_then::map_source`).
+fn remap_diamond_goto_args(
+    link_args: &[Variable],
+    placeholder: &Variable,
+    produced: &Variable,
+    sources: &[Variable],
+    inputs: &[Variable],
+) -> Vec<Variable> {
+    link_args
+        .iter()
+        .map(|v| {
+            if v == placeholder {
+                produced.clone()
+            } else {
+                crate::front::bool_then::map_source(sources, inputs, v)
+                    .expect("diamond edge arg carried")
+            }
+        })
+        .collect()
+}
+
 fn emit_enum_disc_read(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -110373,6 +110895,240 @@ mod tests {
             }),
             "the Result Ok payload must keep the lifted string repr: {graph:#?}"
         );
+    }
+
+    fn oefmt_call_paths(graph: &crate::model::FunctionGraph) -> Vec<Vec<String>> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn oefmt_mentions_cow(graph: &crate::model::FunctionGraph) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                let cow_in = |s: &str| s.contains("Cow");
+                match &op.kind {
+                    OpKind::Call {
+                        target, result_ty, ..
+                    } => {
+                        let path = match target {
+                            CallTarget::FunctionPath { segments, .. } => {
+                                segments.iter().any(|s| cow_in(s))
+                            }
+                            CallTarget::Method {
+                                name,
+                                receiver_root,
+                                resolved_path,
+                                ..
+                            } => {
+                                cow_in(name)
+                                    || receiver_root.as_deref().is_some_and(cow_in)
+                                    || resolved_path
+                                        .as_ref()
+                                        .is_some_and(|p| p.segments.iter().any(|s| cow_in(s)))
+                            }
+                            CallTarget::SyntheticTransparentCtor {
+                                name, owner_path, ..
+                            } => cow_in(name) || owner_path.iter().any(|s| cow_in(s)),
+                            _ => false,
+                        };
+                        let ty = match result_ty {
+                            ValueType::Ref(Some(root)) => cow_in(root),
+                            _ => false,
+                        };
+                        path || ty
+                    }
+                    OpKind::FieldRead { field, ty, .. } | OpKind::FieldWrite { field, ty, .. } => {
+                        field.owner_root.as_deref().is_some_and(cow_in)
+                            || matches!(ty, ValueType::Ref(Some(root)) if cow_in(root))
+                    }
+                    _ => false,
+                }
+            })
+    }
+
+    fn oefmt_is_empty_str_const(op: &crate::model::SpaceOperation) -> bool {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )
+    }
+
+    fn oefmt_link_is_assert_raise(
+        link: &crate::model::Link,
+        except: crate::model::BlockId,
+    ) -> bool {
+        use crate::flowspace::model::ConstValue;
+        if link.target != except {
+            return false;
+        }
+        let Some(LinkArg::Const(ty)) = link.args.first() else {
+            return false;
+        };
+        let ConstValue::HostObject(class) = &ty.value else {
+            return false;
+        };
+        if !class.is_class() || !class.qualname().contains("AssertionError") {
+            return false;
+        }
+        let Some(LinkArg::Const(value)) = link.args.get(1) else {
+            return false;
+        };
+        let ConstValue::HostObject(inst) = &value.value else {
+            return false;
+        };
+        inst.is_instance()
+            && inst.instance_args().is_some_and(|args| {
+                matches!(
+                    args.first(),
+                    Some(ConstValue::UniStr(msg))
+                        if msg == "implicit AssertionError shouldn't occur"
+                )
+            })
+    }
+
+    /// `decode_utf8_with_errors` Err arm is `RaiseImplicit(AssertionError)`
+    /// (`rtyper/debug.py ll_assert`), never a fabricated `""`.
+    /// `remove_assertion_errors` (simplify.py) may prune that arm.
+    fn oefmt_decode_utf8_err_arm_is_assert_raise(graph: &crate::model::FunctionGraph) {
+        let decode_bb = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.ends_with(&["typedef".to_string(), "decode_utf8_with_errors".to_string()])
+                ))
+            })
+            .expect("decode_utf8_with_errors call");
+        assert!(
+            !decode_bb.operations.iter().any(oefmt_is_empty_str_const),
+            "decode block must not fabricate \"\": {decode_bb:#?}"
+        );
+        let except = graph.exceptblock;
+        let mut saw_assert_raise = false;
+        for link in &decode_bb.exits {
+            if oefmt_link_is_assert_raise(link, except) {
+                saw_assert_raise = true;
+                continue;
+            }
+            let succ = graph.block(link.target);
+            assert!(
+                !succ.operations.iter().any(oefmt_is_empty_str_const),
+                "decode successor must not fabricate \"\": {succ:#?}"
+            );
+            if succ
+                .exits
+                .iter()
+                .any(|exit| oefmt_link_is_assert_raise(exit, except))
+            {
+                saw_assert_raise = true;
+            }
+        }
+        assert!(
+            saw_assert_raise || decode_bb.exits.len() == 1,
+            "Err arm must RaiseImplicit(AssertionError) or be pruned by \
+             remove_assertion_errors: {graph:#?}"
+        );
+    }
+
+    /// Checked `Wtf8::from_bytes` is `rutf8.py check_utf8` plus the
+    /// Option Some/None wrap (`unicodehelper.py str_decode_utf8` fast arm).
+    #[test]
+    #[ignore]
+    fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
+        use crate::model::{CallTarget, OpKind};
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "oefmt").expect("lower oefmt");
+        let paths = oefmt_call_paths(&graph);
+        assert!(
+            !paths
+                .iter()
+                .any(|segments| segments == &["Wtf8".to_string(), "from_bytes".to_string()]),
+            "checked Wtf8::from_bytes must not remain a residual: {paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                segments.ends_with(&["rutf8".to_string(), "check_utf8".to_string()])
+            }),
+            "rutf8.check_utf8 must remain in the caller: {paths:#?}"
+        );
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstBool(true))),
+            "allow_surrogates=True is ConstBool(true): {graph:#?}"
+        );
+        let has_null_mut = ops.iter().any(|op| {
+            matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                if segments == &["core".to_string(), "ptr".to_string(), "null_mut".to_string()])
+        });
+        let has_option_ctor = ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } => matches!(name.as_str(), "Some" | "None"),
+            _ => false,
+        });
+        assert!(
+            has_null_mut || has_option_ctor,
+            "Ok/Err of check_utf8 must construct Option Some/None: {graph:#?}"
+        );
+    }
+
+    /// `String::from_utf8_lossy` is `unicodehelper.py str_decode_utf8`
+    /// replace / U+FFFD (`typedef::decode_utf8_with_errors`), never a Cow.
+    /// The Result Err arm is `RaiseImplicit(AssertionError)`
+    /// (`rtyper/debug.py ll_assert`), never a fabricated `""`.
+    #[test]
+    #[ignore]
+    fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "oefmt").expect("lower oefmt");
+        let paths = oefmt_call_paths(&graph);
+        assert!(
+            !paths.iter().any(|segments| {
+                segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "from_utf8_lossy")
+            }),
+            "from_utf8_lossy must not remain a residual: {paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                segments.ends_with(&["typedef".to_string(), "decode_utf8_with_errors".to_string()])
+            }),
+            "decode_utf8_with_errors must remain in the caller: {paths:#?}"
+        );
+        assert!(
+            !oefmt_mentions_cow(&graph),
+            "from_utf8_lossy dest is a plain string, not Cow: {graph:#?}"
+        );
+        oefmt_decode_utf8_err_arm_is_assert_raise(&graph);
     }
 
     /// Every local UTF-8 accumulator in PyPy's repr helpers is a
