@@ -7547,8 +7547,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
             match (entry_twin, entry_jitcode_pc >= 0) {
                 (OuterActiveBoxesEntryTwin::Plain, true) => jc
                     .payload
-                    .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-                    .unwrap_or_default(),
+                    .pcdep_for_snapshot_entry(entry_jitcode_pc as usize, crate::state::op_live()),
                 (OuterActiveBoxesEntryTwin::Trivia, true) => jc
                     .payload
                     .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)

@@ -69,6 +69,61 @@ pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) ->
     (marker.opname == "live" && marker.next_pc == op_pc).then_some(pc)
 }
 
+/// Exact `pcdep_by_jit_pc` row emptiness — not the predecessor scan.
+///
+/// `pcdep_for_jitcode_pc` is a largest-offset-≤ lookup, so a later
+/// unrolled `-live-` that is absent from the first-offset table inherits
+/// the first emission's color→slot map and looks non-empty. `jitcode.py
+/// get_live_vars_info` walks BACK `OFFSET_SIZE+1` onto the marker itself;
+/// an absent or empty *own* row is the 7th-commit empty `-live-`.
+pub(crate) fn exact_pcdep_row_is_empty_in(
+    table: &[(usize, Vec<(u8, u16, u16)>)],
+    jit_pc: usize,
+) -> bool {
+    match table.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+        Ok(i) => table[i].1.is_empty(),
+        Err(_) => true,
+    }
+}
+
+pub(crate) fn exact_pcdep_row_is_empty(pjc: &crate::PyJitCode, jit_pc: usize) -> bool {
+    exact_pcdep_row_is_empty_in(&pjc.metadata.pcdep_by_jit_pc, jit_pc)
+}
+
+/// FBW color→slot entry for a guard whose capture pc is already a `-live-`.
+///
+/// #2436 / `first_floor_boundary_for_py`: the first emission of this
+/// Python PC uses that floor (`get_live_vars_info` walks BACK onto the
+/// marker). A later unrolled copy of the same opcode has its own
+/// `-live-`; using the first floor as its map remaps colours
+/// `get_list_of_active_boxes` would have read at the later marker.
+pub(crate) fn entry_pc_for_branch_guard_live(
+    capture_live: usize,
+    first_floor: Option<usize>,
+    preceding_live_of_floor: Option<usize>,
+) -> usize {
+    match first_floor {
+        Some(floor) if floor == capture_live || preceding_live_of_floor == Some(capture_live) => {
+            floor
+        }
+        _ => capture_live,
+    }
+}
+
+/// Exact-hit vs predecessor-scan rule used by [`PyJitCode::pcdep_for_snapshot_entry`].
+pub(crate) fn pcdep_for_snapshot_entry_in(
+    table: &[(usize, Vec<(u8, u16, u16)>)],
+    jit_pc: usize,
+    is_live_marker: bool,
+    predecessor: &[(u8, u16, u16)],
+) -> Vec<(u8, u16, u16)> {
+    match table.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+        Ok(i) => table[i].1.clone(),
+        Err(_) if is_live_marker => Vec::new(),
+        Err(_) => predecessor.to_vec(),
+    }
+}
+
 /// Resume coordinate for a plain (non-after-residual) guard.
 ///
 /// `op_pc` is the capture coordinate. Branch guards pass the jump's own
@@ -913,12 +968,35 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         "guard_snapshot_carried_live",
                     )
                 } else {
-                    let entry = unsafe {
+                    // #2436: `generate_guard(resumepc=orgpc)`. Banks stay at
+                    // `guard_jitcode_pc` (the jump's own `-live-`). The first
+                    // emission of this Python PC uses `first_floor_boundary_for_py`
+                    // (`get_live_vars_info` walks BACK onto the marker). A
+                    // later unrolled copy uses its own `-live-` so it does
+                    // not inherit the first emission's color→slot map.
+                    let floor = unsafe {
                         crate::py_coord::first_floor_boundary_for_py(
                             &walked_owned.payload.metadata,
                             liveness_py_pc,
                         )
                         .map(|(pc, _)| pc)
+                    };
+                    let op_live = crate::state::op_live();
+                    let capture_is_live = guard_jitcode_pc >= 0 && {
+                        let live = guard_jitcode_pc as usize;
+                        walked_owned
+                            .payload
+                            .jitcode
+                            .can_decode_live_vars(live, op_live)
+                            || walked_owned.payload.jitcode.code.get(live) == Some(&op_live)
+                    };
+                    let entry = if capture_is_live {
+                        let live = guard_jitcode_pc as usize;
+                        let preceding =
+                            floor.and_then(|f| preceding_live_marker(&walked_owned.payload, f));
+                        Some(entry_pc_for_branch_guard_live(live, floor, preceding))
+                    } else {
+                        floor
                     };
                     match entry {
                         Some(pc) => (
@@ -2465,9 +2543,25 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         Some(m) => m as i32,
         None => majit_ir::resumedata::NO_JITCODE_PC,
     };
+    // A loop-header `-live-` can name colors the sub-walk never wrote
+    // (`OpRef::NONE`). Recover them from this frame's slot shadow so
+    // `collect_callee_active_boxes` does not abort. Skip the pending call
+    // result: `get_list_of_active_boxes` (`pyjitpl.py`) clears that color
+    // while the call is in flight. Snapshot-local only: do not write the
+    // recovered colours into the live banks (`generate_guard(resumepc=orgpc)`
+    // later reads those banks at the jump's own `-live-`).
+    let skip_result = result_register.and_then(|(bank, color)| (bank == 'r').then_some(color));
+    let recovered_regs_r = recover_callee_none_ref_colors(
+        ctx,
+        &pjc,
+        jitcode_index as i32,
+        call_jit_pc,
+        caller_liveness_word,
+        skip_result,
+    );
     let boxes = collect_callee_active_boxes(
         ctx.registers_i,
-        ctx.registers_r,
+        recovered_regs_r.as_slice(),
         ctx.registers_f,
         jitcode_index,
         call_jit_pc,
@@ -2749,9 +2843,19 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         .resume_marker_for_jitcode_pc(call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
     let boxes = if caller_code.is_some() {
+        let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);
+        let skip_result = result_register.and_then(|(bank, color)| (bank == 'r').then_some(color));
+        let recovered_regs_r = recover_callee_none_ref_colors(
+            ctx,
+            &pjc,
+            jitcode_index as i32,
+            call_jit_pc,
+            resume_marker_jit_pc as i32,
+            skip_result,
+        );
         collect_callee_active_boxes(
             ctx.registers_i,
-            ctx.registers_r,
+            recovered_regs_r.as_slice(),
             ctx.registers_f,
             jitcode_index,
             call_jit_pc,
@@ -3332,23 +3436,72 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     let maps =
         crate::state::bridge_semantic_maps_from_jitcode_pc(callee_jitcode_index, callee_jitcode_pc);
     if recovered_regs_r.iter().any(|value| value.is_none()) && !callee_pjc.code_ptr.is_null() {
-        if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
-            for (color, value) in recovered_regs_r.iter_mut().enumerate() {
-                if !value.is_none() {
-                    continue;
-                }
-                let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
-                    stack_base,
-                    maps.stack_depth_at_pc,
-                    &maps.pcdep_entries,
-                    color,
-                ) else {
-                    continue;
-                };
-                if let Some(&slot_value) = shadow.opref.get(&(slot as i64)) {
-                    *value = slot_value;
-                }
-            }
+        // The carried resume coordinate is the `-live-` immediately before
+        // this op (`preceding_live_marker`). That marker's `pcdep_by_jit_pc`
+        // row is often empty while `all_liveness` still names colors — the
+        // next op owns the color→slot map. Using the empty row made
+        // `semantic_ref_slot_for_reg_color` return None, so `self` / `line`
+        // stayed `OpRef::NONE` and `collect_callee_active_boxes` aborted.
+        //
+        // A branch guard's `callee_op_pc` *is* that `-live-`
+        // (`generate_guard(resumepc=orgpc)` / `guarded_branch_core`
+        // `capture_pc = live_before_jit_pc`). `get_list_of_active_boxes`
+        // reads `registers_r[index]` at that marker; substituting the
+        // jump's pcdep remaps colours the `-live-` still names.
+        // Keep the empty marker map there. Only a *preceding* empty
+        // loop-header `-live-` at the same depth takes the next-op map
+        // (`live_marker_belongs_to_op` / `jitcode.py get_live_vars_info`
+        // walks BACK onto the `-live-`, never forward onto a different
+        // opcode). Snapshot-local fill only: do not write the recovered
+        // colours into the live banks.
+        let (shadow_opref, vstack) = {
+            let state = ctx.frame_state.borrow();
+            let opref = state
+                .callee_shadow
+                .as_ref()
+                .map(|shadow| shadow.opref.clone())
+                .unwrap_or_default();
+            (opref, state.vstack_boxes.clone())
+        };
+        let op_for_map =
+            op_pc_for_empty_live_recovery(&callee_pjc, callee_op_pc, callee_jitcode_pc);
+        let belongs = op_for_map.is_some();
+        let exact_empty = usize::try_from(callee_jitcode_pc)
+            .map(|pc| exact_pcdep_row_is_empty(&callee_pjc, pc))
+            .unwrap_or(true);
+        let take_next_op = belongs && exact_empty;
+        if take_next_op {
+            // Mailbox: empty loop-header `-live-` precedes this op at the
+            // same depth. Take the next-op color→slot map and overlay
+            // vstack (`get_live_vars_info` walks BACK onto that marker).
+            let op_pcdep = op_for_map
+                .and_then(|pc| callee_pjc.pcdep_for_jitcode_pc(pc))
+                .unwrap_or_default();
+            let pcdep = pcdep_for_callee_none_ref_recovery(&maps.pcdep_entries, &op_pcdep, true);
+            fill_none_refs_from_callee_slots(
+                &mut recovered_regs_r,
+                stack_base,
+                maps.stack_depth_at_pc,
+                &pcdep,
+                &shadow_opref,
+                &vstack,
+                None,
+            );
+        } else if !exact_empty {
+            // The marker has its own color→slot row.
+            // `get_list_of_active_boxes` reads `registers_r[index]` there;
+            // fill NONE holes from that map. Do not substitute the jump
+            // or CALL behind a capture that *is* the `-live-`, and do not
+            // inherit a predecessor row the later `-live-` does not own.
+            fill_none_refs_from_callee_slots(
+                &mut recovered_regs_r,
+                stack_base,
+                maps.stack_depth_at_pc,
+                &maps.pcdep_entries,
+                &shadow_opref,
+                &[],
+                None,
+            );
         }
         // A dense fallthrough marker can name the NEXT Python opcode's result
         // color before that opcode has executed.  RPython's sparse stream has
@@ -3437,6 +3590,244 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             ),
     }
     Ok(())
+}
+
+/// A `-live-` marker's `pcdep_by_jit_pc` row can be empty while
+/// `all_liveness` at that same coordinate still names colors.
+///
+/// `get_list_of_active_boxes` (`pyjitpl.py`) reads `registers_r[index]`
+/// from `all_liveness` at `pc = self.pc - SIZE_LIVE_OP` for a plain guard,
+/// or at `self.pc` for `in_a_call` / `after_residual_call`.
+/// `jitcode.py get_live_vars_info` accepts either the `-live-` itself or
+/// the instruction that follows it. An empty pcdep row does not mean the
+/// live set is empty.
+///
+/// pyre's inlined callee stores locals in `CalleeLocalsShadow` (slot
+/// indexed). At a loop-header `-live-` the post-regalloc colors
+/// `all_liveness` names may still be `OpRef::NONE`; mapping those colors
+/// through the next instruction's pcdep recovers the already-recorded
+/// slot boxes so `collect_callee_active_boxes` does not abort.
+///
+/// That next-op map is only the slot map of the op a *preceding* marker
+/// belongs to ([`live_marker_belongs_to_op`]). A branch guard's capture
+/// pc *is* the jump's own `-live-` (`generate_guard(resumepc=orgpc)`).
+/// Substituting the jump's pcdep there remaps colours
+/// `get_list_of_active_boxes` would have read at that `-live-`. Keep the
+/// empty marker map in that case. An `in_a_call` / after-residual
+/// trailing `-live-` is already `self.pc`; it is not the CALL behind it.
+pub(crate) fn pcdep_for_callee_none_ref_recovery(
+    marker_pcdep: &[(u8, u16, u16)],
+    op_pcdep: &[(u8, u16, u16)],
+    take_next_op: bool,
+) -> Vec<(u8, u16, u16)> {
+    if take_next_op {
+        op_pcdep.to_vec()
+    } else {
+        marker_pcdep.to_vec()
+    }
+}
+
+/// Slot map and optional vstack overlay for filling `OpRef::NONE` holes.
+///
+/// Next-op pcdep and `vstack_boxes` are the mailbox loop-header recovery
+/// (`for_iter_inflight` / `test_mailbox`). They apply only when the
+/// empty `-live-` precedes `op_pc` at the same stack depth *and* that
+/// marker's own `pcdep_by_jit_pc` row is empty. Otherwise
+/// `get_list_of_active_boxes` reads `registers_r[index]` at the marker;
+/// overlaying vstack or the jump/CALL pcdep is the pre-#2436 remap.
+#[allow(dead_code)]
+pub(crate) fn none_ref_recovery_sources<'a>(
+    marker_pcdep: &'a [(u8, u16, u16)],
+    op_pcdep: &'a [(u8, u16, u16)],
+    take_next_op: bool,
+    vstack: &'a [OpRef],
+) -> (&'a [(u8, u16, u16)], &'a [OpRef]) {
+    if take_next_op {
+        (op_pcdep, vstack)
+    } else {
+        (marker_pcdep, &[])
+    }
+}
+
+/// Whether `carried_jitcode_pc` is the `-live-` immediately before `op_pc`.
+///
+/// `preceding_live_marker` is the plain-guard coordinate
+/// (`get_list_of_active_boxes`, `pc = self.pc - SIZE_LIVE_OP`).
+/// `resume_marker_for_jitcode_pc` is the codewrite-time twin of that
+/// opcode-start `-live-`. A trailing after-call `-live-` is already the
+/// resume pc (`in_a_call or after_residual_call` uses `self.pc`); mapping
+/// it through the CALL behind it pops arguments the marker still names.
+/// A branch guard captures at the jump's own `-live-`, so `op_pc` *is*
+/// that marker and is not "the next op".
+pub(crate) fn live_marker_belongs_to_op(
+    pjc: &crate::PyJitCode,
+    op_pc: usize,
+    carried_jitcode_pc: i32,
+) -> bool {
+    if carried_jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC {
+        return false;
+    }
+    let Ok(carried) = usize::try_from(carried_jitcode_pc) else {
+        return false;
+    };
+    // Capture pc *is* the `-live-` (`generate_guard(resumepc=orgpc)`).
+    // `get_list_of_active_boxes` already reads `all_liveness` at this
+    // coordinate; the jump that follows has a different color→slot map
+    // (condition popped). Do not treat that jump as "the next op".
+    if carried == op_pc {
+        return false;
+    }
+    let attached = preceding_live_marker(pjc, op_pc) == Some(carried);
+    if !attached {
+        return false;
+    }
+    // A branch jump has already popped the condition the `-live-` still
+    // names (`opimpl_goto_if_not`). Its pcdep is a different slot map.
+    // A loop-header `-live-` and the op it precedes share a depth.
+    match (
+        pjc.depth_for_jitcode_pc_pred(carried),
+        pjc.depth_for_jitcode_pc_pred(op_pc),
+    ) {
+        (Some(marker_depth), Some(op_depth)) => marker_depth == op_depth,
+        _ => false,
+    }
+}
+
+/// Opcode whose pcdep may fill `OpRef::NONE` holes at an empty `-live-`.
+///
+/// `None` when the capture coordinate *is* that `-live-`
+/// (`generate_guard(resumepc=orgpc)`): #2436 already snapshots
+/// `registers_r[index]` there, and the jump that follows has popped the
+/// condition. `get_live_vars_info` walks BACK onto the marker from `op_pc`;
+/// it never walks forward onto a different opcode, so a trailing after-call
+/// `-live-` (`in_a_call` uses `self.pc`) does not take the CALL behind it
+/// or the instruction after it.
+///
+/// Otherwise `op_pc` itself when [`live_marker_belongs_to_op`] holds:
+/// the marker immediately precedes this op at the same depth (mailbox
+/// loop-header `-live-` of an inlined callee).
+pub(crate) fn op_pc_for_empty_live_recovery(
+    pjc: &crate::PyJitCode,
+    op_pc: usize,
+    carried_jitcode_pc: i32,
+) -> Option<usize> {
+    live_marker_belongs_to_op(pjc, op_pc, carried_jitcode_pc).then_some(op_pc)
+}
+
+/// Fill `OpRef::NONE` holes from the callee slot shadow / vstack.
+///
+/// Returns a snapshot-local copy of `registers_r`. Does not write the
+/// recovered colours into the live banks: a later branch guard's
+/// `collect_outer_active_boxes` reads those banks at the jump's own
+/// `-live-` (`generate_guard(resumepc=orgpc)`).
+fn recover_callee_none_ref_colors<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pjc: &crate::PyJitCode,
+    jitcode_index: i32,
+    op_pc: usize,
+    carried_jitcode_pc: i32,
+    skip_color: Option<usize>,
+) -> Vec<OpRef> {
+    let mut recovered = ctx.registers_r.to_vec();
+    if carried_jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC
+        || !recovered.iter().any(|value| value.is_none())
+    {
+        return recovered;
+    }
+    let maps =
+        crate::state::bridge_semantic_maps_from_jitcode_pc(jitcode_index, carried_jitcode_pc);
+    let op_for_map = op_pc_for_empty_live_recovery(pjc, op_pc, carried_jitcode_pc);
+    let exact_empty = usize::try_from(carried_jitcode_pc)
+        .map(|pc| exact_pcdep_row_is_empty(pjc, pc))
+        .unwrap_or(true);
+    let take_next_op = op_for_map.is_some() && exact_empty;
+    if !take_next_op && exact_empty {
+        // Capture pc *is* an empty `-live-` that does not precede `op_pc`
+        // at the same depth (`generate_guard(resumepc=orgpc)`). Keep the
+        // empty map: `get_list_of_active_boxes` reads `registers_r[index]`
+        // there, not the jump, the CALL behind it, or a predecessor row
+        // the later `-live-` does not own.
+        return recovered;
+    }
+    let op_pcdep = op_for_map
+        .and_then(|pc| pjc.pcdep_for_jitcode_pc(pc))
+        .unwrap_or_default();
+    let nlocals = if pjc.code_ptr.is_null() {
+        0
+    } else {
+        let code = unsafe { &*pjc.code_ptr };
+        crate::state::callee_layout_for_call_assembler(code).0
+    };
+    let (shadow_opref, vstack) = {
+        let state = ctx.frame_state.borrow();
+        let opref = state
+            .callee_shadow
+            .as_ref()
+            .map(|shadow| shadow.opref.clone())
+            .unwrap_or_default();
+        (opref, state.vstack_boxes.clone())
+    };
+    let pcdep = pcdep_for_callee_none_ref_recovery(&maps.pcdep_entries, &op_pcdep, take_next_op);
+    if pcdep.is_empty() {
+        return recovered;
+    }
+    let vstack_src: &[OpRef] = if take_next_op { &vstack } else { &[] };
+    fill_none_refs_from_callee_slots(
+        &mut recovered,
+        nlocals,
+        maps.stack_depth_at_pc,
+        &pcdep,
+        &shadow_opref,
+        vstack_src,
+        skip_color,
+    );
+    recovered
+}
+
+/// Fill liveness-active Ref colors the sub-walk left as `OpRef::NONE`.
+///
+/// RPython reads `MIFrame.registers_r` directly (`get_list_of_active_boxes`).
+/// pyre's inlined callee keeps locals in `CalleeLocalsShadow` (slot-indexed)
+/// and operand-stack temps in `vstack_boxes`; post-regalloc colors at a
+/// loop-header `-live-` are a different index space. Map each hole through
+/// `pcdep` onto those per-frame stores and write the existing recorded box
+/// into the color. Does not emit IR: the boxes already sit on the trace.
+pub(crate) fn fill_none_refs_from_callee_slots(
+    registers_r: &mut [OpRef],
+    nlocals: usize,
+    stack_depth: usize,
+    pcdep: &[(u8, u16, u16)],
+    shadow_opref: &std::collections::HashMap<i64, OpRef>,
+    vstack: &[OpRef],
+    skip_color: Option<usize>,
+) -> usize {
+    let mut filled = 0;
+    for (color, value) in registers_r.iter_mut().enumerate() {
+        if skip_color == Some(color) || !value.is_none() {
+            continue;
+        }
+        let Some(slot) =
+            crate::state::semantic_ref_slot_for_reg_color(nlocals, stack_depth, pcdep, color)
+        else {
+            continue;
+        };
+        if let Some(&slot_value) = shadow_opref.get(&(slot as i64))
+            && !slot_value.is_none()
+        {
+            *value = slot_value;
+            filled += 1;
+            continue;
+        }
+        if let Some(stack_i) = slot.checked_sub(nlocals)
+            && stack_i < stack_depth
+            && let Some(&stack_value) = vstack.get(stack_i)
+            && !stack_value.is_none()
+        {
+            *value = stack_value;
+            filled += 1;
+        }
+    }
+    filled
 }
 
 /// Seed only the not-yet-defined result color carried by pyre's dense

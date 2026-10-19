@@ -19252,6 +19252,130 @@ fn dense_fallthrough_seeds_only_its_missing_result_color() {
     assert_eq!(registers, vec![keep, null_ref, OpRef::NONE]);
 }
 
+#[test]
+fn empty_live_marker_pcdep_uses_the_next_ops_color_map() {
+    let marker: Vec<(u8, u16, u16)> = Vec::new();
+    let op = vec![(1, 0, 0), (1, 3, 1), (1, 4, 3)];
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_callee_none_ref_recovery(&marker, &op, true),
+        op
+    );
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_callee_none_ref_recovery(&op, &marker, false),
+        op
+    );
+}
+
+#[test]
+fn empty_live_marker_that_is_the_resume_coordinate_keeps_the_empty_map() {
+    // Branch-guard capture pc *is* the jump's own `-live-`
+    // (`generate_guard(resumepc=orgpc)`). The empty pcdep row stays
+    // empty: `get_list_of_active_boxes` reads `all_liveness` at that
+    // marker, not the jump's color→slot map.
+    let marker: Vec<(u8, u16, u16)> = Vec::new();
+    let op = vec![(1, 0, 0), (1, 3, 1), (1, 4, 3)];
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_callee_none_ref_recovery(&marker, &op, false),
+        marker
+    );
+    let vstack = vec![OpRef::ref_op(7)];
+    let (pcdep, vstack_src) =
+        super::resume_snapshot::none_ref_recovery_sources(&marker, &op, false, &vstack);
+    assert!(pcdep.is_empty());
+    assert!(vstack_src.is_empty());
+    let (pcdep, vstack_src) =
+        super::resume_snapshot::none_ref_recovery_sources(&marker, &op, true, &vstack);
+    assert_eq!(pcdep, op.as_slice());
+    assert_eq!(vstack_src, vstack.as_slice());
+}
+
+#[test]
+fn exact_pcdep_row_empty_is_not_the_predecessor_scan() {
+    // `pcdep_for_jitcode_pc` predecessor-scans: 11389 would inherit
+    // 11376's non-empty row. Exact lookup: 11373 is an empty own row
+    // (mailbox / first-emission `-live-`); 11389 is absent (later
+    // unrolled copy) and is also empty. #2436 keeps that empty map
+    // unless the marker belongs to the next op.
+    let table = vec![(11373, vec![]), (11376, vec![(1, 0, 19)])];
+    assert!(super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11373
+    ));
+    assert!(!super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11376
+    ));
+    assert!(super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11389
+    ));
+    let pred = table[1].1.clone();
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11376, false, &pred),
+        pred
+    );
+    assert!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11389, true, &pred).is_empty()
+    );
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11400, false, &pred),
+        pred
+    );
+}
+
+#[test]
+fn first_emission_branch_guard_keeps_the_first_floor() {
+    // Main #2436: carried=11373 (`-live-`), first_floor=11376 (the jump).
+    // `get_live_vars_info` walks BACK onto the marker.
+    assert_eq!(
+        super::resume_snapshot::entry_pc_for_branch_guard_live(11373, Some(11376), Some(11373),),
+        11376
+    );
+    assert_eq!(
+        super::resume_snapshot::entry_pc_for_branch_guard_live(11373, Some(11373), None,),
+        11373
+    );
+}
+
+#[test]
+fn later_emission_branch_guard_does_not_inherit_the_first_floor() {
+    // Same Python PC, later jit offset. first_floor is still 11376.
+    // That floor's preceding `-live-` is the first emission (11373),
+    // not this capture (11389). Use this marker; an absent exact
+    // pcdep row stays empty (`pcdep_for_snapshot_entry`).
+    assert_eq!(
+        super::resume_snapshot::entry_pc_for_branch_guard_live(11389, Some(11376), Some(11373),),
+        11389
+    );
+    assert_eq!(
+        super::resume_snapshot::entry_pc_for_branch_guard_live(11439, Some(11376), Some(11373),),
+        11439
+    );
+}
+
+#[test]
+fn none_ref_colors_reload_from_the_callee_slot_shadow() {
+    let keep = OpRef::ref_op(3);
+    let self_box = OpRef::ref_op(11);
+    let line_box = OpRef::ref_op(13);
+    let mut registers = vec![OpRef::NONE, keep, OpRef::NONE, OpRef::NONE, keep];
+    let mut shadow = std::collections::HashMap::new();
+    shadow.insert(0, self_box);
+    shadow.insert(1, line_box);
+    // Loop-header coloring: color 0 = local 0 (`self`), color 3 = local 1
+    // (`line`). The `-live-` marker's own pcdep row is empty, so recovery
+    // has to consult this map.
+    let pcdep = vec![(1, 0, 0), (1, 3, 1), (1, 4, 3)];
+    let filled = super::resume_snapshot::fill_none_refs_from_callee_slots(
+        &mut registers,
+        3,
+        1,
+        &pcdep,
+        &shadow,
+        &[],
+        None,
+    );
+    assert_eq!(filled, 2);
+    assert_eq!(registers, vec![self_box, keep, OpRef::NONE, line_box, keep]);
+}
+
 /// `insert_renamings` routes a cyclic parallel move through the Int scratch
 /// (`int_push/i` then `int_pop/>i`).  The pop must land the source's concrete
 /// shadow in `concrete_registers_i[dst]`; leaving the destination slot's old
