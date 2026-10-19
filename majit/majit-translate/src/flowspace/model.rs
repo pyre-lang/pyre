@@ -1808,6 +1808,13 @@ impl HostEnv {
         // becomes `__majit_utf8iter(s)`.  Not a Python builtin class; a
         // translator shim keyed like CAST_INSTANCE (callable, not a class).
         self.insert_builtin("utf8iter", HostObject::new_builtin_callable("utf8iter"));
+        // Front-end spelling of `rutf8.unichr_as_utf8(code, True)`: a
+        // `String::push` / `Wtf8Buf::push` code-point piece becomes a
+        // one-code-point UTF-8 string.
+        self.insert_builtin(
+            "unichr_as_utf8",
+            HostObject::new_builtin_callable("unichr_as_utf8"),
+        );
     }
 
     fn bootstrap_std_modules(&mut self) {

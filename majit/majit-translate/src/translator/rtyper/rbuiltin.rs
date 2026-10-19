@@ -234,6 +234,8 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("reversed", rtype_builtin_reversed),
         // Translator shim: `__majit_utf8iter` → HOST_ENV `utf8iter`.
         ("utf8iter", rtype_builtin_utf8iter),
+        // Translator shim: `__majit_unichr_as_utf8` → HOST_ENV `unichr_as_utf8`.
+        ("unichr_as_utf8", rtype_builtin_unichr_as_utf8),
         // rbuiltin.py:709-715
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
@@ -2265,6 +2267,28 @@ pub fn rtype_builtin_utf8iter(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize
         .clone()
         .ok_or_else(|| TyperError::message("rtype_builtin_utf8iter: r_result missing"))?;
     r_result.newiter(hop)
+}
+
+/// `unichr_as_utf8(code)` — the front's `__majit_unichr_as_utf8` spelling
+/// of `rutf8.unichr_as_utf8(code, allow_surrogates=True)`.  The helper
+/// graph encodes 1–4 UTF-8 bytes; `code > 0x10FFFF` raises ValueError.
+pub fn rtype_builtin_unichr_as_utf8(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        STRPTR, build_ll_unichr_as_utf8_helper_graph,
+    };
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    hop.exception_is_here()?;
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_unichr_as_utf8".to_string(),
+        vec![LowLevelType::Signed],
+        STRPTR.clone(),
+        move |_rtyper, _args, _result| build_ll_unichr_as_utf8_helper_graph("ll_unichr_as_utf8"),
+    )?;
+    hop.gendirectcall(&helper, vlist)
 }
 
 /// The receiver of an exception `__init__` hop, as `InstanceRepr`.

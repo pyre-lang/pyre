@@ -4444,6 +4444,35 @@ impl<'a> Transformer<'a> {
                 }
                 RewriteResult::Replace(ops)
             }
+            // `pairtype(AbstractStringRepr, AbstractStringRepr).rtype_contains`
+            // (`rstr.py`): `ll_strlen` then `ll_find(s1, s2, 0, end)` then
+            // `int_ne(vres, -1)`.  The front keeps `str::contains` as
+            // `BinOp { op: "contains" }`; a skip-spine graph never meets the
+            // rtyper, so this arm is the leftover-BinOp sibling of
+            // `is_string_equality` / `is_string_concat`.  `ll_find` has no
+            // oopspec residual, so the helper is minted as a Spine-B
+            // candidate (`codewriter::strfind`) rather than a host call.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if self.is_string_contains(binop_name, lhs, rhs) && self.callcontrol.is_some() => {
+                if (crate::front::mir::interpolant_is_rust_heap_string(graph, lhs)
+                    || crate::front::mir::interpolant_is_rust_heap_string(graph, rhs))
+                    && self.config.rust_string_str_helper.is_empty()
+                {
+                    self.abort_unwired_ref_result(op.result.clone())
+                } else {
+                    RewriteResult::Replace(self.emit_string_contains(
+                        graph,
+                        lhs,
+                        rhs,
+                        op.result.clone(),
+                        graph_name,
+                    ))
+                }
+            }
             // RPython `jtransform.py` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`
             // + `_is_rclass_instance` → `instance_ptr_eq`/`instance_ptr_ne`.
             // Pyre's front-end emits a unified `BinOp { op: "eq"/"ne" }`
@@ -5642,6 +5671,163 @@ impl<'a> Transformer<'a> {
             && self.get_value_kind_var(rhs) == 'r'
             && (matches!(stroruni_first_arg_kind(lhs), StrOrUniKind::Str)
                 || matches!(stroruni_first_arg_kind(rhs), StrOrUniKind::Str))
+    }
+
+    /// Whether `contains` over `lhs` / `rhs` is the leftover
+    /// `BinOp { op: "contains" }` `rtype_contains` would have expanded.
+    /// The front only emits that op for `str::contains`; both operands
+    /// are Ref (`int_contains/rr>i` without this rewrite).
+    fn is_string_contains(
+        &self,
+        binop_name: &str,
+        lhs: &crate::flowspace::model::Variable,
+        rhs: &crate::flowspace::model::Variable,
+    ) -> bool {
+        binop_name == "contains"
+            && self.get_value_kind_var(lhs) == 'r'
+            && self.get_value_kind_var(rhs) == 'r'
+    }
+
+    /// Copy a rust-heap `String` (`{cap, ptr, len}`) into rstr `STR`
+    /// (`Repr.rtype_str` of a non-STR layout).  Identity when the
+    /// operand is already `Ptr(STR)`.
+    fn coerce_operand_to_rstr_str(
+        &mut self,
+        graph: &mut FunctionGraph,
+        operand: &crate::flowspace::model::Variable,
+    ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
+        if !crate::front::mir::interpolant_is_rust_heap_string(graph, operand) {
+            return (operand.clone(), Vec::new());
+        }
+        let target = CallTarget::function_path([self.config.rust_string_str_helper.as_str()]);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        let coerced = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        coerced.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
+        ));
+        (
+            coerced.clone(),
+            vec![
+                funcptr_op,
+                SpaceOperation {
+                    result: Some(coerced),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Ref],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![],
+                        args_r: vec![operand.clone()],
+                        args_f: vec![],
+                        result_kind: 'r',
+                        indirect_targets: None,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                },
+            ],
+        )
+    }
+
+    /// Skip-spine expansion of `pairtype(AbstractStringRepr,
+    /// AbstractStringRepr).rtype_contains` (`rstr.py`): `ll_strlen`
+    /// then `gendirectcall(ll_find, s1, s2, 0, end)` then
+    /// `int_ne(vres, -1)`.  `ll_find` has no oopspec, so the helper is
+    /// minted as a Spine-B candidate (`codewriter::strfind`) and the
+    /// Call is rewritten here — `Replace` output is not re-traversed.
+    fn emit_string_contains(
+        &mut self,
+        graph: &mut FunctionGraph,
+        lhs: &crate::flowspace::model::Variable,
+        rhs: &crate::flowspace::model::Variable,
+        result: Option<crate::flowspace::model::Variable>,
+        graph_name: &str,
+    ) -> Vec<SpaceOperation> {
+        let (lhs, mut ops) = self.coerce_operand_to_rstr_str(graph, lhs);
+        let (rhs, rhs_ops) = self.coerce_operand_to_rstr_str(graph, rhs);
+        ops.extend(rhs_ops);
+
+        let v_end = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        ops.push(SpaceOperation {
+            result: Some(v_end.clone()),
+            kind: OpKind::LoweredBlackholeOp {
+                opname: "strlen".into(),
+                args: vec![lhs.clone()],
+            },
+        });
+
+        let zero = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        ops.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+
+        let path = {
+            let cc = self
+                .callcontrol
+                .as_deref_mut()
+                .expect("string contains rewrite requires CallControl");
+            crate::codewriter::strfind::ll_find_path(cc)
+        };
+        let vres = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let find_call = SpaceOperation {
+            result: Some(vres.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: path.segments.clone(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![lhs, rhs, zero, v_end]),
+                result_ty: ValueType::Int,
+            },
+        };
+        match self.rewrite_operation(&find_call, graph_name, graph) {
+            RewriteResult::Replace(mut rewritten) => ops.append(&mut rewritten),
+            RewriteResult::Keep => ops.push(find_call),
+            RewriteResult::Identity(_) => {
+                unreachable!("ll_find is a four-arg helper, never an identity rewrite")
+            }
+        }
+
+        let neg1 = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        ops.push(SpaceOperation {
+            result: Some(neg1.clone()),
+            kind: OpKind::ConstInt(-1),
+        });
+        self.stamp_value_kind(
+            graph,
+            result.clone(),
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        ops.push(SpaceOperation {
+            result,
+            kind: OpKind::BinOp {
+                op: "int_ne".into(),
+                lhs: vres,
+                rhs: neg1,
+                result_ty: ValueType::Int,
+            },
+        });
+        ops
     }
 
     /// `rewrite_op_ptr_eq` / `rewrite_op_ptr_ne` opname after the
@@ -18517,6 +18703,141 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
             "identity never calls ll_streq: {ops:?}",
         );
+    }
+
+    /// Skip-spine leftover of `str::contains`: `rtype_contains`
+    /// (`rstr.py`) is `ll_strlen` then `ll_find(s1, s2, 0, end)` then
+    /// `int_ne(vres, -1)`.  Without this rewrite the assembler spells
+    /// `int_contains/rr>i`.
+    #[test]
+    fn string_contains_expands_to_strlen_ll_find_and_int_ne() {
+        let graph = str_compare_graph("contains");
+        let mut cc = crate::call::CallControl::new();
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "contains"
+            )),
+            "leftover contains must not survive (int_contains/rr>i): {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, args }
+                    if opname == "strlen" && args.len() == 1
+            )),
+            "rtype_contains starts with ll_strlen: {ops:?}",
+        );
+        let inline = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::InlineCall {
+                    args_i,
+                    args_r,
+                    result_kind,
+                    ..
+                } => Some((args_i.len(), args_r.len(), *result_kind)),
+                _ => None,
+            })
+            .expect("ll_find is an inline_call");
+        assert_eq!(inline, (2, 2, 'i'), "ll_find(s1, s2, 0, end): {ops:?}");
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            "inline_call is followed by -live-: {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "int_ne"
+            )),
+            "rtype_contains ends with int_ne(vres, -1): {ops:?}",
+        );
+    }
+
+    /// A rust-heap `String` haystack is copied into `STR` before the
+    /// `rtype_contains` expansion (`Repr.rtype_str` of a non-STR layout).
+    #[test]
+    fn string_contains_coerces_rust_heap_haystack_before_ll_find() {
+        let graph = rust_heap_string_contains_graph();
+        let mut cc = crate::call::CallControl::new();
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ConstFnAddr { path, .. } if path == "jit_ll_str_from_rust_string"
+            )),
+            "rust-heap haystack copies into STR: {ops:?}",
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "contains"
+            )),
+            "leftover contains must not survive: {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "strlen"
+            )),
+            "strlen runs on the STR copy: {ops:?}",
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::InlineCall { .. })),
+            "ll_find is an inline_call: {ops:?}",
+        );
+    }
+
+    fn rust_heap_string_contains_graph() -> FunctionGraph {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        let mut graph = FunctionGraph::new("rust_heap_contains");
+        let lhs = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "haystack".into(),
+                    ty: ValueType::Ref(Some("String".into())),
+                    class_root: Some("String".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "needle".into(),
+                    ty: ValueType::Str,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "contains".into(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+        rhs.set_concretetype(Some(STRPTR.clone()));
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::Signed);
+        graph
     }
 
     /// `core::ptr::eq` is address identity, `rptr.py` `rtype_is_`: over two

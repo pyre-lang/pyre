@@ -130,6 +130,10 @@ pub(crate) mod shims {
     /// `str::chars()`: the front respells `s.chars()` as `__majit_utf8iter(s)`,
     /// the translator-synthesised `Utf8StringIterator` (`rutf8.py`).
     pub(crate) const UTF8_ITER: &str = "__majit_utf8iter";
+    /// `String::push(c)` / `Wtf8Buf::push(c)`: a code point becomes a
+    /// one-code-point UTF-8 string via `rutf8.unichr_as_utf8`
+    /// (`allow_surrogates=True`).
+    pub(crate) const UNICHAR_AS_UTF8: &str = "__majit_unichr_as_utf8";
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";

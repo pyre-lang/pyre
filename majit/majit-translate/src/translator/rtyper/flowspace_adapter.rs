@@ -3315,6 +3315,9 @@ pub fn translate_op(
                         [leaf] if leaf == crate::runtime_names::shims::UTF8_ITER => {
                             Some("utf8iter")
                         }
+                        [leaf] if leaf == crate::runtime_names::shims::UNICHAR_AS_UTF8 => {
+                            Some("unichr_as_utf8")
+                        }
                         _ => None,
                     };
                     if let Some(builtin) = builtin {
@@ -10080,6 +10083,48 @@ mod tests {
                 .expect("utf8iter builtin")
         );
         assert_eq!(translated[0].args[1..], [s]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_unichr_as_utf8_marker_calls_the_unichr_as_utf8_builtin() {
+        // `__majit_unichr_as_utf8(code)` (the front's spelling of
+        // `rutf8.unichr_as_utf8`) → `simple_call(unichr_as_utf8, code)`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let code = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), code.clone());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Str,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_unichr_as_utf8 marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("unichr_as_utf8")
+                .expect("unichr_as_utf8 builtin")
+        );
+        assert_eq!(translated[0].args[1..], [code]);
         assert_eq!(translated[0].result, result_var);
     }
 

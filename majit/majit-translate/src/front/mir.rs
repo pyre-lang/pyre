@@ -10100,6 +10100,58 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Owned `String` / `Wtf8Buf` accumulator `mem::take` rebinds.
+    /// Walks `atomic_ref_place` through a two-phase `&mut` the way
+    /// [`append_accumulator_of_arg_temp`] walks append receivers, then
+    /// falls back to a MIR scan of [`take_receiver_of_borrow`].
+    fn string_accumulator_of_take_arg(&self, take_arg: Option<usize>) -> Option<usize> {
+        let rt = take_arg?;
+        if let Some(MemSlot::Place(place)) = self.mem_slot(Some(rt)) {
+            let place = self.concrete_borrow_place(place);
+            if let PlaceKind::Local(i) = place.kind {
+                let i = i as usize;
+                if tyref_is_owned_str_builder(&place.ty, self.llbc)
+                    || self
+                        .body
+                        .locals
+                        .locals
+                        .get(i)
+                        .is_some_and(|local| tyref_is_owned_str_builder(&local.ty, self.llbc))
+                {
+                    return Some(i);
+                }
+            }
+        }
+        let cache = ScanCache::new(self.body.locals.locals.len());
+        cache.precompute_fresh(self.body, self.llbc);
+        let forward_blocks = forward_reachable_mask(self.llbc, self.body);
+        for candidate in owned_builder_dest_locals(self.body, self.llbc) {
+            if !is_fresh_str_builder(&cache, self.body, self.llbc, candidate) {
+                continue;
+            }
+            for (bb_idx, block) in self.body.body.iter().enumerate() {
+                if !forward_blocks[bb_idx] {
+                    continue;
+                }
+                for stmt in &block.statements {
+                    let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
+                        stmt.stmt_kind_ref()
+                    else {
+                        continue;
+                    };
+                    if matches!(source.kind, PlaceKind::Local(i) if i as usize == candidate)
+                        && let PlaceKind::Local(direct_borrow) = place.kind
+                        && take_receiver_of_borrow(self.body, self.llbc, direct_borrow as usize)
+                            == Some(rt)
+                    {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
         // Each MIR basic block is a FlowGraph block.  Locals live across
         // a successor edge are explicit `Link.args` into the target
@@ -18614,6 +18666,50 @@ impl<'a> Lowering<'a> {
         Ok(result)
     }
 
+    /// Encode a `String::push` / `Wtf8Buf::push` code-point piece as a
+    /// one-code-point UTF-8 string (`rutf8.py unichr_as_utf8`,
+    /// `allow_surrogates=True`).  An ASCII / Unicode-scalar constant
+    /// becomes `__str_const`; a variable code point becomes
+    /// `__majit_unichr_as_utf8`.
+    fn emit_codepoint_as_utf8(
+        &mut self,
+        mir_bb: usize,
+        piece: &Variable,
+        piece_operand: Option<&Operand>,
+    ) -> Result<Variable, LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Some(Operand::Const(value)) = piece_operand
+            && let Ok(decoded) = decode_constant(self.llbc, value)
+        {
+            let code = match decoded {
+                DecodedConst::Int(n) => Some(n),
+                DecodedConst::UInt(n) => i64::try_from(n).ok(),
+                _ => None,
+            };
+            if let Some(code) = code
+                && let Some(text) = unichr_as_utf8_text(code)
+            {
+                return Ok(emit_str_const(&mut self.graph, bb_id, &text));
+            }
+        }
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        stamp_as_rstr_str(&result);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![piece.clone()]),
+                result_ty: ValueType::Str,
+            },
+        });
+        Ok(result)
+    }
+
     /// If `arg_locals[0]` is the sole identity argument of a builder-mode
     /// accumulator (`as_bytes` / `deref` / `as_str` on that builder), emit
     /// `ll_build` (`AbstractStringBuilderRepr.rtype_method_build`) and
@@ -26996,6 +27092,15 @@ impl<'a> Lowering<'a> {
                             self.piece_accumulator_of_append_arg(piece_temp)
                     {
                         self.resolve_builder_build(mir_bb, piece_builder)?
+                    } else if str_builder_ctor_leaf(self.llbc, &reg) == Some("push") {
+                        // `String::push(c)` / `Wtf8Buf::push(c)`: `c` is a
+                        // code point (`rutf8.py unichr_as_utf8`), not a
+                        // leftover SomeInteger append piece.
+                        self.emit_codepoint_as_utf8(
+                            mir_bb,
+                            &args[piece_i],
+                            arg_operands.get(piece_i),
+                        )?
                     } else {
                         args[piece_i].clone()
                     };
@@ -27894,6 +27999,47 @@ impl<'a> Lowering<'a> {
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::str::<Impl>::contains(haystack, needle)` is the
+                // flowspace `contains` operation (`op.contains(container, item)`,
+                // `rstr.py` `rtype_contains`).  A `char` Pattern — including
+                // the utf8iter code-point Variable `decompose_valuefmt` feeds
+                // `FMTS.contains(spec)` — becomes a one-code-point UTF-8
+                // string (`rutf8.py unichr_as_utf8`) so the pairtype is
+                // String+String.  `&str` / `&String` needles stay as the
+                // string.  Any other Pattern (closure, `&[char]`, …) keeps
+                // the residual FunctionPath.
+                if args.len() == 2
+                    && self.is_str_contains_call(&reg)
+                    && let Some(kind) = self.str_contains_needle_kind(
+                        &reg,
+                        second_arg_ty.as_ref(),
+                        second_const_arg_ty.as_ref(),
+                    )
+                {
+                    let needle = match kind {
+                        StrContainsNeedleKind::Char => {
+                            self.emit_codepoint_as_utf8(mir_bb, &args[1], arg_operands.get(1))?
+                        }
+                        StrContainsNeedleKind::Str => args[1].clone(),
+                    };
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "contains".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: needle,
+                            result_ty: ValueType::Bool,
                         },
                     });
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -33331,50 +33477,97 @@ impl<'a> Lowering<'a> {
                 self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
             }
             Some("take") if args.len() == 1 => {
-                let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
-                    return Ok(false);
-                };
-                let address = arg_address(self, 0);
-                if let Some(place) = self.bare_deref_place(&slot)
-                    && self.move_plan(&place.ty).is_some()
+                if let Some(acc) =
+                    self.string_accumulator_of_take_arg(arg_locals.first().copied().flatten())
                 {
-                    // `mem::take` is `replace(dest, <T as Default>::default())`.
-                    // Resolve that call before any read: a missing impl
-                    // leaves the whole `take` residual and emits nothing.
-                    let Some(target) = self.default_call_for_take(reg, &place.ty) else {
-                        return Ok(false);
+                    // `std::mem::take(&mut acc)` on a String / Wtf8Buf
+                    // accumulator is `old = place; place = empty`
+                    // (`rbuilder.py` `StringBuilder.build` then
+                    // `StringBuilder()`).  The generic mem-slot path
+                    // cannot rebind an SSA string local (`zero_for_mem_slot`
+                    // refuses `ValueType::Str`).
+                    let taken = if self.builder_mode && self.accumulator_is_builder_mode(acc) {
+                        let built = self.resolve_builder_build(mir_bb, acc)?;
+                        let bb_id = self.emit_bb(mir_bb);
+                        let fresh = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(fresh.clone()),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec![
+                                        crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
+                                    ],
+                                    fun_decl_id: None,
+                                },
+                                args: Vec::new(),
+                                result_ty: ValueType::Ref(None),
+                            },
+                        });
+                        self.local_var[acc] = Some(LocalValue::One(fresh));
+                        built
+                    } else {
+                        let Some(old) = self
+                            .local_var
+                            .get(acc)
+                            .and_then(Option::as_ref)
+                            .and_then(|value| value.one().ok())
+                        else {
+                            return Ok(false);
+                        };
+                        let bb_id = self.emit_bb(mir_bb);
+                        let empty = emit_str_const(&mut self.graph, bb_id, "");
+                        self.local_var[acc] = Some(LocalValue::One(empty));
+                        old
                     };
-                    let result_ty = tyref_to_value_type_with(
-                        &place.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                    );
-                    let bb_id = self.emit_bb(mir_bb);
-                    let fresh = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(fresh.clone()),
-                        kind: OpKind::Call {
-                            target,
-                            args: Vec::new(),
-                            result_ty,
-                        },
-                    });
-                    let Some(old) =
-                        self.exchange_deref_aggregate(mir_bb, &place, fresh, address)?
-                    else {
-                        return Ok(false);
-                    };
-                    self.local_var[dest_local] = Some(LocalValue::One(old));
+                    self.local_var[dest_local] = Some(LocalValue::One(taken));
                 } else {
-                    let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
+                    let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
                         return Ok(false);
                     };
-                    let old = self.read_mem_slot(mir_bb, &slot)?;
-                    self.write_mem_slot(mir_bb, slot, zero)?;
-                    self.local_var[dest_local] = Some(LocalValue::One(old));
+                    let address = arg_address(self, 0);
+                    if let Some(place) = self.bare_deref_place(&slot)
+                        && self.move_plan(&place.ty).is_some()
+                    {
+                        // `mem::take` is `replace(dest, <T as Default>::default())`.
+                        // Resolve that call before any read: a missing impl
+                        // leaves the whole `take` residual and emits nothing.
+                        let Some(target) = self.default_call_for_take(reg, &place.ty) else {
+                            return Ok(false);
+                        };
+                        let result_ty = tyref_to_value_type_with(
+                            &place.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        );
+                        let bb_id = self.emit_bb(mir_bb);
+                        let fresh = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(fresh.clone()),
+                            kind: OpKind::Call {
+                                target,
+                                args: Vec::new(),
+                                result_ty,
+                            },
+                        });
+                        let Some(old) =
+                            self.exchange_deref_aggregate(mir_bb, &place, fresh, address)?
+                        else {
+                            return Ok(false);
+                        };
+                        self.local_var[dest_local] = Some(LocalValue::One(old));
+                    } else {
+                        let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
+                            return Ok(false);
+                        };
+                        let old = self.read_mem_slot(mir_bb, &slot)?;
+                        self.write_mem_slot(mir_bb, slot, zero)?;
+                        self.local_var[dest_local] = Some(LocalValue::One(old));
+                    }
                 }
             }
             _ => return Ok(false),
@@ -36588,6 +36781,64 @@ impl<'a> Lowering<'a> {
             return false;
         }
         first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
+    }
+
+    /// `core::str::<Impl>::contains` / `core::str::contains`.
+    /// Distinct from `Range::contains`, slice `contains`, and flag-set
+    /// `contains`: those owners have no `str` path segment.  The
+    /// haystack place type is not consulted — `FMTS.contains(spec)`
+    /// materialises a `Ref` of the static whose Dedup id can share a
+    /// number with a layout node, so `tyref_is_string_family` is not a
+    /// reliable gate here.
+    fn is_str_contains_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path
+            .rsplit("::")
+            .next()
+            .map(crate::front::clause_spec::unspecialized_leaf);
+        leaf == Some("contains") && path.split("::").any(|seg| seg == "str")
+    }
+
+    /// `str::contains`'s `Pattern` generic, monomorphised.  `char` (and
+    /// a code-point Variable that rustc still types as `char`) becomes a
+    /// UTF-8 string needle; `&str` / `&String` stay a string needle.
+    fn str_contains_needle_kind(
+        &self,
+        reg: &RegularCall,
+        second_arg_ty: Option<&TyRef>,
+        second_const_arg_ty: Option<&TyRef>,
+    ) -> Option<StrContainsNeedleKind> {
+        let mut tys: Vec<TyRef> = Vec::new();
+        if let Some(ty) = str_contains_pattern_generic(reg, self.llbc) {
+            tys.push(ty);
+        }
+        if let Some(ty) = second_arg_ty {
+            tys.push(ty.clone());
+        }
+        if let Some(ty) = second_const_arg_ty {
+            tys.push(ty.clone());
+        }
+        if tys.iter().any(|ty| tyref_is_char(ty, self.llbc)) {
+            return Some(StrContainsNeedleKind::Char);
+        }
+        if tys
+            .iter()
+            .any(|ty| tyref_is_string_family(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc))
+        {
+            return Some(StrContainsNeedleKind::Str);
+        }
+        // After `str::chars` → utf8iter the live needle is a nonneg
+        // SomeInteger code point while the MIR Pattern is still `char`.
+        if tys.iter().any(|ty| tyref_is_integer_scalar(ty, self.llbc)) {
+            return Some(StrContainsNeedleKind::Char);
+        }
+        None
     }
 
     /// `<[T]>::len` / `Vec::len` — the container element count.  Lowered
@@ -45257,7 +45508,9 @@ fn ref_temp_is_sole_append_arg(
 /// directly or through a single two-phase reborrow); a Shared borrow that is
 /// the sole argument of a string-family identity (`as_bytes` / `deref` /
 /// `as_str`, [`identity_view_of_borrow`]) — a terminal `ll_build` read
-/// (`AbstractStringBuilderRepr.rtype_method_build`); or a bare `move c`
+/// (`AbstractStringBuilderRepr.rtype_method_build`); a `mem::take(&mut c)`
+/// borrow ([`take_receiver_of_borrow`], including the two-phase reborrow
+/// `take` uses) — `old = place; place = empty`; or a bare `move c`
 /// (ownership transfer of the complete accumulated string).  Any other use — a
 /// `copy`, a projection read/write (`c.field` / `*c`), `&c.field`, `Len`/
 /// `Discriminant`, an opaque `escape(&c)`, or `c` in an assert / switch — is an
@@ -45265,7 +45518,7 @@ fn ref_temp_is_sole_append_arg(
 /// declines.  The returned temps are the call-argument locals the append arm
 /// resolves against ([`append_accumulator_of_arg_temp`]), which for a
 /// reborrowed `&mut` argument is the reborrow, not the direct borrow. Identity
-/// temps are accepted but not returned: they are not append receivers.
+/// and take temps are accepted but not returned: they are not append receivers.
 fn clean_accumulator_ref_temps(
     cache: &ScanCache,
     body: &Unstructured,
@@ -45394,11 +45647,164 @@ fn clean_accumulator_ref_temps_scan(
             receivers.push(receiver);
         } else if append_piece_of_borrow(cache, body, llbc, rt).is_none()
             && identity_view_of_borrow(cache, body, llbc, rt).is_none()
+            && take_receiver_of_borrow(body, llbc, rt).is_none()
         {
             return None;
         }
     }
     Some(receivers)
+}
+
+/// Whether `call` is `core::mem::take` / `std::mem::take` of one argument.
+fn is_mem_take_call(llbc: &Llbc, call: &CallPayload) -> bool {
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    if call.args.len() != 1 {
+        return false;
+    }
+    let Some(name) = regular_call_name_path(reg, llbc) else {
+        return false;
+    };
+    matches!(name.rsplit("::").next(), Some("take"))
+        && (name.starts_with("core::mem::") || name.starts_with("std::mem::"))
+}
+
+/// Whether borrow temp `rt` is used exactly once as the sole argument of
+/// `mem::take` and nowhere else.
+fn ref_temp_is_sole_take_arg(body: &Unstructured, llbc: &Llbc, rt: usize) -> bool {
+    let mut selected = 0usize;
+    let mut other = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for st in &bb.statements {
+            match st.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                let take = is_mem_take_call(llbc, call);
+                for (i, arg) in call.args.iter().enumerate() {
+                    if operand_reads_local(arg, rt) {
+                        if take && i == 0 {
+                            selected += 1;
+                        } else {
+                            other += 1;
+                        }
+                    }
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
+            }
+            _ => {}
+        }
+    }
+    selected == 1 && other == 0
+}
+
+/// Resolve a direct `&(mut) acc` borrow temp `rt` to the temp actually
+/// passed as `mem::take`'s argument.  Method-autoref `take(&mut acc)`
+/// reaches the call as `rt`; a two-phase reborrow
+/// (`rt := &mut acc; recv := &TwoPhaseMut *rt`) is the same walk
+/// [`append_receiver_of_borrow`] uses for an explicit `&mut buf`
+/// append.  Accepted by [`clean_accumulator_ref_temps`] like an identity
+/// view: the borrow does not disqualify the accumulator and is not an
+/// append receiver.
+fn take_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    if ref_temp_is_sole_take_arg(body, llbc, rt) {
+        return Some(rt);
+    }
+    let mut recv: Option<usize> = None;
+    let mut other = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for st in &bb.statements {
+            match st.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if let Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } = rvalue
+                        && place_is_immediate_deref_of(rp, rt)
+                    {
+                        let &PlaceKind::Local(r) = &place.kind else {
+                            return None;
+                        };
+                        if recv.replace(r as usize).is_some() {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                if call.args.iter().any(|a| operand_reads_local(a, rt)) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
+            }
+            _ => {}
+        }
+    }
+    let recv = recv?;
+    if other != 0 {
+        return None;
+    }
+    ref_temp_is_sole_take_arg(body, llbc, recv).then_some(recv)
 }
 
 /// Whether `call` is a 1-arg string-family identity: `as_bytes` / `bytes`,
@@ -45942,10 +46348,11 @@ fn identity_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize)
 
 /// Count the terminal consumptions of a fresh accumulator local `c`.
 /// [`clean_accumulator_ref_temps`] already proves every other use of `c`
-/// is the ctor def, an append borrow, or a string-family identity view, so
-/// each `move c`, each inner-builder append piece, and each identity-view
-/// borrow (`as_bytes` / `deref` / `as_str`) is a terminal materialisation of
-/// the finished string — the point where a real builder must run `ll_build`
+/// is the ctor def, an append borrow, a string-family identity view, or a
+/// `mem::take`, so each `move c`, each inner-builder append piece, each
+/// identity-view borrow (`as_bytes` / `deref` / `as_str`), and each
+/// `mem::take` is a terminal materialisation of the finished string — the
+/// point where a real builder must run `ll_build`
 /// (`AbstractStringBuilderRepr.rtype_method_build`).  Exclusive-branch
 /// identity views are several such points; sequential `build()` is valid
 /// on one `StringBuilder`.  See [`is_builder_mode_accumulator`].
@@ -45975,7 +46382,8 @@ fn accumulator_materialization_site_count(
                     && let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
                     && let &PlaceKind::Local(rt) = &place.kind
                     && (append_piece_of_borrow(cache, body, llbc, rt as usize).is_some()
-                        || identity_view_of_borrow(cache, body, llbc, rt as usize).is_some())
+                        || identity_view_of_borrow(cache, body, llbc, rt as usize).is_some()
+                        || take_receiver_of_borrow(body, llbc, rt as usize).is_some())
                 {
                     moves += 1;
                 }
@@ -46058,14 +46466,14 @@ fn single_def_is_str_builder_ctor(body: &Unstructured, llbc: &Llbc, c: usize) ->
 ///   ([`single_def_is_str_builder_ctor`]) — a non-constructor definition is
 ///   an already-built string, and the ctor rewrite would replace that
 ///   producer with `__majit_stringbuilder_new`,
-/// * every borrow of `c` an append or a string-family identity view
-///   ([`clean_accumulator_ref_temps`]), and
+/// * every borrow of `c` an append, a string-family identity view, or a
+///   `mem::take` ([`clean_accumulator_ref_temps`]), and
 /// * at least one terminal consumption
 ///   ([`accumulator_materialization_site_count`]) — a by-value move, an
-///   inner-builder append piece, or an identity-view `as_bytes` / `deref` /
-///   `as_str` (`AbstractStringBuilderRepr.rtype_method_build`). Exclusive
-///   branches may each `ll_build`; sequential `build()` is valid on one
-///   `StringBuilder`.
+///   inner-builder append piece, an identity-view `as_bytes` / `deref` /
+///   `as_str`, or a `mem::take` (`AbstractStringBuilderRepr.rtype_method_build`).
+///   Exclusive branches may each `ll_build`; sequential `build()` is valid
+///   on one `StringBuilder`.
 ///
 /// Zero terminal reads, or a non-constructor definition, keep the
 /// `ll_strconcat` fallback so the builder rewrite only fires where the
@@ -66580,6 +66988,50 @@ fn tyref_is_char(ty: &TyRef, llbc: &Llbc) -> bool {
         })
 }
 
+/// Needle of `str::contains<P>` after Pattern monomorphisation.
+enum StrContainsNeedleKind {
+    /// `char`, including a utf8iter code-point Variable still typed as `char`.
+    Char,
+    /// `&str` / `&String` / string-family.
+    Str,
+}
+
+/// `str::contains<P>`'s monomorphised Pattern type `P`.
+///
+/// Charon `--monomorphize` copies the instance arguments onto the call
+/// (`RegularCall::take_instance_arguments`); the FunDecl Instantiated
+/// segment is the fallback when the call's `types` list is empty.
+fn str_contains_pattern_generic(reg: &RegularCall, llbc: &Llbc) -> Option<TyRef> {
+    let from_call = reg
+        .generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+        .cloned();
+    let from_decl = match &reg.kind {
+        CallKind::Fun(FunId::Regular { id }) => llbc
+            .fn_by_id(*id)
+            .and_then(|fd| fd.item_meta.instantiation())
+            .and_then(|inst| inst.get("types"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .cloned(),
+        _ => None,
+    };
+    let raw = from_call.or(from_decl)?;
+    Some(serde_json::from_value(raw.clone()).unwrap_or_else(|_| TyRef::Other(raw)))
+}
+
+/// `{"Scalar": {"Integer": …}}` after stripping `&T` / `*T`.
+/// utf8iter yields a nonneg SomeInteger code point for `str::chars`.
+fn tyref_is_integer_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(|node| node.as_object()?.get("Scalar"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scalar| scalar.contains_key("Integer"))
+}
+
 fn json_ty_literal_byte_size(node: &serde_json::Value) -> Option<i64> {
     let lit = node.as_object()?.get("Scalar")?;
     if lit.as_str() == Some("Bool") {
@@ -77218,6 +77670,17 @@ fn stamp_as_rstr_str(var: &Variable) {
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
     FunctionGraph::set_concretetype_of_inline(var, crate::model::ConcreteType::GcRef);
     var.set_concretetype(Some(STRPTR.clone()));
+}
+
+/// `rutf8.unichr_as_utf8(code, allow_surrogates=True)` for a Unicode
+/// scalar constant.  Surrogates are left to the runtime helper (Rust
+/// `String` cannot hold them).
+fn unichr_as_utf8_text(code: i64) -> Option<String> {
+    let code = u32::try_from(code).ok()?;
+    if code > 0x10FFFF {
+        return None;
+    }
+    char::from_u32(code).map(String::from)
 }
 
 /// Emit a `__str_const` constant of `text` into `bb_id` and return its
@@ -109705,6 +110168,49 @@ mod tests {
         })
     }
 
+    fn char_ty() -> Value {
+        json!({"Scalar": "Char"})
+    }
+
+    fn const_char_op(ch: &str) -> Value {
+        json!({"Const": [{"Char": ch}, {"Scalar": "Char"}]})
+    }
+
+    fn push_char_decl() -> Value {
+        json!({
+            "def_id": 2,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("rustpython_wtf8"),
+                ident_seg("Wtf8Buf"),
+                wtf8buf_impl_seg(),
+                ident_seg("push"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_wtf8("Mut"), char_ty()],
+                "output": unit_ty()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn mem_take_decl() -> Value {
+        json!({
+            "def_id": 3,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("core"),
+                ident_seg("mem"),
+                ident_seg("take"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_wtf8("Mut")],
+                "output": wtf8_adt()
+            },
+            "body": "Opaque"
+        })
+    }
+
     fn as_bytes_decl() -> Value {
         json!({
             "def_id": 3,
@@ -109809,6 +110315,28 @@ mod tests {
             })
     }
 
+    fn leftover_push_or_take(graph: &FunctionGraph) -> Vec<Vec<String>> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    let leaf = segments.last().map(String::as_str);
+                    let is_string_push = leaf == Some("push")
+                        && segments.iter().any(|s| s == "String" || s == "Wtf8Buf");
+                    let is_mem_take = leaf == Some("take")
+                        && segments.windows(2).any(|w| w[0] == "mem" && w[1] == "take");
+                    (is_string_push || is_mem_take).then(|| segments.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn assert_builder_identity_lowering(graph: &FunctionGraph, name: &str) {
         assert!(
             !has_path_leaf(graph, "push_str"),
@@ -109828,6 +110356,148 @@ mod tests {
                 "{name}: missing builder marker {marker}: {graph:#?}"
             );
         }
+    }
+
+    /// `Wtf8Buf::new(); buf.push('%'); mem::take(&mut buf)` — W4 + W5:
+    /// the take borrow is clean, `push(char)` becomes a one-char str, and
+    /// neither `push` nor `take` remains a FunctionPath.
+    #[test]
+    fn owned_ctor_push_char_take_lowers() {
+        let wtf8 = wtf8_adt();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let graph = lower_owned_concat(
+            "ctor_push_char_take",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "ctor_push_char_take",
+                    0,
+                    vec![],
+                    wtf8.clone(),
+                    vec![
+                        local_of(0, &wtf8),
+                        local_of(1, &wtf8),
+                        local_of(2, &borrow),
+                        local_of(3, &unit),
+                        local_of(4, &borrow),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(1, &wtf8), 1, 4)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(2, &borrow),
+                                ref_rvalue(place_of(1, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(2, &borrow)), const_char_op("%")],
+                                place_of(3, &unit),
+                                2,
+                                4,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(4, &borrow),
+                                ref_rvalue(place_of(1, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(4, &borrow))],
+                                place_of(0, &wtf8),
+                                3,
+                                4,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                wtf8buf_new_decl(),
+                push_char_decl(),
+                mem_take_decl(),
+            ],
+        );
+        let leftover = leftover_push_or_take(&graph);
+        assert!(
+            leftover.is_empty(),
+            "push(char)/take must not stay residual: {leftover:#?} {graph:#?}"
+        );
+        let has_str_const = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.first().map(String::as_str) == Some("__str_const"))
+            })
+        });
+        assert!(
+            has_path_leaf(&graph, crate::runtime_names::shims::UNICHAR_AS_UTF8) || has_str_const,
+            "push(char) must become unichr_as_utf8 or a one-char str const: {graph:#?}"
+        );
+    }
+
+    /// `Wtf8Buf::new(); buf.push(ch); return buf` — a variable code point
+    /// piece is `__majit_unichr_as_utf8`, not a leftover SomeInteger.
+    #[test]
+    fn owned_ctor_push_char_local_lowers() {
+        let wtf8 = wtf8_adt();
+        let ch = char_ty();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let graph = lower_owned_concat(
+            "ctor_push_char_local",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "ctor_push_char_local",
+                    1,
+                    vec![ch.clone()],
+                    wtf8.clone(),
+                    vec![
+                        local_of(0, &wtf8),
+                        local_of(1, &ch),
+                        local_of(2, &wtf8),
+                        local_of(3, &borrow),
+                        local_of(4, &unit),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &wtf8), 1, 4)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &borrow),
+                                ref_rvalue(place_of(2, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &ch))],
+                                place_of(4, &unit),
+                                2,
+                                4,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(0, &wtf8),
+                                use_move(place_of(2, &wtf8)),
+                            )],
+                            json!("Return"),
+                        ),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                wtf8buf_new_decl(),
+                push_char_decl(),
+            ],
+        );
+        let leftover = leftover_push_or_take(&graph);
+        assert!(
+            leftover.is_empty(),
+            "push(char) must not stay residual: {leftover:#?} {graph:#?}"
+        );
+        assert!(
+            has_path_leaf(&graph, crate::runtime_names::shims::UNICHAR_AS_UTF8),
+            "a variable code point must go through unichr_as_utf8: {graph:#?}"
+        );
     }
 
     /// `Wtf8Buf::new(); buf.push_str(s); buf.as_bytes()` — a Shared identity
@@ -111129,6 +111799,174 @@ mod tests {
             "from_utf8_lossy dest is a plain string, not Cow: {graph:#?}"
         );
         oefmt_decode_utf8_err_arm_is_assert_raise(&graph);
+    }
+
+    /// `decompose_valuefmt` `current: String` is a `StringBuilder`
+    /// (`rbuilder.py`): `push(char)` is `unichr_as_utf8` then append,
+    /// `mem::take` is `build()` plus a fresh builder.
+    #[test]
+    #[ignore]
+    fn decompose_valuefmt_lowers_string_accumulator_push_and_take() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "decompose_valuefmt").expect("lower decompose_valuefmt");
+        let paths = oefmt_call_paths(&graph);
+        let leftover: Vec<_> = paths
+            .iter()
+            .filter(|segments| {
+                let leaf = segments.last().map(String::as_str);
+                let is_string_push = leaf == Some("push")
+                    && segments.iter().any(|s| s == "String" || s == "Wtf8Buf");
+                let is_mem_take = leaf == Some("take")
+                    && segments.windows(2).any(|w| w[0] == "mem" && w[1] == "take");
+                let is_str_contains =
+                    leaf == Some("contains") && segments.iter().any(|s| s == "str");
+                is_string_push || is_mem_take || is_str_contains
+            })
+            .cloned()
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "String/Wtf8Buf::push, mem::take, and str::contains must not remain residual: {leftover:#?}"
+        );
+        // The `contains` dest feeds an If whose false arm is only
+        // `fmt::Arguments::from_str` + Panic.  That chain is
+        // `set_raise_implicit(AssertionError)`, so `remove_assertion_errors`
+        // promotes the If and `prune_dead_phis` reclaims the pure BinOp.
+        // Live dest is asserted by `str_contains_lowers_as_binop_contains`.
+        assert!(
+            paths.iter().any(|segments| {
+                segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::UNICHAR_AS_UTF8)
+                    || (segments.first().map(String::as_str) == Some("__str_const"))
+            }),
+            "push(char) must become unichr_as_utf8 or a one-char str const: {paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                matches!(
+                    segments.last().map(String::as_str),
+                    Some(crate::runtime_names::shims::STRINGBUILDER_APPEND)
+                        | Some(crate::runtime_names::shims::STRINGBUILDER_BUILD)
+                        | Some(crate::runtime_names::shims::STRINGBUILDER_NEW)
+                )
+            }) || graph.blocks.iter().any(|block| {
+                block.operations.iter().any(
+                    |op| matches!(&op.kind, crate::model::OpKind::BinOp { op, .. } if op == "add"),
+                )
+            }),
+            "the accumulator must append (builder or ll_strconcat): {graph:#?}"
+        );
+        let leftover_some_casts: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| {
+                crate::model::cast_instance_root(&op.kind).and_then(|root| {
+                    (root.contains("Option") && root.ends_with("::Some")).then_some(root)
+                })
+            })
+            .collect();
+        assert!(
+            leftover_some_casts.is_empty(),
+            "inner next payload downcasts must collapse; leftover {leftover_some_casts:#?}"
+        );
+        let residual_next: Vec<_> = paths
+            .iter()
+            .filter(|segments| {
+                crate::front::iter_next::is_iterator_next_target(&CallTarget::FunctionPath {
+                    segments: (*segments).clone(),
+                    fun_decl_id: None,
+                })
+            })
+            .cloned()
+            .collect();
+        assert!(
+            residual_next.is_empty(),
+            "Iterator::next must rewrite to [__iter_next]: {residual_next:#?}"
+        );
+    }
+
+    /// `core::str::<Impl>::contains` with a returned dest, so the BinOp
+    /// survives `prune_dead_phis`.  A `char` Pattern is `unichr_as_utf8`
+    /// then Contains; `&str` is Contains on the string (`rstr.py`
+    /// `rtype_contains`).
+    #[test]
+    fn str_contains_lowers_as_binop_contains() {
+        let str_ty = str_ref_ty();
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let char_ty = serde_json::json!({"Scalar": "Char"});
+        let graph = super::lower_function(
+            &std_extern_call_fixture(
+                "str_contains_char",
+                &["core", "str", "<Impl>", "contains"],
+                &[str_ty.clone(), char_ty],
+                bool_ty.clone(),
+            ),
+            "str_contains_char",
+        )
+        .expect("lower str::contains(char)");
+        let paths = oefmt_call_paths(&graph);
+        assert!(
+            !paths.iter().any(|segments| {
+                segments.last().map(String::as_str) == Some("contains")
+                    && segments.iter().any(|s| s == "str")
+            }),
+            "str::contains must not remain residual: {paths:#?}"
+        );
+        let binops: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                crate::model::OpKind::BinOp { op, .. } => Some(op.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            binops.iter().any(|op| *op == "contains"),
+            "char needle must become BinOp contains; binops={binops:?} paths={paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::UNICHAR_AS_UTF8)
+            }),
+            "char needle must become unichr_as_utf8: {paths:#?}"
+        );
+
+        let graph = super::lower_function(
+            &std_extern_call_fixture(
+                "str_contains_str",
+                &["core", "str", "<Impl>", "contains"],
+                &[str_ty.clone(), str_ty],
+                bool_ty,
+            ),
+            "str_contains_str",
+        )
+        .expect("lower str::contains(&str)");
+        let paths = oefmt_call_paths(&graph);
+        let binops: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                crate::model::OpKind::BinOp { op, .. } => Some(op.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            binops.iter().any(|op| *op == "contains"),
+            "&str needle must become BinOp contains; binops={binops:?} paths={paths:#?}"
+        );
+        assert!(
+            !paths.iter().any(|segments| {
+                segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::UNICHAR_AS_UTF8)
+            }),
+            "&str needle must not go through unichr_as_utf8: {paths:#?}"
+        );
     }
 
     /// Every local UTF-8 accumulator in PyPy's repr helpers is a

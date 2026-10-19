@@ -2214,6 +2214,10 @@ fn dict_method_move_to_end(
 // unaryop.py:593-690 — @op.contains.register(SomeString|SomeUnicodeString)
 // + class __extend__(SomeString, SomeUnicodeString) shared overrides
 
+/// `unaryop.py contains_String` (`@op.contains.register(SomeString)`).
+/// The needle is named `char` upstream; a SomeString needle (str-in-str,
+/// including a `char` Pattern rewritten to UTF-8 in `front/mir`) takes
+/// the same SomeBool path — `const_str_of` already reads SomeString.
 #[allow(non_snake_case)]
 pub fn contains_String(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_string = ann
@@ -6494,6 +6498,27 @@ mod tests {
         );
         let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_contains_string_with_string_needle_returns_bool() {
+        let ann = mk_ann();
+        let mut v_string = Variable::named("s");
+        ann.setbinding(
+            &mut v_string,
+            SomeValue::String(SomeString::new(false, false)),
+        );
+        let mut v_needle = Variable::named("n");
+        ann.setbinding(
+            &mut v_needle,
+            SomeValue::String(SomeString::new(false, false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::Contains,
+            vec![Hlvalue::Variable(v_string), Hlvalue::Variable(v_needle)],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        assert!(matches!(r, SomeValue::Bool(_)), "got {r:?}");
     }
 
     #[test]

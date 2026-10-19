@@ -230,6 +230,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "enumerate", builtin_enumerate);
     analyzer_for(&mut reg, "reversed", builtin_reversed);
     analyzer_for(&mut reg, "utf8iter", builtin_utf8iter);
+    analyzer_for(&mut reg, "unichr_as_utf8", builtin_unichr_as_utf8);
     // builtin.py:102-130 — bool / int / float / chr / unichr /
     // unicode / bytearray.
     analyzer_for(&mut reg, "bool", builtin_bool);
@@ -899,6 +900,23 @@ pub fn builtin_utf8iter(
         s_str.clone(),
         vec!["utf8".to_string()],
     )))
+}
+
+/// Translator-synthesised `rutf8.unichr_as_utf8(code, allow_surrogates=True)`:
+/// a nonneg integer code point becomes a UTF-8 `SomeString`.  The front
+/// spells `String::push(c)`'s piece as `__majit_unichr_as_utf8(c)`.
+pub fn builtin_unichr_as_utf8(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "unichr_as_utf8() takes exactly one argument",
+        ));
+    }
+    let _s_int = arg_at(args_s, 0, "builtin_unichr_as_utf8");
+    Ok(SomeValue::String(SomeString::new(false, false)))
 }
 
 /// Upstream `builtin_bool(s_obj)` (builtin.py).
@@ -4885,6 +4903,17 @@ mod tests {
         };
         assert_eq!(it.variant, vec!["utf8".to_string()]);
         assert!(matches!(*it.s_container, SomeValue::String(_)));
+    }
+
+    #[test]
+    fn builtin_unichr_as_utf8_returns_somestring() {
+        let bk = bk();
+        let s_int = bk.immutablevalue(&ConstValue::Int(0x20ac)).unwrap();
+        let result = builtin_unichr_as_utf8(&bk, &[Some(s_int)], &no_kwds()).unwrap();
+        assert!(
+            matches!(result, SomeValue::String(_)),
+            "unichr_as_utf8 annotates a UTF-8 string, got {result:?}"
+        );
     }
 
     #[test]
