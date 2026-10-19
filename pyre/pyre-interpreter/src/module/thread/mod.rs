@@ -1684,9 +1684,14 @@ mod local_class {
         fn create_new_dict(&self, ident: i64) -> Result<PyObjectRef, crate::PyError> {
             let this = self as *const Self as *mut Self;
             let obj = this as PyObjectRef;
+            // Live `self` is on the root stack before `newdict`
+            // (`shadowstack.py push_roots`); the dict is pinned before the
+            // next collecting call (`pop_roots` reloads both).
+            let roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
             // create a new dict for this thread
             let w_dict = pyre_object::w_dict_new();
-            let roots = pyre_object::gc_roots::push_roots();
             let w_dict = pyre_object::gc_roots::pin_root(w_dict);
             let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // Published before the initializer runs: the `__init__` about to be
@@ -1701,18 +1706,22 @@ mod local_class {
             // lookup, which can itself run Python: nothing between the copy and
             // the callee rooting them allocates, so a collection cannot leave
             // the copies naming pre-move addresses.
-            let result = match crate::typedef::r#type(obj) {
-                None => Err(crate::PyError::type_error("_local instance has no type")),
-                Some(w_type) => match crate::baseobjspace::getattr_str(w_type.as_ptr(), "__init__")
-                {
-                    Err(err) => Err(err),
-                    Ok(w_init) => {
-                        let mut call_args = vec![obj];
-                        call_args.extend(unsafe { w_tuple_items_copy_as_vec(self.initargs) });
-                        self.call_init(w_init, &call_args)
+            let result =
+                match crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
+                    None => Err(crate::PyError::type_error("_local instance has no type")),
+                    Some(w_type) => {
+                        match crate::baseobjspace::getattr_str(w_type.as_ptr(), "__init__") {
+                            Err(err) => Err(err),
+                            Ok(w_init) => {
+                                let mut call_args =
+                                    vec![pyre_object::gc_roots::shadow_stack_get(obj_slot)];
+                                call_args
+                                    .extend(unsafe { w_tuple_items_copy_as_vec(self.initargs) });
+                                self.call_init(w_init, &call_args)
+                            }
+                        }
                     }
-                },
-            };
+                };
             if let Err(err) = result {
                 // failed, forget w_dict and propagate the exception
                 let key = w_int_new(ident);
@@ -1737,7 +1746,7 @@ mod local_class {
             // still reachable through `self.dicts`, and a moving collection
             // would relocate it there while this frame's copy kept the pre-move
             // address for `current_dict` to cache and return.
-            register_local_in_current_ec(obj);
+            register_local_in_current_ec(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
             drop(roots);
             Ok(w_dict)
