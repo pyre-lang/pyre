@@ -15457,7 +15457,7 @@ fn generator_table_is_only_the_stopiteration_wrapper(code: &pyre_interpreter::Co
 /// What the census reports about one `FOR_ITER` over a generator.
 pub(crate) struct GeneratorResumeCensus {
     verdict: GeneratorResumeVerdict,
-    /// `last_instr + 1`, the coordinate a resume walk would enter at.
+    /// `next_instr()`, the coordinate a resume walk would enter at.
     resume_py_pc: usize,
     /// The JitCode byte offset that coordinate resolves to, once it does.
     marker_offset: Option<usize>,
@@ -15519,9 +15519,10 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
         decline!(V::NotResumable)
     };
     // `execute_frame` documents execution as starting just after `last_instr`,
-    // and `resume_execute_frame` returns exactly `last_instr + 1` after
-    // pushing the sent value.
-    census.resume_py_pc = shape.last_instr as usize + 1;
+    // and `resume_execute_frame` returns `next_instr()` after pushing the
+    // sent value.  This fast path only admits a parked `YIELD_VALUE`
+    // (`last_instr >= 0`), where that is `last_instr + 1`.
+    census.resume_py_pc = unsafe { (*shape.frame).next_instr() };
     let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) }
         as *const pyre_interpreter::CodeObject;
     if raw.is_null() {
@@ -16101,7 +16102,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         pyre_object::gc_roots::shadow_stack_get(frame_root) as *mut pyre_interpreter::PyFrame;
 
     // `resume_execute_frame`: push the sent `None` and start at
-    // `last_instr + 1`.  Arm the durable undo first so a declined walk
+    // `next_instr()`.  Arm the durable undo first so a declined walk
     // puts the frame back whole.
     fbw_arm_durable_frame_undo(gen_frame as usize);
     unsafe {
@@ -19304,7 +19305,7 @@ fn setup_call_ref_concrete<Sym: WalkSym>(
 /// Same as [`run_sub_jitcode_walk`], but enter the callee body at
 /// `start_pc` and seed extra Ref-bank registers after the call args.
 ///
-/// A generator resume starts at `resume_execute_frame` (`last_instr + 1`),
+/// A generator resume starts at `resume_execute_frame` (`next_instr()`),
 /// not at function entry, and needs the portal frame / ec colors plus the
 /// live locals the resume block reads.  `extra_ref_seeds` is `(reg, box,
 /// concrete)` — later entries overwrite earlier ones at the same color.

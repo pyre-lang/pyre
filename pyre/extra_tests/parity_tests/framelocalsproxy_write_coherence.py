@@ -39,6 +39,26 @@ yet.
 """
 
 import sys
+import types
+
+try:
+    from inspect import GEN_CLOSED, GEN_CREATED, GEN_SUSPENDED, getgeneratorstate
+except ImportError:
+    # `inspect.getgeneratorstate`. The cranelift core binary has no `_tokenize`,
+    # so `inspect` cannot import; the checks are the same four `gi_*` reads.
+    GEN_CREATED = "GEN_CREATED"
+    GEN_RUNNING = "GEN_RUNNING"
+    GEN_SUSPENDED = "GEN_SUSPENDED"
+    GEN_CLOSED = "GEN_CLOSED"
+
+    def getgeneratorstate(generator):
+        if generator.gi_running:
+            return GEN_RUNNING
+        if generator.gi_suspended:
+            return GEN_SUSPENDED
+        if generator.gi_frame is None:
+            return GEN_CLOSED
+        return GEN_CREATED
 
 ROUNDS = 4000
 
@@ -82,10 +102,185 @@ def check(name, got):
     return True
 
 
+def unstarted_generator_cellvar_argument():
+    # A generator is created at the CALL after the prologue `MAKE_CELL` has
+    # run (`f_lasti` past that instruction). `framelocalsproxy_getval` /
+    # `framelocalsproxy_setitem` unwrap / write-through the Cell, so both
+    # print 42, write 43 into the cell, and `next(g)` yields 43.
+    def gen(x):
+        def capture():
+            return x
+
+        yield capture()
+
+    g = gen(42)
+    before = g.gi_frame.f_locals["x"]
+    g.gi_frame.f_locals["x"] = 43
+    after = g.gi_frame.f_locals["x"]
+    yielded = next(g)
+    return before, after, yielded
+
+
+def unstarted_generator_celltype_argument():
+    # The argument *is* a cell object. `MAKE_CELL` wraps it, so
+    # `f_locals["x"]` is that cell (identity), a write stores into the
+    # wrapper, and `next(g)` is 7 while the original cell still holds 5.
+    c = types.CellType(5)
+
+    def gen(x):
+        def capture():
+            return x
+
+        yield capture()
+
+    g = gen(c)
+    before = g.gi_frame.f_locals["x"]
+    g.gi_frame.f_locals["x"] = 7
+    after = g.gi_frame.f_locals["x"]
+    yielded = next(g)
+    return before, after, yielded, c.cell_contents, before is c
+
+
+def check_unstarted_generator_cellvar():
+    got = unstarted_generator_cellvar_argument()
+    want = (42, 43, 43)
+    if got != want:
+        print(f"unstarted_generator_cellvar_argument: got {got!r}, want {want!r}")
+        return False
+    return True
+
+
+def check_unstarted_generator_celltype():
+    before, after, yielded, orig, before_is_c = unstarted_generator_celltype_argument()
+    if not before_is_c or after != 7 or yielded != 7 or orig != 5:
+        print(
+            "unstarted_generator_celltype_argument: "
+            f"got before={before!r} after={after!r} yielded={yielded!r} "
+            f"orig={orig!r} before_is_c={before_is_c!r}"
+        )
+        return False
+    return True
+
+
+def check_unstarted_generator_state_and_lineno():
+    def gen(x):
+        yield x
+
+    g = gen(1)
+    before = getgeneratorstate(g)
+    lineno = g.gi_frame.f_lineno
+    first = gen.__code__.co_firstlineno
+    yielded = next(g)
+    after = getgeneratorstate(g)
+    if before != GEN_CREATED or after != GEN_SUSPENDED:
+        print(
+            "unstarted_generator_state: "
+            f"got before={before!r} after={after!r}"
+        )
+        return False
+    if lineno != first:
+        print(
+            "unstarted_generator_f_lineno: "
+            f"got {lineno!r}, want {first!r}"
+        )
+        return False
+    if yielded != 1:
+        print(f"unstarted_generator_state yield: got {yielded!r}")
+        return False
+    return True
+
+
+def check_unstarted_closure_generator_f_locals():
+    def outer():
+        n = 1
+
+        def inner():
+            yield n
+
+        return inner()
+
+    g = outer()
+    got = g.gi_frame.f_locals
+    want = {"n": 1}
+    if got != want:
+        print(f"unstarted_closure_generator_f_locals: got {got!r}, want {want!r}")
+        return False
+    return True
+
+
+def check_unstarted_generator_throw():
+    def gen():
+        yield 1
+
+    g = gen()
+    raised = None
+    try:
+        g.throw(ValueError)
+    except ValueError as e:
+        raised = type(e)
+    if raised is not ValueError:
+        print(f"unstarted_generator_throw: got {raised!r}, want ValueError")
+        return False
+    if getgeneratorstate(g) != GEN_CLOSED or g.gi_frame is not None:
+        print(
+            "unstarted_generator_throw closed: "
+            f"state={getgeneratorstate(g)!r} gi_frame={g.gi_frame!r}"
+        )
+        return False
+    return True
+
+
+def check_unstarted_coroutine_celltype_f_locals():
+    c = types.CellType(5)
+
+    async def coro(x):
+        def capture():
+            return x
+
+        return capture()
+
+    co = coro(c)
+    got = co.cr_frame.f_locals["x"]
+    if got is not c:
+        print(
+            "unstarted_coroutine_celltype_f_locals: "
+            f"got {got!r}, want the argument cell"
+        )
+        return False
+    return True
+
+
+def check_unstarted_asyncgen_celltype_f_locals():
+    c = types.CellType(5)
+
+    async def agen(x):
+        def capture():
+            return x
+
+        yield capture()
+
+    ag = agen(c)
+    got = ag.ag_frame.f_locals["x"]
+    if got is not c:
+        print(
+            "unstarted_asyncgen_celltype_f_locals: "
+            f"got {got!r}, want the argument cell"
+        )
+        return False
+    return True
+
+
 results = [
     check("write_through_proxy", write_through_proxy(ROUNDS)),
     check("store_then_read_proxy", store_then_read_proxy(ROUNDS)),
     check("write_through_caller_proxy", write_through_caller_proxy(ROUNDS)),
+    check_unstarted_generator_cellvar(),
+    check_unstarted_generator_celltype(),
+    check_unstarted_generator_state_and_lineno(),
+    check_unstarted_closure_generator_f_locals(),
+    check_unstarted_generator_throw(),
+    check_unstarted_coroutine_celltype_f_locals(),
+    check_unstarted_asyncgen_celltype_f_locals(),
 ]
 
 def framelocalsproxy_gc_roots():

@@ -2264,11 +2264,24 @@ pub fn handle_exception_with_context(
         // `w_pytraceback_new` copies this pointer into the node it allocates,
         // so it has to be the address the frame has now.
         let frame = unsafe { &mut *frame_anchor.live() };
+        // An unstarted generator still has `last_instr == -1` (PyPy's
+        // not-started sentinel), but CPython's `instr_ptr` already sits on
+        // the `POP_TOP` after `RETURN_GENERATOR`.  A `throw()` into that
+        // frame raises at that coordinate (`gen_send_ex2` + throwflag);
+        // record it so `tb_lasti` / `tb_lineno` match.  Regular frames
+        // keep the `-1` sentinel (`offset2lineno` answers "no line").
+        let last_instruction = if frame.last_instr < 0 {
+            crate::pycode::after_return_generator_index(frame.code())
+                .map(|i| i as i64)
+                .unwrap_or(frame.last_instr as i64)
+        } else {
+            frame.last_instr as i64
+        };
         unsafe {
             crate::pytraceback::record_application_traceback(
                 pyre_object::gc_roots::shadow_stack_get(exc_slot),
                 frame as *mut PyFrame,
-                frame.last_instr as i64,
+                last_instruction,
             );
         }
         err.reload(&_exc_roots, err_slot);
@@ -6045,11 +6058,16 @@ impl OpcodeStepExecutor for PyFrame {
     // CPython 3.12: RETURN_GENERATOR creates a generator from the current
     // frame and returns it to the caller. PyPy: generator.py GeneratorIterator.
     fn return_generator(&mut self) -> Result<(), PyError> {
-        // When the generator function is already wrapped (CodeFlags::GENERATOR
-        // detected in call_user_function_with_eval), RETURN_GENERATOR fires
-        // during the first __next__() resume. It's a no-op in that case —
-        // the generator object was already created at call time.
-        // Push dummy value for the following POP_TOP to consume.
+        // `RETURN_GENERATOR` does not run for a frame created by
+        // `into_generator_named`: that path executes the prefix itself
+        // (`run_generator_prologue`) and leaves the frame on the following
+        // `POP_TOP`.  The first resume therefore never dispatches this opcode.
+        //
+        // A walk that still starts at pc 0 — JIT codewriter / blackhole of
+        // generator bytecode, or a theoretical `execute_frame` of generator
+        // code that skipped the wrap — still hits it.  Keep the dummy `None`
+        // push so the following `POP_TOP` has a value, matching the previous
+        // no-op behaviour.
         self.push(pyre_object::w_none());
         Ok(())
     }
