@@ -295,9 +295,6 @@ pub fn do_combine_starstarargs_wrapped(
     values_w: Option<&[PyObjectRef]>,
     w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    // argument.py `seen = {}` — membership of already-emitted keys.  A
-    // small list, not `HashMap`: the std HashMap graph does not annotate.
-    let mut seen: Vec<rustpython_wtf8::Wtf8Buf> = Vec::new();
     // The per-key value lookup below runs `__getitem__` when `values_w` is
     // None, so every turn is a collection point.
     // `gctransform/framework.py push_roots` stores every live GCREF before
@@ -306,17 +303,36 @@ pub fn do_combine_starstarargs_wrapped(
     // `keyword_names_w[i] = w_key` / `keywords_w[i] = w_value` into GC lists
     // the caller allocated and owns. Those lists are the two shadow-stack
     // ranges whose bases are `keyword_names_w` / `keywords_w`; this helper
-    // fills slot `i` of each during the iteration and returns None.
+    // fills slot `i` of each during the iteration and returns None. A stack
+    // `RDict` is not a GC object; `entries_gc_ptr` / `indexes` are published
+    // there and restored before each use (`RDict::entries_gc_ptr`).
     let _roots = pyre_object::gc_roots::push_roots();
     let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
     let n = keys_w.len();
+    let has_values = values_w.is_some();
     let values_slice = values_w.unwrap_or(&[]);
-    debug_assert!(values_w.is_none() || values_slice.len() == n);
+    debug_assert!(!has_values || values_slice.len() == n);
     let root_base = pyre_object::gc_roots::publish_roots(&[w_starstararg, w_function]);
     let existing_base = pyre_object::gc_roots::publish_roots(existingkeywords_w.unwrap_or(&[]));
     let keys_base = pyre_object::gc_roots::publish_roots(keys_w);
     let values_base = pyre_object::gc_roots::publish_roots(values_slice);
-    pyre_object::gc_roots::normalize_roots(root_base, 2 + existing_len + n + values_slice.len());
+    let seen_entries_slot = pyre_object::gc_roots::publish_roots(&[pyre_object::PY_NULL]);
+    let seen_indexes_slot = pyre_object::gc_roots::publish_roots(&[pyre_object::PY_NULL]);
+    pyre_object::gc_roots::normalize_roots(
+        root_base,
+        2 + existing_len + n + values_slice.len() + 2,
+    );
+    // `_do_combine_starstarargs_wrapped` `seen = {}` — RPython `{}` is
+    // `SomeDict` of `text_w` (`_utf8`) → `None`. `StrKey` is that STR
+    // (`celldict.py`); `contains_key` / `insert` are `key in seen` /
+    // `seen[key] = None` (`ll_dict_contains` / `ll_dict_setitem`).
+    let mut seen: pyre_object::rordereddict::RDict<
+        pyre_object::celldict::StrKey,
+        (),
+        pyre_object::dictmultiobject::StrKeyBuildHasher,
+    > = pyre_object::rordereddict::RDict::new();
+    pyre_object::gc_roots::shadow_stack_set(seen_entries_slot, seen.entries_gc_ptr());
+    seen.reload_indexes_root(seen_indexes_slot);
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let mut existing_now = vec![pyre_object::PY_NULL; existing_len];
@@ -330,24 +346,28 @@ pub fn do_combine_starstarargs_wrapped(
         if unsafe { !pyre_object::is_str(w_key) } {
             return Err(crate::PyError::type_error("keywords must be strings"));
         }
-        // `space.text_w` preserves lone surrogates as WTF-8 bytes; keep the
-        // key in WTF-8 so a surrogate keyword name survives the seen-set and
-        // the dict value read.
-        let key = unsafe { pyre_object::w_str_get_wtf8(w_key).to_owned() };
-        // argument.py:439-445 — duplicate check against existing kwargs +
-        // already-seen names in this iteration.
+        // `space.text_w` preserves lone surrogates as WTF-8 bytes; the
+        // copy can collect. `%S` formats the live key object, so this
+        // buffer is only the collection point `argument.py` `text_w`
+        // performs before `key in seen`.
+        let _key = unsafe { pyre_object::w_str_get_wtf8(w_key).to_owned() };
+        // `text_w` copies into an owned buffer and can collect.
+        // `shadowstack.py` `expand_pop_roots` restores before the next use.
+        let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+        // `_do_combine_starstarargs_wrapped` — duplicate check against
+        // existing kwargs + already-seen names in this iteration.
         let already_in_existing = existing_len != 0 && {
             pyre_object::gc_roots::shadow_stack_copy_range(existing_base, &mut existing_now);
             contains_w_names(w_key, &existing_now)
         };
-        let mut already_seen = false;
-        for j in 0..seen.len() {
-            if seen.as_slice()[j] == key {
-                already_seen = true;
-                break;
-            }
-        }
-        if already_in_existing || already_seen {
+        // `contains_w_names` can collect (`is_w` / `eq_w`). Restore
+        // before `w_str_storage` (`shadowstack.py` restore-before-use).
+        let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+        let seen_key = pyre_object::celldict::StrKey(unsafe {
+            pyre_object::unicodeobject::w_str_storage(w_key)
+        });
+        seen.restore_from_roots(seen_entries_slot, seen_indexes_slot);
+        if already_in_existing || seen.contains_key(&seen_key) {
             // `contains_w_names` can collect; `%S` needs the key object.
             let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
             return Err(raise_type_error!(
@@ -356,22 +376,23 @@ pub fn do_combine_starstarargs_wrapped(
                 &[FmtArg::Obj(w_key)],
             ));
         }
-        // `contains_w_names` can collect; the key is read back from its slot.
+        // `seen[key] = None` before the value lookup.
+        seen.insert(seen_key, ());
+        pyre_object::gc_roots::shadow_stack_set(seen_entries_slot, seen.entries_gc_ptr());
+        seen.reload_indexes_root(seen_indexes_slot);
+        // `seen.insert` can collect; the key is read back from its slot.
         let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py — `keyword_names_w[i] = w_key`.
         pyre_object::gc_roots::shadow_stack_set(keyword_names_w + i, w_key);
         // argument.py — `space.getitem` when `values_w` is None. A str subclass
         // is probed as `w_key`; the WTF-8 `seen` key is the wrong probe.
-        let w_value = if values_w.is_some() {
+        let w_value = if has_values {
             pyre_object::gc_roots::shadow_stack_get(values_base + i)
         } else {
             crate::baseobjspace::getitem(w_starstararg(), w_key)?
         };
         // argument.py — `keywords_w[i] = w_value`.
         pyre_object::gc_roots::shadow_stack_set(keywords_w + i, w_value);
-        // argument.py `seen[key] = None` — record key, value slot
-        // is unread.
-        seen.push(key);
     }
     Ok(())
 }
