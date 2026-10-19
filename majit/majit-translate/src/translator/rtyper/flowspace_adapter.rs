@@ -67,6 +67,7 @@ use crate::flowspace::model::{
     FunctionGraph as FlowspaceGraph, HOST_ENV, Hlvalue, HostObject, Link as FlowspaceLink,
     SpaceOperation as FlowspaceOp, Variable, c_last_exception,
 };
+use crate::front::slice_index::vec_inherent_index_segments;
 use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::llannotation::lltype_to_annotation;
@@ -1391,33 +1392,24 @@ fn is_vec_set_len_segments(segments: &[String]) -> bool {
     }
 }
 
-/// `<Vec<T> as Index<usize>>::index` (Rust MIR `v[i]` / `vec::Vec::index`).
-///
-/// RPython writes the same operation as `lst[i]`:
-/// `pairtype(AbstractBaseListRepr, IntegerRepr).rtype_getitem` (`rlist.py`)
-/// → `ll_getitem_nonneg` / `ll_getitem`. A Rust `Vec` is the raw header
-/// `RustVecRepr`; `rtype_getitem` calls `ll_vec_getitem_fast` and
-/// `exception_cannot_occur` (out-of-bounds is a panic, not a raised
-/// `IndexError`). Routed to the same flowspace `getitem` that
-/// [`OpKind::ArrayRead`] and [`rust_vec_helper_ops`] `VecOp::GetItem`
-/// already emit, so pairtype dispatch (`RustVecRepr`, `IntegerRepr`,
-/// `"getitem"`) is the one lowering.
-///
-/// The foreign `vec` crate has no classdef, so the call arrives as
-/// `CallTarget::FunctionPath` (`front::mir::impl_method_owner` returns
-/// `None`). `Index<Range>` is a different callee; this recognizer is the
-/// `index` leaf only.
-fn is_vec_index_segments(segments: &[String]) -> bool {
-    match segments {
-        [a, b, c, leaf]
-            if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") && leaf == "index" =>
-        {
-            true
-        }
-        [a, b, leaf] if a == "vec" && b == "Vec" && leaf == "index" => true,
-        _ => false,
-    }
-}
+// `<Vec<T> as Index<usize>>::index` (Rust MIR `v[i]` / `vec::Vec::index`).
+//
+// RPython writes the same operation as `lst[i]`:
+// `pairtype(AbstractBaseListRepr, IntegerRepr).rtype_getitem` (`rlist.py`)
+// → `ll_getitem_nonneg` / `ll_getitem`. A Rust `Vec` is the raw header
+// `RustVecRepr`; `rtype_getitem` calls `ll_vec_getitem_fast` and
+// `exception_cannot_occur` (out-of-bounds is a panic, not a raised
+// `IndexError`). Routed to the same flowspace `getitem` that
+// [`OpKind::ArrayRead`] and [`rust_vec_helper_ops`] `VecOp::GetItem`
+// already emit, so pairtype dispatch (`RustVecRepr`, `IntegerRepr`,
+// `"getitem"`) is the one lowering.
+//
+// The foreign `vec` crate has no classdef, so the call arrives as
+// `CallTarget::FunctionPath` (`front::mir::impl_method_owner` returns
+// `None`). Every `Index<I>` shares this path; a Range index is rewritten
+// by `front::slice_index` into `__getslice_*` markers before it reaches
+// here. This arm is `lst[i]`. The callee-spelling predicate lives in
+// `front::slice_index::vec_inherent_index_segments`.
 
 /// Test-only mirror of whether the flowspace op(s) this `OpKind`
 /// lowers to carry a non-empty `canraise` (`operation.py`).
@@ -1534,7 +1526,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
-        } if args.len() == 2 && is_vec_index_segments(segments) => true,
+        } if args.len() == 2 && vec_inherent_index_segments(segments) => true,
         // `[__iter_next]` (`front::iter_next`) lowers to the raising
         // flowspace `next` op (`operation.rs` `OpKind::Next.can_only_throw
         // = [StopIteration, RuntimeError]`).  Matched before the general
@@ -3616,9 +3608,11 @@ pub fn translate_op(
                     // `getitem(recv, index)` so `RustVecRepr.rtype_getitem`
                     // / `pairtype(AbstractBaseListRepr, IntegerRepr).rtype_getitem`
                     // (`rlist.py`) is the one lowering — the same op
-                    // [`OpKind::ArrayRead`] already emits. `Index<Range>` is
-                    // a different callee.
-                    if is_vec_index_segments(segments) {
+                    // [`OpKind::ArrayRead`] already emits. Every `Index<I>`
+                    // shares this path; a Range index is rewritten by
+                    // `front::slice_index` into `__getslice_*` markers before
+                    // it reaches here, so this arm is `lst[i]`.
+                    if vec_inherent_index_segments(segments) {
                         if arg_hls.len() != 2 {
                             return Err(TyperError::message(format!(
                                 "Vec::index requires exactly two args (receiver, index), got {}",

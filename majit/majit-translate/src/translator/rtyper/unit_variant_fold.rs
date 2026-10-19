@@ -214,7 +214,6 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
     let Some(bk) = bookkeeper else {
         return;
     };
-    let field_bases = collect_field_bases(graph);
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
             let OpKind::Call {
@@ -263,37 +262,44 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph, bookkeeper: Option<&Rc
                 op.kind = OpKind::ConstRef(instance);
                 continue;
             }
-            // A fieldless named struct (`PyreEnv`, `KwargsDictStrategy`, a
-            // zero-capture closure env) is an instance of a class with no
-            // fields. Payloads of a struct ctor go through FieldWrites, so
-            // an empty-arg ctor with no field traffic is that empty class.
-            // Intern under the crate-relative STRUCT path
-            // `synthetic_transparent_ctor_owner` / `rewrite_op_malloc`
-            // uses for this ctor (`ClassDesc` / `getuniqueclassdef`
-            // identity, `rclass.py` `getinstancerepr`). The ctor leaf
-            // alone is not that object: a shared `closure` / `closure#N`
-            // leaf is ambiguous across TypeDecls.
+            // A named struct whose declared field list is empty is a
+            // zero-sized class (`PyreEnv`, `KwargsDictStrategy`, a
+            // zero-capture closure env). The list is
+            // `StructFieldRegistry.fields` under the crate-relative
+            // STRUCT path `synthetic_transparent_ctor_owner` /
+            // `rewrite_op_malloc` uses for this ctor (`ClassDesc` /
+            // `getuniqueclassdef` identity, `rclass.py`
+            // `getinstancerepr`) — the same key
+            // `intern_unit_variant_prebuilt_instance` interns. Fold
+            // only when that key is present and the list is empty; an
+            // unknown STRUCT or a nonempty list leaves the ctor
+            // (`rclass.py` `InstanceRepr.new_instance` mallocs). The
+            // ctor leaf alone is not that object: a shared `closure`
+            // / `closure#N` leaf is ambiguous across TypeDecls.
+            //
+            // Every such ctor yields the one prebuilt instance instead of a
+            // fresh `malloc` (`rclass.py` `InstanceRepr.new_instance`). A
+            // fieldless Rust struct is zero-sized and has no address identity
+            // (`Box::new` of it does not allocate, `ptr::eq` between two of them
+            // is unspecified), so no caller can tell the instances apart. PyPy
+            // reaches the same shape for its stateless strategy objects through
+            // `space.fromcache(Strategy)`.
             if *is_struct {
-                let fieldless = op
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| !field_bases.iter().any(|base| base == result));
-                if fieldless {
-                    let name_path = if owner_path.is_empty() {
-                        name.clone()
-                    } else {
-                        format!("{}::{name}", owner_path.join("::"))
-                    };
-                    let intern_key = crate::model::crate_relative_struct_owner(
-                        &name_path,
-                        graph.name.split("::").next(),
-                    );
-                    if let Some(instance) =
+                let name_path = if owner_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}::{name}", owner_path.join("::"))
+                };
+                let intern_key = crate::model::crate_relative_struct_owner(
+                    &name_path,
+                    graph.name.split("::").next(),
+                );
+                if declared_struct_is_fieldless(bk, &intern_key)
+                    && let Some(instance) =
                         intern_unit_variant_prebuilt_instance(bk, &intern_key, None)
-                    {
-                        op.kind = OpKind::ConstRef(instance);
-                        continue;
-                    }
+                {
+                    op.kind = OpKind::ConstRef(instance);
+                    continue;
                 }
             }
             let mut segments = owner_path.clone();
@@ -449,27 +455,43 @@ fn strip_void_call_operands(
     }
 }
 
-fn collect_field_bases(graph: &FunctionGraph) -> Vec<crate::flowspace::model::Variable> {
-    let mut field_bases = Vec::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            match &op.kind {
-                OpKind::FieldRead { base, .. }
-                | OpKind::FieldWrite { base, .. }
-                | OpKind::InteriorFieldRead { base, .. }
-                | OpKind::InteriorFieldWrite { base, .. }
-                | OpKind::VableFieldRead { base, .. }
-                | OpKind::VableFieldWrite { base, .. } => field_bases.push(base.clone()),
-                _ => {}
-            }
-        }
-    }
-    field_bases
+/// True when `intern_key` is a STRUCT the annotator harvested with an
+/// empty declared field list (`StructFieldRegistry.fields`, the same
+/// table `Bookkeeper::project_struct_rows` / `ClassDesc::_init_classdef`
+/// FORCE rows consume). Missing registry, missing key, or a nonempty
+/// list are all false — `InstanceRepr.new_instance` mallocs those.
+fn declared_struct_is_fieldless(bk: &Bookkeeper, intern_key: &str) -> bool {
+    bk.struct_fields
+        .borrow()
+        .as_ref()
+        .and_then(|reg| reg.fields.get(intern_key))
+        .is_some_and(|rows| rows.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::front::StructFieldRegistry;
+    use crate::front::semantic::FieldRow;
+
+    fn bookkeeper_with_struct_rows(entries: &[(&str, Vec<FieldRow>)]) -> Rc<Bookkeeper> {
+        let bk = Rc::new(Bookkeeper::new());
+        let mut reg = StructFieldRegistry::default();
+        for (key, rows) in entries {
+            reg.fields.insert((*key).to_string(), rows.clone());
+        }
+        bk.set_struct_fields(Rc::new(reg));
+        bk
+    }
+
+    fn intern_key_for(graph: &FunctionGraph, owner_path: &[&str], name: &str) -> String {
+        let name_path = if owner_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{name}", owner_path.join("::"))
+        };
+        crate::model::crate_relative_struct_owner(&name_path, graph.name.split("::").next())
+    }
 
     #[test]
     fn zero_length_shapes_are_recognised() {
@@ -620,7 +642,8 @@ mod tests {
         );
         graph.set_goto(entry, entry, Vec::new());
 
-        let bk = Rc::new(Bookkeeper::new());
+        let intern_key = intern_key_for(&graph, &["grain", "vm", "jit"], "Marker");
+        let bk = bookkeeper_with_struct_rows(&[(&intern_key, Vec::new())]);
         fold_unit_variant_ctors(&mut graph, Some(&bk));
         assert_ne!(
             FunctionGraph::concretetype_of(&zst),
@@ -708,7 +731,9 @@ mod tests {
             .unwrap();
         graph.set_goto(entry, entry, Vec::new());
 
-        let bk = Rc::new(Bookkeeper::new());
+        let key_a = intern_key_for(&graph, &["pyre_interpreter", "mod", "f"], "closure");
+        let key_b = intern_key_for(&graph, &["pyre_interpreter", "other", "g"], "closure");
+        let bk = bookkeeper_with_struct_rows(&[(&key_a, Vec::new()), (&key_b, Vec::new())]);
         fold_unit_variant_ctors(&mut graph, Some(&bk));
         let class_of = |var: &crate::flowspace::model::Variable| -> String {
             for block in &graph.blocks {
@@ -768,5 +793,103 @@ mod tests {
             "getcalldescr still sees the Void actual so residual rewrite can stamp FUNC.ARGS"
         );
         assert_eq!(args[0].as_variable(), Some(&depth));
+    }
+
+    /// An empty-arg struct ctor whose STRUCT has declared fields stays a
+    /// malloc even when this graph never FieldWrites the result.
+    /// `InstanceRepr.new_instance` always mallocs a field-bearing class.
+    #[test]
+    fn empty_arg_struct_with_declared_fields_is_not_folded() {
+        use crate::model::{FunctionGraph, ValueType};
+
+        let mut graph = FunctionGraph::new("has_fields");
+        let entry = graph.startblock;
+        let inst = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["pkg".into()],
+                        "HasFields",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("pkg::HasFields".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_goto(entry, entry, Vec::new());
+
+        let intern_key = intern_key_for(&graph, &["pkg"], "HasFields");
+        let bk =
+            bookkeeper_with_struct_rows(&[(&intern_key, vec![FieldRow::named("payload", "i64")])]);
+        fold_unit_variant_ctors(&mut graph, Some(&bk));
+        let mut saw_ctor = false;
+        let mut saw_prebuilt = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { .. },
+                        ..
+                    } if op.result.as_ref() == Some(&inst) => saw_ctor = true,
+                    OpKind::ConstRef(_) if op.result.as_ref() == Some(&inst) => saw_prebuilt = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_ctor, "field-bearing empty-arg ctor must stay a malloc");
+        assert!(
+            !saw_prebuilt,
+            "must not intern a field-bearing instance as ConstRef"
+        );
+    }
+
+    /// An empty-arg ctor of a STRUCT whose declared field list is empty
+    /// folds to `OpKind::ConstRef` (`get_reusable_prebuilt_instance`).
+    #[test]
+    fn empty_arg_struct_with_empty_declared_fields_is_folded() {
+        use crate::model::{FunctionGraph, ValueType};
+
+        let mut graph = FunctionGraph::new("empty_fields");
+        let entry = graph.startblock;
+        let inst = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["pkg".into()],
+                        "Empty",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("pkg::Empty".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_goto(entry, entry, Vec::new());
+
+        let intern_key = intern_key_for(&graph, &["pkg"], "Empty");
+        let bk = bookkeeper_with_struct_rows(&[(&intern_key, Vec::new())]);
+        fold_unit_variant_ctors(&mut graph, Some(&bk));
+        let mut saw_ctor = false;
+        let mut saw_prebuilt = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { .. },
+                        ..
+                    } if op.result.as_ref() == Some(&inst) => saw_ctor = true,
+                    OpKind::ConstRef(_) if op.result.as_ref() == Some(&inst) => saw_prebuilt = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(!saw_ctor, "empty declared-field list ctor survived");
+        assert!(
+            saw_prebuilt,
+            "empty declared-field list interned as ConstRef"
+        );
     }
 }

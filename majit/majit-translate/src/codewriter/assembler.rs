@@ -4140,7 +4140,11 @@ impl AssemblerEncode for Assembler {
             size: spec.size,
             type_id: spec.type_id,
             vtable: 0,
-            owner: String::new(),
+            owner: if spec.headerless {
+                majit_jitcode::jitcode::HEADERLESS_SIZE_OWNER_MARKER.to_string()
+            } else {
+                String::new()
+            },
             all_fielddescrs: Vec::new(),
             is_gc_managed: spec.is_gc_managed,
         });
@@ -4160,6 +4164,8 @@ impl AssemblerEncode for Assembler {
                 size: spec.size,
                 type_id: spec.type_id,
                 has_vtable: spec.has_vtable,
+                is_gc_managed: spec.is_gc_managed,
+                headerless: spec.headerless,
             });
         reg
     }
@@ -4302,6 +4308,7 @@ struct EmptyClassPrebuilt {
     type_id: u64,
     has_vtable: bool,
     is_gc_managed: bool,
+    headerless: bool,
 }
 
 /// Empty-class singleton (`reusable_prebuilt_instance` /
@@ -4348,6 +4355,7 @@ fn empty_class_prebuilt_instance(
         type_id: spec.type_id,
         has_vtable: crate::codewriter::heaptracker::callcontrol_has_vtable(cc, owner),
         is_gc_managed: spec.is_gc_managed,
+        headerless: spec.headerless,
     })
 }
 
@@ -8616,6 +8624,8 @@ mod tests {
         assert_eq!(desc.identity, identity);
         assert_eq!(desc.size, 0);
         assert!(!desc.has_vtable);
+        assert!(desc.is_gc_managed);
+        assert!(!desc.headerless);
         assert_eq!(
             desc.type_id,
             majit_ir::descr::StructId::from_canonical(owner).as_u64()

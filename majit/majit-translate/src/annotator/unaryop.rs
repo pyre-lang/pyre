@@ -32,8 +32,9 @@ use super::annrpython::RPythonAnnotator;
 use super::classdesc::{BuiltinTypeDesc, ClassDesc, is_primitive_type};
 use super::model::{
     AnnotatorError, ExitCaseKey, KnownType, SomeBool, SomeBuiltinMethod, SomeFloat, SomeInteger,
-    SomeIterator, SomeObjectTrait, SomeString, SomeTuple, SomeTypeOf, SomeUnicodeString, SomeValue,
-    SomeValueTag, add_knowntypedata, s_bool, s_impossible_value, s_none,
+    SomeIterator, SomeObjectTrait, SomeRustVec, SomeString, SomeTuple, SomeTypeOf,
+    SomeUnicodeString, SomeValue, SomeValueTag, add_knowntypedata, s_bool, s_impossible_value,
+    s_none,
 };
 
 /// RPython `UNARY_OPERATIONS` (unaryop.py).
@@ -1474,6 +1475,31 @@ fn init_somerustvec_overrides(
                     .setattr(&s_attr, &s_value)
                     .unwrap_or_else(|err| std::panic::panic_any(err));
                 None
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    // unaryop.py `SomeList.getslice`: check_negative_slice + listdef.offspring.
+    // SomeRustVec has a fixed s_item and no listdef, so the offspring analog
+    // is a fresh SomeRustVec of the same item.
+    register(
+        reg,
+        OpKind::GetSlice,
+        SomeValueTag::RustVec,
+        Specialization {
+            apply: pure(|ann, hl| {
+                let s_vec = match ann.annotation(&hl.args[0]) {
+                    Some(SomeValue::RustVec(s)) => s,
+                    _ => panic!("rustvec.getslice: arg 0 not SomeRustVec"),
+                };
+                let s_start = ann
+                    .annotation(&hl.args[1])
+                    .expect("rustvec.getslice: start unbound");
+                let s_stop = ann
+                    .annotation(&hl.args[2])
+                    .expect("rustvec.getslice: stop unbound");
+                check_negative_slice(&s_start, &s_stop, "slicing");
+                SomeValue::RustVec(SomeRustVec::new((*s_vec.s_item).clone()))
             }),
             can_only_throw: CanOnlyThrow::Absent,
         },

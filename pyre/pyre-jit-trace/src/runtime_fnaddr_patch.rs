@@ -957,8 +957,18 @@ pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
 }
 
 /// Immortal rclass instance. `InstanceRepr.create_instance` mallocs
-/// `self.object_type` immortal; `initialize_prebuilt_instance` writes
-/// `ClassRepr.getvtable` into typeptr when the STRUCT has one.
+/// `self.object_type` immortal with `flavor=self.gcflavor`;
+/// `initialize_prebuilt_instance` writes `ClassRepr.getvtable` into
+/// typeptr when the STRUCT has one.
+///
+/// `TypeLayoutBuilder.consider_constant` installs a GC header and type
+/// id only for GC containers, and only when a framework GC is present
+/// (`database.py getcontainernode` calls it only if the transformer
+/// defines it; `BoehmGCTransformer` / `NoneGcPolicy` do not). A
+/// GC-managed non-headerless instance therefore takes
+/// `alloc_varsize_with_gc_header_immortal_zeroed` only while
+/// `gc_sync::is_initialized()`. With no collector, `bh_alloc_struct`'s
+/// no-collector tail is a zeroed malloc with no header and no tid.
 ///
 /// `rewrite_op_malloc` is `new_with_vtable` iff `has_gcstruct_a_vtable`;
 /// `get_vtable_for_gcstruct` only reads `_cache_gcstruct2vtable` (filled
@@ -967,9 +977,18 @@ pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
 fn prebuilt_empty_class_instance_addr(
     desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
 ) -> i64 {
-    let (vtable, tid) = prebuilt_instance_vtable_and_tid(desc);
-    let ptr =
-        majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(desc.size, tid) as usize;
+    let vtable = prebuilt_instance_vtable(desc);
+    let ptr = if desc.is_gc_managed && !desc.headerless && majit_gc::gc_sync::is_initialized() {
+        let tid = prebuilt_instance_tid(desc);
+        majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(desc.size, tid) as usize
+    } else {
+        let layout =
+            std::alloc::Layout::from_size_align(desc.size.max(1), std::mem::align_of::<usize>())
+                .expect("prebuilt raw instance layout");
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!raw.is_null(), "prebuilt instance allocation failed");
+        raw as usize
+    };
     assert!(ptr != 0, "prebuilt instance allocation failed");
     if let Some(vtable) = vtable {
         assert!(
@@ -987,6 +1006,10 @@ fn prebuilt_empty_class_instance_addr(
 /// Size descr `OpKind::New` interns. Empty-class `all_fielddescrs` is
 /// empty; vtable is 0. The typeptr word is `ClassRepr.getvtable` from
 /// `_cache_gcstruct2vtable`, never this field.
+///
+/// `is_gc_managed` is `InstanceRepr.create_instance`'s `self.gcflavor`.
+/// `TypeLayoutBuilder.consider_constant` headers GC containers only;
+/// a headerless Size stamps `HEADERLESS_SIZE_OWNER_MARKER` in `owner`.
 fn prebuilt_instance_size_descr(
     desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
 ) -> majit_jitcode::jitcode::BhDescr {
@@ -994,25 +1017,22 @@ fn prebuilt_instance_size_descr(
         size: desc.size,
         type_id: desc.type_id,
         vtable: 0,
-        owner: String::new(),
+        owner: if desc.headerless {
+            majit_jitcode::jitcode::HEADERLESS_SIZE_OWNER_MARKER.to_string()
+        } else {
+            String::new()
+        },
         all_fielddescrs: Vec::new(),
-        is_gc_managed: true,
+        is_gc_managed: desc.is_gc_managed,
     }
 }
 
-/// Vtable word and collector tid for one prebuilt instance.
-///
 /// Typeptr-header: the `_cache_gcstruct2vtable` row
 /// `heaptracker.get_vtable_for_gcstruct` reads. Never minted.
-/// Header tid is `SizeDescr.type_id` on the descr `new` interns
-/// (`descr.py get_size_descr` via `make_descr_from_bh` of this
-/// STRUCT's Size). `TypeLayoutBuilder.consider_constant` interned
-/// that Size into kind-0 so `GcLLDescr_framework.init_size_descr`
-/// already stamped it.
-fn prebuilt_instance_vtable_and_tid(
+fn prebuilt_instance_vtable(
     desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
-) -> (Option<usize>, u32) {
-    let vtable = if desc.has_vtable {
+) -> Option<usize> {
+    if desc.has_vtable {
         crate::descr::publish_pyre_class_vtables();
         let found = {
             let gc = majit_ir::descr::gc_cache().lock();
@@ -1028,7 +1048,16 @@ fn prebuilt_instance_vtable_and_tid(
         }
     } else {
         None
-    };
+    }
+}
+
+/// Collector tid for a GC-container prebuilt. Reached only while
+/// `gc_sync::is_initialized()` (`prebuilt_empty_class_instance_addr`).
+/// Header tid is `SizeDescr.type_id` on the descr `new` interns
+/// (`descr.py get_size_descr` via `make_descr_from_bh` of this STRUCT's
+/// Size). `TypeLayoutBuilder.consider_constant` interned that Size into
+/// kind-0 so `GcLLDescr_framework.init_size_descr` already stamped it.
+fn prebuilt_instance_tid(desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor) -> u32 {
     if let Some((_, cached_size)) = majit_ir::descr::gc_cache()
         .lock()
         .resolve_struct_layout(desc.type_id)
@@ -1049,23 +1078,17 @@ fn prebuilt_instance_vtable_and_tid(
         let sd = descr.as_size_descr().expect("new of the same Size descr");
         (sd.cache_key(), sd.type_id())
     };
-    // With a collector, `GCTransformer.finish_tables` /
-    // `TypeLayoutBuilder.consider_constant` must already have stamped
-    // the STRUCT, so an unresolved tid is a happens-before violation.
-    // Without one there is no type registry
-    // (`register_synthetic_struct_tids` returns early) and the header
-    // carries the same tid the `new` SizeDescr of this STRUCT carries
-    // in that mode.
-    if majit_gc::gc_sync::is_initialized()
-        && (majit_ir::descr::struct_tid_is_unresolved(cache_key, tid)
-            || (cache_key != 0 && tid == 0))
-    {
+    // This function is only reached with a collector, so
+    // `GCTransformer.finish_tables` / `TypeLayoutBuilder.consider_constant`
+    // must already have stamped the STRUCT. An unresolved tid is a
+    // happens-before violation.
+    if majit_ir::descr::struct_tid_is_unresolved(cache_key, tid) || (cache_key != 0 && tid == 0) {
         panic!(
             "prebuilt instance: SizeDescr collector tid for cache_key={cache_key:#x} is unresolved \
              after TypeLayoutBuilder.consider_constant / kind-0"
         );
     }
-    (vtable, tid)
+    tid
 }
 
 /// One immortal empty `GcArray` for `type_name` (`Array<T;0>`).
@@ -1463,6 +1486,8 @@ mod tests {
             size,
             type_id,
             has_vtable,
+            is_gc_managed: true,
+            headerless: false,
         }
     }
 
@@ -1549,21 +1574,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn materialize_prebuilt_instance_consts_overwrites_sentinel_with_header_only_instance() {
+    /// Collector-less materialize takes `bh_alloc_struct`'s no-collector
+    /// tail: immortal zeroed block, no GC header, no tid. `vtable` is the
+    /// typeptr word `initialize_prebuilt_instance` writes when the STRUCT
+    /// has one.
+    fn assert_raw_prebuilt_payload(
+        addr: i64,
+        desc: &majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor,
+        vtable: Option<usize>,
+    ) {
         use majit_jitcode::codewriter::assembler::PREBUILT_INSTANCE_CONST_SENTINEL_BASE;
-
-        let type_id = majit_ir::descr::path_hash("c1i::HeaderOnlyEmpty");
-        let desc = prebuilt_instance_desc(0xC110_0001, 0, type_id, false);
-        publish_kind0_size_then_stamp(&desc);
-        let mut jcs = vec![jitcode_with_prebuilt("dict_key_error", desc.clone())];
-        materialize_prebuilt_instance_consts(&mut jcs);
-        let addr = jcs[0].body().constants_r[0].get();
+        assert!(
+            !majit_gc::gc_sync::is_initialized(),
+            "these tests do not install a process-global collector"
+        );
         assert_ne!(addr, PREBUILT_INSTANCE_CONST_SENTINEL_BASE);
         assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
         assert_ne!(addr, 0);
-        let hdr = unsafe { majit_gc::header::header_of(addr as usize) };
-        assert_header_tid_is_stamped(unsafe { (*hdr).type_id() }, &desc);
+        let nbytes = desc.size.max(1);
+        let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, nbytes) };
+        if let Some(vtable) = vtable {
+            assert!(
+                desc.size >= std::mem::size_of::<usize>(),
+                "typeptr-header prebuilt needs a word, size={}",
+                desc.size
+            );
+            assert_eq!(
+                unsafe { *(addr as *const usize) },
+                vtable,
+                "typeptr is ClassRepr.getvtable, the registered STRUCT vtable"
+            );
+            assert!(
+                bytes[std::mem::size_of::<usize>()..]
+                    .iter()
+                    .all(|&b| b == 0),
+                "collector-less prebuilt payload after the typeptr word must be zeroed"
+            );
+        } else {
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "collector-less prebuilt payload must be zeroed"
+            );
+        }
+    }
+
+    #[test]
+    fn materialize_prebuilt_instance_consts_overwrites_sentinel_with_header_only_instance() {
+        let type_id = majit_ir::descr::path_hash("c1i::HeaderOnlyEmpty");
+        let desc = prebuilt_instance_desc(0xC110_0001, 0, type_id, false);
+        publish_kind0_size_then_stamp(&desc);
+        let tid = prebuilt_instance_tid(&desc);
+        assert_header_tid_is_stamped(tid, &desc);
+        let mut jcs = vec![jitcode_with_prebuilt("dict_key_error", desc.clone())];
+        materialize_prebuilt_instance_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_raw_prebuilt_payload(addr, &desc, None);
         let registered = majit_ir::descr::gc_cache()
             .lock()
             ._cache_gcstruct2vtable
@@ -1587,16 +1652,16 @@ mod tests {
         );
         let desc = prebuilt_instance_desc(0xC110_0009, 0, type_id, false);
         let stamped_tid = publish_kind0_size_then_stamp(&desc);
+        let tid = prebuilt_instance_tid(&desc);
+        assert_header_tid_is_stamped(tid, &desc);
+        assert_eq!(
+            tid, stamped_tid,
+            "header tid is the tid the local init_size_descr analog returned"
+        );
         let mut jcs = vec![jitcode_with_prebuilt("unstamped_header", desc.clone())];
         materialize_prebuilt_instance_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
-        let hdr = unsafe { majit_gc::header::header_of(addr as usize) };
-        let header_tid = unsafe { (*hdr).type_id() };
-        assert_header_tid_is_stamped(header_tid, &desc);
-        assert_eq!(
-            header_tid, stamped_tid,
-            "header tid is the tid the local init_size_descr analog returned"
-        );
+        assert_raw_prebuilt_payload(addr, &desc, None);
     }
 
     #[test]
@@ -1604,6 +1669,8 @@ mod tests {
         let type_id = majit_ir::descr::path_hash("c1i::InternByIdentity");
         let same = prebuilt_instance_desc(0xC110_0002, 0, type_id, false);
         publish_kind0_size_then_stamp(&same);
+        let tid = prebuilt_instance_tid(&same);
+        assert_header_tid_is_stamped(tid, &same);
         let mut first = vec![jitcode_with_prebuilt("a", same.clone())];
         let mut second = vec![jitcode_with_prebuilt("b", same.clone())];
         materialize_prebuilt_instance_consts(&mut first);
@@ -1614,8 +1681,7 @@ mod tests {
             "one HostObject identity must resolve to one immortal instance"
         );
         let addr_a = first[0].body().constants_r[0].get();
-        let hdr = unsafe { majit_gc::header::header_of(addr_a as usize) };
-        assert_header_tid_is_stamped(unsafe { (*hdr).type_id() }, &same);
+        assert_raw_prebuilt_payload(addr_a, &same, None);
         let other = {
             let desc = prebuilt_instance_desc(0xC110_0003, 0, type_id, false);
             let mut jcs = vec![jitcode_with_prebuilt("other", desc)];
@@ -1634,6 +1700,8 @@ mod tests {
         let a = prebuilt_instance_desc(0xC110_0006, 0, type_id, false);
         let b = prebuilt_instance_desc(0xC110_0007, 0, type_id, false);
         publish_kind0_size_then_stamp(&a);
+        let tid = prebuilt_instance_tid(&a);
+        assert_header_tid_is_stamped(tid, &a);
         let mut jcs = vec![
             jitcode_with_prebuilt("host_a", a.clone()),
             jitcode_with_prebuilt("host_b", b),
@@ -1645,8 +1713,7 @@ mod tests {
             addr_a, addr_b,
             "two HostObjects of one empty class are two runtime objects"
         );
-        let hdr = unsafe { majit_gc::header::header_of(addr_a as usize) };
-        assert_header_tid_is_stamped(unsafe { (*hdr).type_id() }, &a);
+        assert_raw_prebuilt_payload(addr_a, &a, None);
     }
 
     #[test]
@@ -1665,18 +1732,7 @@ mod tests {
         let mut jcs = vec![jitcode_with_prebuilt("registered_vtable", desc.clone())];
         materialize_prebuilt_instance_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
-        let typeptr = unsafe { *(addr as *const usize) };
-        assert_eq!(
-            typeptr, real_vtable,
-            "typeptr is ClassRepr.getvtable, the registered STRUCT vtable"
-        );
-        let hdr = unsafe { majit_gc::header::header_of(addr as usize) };
-        let header_tid = unsafe { (*hdr).type_id() };
-        assert_header_tid_is_stamped(header_tid, &desc);
-        assert_eq!(
-            header_tid, real_tid,
-            "header tid is the tid init_size_descr stamps (object_shape_for_struct)"
-        );
+        assert_raw_prebuilt_payload(addr, &desc, Some(real_vtable));
         let registered = majit_ir::descr::gc_cache()
             .lock()
             ._cache_gcstruct2vtable
@@ -1705,8 +1761,10 @@ mod tests {
             false,
         );
         let desc = prebuilt_instance_desc(0xC110_0008, 0, type_id, false);
-        let mut jcs = vec![jitcode_with_prebuilt("foreign_layout", desc)];
-        materialize_prebuilt_instance_consts(&mut jcs);
+        // Collector-less materialize takes the raw branch and does not call
+        // `prebuilt_instance_tid`. The layout check still lives there and
+        // is reached with a collector (`prebuilt_empty_class_instance_addr`).
+        let _ = prebuilt_instance_tid(&desc);
     }
 
     #[test]
@@ -1716,16 +1774,7 @@ mod tests {
         let mut jcs = vec![jitcode_with_prebuilt("unpublished", desc.clone())];
         materialize_prebuilt_instance_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
-        let hdr = unsafe { majit_gc::header::header_of(addr as usize) };
-        let header_tid = unsafe { (*hdr).type_id() };
-        let new_tid = crate::descr::make_descr_from_bh(&prebuilt_instance_size_descr(&desc))
-            .as_size_descr()
-            .unwrap()
-            .type_id();
-        assert_eq!(
-            header_tid, new_tid,
-            "unpublished header tid is the tid new gets without a collector"
-        );
+        assert_raw_prebuilt_payload(addr, &desc, None);
     }
 
     #[test]
@@ -1744,18 +1793,7 @@ mod tests {
         let mut jcs = vec![jitcode_with_prebuilt("vtable_before_new", desc.clone())];
         materialize_prebuilt_instance_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
-        let typeptr = unsafe { *(addr as *const usize) };
-        assert_eq!(
-            typeptr, real_vtable,
-            "typeptr is ClassRepr.getvtable, the registered STRUCT vtable"
-        );
-        let hdr = unsafe { majit_gc::header::header_of(addr as usize) };
-        let header_tid = unsafe { (*hdr).type_id() };
-        assert_header_tid_is_stamped(header_tid, &desc);
-        assert_eq!(
-            header_tid, real_tid,
-            "header tid is the tid init_size_descr stamps (object_shape_for_struct)"
-        );
+        assert_raw_prebuilt_payload(addr, &desc, Some(real_vtable));
         let size_descr = published_size_descr(&desc);
         let sd = size_descr
             .as_size_descr()
@@ -1766,6 +1804,59 @@ mod tests {
             "new_with_vtable keeps ClassRepr.getvtable"
         );
         assert_ne!(sd.vtable(), 0);
+    }
+
+    #[test]
+    fn materialize_prebuilt_instance_consts_raw_flavor_zeroed_without_gc_header() {
+        use majit_jitcode::codewriter::assembler::PREBUILT_INSTANCE_CONST_SENTINEL_BASE;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let type_id = majit_ir::descr::path_hash("c1i::RawFlavorEmpty");
+        let desc = majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor {
+            constants_r_index: 0,
+            identity: 0xC110_00F1,
+            size: 16,
+            type_id,
+            has_vtable: false,
+            is_gc_managed: false,
+            headerless: false,
+        };
+        match prebuilt_instance_size_descr(&desc) {
+            BhDescr::Size { is_gc_managed, .. } => {
+                assert!(!is_gc_managed, "raw flavor Size is not GC-managed")
+            }
+            other => panic!("expected Size descr, got {other:?}"),
+        }
+        let mut jcs = vec![jitcode_with_prebuilt("raw_flavor", desc.clone())];
+        materialize_prebuilt_instance_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_ne!(addr, PREBUILT_INSTANCE_CONST_SENTINEL_BASE);
+        assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
+        assert_ne!(addr, 0);
+        let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, desc.size) };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "raw immortal payload must be zeroed"
+        );
+    }
+
+    #[test]
+    fn materialize_prebuilt_instance_consts_truncated_path_hash_without_collector_is_raw() {
+        let type_id = majit_ir::descr::path_hash("c1i::TruncatedPathHashPrebuilt");
+        assert!(
+            type_id > u32::MAX as u64,
+            "path_hash must truncate when stored as SizeDescr type_id"
+        );
+        let real_vtable = Box::leak(Box::new(0xC1B2_0000_0003usize)) as *const usize as usize;
+        {
+            let mut gc = majit_ir::descr::gc_cache().lock();
+            gc.register_gcstruct_vtable(type_id, real_vtable, 1);
+        }
+        let desc = prebuilt_instance_desc(0xC110_00F2, 8, type_id, true);
+        let mut jcs = vec![jitcode_with_prebuilt("truncated_path_hash", desc.clone())];
+        materialize_prebuilt_instance_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_raw_prebuilt_payload(addr, &desc, Some(real_vtable));
     }
 
     /// Walker folds that recognise a residual by callee compare against this

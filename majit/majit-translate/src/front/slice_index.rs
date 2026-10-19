@@ -692,7 +692,7 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
 /// Inherent `Vec::index` (not `index_mut`). Accepts the impl-owner residual
 /// `["vec","Vec","index"]` and crate-qualified / FunDecl forms that end in
 /// `"vec","Vec","index"` or `"vec","<Impl>","index"`.
-fn vec_inherent_index_segments(segments: &[String]) -> bool {
+pub(crate) fn vec_inherent_index_segments(segments: &[String]) -> bool {
     let n = segments.len();
     n >= 3
         && segments[n - 1] == "index"
